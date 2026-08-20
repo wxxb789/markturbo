@@ -68,6 +68,16 @@ pub struct DocumentView {
     /// Cached WebView HTML, rebuilt on reparse. Held here rather than in the
     /// WebView so switching modes does not re-render.
     web_html: Option<String>,
+    /// The window's single WebView, lent to this tab while it is the active one
+    /// showing a Web pane.
+    ///
+    /// It has to be *in this element tree* rather than merely alive: the OS
+    /// child window's bounds are set by `WebViewElement::prepaint`, and a
+    /// `WebView` that is never rendered keeps the `Rect::default()` it was
+    /// constructed with — 0x0 at the origin, which is exactly "the Web view does
+    /// not work".
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    webview: Option<Entity<gpui_wry::WebView>>,
     _reparse: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -124,6 +134,8 @@ impl DocumentView {
             externally_changed: false,
             registry,
             web_html: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            webview: None,
             _reparse: None,
             _subscriptions: subscriptions,
         };
@@ -143,7 +155,11 @@ impl DocumentView {
             .and_then(|n| n.to_str())
             .unwrap_or("untitled")
             .to_string();
-        if self.dirty { format!("{name} •") } else { name }
+        if self.dirty {
+            format!("{name} •")
+        } else {
+            name
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -215,6 +231,30 @@ impl DocumentView {
     /// Cursor offset, for block-scoped operations.
     pub fn cursor(&self, cx: &App) -> usize {
         self.editor.read(cx).cursor()
+    }
+
+    /// Put the cursor at `offset` and scroll it into view.
+    ///
+    /// Used by the outline, where clicking a heading has to actually go there.
+    /// A preview-only mode has no cursor to move, so this switches into one that
+    /// shows the editor — Split rather than Source, so the reader keeps the
+    /// rendered document they were navigating.
+    pub fn reveal_offset(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.mode.shows_editor() {
+            self.set_mode(ViewMode::Split, cx);
+        }
+        // Clamp against the *editor's* text, not the parsed document: the parse
+        // is debounced, so an outline built moments ago can name an offset past
+        // the end of a document the user has since shortened.
+        let offset = offset.min(self.text(cx).len());
+        self.editor.update(cx, |state, cx| {
+            // `set_selected_range` routes through `move_to`, which is what
+            // scrolls the viewport; setting the cursor without it would move an
+            // invisible caret.
+            state.set_selected_range(offset..offset, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
     }
 
     /// Replace the whole document text, e.g. with a translation result.
@@ -313,7 +353,8 @@ impl DocumentView {
 
         // The native preview is driven by `TextViewState`, which does its own
         // background parsing, so it can update immediately.
-        self.preview.update(cx, |state, cx| state.set_text(&text, cx));
+        self.preview
+            .update(cx, |state, cx| state.set_text(&text, cx));
 
         self._reparse = Some(cx.spawn(async move |this, cx| {
             let parsed = cx
@@ -360,17 +401,68 @@ impl DocumentView {
         }
     }
 
-    fn rebuild_web(&mut self, _cx: &mut Context<Self>) {
+    fn rebuild_web(&mut self, cx: &mut Context<Self>) {
         if self.document.source().len() > LIVE_PREVIEW_LIMIT {
             self.web_html = Some(oversize_notice(self.document.source().len()));
             return;
         }
-        self.web_html = Some(web::build_html(&self.document, &self.registry, self.trust));
+        // Pin the preview to the app's effective theme rather than letting the
+        // browser follow the OS: otherwise an explicit Light preference shows a
+        // dark preview next to a light editor.
+        let appearance = if crate::settings::is_dark(cx) {
+            web::Appearance::Dark
+        } else {
+            web::Appearance::Light
+        };
+        self.web_html = Some(web::build_html_themed(
+            &self.document,
+            &self.registry,
+            self.trust,
+            appearance,
+        ));
+    }
+
+    /// Rebuild the Web payload after something outside this view changed how it
+    /// should look — today, the theme.
+    pub fn theme_changed(&mut self, cx: &mut Context<Self>) {
+        if self.web_html.is_some() {
+            self.rebuild_web(cx);
+        }
+        cx.notify();
     }
 
     /// The HTML currently destined for the WebView, if any.
     pub fn web_html(&self) -> Option<&str> {
         self.web_html.as_deref()
+    }
+
+    /// Lend this tab the window's WebView, or take it back.
+    ///
+    /// The workspace owns it — it is one OS child window per window, not per
+    /// document — but only the tab currently rendering a Web pane may put it in
+    /// its element tree, or two tabs would fight over its bounds.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub fn set_webview(
+        &mut self,
+        webview: Option<Entity<gpui_wry::WebView>>,
+        cx: &mut Context<Self>,
+    ) {
+        let same = match (&self.webview, &webview) {
+            (Some(current), Some(next)) => current == next,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.webview = webview;
+        cx.notify();
+    }
+
+    /// Whether this tab currently holds the window's WebView.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub fn has_webview(&self) -> bool {
+        self.webview.is_some()
     }
 
     fn render_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -390,17 +482,15 @@ impl DocumentView {
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(
-                h_flex().gap_1().children(ViewMode::ALL.map(|mode| {
-                    Button::new(SharedString::from(format!("mode-{}", mode.label())))
-                        .label(mode.label())
-                        .xsmall()
-                        .when(self.mode == mode, |b| b.primary())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_mode(mode, cx);
-                        }))
-                })),
-            )
+            .child(h_flex().gap_1().children(ViewMode::ALL.map(|mode| {
+                Button::new(SharedString::from(format!("mode-{}", mode.label())))
+                    .label(mode.label())
+                    .xsmall()
+                    .when(self.mode == mode, |b| b.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_mode(mode, cx);
+                    }))
+            })))
             // In Split, which renderer fills the preview pane is a separate
             // choice from the mode. Keeping them separate is what leaves room
             // for `Native | Web` and `Original | Translation` later.
@@ -586,15 +676,20 @@ impl DocumentView {
 
     /// The Web pane.
     ///
-    /// The actual `WebView` entity lives in the workspace (one per window,
-    /// reused across tabs, because each is an OS-level child window). This
-    /// renders the placeholder the workspace overlays it onto, plus the
-    /// fallback for platforms where `gpui-wry` has no implementation.
+    /// The `WebView` entity itself lives in the workspace (one per window,
+    /// reused across tabs, because each is an OS-level child window) and is
+    /// lent to the active tab via [`Self::set_webview`]. Childing it here is
+    /// load-bearing rather than decorative: `WebViewElement::prepaint` is the
+    /// only thing that ever calls `set_bounds` on the child window, so a
+    /// `WebView` outside the element tree stays 0x0 no matter what it loads.
     fn render_web_preview(&self, cx: &Context<Self>) -> impl IntoElement {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let _ = cx;
-            div().id("web-preview").size_full()
+            div()
+                .id("web-preview")
+                .size_full()
+                .children(self.webview.clone())
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
@@ -606,7 +701,11 @@ impl DocumentView {
                 .gap_2()
                 .p_8()
                 .child(Icon::new(IconName::Globe))
-                .child(div().text_sm().child("WebView is not available on this platform."))
+                .child(
+                    div()
+                        .text_sm()
+                        .child("WebView is not available on this platform."),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -651,11 +750,7 @@ pub fn diagram_extensions(
             let lang = code.lang.as_deref().unwrap_or("").trim();
             let id = match mt_doc::DiagramKind::from_lang(lang) {
                 Some(kind) => kind.id().to_string(),
-                None if matches!(
-                    lang.to_ascii_lowercase().as_str(),
-                    "math" | "latex" | "tex"
-                ) =>
-                {
+                None if matches!(lang.to_ascii_lowercase().as_str(), "math" | "latex" | "tex") => {
                     "math".to_string()
                 }
                 None => return None,
@@ -664,11 +759,14 @@ pub fn diagram_extensions(
             // shell-out never blocks the UI thread.
             let outcome = parse_registry.render(&id, &code.value);
             Some(
-                MarkdownNode::new("mt-block", RenderedBlock {
-                    id,
-                    outcome,
-                    source: code.value.clone(),
-                })
+                MarkdownNode::new(
+                    "mt-block",
+                    RenderedBlock {
+                        id,
+                        outcome,
+                        source: code.value.clone(),
+                    },
+                )
                 .markdown(format!("```{lang}\n{}\n```", code.value)),
             )
         })
@@ -820,5 +918,63 @@ impl Render for DocumentView {
             .child(self.render_toolbar(cx))
             .children(self.render_conflict_banner(cx))
             .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Import selectively: the `gpui::*` glob above re-exports a `test` attribute
+    // macro that shadows the built-in one and blows the recursion limit.
+
+    /// The Web pane must place the `WebView` in the element tree.
+    ///
+    /// A source-level check, like `workspace.rs`'s companion, and for the same
+    /// reason: the failure needs a real window with a real WebView2 runtime, so
+    /// it is not reachable from a unit test — but it is trivially reintroducible
+    /// by anyone who reads `render_web_preview`'s empty div as the whole story.
+    ///
+    /// What broke: the WebView was created, shown, and given a `data:` URL, but
+    /// never childed anywhere. `WebViewElement::prepaint` is the only code that
+    /// calls `set_bounds` on the OS child window, so it kept the 0x0
+    /// `Rect::default()` from `WebView::new` — loaded, visible, and invisible.
+    #[test]
+    fn the_web_pane_renders_the_webview_entity() {
+        let source = include_str!("document.rs");
+        let start = source
+            .find("fn render_web_preview")
+            .expect("the Web pane renderer");
+        let body = &source[start..];
+        let end = body.find("\n    fn render_preview").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("self.webview"),
+            "`render_web_preview` must child the WebView entity; without it the \
+             OS child window is never laid out and stays 0x0 no matter what it \
+             loads"
+        );
+        assert!(
+            source.contains("pub fn set_webview"),
+            "the workspace needs a way to lend the WebView to the active tab"
+        );
+    }
+
+    /// Revealing an offset must move the *editor* cursor, not just the mode.
+    #[test]
+    fn reveal_offset_moves_the_cursor_and_shows_the_editor() {
+        let source = include_str!("document.rs");
+        let start = source.find("pub fn reveal_offset").expect("reveal_offset");
+        let body = &source[start..];
+        let end = body.find("\n    /// Replace the whole").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("set_selected_range"),
+            "must move the cursor through the path that also scrolls it into view"
+        );
+        assert!(
+            body.contains("shows_editor"),
+            "a preview-only mode has no visible cursor to move"
+        );
     }
 }

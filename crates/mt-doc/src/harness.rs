@@ -221,6 +221,108 @@ pub fn project_roots() -> Vec<&'static str> {
 /// Roots that win attribution when a skill is reachable from several.
 const PREFERRED_ROOTS: &[&str] = &["skills", ".agents/skills", ".claude/skills"];
 
+/// Which harnesses use a given workspace-relative root.
+///
+/// Several share one directory (`.agents/skills` alone serves a dozen), so this
+/// returns every match rather than a single answer.
+pub fn harnesses_for_project(root: &str) -> Vec<&'static str> {
+    HARNESSES
+        .iter()
+        .filter(|h| h.project == root)
+        .map(|h| h.id)
+        .collect()
+}
+
+/// Which harnesses resolve to a given global directory on this machine.
+pub fn harnesses_for_global(root: &std::path::Path) -> Vec<&'static str> {
+    HARNESSES
+        .iter()
+        .filter(|h| h.global.resolve().is_some_and(|p| p == root))
+        .map(|h| h.id)
+        .collect()
+}
+
+/// A single display name for whichever harnesses own `root`.
+///
+/// Grouping by harness needs one label per group, and the shared directories
+/// are exactly the ones with several owners — `.agents/skills` is not "amp", it
+/// is the vendor-neutral convention. Naming the convention beats picking an
+/// arbitrary harness out of twelve.
+pub fn label_for_root(root: &std::path::Path, is_global: bool) -> String {
+    if is_global {
+        let owners = harnesses_for_global(root);
+        return match owners.len() {
+            1 => owners[0].to_string(),
+            0 => fallback_label(root),
+            _ => shared_root_label(root),
+        };
+    }
+
+    // A project root is stored as the workspace-relative string it was joined
+    // onto, so recover it by matching path components from the end.
+    //
+    // Only the *most specific* match counts. OpenClaw's project root is the
+    // bare `skills`, which is a component-suffix of every other root — take
+    // every match and `.factory/skills` comes back owned by droid plus three
+    // OpenClaw variants, and renders as "shared".
+    let matches: Vec<&Harness> = HARNESSES
+        .iter()
+        .filter(|h| ends_with_components(root, h.project))
+        .collect();
+    let longest = matches
+        .iter()
+        .map(|h| h.project.split('/').count())
+        .max()
+        .unwrap_or(0);
+    let owners: Vec<&Harness> = matches
+        .into_iter()
+        .filter(|h| h.project.split('/').count() == longest)
+        .collect();
+
+    match owners.len() {
+        1 => owners[0].id.to_string(),
+        0 => fallback_label(root),
+        // Shared: name the convention as the table spells it, not as the path
+        // happens to end — the bare `skills` root would otherwise pick up the
+        // workspace directory's own name as a prefix.
+        _ => owners[0].project.to_string(),
+    }
+}
+
+/// A label for a root no harness in the table claims.
+fn fallback_label(root: &std::path::Path) -> String {
+    root.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Whether `path` ends with every component of the `/`-separated `suffix`.
+///
+/// Component-wise rather than textual: `.factory/skills` must not be reported as
+/// ending with the bare `skills`, or every uniquely-owned root would look shared
+/// with the three harnesses whose project root is just `skills`.
+fn ends_with_components(path: &std::path::Path, suffix: &str) -> bool {
+    let wanted: Vec<&str> = suffix.split('/').collect();
+    let actual: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    actual.len() >= wanted.len() && actual[actual.len() - wanted.len()..] == wanted[..]
+}
+
+/// The name of a global directory shared by several harnesses.
+fn shared_root_label(root: &std::path::Path) -> String {
+    let text = root.to_string_lossy().replace('\\', "/");
+    // The last two components are the convention (`.agents/skills`); one alone
+    // would render every shared root as the indistinguishable "skills".
+    let parts: Vec<&str> = text.rsplit('/').take(2).collect();
+    match parts.len() {
+        2 => format!("{}/{}", parts[1], parts[0]),
+        _ => text,
+    }
+}
+
 /// Global skill directories that exist on this machine, in priority order.
 ///
 /// Resolved and deduplicated by path — many harnesses share one directory, and
@@ -360,5 +462,68 @@ mod tests {
         );
         // Two project-only harnesses contribute nothing.
         assert!(roots.len() < HARNESSES.len());
+    }
+
+    #[test]
+    fn a_uniquely_owned_root_is_labelled_with_its_harness() {
+        let root = PathBuf::from("/home/u/project/.factory/skills");
+        assert_eq!(label_for_root(&root, false), "droid");
+    }
+
+    #[test]
+    fn a_shared_root_is_labelled_with_the_convention_not_one_owner() {
+        // `.agents/skills` serves a dozen harnesses; calling the group "amp"
+        // because it sorts first would be arbitrary and misleading.
+        let root = PathBuf::from("/home/u/project/.agents/skills");
+        let owners = harnesses_for_project(".agents/skills");
+        assert!(owners.len() > 5, "expected a shared root, got {owners:?}");
+        assert_eq!(label_for_root(&root, false), ".agents/skills");
+    }
+
+    #[test]
+    fn an_unknown_root_falls_back_to_its_directory_name() {
+        let root = PathBuf::from("/somewhere/entirely/custom");
+        assert_eq!(label_for_root(&root, false), "custom");
+    }
+
+    #[test]
+    fn every_project_root_produces_a_non_empty_label() {
+        // Grouping by harness must never produce a blank header.
+        for root in project_roots() {
+            let path = PathBuf::from("/w").join(rel(root));
+            let label = label_for_root(&path, false);
+            assert!(!label.trim().is_empty(), "{root} produced no label");
+        }
+    }
+
+    #[test]
+    fn windows_separators_do_not_defeat_root_matching() {
+        // Project roots are stored joined onto the workspace, so on Windows the
+        // path uses backslashes while the table uses forward slashes.
+        let root = PathBuf::from(r"Q:\repos\demo\.factory\skills");
+        assert_eq!(label_for_root(&root, false), "droid");
+    }
+
+    #[test]
+    fn the_bare_skills_root_does_not_claim_every_other_root() {
+        // OpenClaw's project root is `skills`, a component-suffix of all 70
+        // others. Only the most specific match may own a root.
+        assert!(
+            harnesses_for_project("skills")
+                .iter()
+                .any(|id| id.starts_with("openclaw")),
+            "the bare `skills` root should exist in the table"
+        );
+        for root in [".factory/skills", ".claude/skills", ".goose/skills"] {
+            let path = PathBuf::from("/w").join(rel(root));
+            let label = label_for_root(&path, false);
+            assert!(
+                !label.starts_with("openclaw"),
+                "{root} was claimed by the bare `skills` root as {label}"
+            );
+        }
+        // And the bare root resolves to the convention itself, without picking
+        // up the workspace directory's own name.
+        assert_eq!(label_for_root(&PathBuf::from("/w/skills"), false), "skills");
     }
 }

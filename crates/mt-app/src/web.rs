@@ -39,20 +39,59 @@ impl Trust {
     }
 }
 
+/// Which color scheme the rendered document uses.
+///
+/// The WebView renders in its own browser context, so it does not see the GPUI
+/// theme at all — without this it follows the OS while the rest of the window
+/// follows the user's explicit preference, and Split mode shows two documents in
+/// two different themes side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Appearance {
+    /// Let the browser decide from the OS. Correct when the app is also
+    /// following the system.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    /// The CSS `color-scheme` value, which drives both the browser's default
+    /// colors and the `light-dark()` values in the stylesheet.
+    fn color_scheme(self) -> &'static str {
+        match self {
+            Appearance::System => "light dark",
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+        }
+    }
+}
+
 /// Build the HTML document shown in the WebView.
 ///
 /// Diagrams and math are pre-rendered by the same registry the native path
 /// uses, so both renderers are driven by one document model — the WebView is
 /// not a second, divergent pipeline.
 pub fn build_html(doc: &Document, registry: &RendererRegistry, trust: Trust) -> String {
+    build_html_themed(doc, registry, trust, Appearance::System)
+}
+
+/// Build the HTML document, pinning its color scheme.
+pub fn build_html_themed(
+    doc: &Document,
+    registry: &RendererRegistry,
+    trust: Trust,
+    appearance: Appearance,
+) -> String {
     let body = match doc.doc_type() {
         mt_doc::DocType::Mdx => render_mdx_body(doc, registry, trust),
         _ => render_markdown_body(doc, registry),
     };
 
     format!(
-        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>{style}</style>\n</head><body>{banner}{body}</body></html>",
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>:root {{ color-scheme: {scheme}; }}\n{style}</style>\n</head><body>{banner}{body}</body></html>",
         csp = csp_meta(trust),
+        scheme = appearance.color_scheme(),
         style = STYLE,
         banner = trust_banner(doc, trust),
     )
@@ -141,9 +180,7 @@ fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> S
         RenderOutcome::Svg(markup) => {
             format!("<figure class=\"mt-render mt-{id}\">{markup}</figure>")
         }
-        RenderOutcome::Failed(diag) => {
-            diagnostic_html(&diag.source, &diag.message, &block.content)
-        }
+        RenderOutcome::Failed(diag) => diagnostic_html(&diag.source, &diag.message, &block.content),
     }
 }
 
@@ -244,7 +281,6 @@ pub fn to_data_url(html: &str) -> String {
 }
 
 const STYLE: &str = r#"
-:root { color-scheme: light dark; }
 body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif; line-height: 1.6;
        margin: 0; padding: 24px 32px; max-width: 60rem; }
 pre  { background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; overflow-x: auto; }
@@ -290,7 +326,11 @@ mod tests {
 
     #[test]
     fn renders_ordinary_markdown() {
-        let html = build_html(&md("# Title\n\nSome *text*.\n"), &registry(), Trust::Restricted);
+        let html = build_html(
+            &md("# Title\n\nSome *text*.\n"),
+            &registry(),
+            Trust::Restricted,
+        );
         assert!(html.contains("<h1>Title</h1>"), "got {html}");
         assert!(html.contains("<em>text</em>"));
     }
@@ -314,7 +354,11 @@ mod tests {
 
     #[test]
     fn math_renders_to_svg() {
-        let html = build_html(&md("$$\n\\frac{a}{b}\n$$\n"), &registry(), Trust::Restricted);
+        let html = build_html(
+            &md("$$\n\\frac{a}{b}\n$$\n"),
+            &registry(),
+            Trust::Restricted,
+        );
         assert!(body(&html).contains("<svg"), "got {}", body(&html));
     }
 
@@ -339,9 +383,15 @@ mod tests {
         let src = "# Title\n\n<RevenueChart data={rows} />\n";
         let doc = Document::with_type(DocType::Mdx, src.to_string());
         let html = build_html(&doc, &registry(), Trust::Restricted);
-        assert!(body(&html).contains("mt-banner"), "untrusted MDX must be flagged");
+        assert!(
+            body(&html).contains("mt-banner"),
+            "untrusted MDX must be flagged"
+        );
         assert!(html.contains("&lt;RevenueChart /&gt;"), "got {html}");
-        assert!(html.contains("<h1>Title</h1>"), "markdown parts still render");
+        assert!(
+            html.contains("<h1>Title</h1>"),
+            "markdown parts still render"
+        );
     }
 
     #[test]
@@ -416,6 +466,43 @@ mod tests {
     }
 
     #[test]
+    fn the_color_scheme_follows_the_requested_appearance() {
+        let doc = md("# x\n");
+        // Default is System, so a browser with no app preference matches the OS.
+        assert!(
+            build_html(&doc, &registry(), Trust::Restricted).contains("color-scheme: light dark")
+        );
+
+        for (appearance, expected) in [
+            (Appearance::Light, "color-scheme: light"),
+            (Appearance::Dark, "color-scheme: dark"),
+        ] {
+            let html = build_html_themed(&doc, &registry(), Trust::Restricted, appearance);
+            assert!(html.contains(expected), "{appearance:?} produced {html}");
+            // A pinned scheme must not also leave the paired value in, or the
+            // browser falls back to following the OS.
+            assert!(
+                !html.contains("color-scheme: light dark"),
+                "{appearance:?} must pin the scheme"
+            );
+        }
+    }
+
+    #[test]
+    fn theming_does_not_weaken_the_csp() {
+        // The color scheme is injected next to the stylesheet; a mistake there
+        // would be the kind that quietly drops a directive.
+        let html = build_html_themed(
+            &md("# x\n"),
+            &registry(),
+            Trust::Restricted,
+            Appearance::Dark,
+        );
+        assert!(html.contains("default-src 'none'"));
+        assert!(html.contains("script-src 'none'"));
+    }
+
+    #[test]
     fn block_order_is_preserved_around_diagrams() {
         let src = "First.\n\n$$\nx\n$$\n\nLast.\n";
         let html = build_html(&md(src), &registry(), Trust::Restricted);
@@ -423,7 +510,10 @@ mod tests {
         let first = body.find("First.").expect("first paragraph");
         let math = body.find("mt-render").expect("rendered math");
         let last = body.find("Last.").expect("last paragraph");
-        assert!(first < math && math < last, "blocks out of order in:
-{body}");
+        assert!(
+            first < math && math < last,
+            "blocks out of order in:
+{body}"
+        );
     }
 }

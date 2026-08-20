@@ -18,6 +18,8 @@ use gpui_component::{
 };
 use mt_doc::{Origin, Severity, Skill, skill};
 
+use crate::settings::{AppSettings, GroupBy};
+
 /// Emitted when the user wants to open a skill's entry document.
 #[derive(Debug, Clone)]
 pub enum SkillsEvent {
@@ -56,14 +58,17 @@ impl SkillsView {
     /// would stutter the window on every save.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let root = self.root.clone();
+        let settings = AppSettings::global(cx);
+        let options = mt_doc::Discovery {
+            global: settings.skills_include_global,
+            include_internal: settings.skills_include_internal,
+        };
         self.scanning = true;
         // Replacing the task cancels any scan still in flight, so a burst of
         // filesystem events costs one scan rather than one per event.
         self._scan = Some(cx.spawn(async move |this, cx| {
             let skills = cx
-                .background_spawn(async move {
-                    skill::discover_with(&root, mt_doc::Discovery::everything())
-                })
+                .background_spawn(async move { skill::discover_with(&root, options) })
                 .await;
             crate::views::try_update(&this, cx, |this, cx| this.apply(skills, cx));
         }));
@@ -81,12 +86,25 @@ impl SkillsView {
         self.scanning = false;
         self.selected = previous
             .and_then(|dir| self.skills.iter().position(|s| s.dir == dir))
-            .or(if self.skills.is_empty() { None } else { Some(0) });
+            .or(if self.skills.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
         cx.notify();
     }
 
     pub fn skills(&self) -> &[Skill] {
         &self.skills
+    }
+
+    /// Redraw without rescanning.
+    ///
+    /// `selected` is an index into `self.skills`, which regrouping does not
+    /// reorder — only the rendered order changes — so the selection survives on
+    /// its own and this is just a notify with a name that says why.
+    fn keep_selection_stable(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
     }
 
     fn selected_skill(&self) -> Option<&Skill> {
@@ -118,26 +136,25 @@ impl SkillsView {
                 .into_any_element();
         }
 
+        let group_by = AppSettings::global(cx).skills_group_by;
+        let rows = group(&self.skills, group_by);
+
         v_flex()
             .p_1()
             .gap_0p5()
-            .children(self.skills.iter().enumerate().map(|(ix, skill)| {
+            .children(rows.into_iter().map(|Row { ix, heading }| {
+                let skill = &self.skills[ix];
                 let selected = self.selected == Some(ix);
                 let invalid = !skill.is_valid();
-                // A group header before the first skill of each origin, so
-                // "this project ships it" and "I have it everywhere" stay
-                // distinguishable at a glance.
-                let heading = (ix == 0 || self.skills[ix - 1].origin != skill.origin)
-                    .then_some(skill.origin);
                 v_flex()
                     .gap_0p5()
-                    .children(heading.map(|origin| {
+                    .children(heading.map(|heading| {
                         div()
                             .px_2()
                             .pt_2()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(origin.label().to_uppercase())
+                            .child(heading)
                     }))
                     .child(
                         ListItem::new(ix)
@@ -218,13 +235,13 @@ impl SkillsView {
                             })),
                     ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .child(skill.summary().to_string()),
-            )
+            .child(div().text_xs().child(skill.summary().to_string()))
             .children(field(cx, "Origin", skill.origin.label()))
-            .children(field(cx, "Location", &located(&self.root, skill.origin, &skill.dir)))
+            .children(field(
+                cx,
+                "Location",
+                &located(&self.root, skill.origin, &skill.dir),
+            ))
             .children(field(
                 cx,
                 "Discovered in",
@@ -264,35 +281,45 @@ impl SkillsView {
                     .as_deref()
                     .and_then(|v| field(cx, "Compatibility", v)),
             )
-            .children(skill.meta.metadata.iter().filter_map(|(k, v)| {
-                field(cx, k, v)
-            }))
-            .children(skill.meta.extra.iter().filter_map(|(k, v)| {
-                field(cx, &format!("{k} (non-standard)"), v)
-            }))
+            .children(
+                skill
+                    .meta
+                    .metadata
+                    .iter()
+                    .filter_map(|(k, v)| field(cx, k, v)),
+            )
+            .children(
+                skill
+                    .meta
+                    .extra
+                    .iter()
+                    .filter_map(|(k, v)| field(cx, &format!("{k} (non-standard)"), v)),
+            )
             // Supporting directories: `scripts/`, `references/`, `assets/`.
             .children((!skill.support_dirs.is_empty()).then(|| {
-                v_flex().gap_0p5().mt_1().child(label(cx, "Files")).children(
-                    std::iter::once(
-                        div()
-                            .text_xs()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child("SKILL.md")
-                            .into_any_element(),
+                v_flex()
+                    .gap_0p5()
+                    .mt_1()
+                    .child(label(cx, "Files"))
+                    .children(
+                        std::iter::once(
+                            div()
+                                .text_xs()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .child("SKILL.md")
+                                .into_any_element(),
+                        )
+                        .chain(skill.support_dirs.iter().map(|dir| {
+                            div()
+                                .text_xs()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .child(format!(
+                                    "{}/",
+                                    dir.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+                                ))
+                                .into_any_element()
+                        })),
                     )
-                    .chain(skill.support_dirs.iter().map(|dir| {
-                        div()
-                            .text_xs()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(format!(
-                                "{}/",
-                                dir.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or_default()
-                            ))
-                            .into_any_element()
-                    })),
-                )
             }))
             // Validation results last: they are the reason to open this panel
             // when something is wrong, but noise when everything is fine.
@@ -307,14 +334,85 @@ impl SkillsView {
                             Severity::Warning => cx.theme().warning,
                             Severity::Info => cx.theme().muted_foreground,
                         };
-                        div()
+                        h_flex()
+                            .gap_2()
+                            .items_start()
                             .text_xs()
-                            .text_color(color)
-                            .child(d.message.clone())
+                            // The line is what turns "this field is wrong" into
+                            // something the reader can act on without scanning
+                            // the file for the field the message names.
+                            .when_some(d.line, |this, line| {
+                                this.child(
+                                    div()
+                                        .w(px(48.))
+                                        .flex_shrink_0()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .child(format!("line {line}")),
+                                )
+                            })
+                            .child(div().flex_1().text_color(color).child(d.message.clone()))
                     }))
             }))
             .into_any_element()
     }
+}
+
+/// One list row: a skill, and the group heading that precedes it (if it is the
+/// first of its group).
+struct Row {
+    ix: usize,
+    heading: Option<String>,
+}
+
+/// Order `skills` for display and decide where headings fall.
+///
+/// A pure function over indices rather than a method: grouping is the part with
+/// rules worth testing, and testing it should not need a window.
+fn group(skills: &[Skill], group_by: GroupBy) -> Vec<Row> {
+    let key = |skill: &Skill| -> Option<String> {
+        match group_by {
+            GroupBy::None => None,
+            GroupBy::Origin => Some(skill.origin.label().to_uppercase()),
+            GroupBy::Harness => Some(
+                mt_doc::harness::label_for_root(&skill.root, skill.origin == Origin::Global)
+                    .to_uppercase(),
+            ),
+            GroupBy::Status => Some(
+                if skill.is_valid() {
+                    "VALID"
+                } else {
+                    "NEEDS ATTENTION"
+                }
+                .to_string(),
+            ),
+        }
+    };
+
+    let mut order: Vec<usize> = (0..skills.len()).collect();
+    // Stable, so the discovery order (origin, then name) still decides within a
+    // group. `Status` puts the problems first: a conformance sweep is the
+    // reason to group by it at all.
+    order.sort_by_key(|&ix| match group_by {
+        GroupBy::Status => (
+            skills[ix].is_valid() as u8,
+            key(&skills[ix]).unwrap_or_default(),
+        ),
+        _ => (0, key(&skills[ix]).unwrap_or_default()),
+    });
+
+    let mut rows = Vec::with_capacity(order.len());
+    let mut previous: Option<String> = None;
+    for ix in order {
+        let heading = key(&skills[ix]);
+        let show = heading.is_some() && heading != previous;
+        rows.push(Row {
+            ix,
+            heading: show.then(|| heading.clone().unwrap_or_default()),
+        });
+        previous = heading;
+    }
+    rows
 }
 
 fn field(cx: &App, name: &str, value: &str) -> Option<AnyElement> {
@@ -383,6 +481,7 @@ impl Render for SkillsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.skills.len();
         let invalid = self.skills.iter().filter(|s| !s.is_valid()).count();
+        let group_by = AppSettings::global(cx).skills_group_by;
 
         v_flex()
             .id("skills")
@@ -419,6 +518,38 @@ impl Render for SkillsView {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
             )
+            // Grouping is a view choice, so it belongs next to the list rather
+            // than buried in settings — but it persists there, because a user
+            // who groups by harness means it next time too.
+            .child(
+                h_flex()
+                    .px_3()
+                    .pb_2()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Group by"),
+                    )
+                    .children(GroupBy::ALL.map(|option| {
+                        Button::new(SharedString::from(format!("group-{}", option.key())))
+                            .label(option.label())
+                            .xsmall()
+                            .when(option == group_by, |b| b.primary())
+                            .when(option != group_by, |b| b.ghost())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                AppSettings::update(cx, |settings| {
+                                    settings.skills_group_by = option
+                                });
+                                // Grouping only reorders what is already
+                                // loaded; rescanning the filesystem for a view
+                                // change would be gratuitous.
+                                this.keep_selection_stable(cx);
+                            }))
+                    })),
+            )
             .child(
                 div()
                     .id("skill-list")
@@ -428,5 +559,114 @@ impl Render for SkillsView {
                     .child(self.render_list(cx)),
             )
             .child(self.render_inspector(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Import selectively: the `gpui::*` glob above re-exports a `test`
+    // attribute macro that shadows the built-in one and blows the recursion
+    // limit.
+    use super::{Row, group};
+    use crate::settings::GroupBy;
+    use mt_doc::skill::{Skill, SkillMeta};
+    use mt_doc::{Diagnostic, Origin};
+    use std::path::PathBuf;
+
+    fn skill(name: &str, origin: Origin, root: &str, valid: bool) -> Skill {
+        Skill {
+            dir: PathBuf::from(root).join(name),
+            entry: PathBuf::from(root).join(name).join("SKILL.md"),
+            root: PathBuf::from(root),
+            origin,
+            aliases: Vec::new(),
+            name: name.to_string(),
+            meta: SkillMeta::default(),
+            diagnostics: if valid {
+                Vec::new()
+            } else {
+                vec![Diagnostic::error("skill", "broken")]
+            },
+            support_dirs: Vec::new(),
+        }
+    }
+
+    fn headings(rows: &[Row]) -> Vec<&str> {
+        rows.iter().filter_map(|r| r.heading.as_deref()).collect()
+    }
+
+    #[test]
+    fn no_grouping_lists_everything_once_with_no_headings() {
+        let skills = vec![
+            skill("a", Origin::Workspace, "/w/.claude/skills", true),
+            skill("b", Origin::Global, "/h/.agents/skills", true),
+        ];
+        let rows = group(&skills, GroupBy::None);
+        assert_eq!(rows.len(), 2);
+        assert!(headings(&rows).is_empty());
+    }
+
+    #[test]
+    fn origin_grouping_emits_one_heading_per_origin() {
+        let skills = vec![
+            skill("a", Origin::Workspace, "/w/.claude/skills", true),
+            skill("b", Origin::Workspace, "/w/.claude/skills", true),
+            skill("c", Origin::Global, "/h/.agents/skills", true),
+        ];
+        let rows = group(&skills, GroupBy::Origin);
+        assert_eq!(headings(&rows), vec!["GLOBAL", "WORKSPACE"]);
+        assert_eq!(rows.len(), 3, "every skill still appears");
+    }
+
+    #[test]
+    fn harness_grouping_uses_the_root_the_skill_was_found_under() {
+        let skills = vec![
+            skill("a", Origin::Workspace, "/w/.factory/skills", true),
+            skill("b", Origin::Workspace, "/w/.goose/skills", true),
+        ];
+        let rows = group(&skills, GroupBy::Harness);
+        assert_eq!(headings(&rows), vec!["DROID", "GOOSE"]);
+    }
+
+    #[test]
+    fn status_grouping_puts_the_problems_first() {
+        // The reason to group by status is to find what needs fixing; burying
+        // it below a hundred valid skills would defeat that.
+        let skills = vec![
+            skill("ok", Origin::Workspace, "/w/skills", true),
+            skill("broken", Origin::Workspace, "/w/skills", false),
+        ];
+        let rows = group(&skills, GroupBy::Status);
+        assert_eq!(headings(&rows), vec!["NEEDS ATTENTION", "VALID"]);
+        assert_eq!(rows[0].ix, 1, "the invalid skill leads");
+    }
+
+    #[test]
+    fn every_grouping_shows_every_skill_exactly_once() {
+        // A grouping that drops or duplicates a row is the bug worth guarding:
+        // it looks like a discovery failure.
+        let skills = vec![
+            skill("a", Origin::Workspace, "/w/skills", true),
+            skill("b", Origin::Global, "/h/.agents/skills", false),
+            skill("c", Origin::Global, "/h/.claude/skills", true),
+        ];
+        for option in GroupBy::ALL {
+            let rows = group(&skills, option);
+            let mut seen: Vec<usize> = rows.iter().map(|r| r.ix).collect();
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                vec![0, 1, 2],
+                "{} lost or duplicated a skill",
+                option.label()
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_list_groups_to_nothing() {
+        for option in GroupBy::ALL {
+            assert!(group(&[], option).is_empty(), "{}", option.label());
+        }
     }
 }

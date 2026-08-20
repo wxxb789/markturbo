@@ -36,14 +36,10 @@ ENVIRONMENT:
 fn resolve_target(args: &[String]) -> Result<Option<PathBuf>, (String, i32)> {
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => Err((USAGE.to_string(), 0)),
-        Some("-V" | "--version") => Err((
-            format!("markturbo {}", env!("CARGO_PKG_VERSION")),
-            0,
-        )),
-        Some(flag) if flag.starts_with('-') => Err((
-            format!("unknown option `{flag}`\n\n{USAGE}"),
-            2,
-        )),
+        Some("-V" | "--version") => Err((format!("markturbo {}", env!("CARGO_PKG_VERSION")), 0)),
+        Some(flag) if flag.starts_with('-') => {
+            Err((format!("unknown option `{flag}`\n\n{USAGE}"), 2))
+        }
         Some(path) => {
             let path = PathBuf::from(path);
             if !path.exists() {
@@ -60,6 +56,23 @@ fn resolve_target(args: &[String]) -> Result<Option<PathBuf>, (String, i32)> {
 }
 
 fn main() {
+    // GPUI composites its swap chain through DirectComposition, which sits on
+    // top of the WebView2 child HWND — the Web preview loads and paints, and
+    // then is covered by the window's own surface. Disabling composition puts
+    // the swap chain on the HWND directly and lets the child window through.
+    // This is what gpui-component's own webview example does, with the comment
+    // "Required this for Windows to render the WebView".
+    //
+    // The cost is transparent window backgrounds, which need a composition swap
+    // chain — this app only asks for those on Linux, so on Windows there is
+    // nothing to trade away.
+    //
+    // SAFETY: single-threaded, before any window or background executor exists.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true")
+    };
+
     // Renderers run on background tasks and are wrapped in `catch_unwind`; a
     // panic there becomes an inline diagnostic. Logging it is still useful.
     env_logger::builder()
@@ -85,6 +98,9 @@ fn main() {
     app.run(move |cx| {
         // Must come before any component is constructed.
         gpui_component::init(cx);
+        // Before the first window: `Workspace::new` reads the saved theme to
+        // apply it ahead of the first frame.
+        mt_app::settings::AppSettings::init(cx);
         mt_app::views::workspace::init(cx);
 
         let mut window_size = size(px(1400.0), px(900.0));
@@ -180,8 +196,7 @@ mod tests {
 
     #[test]
     fn a_missing_path_is_reported_rather_than_opening_an_empty_window() {
-        let (message, code) =
-            resolve_target(&args(&["Q:/definitely/not/here/xyz"])).unwrap_err();
+        let (message, code) = resolve_target(&args(&["Q:/definitely/not/here/xyz"])).unwrap_err();
         assert_eq!(code, 1);
         assert!(message.contains("no such file or directory"));
     }
@@ -195,10 +210,7 @@ mod tests {
             .expect("some path");
         // Canonicalization may add a UNC prefix on Windows; compare resolved
         // forms rather than strings.
-        assert_eq!(
-            target.canonicalize().unwrap(),
-            path.canonicalize().unwrap()
-        );
+        assert_eq!(target.canonicalize().unwrap(), path.canonicalize().unwrap());
     }
 
     #[test]

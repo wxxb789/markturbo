@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use mt_doc::translate::TranslationService;
 
+use crate::settings::AppSettings;
+
 /// Providers this build can construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -21,6 +23,8 @@ pub enum Provider {
 }
 
 impl Provider {
+    pub const ALL: [Provider; 2] = [Provider::Anthropic, Provider::Echo];
+
     pub fn label(self) -> &'static str {
         match self {
             Provider::Echo => "Echo (offline)",
@@ -28,32 +32,77 @@ impl Provider {
         }
     }
 
-    /// Build a service, or explain why it is unavailable.
-    pub fn build(self) -> Result<Arc<dyn TranslationService>, String> {
+    /// Stable id, used in settings and never shown to the user.
+    pub fn key(self) -> &'static str {
         match self {
-            Provider::Echo => Ok(Arc::new(EchoTranslator)),
-            Provider::Anthropic => AnthropicTranslator::from_env().map(|t| Arc::new(t) as _),
+            Provider::Echo => "echo",
+            Provider::Anthropic => "anthropic",
         }
     }
 
-    /// Providers usable right now, cheapest first.
+    pub fn from_key(key: &str) -> Option<Provider> {
+        Self::ALL.into_iter().find(|p| p.key() == key)
+    }
+
+    /// Whether this provider actually translates.
+    ///
+    /// Echo does not — it tags segments so the structure-preserving split is
+    /// visible. Calling that a translation would be a lie the status bar has to
+    /// tell for it.
+    pub fn is_real(self) -> bool {
+        self != Provider::Echo
+    }
+
+    /// Build a service, or explain why it is unavailable.
+    pub fn build(self) -> Result<Arc<dyn TranslationService>, String> {
+        self.build_with(None)
+    }
+
+    /// Build a service, overriding the model where the provider takes one.
+    pub fn build_with(self, model: Option<&str>) -> Result<Arc<dyn TranslationService>, String> {
+        match self {
+            Provider::Echo => Ok(Arc::new(EchoTranslator)),
+            Provider::Anthropic => AnthropicTranslator::from_env(model).map(|t| Arc::new(t) as _),
+        }
+    }
+
+    /// Providers usable right now, best first.
     pub fn available() -> Vec<Provider> {
-        [Provider::Anthropic, Provider::Echo]
+        Self::ALL
             .into_iter()
             .filter(|p| p.build().is_ok())
             .collect()
+    }
+
+    /// The provider to use, honoring the user's choice when it is usable.
+    ///
+    /// A configured provider that cannot be built (a key was removed) falls
+    /// through rather than failing the command outright — but the caller is told
+    /// which one it got, so a silent downgrade to Echo can be reported.
+    pub fn resolve(settings: &AppSettings) -> Option<Provider> {
+        let chosen = Provider::from_key(&settings.translate_provider);
+        if let Some(chosen) = chosen
+            && chosen.build().is_ok()
+        {
+            return Some(chosen);
+        }
+        Self::available().into_iter().next()
     }
 }
 
 /// Offline provider that tags prose so the caller can see exactly which
 /// segments were considered translatable.
+///
+/// It does not translate, and the tag says so: a user who sees `[zh]` in front
+/// of untouched English needs to know that is the placeholder working correctly
+/// rather than a translation that failed silently.
 struct EchoTranslator;
 
 impl TranslationService for EchoTranslator {
     fn translate(&self, texts: &[String], target_lang: &str) -> anyhow::Result<Vec<String>> {
         Ok(texts
             .iter()
-            .map(|t| format!("[{target_lang}] {}", t.trim()))
+            .map(|t| format!("[{target_lang}?] {}", t.trim()))
             .collect())
     }
 }
@@ -69,14 +118,24 @@ struct AnthropicTranslator {
 }
 
 impl AnthropicTranslator {
-    fn from_env() -> Result<Self, String> {
+    /// Build from the environment, with `model` overriding the default.
+    ///
+    /// The key stays environment-only on purpose: writing an API key into a
+    /// settings file the app rewrites on every toggle is how keys end up in
+    /// backups and screenshots.
+    fn from_env(model: Option<&str>) -> Result<Self, String> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| "ANTHROPIC_API_KEY is not set".to_string())?;
-        Ok(Self {
-            api_key,
-            model: std::env::var("MARKTURBO_TRANSLATE_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-5".to_string()),
-        })
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| "ANTHROPIC_API_KEY is not set".to_string())?;
+        let model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or_else(|| std::env::var("MARKTURBO_TRANSLATE_MODEL").ok())
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| "claude-sonnet-5".to_string());
+        Ok(Self { api_key, model })
     }
 }
 
@@ -201,7 +260,8 @@ fn post_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mt_doc::{Document, DocType, translate::Scope};
+    use crate::settings::AppSettings;
+    use mt_doc::{DocType, Document, translate::Scope};
 
     #[test]
     fn echo_provider_is_always_available() {
@@ -217,16 +277,28 @@ mod tests {
         let out =
             mt_doc::translate::translate(&doc, &Scope::Document, "zh", service.as_ref()).unwrap();
 
-        assert!(out.text.contains("[zh] Title"), "prose translated: {}", out.text);
+        assert!(out.text.contains("Title"), "prose tagged: {}", out.text);
         assert!(out.text.contains("let x = 1;"), "code untouched");
         assert!(out.text.contains("`code`"), "inline code untouched");
+    }
+
+    #[test]
+    fn echo_marks_its_output_as_not_a_translation() {
+        // A user reading `[zh] Some English` could reasonably conclude the
+        // translation silently failed. The `?` is what distinguishes the
+        // placeholder from a result.
+        let service = Provider::Echo.build().unwrap();
+        let out = service.translate(&["Hello".to_string()], "zh").unwrap();
+        assert_eq!(out, vec!["[zh?] Hello"]);
+        assert!(!Provider::Echo.is_real());
+        assert!(Provider::Anthropic.is_real());
     }
 
     #[test]
     fn anthropic_reports_a_missing_key_rather_than_panicking() {
         // Only meaningful when the key is absent; skip otherwise so the suite
         // passes on a developer machine that has one configured.
-        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.trim().is_empty()) {
             return;
         }
         // `Arc<dyn TranslationService>` is not Debug, so match rather than
@@ -238,20 +310,49 @@ mod tests {
     }
 
     #[test]
-    fn extracts_a_json_array_from_various_reply_shapes() {
-        assert_eq!(extract_json_array(r#"["a","b"]"#), r#"["a","b"]"#);
+    fn provider_keys_round_trip_and_are_distinct() {
+        for provider in Provider::ALL {
+            assert_eq!(Provider::from_key(provider.key()), Some(provider));
+        }
+        assert_eq!(Provider::from_key("nonexistent"), None);
+        assert_ne!(Provider::Echo.label(), Provider::Anthropic.label());
+    }
+
+    #[test]
+    fn resolve_prefers_the_configured_provider_and_never_returns_nothing() {
+        // Echo is always buildable, so an explicit choice of it is honored.
+        let settings = AppSettings {
+            translate_provider: "echo".into(),
+            ..AppSettings::default()
+        };
+        assert_eq!(Provider::resolve(&settings), Some(Provider::Echo));
+
+        // An unknown id falls through to whatever is available rather than
+        // failing the command.
+        let settings = AppSettings {
+            translate_provider: "not-a-provider".into(),
+            ..AppSettings::default()
+        };
+        assert!(Provider::resolve(&settings).is_some());
+
+        // Unset means "best available".
+        let settings = AppSettings {
+            translate_provider: String::new(),
+            ..AppSettings::default()
+        };
         assert_eq!(
-            extract_json_array("```json\n[\"a\"]\n```"),
-            "[\"a\"]"
-        );
-        assert_eq!(
-            extract_json_array("Here you go:\n[\"a\", \"b\"]\nHope that helps."),
-            "[\"a\", \"b\"]"
+            Provider::resolve(&settings),
+            Provider::available().first().copied()
         );
     }
 
     #[test]
-    fn provider_labels_are_distinct() {
-        assert_ne!(Provider::Echo.label(), Provider::Anthropic.label());
+    fn extracts_a_json_array_from_various_reply_shapes() {
+        assert_eq!(extract_json_array(r#"["a","b"]"#), r#"["a","b"]"#);
+        assert_eq!(extract_json_array("```json\n[\"a\"]\n```"), "[\"a\"]");
+        assert_eq!(
+            extract_json_array("Here you go:\n[\"a\", \"b\"]\nHope that helps."),
+            "[\"a\", \"b\"]"
+        );
     }
 }

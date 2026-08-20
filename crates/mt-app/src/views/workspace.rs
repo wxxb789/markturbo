@@ -15,23 +15,32 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
+    list::ListItem,
     resizable::{h_resizable, resizable_panel},
     tab::{Tab, TabBar},
     v_flex,
 };
 use mt_doc::translate::Scope;
 
+use crate::fs;
 use crate::renderer::RendererRegistry;
 use crate::translate::Provider;
 use crate::views::document::{DocumentEvent, DocumentView};
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::skills::{SkillsEvent, SkillsView};
 use crate::watcher::Watcher;
-use crate::fs;
 
 actions!(
     markturbo,
-    [OpenFolder, Save, CloseTab, TranslateDocument, TranslateSelection, TranslateBlock]
+    [
+        OpenFolder,
+        Save,
+        CloseTab,
+        OpenSettings,
+        TranslateDocument,
+        TranslateSelection,
+        TranslateBlock
+    ]
 );
 
 /// Which left-panel section is showing.
@@ -95,17 +104,19 @@ pub struct Workspace {
     /// What the WebView is currently showing, so we do not reload identical
     /// content on every frame.
     web_current: Option<String>,
+    /// True while the settings page is showing.
+    settings_open: bool,
     _tasks: Vec<Task<()>>,
+    /// Subscriptions that live as long as the workspace does.
     _subscriptions: Vec<Subscription>,
+    /// Subscriptions to the current folder's explorer and skills views,
+    /// replaced wholesale when the folder changes.
+    _panel_subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
     /// Create the workspace, opening `initial` if given.
-    pub fn new(
-        initial: Option<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(initial: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Poll the watcher on a timer rather than blocking a thread on it: the
         // receiver is non-blocking and a UI tick is the natural cadence.
         let poll = cx.spawn(async move |this, cx| {
@@ -131,6 +142,7 @@ impl Workspace {
             registry: Arc::new(RendererRegistry::with_defaults()),
             watcher: None,
             status: None,
+            settings_open: false,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -138,7 +150,43 @@ impl Workspace {
             web_current: None,
             _tasks: vec![poll],
             _subscriptions: Vec::new(),
+            _panel_subscriptions: Vec::new(),
         };
+
+        // The saved preference, applied before the first frame so the window
+        // never flashes the wrong theme.
+        crate::settings::apply_theme(
+            crate::settings::AppSettings::global(cx).theme,
+            Some(window),
+            cx,
+        );
+        // Following the system means following it *while running*, not only at
+        // startup — someone whose OS flips at sunset expects the app to flip
+        // with it. An explicit preference ignores the event.
+        let handle = cx.entity().downgrade();
+        this._subscriptions
+            .push(window.observe_window_appearance(move |window, cx| {
+                if crate::settings::AppSettings::global(cx).theme
+                    != crate::settings::ThemePreference::System
+                {
+                    return;
+                }
+                crate::settings::apply_theme(
+                    crate::settings::ThemePreference::System,
+                    Some(window),
+                    cx,
+                );
+                // The Web preview caches HTML with the scheme baked in, so
+                // recoloring GPUI alone would leave it on the old theme.
+                if let Some(this) = handle.upgrade() {
+                    this.update(cx, |this, cx| {
+                        for doc in this.documents.clone() {
+                            doc.update(cx, |doc, cx| doc.theme_changed(cx));
+                        }
+                        this.web_dirty(cx);
+                    });
+                }
+            }));
 
         // A path argument may name a file: open its parent as the workspace and
         // the file as the first tab, which is what "open this file with
@@ -169,7 +217,11 @@ impl Workspace {
         let explorer = cx.new(|cx| Explorer::new(path.clone(), window, cx));
         let skills = cx.new(|cx| SkillsView::new(path.clone(), cx));
 
-        self._subscriptions = vec![
+        // Kept apart from `_subscriptions`: this set is replaced wholesale on
+        // every folder change, and folding it into the general one would take
+        // the window's appearance observer and every open document's observer
+        // down with it.
+        self._panel_subscriptions = vec![
             cx.subscribe_in(
                 &explorer,
                 window,
@@ -204,6 +256,10 @@ impl Workspace {
 
     /// Open a file in a tab, focusing an existing tab if it is already open.
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // Opening a document while settings are showing has to show the
+        // document, or the click in the explorer looks like it did nothing.
+        self.settings_open = false;
+
         if let Some(ix) = self
             .documents
             .iter()
@@ -271,6 +327,27 @@ impl Workspace {
         let _ = cx;
     }
 
+    /// Rediscover skills, e.g. after a setting changed what is in scope.
+    fn rescan_skills(&mut self, cx: &mut Context<Self>) {
+        if let Some(skills) = &self.skills {
+            skills.update(cx, |skills, cx| skills.refresh(cx));
+        }
+    }
+
+    /// Apply a theme preference and rebuild anything that bakes it in.
+    ///
+    /// The Web preview renders in its own browser context and caches its HTML,
+    /// so it does not pick up a GPUI theme change on its own.
+    fn set_theme(&mut self, preference: crate::settings::ThemePreference, cx: &mut Context<Self>) {
+        crate::settings::AppSettings::update(cx, |settings| settings.theme = preference);
+        crate::settings::apply_theme(preference, None, cx);
+        for doc in self.documents.clone() {
+            doc.update(cx, |doc, cx| doc.theme_changed(cx));
+        }
+        self.web_dirty(cx);
+        cx.notify();
+    }
+
     fn active_document(&self) -> Option<&Entity<DocumentView>> {
         self.documents.get(self.active)
     }
@@ -316,7 +393,9 @@ impl Workspace {
         if tree_changed && let Some(explorer) = &self.explorer {
             explorer.update(cx, |explorer, cx| explorer.refresh(cx));
         }
-        if (tree_changed || skills_changed) && let Some(skills) = &self.skills {
+        if (tree_changed || skills_changed)
+            && let Some(skills) = &self.skills
+        {
             skills.update(cx, |skills, cx| skills.refresh(cx));
         }
         cx.notify();
@@ -357,6 +436,197 @@ impl Workspace {
 
     fn on_close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
         self.close_tab(self.active, cx);
+    }
+
+    fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        // The WebView's visibility depends on this flag, and it is an OS child
+        // window that will not notice a re-render on its own.
+        self.web_dirty(cx);
+        cx.notify();
+    }
+
+    /// The settings page, shown in place of the workspace body.
+    ///
+    /// A takeover rather than a dialog: settings here are mostly toggles the
+    /// user wants to see take effect on the document behind them, and a modal
+    /// covering that document would hide the feedback.
+    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::settings::{AppSettings, GroupBy, ThemePreference};
+        use gpui_component::setting::{
+            SettingField, SettingGroup, SettingItem, SettingPage, Settings,
+        };
+
+        let workspace = cx.entity();
+
+        let theme_options: Vec<(SharedString, SharedString)> = ThemePreference::ALL
+            .iter()
+            .map(|p| (p.key().into(), p.label().into()))
+            .collect();
+        let group_options: Vec<(SharedString, SharedString)> = GroupBy::ALL
+            .iter()
+            .map(|g| (g.key().into(), g.label().into()))
+            .collect();
+        // Only providers this build can actually construct: offering Anthropic
+        // on a machine with no key would be a setting that silently does
+        // nothing.
+        let mut provider_options: Vec<(SharedString, SharedString)> =
+            vec![("".into(), "Best available".into())];
+        provider_options.extend(
+            Provider::available()
+                .into_iter()
+                .map(|p| (p.key().into(), p.label().into())),
+        );
+
+        Settings::new("settings")
+            .page(
+                SettingPage::new("Appearance")
+                    .icon(Icon::new(IconName::Palette))
+                    .default_open(true)
+                    .group(
+                        SettingGroup::new().title("Theme").item(
+                            SettingItem::new(
+                                "Theme",
+                                SettingField::dropdown(
+                                    theme_options,
+                                    |cx: &App| AppSettings::global(cx).theme.key().into(),
+                                    {
+                                        let workspace = workspace.clone();
+                                        move |value: SharedString, cx: &mut App| {
+                                            let preference = ThemePreference::from_key(&value);
+                                            // Through the workspace so the Web
+                                            // preview, which bakes the scheme into
+                                            // cached HTML, rebuilds too.
+                                            workspace.update(cx, |this, cx| {
+                                                this.set_theme(preference, cx)
+                                            });
+                                        }
+                                    },
+                                )
+                                .default_value(ThemePreference::System.key().to_string()),
+                            )
+                            .description(
+                                "System follows the operating system, and keeps following it \
+                             while the app is running.",
+                            ),
+                        ),
+                    ),
+            )
+            .page(
+                SettingPage::new("Translation")
+                    .icon(Icon::new(IconName::Globe))
+                    .groups(vec![SettingGroup::new().title("Provider").items(vec![
+                            SettingItem::new(
+                                "Provider",
+                                SettingField::dropdown(
+                                    provider_options,
+                                    |cx: &App| {
+                                        AppSettings::global(cx).translate_provider.clone().into()
+                                    },
+                                    |value: SharedString, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.translate_provider = value.to_string()
+                                        });
+                                    },
+                                ),
+                            )
+                            .description(
+                                "Only providers this machine can reach are listed. \
+                                 Anthropic needs ANTHROPIC_API_KEY in the environment — \
+                                 an API key is never written to this settings file.",
+                            ),
+                            SettingItem::new(
+                                "Model",
+                                SettingField::input(
+                                    |cx: &App| {
+                                        AppSettings::global(cx).translate_model.clone().into()
+                                    },
+                                    |value: SharedString, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.translate_model = value.to_string()
+                                        });
+                                    },
+                                ),
+                            )
+                            .description("Leave empty for the provider's default."),
+                            SettingItem::new(
+                                "Target language",
+                                SettingField::input(
+                                    |cx: &App| AppSettings::global(cx).translate_to.clone().into(),
+                                    |value: SharedString, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.translate_to = value.to_string()
+                                        });
+                                    },
+                                )
+                                .default_value("zh"),
+                            )
+                            .description("A language name or code, e.g. `zh`, `ja`, `German`."),
+                        ])]),
+            )
+            .page(
+                SettingPage::new("Skills")
+                    .icon(Icon::new(IconName::Bot))
+                    .group(SettingGroup::new().title("Discovery").items(vec![
+                            SettingItem::new(
+                                "Include global skills",
+                                SettingField::switch(
+                                    |cx: &App| AppSettings::global(cx).skills_include_global,
+                                    {
+                                        let workspace = workspace.clone();
+                                        move |value: bool, cx: &mut App| {
+                                            AppSettings::update(cx, |settings| {
+                                                settings.skills_include_global = value
+                                            });
+                                            // Discovery scope changed, so the
+                                            // list is now wrong until rescanned.
+                                            workspace.update(cx, |this, cx| this.rescan_skills(cx));
+                                        }
+                                    },
+                                )
+                                .default_value(true),
+                            )
+                            .description(
+                                "Search every harness's global directory (~/.claude/skills, \
+                                 ~/.agents/skills, …) as well as this workspace.",
+                            ),
+                            SettingItem::new(
+                                "Show internal skills",
+                                SettingField::switch(
+                                    |cx: &App| AppSettings::global(cx).skills_include_internal,
+                                    {
+                                        let workspace = workspace.clone();
+                                        move |value: bool, cx: &mut App| {
+                                            AppSettings::update(cx, |settings| {
+                                                settings.skills_include_internal = value
+                                            });
+                                            workspace.update(cx, |this, cx| this.rescan_skills(cx));
+                                        }
+                                    },
+                                )
+                                .default_value(false),
+                            )
+                            .description(
+                                "Skills marked `metadata.internal: true`, which the reference \
+                                 tooling hides by default.",
+                            ),
+                            SettingItem::new(
+                                "Group by",
+                                SettingField::dropdown(
+                                    group_options,
+                                    |cx: &App| AppSettings::global(cx).skills_group_by.key().into(),
+                                    |value: SharedString, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.skills_group_by = GroupBy::from_key(&value)
+                                        });
+                                    },
+                                )
+                                .default_value(GroupBy::Origin.key().to_string()),
+                            )
+                            .description("How the Skills list is organized."),
+                        ])),
+            )
+            .into_any_element()
     }
 
     fn on_translate_document(
@@ -407,11 +677,12 @@ impl Workspace {
         let Some(doc) = self.active_document().cloned() else {
             return;
         };
-        let Some(provider) = Provider::available().into_iter().next() else {
+        let settings = crate::settings::AppSettings::global(cx).clone();
+        let Some(provider) = Provider::resolve(&settings) else {
             self.set_status("No translation provider is configured".into(), cx);
             return;
         };
-        let service = match provider.build() {
+        let service = match provider.build_with(Some(&settings.translate_model)) {
             Ok(service) => service,
             Err(err) => {
                 self.set_status(format!("Translation unavailable: {err}"), cx);
@@ -419,13 +690,38 @@ impl Workspace {
             }
         };
 
-        let target = std::env::var("MARKTURBO_TRANSLATE_TO").unwrap_or_else(|_| "zh".into());
-        let source = doc.read(cx).document().clone();
-        self.set_status(format!("Translating via {}…", provider.label()), cx);
+        let target = settings.translate_to.trim().to_string();
+        let target = if target.is_empty() {
+            "zh".to_string()
+        } else {
+            target
+        };
+
+        // Parse the editor's *current* text rather than reusing
+        // `doc.document()`: that parse is debounced by 180ms, so translating
+        // right after a keystroke would translate the previous text and then
+        // overwrite the editor with it — silently discarding the edit.
+        let text = doc.read(cx).text(cx);
+        let doc_type = doc.read(cx).document().doc_type();
+
+        self.set_status(
+            if provider.is_real() {
+                format!("Translating via {}…", provider.label())
+            } else {
+                // Echo tags segments, it does not translate. Saying so up front
+                // beats the user discovering it in the diff.
+                format!(
+                    "{} does not translate — marking translatable segments only",
+                    provider.label()
+                )
+            },
+            cx,
+        );
 
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
+                    let source = mt_doc::Document::with_type(doc_type, text);
                     mt_doc::translate::translate(&source, &scope, &target, service.as_ref())
                 })
                 .await;
@@ -435,7 +731,21 @@ impl Workspace {
                     doc.update(cx, |doc, cx| {
                         doc.replace_text(translation.text, window, cx);
                     });
-                    this.set_status("Translated".into(), cx);
+                    this.set_status(
+                        if provider.is_real() {
+                            format!("Translated via {}", provider.label())
+                        } else {
+                            format!(
+                                "Marked {} segment(s) — not translated",
+                                translation
+                                    .segments
+                                    .iter()
+                                    .filter(|s| s.translatable)
+                                    .count()
+                            )
+                        },
+                        cx,
+                    );
                 }
                 Err(err) => this.set_status(format!("Translation failed: {err}"), cx),
             });
@@ -451,6 +761,11 @@ impl Workspace {
     /// applying is not — see [`Self::sync_webview`].
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn webview_intent(&self, cx: &App) -> WebIntent {
+        // The WebView is an OS child window drawn over GPUI's surface, not an
+        // element in the tree — it would float on top of the settings page.
+        if self.settings_open {
+            return WebIntent::Hide;
+        }
         let Some(doc) = self.active_document() else {
             return WebIntent::Hide;
         };
@@ -503,6 +818,7 @@ impl Workspace {
                 if let Some(webview) = &self.webview {
                     webview.update(cx, |webview, _| webview.hide());
                 }
+                self.lend_webview(None, cx);
                 self.web_current = None;
                 return;
             }
@@ -520,11 +836,29 @@ impl Workspace {
             }
         };
 
+        // The WebView must be *in the active tab's element tree*, not merely
+        // alive: its OS child window is positioned by `WebViewElement::prepaint`
+        // and stays at the 0x0 `Rect::default()` it was built with otherwise.
+        self.lend_webview(Some(webview.clone()), cx);
+
         webview.update(cx, |webview, _| webview.show());
         if self.web_current.as_deref() != Some(html.as_str()) {
             let url = crate::web::to_data_url(&html);
             webview.update(cx, |webview, _| webview.load_url(&url));
             self.web_current = Some(html);
+        }
+    }
+
+    /// Give the WebView to the active tab and take it from every other one.
+    ///
+    /// Exactly one document may render it at a time — two would set conflicting
+    /// bounds on the same child window every frame.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn lend_webview(&mut self, webview: Option<Entity<gpui_wry::WebView>>, cx: &mut Context<Self>) {
+        let active = self.active;
+        for (ix, doc) in self.documents.clone().into_iter().enumerate() {
+            let lent = (ix == active).then(|| webview.clone()).flatten();
+            doc.update(cx, |doc, cx| doc.set_webview(lent, cx));
         }
     }
 
@@ -551,25 +885,23 @@ impl Workspace {
                     }))
                     .children(SidePanel::ALL.map(|p| Tab::new().label(p.label()))),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .map(|this| match self.side_panel {
-                        SidePanel::Files => match &self.explorer {
-                            Some(explorer) => this.child(explorer.clone()),
-                            None => this.child(empty_hint(cx, "Open a folder to begin.")),
-                        },
-                        SidePanel::Skills => match &self.skills {
-                            Some(skills) => this.child(skills.clone()),
-                            None => this.child(empty_hint(cx, "Open a folder to discover skills.")),
-                        },
-                        SidePanel::Outline => this.child(self.render_outline(cx)),
-                    }),
-            )
+            .child(div().flex_1().min_h_0().map(|this| match self.side_panel {
+                SidePanel::Files => match &self.explorer {
+                    Some(explorer) => this.child(explorer.clone()),
+                    None => this.child(empty_hint(cx, "Open a folder to begin.")),
+                },
+                SidePanel::Skills => match &self.skills {
+                    Some(skills) => this.child(skills.clone()),
+                    None => this.child(empty_hint(cx, "Open a folder to discover skills.")),
+                },
+                SidePanel::Outline => this.child(self.render_outline(cx)),
+            }))
     }
 
     /// Document outline: headings plus MDX structure.
+    ///
+    /// Every row navigates: an outline you cannot click is a table of contents
+    /// with the page numbers torn off.
     fn render_outline(&self, cx: &Context<Self>) -> AnyElement {
         let Some(doc) = self.active_document() else {
             return empty_hint(cx, "Open a document to see its outline.").into_any_element();
@@ -586,26 +918,56 @@ impl Workspace {
             .p_1()
             .gap_0p5()
             .overflow_y_scroll()
-            .children(outline.headings.iter().map(|h| {
-                div()
+            .children(outline.headings.iter().enumerate().map(|(ix, h)| {
+                let offset = h.offset;
+                ListItem::new(("outline-heading", ix))
+                    .w_full()
                     .px_2()
                     .py_0p5()
-                    .pl(px(8.) + px(10.) * (h.depth.saturating_sub(1)) as f32)
-                    .text_sm()
                     .rounded(cx.theme().radius)
-                    .child(h.text.clone())
+                    .child(
+                        div()
+                            // Indentation carries the heading level, so the
+                            // padding has to be on the content rather than the
+                            // row — otherwise the hover highlight steps in with
+                            // it and the list looks ragged.
+                            .pl(px(10.) * (h.depth.saturating_sub(1)) as f32)
+                            .text_sm()
+                            .truncate()
+                            .child(h.text.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.reveal_offset(offset, window, cx)
+                    }))
             }))
-            .children(outline.structural.iter().map(|entry| {
-                h_flex()
+            .children(outline.structural.iter().enumerate().map(|(ix, entry)| {
+                let offset = entry.offset;
+                ListItem::new(("outline-structural", ix))
+                    .w_full()
                     .px_2()
                     .py_0p5()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(entry.kind.label())
-                    .child(div().flex_1().truncate().child(entry.label.clone()))
+                    .rounded(cx.theme().radius)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(entry.kind.label())
+                            .child(div().flex_1().truncate().child(entry.label.clone())),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.reveal_offset(offset, window, cx)
+                    }))
             }))
             .into_any_element()
+    }
+
+    /// Move the active document's cursor to `offset` and show it.
+    fn reveal_offset(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = self.active_document().cloned() else {
+            return;
+        };
+        doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
     }
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -657,9 +1019,13 @@ impl Workspace {
             .text_color(cx.theme().muted_foreground)
             .children(self.status.clone().map(|s| div().flex_1().child(s)))
             .when(self.status.is_none(), |this| {
-                this.child(div().flex_1().children(self.root.as_ref().map(|root| {
-                    div().child(root.to_string_lossy().to_string())
-                })))
+                this.child(
+                    div().flex_1().children(
+                        self.root
+                            .as_ref()
+                            .map(|root| div().child(root.to_string_lossy().to_string())),
+                    ),
+                )
             })
             .when(!renderers.is_empty(), |this| {
                 this.child(
@@ -707,16 +1073,20 @@ impl Render for Workspace {
         // with the App already borrowed. `schedule_webview_sync` runs it after
         // the effect cycle instead.
 
-        let content: AnyElement = match self.active_document() {
-            Some(doc) => doc.clone().into_any_element(),
-            None => v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(Icon::new(IconName::BookOpen))
-                .child(div().text_sm().child("Open a Markdown file to begin."))
-                .into_any_element(),
+        let content: AnyElement = if self.settings_open {
+            self.render_settings(cx)
+        } else {
+            match self.active_document() {
+                Some(doc) => doc.clone().into_any_element(),
+                None => v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::BookOpen))
+                    .child(div().text_sm().child("Open a Markdown file to begin."))
+                    .into_any_element(),
+            }
         };
 
         v_flex()
@@ -731,6 +1101,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_translate_document))
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
@@ -754,9 +1125,7 @@ impl Render for Workspace {
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
                                     Button::new("open-folder")
                                         .label("Open Folder")
@@ -795,6 +1164,17 @@ impl Render for Workspace {
                                                 )
                                             }
                                         })),
+                                )
+                                .child(
+                                    Button::new("settings")
+                                        .icon(IconName::Settings)
+                                        .xsmall()
+                                        .ghost()
+                                        .when(self.settings_open, |b| b.primary())
+                                        .tooltip("Settings")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.on_open_settings(&OpenSettings, window, cx)
+                                        })),
                                 ),
                         ),
                 ),
@@ -832,6 +1212,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-s", Save, None),
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("ctrl-w", CloseTab, None),
+        // The platform convention for preferences on each host.
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
         // All three translation scopes are reachable: document, the editor
         // selection, and the block under the cursor.
         KeyBinding::new("cmd-shift-t", TranslateDocument, None),

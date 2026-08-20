@@ -105,7 +105,10 @@ impl Skill {
 
     /// Short description for list rows.
     pub fn summary(&self) -> &str {
-        self.meta.description.as_deref().unwrap_or("(no description)")
+        self.meta
+            .description
+            .as_deref()
+            .unwrap_or("(no description)")
     }
 
     /// Whether the skill marks itself as internal.
@@ -141,6 +144,10 @@ pub fn parse(source: &str, dir_name: &str) -> (SkillMeta, Vec<Diagnostic>) {
         return (meta, diags);
     };
 
+    // Where each top-level key sits in the file, so a diagnostic can point at
+    // the line the user has to edit rather than just naming the field.
+    let lines = KeyLines::of(source, &fm);
+
     let value = match frontmatter::parse_yaml(&fm.raw) {
         Ok(value) => value,
         Err(diag) => {
@@ -174,9 +181,7 @@ pub fn parse(source: &str, dir_name: &str) -> (SkillMeta, Vec<Diagnostic>) {
                 meta.allowed_tools = match val {
                     // The spec says space-separated string; accept a YAML list
                     // too since several published skills use one.
-                    serde_yaml::Value::Sequence(items) => {
-                        items.iter().filter_map(scalar).collect()
-                    }
+                    serde_yaml::Value::Sequence(items) => items.iter().filter_map(scalar).collect(),
                     other => scalar(other)
                         .unwrap_or_default()
                         .split_whitespace()
@@ -192,9 +197,12 @@ pub fn parse(source: &str, dir_name: &str) -> (SkillMeta, Vec<Diagnostic>) {
                         }
                     }
                 }
-                None => diags.push(Diagnostic::warning(
-                    "skill",
-                    "`metadata` must be a map from string keys to string values",
+                None => diags.push(lines.attach(
+                    Diagnostic::warning(
+                        "skill",
+                        "`metadata` must be a map from string keys to string values",
+                    ),
+                    "metadata",
                 )),
             },
             other => {
@@ -203,83 +211,150 @@ pub fn parse(source: &str, dir_name: &str) -> (SkillMeta, Vec<Diagnostic>) {
                 } else {
                     meta.extra.insert(other.to_string(), "…".to_string());
                 }
-                diags.push(Diagnostic::warning(
-                    "skill",
-                    format!(
-                        "unexpected field `{other}`; the spec allows only {}",
-                        ALLOWED_FIELDS.join(", ")
+                diags.push(lines.attach(
+                    Diagnostic::warning(
+                        "skill",
+                        format!(
+                            "unexpected field `{other}`; the spec allows only {}",
+                            ALLOWED_FIELDS.join(", ")
+                        ),
                     ),
+                    other,
                 ));
             }
         }
     }
 
-    validate(&meta, dir_name, &mut diags);
+    validate(&meta, dir_name, &lines, &mut diags);
     (meta, diags)
 }
 
+/// The 1-based line of each top-level frontmatter key.
+///
+/// Scanned from the raw text rather than taken from the YAML parse:
+/// `serde_yaml` discards spans by the time a `Mapping` is handed back, and a
+/// validation message that cannot say *where* sends the user hunting through a
+/// file to find a field this code already read.
+#[derive(Debug, Default)]
+struct KeyLines {
+    lines: BTreeMap<String, usize>,
+    /// Line of the opening `---`, used when a rule is about the block as a
+    /// whole (a missing required field has no line of its own).
+    fence: usize,
+}
+
+impl KeyLines {
+    fn of(source: &str, fm: &frontmatter::Frontmatter) -> Self {
+        // The fence is the line before the YAML body starts.
+        let fence = line_of(source, fm.body_start).saturating_sub(1).max(1);
+        let mut lines = BTreeMap::new();
+        for (offset, raw) in fm.raw.split_inclusive('\n').enumerate() {
+            let text = raw.trim_end_matches(['\n', '\r']);
+            // Top-level keys only: an indented line belongs to the key above it,
+            // and `metadata:`'s children must not shadow their parent.
+            if !text.starts_with([' ', '\t', '#'])
+                && let Some((key, _)) = text.split_once(':')
+                && !key.is_empty()
+            {
+                lines
+                    .entry(key.trim().to_string())
+                    .or_insert(fence + 1 + offset);
+            }
+        }
+        Self { lines, fence }
+    }
+
+    /// Anchor `diag` to `key`'s line, or to the frontmatter fence when the key
+    /// is absent — which is exactly the case for a missing required field.
+    fn attach(&self, diag: Diagnostic, key: &str) -> Diagnostic {
+        diag.at_line(self.lines.get(key).copied().unwrap_or(self.fence))
+    }
+}
+
+/// The 1-based line containing `offset`.
+fn line_of(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())].matches('\n').count() + 1
+}
+
 /// Apply the spec's validation rules to already-parsed metadata.
-fn validate(meta: &SkillMeta, dir_name: &str, diags: &mut Vec<Diagnostic>) {
+fn validate(meta: &SkillMeta, dir_name: &str, lines: &KeyLines, diags: &mut Vec<Diagnostic>) {
+    let at_name = |d: Diagnostic| lines.attach(d, "name");
+
     match meta.name.as_deref().map(str::trim) {
-        None => diags.push(Diagnostic::warning(
+        None => diags.push(at_name(Diagnostic::warning(
             "skill",
             format!("missing `name`; defaulting to directory name `{dir_name}`"),
-        )),
-        Some("") => diags.push(Diagnostic::error("skill", "`name` must not be empty")),
+        ))),
+        Some("") => diags.push(at_name(Diagnostic::error(
+            "skill",
+            "`name` must not be empty",
+        ))),
         Some(name) => {
             let chars = name.chars().count();
             if chars > NAME_MAX {
-                diags.push(Diagnostic::error(
+                diags.push(at_name(Diagnostic::error(
                     "skill",
                     format!("`name` must be 1-{NAME_MAX} characters (got {chars})"),
-                ));
+                )));
             }
             if name != name.to_lowercase() {
-                diags.push(Diagnostic::error(
+                diags.push(at_name(Diagnostic::error(
                     "skill",
                     "`name` must be lowercase",
-                ));
+                )));
             }
             // Unicode alphanumeric, matching the reference validator: `café-tools`
             // and `日本語-skill` are conformant.
             if let Some(bad) = name.chars().find(|c| !(c.is_alphanumeric() || *c == '-')) {
-                diags.push(Diagnostic::error(
+                // Naming the character alone leaves the reader to guess what the
+                // rule is; underscores and spaces in particular look perfectly
+                // reasonable until you know only hyphens separate words here.
+                diags.push(at_name(Diagnostic::error(
                     "skill",
-                    format!("`name` contains invalid character `{bad}`"),
-                ));
+                    format!(
+                        "`name` may contain only letters, digits and hyphens — \
+                         found `{bad}` in `{name}`. Rename it to `{}`.",
+                        suggest_name(name)
+                    ),
+                )));
             }
             if name.starts_with('-') || name.ends_with('-') {
-                diags.push(Diagnostic::error(
+                diags.push(at_name(Diagnostic::error(
                     "skill",
                     "Skill name cannot start or end with a hyphen",
-                ));
+                )));
             }
             if name.contains("--") {
-                diags.push(Diagnostic::error(
+                diags.push(at_name(Diagnostic::error(
                     "skill",
                     "Skill name cannot contain consecutive hyphens",
-                ));
+                )));
             }
             if !nfkc_eq(name, dir_name) {
-                diags.push(Diagnostic::warning(
+                diags.push(at_name(Diagnostic::warning(
                     "skill",
                     format!("Directory name '{dir_name}' must match skill name '{name}'"),
-                ));
+                )));
             }
         }
     }
 
     match meta.description.as_deref().map(str::trim) {
-        None | Some("") => diags.push(Diagnostic::error(
-            "skill",
-            "`description` is required and must not be empty",
+        None | Some("") => diags.push(lines.attach(
+            Diagnostic::error("skill", "`description` is required and must not be empty"),
+            "description",
         )),
         Some(d) => {
             let chars = d.chars().count();
             if chars > DESCRIPTION_MAX {
-                diags.push(Diagnostic::error(
-                    "skill",
-                    format!("`description` must be 1-{DESCRIPTION_MAX} characters (got {chars})"),
+                diags.push(lines.attach(
+                    Diagnostic::error(
+                        "skill",
+                        format!(
+                            "`description` must be 1-{DESCRIPTION_MAX} characters (got {chars})"
+                        ),
+                    ),
+                    "description",
                 ));
             }
         }
@@ -288,12 +363,41 @@ fn validate(meta: &SkillMeta, dir_name: &str, diags: &mut Vec<Diagnostic>) {
     if let Some(compat) = meta.compatibility.as_deref() {
         let chars = compat.chars().count();
         if chars > COMPATIBILITY_MAX {
-            diags.push(Diagnostic::error(
-                "skill",
-                format!("`compatibility` must be at most {COMPATIBILITY_MAX} characters (got {chars})"),
+            diags.push(lines.attach(
+                Diagnostic::error(
+                    "skill",
+                    format!("`compatibility` must be at most {COMPATIBILITY_MAX} characters (got {chars})"),
+                ),
+                "compatibility",
             ));
         }
     }
+}
+
+/// A conformant name derived from a rejected one, for the diagnostic to offer.
+///
+/// Every disallowed character becomes a hyphen, which is what the offenders in
+/// the wild — `_leading_underscore`, `My Skill`, `foo.bar` — actually mean.
+fn suggest_name(name: &str) -> String {
+    let mapped: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    // The same rules the name itself must satisfy: no leading, trailing or
+    // consecutive hyphens. Suggesting something still invalid would be worse
+    // than suggesting nothing.
+    let mut out = String::with_capacity(mapped.len());
+    for c in mapped.chars() {
+        if c == '-' && (out.is_empty() || out.ends_with('-')) {
+            continue;
+        }
+        out.push(c);
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 /// Compare two names the way the spec's reference validator does.
@@ -311,9 +415,7 @@ fn nfkc_eq(a: &str, b: &str) -> bool {
             .chars()
             .map(|c| match c {
                 // Fullwidth ASCII block -> ASCII.
-                '\u{ff01}'..='\u{ff5e}' => {
-                    char::from_u32(c as u32 - 0xfee0).unwrap_or(c)
-                }
+                '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
                 // Dash variants -> hyphen-minus.
                 '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{fe58}' | '\u{fe63}' => '-',
                 other => other,
@@ -598,9 +700,15 @@ mod tests {
         assert_eq!(meta.description.as_deref(), Some("Extract text from PDFs."));
         assert_eq!(meta.license.as_deref(), Some("MIT"));
         assert_eq!(meta.allowed_tools, vec!["Read", "Write", "Bash"]);
-        assert_eq!(meta.metadata.get("version").map(String::as_str), Some("1.0"));
+        assert_eq!(
+            meta.metadata.get("version").map(String::as_str),
+            Some("1.0")
+        );
         // Non-string scalars are stringified, per strictyaml semantics.
-        assert_eq!(meta.metadata.get("internal").map(String::as_str), Some("true"));
+        assert_eq!(
+            meta.metadata.get("internal").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -653,14 +761,114 @@ mod tests {
         assert!(bad("trail-", "trail-")[0].contains("start or end with a hyphen"));
         assert!(bad("a--b", "a--b")[0].contains("consecutive hyphens"));
         assert!(bad("Upper", "Upper")[0].contains("lowercase"));
-        assert!(bad("has space", "has space")[0].contains("invalid character"));
+        assert!(bad("has space", "has space")[0].contains("only letters, digits and hyphens"));
         assert!(bad(&"x".repeat(65), "x")[0].contains("1-64"));
+    }
+
+    /// The message the user saw for `_my-commit-push-pr` named the character but
+    /// not the rule, so "why is it invalid?" was a fair question. It must state
+    /// the rule and offer the fix.
+    #[test]
+    fn an_invalid_character_explains_the_rule_and_suggests_a_name() {
+        let src = "---\nname: _my-commit-push-pr\ndescription: d\n---\n";
+        let (_, diags) = parse(src, "_my-commit-push-pr");
+        let message = errors(&diags)
+            .into_iter()
+            .find(|m| m.contains("letters, digits and hyphens"))
+            .expect("the name rule must be stated");
+        assert!(message.contains('_'), "must name the offending character");
+        assert!(
+            message.contains("`my-commit-push-pr`"),
+            "must suggest a conformant name, got {message}"
+        );
+    }
+
+    #[test]
+    fn suggested_names_are_themselves_valid() {
+        for input in [
+            "_my-commit-push-pr",
+            "My Skill",
+            "foo.bar",
+            "__a__b__",
+            "a_",
+        ] {
+            let suggested = suggest_name(input);
+            assert!(!suggested.is_empty(), "{input} produced nothing");
+            assert!(
+                !suggested.starts_with('-') && !suggested.ends_with('-'),
+                "{input} -> {suggested} has an edge hyphen"
+            );
+            assert!(!suggested.contains("--"), "{input} -> {suggested}");
+            assert!(
+                suggested.chars().all(|c| c.is_alphanumeric() || c == '-'),
+                "{input} -> {suggested}"
+            );
+            assert_eq!(suggested, suggested.to_lowercase());
+        }
+    }
+
+    #[test]
+    fn diagnostics_point_at_the_offending_line() {
+        let src = "---\nname: Bad_Name\nlicense: MIT\nmodel: opus\n---\n\n# body\n";
+        let (_, diags) = parse(src, "Bad_Name");
+        for diag in &diags {
+            assert!(
+                diag.line.is_some(),
+                "every field diagnostic needs a line: {diag:?}"
+            );
+        }
+        // `name:` is line 2 — the fence is line 1. Match on `name` rules
+        // specifically: the unexpected-field message lists every allowed field,
+        // so a bare `contains("name")` matches it too.
+        let name_lines: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.starts_with("`name`"))
+            .filter_map(|d| d.line)
+            .collect();
+        assert!(
+            !name_lines.is_empty() && name_lines.iter().all(|l| *l == 2),
+            "name rules must point at line 2, got {name_lines:?}"
+        );
+        // `model:` is line 4.
+        let unexpected = diags
+            .iter()
+            .find(|d| d.message.contains("unexpected field"))
+            .expect("model is not a spec field");
+        assert_eq!(unexpected.line, Some(4));
+    }
+
+    #[test]
+    fn a_missing_field_points_at_the_frontmatter_fence() {
+        // A required field that is absent has no line of its own; the fence is
+        // where the user has to add it.
+        let (_, diags) = parse("---\nname: demo\n---\n", "demo");
+        let missing = diags
+            .iter()
+            .find(|d| d.message.contains("`description`"))
+            .expect("description is required");
+        assert_eq!(missing.line, Some(1));
+    }
+
+    #[test]
+    fn nested_metadata_keys_do_not_shadow_top_level_ones() {
+        // `metadata:`'s children are indented; a naive scan would record
+        // `name` at the nested line and point every name diagnostic there.
+        let src = "---\nmetadata:\n  name: nested\ndescription: d\nname: Bad\n---\n";
+        let (_, diags) = parse(src, "Bad");
+        let name_diag = diags
+            .iter()
+            .find(|d| d.message.contains("lowercase"))
+            .expect("Bad is not lowercase");
+        assert_eq!(name_diag.line, Some(5), "the top-level `name:` is line 5");
     }
 
     #[test]
     fn unicode_names_are_valid() {
         // The reference validator uses Unicode `isalnum`, not `[a-z0-9-]`.
-        let (_, diags) = parse("---\nname: 日本語-skill\ndescription: d\n---\n", "日本語-skill");
+        let (_, diags) = parse(
+            "---\nname: 日本語-skill\ndescription: d\n---\n",
+            "日本語-skill",
+        );
         assert_eq!(errors(&diags), Vec::<&str>::new());
     }
 
