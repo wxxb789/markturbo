@@ -88,22 +88,34 @@ Translation works offline out of the box using the **Echo** provider, which
 marks each translatable fragment so you can see exactly what would be sent
 without any credentials. It tags fragments as `[zh?] …` — it does not translate.
 
-For real translation, set a key in the environment and pick the provider in
+For real translation, set a key in the environment and pick a schema in
 Settings:
 
 ```sh
-export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_API_KEY=sk-ant-...   # Anthropic Messages
+export OPENAI_API_KEY=sk-...          # both OpenAI schemas
 ```
 
-The target language and model live in Settings. An API key never does: it is
-read from the environment only, so it cannot end up in a settings file that gets
-backed up or screenshotted.
+Three wire formats are supported, which between them cover essentially every
+hosted and self-hosted endpoint:
+
+| Schema | Endpoint | Key |
+|---|---|---|
+| Anthropic Messages | `/v1/messages` | `ANTHROPIC_API_KEY` |
+| OpenAI Chat Completions | `/v1/chat/completions` | `OPENAI_API_KEY` |
+| OpenAI Responses | `/v1/responses` | `OPENAI_API_KEY` |
+
+Set **Base URL** to reach an OpenAI-compatible server — vLLM, Ollama,
+OpenRouter, LM Studio, Azure. The wire format is the same, so picking Chat
+Completions and pasting a URL is all that is needed.
+
+The target language, model, and base URL live in Settings. An API key never
+does: it is read from the environment only, so it cannot end up in a settings
+file that gets backed up or screenshotted.
 
 ## Settings
 
-`Ctrl/Cmd+,` opens Settings — theme, translation provider/model/target
-language, and how the Skills panel discovers and groups skills. Changes save
-immediately to:
+`Ctrl/Cmd+,` opens Settings. Changes save immediately to:
 
 | Platform | Location |
 |---|---|
@@ -115,8 +127,42 @@ install. The file is plain JSON and safe to edit by hand; if it cannot be
 parsed, markturbo logs a warning, starts with defaults, and leaves your file
 alone rather than overwriting it.
 
-**Theme** defaults to *System* and keeps following the OS while running, so a
-machine that switches to dark at sunset takes the app with it.
+**Appearance** — twelve preset themes, six light and six dark:
+
+| Light | Dark |
+|---|---|
+| Light, Notion, Bear | Dark, Midnight, Nord |
+| Elegant, Sepia, Writer | Gruvbox, Solarized Dark, Dracula |
+
+You pick one for each mode, because **Mode** defaults to *System* and keeps
+following the OS while running — a machine that switches to dark at sunset takes
+the app with it, landing on the dark preset you chose. Writer is monospace;
+Sepia and Elegant are serif. The theme drives both the window and the Web
+preview, so the two never disagree.
+
+**Language** — the interface itself, in English or 简体中文. Separate from the
+translation target, which is about documents.
+
+**Editor → Sync scrolling** — off by default. On, the preview follows the editor
+in Split view, and follows an outline click. The mapping is proportional, so a
+document with one tall diagram moves further than the eye expects. It drives the
+Web preview; the native preview does not expose a scroll handle yet.
+
+## The Harness panel
+
+Skills and instruction files are both agent artifacts discovered from the same
+harness conventions, so they share one panel with two sections.
+
+**Skills** lists every `SKILL.md` found across ~75 workspace conventions
+(`skills/`, `.agents/skills`, `.claude/skills`, …) and, when *Include global
+skills* is on, every harness's global directory. A skill reachable by several
+paths — a junctioned `~/.claude/skills` — appears once, with the other paths
+shown as links. Group by origin, harness, or validation status; the last puts
+what needs fixing first. Selecting one shows its metadata and any validation
+errors, each with the line it came from.
+
+**Instructions** lists `AGENTS.md`, `CLAUDE.md`, Cursor rules, and scoped
+`*.instructions.md` — the files a harness reads unprompted.
 
 ## Keyboard
 
