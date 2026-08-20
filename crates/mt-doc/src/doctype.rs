@@ -49,7 +49,11 @@ impl DocType {
     pub fn is_agent_artifact(self) -> bool {
         matches!(
             self,
-            DocType::Skill | DocType::Agents | DocType::Claude | DocType::CursorRule | DocType::Instructions
+            DocType::Skill
+                | DocType::Agents
+                | DocType::Claude
+                | DocType::CursorRule
+                | DocType::Instructions
         )
     }
 
@@ -150,7 +154,10 @@ mod tests {
         assert_eq!(ty("repo/CLAUDE.local.md"), DocType::Claude);
         assert_eq!(ty("x/rust.instructions.md"), DocType::Instructions);
         assert_eq!(ty("repo/.cursor/rules/style.mdc"), DocType::CursorRule);
-        assert_eq!(ty("repo/.cursor/rules/nested/style.md"), DocType::CursorRule);
+        assert_eq!(
+            ty("repo/.cursor/rules/nested/style.md"),
+            DocType::CursorRule
+        );
     }
 
     #[test]

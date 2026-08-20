@@ -59,7 +59,11 @@ fn every_fixture_opens_renders_and_survives_a_round_trip() {
         let (file, doc) = load(relative);
 
         // Opening never rewrites the source.
-        assert_eq!(doc.source(), file.text, "{relative}: source changed on open");
+        assert_eq!(
+            doc.source(),
+            file.text,
+            "{relative}: source changed on open"
+        );
 
         // Both renderers accept the same document model, and neither panics.
         let html = web::build_html(&doc, &registry, Trust::Restricted);
@@ -190,12 +194,18 @@ fn untrusted_mdx_is_rendered_under_a_blocking_policy() {
     let (_, doc) = load("mdx/untrusted.mdx");
     let html = web::build_html(&doc, &registry(), Trust::Restricted);
 
-    assert!(html.contains("script-src 'none'"), "scripts must be blocked");
+    assert!(
+        html.contains("script-src 'none'"),
+        "scripts must be blocked"
+    );
     assert!(
         html.contains("default-src 'none'"),
         "all network access must be blocked"
     );
-    assert!(body(&html).contains("mt-banner"), "and the user must be told");
+    assert!(
+        body(&html).contains("mt-banner"),
+        "and the user must be told"
+    );
 
     // The executable content is shown, not executed — and it is escaped, so it
     // cannot become live markup in the WebView.

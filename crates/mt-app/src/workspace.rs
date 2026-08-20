@@ -78,7 +78,11 @@ pub fn read_dir(path: &Path) -> std::io::Result<Vec<FileNode>> {
             children: Vec::new(),
             path: entry_path,
         };
-        if is_dir { dirs.push(node) } else { files.push(node) }
+        if is_dir {
+            dirs.push(node)
+        } else {
+            files.push(node)
+        }
     }
 
     // Directories first, then files, each case-insensitively by name — the
@@ -158,7 +162,10 @@ mod tests {
         let readme = nodes.iter().find(|n| n.name == "README.md").unwrap();
         let txt = nodes.iter().find(|n| n.name == "notes.txt").unwrap();
         assert!(readme.is_openable());
-        assert!(!txt.is_openable(), "plain text is not a document view target");
+        assert!(
+            !txt.is_openable(),
+            "plain text is not a document view target"
+        );
     }
 
     #[test]

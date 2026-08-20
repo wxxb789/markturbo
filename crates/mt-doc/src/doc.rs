@@ -145,8 +145,11 @@ impl Document {
         };
         if frontmatter::has_unterminated_fence(&self.source) {
             self.diagnostics.push(
-                Diagnostic::warning("frontmatter", "unterminated `---` block; treated as content")
-                    .at_line(1),
+                Diagnostic::warning(
+                    "frontmatter",
+                    "unterminated `---` block; treated as content",
+                )
+                .at_line(1),
             );
         }
 
@@ -157,7 +160,11 @@ impl Document {
             Ok(tree) => tree,
             Err(message) => {
                 let mut diag = Diagnostic::error(
-                    if self.doc_type.is_mdx() { "mdx" } else { "markdown" },
+                    if self.doc_type.is_mdx() {
+                        "mdx"
+                    } else {
+                        "markdown"
+                    },
                     message.reason.clone(),
                 );
                 if let Some(place) = message.place.as_ref() {
@@ -336,7 +343,12 @@ mod tests {
     #[test]
     fn extracts_headings_in_order() {
         let doc = md("# One\n\ntext\n\n## Two `code`\n\n### 三级标题\n");
-        let texts: Vec<_> = doc.outline().headings.iter().map(|h| h.text.as_str()).collect();
+        let texts: Vec<_> = doc
+            .outline()
+            .headings
+            .iter()
+            .map(|h| h.text.as_str())
+            .collect();
         assert_eq!(texts, vec!["One", "Two code", "三级标题"]);
         let depths: Vec<_> = doc.outline().headings.iter().map(|h| h.depth).collect();
         assert_eq!(depths, vec![1, 2, 3]);
@@ -347,15 +359,13 @@ mod tests {
         let doc = md(
             "```rust\nlet x = 1;\n```\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\n```d2\na -> b\n```\n\n```plantuml\n@startuml\n@enduml\n```\n",
         );
-        let kinds: Vec<_> = doc
-            .blocks()
-            .iter()
-            .map(|b| b.kind.clone())
-            .collect();
+        let kinds: Vec<_> = doc.blocks().iter().map(|b| b.kind.clone()).collect();
         assert_eq!(
             kinds,
             vec![
-                BlockKind::Code { lang: Some("rust".into()) },
+                BlockKind::Code {
+                    lang: Some("rust".into())
+                },
                 BlockKind::Diagram(DiagramKind::Mermaid),
                 BlockKind::Diagram(DiagramKind::D2),
                 BlockKind::Diagram(DiagramKind::PlantUml),
@@ -478,7 +488,11 @@ mod tests {
         assert_eq!(doc.outline().headings[0].text, "标题 🎉");
         // All block ranges must be valid char boundaries into the source.
         for b in doc.blocks() {
-            assert!(src.get(b.range.clone()).is_some(), "bad range {:?}", b.range);
+            assert!(
+                src.get(b.range.clone()).is_some(),
+                "bad range {:?}",
+                b.range
+            );
         }
     }
 

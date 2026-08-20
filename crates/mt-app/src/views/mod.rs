@@ -36,9 +36,7 @@ where
     use gpui::AppContext as _;
 
     let entity = entity.upgrade()?;
-    cx.with_window(entity.entity_id(), |_, app| {
-        app.update_entity(&entity, f)
-    })
+    cx.with_window(entity.entity_id(), |_, app| app.update_entity(&entity, f))
 }
 
 /// Which view of a document is showing.

@@ -25,8 +25,12 @@ fn fixture(name: &str) -> PathBuf {
 
 fn read(name: &str) -> String {
     let path = fixture(name);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {} — run the fixture generator: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {} — run the fixture generator: {e}",
+            path.display()
+        )
+    })
 }
 
 fn time<T>(f: impl FnOnce() -> T) -> (T, Duration) {
@@ -195,7 +199,10 @@ fn outline_and_block_lookup_are_cheap_on_a_huge_document() {
     // Outline is precomputed, so reading it is O(1).
     let (headings, elapsed) = time(|| doc.outline().headings.len());
     assert!(headings > 1_000);
-    assert!(elapsed < Duration::from_millis(10), "outline read {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(10),
+        "outline read {elapsed:?}"
+    );
 
     // Block lookup backs "translate the block at the cursor"; it runs on user
     // interaction, so it must not be a full scan of a huge document per call.

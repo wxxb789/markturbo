@@ -71,7 +71,11 @@ impl Diagnostic {
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.line {
-            Some(line) => write!(f, "{}:{}: {}: {}", self.source, line, self.severity, self.message),
+            Some(line) => write!(
+                f,
+                "{}:{}: {}: {}",
+                self.source, line, self.severity, self.message
+            ),
             None => write!(f, "{}: {}: {}", self.source, self.severity, self.message),
         }
     }

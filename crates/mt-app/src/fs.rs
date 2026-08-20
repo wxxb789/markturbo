@@ -72,7 +72,11 @@ impl Newline {
     pub fn detect(text: &str) -> Self {
         let crlf = text.matches("\r\n").count();
         let lf = text.matches('\n').count() - crlf;
-        if crlf > lf { Newline::Crlf } else { Newline::Lf }
+        if crlf > lf {
+            Newline::Crlf
+        } else {
+            Newline::Lf
+        }
     }
 }
 
@@ -117,9 +121,9 @@ pub enum SaveError {
 impl std::fmt::Display for SaveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SaveError::Conflict => f.write_str(
-                "the file changed on disk since it was opened; reload or save a copy",
-            ),
+            SaveError::Conflict => {
+                f.write_str("the file changed on disk since it was opened; reload or save a copy")
+            }
             SaveError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -148,12 +152,7 @@ pub fn save_as(
     write(path, text, newline, had_bom)
 }
 
-fn write(
-    path: &Path,
-    text: &str,
-    newline: Newline,
-    had_bom: bool,
-) -> std::io::Result<FileStamp> {
+fn write(path: &Path, text: &str, newline: Newline, had_bom: bool) -> std::io::Result<FileStamp> {
     let mut bytes = Vec::with_capacity(text.len() + 3);
     if had_bom {
         bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);

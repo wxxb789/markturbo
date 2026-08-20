@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
 
-use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 
 /// What changed on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]

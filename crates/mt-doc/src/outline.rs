@@ -59,7 +59,11 @@ impl Outline {
 
 /// One-line label for an MDX block, for the outline and native placeholders.
 fn summarize_mdx(content: &str, kind: MdxKind) -> String {
-    let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let first = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     match kind {
         // `<RevenueChart data={x} />` -> `<RevenueChart />`
         MdxKind::JsxElement => jsx_tag_name(first)
@@ -95,7 +99,10 @@ mod tests {
 
     #[test]
     fn jsx_tag_names() {
-        assert_eq!(jsx_tag_name("<RevenueChart />"), Some("RevenueChart".into()));
+        assert_eq!(
+            jsx_tag_name("<RevenueChart />"),
+            Some("RevenueChart".into())
+        );
         assert_eq!(jsx_tag_name("  <Foo.Bar a={1}>"), Some("Foo.Bar".into()));
         assert_eq!(jsx_tag_name("</Closing>"), Some("Closing".into()));
         assert_eq!(jsx_tag_name("not jsx"), None);
@@ -104,7 +111,10 @@ mod tests {
 
     #[test]
     fn summarizes_jsx_to_a_bare_tag() {
-        let s = summarize_mdx("<RevenueChart data={rows} height={300} />", MdxKind::JsxElement);
+        let s = summarize_mdx(
+            "<RevenueChart data={rows} height={300} />",
+            MdxKind::JsxElement,
+        );
         assert_eq!(s, "<RevenueChart />");
     }
 

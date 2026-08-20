@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 
 use gpui::*;
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName,
-    h_flex,
+    ActiveTheme as _, Icon, IconName, h_flex,
     list::ListItem,
     tree::{TreeEvent, TreeItem, TreeState, tree},
     v_flex,
@@ -227,13 +226,11 @@ impl Render for Explorer {
                                 h_flex()
                                     .gap_2()
                                     .items_center()
-                                    .child(Icon::new(icon).text_color(
-                                        if is_dir {
-                                            cx.theme().muted_foreground
-                                        } else {
-                                            cx.theme().foreground
-                                        },
-                                    ))
+                                    .child(Icon::new(icon).text_color(if is_dir {
+                                        cx.theme().muted_foreground
+                                    } else {
+                                        cx.theme().foreground
+                                    }))
                                     .child(div().text_sm().child(item.label.clone())),
                             )
                             .on_click(move |_, _, cx| {
@@ -257,7 +254,9 @@ mod tests {
     /// `IconName` is macro-generated and implements neither `PartialEq` nor
     /// `Debug`, so compare the SVG paths it resolves to.
     fn icon(path: &str, is_dir: bool, expanded: bool) -> String {
-        icon_for(Path::new(path), is_dir, expanded).path().to_string()
+        icon_for(Path::new(path), is_dir, expanded)
+            .path()
+            .to_string()
     }
 
     #[test]

@@ -965,7 +965,9 @@ mod tests {
         let source = include_str!("document.rs");
         let start = source.find("pub fn reveal_offset").expect("reveal_offset");
         let body = &source[start..];
-        let end = body.find("\n    /// Replace the whole").unwrap_or(body.len());
+        let end = body
+            .find("\n    /// Replace the whole")
+            .unwrap_or(body.len());
         let body = &body[..end];
 
         assert!(

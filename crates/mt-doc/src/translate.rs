@@ -101,7 +101,11 @@ pub fn segment(doc: &Document, scope: &Scope) -> Vec<Segment> {
 fn segment_block(block: &Block, source: &str, range: Range<usize>, out: &mut Vec<Segment>) {
     let verbatim_block = matches!(
         block.kind,
-        BlockKind::Code { .. } | BlockKind::Math | BlockKind::Diagram(_) | BlockKind::Html | BlockKind::Mdx(_)
+        BlockKind::Code { .. }
+            | BlockKind::Math
+            | BlockKind::Diagram(_)
+            | BlockKind::Html
+            | BlockKind::Mdx(_)
     );
     if verbatim_block {
         push_verbatim(out, source, range);
@@ -291,14 +295,12 @@ fn leading_marker(line: &str) -> usize {
 
     // Task-list checkbox directly after a bullet: `- [ ] ` / `- [x] `.
     let after = &rest[marker..];
-    let checkbox = if after.starts_with("[ ] ")
-        || after.starts_with("[x] ")
-        || after.starts_with("[X] ")
-    {
-        4
-    } else {
-        0
-    };
+    let checkbox =
+        if after.starts_with("[ ] ") || after.starts_with("[x] ") || after.starts_with("[X] ") {
+            4
+        } else {
+            0
+        };
 
     indent + marker + checkbox
 }
@@ -436,7 +438,8 @@ mod tests {
 
     #[test]
     fn diagram_and_math_source_are_never_translated() {
-        let src = "Before.\n\n```mermaid\ngraph TD;\nA[Start]-->B[End];\n```\n\n$$\n\\frac{a}{b}\n$$\n";
+        let src =
+            "Before.\n\n```mermaid\ngraph TD;\nA[Start]-->B[End];\n```\n\n$$\n\\frac{a}{b}\n$$\n";
         let out = translate(&doc(src), &Scope::Document, "zh", &Upper).unwrap();
         assert!(out.text.contains("A[Start]-->B[End];"));
         assert!(out.text.contains("\\frac{a}{b}"));
@@ -445,7 +448,8 @@ mod tests {
 
     #[test]
     fn inline_code_urls_and_link_targets_survive() {
-        let src = "Use `String::new()` here, see [docs](https://example.com/a_b) and <https://x.dev>.\n";
+        let src =
+            "Use `String::new()` here, see [docs](https://example.com/a_b) and <https://x.dev>.\n";
         let out = translate(&doc(src), &Scope::Document, "zh", &Upper).unwrap();
         assert!(out.text.contains("`String::new()`"), "got {}", out.text);
         assert!(out.text.contains("(https://example.com/a_b)"));
@@ -464,7 +468,11 @@ mod tests {
     fn frontmatter_keys_are_not_translated() {
         let src = "---\nname: demo\ndescription: A demo skill.\n---\n\nBody text.\n";
         let out = translate(&doc(src), &Scope::Document, "zh", &Upper).unwrap();
-        assert!(out.text.starts_with("---\nname: demo\n"), "got {}", out.text);
+        assert!(
+            out.text.starts_with("---\nname: demo\n"),
+            "got {}",
+            out.text
+        );
         assert!(out.text.contains("BODY TEXT."));
     }
 

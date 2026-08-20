@@ -154,7 +154,10 @@ impl RendererRegistry {
                 Ok(outcome) => outcome,
                 Err(_) => RenderOutcome::Failed(Diagnostic::error(
                     renderer.id().to_string(),
-                    format!("{} renderer panicked on this input", renderer.display_name()),
+                    format!(
+                        "{} renderer panicked on this input",
+                        renderer.display_name()
+                    ),
                 )),
             },
         };
@@ -357,7 +360,9 @@ fn plantuml_error(svg: &str) -> Option<String> {
     while let Some(start) = rest.find("<text") {
         let after = &rest[start..];
         let Some(open) = after.find('>') else { break };
-        let Some(close) = after.find("</text>") else { break };
+        let Some(close) = after.find("</text>") else {
+            break;
+        };
         if close > open {
             parts.push(after[open + 1..close].trim().to_string());
         }
@@ -650,7 +655,11 @@ mod tests {
         let mut registry = RendererRegistry::new();
         registry.register(Arc::new(AlwaysMissing));
         let diag = registry.render("fake", "x").diagnostic().unwrap().clone();
-        assert!(diag.message.contains("install fake-tool"), "{}", diag.message);
+        assert!(
+            diag.message.contains("install fake-tool"),
+            "{}",
+            diag.message
+        );
     }
 
     #[test]
@@ -704,7 +713,11 @@ mod tests {
         registry.register(Arc::new(Counting));
         registry.render("counting", "unique-source-abc");
         registry.render("counting", "unique-source-abc");
-        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "second call must hit cache");
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "second call must hit cache"
+        );
         registry.render("counting", "unique-source-xyz");
         assert_eq!(CALLS.load(Ordering::SeqCst), 2, "new source must re-render");
     }
@@ -805,7 +818,11 @@ mod tests {
         assert_eq!(diag.line, Some(2), "the reported line is extracted");
 
         // Non-SVG output is a failure, not silently accepted.
-        assert!(interpret_plantuml("Exception in thread \"main\"").diagnostic().is_some());
+        assert!(
+            interpret_plantuml("Exception in thread \"main\"")
+                .diagnostic()
+                .is_some()
+        );
         assert!(interpret_plantuml("").diagnostic().is_some());
     }
 

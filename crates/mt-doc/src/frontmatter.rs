@@ -60,7 +60,9 @@ fn strip_open_fence(source: &str) -> Option<&str> {
     let rest = source.strip_prefix("---")?;
     // Must be `---` alone on the first line, otherwise this is a thematic break
     // or a setext heading underline.
-    let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n'))?;
+    let rest = rest
+        .strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\n'))?;
     Some(rest)
 }
 

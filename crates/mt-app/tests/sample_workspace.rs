@@ -171,8 +171,7 @@ fn translation_preserves_what_the_readme_promises() {
 
     let doc = open("README.md");
     let service = mt_app::translate::Provider::Echo.build().unwrap();
-    let out =
-        mt_doc::translate::translate(&doc, &Scope::Document, "zh", service.as_ref()).unwrap();
+    let out = mt_doc::translate::translate(&doc, &Scope::Document, "zh", service.as_ref()).unwrap();
 
     // The README names exactly these as untouched. Verify each.
     assert!(
@@ -188,10 +187,7 @@ fn translation_preserves_what_the_readme_promises() {
         out.text.contains("Human -->|writes| Markdown;"),
         "diagram source must survive"
     );
-    assert!(
-        out.text.contains(r"\frac{n(n+1)}{2}"),
-        "math must survive"
-    );
+    assert!(out.text.contains(r"\frac{n(n+1)}{2}"), "math must survive");
 
     // Block markup survives even though the text after it is translated —
     // that is the whole point, so assert the marker, not the heading text.

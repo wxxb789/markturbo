@@ -63,7 +63,9 @@ pub enum BlockKind {
     /// handles directly.
     Markdown,
     /// A fenced code block with an ordinary language.
-    Code { lang: Option<String> },
+    Code {
+        lang: Option<String>,
+    },
     /// Display math: a `$$…$$` block or a ```math fence.
     Math,
     Diagram(DiagramKind),
@@ -134,8 +136,14 @@ mod tests {
 
     #[test]
     fn maps_fence_languages() {
-        assert_eq!(DiagramKind::from_lang("mermaid"), Some(DiagramKind::Mermaid));
-        assert_eq!(DiagramKind::from_lang("MERMAID"), Some(DiagramKind::Mermaid));
+        assert_eq!(
+            DiagramKind::from_lang("mermaid"),
+            Some(DiagramKind::Mermaid)
+        );
+        assert_eq!(
+            DiagramKind::from_lang("MERMAID"),
+            Some(DiagramKind::Mermaid)
+        );
         assert_eq!(DiagramKind::from_lang("puml"), Some(DiagramKind::PlantUml));
         assert_eq!(DiagramKind::from_lang("d2"), Some(DiagramKind::D2));
         assert_eq!(DiagramKind::from_lang("rust"), None);
@@ -159,7 +167,10 @@ mod tests {
         };
         assert_eq!(at(BlockKind::Markdown).renderer_id(), None);
         assert_eq!(
-            at(BlockKind::Code { lang: Some("rust".into()) }).renderer_id(),
+            at(BlockKind::Code {
+                lang: Some("rust".into())
+            })
+            .renderer_id(),
             None
         );
         assert_eq!(at(BlockKind::Math).renderer_id(), Some("math"));

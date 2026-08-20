@@ -39,7 +39,12 @@ fn markdown_fixture_parses_every_construct() {
     let doc = open("markdown.md");
     assert_eq!(doc.doc_type(), DocType::Markdown);
 
-    let headings: Vec<_> = doc.outline().headings.iter().map(|h| h.text.as_str()).collect();
+    let headings: Vec<_> = doc
+        .outline()
+        .headings
+        .iter()
+        .map(|h| h.text.as_str())
+        .collect();
     for expected in [
         "Heading 1",
         "Heading 2 with code",
@@ -362,7 +367,9 @@ fn discovery_does_not_descend_into_a_skill() {
     // be reported as skills of their own.
     let skills = discovered();
     assert!(
-        !skills.iter().any(|s| s.name == "scripts" || s.name == "references"),
+        !skills
+            .iter()
+            .any(|s| s.name == "scripts" || s.name == "references"),
         "supporting directories must not be mistaken for skills"
     );
 }
