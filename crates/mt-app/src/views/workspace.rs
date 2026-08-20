@@ -942,7 +942,7 @@ impl Workspace {
             return WebIntent::Hide;
         };
         let doc = doc.read(cx);
-        if !doc.mode().uses_webview(doc.split_preview()) {
+        if !doc.layout().uses_webview() {
             return WebIntent::Hide;
         }
         match doc.web_html() {

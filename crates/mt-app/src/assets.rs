@@ -1,8 +1,9 @@
 //! The application's asset source.
 //!
 //! GPUI resolves every asset — icons, and the fonts its SVG renderer needs —
-//! through one [`AssetSource`]. `gpui-component` ships the icons; the fonts are
-//! ours to supply, so this composes the two rather than replacing either.
+//! through one [`AssetSource`]. `gpui-component` ships most icons; the fonts and
+//! the handful of icons it lacks are ours to supply, so this composes the two
+//! rather than replacing either.
 
 use std::borrow::Cow;
 
@@ -21,6 +22,16 @@ use gpui::{AssetSource, Result, SharedString};
 #[include = "fonts/**/*.ttf"]
 struct Fonts;
 
+/// Icons `gpui-component` does not ship.
+///
+/// Ours take priority over the delegate's, so a name that exists in both
+/// resolves here — which is how an upstream icon can be replaced without
+/// forking the icon set.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "assets"]
+#[include = "icons/**/*.svg"]
+struct Icons;
+
 /// Icons plus fonts.
 ///
 /// Order matters only in that the two sets are disjoint: `gpui-component`
@@ -33,13 +44,25 @@ impl AssetSource for Assets {
         if let Some(file) = Fonts::get(path) {
             return Ok(Some(file.data));
         }
+        if let Some(file) = Icons::get(path) {
+            return Ok(Some(file.data));
+        }
         // Delegate rather than replace: this is what supplies every `IconName`.
         gpui_component_assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut items = gpui_component_assets::Assets.list(path)?;
-        items.extend(Fonts::iter().filter_map(|p| p.starts_with(path).then(|| p.into())));
+        let own = Fonts::iter()
+            .chain(Icons::iter())
+            .filter(|p| p.starts_with(path));
+        for path in own {
+            let path: SharedString = path.into();
+            // An icon of ours that shadows an upstream one is still one entry.
+            if !items.contains(&path) {
+                items.push(path);
+            }
+        }
         Ok(items)
     }
 }
@@ -85,8 +108,44 @@ mod tests {
     }
 
     #[test]
-    fn listing_covers_both_sets() {
+    fn listing_covers_every_set() {
         assert_eq!(Assets.list("fonts").unwrap().len(), 2);
-        assert!(!Assets.list("icons").unwrap().is_empty());
+        let icons = Assets.list("icons").unwrap();
+        assert!(!icons.is_empty());
+        // Ours appear alongside the delegate's rather than replacing the list.
+        assert!(
+            icons.iter().any(|p| p.ends_with("refresh-cw.svg")),
+            "own icons must be listed"
+        );
+        assert!(icons.iter().any(|p| p.ends_with("folder.svg")));
+    }
+
+    #[test]
+    fn serves_the_icons_upstream_lacks() {
+        // `refresh-cw` is not in gpui-component's set; the Harness panel used
+        // `redo` for rescanning, which is a single curved arrow and reads as
+        // "undo" rather than "reload".
+        let icon = Assets
+            .load("icons/refresh-cw.svg")
+            .expect("must resolve")
+            .expect("must exist");
+        let text = std::str::from_utf8(&icon).expect("svg is text");
+        assert!(text.contains("<svg"), "not an SVG");
+        assert!(
+            text.contains("stroke=\"currentColor\""),
+            "must take its color from the theme like every other icon"
+        );
+    }
+
+    #[test]
+    fn listing_does_not_duplicate_a_shadowed_icon() {
+        // Ours take priority on load, so listing both copies would report an
+        // icon set larger than what can actually be resolved.
+        let icons = Assets.list("icons").unwrap();
+        let mut sorted: Vec<&SharedString> = icons.iter().collect();
+        sorted.sort();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate entries in the icon list");
     }
 }

@@ -39,96 +39,123 @@ where
     cx.with_window(entity.entity_id(), |_, app| app.update_entity(&entity, f))
 }
 
-/// Which view of a document is showing.
+/// How a document is laid out.
 ///
-/// Every document conceptually supports all four; a view that does not apply
-/// (Web on a platform without a WebView) degrades with an explanation rather
-/// than disappearing.
+/// One flat list rather than a mode plus a separate preview choice. The old
+/// shape made `Split` mean two different things depending on a second control
+/// that only appeared once Split was selected, so the five layouts a user
+/// actually picks between were spread across two widgets.
+///
+/// Exactly one is active at a time, and each names exactly one preview
+/// renderer — which is what lets every other question ("does this use the
+/// WebView?", "is the editor visible?") be answered from the layout alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewMode {
-    /// Native lightweight editor.
+pub enum Layout {
+    /// The editor alone.
     Source,
     /// GPUI-native rendering: the fast path.
     Native,
     /// WebView rendering: the compatibility path.
     Web,
-    /// Source alongside a preview.
-    Split,
+    /// Editor alongside the native preview.
+    SplitNative,
+    /// Editor alongside the WebView preview.
+    SplitWeb,
 }
 
-impl ViewMode {
-    pub const ALL: [ViewMode; 4] = [
-        ViewMode::Source,
-        ViewMode::Native,
-        ViewMode::Web,
-        ViewMode::Split,
+impl Layout {
+    pub const ALL: [Layout; 5] = [
+        Layout::Source,
+        Layout::Native,
+        Layout::Web,
+        Layout::SplitNative,
+        Layout::SplitWeb,
     ];
 
-    /// The string key for this mode.
-    ///
-    /// A key rather than a string: the mode buttons are the most visible labels
-    /// in the window, so leaving them in English would make a translated UI look
-    /// half-done.
+    /// The string key for this layout's label.
     pub fn label_key(self) -> crate::i18n::Key {
         match self {
-            ViewMode::Source => crate::i18n::Key::ModeSource,
-            ViewMode::Native => crate::i18n::Key::ModeNative,
-            ViewMode::Web => crate::i18n::Key::ModeWeb,
-            ViewMode::Split => crate::i18n::Key::ModeSplit,
+            Layout::Source => crate::i18n::Key::ModeSource,
+            Layout::Native => crate::i18n::Key::ModeNative,
+            Layout::Web => crate::i18n::Key::ModeWeb,
+            Layout::SplitNative => crate::i18n::Key::ModeSplitNative,
+            Layout::SplitWeb => crate::i18n::Key::ModeSplitWeb,
         }
     }
 
-    /// The untranslated name, used for element ids and tests.
+    /// Stable id, used for element ids and settings.
     ///
-    /// Element ids must not change with the language: a keybinding or a test
-    /// that referred to `mode-Source` would break the moment the user switched
-    /// to Chinese.
-    pub fn label(self) -> &'static str {
+    /// Never translated: an id that changed with the language would break every
+    /// test and keybinding referring to it.
+    pub fn key(self) -> &'static str {
         match self {
-            ViewMode::Source => "Source",
-            ViewMode::Native => "Native",
-            ViewMode::Web => "Web",
-            ViewMode::Split => "Split",
+            Layout::Source => "source",
+            Layout::Native => "native",
+            Layout::Web => "web",
+            Layout::SplitNative => "split-native",
+            Layout::SplitWeb => "split-web",
         }
     }
 
-    /// Whether the editor is visible in this mode.
+    pub fn from_key(key: &str) -> Option<Layout> {
+        Self::ALL.into_iter().find(|l| l.key() == key)
+    }
+
+    /// Whether the editor is visible.
     pub fn shows_editor(self) -> bool {
-        matches!(self, ViewMode::Source | ViewMode::Split)
+        matches!(
+            self,
+            Layout::Source | Layout::SplitNative | Layout::SplitWeb
+        )
     }
 
-    /// Whether a preview is visible in this mode.
+    /// Whether a preview is visible.
     pub fn shows_preview(self) -> bool {
-        !matches!(self, ViewMode::Source)
+        self != Layout::Source
     }
 
-    /// Whether this mode drives the WebView.
-    pub fn uses_webview(self, split_preview: PreviewKind) -> bool {
+    /// Whether the editor and a preview are side by side.
+    pub fn is_split(self) -> bool {
+        matches!(self, Layout::SplitNative | Layout::SplitWeb)
+    }
+
+    /// Whether this layout drives the WebView.
+    ///
+    /// No second argument: the layout already names its renderer, which is the
+    /// point of collapsing the two enums.
+    pub fn uses_webview(self) -> bool {
+        matches!(self, Layout::Web | Layout::SplitWeb)
+    }
+
+    /// The preview renderer this layout uses, if it shows one.
+    pub fn preview(self) -> Option<PreviewKind> {
         match self {
-            ViewMode::Web => true,
-            ViewMode::Split => split_preview == PreviewKind::Web,
-            _ => false,
+            Layout::Source => None,
+            Layout::Native | Layout::SplitNative => Some(PreviewKind::Native),
+            Layout::Web | Layout::SplitWeb => Some(PreviewKind::Web),
+        }
+    }
+
+    /// This layout with the editor shown, for a jump that needs a cursor.
+    ///
+    /// A preview-only layout has nowhere to put a caret, so revealing an offset
+    /// in one has to open the editor. Keeping the user's chosen renderer is the
+    /// part that matters: forcing a bare "Split" silently swapped a Web preview
+    /// for a native one.
+    pub fn with_editor(self) -> Layout {
+        match self {
+            Layout::Native => Layout::SplitNative,
+            Layout::Web => Layout::SplitWeb,
+            other => other,
         }
     }
 }
 
-/// Which renderer the preview pane uses in Split mode.
-///
-/// Separating this from [`ViewMode`] is what leaves room for `Native | Web` and
-/// `Original | Translation` layouts without reworking the mode enum.
+/// Which renderer a preview pane uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewKind {
     Native,
     Web,
-}
-
-impl PreviewKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            PreviewKind::Native => "Native preview",
-            PreviewKind::Web => "Web preview",
-        }
-    }
 }
 
 #[cfg(test)]
@@ -136,65 +163,124 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mode_visibility() {
-        assert!(ViewMode::Source.shows_editor());
-        assert!(!ViewMode::Source.shows_preview());
-        assert!(!ViewMode::Native.shows_editor());
-        assert!(ViewMode::Native.shows_preview());
-        assert!(ViewMode::Split.shows_editor() && ViewMode::Split.shows_preview());
+    fn layout_visibility() {
+        assert!(Layout::Source.shows_editor());
+        assert!(!Layout::Source.shows_preview());
+        assert!(!Layout::Native.shows_editor());
+        assert!(Layout::Native.shows_preview());
+        assert!(Layout::SplitNative.shows_editor() && Layout::SplitNative.shows_preview());
+        assert!(Layout::SplitWeb.shows_editor() && Layout::SplitWeb.shows_preview());
     }
 
     #[test]
-    fn webview_is_used_only_where_expected() {
-        assert!(ViewMode::Web.uses_webview(PreviewKind::Native));
-        assert!(!ViewMode::Native.uses_webview(PreviewKind::Web));
-        assert!(!ViewMode::Source.uses_webview(PreviewKind::Web));
-        assert!(ViewMode::Split.uses_webview(PreviewKind::Web));
-        assert!(!ViewMode::Split.uses_webview(PreviewKind::Native));
-    }
-
-    #[test]
-    fn all_modes_have_distinct_labels() {
-        let labels: std::collections::HashSet<_> =
-            ViewMode::ALL.iter().map(|m| m.label()).collect();
-        assert_eq!(labels.len(), ViewMode::ALL.len());
-    }
-
-    #[test]
-    fn every_mode_shows_at_least_one_pane() {
-        // A mode that shows neither the editor nor a preview would render an
+    fn every_layout_shows_at_least_one_pane() {
+        // A layout showing neither the editor nor a preview would render an
         // empty document area.
-        for mode in ViewMode::ALL {
+        for layout in Layout::ALL {
             assert!(
-                mode.shows_editor() || mode.shows_preview(),
+                layout.shows_editor() || layout.shows_preview(),
                 "{} shows nothing",
-                mode.label()
+                layout.key()
             );
         }
     }
 
     #[test]
-    fn the_preview_choice_only_matters_in_split() {
-        // Native and Source ignore it entirely; Web always uses the WebView.
-        // This is what lets one predicate drive the pane, the HTML rebuild, and
-        // the workspace's WebView sync without them disagreeing.
-        for kind in [PreviewKind::Native, PreviewKind::Web] {
-            assert!(!ViewMode::Source.uses_webview(kind));
-            assert!(!ViewMode::Native.uses_webview(kind));
-            assert!(ViewMode::Web.uses_webview(kind));
+    fn every_layout_names_exactly_one_preview_renderer() {
+        // The reason for collapsing the two enums: `Split` used to mean two
+        // different layouts depending on a separate control, so "which renderer
+        // is showing" could not be answered from the mode alone.
+        for layout in Layout::ALL {
+            match layout.preview() {
+                None => assert!(!layout.shows_preview(), "{}", layout.key()),
+                Some(_) => assert!(layout.shows_preview(), "{}", layout.key()),
+            }
         }
-        assert!(ViewMode::Split.uses_webview(PreviewKind::Web));
-        assert!(!ViewMode::Split.uses_webview(PreviewKind::Native));
+        assert_eq!(Layout::Source.preview(), None);
+        assert_eq!(Layout::Native.preview(), Some(PreviewKind::Native));
+        assert_eq!(Layout::SplitWeb.preview(), Some(PreviewKind::Web));
     }
 
     #[test]
-    fn native_is_the_default_path_for_reading() {
-        // The conceptual rule: native is the fast path. Only two of four modes
-        // reach the WebView at all, and neither is a reading default.
-        let web_modes = ViewMode::ALL
+    fn the_webview_is_used_by_exactly_the_web_layouts() {
+        let web: Vec<&str> = Layout::ALL
             .iter()
-            .filter(|m| m.uses_webview(PreviewKind::Web))
-            .count();
-        assert_eq!(web_modes, 2, "only Web and Split-with-Web use the WebView");
+            .filter(|l| l.uses_webview())
+            .map(|l| l.key())
+            .collect();
+        assert_eq!(web, vec!["web", "split-web"]);
+        // And that agrees with the renderer each names, so the two cannot drift.
+        for layout in Layout::ALL {
+            assert_eq!(
+                layout.uses_webview(),
+                layout.preview() == Some(PreviewKind::Web),
+                "{}",
+                layout.key()
+            );
+        }
+    }
+
+    #[test]
+    fn keys_round_trip_and_are_distinct() {
+        for layout in Layout::ALL {
+            assert_eq!(Layout::from_key(layout.key()), Some(layout));
+        }
+        assert_eq!(Layout::from_key("nonsense"), None);
+        let keys: std::collections::HashSet<&str> = Layout::ALL.iter().map(|l| l.key()).collect();
+        assert_eq!(keys.len(), Layout::ALL.len());
+    }
+
+    #[test]
+    fn all_layouts_have_distinct_labels() {
+        use crate::i18n::text;
+        use crate::settings::Language;
+
+        for language in Language::ALL {
+            let labels: std::collections::HashSet<&str> = Layout::ALL
+                .iter()
+                .map(|l| text(l.label_key(), language))
+                .collect();
+            assert_eq!(
+                labels.len(),
+                Layout::ALL.len(),
+                "duplicate labels in {}",
+                language.label()
+            );
+        }
+    }
+
+    #[test]
+    fn showing_the_editor_keeps_the_chosen_renderer() {
+        // The bug this replaces: clicking an outline entry in Web mode forced
+        // the document to Split *with the native preview*, silently discarding
+        // the renderer the user had picked.
+        assert_eq!(Layout::Web.with_editor(), Layout::SplitWeb);
+        assert_eq!(Layout::Native.with_editor(), Layout::SplitNative);
+        // Layouts that already show the editor are unchanged.
+        for layout in Layout::ALL.iter().filter(|l| l.shows_editor()) {
+            assert_eq!(layout.with_editor(), *layout);
+        }
+        // And the result always has an editor to put a cursor in.
+        for layout in Layout::ALL {
+            assert!(layout.with_editor().shows_editor(), "{}", layout.key());
+        }
+    }
+
+    #[test]
+    fn split_is_exactly_the_two_side_by_side_layouts() {
+        let split: Vec<&str> = Layout::ALL
+            .iter()
+            .filter(|l| l.is_split())
+            .map(|l| l.key())
+            .collect();
+        assert_eq!(split, vec!["split-native", "split-web"]);
+        for layout in Layout::ALL {
+            assert_eq!(
+                layout.is_split(),
+                layout.shows_editor() && layout.shows_preview(),
+                "{}",
+                layout.key()
+            );
+        }
     }
 }

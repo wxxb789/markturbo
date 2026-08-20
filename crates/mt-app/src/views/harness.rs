@@ -763,7 +763,11 @@ impl Render for HarnessView {
                     })
                     .child(
                         Button::new("rescan")
-                            .icon(IconName::Redo)
+                            // Not `Redo`: a single curved arrow is the universal
+                            // "undo/revert" glyph, and on a button that rescans
+                            // the filesystem it reads as though it will put
+                            // something back. `refresh-cw` is a closed cycle.
+                            .icon(Icon::empty().path("icons/refresh-cw.svg"))
                             .xsmall()
                             .ghost()
                             .tooltip(i18n::t(i18n::Key::Rescan, cx))

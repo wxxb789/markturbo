@@ -15,6 +15,7 @@ use gpui_component::{
     h_flex,
     highlighter::Language,
     input::{Editor, EditorState, InputEvent, TabSize},
+    menu::DropdownMenu as _,
     resizable::{h_resizable, resizable_panel},
     text::{TextView, TextViewState, TextViewStyle},
     v_flex,
@@ -25,8 +26,36 @@ use crate::fs::{self, LoadedFile, SaveError};
 use crate::i18n;
 use crate::metrics;
 use crate::renderer::RendererRegistry;
-use crate::views::{PreviewKind, ViewMode};
+use crate::views::{Layout, PreviewKind};
 use crate::web::{self, Trust};
+
+// One action per layout.
+//
+// Unit actions rather than one carrying the layout: `PopupMenu` items are
+// actions, and a payload-carrying action needs `schemars` derives this crate
+// does not otherwise depend on. Five names is the cheaper trade, and it makes
+// each layout independently bindable to a key.
+actions!(
+    markturbo,
+    [
+        ViewSource,
+        ViewNative,
+        ViewWeb,
+        ViewSplitNative,
+        ViewSplitWeb
+    ]
+);
+
+/// The action that selects `layout`.
+fn layout_action(layout: Layout) -> Box<dyn gpui::Action> {
+    match layout {
+        Layout::Source => Box::new(ViewSource),
+        Layout::Native => Box::new(ViewNative),
+        Layout::Web => Box::new(ViewWeb),
+        Layout::SplitNative => Box::new(ViewSplitNative),
+        Layout::SplitWeb => Box::new(ViewSplitWeb),
+    }
+}
 
 /// How long after the last keystroke to reparse and refresh the preview.
 ///
@@ -60,8 +89,7 @@ pub struct DocumentView {
     editor: Entity<EditorState>,
     /// Native preview state. Rebuilt from `document` on reparse.
     preview: Entity<TextViewState>,
-    mode: ViewMode,
-    split_preview: PreviewKind,
+    layout: Layout,
     trust: Trust,
     dirty: bool,
     /// Set when the file changed on disk while open.
@@ -127,7 +155,7 @@ impl DocumentView {
 
         // Markdown opens in Native: reading is the common case, and it is the
         // fast path.
-        let mode = ViewMode::Native;
+        let layout = Layout::Native;
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -135,8 +163,7 @@ impl DocumentView {
             document,
             editor,
             preview,
-            mode,
-            split_preview: PreviewKind::Native,
+            layout,
             trust: Trust::Restricted,
             dirty: false,
             externally_changed: false,
@@ -179,18 +206,18 @@ impl DocumentView {
         &self.document
     }
 
-    pub fn mode(&self) -> ViewMode {
-        self.mode
+    pub fn layout(&self) -> Layout {
+        self.layout
     }
 
-    pub fn set_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
-        if self.mode == mode {
+    pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
+        if self.layout == layout {
             return;
         }
-        self.mode = mode;
+        self.layout = layout;
         // The WebView HTML is only built when a Web pane is actually visible;
         // switching into one for the first time needs it now.
-        if mode.uses_webview(self.split_preview) && self.web_html.is_none() {
+        if layout.uses_webview() && self.web_html.is_none() {
             self.rebuild_web(cx);
         }
         cx.notify();
@@ -203,24 +230,6 @@ impl DocumentView {
         self.trust = trust;
         self.rebuild_web(cx);
         cx.notify();
-    }
-
-    /// Choose which renderer fills the preview pane in Split mode.
-    pub fn set_split_preview(&mut self, kind: PreviewKind, cx: &mut Context<Self>) {
-        if self.split_preview == kind {
-            return;
-        }
-        self.split_preview = kind;
-        // Switching into a Web preview needs the HTML that was skipped while it
-        // was hidden.
-        if self.mode.uses_webview(kind) && self.web_html.is_none() {
-            self.rebuild_web(cx);
-        }
-        cx.notify();
-    }
-
-    pub fn split_preview(&self) -> PreviewKind {
-        self.split_preview
     }
 
     pub fn trust(&self) -> Trust {
@@ -265,7 +274,7 @@ impl DocumentView {
         if !crate::settings::AppSettings::global(cx).split_sync_scroll {
             return;
         }
-        if self.mode != ViewMode::Split {
+        if !self.layout.is_split() {
             return;
         }
         let Some(visible) = self.editor.read(cx).visible_row_range() else {
@@ -294,7 +303,7 @@ impl DocumentView {
 
     /// Scroll whichever preview is showing to `fraction` of its height.
     fn scroll_preview_to(&mut self, fraction: f32, cx: &mut Context<Self>) {
-        match self.split_preview {
+        match self.layout.preview().unwrap_or(PreviewKind::Native) {
             PreviewKind::Web => {
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 if let Some(webview) = &self.webview {
@@ -320,32 +329,44 @@ impl DocumentView {
     }
 
     pub fn reveal_offset(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.mode.shows_editor() {
-            self.set_mode(ViewMode::Split, cx);
-        }
         // Clamp against the *editor's* text, not the parsed document: the parse
         // is debounced, so an outline built moments ago can name an offset past
         // the end of a document the user has since shortened.
-        let offset = offset.min(self.text(cx).len());
-        self.editor.update(cx, |state, cx| {
-            // `set_selected_range` routes through `move_to`, which is what
-            // scrolls the viewport; setting the cursor without it would move an
-            // invisible caret.
-            state.set_selected_range(offset..offset, cx);
-            state.focus(window, cx);
-        });
-        // Jumping from the outline is exactly when the two panes must agree, and
-        // the editor has not laid out at the new position yet — so compute the
-        // fraction from the offset rather than waiting for a visible range.
-        if crate::settings::AppSettings::global(cx).split_sync_scroll
-            && self.mode == ViewMode::Split
-        {
-            let text = self.text(cx);
-            let fraction = if text.is_empty() {
-                0.
-            } else {
-                offset as f32 / text.len() as f32
-            };
+        let text = self.text(cx);
+        let offset = offset.min(text.len());
+        let fraction = if text.is_empty() {
+            0.
+        } else {
+            offset as f32 / text.len() as f32
+        };
+
+        // A preview-only layout has no caret to move, so the jump has to reach
+        // the preview instead. Only the Web preview can be scrolled today —
+        // the native one is a `TextView` that owns its scroll handle without
+        // exposing it — so Native falls back to opening the editor beside it,
+        // keeping the renderer the user chose.
+        let can_scroll_preview = self.layout.preview() == Some(PreviewKind::Web);
+        if !self.layout.shows_editor() && !can_scroll_preview {
+            self.set_layout(self.layout.with_editor(), cx);
+        }
+
+        if self.layout.shows_editor() {
+            self.editor.update(cx, |state, cx| {
+                // `set_selected_range` routes through `move_to`, which is what
+                // scrolls the viewport; setting the cursor without it would move
+                // an invisible caret.
+                state.set_selected_range(offset..offset, cx);
+                state.focus(window, cx);
+            });
+        }
+
+        // Scroll the preview when it is the only pane — a jump that moved
+        // nothing visible is a click that did nothing — and in Split only when
+        // the user asked the panes to stay together.
+        let preview_only = !self.layout.shows_editor();
+        let sync_split =
+            self.layout.is_split() && crate::settings::AppSettings::global(cx).split_sync_scroll;
+        if preview_only || sync_split {
             // The render-driven sync would otherwise see the same first visible
             // row it last recorded and skip the update.
             self.synced_row = None;
@@ -489,7 +510,7 @@ impl DocumentView {
     fn refresh_web(&mut self, cx: &mut Context<Self>) {
         // Only build HTML when a Web pane is actually visible; doing it for a
         // hidden pane is pure waste.
-        if self.mode.uses_webview(self.split_preview) {
+        if self.layout.uses_webview() {
             self.rebuild_web(cx);
         } else {
             // Invalidate so switching to Web later rebuilds rather than showing
@@ -575,39 +596,34 @@ impl DocumentView {
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
+            // One dropdown rather than four buttons and a conditional toggle.
+            // The five layouts are mutually exclusive, so a control that shows
+            // one value and opens to reveal the rest is the honest shape — and
+            // the old toggle only appeared once Split was selected, which hid
+            // half the choices behind the other half.
             .child(
-                h_flex()
-                    .gap(metrics::gap())
-                    .children(ViewMode::ALL.map(|mode| {
-                        // The id keeps the untranslated name so it stays
-                        // stable across languages; only the label translates.
-                        Button::new(SharedString::from(format!("mode-{}", mode.label())))
-                            .label(i18n::t(mode.label_key(), cx))
-                            .xsmall()
-                            .when(self.mode == mode, |b| b.primary())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_mode(mode, cx);
-                            }))
-                    })),
+                Button::new("layout")
+                    .label(i18n::t(self.layout.label_key(), cx))
+                    .icon(IconName::ChevronDown)
+                    .xsmall()
+                    .ghost()
+                    .tooltip(i18n::t(i18n::Key::ViewLayout, cx))
+                    .dropdown_menu({
+                        let current = self.layout;
+                        move |menu, _window, _cx| {
+                            Layout::ALL.iter().fold(menu, |menu, layout| {
+                                menu.menu_with_check(
+                                    i18n::text(
+                                        layout.label_key(),
+                                        crate::settings::Language::default(),
+                                    ),
+                                    *layout == current,
+                                    layout_action(*layout),
+                                )
+                            })
+                        }
+                    }),
             )
-            // In Split, which renderer fills the preview pane is a separate
-            // choice from the mode. Keeping them separate is what leaves room
-            // for `Native | Web` and `Original | Translation` later.
-            .when(self.mode == ViewMode::Split, |this| {
-                let next = match self.split_preview {
-                    PreviewKind::Native => PreviewKind::Web,
-                    PreviewKind::Web => PreviewKind::Native,
-                };
-                this.child(
-                    Button::new("split-preview")
-                        .label(self.split_preview.label())
-                        .xsmall()
-                        .ghost()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_split_preview(next, cx);
-                        })),
-                )
-            })
             .child(div().flex_1())
             // Document type is a first-class label: an AGENTS.md is not just
             // "a Markdown file".
@@ -822,7 +838,7 @@ impl DocumentView {
         // One predicate decides this everywhere — here, in `refresh_web`, and
         // in the workspace's WebView sync — so the panes cannot disagree about
         // which renderer is showing.
-        if self.mode.uses_webview(self.split_preview) {
+        if self.layout.uses_webview() {
             self.render_web_preview(cx).into_any_element()
         } else {
             self.render_native_preview(cx).into_any_element()
@@ -1001,13 +1017,15 @@ impl Focusable for DocumentView {
 
 impl Render for DocumentView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match self.mode {
-            ViewMode::Source => self.render_editor(cx).into_any_element(),
-            ViewMode::Native | ViewMode::Web => self.render_preview(cx),
-            ViewMode::Split => h_resizable("split")
+        let body = if self.layout.is_split() {
+            h_resizable("split")
                 .child(resizable_panel().child(self.render_editor(cx)))
                 .child(resizable_panel().child(self.render_preview(cx)))
-                .into_any_element(),
+                .into_any_element()
+        } else if self.layout.shows_editor() {
+            self.render_editor(cx).into_any_element()
+        } else {
+            self.render_preview(cx)
         };
 
         // After the panes are built, so the editor has a layout to report a
@@ -1017,6 +1035,21 @@ impl Render for DocumentView {
 
         v_flex()
             .id("document")
+            // One handler per layout action, so the dropdown items work and each
+            // layout is independently bindable.
+            .on_action(
+                cx.listener(|this, _: &ViewSource, _, cx| this.set_layout(Layout::Source, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ViewNative, _, cx| this.set_layout(Layout::Native, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ViewWeb, _, cx| this.set_layout(Layout::Web, cx)))
+            .on_action(cx.listener(|this, _: &ViewSplitNative, _, cx| {
+                this.set_layout(Layout::SplitNative, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ViewSplitWeb, _, cx| this.set_layout(Layout::SplitWeb, cx)),
+            )
             // A focusable element with an id but no role makes assistive
             // technology announce the whole window instead of the document —
             // gpui logs exactly that. `Group` is the right one for a container
@@ -1069,9 +1102,14 @@ mod tests {
         );
     }
 
-    /// Revealing an offset must move the *editor* cursor, not just the mode.
+    /// Revealing an offset must move something visible, in every layout.
+    ///
+    /// The bug this replaces: a jump from the outline forced the document into
+    /// Split — discarding the user's chosen renderer — because moving a caret
+    /// was the only thing it knew how to do. Every layout has to respond, and
+    /// none may silently switch to a different preview.
     #[test]
-    fn reveal_offset_moves_the_cursor_and_shows_the_editor() {
+    fn reveal_offset_moves_something_in_every_layout() {
         let source = include_str!("document.rs");
         let start = source.find("pub fn reveal_offset").expect("reveal_offset");
         let body = &source[start..];
@@ -1085,8 +1123,18 @@ mod tests {
             "must move the cursor through the path that also scrolls it into view"
         );
         assert!(
-            body.contains("shows_editor"),
-            "a preview-only mode has no visible cursor to move"
+            body.contains("scroll_preview_to"),
+            "a preview-only layout has no caret, so the preview has to move"
+        );
+        assert!(
+            body.contains("with_editor()"),
+            "a layout whose preview cannot be scrolled must open the editor \
+             beside it rather than switching renderers"
+        );
+        assert!(
+            !body.contains("Layout::SplitNative") && !body.contains("Layout::Split)"),
+            "the layout must be derived from the current one, not hard-coded — \
+             hard-coding is what discarded the user's renderer"
         );
     }
 
