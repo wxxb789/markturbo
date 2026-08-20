@@ -114,6 +114,14 @@ impl GroupBy {
 #[serde(default, rename_all = "kebab-case")]
 pub struct AppSettings {
     pub theme: ThemePreference,
+    /// Preset id used when the effective mode is light.
+    ///
+    /// Two ids rather than one: the theme preference can be `System`, and a
+    /// machine that flips at sunset should land on the user's chosen dark preset
+    /// rather than a generic one.
+    pub theme_light: String,
+    /// Preset id used when the effective mode is dark.
+    pub theme_dark: String,
     /// Target language for translation, e.g. `zh`.
     pub translate_to: String,
     /// Provider id, matching [`crate::translate::Provider::key`].
@@ -131,6 +139,8 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             theme: ThemePreference::default(),
+            theme_light: crate::theme::DEFAULT_LIGHT.into(),
+            theme_dark: crate::theme::DEFAULT_DARK.into(),
             translate_to: "zh".into(),
             // Empty means "whatever is configured and available", so a machine
             // that gains an API key starts using it without editing settings.
@@ -226,21 +236,57 @@ pub fn settings_path() -> Option<PathBuf> {
 
 /// Apply the theme preference.
 ///
-/// `System` reads the OS appearance rather than guessing; the other two are
-/// explicit. Pass the window where there is one — on Linux the app-level
-/// appearance query errors, which is why gpui-component's helper takes one at
-/// all — and `None` from a setting callback, which only has an `App`.
+/// Resolves the preference to a light/dark mode, then applies the preset the
+/// user picked for that mode. `System` reads the OS appearance rather than
+/// guessing; the other two are explicit. Pass the window where there is one —
+/// on Linux the app-level appearance query errors, which is why gpui-component's
+/// helper takes one at all — and `None` from a setting callback, which only has
+/// an `App`.
 ///
 /// This recolors GPUI. It does *not* rebuild the Web preview, which caches HTML
-/// with the scheme baked in; see `Workspace::set_theme`.
+/// with the palette baked in; see `Workspace::set_theme`.
 pub fn apply_theme(preference: ThemePreference, window: Option<&mut gpui::Window>, cx: &mut App) {
-    use gpui_component::{Theme, ThemeMode};
+    let dark = resolve_dark(preference, window.as_deref(), cx);
+    let settings = AppSettings::global(cx);
+    let id = if dark {
+        settings.theme_dark.clone()
+    } else {
+        settings.theme_light.clone()
+    };
+    crate::theme::apply(crate::theme::by_id(&id, dark), window, cx);
+}
+
+/// Whether `preference` means dark right now.
+///
+/// For `System` this is the window's appearance where there is a window, and the
+/// app-level one otherwise. gpui-component's own `sync_system_appearance` prefers
+/// the window for the same reason: the app-level query errors on Linux.
+fn resolve_dark(preference: ThemePreference, window: Option<&gpui::Window>, cx: &App) -> bool {
+    use gpui_component::ThemeMode;
 
     match preference {
-        ThemePreference::System => Theme::sync_system_appearance(window, cx),
-        ThemePreference::Light => Theme::change(ThemeMode::Light, window, cx),
-        ThemePreference::Dark => Theme::change(ThemeMode::Dark, window, cx),
+        ThemePreference::Light => false,
+        ThemePreference::Dark => true,
+        ThemePreference::System => {
+            let appearance = match window {
+                Some(window) => window.appearance(),
+                None => cx.window_appearance(),
+            };
+            ThemeMode::from(appearance).is_dark()
+        }
     }
+}
+
+/// The preset that is currently in effect.
+pub fn active_preset(cx: &App) -> &'static crate::theme::Preset {
+    let dark = is_dark(cx);
+    let settings = AppSettings::global(cx);
+    let id = if dark {
+        &settings.theme_dark
+    } else {
+        &settings.theme_light
+    };
+    crate::theme::by_id(id, dark)
 }
 
 /// Whether the *effective* theme is dark, after the preference is resolved.
@@ -323,6 +369,25 @@ mod tests {
         assert_eq!(back.theme, ThemePreference::Dark);
         assert_eq!(back.translate_to, AppSettings::default().translate_to);
         assert_eq!(back.skills_group_by, GroupBy::Origin);
+        // Added after the first release: a file that predates presets must
+        // still resolve to a real one rather than an empty id.
+        assert_eq!(back.theme_light, crate::theme::DEFAULT_LIGHT);
+        assert_eq!(back.theme_dark, crate::theme::DEFAULT_DARK);
+    }
+
+    #[test]
+    fn the_default_preset_ids_name_real_presets() {
+        // A default that does not resolve would silently fall back, hiding a
+        // typo behind correct-looking behavior.
+        let settings = AppSettings::default();
+        assert_eq!(
+            crate::theme::by_id(&settings.theme_light, false).id,
+            settings.theme_light
+        );
+        assert_eq!(
+            crate::theme::by_id(&settings.theme_dark, true).id,
+            settings.theme_dark
+        );
     }
 
     #[test]
@@ -350,6 +415,8 @@ mod tests {
 
         let settings = AppSettings {
             theme: ThemePreference::Light,
+            theme_light: "sepia".into(),
+            theme_dark: "nord".into(),
             translate_provider: "anthropic".into(),
             translate_model: "claude-sonnet-5".into(),
             skills_include_internal: true,

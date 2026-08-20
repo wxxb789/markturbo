@@ -8,6 +8,7 @@
 //!   ↓
 //! assets     icons + the fonts GPUI's SVG renderer needs
 //! settings   user preferences, persisted as JSON
+//! theme      preset palettes, driving GPUI and the Web preview alike
 //! fs         load/save with conflict protection
 //! workspace  directory tree
 //! renderer   block renderer registry (diagrams, math)
@@ -20,6 +21,7 @@ pub mod assets;
 pub mod fs;
 pub mod renderer;
 pub mod settings;
+pub mod theme;
 pub mod translate;
 pub mod views;
 pub mod watcher;

@@ -406,19 +406,15 @@ impl DocumentView {
             self.web_html = Some(oversize_notice(self.document.source().len()));
             return;
         }
-        // Pin the preview to the app's effective theme rather than letting the
-        // browser follow the OS: otherwise an explicit Light preference shows a
-        // dark preview next to a light editor.
-        let appearance = if crate::settings::is_dark(cx) {
-            web::Appearance::Dark
-        } else {
-            web::Appearance::Light
-        };
+        // Paint the preview with the app's own preset rather than letting the
+        // browser follow the OS: otherwise an explicit Nord shows a generic dark
+        // preview next to Nord-colored chrome.
+        let preset = crate::settings::active_preset(cx);
         self.web_html = Some(web::build_html_themed(
             &self.document,
             &self.registry,
             self.trust,
-            appearance,
+            Some(preset),
         ));
     }
 

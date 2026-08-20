@@ -39,49 +39,28 @@ impl Trust {
     }
 }
 
-/// Which color scheme the rendered document uses.
-///
-/// The WebView renders in its own browser context, so it does not see the GPUI
-/// theme at all — without this it follows the OS while the rest of the window
-/// follows the user's explicit preference, and Split mode shows two documents in
-/// two different themes side by side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Appearance {
-    /// Let the browser decide from the OS. Correct when the app is also
-    /// following the system.
-    #[default]
-    System,
-    Light,
-    Dark,
-}
-
-impl Appearance {
-    /// The CSS `color-scheme` value, which drives both the browser's default
-    /// colors and the `light-dark()` values in the stylesheet.
-    fn color_scheme(self) -> &'static str {
-        match self {
-            Appearance::System => "light dark",
-            Appearance::Light => "light",
-            Appearance::Dark => "dark",
-        }
-    }
-}
-
 /// Build the HTML document shown in the WebView.
 ///
 /// Diagrams and math are pre-rendered by the same registry the native path
 /// uses, so both renderers are driven by one document model — the WebView is
 /// not a second, divergent pipeline.
+///
+/// Uses the system color scheme. [`build_html_themed`] is the one the app
+/// calls; this is for tests and any caller with no preset in hand.
 pub fn build_html(doc: &Document, registry: &RendererRegistry, trust: Trust) -> String {
-    build_html_themed(doc, registry, trust, Appearance::System)
+    build_html_themed(doc, registry, trust, None)
 }
 
-/// Build the HTML document, pinning its color scheme.
+/// Build the HTML document, painted with a preset.
+///
+/// `None` leaves the document following the OS, which is right only when the
+/// app is too. Passing the app's own preset is what keeps Split mode from
+/// showing the same document in two palettes.
 pub fn build_html_themed(
     doc: &Document,
     registry: &RendererRegistry,
     trust: Trust,
-    appearance: Appearance,
+    preset: Option<&crate::theme::Preset>,
 ) -> String {
     let body = match doc.doc_type() {
         mt_doc::DocType::Mdx => render_mdx_body(doc, registry, trust),
@@ -89,11 +68,50 @@ pub fn build_html_themed(
     };
 
     format!(
-        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>:root {{ color-scheme: {scheme}; }}\n{style}</style>\n</head><body>{banner}{body}</body></html>",
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>{vars}\n{style}</style>\n</head><body>{banner}{body}</body></html>",
         csp = csp_meta(trust),
-        scheme = appearance.color_scheme(),
+        vars = css_variables(preset),
         style = STYLE,
         banner = trust_banner(doc, trust),
+    )
+}
+
+/// The `:root` block: the preset's palette as CSS custom properties.
+///
+/// Variable names follow ColaMD's, which is what the palettes were authored
+/// against — so a preset transcribed from one of its stylesheets keeps meaning
+/// the same thing here.
+fn css_variables(preset: Option<&crate::theme::Preset>) -> String {
+    let Some(preset) = preset else {
+        // No preset: follow the OS, and let the stylesheet's `light-dark()`
+        // values resolve. Every `var()` below has a fallback for exactly this.
+        return ":root { color-scheme: light dark; }".to_string();
+    };
+    let t = preset.tokens;
+    let hex = |c: u32| format!("#{c:06x}");
+    format!(
+        ":root {{\n  color-scheme: {scheme};\n  --bg-color: {bg};\n  --text-color: {text};\n  \
+         --text-secondary: {secondary};\n  --text-muted: {muted};\n  --border-color: {border};\n  \
+         --link-color: {link};\n  --code-bg: {code_bg};\n  --code-block-bg: {code_block_bg};\n  \
+         --blockquote-border: {quote};\n  --table-header-bg: {table_head};\n  \
+         --selection-bg: {selection};\n  --highlight-bg: {highlight};\n  --accent-color: {accent};\n  \
+         --body-font: {font};\n  --body-line-height: {line_height};\n}}",
+        scheme = if preset.dark { "dark" } else { "light" },
+        bg = hex(t.bg),
+        text = hex(t.text),
+        secondary = hex(t.text_secondary),
+        muted = hex(t.text_muted),
+        border = hex(t.border),
+        link = hex(t.link),
+        code_bg = hex(t.code_bg),
+        code_block_bg = hex(t.code_block_bg),
+        quote = hex(t.blockquote_border),
+        table_head = hex(t.table_header_bg),
+        selection = hex(t.selection),
+        highlight = hex(t.highlight),
+        accent = hex(t.accent),
+        font = preset.font.css(),
+        line_height = preset.font.line_height(),
     )
 }
 
@@ -280,27 +298,50 @@ pub fn to_data_url(html: &str) -> String {
     out
 }
 
+/// The document stylesheet.
+///
+/// Every color reads a custom property with a fallback, so the same sheet works
+/// both when a preset supplied `:root` variables and when it did not (the
+/// system-following case, where the fallbacks are translucent grays that read on
+/// either page).
 const STYLE: &str = r#"
-body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif; line-height: 1.6;
-       margin: 0; padding: 24px 32px; max-width: 60rem; }
-pre  { background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; overflow-x: auto; }
-code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .9em; }
+body { font-family: var(--body-font, -apple-system, "Segoe UI", system-ui, sans-serif);
+       line-height: var(--body-line-height, 1.6);
+       color: var(--text-color, inherit); background: var(--bg-color, transparent);
+       margin: 0; padding: 32px 40px; max-width: 62rem; }
+::selection { background: var(--selection-bg, rgba(127,127,127,.3)); }
+a { color: var(--link-color, inherit); }
+h1, h2, h3, h4, h5, h6 { line-height: 1.3; margin: 1.6em 0 .6em; }
+h1 { font-size: 1.9em; letter-spacing: -0.01em; }
+h1, h2 { border-bottom: 1px solid var(--border-color, rgba(127,127,127,.35));
+         padding-bottom: .3em; }
+strong { color: var(--accent-color, inherit); }
+hr { border: none; border-top: 1px solid var(--border-color, rgba(127,127,127,.35));
+     margin: 2em 0; }
+pre  { background: var(--code-block-bg, rgba(127,127,127,.12)); padding: 14px 16px;
+       border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .9em;
+       background: var(--code-bg, rgba(127,127,127,.15)); border-radius: 4px;
+       padding: .15em .35em; }
 pre code { background: none; padding: 0; }
-table { border-collapse: collapse; }
-th, td { border: 1px solid rgba(127,127,127,.35); padding: 6px 10px; }
-blockquote { border-left: 3px solid rgba(127,127,127,.4); margin-left: 0; padding-left: 1em;
-             opacity: .85; }
+table { border-collapse: collapse; margin: 1.2em 0; }
+th, td { border: 1px solid var(--border-color, rgba(127,127,127,.35)); padding: 7px 12px; }
+th { background: var(--table-header-bg, rgba(127,127,127,.12)); }
+mark { background: var(--highlight-bg, rgba(240,200,60,.35)); color: inherit; }
+blockquote { border-left: 3px solid var(--blockquote-border, rgba(127,127,127,.4));
+             color: var(--text-secondary, inherit); margin-left: 0; padding-left: 1.1em; }
 img, svg { max-width: 100%; }
-.mt-render { margin: 1em 0; text-align: center; }
-.mt-error { border: 1px solid #d9534f; border-left-width: 4px; border-radius: 6px;
-            padding: 10px 14px; margin: 1em 0; }
+.mt-render { margin: 1.4em 0; text-align: center; }
+.mt-error { border: 1px solid #d9534f; border-left-width: 4px; border-radius: 8px;
+            padding: 10px 14px; margin: 1.2em 0; }
 .mt-error-title { font-weight: 600; color: #d9534f; }
 .mt-error-msg   { white-space: pre-wrap; margin: .4em 0; font-size: .92em; }
-.mt-mdx { border: 1px dashed rgba(127,127,127,.6); border-radius: 6px; padding: 8px 12px;
-          margin: 1em 0; }
-.mt-mdx-label { font-family: ui-monospace, monospace; font-size: .85em; opacity: .75; }
+.mt-mdx { border: 1px dashed var(--border-color, rgba(127,127,127,.6)); border-radius: 8px;
+          padding: 8px 12px; margin: 1.2em 0; }
+.mt-mdx-label { font-family: ui-monospace, monospace; font-size: .85em;
+                color: var(--text-muted, inherit); }
 .mt-banner { background: rgba(240,173,78,.18); border: 1px solid rgba(240,173,78,.6);
-             border-radius: 6px; padding: 10px 14px; margin-bottom: 1.5em; font-size: .92em; }
+             border-radius: 8px; padding: 10px 14px; margin-bottom: 1.5em; font-size: .92em; }
 "#;
 
 #[cfg(test)]
@@ -466,37 +507,64 @@ mod tests {
     }
 
     #[test]
-    fn the_color_scheme_follows_the_requested_appearance() {
+    fn the_color_scheme_follows_the_preset() {
         let doc = md("# x\n");
-        // Default is System, so a browser with no app preference matches the OS.
+        // No preset: follow the OS, which is right only when the app does too.
         assert!(
             build_html(&doc, &registry(), Trust::Restricted).contains("color-scheme: light dark")
         );
 
-        for (appearance, expected) in [
-            (Appearance::Light, "color-scheme: light"),
-            (Appearance::Dark, "color-scheme: dark"),
+        for (id, dark, expected) in [
+            ("light", false, "color-scheme: light"),
+            ("dark", true, "color-scheme: dark"),
         ] {
-            let html = build_html_themed(&doc, &registry(), Trust::Restricted, appearance);
-            assert!(html.contains(expected), "{appearance:?} produced {html}");
+            let preset = crate::theme::by_id(id, dark);
+            let html = build_html_themed(&doc, &registry(), Trust::Restricted, Some(preset));
+            assert!(html.contains(expected), "{id} produced {html}");
             // A pinned scheme must not also leave the paired value in, or the
             // browser falls back to following the OS.
             assert!(
                 !html.contains("color-scheme: light dark"),
-                "{appearance:?} must pin the scheme"
+                "{id} must pin the scheme"
             );
         }
     }
 
     #[test]
+    fn a_preset_paints_the_document_with_its_own_palette() {
+        // The whole point of the preset reaching the WebView: the preview and
+        // the chrome around it must not disagree about what Nord looks like.
+        let preset = crate::theme::by_id("nord", true);
+        let html = build_html_themed(&md("# x\n"), &registry(), Trust::Restricted, Some(preset));
+        assert!(
+            html.contains(&format!("--bg-color: #{:06x}", preset.tokens.bg)),
+            "got {html}"
+        );
+        assert!(html.contains(&format!("--link-color: #{:06x}", preset.tokens.link)));
+        // The stylesheet has to actually consume them, or the variables are
+        // decoration.
+        assert!(html.contains("var(--bg-color"));
+        assert!(html.contains("var(--link-color"));
+    }
+
+    #[test]
+    fn a_reading_preset_carries_its_typeface_into_the_preview() {
+        let writer = crate::theme::by_id("writer", false);
+        let html = build_html_themed(&md("# x\n"), &registry(), Trust::Restricted, Some(writer));
+        assert!(html.contains("--body-font:"), "got {html}");
+        assert!(html.contains("monospace"), "Writer is a monospace preset");
+        assert!(html.contains("var(--body-font"));
+    }
+
+    #[test]
     fn theming_does_not_weaken_the_csp() {
-        // The color scheme is injected next to the stylesheet; a mistake there
-        // would be the kind that quietly drops a directive.
+        // The palette is injected next to the stylesheet; a mistake there would
+        // be the kind that quietly drops a directive.
         let html = build_html_themed(
             &md("# x\n"),
             &registry(),
             Trust::Restricted,
-            Appearance::Dark,
+            Some(crate::theme::by_id("dracula", true)),
         );
         assert!(html.contains("default-src 'none'"));
         assert!(html.contains("script-src 'none'"));

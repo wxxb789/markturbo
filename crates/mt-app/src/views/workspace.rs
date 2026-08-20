@@ -335,11 +335,19 @@ impl Workspace {
     }
 
     /// Apply a theme preference and rebuild anything that bakes it in.
-    ///
-    /// The Web preview renders in its own browser context and caches its HTML,
-    /// so it does not pick up a GPUI theme change on its own.
     fn set_theme(&mut self, preference: crate::settings::ThemePreference, cx: &mut Context<Self>) {
         crate::settings::AppSettings::update(cx, |settings| settings.theme = preference);
+        self.reapply_theme(cx);
+    }
+
+    /// Re-resolve the saved theme and repaint everything that caches it.
+    ///
+    /// The Web preview renders in its own browser context and caches its HTML
+    /// with the palette baked in, so it does not pick up a GPUI theme change on
+    /// its own. Called for both a mode change and a preset change — the two are
+    /// separate settings that land in the same place.
+    fn reapply_theme(&mut self, cx: &mut Context<Self>) {
+        let preference = crate::settings::AppSettings::global(cx).theme;
         crate::settings::apply_theme(preference, None, cx);
         for doc in self.documents.clone() {
             doc.update(cx, |doc, cx| doc.theme_changed(cx));
@@ -463,6 +471,12 @@ impl Workspace {
             .iter()
             .map(|p| (p.key().into(), p.label().into()))
             .collect();
+        let light_presets: Vec<(SharedString, SharedString)> = crate::theme::for_mode(false)
+            .map(|p| (p.id.into(), p.name.into()))
+            .collect();
+        let dark_presets: Vec<(SharedString, SharedString)> = crate::theme::for_mode(true)
+            .map(|p| (p.id.into(), p.name.into()))
+            .collect();
         let group_options: Vec<(SharedString, SharedString)> = GroupBy::ALL
             .iter()
             .map(|g| (g.key().into(), g.label().into()))
@@ -483,10 +497,9 @@ impl Workspace {
                 SettingPage::new("Appearance")
                     .icon(Icon::new(IconName::Palette))
                     .default_open(true)
-                    .group(
-                        SettingGroup::new().title("Theme").item(
+                    .group(SettingGroup::new().title("Theme").items(vec![
                             SettingItem::new(
-                                "Theme",
+                                "Mode",
                                 SettingField::dropdown(
                                     theme_options,
                                     |cx: &App| AppSettings::global(cx).theme.key().into(),
@@ -495,7 +508,7 @@ impl Workspace {
                                         move |value: SharedString, cx: &mut App| {
                                             let preference = ThemePreference::from_key(&value);
                                             // Through the workspace so the Web
-                                            // preview, which bakes the scheme into
+                                            // preview, which bakes the palette into
                                             // cached HTML, rebuilds too.
                                             workspace.update(cx, |this, cx| {
                                                 this.set_theme(preference, cx)
@@ -507,10 +520,48 @@ impl Workspace {
                             )
                             .description(
                                 "System follows the operating system, and keeps following it \
-                             while the app is running.",
+                                 while the app is running.",
                             ),
-                        ),
-                    ),
+                            // Two presets rather than one: the mode above can be
+                            // System, so a machine that flips at sunset has to
+                            // know which preset to land on either side.
+                            SettingItem::new(
+                                "Light theme",
+                                SettingField::dropdown(
+                                    light_presets,
+                                    |cx: &App| AppSettings::global(cx).theme_light.clone().into(),
+                                    {
+                                        let workspace = workspace.clone();
+                                        move |value: SharedString, cx: &mut App| {
+                                            AppSettings::update(cx, |settings| {
+                                                settings.theme_light = value.to_string()
+                                            });
+                                            workspace.update(cx, |this, cx| this.reapply_theme(cx));
+                                        }
+                                    },
+                                )
+                                .default_value(crate::theme::DEFAULT_LIGHT.to_string()),
+                            )
+                            .description("Used whenever the effective mode is light."),
+                            SettingItem::new(
+                                "Dark theme",
+                                SettingField::dropdown(
+                                    dark_presets,
+                                    |cx: &App| AppSettings::global(cx).theme_dark.clone().into(),
+                                    {
+                                        let workspace = workspace.clone();
+                                        move |value: SharedString, cx: &mut App| {
+                                            AppSettings::update(cx, |settings| {
+                                                settings.theme_dark = value.to_string()
+                                            });
+                                            workspace.update(cx, |this, cx| this.reapply_theme(cx));
+                                        }
+                                    },
+                                )
+                                .default_value(crate::theme::DEFAULT_DARK.to_string()),
+                            )
+                            .description("Used whenever the effective mode is dark."),
+                        ])),
             )
             .page(
                 SettingPage::new("Translation")
