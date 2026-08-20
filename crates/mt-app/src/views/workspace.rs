@@ -23,6 +23,7 @@ use gpui_component::{
 use mt_doc::translate::Scope;
 
 use crate::fs;
+use crate::metrics;
 use crate::renderer::RendererRegistry;
 use crate::translate::Provider;
 use crate::views::document::{DocumentEvent, DocumentView};
@@ -626,8 +627,7 @@ impl Workspace {
             .page(
                 SettingPage::new("Skills")
                     .icon(Icon::new(IconName::Bot))
-                    .group(
-                        SettingGroup::new().title("Discovery").items(vec![
+                    .group(SettingGroup::new().title("Discovery").items(vec![
                             SettingItem::new(
                                 "Include global skills",
                                 SettingField::switch(
@@ -686,8 +686,7 @@ impl Workspace {
                                 .default_value(GroupBy::Origin.key().to_string()),
                             )
                             .description("How the Skills list is organized."),
-                        ]),
-                    ),
+                        ])),
             )
             .into_any_element()
     }
@@ -936,6 +935,7 @@ impl Workspace {
                 TabBar::new("side-tabs")
                     .underline()
                     .w_full()
+                    .px(metrics::inset() - metrics::row_pad())
                     .selected_index(
                         SidePanel::ALL
                             .iter()
@@ -981,14 +981,15 @@ impl Workspace {
         v_flex()
             .id("outline")
             .size_full()
-            .p_1()
-            .gap_0p5()
+            .px(px(metrics::INSET - metrics::ROW_PAD))
+            .py_1()
+            .gap(metrics::row_gap())
             .overflow_y_scroll()
             .children(outline.headings.iter().enumerate().map(|(ix, h)| {
                 let offset = h.offset;
                 ListItem::new(("outline-heading", ix))
                     .w_full()
-                    .px_2()
+                    .px(metrics::row_pad())
                     .py_0p5()
                     .rounded(cx.theme().radius)
                     .child(
@@ -997,7 +998,7 @@ impl Workspace {
                             // padding has to be on the content rather than the
                             // row — otherwise the hover highlight steps in with
                             // it and the list looks ragged.
-                            .pl(px(10.) * (h.depth.saturating_sub(1)) as f32)
+                            .pl(metrics::indent(h.depth.saturating_sub(1) as usize))
                             .text_sm()
                             .truncate()
                             .child(h.text.clone()),
@@ -1010,7 +1011,7 @@ impl Workspace {
                 let offset = entry.offset;
                 ListItem::new(("outline-structural", ix))
                     .w_full()
-                    .px_2()
+                    .px(metrics::row_pad())
                     .py_0p5()
                     .rounded(cx.theme().radius)
                     .child(
@@ -1075,12 +1076,13 @@ impl Workspace {
 
         h_flex()
             .w_full()
-            .px_3()
-            .py_1()
-            .gap_3()
+            .h(metrics::status_bar())
+            .px(metrics::inset())
+            .gap(metrics::gap_group())
             .items_center()
             .border_t_1()
             .border_color(cx.theme().border)
+            .bg(cx.theme().status_bar)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .children(self.status.clone().map(|s| div().flex_1().child(s)))
@@ -1107,7 +1109,7 @@ impl Workspace {
 
 fn empty_hint(cx: &App, text: &str) -> impl IntoElement {
     div()
-        .p_4()
+        .p(metrics::inset())
         .text_sm()
         .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
@@ -1176,9 +1178,17 @@ impl Render for Workspace {
                 TitleBar::new().child(
                     h_flex()
                         .w_full()
-                        .gap_2()
+                        .h(metrics::title_bar())
+                        .pl(metrics::inset())
+                        .gap(metrics::gap_group())
                         .items_center()
-                        .child(div().text_sm().font_bold().child("markturbo"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(cx.theme().foreground)
+                                .child("markturbo"),
+                        )
                         .child(div().flex_1())
                         .child(
                             // The title bar is a `WindowControlArea::Drag`
@@ -1189,7 +1199,7 @@ impl Render for Workspace {
                             // is what upstream's own example does
                             // (gpui-component `story/src/title_bar.rs`).
                             h_flex()
-                                .gap_2()
+                                .gap(metrics::gap())
                                 .items_center()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
@@ -1250,7 +1260,7 @@ impl Render for Workspace {
                     h_resizable("workspace-split")
                         .child(
                             resizable_panel()
-                                .size(px(260.))
+                                .size(metrics::side_panel())
                                 .child(self.render_side_panel(cx)),
                         )
                         .child(

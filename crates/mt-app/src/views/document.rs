@@ -22,6 +22,7 @@ use gpui_component::{
 use mt_doc::{DocType, Document, Severity};
 
 use crate::fs::{self, LoadedFile, SaveError};
+use crate::metrics;
 use crate::renderer::RendererRegistry;
 use crate::views::{PreviewKind, ViewMode};
 use crate::web::{self, Trust};
@@ -472,21 +473,25 @@ impl DocumentView {
 
         h_flex()
             .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
+            .px(metrics::inset())
+            .py(metrics::header_pad_y())
+            .gap(metrics::gap_group())
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(h_flex().gap_1().children(ViewMode::ALL.map(|mode| {
-                Button::new(SharedString::from(format!("mode-{}", mode.label())))
-                    .label(mode.label())
-                    .xsmall()
-                    .when(self.mode == mode, |b| b.primary())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_mode(mode, cx);
-                    }))
-            })))
+            .child(
+                h_flex()
+                    .gap(metrics::gap())
+                    .children(ViewMode::ALL.map(|mode| {
+                        Button::new(SharedString::from(format!("mode-{}", mode.label())))
+                            .label(mode.label())
+                            .xsmall()
+                            .when(self.mode == mode, |b| b.primary())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_mode(mode, cx);
+                            }))
+                    })),
+            )
             // In Split, which renderer fills the preview pane is a separate
             // choice from the mode. Keeping them separate is what leaves room
             // for `Native | Web` and `Original | Translation` later.
@@ -567,9 +572,9 @@ impl DocumentView {
         Some(
             h_flex()
                 .w_full()
-                .px_3()
-                .py_2()
-                .gap_3()
+                .px(metrics::inset())
+                .py(metrics::header_pad_y())
+                .gap(metrics::gap_group())
                 .items_center()
                 .bg(cx.theme().warning.opacity(0.15))
                 .border_b_1()

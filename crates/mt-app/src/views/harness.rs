@@ -21,6 +21,7 @@ use gpui_component::{
 };
 use mt_doc::{Instruction, Origin, Severity, Skill, instruction, skill};
 
+use crate::metrics;
 use crate::settings::{AppSettings, GroupBy};
 
 /// Emitted when the user wants to open an artifact's document.
@@ -208,7 +209,7 @@ impl HarnessView {
                 )
             };
             return v_flex()
-                .p_4()
+                .p(metrics::inset())
                 .child(
                     div()
                         .text_sm()
@@ -219,13 +220,14 @@ impl HarnessView {
         }
 
         v_flex()
-            .p_1()
-            .gap_0p5()
+            .px(px(metrics::INSET - metrics::ROW_PAD))
+            .py_1()
+            .gap(metrics::row_gap())
             .children(self.instructions.iter().enumerate().map(|(ix, entry)| {
                 let selected = self.selected == Some(ix);
                 ListItem::new(("instruction", ix))
                     .w_full()
-                    .px_2()
+                    .px(metrics::row_pad())
                     .py_1()
                     .rounded(cx.theme().radius)
                     .selected(selected)
@@ -276,15 +278,21 @@ impl HarnessView {
         let path = entry.path.clone();
 
         v_flex()
-            .p_3()
-            .gap_2()
+            .p(metrics::inset())
+            .gap(metrics::gap())
             .border_t_1()
             .border_color(cx.theme().border)
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap(metrics::gap())
                     .items_center()
-                    .child(div().flex_1().text_sm().font_bold().child(entry.label()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_semibold()
+                            .child(entry.label()),
+                    )
                     .child(
                         Button::new("open-instruction")
                             .label("Open")
@@ -330,8 +338,8 @@ impl HarnessView {
                 )
             };
             return v_flex()
-                .p_4()
-                .gap_2()
+                .p(metrics::inset())
+                .gap(metrics::gap())
                 .child(
                     div()
                         .text_sm()
@@ -345,8 +353,9 @@ impl HarnessView {
         let rows = group(&self.skills, group_by);
 
         v_flex()
-            .p_1()
-            .gap_0p5()
+            .px(px(metrics::INSET - metrics::ROW_PAD))
+            .py_1()
+            .gap(metrics::row_gap())
             .children(rows.into_iter().map(|Row { ix, heading }| {
                 let skill = &self.skills[ix];
                 let selected = self.selected == Some(ix);
@@ -355,16 +364,18 @@ impl HarnessView {
                     .gap_0p5()
                     .children(heading.map(|heading| {
                         div()
-                            .px_2()
+                            .px(metrics::row_pad())
                             .pt_2()
+                            .pb_0p5()
                             .text_xs()
+                            .font_medium()
                             .text_color(cx.theme().muted_foreground)
                             .child(heading)
                     }))
                     .child(
                         ListItem::new(ix)
                             .w_full()
-                            .px_2()
+                            .px(metrics::row_pad())
                             .py_1()
                             .rounded(cx.theme().radius)
                             .selected(selected)
@@ -420,15 +431,15 @@ impl HarnessView {
 
         let entry = skill.entry.clone();
         v_flex()
-            .p_3()
-            .gap_2()
+            .p(metrics::inset())
+            .gap(metrics::gap())
             .border_t_1()
             .border_color(cx.theme().border)
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap(metrics::gap())
                     .items_center()
-                    .child(div().text_sm().font_bold().child(skill.name.clone()))
+                    .child(div().text_sm().font_semibold().child(skill.name.clone()))
                     .child(div().flex_1())
                     .child(
                         Button::new("open-skill")
@@ -702,8 +713,8 @@ impl Render for HarnessView {
                 TabBar::new("harness-sections")
                     .segmented()
                     .w_full()
-                    .px_2()
-                    .py_1()
+                    .px(metrics::inset())
+                    .py(metrics::header_pad_y())
                     .selected_index(Section::ALL.iter().position(|s| *s == section).unwrap_or(0))
                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
                         this.set_section(Section::ALL[*ix], cx);
@@ -712,14 +723,15 @@ impl Render for HarnessView {
             )
             .child(
                 h_flex()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
+                    .px(metrics::inset())
+                    .py(metrics::header_pad_y())
+                    .gap(metrics::gap())
                     .items_center()
                     .child(
                         div()
                             .flex_1()
                             .text_xs()
+                            .font_medium()
                             .text_color(cx.theme().muted_foreground)
                             .child(match section {
                                 Section::Skills => format!("SKILLS ({skills})"),
@@ -752,9 +764,9 @@ impl Render for HarnessView {
             .when(section == Section::Skills, |this| {
                 this.child(
                     h_flex()
-                        .px_3()
-                        .pb_2()
-                        .gap_1()
+                        .px(metrics::inset())
+                        .pb(metrics::header_pad_y())
+                        .gap(metrics::gap())
                         .items_center()
                         .child(
                             div()

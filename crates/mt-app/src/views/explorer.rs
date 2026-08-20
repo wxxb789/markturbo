@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 
 use gpui::*;
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, h_flex,
+    ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex,
     list::ListItem,
     tree::{TreeEvent, TreeItem, TreeState, tree},
     v_flex,
 };
 
+use crate::metrics;
 use crate::workspace::{self, FileNode};
 
 /// Emitted when the user picks a file.
@@ -195,9 +196,10 @@ impl Render for Explorer {
             .size_full()
             .child(
                 div()
-                    .px_3()
-                    .py_2()
+                    .px(metrics::inset())
+                    .py(metrics::header_pad_y())
                     .text_xs()
+                    .font_medium()
                     .text_color(cx.theme().muted_foreground)
                     .child(
                         self.root
@@ -219,12 +221,16 @@ impl Render for Explorer {
 
                         ListItem::new(ix)
                             .w_full()
-                            .px_2()
-                            .pl(px(14.) * entry.depth() as f32 + px(8.))
+                            .h(metrics::row())
+                            .px(metrics::row_pad())
+                            // Indentation is padding on the row rather than a
+                            // spacer inside it, so the hover highlight still
+                            // spans the full width at every depth.
+                            .pl(metrics::indent(entry.depth()) + metrics::row_pad())
                             .rounded(cx.theme().radius)
                             .child(
                                 h_flex()
-                                    .gap_2()
+                                    .gap(metrics::gap())
                                     .items_center()
                                     .child(Icon::new(icon).text_color(if is_dir {
                                         cx.theme().muted_foreground

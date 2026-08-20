@@ -393,10 +393,19 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
     theme.slider_thumb = h(t.bg);
 
     // Softer than gpui-component's default 6px: at the density this app runs
-    // (24px rows, xsmall buttons) a 6px corner reads as a chamfer rather than a
+    // (28px rows, xsmall buttons) a 6px corner reads as a chamfer rather than a
     // rounded one. 8px is what tty7 settles on for the same widget sizes.
-    theme.radius = px(8.);
-    theme.radius_lg = px(12.);
+    theme.radius = px(crate::metrics::RADIUS);
+    theme.radius_lg = px(crate::metrics::RADIUS * 1.5);
+
+    // 15px rather than the stock 16: `text_sm` and `text_xs` are relative to
+    // this, and at 16 the panel labels came out larger than the document text
+    // they annotate. The editor keeps its own mono size.
+    theme.font_size = px(15.);
+
+    // Note: `scrollbar_mode` is left alone. gpui-component already defaults to
+    // `Scrolling` — overlay bars that fade — which is what these narrow panels
+    // want; a permanent gutter would cost a visible slice of every file name.
 
     // The theme's colors reach the scrollbar and resize handles only through the
     // Base layer, which caches them — without this the scrollbar keeps the
