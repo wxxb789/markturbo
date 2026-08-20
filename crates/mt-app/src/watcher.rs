@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{DebouncedEvent, Debouncer, NoCache, new_debouncer_opt};
 
 /// What changed on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +39,7 @@ impl Change {
 ///
 /// The watcher must be kept alive; dropping it stops the notifications.
 pub struct Watcher {
-    _debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<Vec<DebouncedEvent>>,
     root: PathBuf,
 }
@@ -50,14 +50,34 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 
 impl Watcher {
     /// Start watching `root` recursively.
+    ///
+    /// Uses [`NoCache`] rather than the platform default. On Windows the
+    /// default is `FileIdMap`, whose `add_path` walks the entire tree opening a
+    /// handle per file to record its file id — measured at **22 seconds** on a
+    /// 3,182-file vault, synchronously, before the window can draw. It also
+    /// walks `.git` and `node_modules`, which this module already treats as
+    /// noise.
+    ///
+    /// The cache buys one thing: correlating a rename's two halves by file id
+    /// when the platform supplies no rename tracker. Windows and macOS both do
+    /// supply one, and [`classify`] derives the same answer from whether the
+    /// path still exists — so the walk paid for a fallback that is never
+    /// reached.
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         let (tx, rx) = channel();
-        let mut debouncer = new_debouncer(DEBOUNCE, None, move |result| {
-            // A closed receiver means the app is shutting down; drop silently.
-            if let Ok(events) = result {
-                let _ = tx.send(events);
-            }
-        })?;
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+            DEBOUNCE,
+            None,
+            move |result| {
+                // A closed receiver means the app is shutting down; drop
+                // silently.
+                if let Ok(events) = result {
+                    let _ = tx.send(events);
+                }
+            },
+            NoCache,
+            notify::Config::default(),
+        )?;
         debouncer.watch(root, RecursiveMode::Recursive)?;
         Ok(Self {
             _debouncer: debouncer,
@@ -208,6 +228,33 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(watcher.poll().is_empty());
         assert!(start.elapsed() < Duration::from_millis(100), "poll blocked");
+    }
+
+    #[test]
+    fn starting_a_watch_does_not_walk_the_tree() {
+        // The defect this guards: on Windows the debouncer's default
+        // `FileIdMap` cache walks every file under the root, opening a handle
+        // each, before `new` returns — 22 seconds on a 3,182-file vault, on the
+        // UI thread, before the window could draw. `NoCache` skips the walk.
+        //
+        // 200 files is enough that a per-file walk is unmistakable while
+        // keeping the test itself quick.
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..200 {
+            std::fs::write(deep.join(format!("f{i}.md")), "x").unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let watcher = Watcher::new(dir.path()).unwrap();
+        let elapsed = start.elapsed();
+        drop(watcher);
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "registering the watch took {elapsed:?}; it must not scan the tree"
+        );
     }
 
     #[test]
