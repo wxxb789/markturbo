@@ -1,0 +1,45 @@
+[package]
+name = "mt-app"
+description = "markturbo: a native GPUI workspace for Markdown as the human-agent interface."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "mt_app"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "markturbo"
+path = "src/main.rs"
+
+[dependencies]
+mt-doc.workspace = true
+
+anyhow.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+log.workspace = true
+d2-little.workspace = true
+env_logger.workspace = true
+markdown.workspace = true
+mathjax-svg-rs.workspace = true
+mermaid-svg.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+gpui-wry.workspace = true
+raw-window-handle.workspace = true
+wry.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

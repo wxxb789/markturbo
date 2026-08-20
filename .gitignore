@@ -1,0 +1,17 @@
+# Build output
+/target
+/dist
+
+# Upstream source cloned for API inspection, not part of this project.
+/.reference
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Local overrides that should not be shared
+.env
+.env.local

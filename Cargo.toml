@@ -1,0 +1,74 @@
+[workspace]
+members = ["crates/mt-doc", "crates/mt-app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[workspace.dependencies]
+mt-doc = { path = "crates/mt-doc" }
+
+# gpui must be specified EXACTLY as gpui-component specifies it (same URL, no
+# rev), or Cargo treats them as distinct sources and the graph ends up with two
+# incompatible gpui crates. Cargo.lock is what actually pins the revision.
+gpui = { git = "https://github.com/zed-industries/zed", features = ["profiler"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364", features = [
+    "tree-sitter-languages",
+] }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364" }
+gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364" }
+
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+d2-little = "0.7.1-1"
+markdown = "1.0"
+mathjax-svg-rs = "0.4"
+mermaid-svg = "0.7"
+notify = "8"
+notify-debouncer-full = "0.6"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+raw-window-handle = "0.6"
+serde_yaml = "0.9"
+wry = { version = "0.53.3", package = "lb-wry" }
+smol = "2"
+tempfile = "3"
+
+[profile.dev]
+codegen-units = 16
+debug = "limited"
+split-debuginfo = "unpacked"
+
+[profile.dev.package]
+# Rendering / layout hot paths are unusable in debug builds otherwise.
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+gpui = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }
+
+[profile.release]
+# `debug = false` alone leaves the symbols in; `strip` is what actually removes
+# them, and it takes ~30MB off the binary.
+strip = "symbols"
+# One codegen unit lets LLVM inline across the whole crate. Slower to build,
+# and worth it here because the parse/render paths are the bottleneck.
+codegen-units = 1
+lto = "thin"
+# REQUIRED, not a default: the renderer registry wraps third-party renderers in
+# `catch_unwind` so a panic in a diagram backend becomes an inline diagnostic
+# instead of killing the app. `panic = "abort"` would silently defeat that.
+panic = "unwind"
+

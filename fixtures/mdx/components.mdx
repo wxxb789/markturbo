@@ -1,0 +1,24 @@
+import { RevenueChart } from './charts'
+import Layout from '../layouts/Doc'
+
+export const year = 2026
+
+# Quarterly report
+
+Prose before the component.
+
+<RevenueChart data={quarterlyRows} height={300} />
+
+Prose between components.
+
+<Layout title="Report">
+  <p>Nested children inside a JSX block.</p>
+</Layout>
+
+The year is {year}, and the total is {rows.reduce((a, b) => a + b, 0)}.
+
+{rows.map((r) => <Row key={r.id} {...r} />)}
+
+## After the components
+
+More prose, so the outline has a second heading.

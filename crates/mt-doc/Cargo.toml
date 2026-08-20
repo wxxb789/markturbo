@@ -1,0 +1,21 @@
+[package]
+name = "mt-doc"
+description = "Document engine for markturbo. No GPUI dependency."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+markdown.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
