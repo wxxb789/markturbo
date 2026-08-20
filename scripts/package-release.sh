@@ -86,15 +86,37 @@ the renderer as unavailable. Nothing else is affected.
 
 Translation works offline out of the box using the **Echo** provider, which
 marks each translatable fragment so you can see exactly what would be sent
-without any credentials.
+without any credentials. It tags fragments as `[zh?] …` — it does not translate.
 
-For real translation:
+For real translation, set a key in the environment and pick the provider in
+Settings:
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...
-export MARKTURBO_TRANSLATE_TO=zh          # optional, default zh
-export MARKTURBO_TRANSLATE_MODEL=...      # optional
 ```
+
+The target language and model live in Settings. An API key never does: it is
+read from the environment only, so it cannot end up in a settings file that gets
+backed up or screenshotted.
+
+## Settings
+
+`Ctrl/Cmd+,` opens Settings — theme, translation provider/model/target
+language, and how the Skills panel discovers and groups skills. Changes save
+immediately to:
+
+| Platform | Location |
+|---|---|
+| Windows | `%APPDATA%\markturbo\settings.json` |
+| macOS / Linux | `$XDG_CONFIG_HOME/markturbo/settings.json`, else `~/.config/markturbo/settings.json` |
+
+Set `MARKTURBO_CONFIG_DIR` to put it somewhere else — useful for a portable
+install. The file is plain JSON and safe to edit by hand; if it cannot be
+parsed, markturbo logs a warning, starts with defaults, and leaves your file
+alone rather than overwriting it.
+
+**Theme** defaults to *System* and keeps following the OS while running, so a
+machine that switches to dark at sunset takes the app with it.
 
 ## Keyboard
 
@@ -103,6 +125,7 @@ export MARKTURBO_TRANSLATE_MODEL=...      # optional
 | `Ctrl/Cmd+O` | Open folder |
 | `Ctrl/Cmd+S` | Save |
 | `Ctrl/Cmd+W` | Close tab |
+| `Ctrl/Cmd+,` | Settings |
 | `Ctrl/Cmd+F` | Find in the editor |
 | `Ctrl/Cmd+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl/Cmd+Shift+T` | Translate document |
@@ -127,9 +150,15 @@ echo "==> Archiving"
 cd "$ROOT/dist"
 case "$TARGET" in
   *windows*)
-    # `tar` ships with Windows 10+; prefer zip for a familiar double-click.
-    if command -v powershell.exe >/dev/null 2>&1; then
-      powershell.exe -NoProfile -Command \
+    # Prefer zip for a familiar double-click. PowerShell 7+ first; fall back to
+    # Windows PowerShell, then to the `tar` that ships with Windows 10+, so the
+    # script still produces an archive on a machine with neither.
+    PS=""
+    for candidate in pwsh pwsh.exe powershell.exe; do
+      if command -v "$candidate" >/dev/null 2>&1; then PS="$candidate"; break; fi
+    done
+    if [ -n "$PS" ]; then
+      "$PS" -NoProfile -Command \
         "Compress-Archive -Path '$NAME' -DestinationPath '$NAME.zip' -Force" >/dev/null
       ARCHIVE="$NAME.zip"
     else
