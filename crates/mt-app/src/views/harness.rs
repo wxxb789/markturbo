@@ -281,8 +281,6 @@ impl HarnessView {
         v_flex()
             .p(metrics::inset())
             .gap(metrics::gap())
-            .border_t_1()
-            .border_color(cx.theme().border)
             .child(
                 h_flex()
                     .gap(metrics::gap())
@@ -433,7 +431,26 @@ impl HarnessView {
             .into_any_element()
     }
 
-    fn render_inspector(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// The details of whatever is selected, rendered wherever the caller puts
+    /// it.
+    ///
+    /// Public because it no longer lives under the list: cramming metadata,
+    /// file lists and validation output into the bottom of a 268px column left
+    /// both halves too short to read. The workspace hosts this in the right
+    /// panel instead.
+    pub fn render_details(&self, cx: &Context<Self>) -> AnyElement {
+        match self.section {
+            Section::Skills => self.render_inspector(cx),
+            Section::Instructions => self.render_instruction_inspector(cx),
+        }
+    }
+
+    /// Whether anything is selected, so the caller can skip an empty panel.
+    pub fn has_selection(&self) -> bool {
+        self.selected_skill().is_some() || self.selected_instruction().is_some()
+    }
+
+    fn render_inspector(&self, cx: &Context<Self>) -> AnyElement {
         let Some(skill) = self.selected_skill() else {
             return div().into_any_element();
         };
@@ -442,8 +459,6 @@ impl HarnessView {
         v_flex()
             .p(metrics::inset())
             .gap(metrics::gap())
-            .border_t_1()
-            .border_color(cx.theme().border)
             .child(
                 h_flex()
                     .gap(metrics::gap())
@@ -820,10 +835,6 @@ impl Render for HarnessView {
                         Section::Instructions => this.child(self.render_instructions(cx)),
                     }),
             )
-            .map(|this| match section {
-                Section::Skills => this.child(self.render_inspector(cx)),
-                Section::Instructions => this.child(self.render_instruction_inspector(cx)),
-            })
     }
 }
 

@@ -110,6 +110,12 @@ pub struct Workspace {
     web_current: Option<String>,
     /// True while the settings page is showing.
     settings_open: bool,
+    /// True while the details panel is showing on the right.
+    ///
+    /// Not derived from whether anything is selected: a panel that appeared and
+    /// vanished as the selection changed would resize the document under the
+    /// user's cursor.
+    right_panel_open: bool,
     _tasks: Vec<Task<()>>,
     /// Subscriptions that live as long as the workspace does.
     _subscriptions: Vec<Subscription>,
@@ -147,6 +153,7 @@ impl Workspace {
             watcher: None,
             status: None,
             settings_open: false,
+            right_panel_open: true,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1036,16 +1043,66 @@ impl Workspace {
 
     // --- Rendering --------------------------------------------------------
 
+    /// The details panel, when there is something to show in it.
+    ///
+    /// `None` rather than an empty panel: a column of blank space next to the
+    /// document is worse than no column, and the toggle in the title bar is
+    /// what says whether the panel is wanted at all.
+    fn render_right_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.right_panel_open || self.settings_open {
+            return None;
+        }
+        let harness = self.harness.clone()?;
+        if !harness.read(cx).has_selection() {
+            return None;
+        }
+        // Through `update` rather than `read`: the details carry an Open button
+        // whose click handler emits a `HarnessEvent`, which needs the harness
+        // view's own `Context`. This is the entity-lease path, not the
+        // `AppCell::borrow_mut` one, so it is safe during a draw.
+        let details = harness.update(cx, |harness, cx| harness.render_details(cx));
+        Some(
+            v_flex()
+                .size_full()
+                .bg(cx.theme().sidebar)
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .px(metrics::inset())
+                        .py(metrics::header_pad_y())
+                        .text_xs()
+                        .font_medium()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(i18n::t(i18n::Key::Details, cx)),
+                )
+                .child(
+                    div()
+                        .id("details")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(details),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_side_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
+            .bg(cx.theme().sidebar)
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
                 TabBar::new("side-tabs")
                     .underline()
                     .w_full()
-                    .px(metrics::inset() - metrics::row_pad())
+                    // The full inset, not one reduced by the row padding: a tab
+                    // strip has no row padding of its own, so subtracting it put
+                    // `Files` four pixels from the window edge while everything
+                    // below it started twelve.
+                    .px(metrics::inset())
                     .selected_index(
                         SidePanel::ALL
                             .iter()
@@ -1288,6 +1345,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
             .size_full()
+            // One bar, not two. The window title row and the document tab strip
+            // were stacked, which spent 80 vertical pixels on chrome and read as
+            // two competing headers; every modern editor puts the tabs in the
+            // title bar. The app name yields to them — the window title already
+            // says what this is.
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -1298,12 +1360,27 @@ impl Render for Workspace {
                         .items_center()
                         .child(
                             div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(cx.theme().foreground)
-                                .child("markturbo"),
+                                .flex_1()
+                                .min_w_0()
+                                // Tabs have to claim the press back from the
+                                // title bar for the same reason the buttons
+                                // below do.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .when(!self.documents.is_empty(), |this| {
+                                    this.child(self.render_tabs(cx))
+                                })
+                                // With nothing open the space is the drag
+                                // handle, so the window can still be moved.
+                                .when(self.documents.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("markturbo"),
+                                    )
+                                }),
                         )
-                        .child(div().flex_1())
                         .child(
                             // The title bar is a `WindowControlArea::Drag`
                             // region, which Windows hit-tests as `HTCAPTION`:
@@ -1313,6 +1390,7 @@ impl Render for Workspace {
                             // is what upstream's own example does
                             // (gpui-component `story/src/title_bar.rs`).
                             h_flex()
+                                .flex_shrink_0()
                                 .gap(metrics::gap())
                                 .items_center()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1356,6 +1434,22 @@ impl Render for Workspace {
                                         })),
                                 )
                                 .child(
+                                    Button::new("toggle-right-panel")
+                                        .icon(IconName::PanelRight)
+                                        .xsmall()
+                                        .ghost()
+                                        .when(self.right_panel_open, |b| b.primary())
+                                        .tooltip(i18n::t(i18n::Key::Details, cx))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.right_panel_open = !this.right_panel_open;
+                                            // The WebView is an OS child window
+                                            // that will not notice the document
+                                            // pane resizing under it.
+                                            this.web_dirty(cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
                                     Button::new("settings")
                                         .icon(IconName::Settings)
                                         .xsmall()
@@ -1377,16 +1471,14 @@ impl Render for Workspace {
                                 .size(metrics::side_panel())
                                 .child(self.render_side_panel(cx)),
                         )
-                        .child(
-                            resizable_panel().child(
-                                v_flex()
-                                    .size_full()
-                                    .when(!self.documents.is_empty(), |this| {
-                                        this.child(self.render_tabs(cx))
-                                    })
-                                    .child(div().flex_1().min_h_0().child(content)),
-                            ),
-                        ),
+                        .child(resizable_panel().child(div().size_full().child(content)))
+                        // The details of whatever is selected on the left, on
+                        // the right. They used to sit under the list in the same
+                        // 268px column, which left the list and the details both
+                        // too short to read.
+                        .when_some(self.render_right_panel(cx), |this, panel| {
+                            this.child(resizable_panel().size(metrics::side_panel()).child(panel))
+                        }),
                 ),
             )
             .child(self.render_status_bar(cx))

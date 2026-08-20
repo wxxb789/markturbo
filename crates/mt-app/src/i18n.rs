@@ -33,6 +33,7 @@ pub enum Key {
     GroupBy,
     Rescan,
     ViewLayout,
+    Details,
 
     // Empty states
     OpenFolderToBegin,
@@ -116,6 +117,7 @@ fn english(key: Key) -> &'static str {
         Key::GroupBy => "Group by",
         Key::Rescan => "Rescan",
         Key::ViewLayout => "View",
+        Key::Details => "Details",
 
         Key::OpenFolderToBegin => "Open a folder to begin.",
         Key::OpenFolderToDiscover => "Open a folder to discover skills and instruction files.",
@@ -184,6 +186,7 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::GroupBy => "分组方式",
         Key::Rescan => "重新扫描",
         Key::ViewLayout => "视图",
+        Key::Details => "详情",
 
         Key::OpenFolderToBegin => "打开一个文件夹以开始。",
         Key::OpenFolderToDiscover => "打开一个文件夹以发现 skills 和指令文件。",
@@ -251,6 +254,7 @@ mod tests {
         Key::GroupBy,
         Key::Rescan,
         Key::ViewLayout,
+        Key::Details,
         Key::OpenFolderToBegin,
         Key::OpenFolderToDiscover,
         Key::OpenDocumentForOutline,
