@@ -81,3 +81,20 @@ fn attribute_the_cost_of_opening_a_folder() {
         )
     });
 }
+
+#[test]
+#[ignore = "measures a real directory named by MARKTURBO_BENCH_DIR"]
+fn read_dir_on_a_flat_directory() {
+    // The explorer reads directories on the UI thread. A vault is usually
+    // nested, but a flat folder of notes is exactly the shape that makes one
+    // `read_dir` expensive — worth knowing the cost of before deciding whether
+    // it can stay synchronous.
+    let Some(root) = bench_dir() else { return };
+    let start = Instant::now();
+    let nodes = mt_app::workspace::read_dir(&root).unwrap_or_default();
+    eprintln!(
+        "{:>10.0?}  flat read_dir  {} entries",
+        start.elapsed(),
+        nodes.len()
+    );
+}

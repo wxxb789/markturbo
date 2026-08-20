@@ -1,9 +1,11 @@
 //! File explorer: the native workspace file tree.
 //!
-//! Lazy: a directory's children are read when it expands, so opening a monorepo
-//! does not stall on a full walk.
+//! Lazy in two senses. A directory's children are read when it expands, so
+//! opening a monorepo does not stall on a full walk — and every read happens on
+//! a background task, so even a flat folder of five thousand notes (~29ms of
+//! `read_dir`) never lands on the UI thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gpui::*;
@@ -33,6 +35,13 @@ pub struct Explorer {
     loaded: HashMap<PathBuf, Vec<FileNode>>,
     /// Which directories the user has expanded, so a refresh preserves shape.
     expanded: Vec<PathBuf>,
+    /// Directories with a read in flight, so an expand/collapse/expand burst
+    /// does not queue three reads of the same directory.
+    reading: HashSet<PathBuf>,
+    /// Background reads, keyed by the directory being read. Held so dropping
+    /// the view cancels them rather than leaving tasks writing into an entity
+    /// nobody renders, and keyed so a re-read replaces rather than accumulates.
+    _reads: HashMap<PathBuf, Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -58,12 +67,14 @@ impl Explorer {
             tree,
             loaded: HashMap::new(),
             expanded: Vec::new(),
+            reading: HashSet::new(),
+            _reads: HashMap::new(),
             _subscriptions: subscriptions,
         };
         // Two levels up front so the first screen is useful without paying for
-        // a deep walk.
-        this.load_dir(&root, 1);
-        this.rebuild(cx);
+        // a deep walk — off-thread, so `Explorer::new` returns immediately and
+        // the window draws with an empty tree that fills in a frame later.
+        this.load_dir(root, 1, cx);
         this
     }
 
@@ -72,15 +83,17 @@ impl Explorer {
     }
 
     /// Re-read the tree from disk, keeping expansion state.
+    ///
+    /// The old entries stay until each replacement lands. Clearing first would
+    /// blank the tree on every filesystem tick, which is a flicker on a watcher
+    /// that fires whenever an agent writes.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let dirs: Vec<PathBuf> = std::iter::once(self.root.clone())
             .chain(self.expanded.iter().cloned())
             .collect();
-        self.loaded.clear();
         for dir in dirs {
-            self.load_dir(&dir, 0);
+            self.load_dir(dir, 0, cx);
         }
-        self.rebuild(cx);
     }
 
     fn on_expand(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -90,21 +103,56 @@ impl Explorer {
         // Load one level below the newly expanded node, so its children show a
         // disclosure triangle if they in turn have children.
         if !self.loaded.contains_key(&path) {
-            self.load_dir(&path, 1);
-            self.rebuild(cx);
+            self.load_dir(path, 1, cx);
         }
     }
 
-    fn load_dir(&mut self, dir: &Path, depth: usize) {
-        let Ok(nodes) = workspace::read_dir(dir) else {
+    /// Read `dir` (and `depth` levels below it) on a background task.
+    ///
+    /// Returns immediately. `read_dir` is a syscall per entry — 29ms for five
+    /// thousand files — and a folder of notes is exactly the shape that makes
+    /// it expensive, so it never runs on the thread that draws.
+    fn load_dir(&mut self, dir: PathBuf, depth: usize, cx: &mut Context<Self>) {
+        if !self.reading.insert(dir.clone()) {
+            // Already in flight. A second read would produce the same answer
+            // and race the first to write it.
             return;
-        };
-        if depth > 0 {
-            for child in nodes.iter().filter(|n| n.is_dir) {
-                self.load_dir(&child.path, depth - 1);
-            }
         }
-        self.loaded.insert(dir.to_path_buf(), nodes);
+        let key = dir.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let dir_for_read = dir.clone();
+            // One task per level rather than a recursive walk: the top level is
+            // what the user sees first, so it should land as soon as it is
+            // read rather than waiting on its children.
+            let nodes = cx
+                .background_spawn(
+                    async move { workspace::read_dir(&dir_for_read).unwrap_or_default() },
+                )
+                .await;
+
+            crate::views::try_update(&this, cx, |this, cx| {
+                this.reading.remove(&dir);
+                let children: Vec<PathBuf> = if depth > 0 {
+                    nodes
+                        .iter()
+                        .filter(|n| n.is_dir)
+                        .map(|n| n.path.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                this.loaded.insert(dir, nodes);
+                this.rebuild(cx);
+                for child in children {
+                    this.load_dir(child, depth - 1, cx);
+                }
+            });
+        });
+        // Keyed by directory rather than pushed onto a list: a re-read of the
+        // same directory replaces its predecessor, so a watcher firing on every
+        // agent write cannot accumulate handles. Dropping the view drops the
+        // map, which cancels every read still in flight.
+        self._reads.insert(key, task);
     }
 
     /// Rebuild the tree items from `loaded`.
