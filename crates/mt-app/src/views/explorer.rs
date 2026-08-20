@@ -190,6 +190,8 @@ impl Render for Explorer {
 
         v_flex()
             .id("explorer")
+            .role(gpui::Role::Tree)
+            .aria_label("Workspace files")
             .track_focus(&self.focus_handle)
             .size_full()
             .child(

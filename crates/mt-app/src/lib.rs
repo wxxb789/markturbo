@@ -6,6 +6,7 @@
 //! ```text
 //! mt-doc     document engine — no GPUI, reusable headless
 //!   ↓
+//! assets     icons + the fonts GPUI's SVG renderer needs
 //! fs         load/save with conflict protection
 //! workspace  directory tree
 //! renderer   block renderer registry (diagrams, math)
@@ -14,6 +15,7 @@
 //! views      GPUI views
 //! ```
 
+pub mod assets;
 pub mod fs;
 pub mod renderer;
 pub mod translate;

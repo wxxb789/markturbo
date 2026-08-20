@@ -61,6 +61,11 @@ pub struct Skill {
     pub entry: PathBuf,
     /// Discovery root this skill was found under, e.g. `.claude/skills`.
     pub root: PathBuf,
+    /// Whether this came from the workspace or from a global harness directory.
+    pub origin: Origin,
+    /// Other paths reaching the same skill directory, typically because a
+    /// harness directory is a symlink or junction into a canonical one.
+    pub aliases: Vec<PathBuf>,
     /// Effective name: frontmatter `name`, else the directory name.
     pub name: String,
     pub meta: SkillMeta,
@@ -69,6 +74,24 @@ pub struct Skill {
     pub diagnostics: Vec<Diagnostic>,
     /// Conventional supporting directories that actually exist.
     pub support_dirs: Vec<PathBuf>,
+}
+
+/// Where a skill was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Origin {
+    /// Under the open workspace — the skills this project ships.
+    Workspace,
+    /// Under a harness's global directory, so available in every project.
+    Global,
+}
+
+impl Origin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::Workspace => "workspace",
+            Origin::Global => "global",
+        }
+    }
 }
 
 impl Skill {
@@ -83,6 +106,17 @@ impl Skill {
     /// Short description for list rows.
     pub fn summary(&self) -> &str {
         self.meta.description.as_deref().unwrap_or("(no description)")
+    }
+
+    /// Whether the skill marks itself as internal.
+    ///
+    /// The spec's reference tooling hides these from ordinary discovery; see
+    /// [`Discovery::include_internal`].
+    pub fn is_internal(&self) -> bool {
+        self.meta
+            .metadata
+            .get("internal")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 }
 
@@ -301,20 +335,13 @@ fn scalar(value: &serde_yaml::Value) -> Option<String> {
 }
 
 /// Directory names, relative to the workspace root, that conventionally hold
-/// skills. Ordered by how load-bearing each is in the ecosystem.
+/// skills.
 ///
-/// Adding a convention is a one-line change here — that is the extensibility
-/// the goal asks for, without a plugin system.
-pub const DISCOVERY_ROOTS: &[&str] = &[
-    "skills",
-    ".agents/skills",
-    ".claude/skills",
-    ".cursor/skills",
-    ".codex/skills",
-    ".github/skills",
-    ".opencode/skills",
-    ".gemini/skills",
-];
+/// Derived from the harness table in [`crate::harness`], so supporting a new
+/// harness is one line there and nothing else in the app changes.
+pub fn discovery_roots() -> Vec<&'static str> {
+    crate::harness::project_roots()
+}
 
 /// Conventional supporting directories inside a skill.
 const SUPPORT_DIRS: &[&str] = &["scripts", "references", "assets"];
@@ -325,31 +352,148 @@ const SUPPORT_DIRS: &[&str] = &["scripts", "references", "assets"];
 /// folders (`root/category/skill/SKILL.md`) without scanning a whole repo.
 const MAX_DEPTH: usize = 3;
 
+/// Directories never worth descending into.
+///
+/// From the reference walker's `SKIP_DIRS`. Load-bearing once global roots are
+/// in scope: a harness directory can sit next to a `node_modules` an order of
+/// magnitude larger than everything else combined.
+const SKIP_DIRS: &[&str] = &["node_modules", ".git", "dist", "build", "__pycache__"];
+
+/// What to search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Discovery {
+    /// Search the harness global directories (`~/.claude/skills`, …) as well as
+    /// the workspace.
+    pub global: bool,
+    /// Include skills marked `metadata.internal: true`.
+    ///
+    /// The reference tooling hides these unless `INSTALL_INTERNAL_SKILLS=1`;
+    /// [`Discovery::from_env`] honors the same variable.
+    pub include_internal: bool,
+}
+
+impl Discovery {
+    /// Workspace only — the conservative default, and what tests want.
+    pub const WORKSPACE: Self = Self {
+        global: false,
+        include_internal: false,
+    };
+
+    /// Everything a harness on this machine could see.
+    pub fn everything() -> Self {
+        Self {
+            global: true,
+            ..Self::from_env()
+        }
+    }
+
+    /// Defaults, with `INSTALL_INTERNAL_SKILLS` applied.
+    pub fn from_env() -> Self {
+        let include_internal = std::env::var("INSTALL_INTERNAL_SKILLS")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true"));
+        Self {
+            global: false,
+            include_internal,
+        }
+    }
+}
+
 /// Discover skills under `workspace`.
+///
+/// Searches the workspace's own conventional directories only. Use
+/// [`discover_with`] to also search the harness global directories — this
+/// signature deliberately stays hermetic so a test or a headless tool cannot
+/// accidentally pick up whatever the developer has installed.
+pub fn discover(workspace: &Path) -> Vec<Skill> {
+    discover_with(workspace, Discovery::WORKSPACE)
+}
+
+/// Discover skills, controlling how far to look.
 ///
 /// A directory containing `SKILL.md` is a leaf: nested skills below it are not
 /// visited, matching the documented "shallower shadows nested" rule. Results
-/// are sorted by name so the explorer is stable across runs.
-pub fn discover(workspace: &Path) -> Vec<Skill> {
-    let mut skills = Vec::new();
-    for root_rel in DISCOVERY_ROOTS {
-        let root = workspace.join(root_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if !root.is_dir() {
-            continue;
-        }
-        walk(&root, &root, 0, &mut skills);
+/// are sorted by origin then name so the explorer is stable across runs.
+pub fn discover_with(workspace: &Path, options: Discovery) -> Vec<Skill> {
+    let mut found = Found::default();
+
+    for root_rel in crate::harness::project_roots() {
+        let root = workspace.join(rel_path(root_rel));
+        walk(&root, &root, Origin::Workspace, 0, &mut found);
     }
-    skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.dir.cmp(&b.dir)));
+
+    if options.global {
+        for root in crate::harness::global_roots() {
+            walk(&root, &root, Origin::Global, 0, &mut found);
+        }
+    }
+
+    let mut skills = found.skills;
+    if !options.include_internal {
+        skills.retain(|s| !s.is_internal());
+    }
+    skills.sort_by(|a, b| {
+        a.origin
+            .cmp(&b.origin)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.dir.cmp(&b.dir))
+    });
     skills
 }
 
-fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Skill>) {
-    if depth > MAX_DEPTH {
+/// Convert a `/`-separated relative root into a platform path.
+fn rel_path(path: &str) -> PathBuf {
+    path.split('/').collect()
+}
+
+/// Accumulator that collapses paths reaching the same directory.
+#[derive(Default)]
+struct Found {
+    skills: Vec<Skill>,
+    /// Canonical directory of each accepted skill, parallel to `skills`.
+    keys: Vec<PathBuf>,
+}
+
+impl Found {
+    /// Record `skill`, or fold it into an existing entry as an alias.
+    ///
+    /// Keyed on the canonical path so a junction and its target collapse. The
+    /// first arrival wins, which is why root order encodes preference.
+    ///
+    /// This is also what makes a symlink cycle harmless: a revisited directory
+    /// produces an alias, never a second entry. Termination itself comes from
+    /// [`MAX_DEPTH`] — a deliberate visited-set would suppress exactly the
+    /// cross-root revisits that aliases are made of.
+    fn insert(&mut self, skill: Skill) {
+        let key = canonical(&skill.dir);
+        if let Some(ix) = self.keys.iter().position(|k| *k == key) {
+            let existing = &mut self.skills[ix];
+            if existing.dir != skill.dir && !existing.aliases.contains(&skill.dir) {
+                existing.aliases.push(skill.dir);
+            }
+            return;
+        }
+        self.keys.push(key);
+        self.skills.push(skill);
+    }
+}
+
+/// A path's canonical form, for identity comparison only.
+///
+/// Falls back to the path as given: `canonicalize` fails on a broken link, and
+/// a skill whose directory cannot be resolved should still be listed once
+/// rather than vanish. The result is never displayed — on Windows it is a
+/// `\\?\` UNC path.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn walk(root: &Path, dir: &Path, origin: Origin, depth: usize, out: &mut Found) {
+    if depth > MAX_DEPTH || !dir.is_dir() {
         return;
     }
-    if let Some(skill) = load(root, dir) {
+    if let Some(skill) = load_with_origin(root, dir, origin) {
         // Leaf: do not descend into a skill's own subdirectories.
-        out.push(skill);
+        out.insert(skill);
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -359,15 +503,24 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Skill>) {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|n| !SKIP_DIRS.contains(&n))
+        })
         .collect();
     children.sort();
     for child in children {
-        walk(root, &child, depth + 1, out);
+        walk(root, &child, origin, depth + 1, out);
     }
 }
 
 /// Load the skill rooted at `dir`, if it has an entry document.
 pub fn load(root: &Path, dir: &Path) -> Option<Skill> {
+    load_with_origin(root, dir, Origin::Workspace)
+}
+
+fn load_with_origin(root: &Path, dir: &Path, origin: Origin) -> Option<Skill> {
     let entry = entry_path(dir)?;
     let dir_name = dir.file_name()?.to_str()?.to_string();
 
@@ -402,6 +555,8 @@ pub fn load(root: &Path, dir: &Path) -> Option<Skill> {
         dir: dir.to_path_buf(),
         entry,
         root: root.to_path_buf(),
+        origin,
+        aliases: Vec::new(),
         name,
         meta,
         diagnostics,

@@ -16,7 +16,7 @@ use gpui_component::{
     list::ListItem,
     v_flex,
 };
-use mt_doc::{Severity, Skill, skill};
+use mt_doc::{Origin, Severity, Skill, skill};
 
 /// Emitted when the user wants to open a skill's entry document.
 #[derive(Debug, Clone)]
@@ -29,6 +29,10 @@ pub struct SkillsView {
     root: PathBuf,
     skills: Vec<Skill>,
     selected: Option<usize>,
+    /// True until the first scan lands, so an empty list is not mistaken for
+    /// "no skills" while the scan is still running.
+    scanning: bool,
+    _scan: Option<Task<()>>,
 }
 
 impl SkillsView {
@@ -38,17 +42,43 @@ impl SkillsView {
             root,
             skills: Vec::new(),
             selected: None,
+            scanning: true,
+            _scan: None,
         };
         this.refresh(cx);
         this
     }
 
-    /// Rediscover skills from disk.
+    /// Rediscover skills from disk, off the UI thread.
+    ///
+    /// Discovery now covers every harness's workspace directory plus the global
+    /// ones, and it runs on a filesystem-watcher tick — doing that synchronously
+    /// would stutter the window on every save.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        self.scanning = true;
+        // Replacing the task cancels any scan still in flight, so a burst of
+        // filesystem events costs one scan rather than one per event.
+        self._scan = Some(cx.spawn(async move |this, cx| {
+            let skills = cx
+                .background_spawn(async move {
+                    skill::discover_with(&root, mt_doc::Discovery::everything())
+                })
+                .await;
+            crate::views::try_update(&this, cx, |this, cx| this.apply(skills, cx));
+        }));
+        cx.notify();
+    }
+
+    fn apply(&mut self, skills: Vec<Skill>, cx: &mut Context<Self>) {
         // Remember the selection by identity, not index: a rediscovery can
         // reorder the list.
-        let previous = self.selected.and_then(|ix| self.skills.get(ix)).map(|s| s.dir.clone());
-        self.skills = skill::discover(&self.root);
+        let previous = self
+            .selected
+            .and_then(|ix| self.skills.get(ix))
+            .map(|s| s.dir.clone());
+        self.skills = skills;
+        self.scanning = false;
         self.selected = previous
             .and_then(|dir| self.skills.iter().position(|s| s.dir == dir))
             .or(if self.skills.is_empty() { None } else { Some(0) });
@@ -65,6 +95,17 @@ impl SkillsView {
 
     fn render_list(&self, cx: &Context<Self>) -> impl IntoElement {
         if self.skills.is_empty() {
+            let hint = if self.scanning {
+                "Scanning…".to_string()
+            } else {
+                format!(
+                    "No skills found.\n\nSearched {} workspace conventions \
+                     (skills/, .agents/skills, .claude/skills, …) and {} global \
+                     harness directories.",
+                    skill::discovery_roots().len(),
+                    mt_doc::harness::global_roots().len(),
+                )
+            };
             return v_flex()
                 .p_4()
                 .gap_2()
@@ -72,16 +113,7 @@ impl SkillsView {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child("No skills found."),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "Looked in: {}",
-                            skill::DISCOVERY_ROOTS.join(", ")
-                        )),
+                        .child(hint),
                 )
                 .into_any_element();
         }
@@ -92,41 +124,69 @@ impl SkillsView {
             .children(self.skills.iter().enumerate().map(|(ix, skill)| {
                 let selected = self.selected == Some(ix);
                 let invalid = !skill.is_valid();
-                ListItem::new(ix)
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .selected(selected)
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(Icon::new(IconName::Bot).small())
-                                    .child(div().text_sm().child(skill.name.clone()))
-                                    .when(invalid, |this| {
-                                        this.child(
-                                            Icon::new(IconName::TriangleAlert)
-                                                .small()
-                                                .text_color(cx.theme().danger),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .truncate()
-                                    .child(skill.summary().to_string()),
-                            ),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = Some(ix);
-                        cx.notify();
+                // A group header before the first skill of each origin, so
+                // "this project ships it" and "I have it everywhere" stay
+                // distinguishable at a glance.
+                let heading = (ix == 0 || self.skills[ix - 1].origin != skill.origin)
+                    .then_some(skill.origin);
+                v_flex()
+                    .gap_0p5()
+                    .children(heading.map(|origin| {
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(origin.label().to_uppercase())
                     }))
+                    .child(
+                        ListItem::new(ix)
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .rounded(cx.theme().radius)
+                            .selected(selected)
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(Icon::new(IconName::Bot).small())
+                                            .child(div().text_sm().child(skill.name.clone()))
+                                            .when(!skill.aliases.is_empty(), |this| {
+                                                this.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(format!(
+                                                            "+{} link(s)",
+                                                            skill.aliases.len()
+                                                        )),
+                                                )
+                                            })
+                                            .when(invalid, |this| {
+                                                this.child(
+                                                    Icon::new(IconName::TriangleAlert)
+                                                        .small()
+                                                        .text_color(cx.theme().danger),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .truncate()
+                                            .child(skill.summary().to_string()),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = Some(ix);
+                                cx.notify();
+                            })),
+                    )
             }))
             .into_any_element()
     }
@@ -163,12 +223,28 @@ impl SkillsView {
                     .text_xs()
                     .child(skill.summary().to_string()),
             )
-            .children(field(cx, "Location", &relative(&self.root, &skill.dir)))
+            .children(field(cx, "Origin", skill.origin.label()))
+            .children(field(cx, "Location", &located(&self.root, skill.origin, &skill.dir)))
             .children(field(
                 cx,
                 "Discovered in",
-                &relative(&self.root, &skill.root),
+                &located(&self.root, skill.origin, &skill.root),
             ))
+            // The same skill reached by several paths — typically a harness
+            // directory symlinked or junctioned into a canonical one. Showing
+            // the links is what makes the deduplication legible rather than
+            // looking like a missing entry.
+            .children((!skill.aliases.is_empty()).then(|| {
+                v_flex()
+                    .gap_0p5()
+                    .child(label(cx, "Also linked from"))
+                    .children(skill.aliases.iter().map(|alias| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(located(&self.root, skill.origin, alias))
+                    }))
+            }))
             .children(
                 skill
                     .meta
@@ -269,8 +345,30 @@ fn label(cx: &App, text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-fn relative(root: &Path, path: &Path) -> String {
-    crate::workspace::display_relative(root, path)
+/// Display a path the way its origin makes readable.
+///
+/// A workspace skill reads best relative to the workspace; a global one is not
+/// under it at all, so relativizing would produce a wall of `../..`. Abbreviate
+/// the home prefix instead, which is how these paths are written everywhere
+/// else.
+fn located(root: &Path, origin: Origin, path: &Path) -> String {
+    match origin {
+        Origin::Workspace => crate::workspace::display_relative(root, path),
+        Origin::Global => abbreviate_home(path),
+    }
+}
+
+fn abbreviate_home(path: &Path) -> String {
+    let home = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .find(|v| !v.trim().is_empty());
+    if let Some(home) = home
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rest.to_string_lossy().replace('\\', "/"));
+    }
+    path.to_string_lossy().replace('\\', "/")
 }
 
 impl EventEmitter<SkillsEvent> for SkillsView {}
@@ -288,6 +386,8 @@ impl Render for SkillsView {
 
         v_flex()
             .id("skills")
+            .role(gpui::Role::List)
+            .aria_label("Agent skills")
             .track_focus(&self.focus_handle)
             .size_full()
             .child(

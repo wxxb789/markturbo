@@ -15,3 +15,6 @@ Thumbs.db
 # Local overrides that should not be shared
 .env
 .env.local
+
+# Working notes from an agent session, not project documentation.
+/.plans

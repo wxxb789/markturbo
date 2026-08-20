@@ -8,6 +8,39 @@ pub mod explorer;
 pub mod skills;
 pub mod workspace;
 
+/// Update an entity from an async task, skipping the update if the `App` is
+/// already borrowed rather than panicking.
+///
+/// `WeakEntity::update` returns `Result`, but the only failure it models is
+/// "entity released" — it bottoms out in `AsyncApp::update_entity`, which calls
+/// the infallible `AppCell::borrow_mut`. A re-entrant borrow therefore panics
+/// before that `Result` is ever produced.
+///
+/// This is reachable on Windows: WebView2 pumps messages, so the window
+/// procedure can re-enter mid-draw with the `App` already mutably borrowed
+/// (visible in the log as `deferring re-entrant draw`). `update_window` takes
+/// the same borrow through `try_borrow_mut` instead, so it reports the conflict
+/// rather than aborting the process.
+///
+/// Skipping costs one frame; panicking costs the session — and every caller
+/// here is either a refresh or a debounced reparse that a later notification
+/// repeats anyway.
+pub fn try_update<T, R>(
+    entity: &gpui::WeakEntity<T>,
+    cx: &mut gpui::AsyncApp,
+    f: impl FnOnce(&mut T, &mut gpui::Context<T>) -> R,
+) -> Option<R>
+where
+    T: 'static,
+{
+    use gpui::AppContext as _;
+
+    let entity = entity.upgrade()?;
+    cx.with_window(entity.entity_id(), |_, app| {
+        app.update_entity(&entity, f)
+    })
+}
+
 /// Which view of a document is showing.
 ///
 /// Every document conceptually supports all four; a view that does not apply

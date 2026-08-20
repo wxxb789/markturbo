@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use gpui::*;
 use gpui_component::Root;
-use gpui_component_assets::Assets;
+use mt_app::assets::Assets;
 use mt_app::views::workspace::Workspace;
 
 const USAGE: &str = "\
@@ -110,10 +110,16 @@ fn main() {
                 ..gpui_component::TitleBar::window_options()
             };
 
+            // Held so the window can focus it below: keybindings only dispatch
+            // along the focused element's path, and nothing focuses the
+            // workspace on its own — so without this, Ctrl+O and friends do
+            // nothing until something has been clicked.
+            let mut workspace = None;
             let window = cx
                 .open_window(options, |window, cx| {
-                    let workspace = cx.new(|cx| Workspace::new(target, window, cx));
-                    cx.new(|cx| Root::new(workspace, window, cx))
+                    let view = cx.new(|cx| Workspace::new(target, window, cx));
+                    workspace = Some(view.clone());
+                    cx.new(|cx| Root::new(view, window, cx))
                 })
                 .expect("failed to open window");
 
@@ -121,6 +127,10 @@ fn main() {
                 .update(cx, |_, window, cx| {
                     window.activate_window();
                     window.set_window_title("markturbo");
+                    if let Some(workspace) = workspace {
+                        let handle = workspace.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                    }
                     cx.on_release(|_, cx| cx.quit()).detach();
                 })
                 .expect("failed to configure window");
@@ -134,8 +144,7 @@ mod tests {
     // Import selectively: the `gpui::*` glob in the parent re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{USAGE, resolve_target};
-    use std::path::PathBuf;
+    use super::resolve_target;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

@@ -60,6 +60,19 @@ impl SidePanel {
 /// detected change reaches the UI.
 const WATCH_POLL: Duration = Duration::from_millis(500);
 
+/// What the WebView should be showing.
+///
+/// `Unchanged` is not "do nothing because nothing happened" — it means the
+/// answer is not known yet (a Web pane is wanted but its HTML has not been
+/// built), and leaving the WebView alone beats flashing the previous document.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebIntent {
+    Hide,
+    Show(String),
+    Unchanged,
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     root: Option<PathBuf>,
@@ -75,6 +88,10 @@ pub struct Workspace {
     /// one is shared by every tab rather than created per document.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     webview: Option<Entity<gpui_wry::WebView>>,
+    /// Set while a deferred WebView sync is queued, so a burst of notifications
+    /// coalesces into one.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    webview_sync_pending: bool,
     /// What the WebView is currently showing, so we do not reload identical
     /// content on every frame.
     web_current: Option<String>,
@@ -94,9 +111,12 @@ impl Workspace {
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(WATCH_POLL).await;
-                if this.update(cx, |this, cx| this.drain_watcher(cx)).is_err() {
+                if this.upgrade().is_none() {
                     break;
                 }
+                // A skipped tick is harmless: the watcher queue is drained on
+                // the next one. A panic here would take the window with it.
+                crate::views::try_update(&this, cx, |this, cx| this.drain_watcher(cx));
             }
         });
 
@@ -113,6 +133,8 @@ impl Workspace {
             status: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            webview_sync_pending: false,
             web_current: None,
             _tasks: vec![poll],
             _subscriptions: Vec::new(),
@@ -188,6 +210,7 @@ impl Workspace {
             .position(|d| d.read(cx).path() == path)
         {
             self.active = ix;
+            self.web_dirty(cx);
             cx.notify();
             return;
         }
@@ -203,7 +226,7 @@ impl Workspace {
         let registry = self.registry.clone();
         let view = cx.new(|cx| DocumentView::new(file, registry, window, cx));
 
-        let subscription = cx.subscribe_in(
+        self._subscriptions.push(cx.subscribe_in(
             &view,
             window,
             |this: &mut Self, _, event: &DocumentEvent, _, cx| match event {
@@ -214,11 +237,17 @@ impl Workspace {
                 ),
                 DocumentEvent::DirtyChanged => cx.notify(),
             },
-        );
-        self._subscriptions.push(subscription);
+        ));
+        // A document notifies on mode change, trust change, and after a
+        // reparse — every event that can alter what the WebView should show.
+        // Observing is what replaces the old sync-from-render.
+        self._subscriptions.push(cx.observe(&view, |this, _, cx| {
+            this.web_dirty(cx);
+        }));
 
         self.documents.push(view);
         self.active = self.documents.len() - 1;
+        self.web_dirty(cx);
         cx.notify();
     }
 
@@ -230,7 +259,16 @@ impl Workspace {
         // the obvious next step; the file on disk is never touched either way.
         self.documents.remove(ix);
         self.active = self.active.min(self.documents.len().saturating_sub(1));
+        self.web_dirty(cx);
         cx.notify();
+    }
+
+    /// Note that the WebView may need to change. Cheap and idempotent.
+    fn web_dirty(&mut self, cx: &mut Context<Self>) {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        self.schedule_webview_sync(cx);
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let _ = cx;
     }
 
     fn active_document(&self) -> Option<&Entity<DocumentView>> {
@@ -243,7 +281,7 @@ impl Workspace {
         // Clear after a few seconds so the bar does not hold a stale message.
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(6)).await;
-            let _ = this.update(cx, |this, cx| {
+            crate::views::try_update(&this, cx, |this, cx| {
                 this.status = None;
                 cx.notify();
             });
@@ -407,34 +445,68 @@ impl Workspace {
 
     // --- WebView ----------------------------------------------------------
 
-    /// Keep the WebView in sync with the active document.
+    /// What the WebView should be showing, as a pure read of current state.
     ///
-    /// Called from render because the WebView is an OS child window positioned
-    /// by the element tree; it must be created after the window exists and
-    /// updated whenever the visible content changes.
+    /// Separated from applying it because deciding is safe during a draw and
+    /// applying is not — see [`Self::sync_webview`].
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn sync_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let wants_web = self
-            .active_document()
-            .map(|d| {
-                let doc = d.read(cx);
-                doc.mode().uses_webview(doc.split_preview())
-            })
-            .unwrap_or(false);
+    fn webview_intent(&self, cx: &App) -> WebIntent {
+        let Some(doc) = self.active_document() else {
+            return WebIntent::Hide;
+        };
+        let doc = doc.read(cx);
+        if !doc.mode().uses_webview(doc.split_preview()) {
+            return WebIntent::Hide;
+        }
+        match doc.web_html() {
+            Some(html) => WebIntent::Show(html.to_string()),
+            // The mode wants the WebView but the HTML has not been built yet;
+            // leaving it as-is avoids a flash of the previous document.
+            None => WebIntent::Unchanged,
+        }
+    }
 
-        if !wants_web {
-            if let Some(webview) = &self.webview {
-                webview.update(cx, |webview, _| webview.hide());
-            }
-            self.web_current = None;
+    /// Schedule a WebView sync for after the current effect cycle.
+    ///
+    /// **Never call the sync itself from `render`.** The WebView is an OS child
+    /// window driven by `wry`, and on Windows WebView2 pumps messages: touching
+    /// it re-enters the window procedure while the `App` is already mutably
+    /// borrowed for the draw, which panics in `AppCell::borrow_mut`. `defer`
+    /// runs the work at the end of the effect cycle, with no borrow held.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn schedule_webview_sync(&mut self, cx: &mut Context<Self>) {
+        if self.webview_sync_pending {
             return;
         }
+        self.webview_sync_pending = true;
+        let this = cx.entity().downgrade();
+        let entity_id = cx.entity_id();
+        cx.defer(move |cx| {
+            cx.with_window(entity_id, |window, cx| {
+                this.update(cx, |this, cx| {
+                    this.webview_sync_pending = false;
+                    this.sync_webview(window, cx);
+                })
+                .ok();
+            });
+        });
+    }
 
-        let Some(html) = self
-            .active_document()
-            .and_then(|d| d.read(cx).web_html().map(str::to_string))
-        else {
-            return;
+    /// Apply the current intent to the WebView. Must run outside a draw.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn sync_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let intent = self.webview_intent(cx);
+
+        let html = match intent {
+            WebIntent::Unchanged => return,
+            WebIntent::Hide => {
+                if let Some(webview) = &self.webview {
+                    webview.update(cx, |webview, _| webview.hide());
+                }
+                self.web_current = None;
+                return;
+            }
+            WebIntent::Show(html) => html,
         };
 
         let webview = match &self.webview {
@@ -559,6 +631,7 @@ impl Workspace {
             }))
             .on_click(cx.listener(|this, ix: &usize, _, cx| {
                 this.active = *ix;
+                this.web_dirty(cx);
                 cx.notify();
             }))
     }
@@ -628,9 +701,11 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        self.sync_webview(window, cx);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The WebView is deliberately NOT touched here: it is an OS child
+        // window, and mutating it during a draw re-enters the window procedure
+        // with the App already borrowed. `schedule_webview_sync` runs it after
+        // the effect cycle instead.
 
         let content: AnyElement = match self.active_document() {
             Some(doc) => doc.clone().into_any_element(),
@@ -646,6 +721,11 @@ impl Render for Workspace {
 
         v_flex()
             .id("workspace")
+            // Without a role the whole window is announced instead of the
+            // focused element; gpui logs exactly that. `Application` is the
+            // right one for a window whose own keybindings drive it.
+            .role(gpui::Role::Application)
+            .aria_label("markturbo workspace")
             .track_focus(&self.focus_handle)
             .key_context("Workspace")
             .on_action(cx.listener(Self::on_open_folder))
@@ -664,33 +744,58 @@ impl Render for Workspace {
                         .child(div().text_sm().font_bold().child("markturbo"))
                         .child(div().flex_1())
                         .child(
-                            Button::new("open-folder")
-                                .label("Open Folder")
-                                .xsmall()
-                                .ghost()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.on_open_folder(&OpenFolder, window, cx)
-                                })),
-                        )
-                        .child(
-                            // Translating the selection when there is one is
-                            // what a user means by "Translate" with text
-                            // highlighted; falling back to the whole document
-                            // otherwise avoids a menu for a two-case choice.
-                            Button::new("translate")
-                                .label("Translate")
-                                .xsmall()
-                                .ghost()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    let has_selection = this
-                                        .active_document()
-                                        .is_some_and(|d| !d.read(cx).selection(cx).is_empty());
-                                    if has_selection {
-                                        this.on_translate_selection(&TranslateSelection, window, cx)
-                                    } else {
-                                        this.on_translate_document(&TranslateDocument, window, cx)
-                                    }
-                                })),
+                            // The title bar is a `WindowControlArea::Drag`
+                            // region, which Windows hit-tests as `HTCAPTION`:
+                            // a press there becomes a window drag and never
+                            // reaches GPUI's mouse dispatch, so buttons inside
+                            // it silently do nothing. Claiming the press back
+                            // is what upstream's own example does
+                            // (gpui-component `story/src/title_bar.rs`).
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .child(
+                                    Button::new("open-folder")
+                                        .label("Open Folder")
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.on_open_folder(&OpenFolder, window, cx)
+                                        })),
+                                )
+                                .child(
+                                    // Translating the selection when there is
+                                    // one is what a user means by "Translate"
+                                    // with text highlighted; falling back to
+                                    // the whole document otherwise avoids a
+                                    // menu for a two-case choice.
+                                    Button::new("translate")
+                                        .label("Translate")
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let has_selection =
+                                                this.active_document().is_some_and(|d| {
+                                                    !d.read(cx).selection(cx).is_empty()
+                                                });
+                                            if has_selection {
+                                                this.on_translate_selection(
+                                                    &TranslateSelection,
+                                                    window,
+                                                    cx,
+                                                )
+                                            } else {
+                                                this.on_translate_document(
+                                                    &TranslateDocument,
+                                                    window,
+                                                    cx,
+                                                )
+                                            }
+                                        })),
+                                ),
                         ),
                 ),
             )
@@ -736,4 +841,46 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-b", TranslateBlock, None),
         KeyBinding::new("ctrl-shift-b", TranslateBlock, None),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    // Import selectively: the `gpui::*` glob above re-exports a `test`
+    // attribute macro that shadows the built-in one and blows the recursion
+    // limit.
+
+    /// `Workspace::render` must not mutate the WebView.
+    ///
+    /// This is a source-level check rather than a runtime one on purpose: the
+    /// failure it guards is a `RefCell` panic that only reproduces when the
+    /// platform re-enters the window procedure mid-draw (WebView2 pumping
+    /// messages, a screen reader attaching). It is not reliably reachable from
+    /// a test, but it is trivially reintroducible by someone "simplifying" the
+    /// deferred sync back into `render` — which is exactly what this catches.
+    #[test]
+    fn render_does_not_touch_the_webview() {
+        // `include_str!` resolves relative to this file at compile time, so it
+        // works regardless of the test runner's working directory.
+        let source = include_str!("workspace.rs");
+        let render = source
+            .split_once("impl Render for Workspace")
+            .expect("the Render impl")
+            .1;
+        // Stop at the next top-level item so this only reads `render`'s body.
+        let body = render.split("\n/// Keybindings").next().unwrap_or(render);
+
+        for forbidden in ["sync_webview(", "webview.update(", "create_webview("] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` is called from render; the WebView is an OS child \
+                 window and touching it during a draw re-enters the window \
+                 procedure with the App already borrowed. Use \
+                 `schedule_webview_sync` instead."
+            );
+        }
+        assert!(
+            source.contains("fn schedule_webview_sync"),
+            "the deferred path must still exist"
+        );
+    }
 }

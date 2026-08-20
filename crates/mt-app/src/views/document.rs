@@ -293,7 +293,7 @@ impl DocumentView {
         // only the last keystroke in a burst triggers work.
         self._reparse = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(REPARSE_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| this.schedule_reparse(cx));
+            crate::views::try_update(&this, cx, |this, cx| this.schedule_reparse(cx));
         }));
         cx.notify();
     }
@@ -323,7 +323,7 @@ impl DocumentView {
                 })
                 .await;
 
-            let _ = this.update(cx, |this, cx| {
+            crate::views::try_update(&this, cx, |this, cx| {
                 // Discard a stale result: the user may have typed on while we
                 // parsed, and a newer task is already queued.
                 if this.text(cx) != parsed.source() {
