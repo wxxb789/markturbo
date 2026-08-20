@@ -28,7 +28,10 @@ use crate::settings::{AppSettings, GroupBy};
 /// Emitted when the user wants to open an artifact's document.
 #[derive(Debug, Clone)]
 pub enum HarnessEvent {
-    OpenFile(PathBuf),
+    /// Open `path`. `preview` means a single click: the tab is transient and
+    /// the next single click replaces it, which is what keeps browsing a list
+    /// from leaving a bar full of tabs.
+    OpenFile { path: PathBuf, preview: bool },
 }
 
 /// Which kind of artifact the panel is listing.
@@ -180,6 +183,14 @@ impl HarnessView {
         cx.notify();
     }
 
+    /// The document behind row `ix` of the current section.
+    fn entry_path(&self, ix: usize) -> Option<PathBuf> {
+        match self.section {
+            Section::Skills => self.skills.get(ix).map(|s| s.entry.clone()),
+            Section::Instructions => self.instructions.get(ix).map(|i| i.path.clone()),
+        }
+    }
+
     fn selected_skill(&self) -> Option<&Skill> {
         (self.section == Section::Skills)
             .then(|| self.selected.and_then(|ix| self.skills.get(ix)))
@@ -259,8 +270,14 @@ impl HarnessView {
                                     .child(entry.origin.label()),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         this.selected = Some(ix);
+                        if let Some(path) = this.entry_path(ix) {
+                            cx.emit(HarnessEvent::OpenFile {
+                                path,
+                                preview: event.click_count() < 2,
+                            });
+                        }
                         cx.notify();
                     }))
             }))
@@ -298,7 +315,10 @@ impl HarnessView {
                             .xsmall()
                             .primary()
                             .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(HarnessEvent::OpenFile(path.clone()));
+                                cx.emit(HarnessEvent::OpenFile {
+                                    path: path.clone(),
+                                    preview: false,
+                                });
                             })),
                     ),
             )
@@ -422,8 +442,17 @@ impl HarnessView {
                                             .child(skill.summary().to_string()),
                                     ),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                 this.selected = Some(ix);
+                                // A single click selects and previews; a second
+                                // promotes the tab. Same rule the file tree and
+                                // VS Code use, so the two lists behave alike.
+                                if let Some(path) = this.entry_path(ix) {
+                                    cx.emit(HarnessEvent::OpenFile {
+                                        path,
+                                        preview: event.click_count() < 2,
+                                    });
+                                }
                                 cx.notify();
                             })),
                     )
@@ -471,7 +500,10 @@ impl HarnessView {
                             .xsmall()
                             .primary()
                             .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(HarnessEvent::OpenFile(entry.clone()));
+                                cx.emit(HarnessEvent::OpenFile {
+                                    path: entry.clone(),
+                                    preview: false,
+                                });
                             })),
                     ),
             )

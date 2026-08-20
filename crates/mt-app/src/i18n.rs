@@ -34,6 +34,8 @@ pub enum Key {
     Rescan,
     ViewLayout,
     Details,
+    CopyPath,
+    CopyRelativePath,
 
     // Empty states
     OpenFolderToBegin,
@@ -118,6 +120,8 @@ fn english(key: Key) -> &'static str {
         Key::Rescan => "Rescan",
         Key::ViewLayout => "View",
         Key::Details => "Details",
+        Key::CopyPath => "Copy path",
+        Key::CopyRelativePath => "Copy relative path",
 
         Key::OpenFolderToBegin => "Open a folder to begin.",
         Key::OpenFolderToDiscover => "Open a folder to discover skills and instruction files.",
@@ -187,6 +191,8 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::Rescan => "重新扫描",
         Key::ViewLayout => "视图",
         Key::Details => "详情",
+        Key::CopyPath => "复制路径",
+        Key::CopyRelativePath => "复制相对路径",
 
         Key::OpenFolderToBegin => "打开一个文件夹以开始。",
         Key::OpenFolderToDiscover => "打开一个文件夹以发现 skills 和指令文件。",
@@ -255,6 +261,8 @@ mod tests {
         Key::Rescan,
         Key::ViewLayout,
         Key::Details,
+        Key::CopyPath,
+        Key::CopyRelativePath,
         Key::OpenFolderToBegin,
         Key::OpenFolderToDiscover,
         Key::OpenDocumentForOutline,

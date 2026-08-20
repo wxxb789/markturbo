@@ -22,7 +22,10 @@ use crate::workspace::{self, FileNode};
 /// Emitted when the user picks a file.
 #[derive(Debug, Clone)]
 pub enum ExplorerEvent {
-    OpenFile(PathBuf),
+    /// Open `path`. `preview` means a single click: the tab is transient and
+    /// the next single click replaces it, so clicking through a tree does not
+    /// leave forty tabs behind.
+    OpenFile { path: PathBuf, preview: bool },
 }
 
 pub struct Explorer {
@@ -192,13 +195,13 @@ impl Explorer {
             .collect()
     }
 
-    fn on_click(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn on_click(&mut self, id: &str, preview: bool, cx: &mut Context<Self>) {
         let path = PathBuf::from(id);
         if path.is_dir() || id.ends_with("\0loading") {
             return;
         }
         if mt_doc::DocType::of(&path).is_document() {
-            cx.emit(ExplorerEvent::OpenFile(path));
+            cx.emit(ExplorerEvent::OpenFile { path, preview });
         }
     }
 }
@@ -287,8 +290,11 @@ impl Render for Explorer {
                                     }))
                                     .child(div().text_sm().child(item.label.clone())),
                             )
-                            .on_click(move |_, _, cx| {
-                                view.update(cx, |this, cx| this.on_click(&id, cx));
+                            .on_click(move |event: &ClickEvent, _, cx| {
+                                // Single click previews, double click pins —
+                                // the rule every file tree in an editor uses.
+                                let preview = event.click_count() < 2;
+                                view.update(cx, |this, cx| this.on_click(&id, preview, cx));
                             })
                     })
                     .size_full(),

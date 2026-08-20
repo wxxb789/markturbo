@@ -16,8 +16,10 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
+    menu::ContextMenuExt as _,
     resizable::{h_resizable, resizable_panel},
     tab::{Tab, TabBar},
+    tooltip::Tooltip,
     v_flex,
 };
 use mt_doc::translate::Scope;
@@ -41,9 +43,41 @@ actions!(
         OpenSettings,
         TranslateDocument,
         TranslateSelection,
-        TranslateBlock
+        TranslateBlock,
+        CopyPath,
+        CopyRelativePath
     ]
 );
+
+/// The longest tab label before it is elided.
+///
+/// Long enough for `architecture.md` and most agent-artifact names, short
+/// enough that six open documents still fit across a laptop window. A tab that
+/// grows to its file name pushes every other tab off the bar, which is the
+/// failure this bounds — the full path is a hover away.
+const TAB_LABEL_MAX: usize = 22;
+
+/// Shorten `name` to [`TAB_LABEL_MAX`], keeping the extension.
+///
+/// The extension is what distinguishes `notes.md` from `notes.mdx`, so eliding
+/// from the end — the obvious implementation — removes exactly the part worth
+/// keeping. This elides the stem instead.
+fn elide_tab_label(name: &str) -> String {
+    let count = name.chars().count();
+    if count <= TAB_LABEL_MAX {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        // A leading dot is a hidden file, not an extension.
+        Some(ix) if ix > 0 => (&name[..ix], &name[ix..]),
+        _ => (name, ""),
+    };
+    let ext_len = ext.chars().count();
+    // Keep at least a few characters of the stem, even beside a long extension.
+    let keep = TAB_LABEL_MAX.saturating_sub(ext_len + 1).max(3);
+    let head: String = stem.chars().take(keep).collect();
+    format!("{head}…{ext}")
+}
 
 /// Which left-panel section is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +142,20 @@ pub struct Workspace {
     /// What the WebView is currently showing, so we do not reload identical
     /// content on every frame.
     web_current: Option<String>,
+    /// Which tab the context menu was opened on.
+    ///
+    /// Not the active tab: right-clicking a tab opens its menu without
+    /// selecting it, so the copy actions would otherwise act on whichever
+    /// document happened to be focused.
+    menu_tab: Option<usize>,
+    /// The tab opened as a preview, if any.
+    ///
+    /// VS Code's rule: a single click opens a document in italics and reuses
+    /// that slot for the next single click, so browsing a tree does not leave
+    /// forty tabs behind. A double click, an edit, or an explicit open promotes
+    /// it. Exactly one slot, identified by path rather than index so it survives
+    /// tabs closing to its left.
+    preview_tab: Option<PathBuf>,
     /// True while the settings page is showing.
     settings_open: bool,
     /// True while the details panel is showing on the right.
@@ -152,6 +200,8 @@ impl Workspace {
             registry: Arc::new(RendererRegistry::with_defaults()),
             watcher: None,
             status: None,
+            menu_tab: None,
+            preview_tab: None,
             settings_open: false,
             right_panel_open: true,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -237,16 +287,16 @@ impl Workspace {
                 &explorer,
                 window,
                 |this: &mut Self, _, event: &ExplorerEvent, window, cx| {
-                    let ExplorerEvent::OpenFile(path) = event;
-                    this.open_file(path.clone(), window, cx);
+                    let ExplorerEvent::OpenFile { path, preview } = event;
+                    this.open_file_as(path.clone(), *preview, window, cx);
                 },
             ),
             cx.subscribe_in(
                 &harness,
                 window,
                 |this: &mut Self, _, event: &HarnessEvent, window, cx| {
-                    let HarnessEvent::OpenFile(path) = event;
-                    this.open_file(path.clone(), window, cx);
+                    let HarnessEvent::OpenFile { path, preview } = event;
+                    this.open_file_as(path.clone(), *preview, window, cx);
                 },
             ),
         ];
@@ -266,7 +316,75 @@ impl Workspace {
     }
 
     /// Open a file in a tab, focusing an existing tab if it is already open.
+    ///
+    /// A pinned open: the tab stays until the user closes it.
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_as(path, false, window, cx);
+    }
+
+    /// Open a file, optionally as a preview.
+    ///
+    /// A preview reuses one slot: opening another preview replaces it rather
+    /// than adding a tab, which is what keeps clicking through a tree from
+    /// leaving a bar full of documents nobody asked to keep.
+    pub fn open_file_as(
+        &mut self,
+        path: PathBuf,
+        preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Opening the file that is already the preview, by double click, is how
+        // it gets promoted — the tab is already right, only its status changes.
+        if preview {
+            if let Some(current) = &self.preview_tab
+                && current == &path
+            {
+                self.focus_path(&path, cx);
+                return;
+            }
+        } else if self.preview_tab.as_deref() == Some(path.as_path()) {
+            self.preview_tab = None;
+            self.focus_path(&path, cx);
+            return;
+        }
+
+        // Replace the outgoing preview rather than accumulating tabs. Its edits
+        // are the one thing that must not be discarded silently, so a dirty
+        // preview is kept and simply stops being one.
+        if preview
+            && let Some(current) = self.preview_tab.take()
+            && let Some(ix) = self
+                .documents
+                .iter()
+                .position(|d| d.read(cx).path() == current)
+        {
+            if self.documents[ix].read(cx).is_dirty() {
+                // Keep it: promoting beats losing unsaved work.
+            } else {
+                self.close_tab(ix, cx);
+            }
+        }
+
+        self.open_file_inner(path.clone(), window, cx);
+        self.preview_tab = preview.then_some(path);
+        cx.notify();
+    }
+
+    /// Focus the tab showing `path`, if it is open.
+    fn focus_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .documents
+            .iter()
+            .position(|d| d.read(cx).path() == path)
+        {
+            self.active = ix;
+            self.web_dirty(cx);
+            cx.notify();
+        }
+    }
+
+    fn open_file_inner(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         // Opening a document while settings are showing has to show the
         // document, or the click in the explorer looks like it did nothing.
         self.settings_open = false;
@@ -489,6 +607,49 @@ impl Workspace {
         // window that will not notice a re-render on its own.
         self.web_dirty(cx);
         cx.notify();
+    }
+
+    /// The path of whichever tab the context menu belongs to.
+    ///
+    /// Falls back to the active tab: the menu is also reachable by keybinding,
+    /// where no tab was right-clicked.
+    fn menu_target(&self, cx: &App) -> Option<PathBuf> {
+        let ix = self.menu_tab.unwrap_or(self.active);
+        Some(self.documents.get(ix)?.read(cx).path().to_path_buf())
+    }
+
+    fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.menu_target(cx) else {
+            return;
+        };
+        let text = path.to_string_lossy().replace(char::from(92), "/");
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.set_status(format!("Copied {text}"), cx);
+    }
+
+    fn on_copy_relative_path(
+        &mut self,
+        _: &CopyRelativePath,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.menu_target(cx) else {
+            return;
+        };
+        // Without a folder open there is nothing to be relative *to*, so this
+        // reports rather than silently copying the absolute path — which would
+        // look like the other menu item misbehaving.
+        let Some(root) = self.root.clone() else {
+            self.set_status("No folder is open, so there is no relative path".into(), cx);
+            return;
+        };
+        let Ok(rest) = path.strip_prefix(&root) else {
+            self.set_status("That file is outside the open folder".into(), cx);
+            return;
+        };
+        let text = rest.to_string_lossy().replace(char::from(92), "/");
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.set_status(format!("Copied {text}"), cx);
     }
 
     /// The settings page, shown in place of the workspace body.
@@ -1205,18 +1366,76 @@ impl Workspace {
     }
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
+        let root = self.root.clone();
         TabBar::new("document-tabs")
             .w_full()
             .selected_index(self.active)
             .children(self.documents.iter().enumerate().map(|(ix, doc)| {
                 let doc = doc.read(cx);
+                let path = doc.path().to_path_buf();
+                let full = path.to_string_lossy().replace('\\', "/");
+                // Relative only makes sense with a folder open, and only for a
+                // file actually under it — a globally-discovered skill is not.
+                let relative = root
+                    .as_ref()
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .map(|rest| rest.to_string_lossy().replace('\\', "/"));
+                let is_preview = self.preview_tab.as_deref() == Some(path.as_path());
+
                 Tab::new()
-                    .label(doc.title())
+                    .label(elide_tab_label(&doc.title()))
                     .icon(if doc.is_externally_changed() {
                         IconName::TriangleAlert
                     } else {
                         IconName::File
                     })
+                    .prefix(
+                        // The whole tab, wrapped: `Tab` is not interactive, so
+                        // the tooltip and the context menu need an element that
+                        // is. A zero-width prefix is the seam that gets one
+                        // without reimplementing the tab.
+                        div()
+                            .id(SharedString::from(format!("tab-affordances-{ix}")))
+                            .w_0()
+                            .h_full()
+                            // gpui's own `tooltip`, not gpui-component's
+                            // `managed_tooltip`: that extension trait is
+                            // private to the crate.
+                            .tooltip({
+                                let full = full.clone();
+                                move |window, cx| Tooltip::new(full.clone()).build(window, cx)
+                            })
+                            .on_mouse_down(MouseButton::Right, {
+                                cx.listener(move |this, _, _, cx| {
+                                    // The menu acts on whichever tab was
+                                    // right-clicked, which is not necessarily
+                                    // the active one.
+                                    this.menu_tab = Some(ix);
+                                    cx.notify();
+                                })
+                            })
+                            .context_menu({
+                                let relative = relative.clone();
+                                move |menu, _window, cx| {
+                                    let menu = menu
+                                        .menu(i18n::t(i18n::Key::CopyPath, cx), Box::new(CopyPath));
+                                    // Only offered when there is one: a menu
+                                    // item that silently does nothing is worse
+                                    // than an absent one.
+                                    match relative {
+                                        Some(_) => menu.menu(
+                                            i18n::t(i18n::Key::CopyRelativePath, cx),
+                                            Box::new(CopyRelativePath),
+                                        ),
+                                        None => menu,
+                                    }
+                                }
+                            }),
+                    )
+                    // A preview tab is italic, the same signal VS Code uses, so
+                    // "this will be replaced by the next click" is visible
+                    // before it happens rather than after.
+                    .when(is_preview, |tab| tab.italic())
                     .suffix(
                         Button::new(SharedString::from(format!("close-{ix}")))
                             .icon(IconName::Close)
@@ -1341,6 +1560,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_copy_path))
+            .on_action(cx.listener(Self::on_copy_relative_path))
             .on_action(cx.listener(Self::on_translate_document))
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
@@ -1513,6 +1734,87 @@ mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
+    use super::{TAB_LABEL_MAX, elide_tab_label};
+
+    #[test]
+    fn short_names_are_left_alone() {
+        for name in ["a.md", "README.md", "architecture.md"] {
+            assert_eq!(elide_tab_label(name), name);
+        }
+    }
+
+    #[test]
+    fn long_names_keep_their_extension() {
+        // Eliding from the end is the obvious implementation and removes
+        // exactly the part worth keeping: `notes.md` and `notes.mdx` are
+        // different documents, and the extension is what says which.
+        let long = "a-very-long-document-name-indeed.mdx";
+        let out = elide_tab_label(long);
+        assert!(out.ends_with(".mdx"), "got {out}");
+        assert!(out.contains('…'), "got {out}");
+        assert!(out.chars().count() <= TAB_LABEL_MAX, "got {out}");
+    }
+
+    #[test]
+    fn elision_counts_characters_not_bytes() {
+        // A CJK name is well under the limit in characters and well over it in
+        // bytes; slicing by byte would also panic mid-codepoint.
+        let name = "这是一个很长的中文文档名称.md";
+        let out = elide_tab_label(name);
+        assert!(out.chars().count() <= TAB_LABEL_MAX, "got {out}");
+        // Long enough to survive intact at this limit.
+        assert_eq!(out, name);
+
+        let longer = "这是一个非常非常非常长的中文文档名称需要省略.md";
+        let out = elide_tab_label(longer);
+        assert!(out.chars().count() <= TAB_LABEL_MAX, "got {out}");
+        assert!(out.ends_with(".md"), "got {out}");
+    }
+
+    #[test]
+    fn a_dotfile_is_not_all_extension() {
+        // `.gitignore` has no stem before the dot; treating the whole name as
+        // an extension would leave nothing to elide and produce just "…".
+        let out = elide_tab_label(".a-really-long-dotfile-name-here");
+        assert!(!out.starts_with('…'), "got {out}");
+        assert!(out.chars().count() <= TAB_LABEL_MAX, "got {out}");
+    }
+
+    #[test]
+    fn a_name_with_no_extension_still_elides() {
+        let out = elide_tab_label("LICENSE-WITH-A-VERY-LONG-SUFFIX");
+        assert!(out.chars().count() <= TAB_LABEL_MAX, "got {out}");
+        assert!(out.ends_with('…'), "got {out}");
+    }
+
+    /// A preview tab must be replaced, not accumulated.
+    ///
+    /// Source-level: the behavior needs a window and a real click sequence, but
+    /// what makes it work is that `open_file_as` takes the outgoing preview and
+    /// closes it. Someone simplifying that away gets forty tabs back.
+    #[test]
+    fn opening_a_preview_replaces_the_previous_one() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("pub fn open_file_as")
+            .expect("open_file_as must exist");
+        let body = &source[start..];
+        let end = body.find("\n    /// Focus the tab").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("self.preview_tab.take()"),
+            "the outgoing preview must be taken, or previews accumulate"
+        );
+        assert!(
+            body.contains("close_tab"),
+            "and closed, or the slot is only forgotten rather than freed"
+        );
+        assert!(
+            body.contains("is_dirty"),
+            "a preview with unsaved edits must be kept, not silently discarded"
+        );
+    }
 
     /// `Workspace::render` must not mutate the WebView.
     ///
