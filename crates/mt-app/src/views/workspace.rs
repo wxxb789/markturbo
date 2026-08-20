@@ -701,6 +701,32 @@ impl Workspace {
                         ])]),
             )
             .page(
+                SettingPage::new("Editor")
+                    .icon(Icon::new(IconName::LayoutDashboard))
+                    .group(
+                        SettingGroup::new().title("Split view").item(
+                            SettingItem::new(
+                                "Sync scrolling",
+                                SettingField::switch(
+                                    |cx: &App| AppSettings::global(cx).split_sync_scroll,
+                                    |value: bool, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.split_sync_scroll = value
+                                        });
+                                    },
+                                )
+                                .default_value(false),
+                            )
+                            .description(
+                                "Scroll the preview to follow the editor, and to follow \
+                             an outline click. The mapping is proportional, so a \
+                             document with one tall diagram moves further than the \
+                             eye expects.",
+                            ),
+                        ),
+                    ),
+            )
+            .page(
                 SettingPage::new("Skills")
                     .icon(Icon::new(IconName::Bot))
                     .group(SettingGroup::new().title("Discovery").items(vec![

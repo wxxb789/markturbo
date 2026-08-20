@@ -180,6 +180,12 @@ pub struct AppSettings {
     /// at a self-hosted or proxied server — the wire format is the same, so an
     /// OpenAI-compatible endpoint needs nothing else.
     pub translate_base_url: String,
+    /// Scroll the preview to follow the editor in Split mode.
+    ///
+    /// Off by default: the mapping is proportional, so on a document with one
+    /// tall diagram the preview moves further than the eye expects. A user who
+    /// wants the panes locked together says so.
+    pub split_sync_scroll: bool,
     /// Search the harness global directories as well as the workspace.
     pub skills_include_global: bool,
     /// Show skills marked `metadata.internal: true`.
@@ -200,6 +206,7 @@ impl Default for AppSettings {
             translate_provider: String::new(),
             translate_model: String::new(),
             translate_base_url: String::new(),
+            split_sync_scroll: false,
             skills_include_global: true,
             skills_include_internal: false,
             skills_group_by: GroupBy::default(),
@@ -472,6 +479,7 @@ mod tests {
             theme_light: "sepia".into(),
             theme_dark: "nord".into(),
             language: Language::Chinese,
+            split_sync_scroll: true,
             translate_provider: "anthropic".into(),
             translate_base_url: "https://gw.invalid/openai".into(),
             translate_model: "claude-sonnet-5".into(),

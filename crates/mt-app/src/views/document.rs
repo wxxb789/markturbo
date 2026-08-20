@@ -70,6 +70,12 @@ pub struct DocumentView {
     /// Cached WebView HTML, rebuilt on reparse. Held here rather than in the
     /// WebView so switching modes does not re-render.
     web_html: Option<String>,
+    /// The first visible editor row the last time the preview was synced.
+    ///
+    /// Sync is driven from render, which runs on every frame — without this the
+    /// preview would be told to scroll to where it already is, sixty times a
+    /// second, and each of those is a script evaluation in another process.
+    synced_row: Option<usize>,
     /// The window's single WebView, lent to this tab while it is the active one
     /// showing a Web pane.
     ///
@@ -136,6 +142,7 @@ impl DocumentView {
             externally_changed: false,
             registry,
             web_html: None,
+            synced_row: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
             _reparse: None,
@@ -241,6 +248,77 @@ impl DocumentView {
     /// A preview-only mode has no cursor to move, so this switches into one that
     /// shows the editor — Split rather than Source, so the reader keeps the
     /// rendered document they were navigating.
+    /// Scroll the preview to match the editor, when the setting asks for it.
+    ///
+    /// Proportional rather than positional: the editor measures in source lines
+    /// and the preview in rendered pixels, and one source line can render as a
+    /// heading, a paragraph, or an entire diagram. Mapping "fraction of the way
+    /// through the source" to "fraction of the way through the render" is the
+    /// approximation every split-pane Markdown editor makes, and it is stable
+    /// under exactly the thing that breaks line-mapping: a block whose rendered
+    /// height has nothing to do with its source height.
+    ///
+    /// Only ever driven from the editor. Two-way sync means each pane's scroll
+    /// event moves the other, which moves the first — and the loop is only not
+    /// infinite because of rounding.
+    fn sync_preview_scroll(&mut self, cx: &mut Context<Self>) {
+        if !crate::settings::AppSettings::global(cx).split_sync_scroll {
+            return;
+        }
+        if self.mode != ViewMode::Split {
+            return;
+        }
+        let Some(visible) = self.editor.read(cx).visible_row_range() else {
+            return;
+        };
+        let row = visible.start;
+        if self.synced_row == Some(row) {
+            return;
+        }
+        self.synced_row = Some(row);
+
+        let total = self.line_count(cx);
+        // A document short enough to fit needs no sync, and would divide by a
+        // near-zero denominator if it tried.
+        if total <= visible.len() {
+            return;
+        }
+        let fraction = row as f32 / total.saturating_sub(visible.len()).max(1) as f32;
+        self.scroll_preview_to(fraction.clamp(0., 1.), cx);
+    }
+
+    /// Number of lines in the editor's current text.
+    fn line_count(&self, cx: &App) -> usize {
+        self.text(cx).lines().count().max(1)
+    }
+
+    /// Scroll whichever preview is showing to `fraction` of its height.
+    fn scroll_preview_to(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        match self.split_preview {
+            PreviewKind::Web => {
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                if let Some(webview) = &self.webview {
+                    // The preview is a separate browser context, so the only
+                    // way in is a script. `scrollingElement` covers both quirks
+                    // and standards mode; the guard makes a document that has
+                    // not finished loading a no-op rather than an exception.
+                    let script = format!(
+                        "(function(){{var e=document.scrollingElement||document.body;\
+                         if(!e)return;var h=e.scrollHeight-e.clientHeight;\
+                         if(h>0)e.scrollTop=h*{fraction};}})()"
+                    );
+                    let _ = webview.read(cx).raw().evaluate_script(&script);
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                let _ = fraction;
+            }
+            // ponytail: the native preview is a `TextView`, which owns its
+            // scroll handle and does not expose it. Syncing it needs an upstream
+            // accessor; the Web preview is the one that can be driven today.
+            PreviewKind::Native => {}
+        }
+    }
+
     pub fn reveal_offset(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.shows_editor() {
             self.set_mode(ViewMode::Split, cx);
@@ -256,6 +334,23 @@ impl DocumentView {
             state.set_selected_range(offset..offset, cx);
             state.focus(window, cx);
         });
+        // Jumping from the outline is exactly when the two panes must agree, and
+        // the editor has not laid out at the new position yet — so compute the
+        // fraction from the offset rather than waiting for a visible range.
+        if crate::settings::AppSettings::global(cx).split_sync_scroll
+            && self.mode == ViewMode::Split
+        {
+            let text = self.text(cx);
+            let fraction = if text.is_empty() {
+                0.
+            } else {
+                offset as f32 / text.len() as f32
+            };
+            // The render-driven sync would otherwise see the same first visible
+            // row it last recorded and skip the update.
+            self.synced_row = None;
+            self.scroll_preview_to(fraction.clamp(0., 1.), cx);
+        }
         cx.notify();
     }
 
@@ -915,6 +1010,11 @@ impl Render for DocumentView {
                 .into_any_element(),
         };
 
+        // After the panes are built, so the editor has a layout to report a
+        // visible range from. Cheap and self-debouncing: it returns immediately
+        // unless the first visible row actually moved.
+        self.sync_preview_scroll(cx);
+
         v_flex()
             .id("document")
             // A focusable element with an id but no role makes assistive
@@ -987,6 +1087,71 @@ mod tests {
         assert!(
             body.contains("shows_editor"),
             "a preview-only mode has no visible cursor to move"
+        );
+    }
+
+    /// Scroll sync must be one-way, driven from the editor.
+    ///
+    /// Source-level because the failure needs two laid-out panes and a real
+    /// scroll event: two-way sync means each pane's movement moves the other,
+    /// which moves the first, and the loop only terminates because of rounding.
+    /// It reads as a preview that drifts or judders and is very hard to
+    /// attribute after the fact.
+    #[test]
+    fn scroll_sync_is_driven_only_from_the_editor() {
+        let source = include_str!("document.rs");
+        let start = source
+            .find("fn sync_preview_scroll")
+            .expect("sync_preview_scroll");
+        let body = &source[start..];
+        let end = body.find("\n    /// Number of lines").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("visible_row_range"),
+            "the editor's visible range is what drives the mapping"
+        );
+        assert!(
+            !body.contains("set_scroll_offset"),
+            "syncing back into the editor closes the feedback loop"
+        );
+        assert!(
+            body.contains("split_sync_scroll"),
+            "sync must be off unless the setting asks for it"
+        );
+        assert!(
+            body.contains("self.synced_row"),
+            "render runs every frame; without the guard this evaluates a script \
+             in another process sixty times a second"
+        );
+    }
+
+    /// The injected script must tolerate a document that has not loaded.
+    #[test]
+    fn the_scroll_script_is_guarded() {
+        let source = include_str!("document.rs");
+        let start = source
+            .find("fn scroll_preview_to")
+            .expect("scroll_preview_to");
+        let body = &source[start..];
+        let end = body
+            .find("\n    pub fn reveal_offset")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("scrollingElement"),
+            "quirks-mode documents scroll on `body`, standards on `documentElement`"
+        );
+        assert!(
+            body.contains("if(!e)return"),
+            "a document mid-load has no scrolling element; without the guard \
+             this throws inside the WebView"
+        );
+        assert!(
+            body.contains("if(h>0)"),
+            "a preview shorter than its viewport has nothing to scroll, and \
+             dividing by its zero height would be a NaN offset"
         );
     }
 }
