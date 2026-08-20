@@ -1,4 +1,21 @@
+# Line endings are normalized to LF in the repository and on checkout.
+#
+# The tree was committed with a mix of CRLF and LF, so every `cargo fmt` pass
+# produced whole-file diffs that buried the real change. `* text=auto eol=lf`
+# makes Git store and check out LF regardless of platform; `.editorconfig`
+# tells editors the same thing.
+* text=auto eol=lf
+
 # Fixtures must reach the parser exactly as committed; Git must not rewrite
 # their line endings on checkout, or the round-trip tests become platform
 # dependent.
 fixtures/** -text
+
+# Binary assets Git should never inspect for line endings.
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.webp binary
+*.zip binary

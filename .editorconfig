@@ -1,0 +1,41 @@
+# markturbo — editor defaults.
+#
+# The repository was committed with a mix of CRLF and LF, which turned every
+# formatting pass into a whole-file diff and hid the real change. Source is
+# UTF-8 without a BOM and LF everywhere; `.gitattributes` enforces the same on
+# checkout so an editor that ignores this file cannot reintroduce the drift.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.rs]
+indent_size = 4
+# rustfmt's own default, restated so an editor's soft wrap agrees with it.
+max_line_length = 100
+
+[*.{json,yml,yaml,toml,js,ts,css,html}]
+indent_size = 2
+
+[*.md]
+indent_size = 2
+# Two trailing spaces are a hard line break in Markdown; stripping them
+# silently rewrites the document.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
+
+# Fixtures are compared byte for byte by the parser tests, so nothing may
+# normalize them — the same exemption `.gitattributes` makes.
+[fixtures/**]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
