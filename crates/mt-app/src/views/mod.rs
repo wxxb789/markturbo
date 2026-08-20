@@ -64,6 +64,25 @@ impl ViewMode {
         ViewMode::Split,
     ];
 
+    /// The string key for this mode.
+    ///
+    /// A key rather than a string: the mode buttons are the most visible labels
+    /// in the window, so leaving them in English would make a translated UI look
+    /// half-done.
+    pub fn label_key(self) -> crate::i18n::Key {
+        match self {
+            ViewMode::Source => crate::i18n::Key::ModeSource,
+            ViewMode::Native => crate::i18n::Key::ModeNative,
+            ViewMode::Web => crate::i18n::Key::ModeWeb,
+            ViewMode::Split => crate::i18n::Key::ModeSplit,
+        }
+    }
+
+    /// The untranslated name, used for element ids and tests.
+    ///
+    /// Element ids must not change with the language: a keybinding or a test
+    /// that referred to `mode-Source` would break the moment the user switched
+    /// to Chinese.
     pub fn label(self) -> &'static str {
         match self {
             ViewMode::Source => "Source",

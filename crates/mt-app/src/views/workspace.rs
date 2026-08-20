@@ -23,6 +23,7 @@ use gpui_component::{
 use mt_doc::translate::Scope;
 
 use crate::fs;
+use crate::i18n;
 use crate::metrics;
 use crate::renderer::RendererRegistry;
 use crate::translate::Provider;
@@ -55,11 +56,13 @@ enum SidePanel {
 impl SidePanel {
     const ALL: [SidePanel; 3] = [SidePanel::Files, SidePanel::Harness, SidePanel::Outline];
 
-    fn label(self) -> &'static str {
+    /// The string key for this panel, resolved against the chosen language
+    /// at render time rather than baked in here.
+    fn label(self) -> crate::i18n::Key {
         match self {
-            SidePanel::Files => "Files",
-            SidePanel::Harness => "Harness",
-            SidePanel::Outline => "Outline",
+            SidePanel::Files => crate::i18n::Key::PanelFiles,
+            SidePanel::Harness => crate::i18n::Key::PanelHarness,
+            SidePanel::Outline => crate::i18n::Key::PanelOutline,
         }
     }
 }
@@ -328,6 +331,24 @@ impl Workspace {
         let _ = cx;
     }
 
+    /// Redraw everything after the interface language changed.
+    ///
+    /// Labels are resolved from the string table during render, so nothing is
+    /// cached — but a view only redraws when it is notified, and the panels are
+    /// separate entities that did not observe the settings change.
+    fn relabel(&mut self, cx: &mut Context<Self>) {
+        if let Some(explorer) = &self.explorer {
+            explorer.update(cx, |_, cx| cx.notify());
+        }
+        if let Some(harness) = &self.harness {
+            harness.update(cx, |_, cx| cx.notify());
+        }
+        for doc in self.documents.clone() {
+            doc.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
     /// Rediscover skills, e.g. after a setting changed what is in scope.
     fn rescan_harness(&mut self, cx: &mut Context<Self>) {
         if let Some(harness) = &self.harness {
@@ -469,7 +490,7 @@ impl Workspace {
     /// user wants to see take effect on the document behind them, and a modal
     /// covering that document would hide the feedback.
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        use crate::settings::{AppSettings, GroupBy, ThemePreference};
+        use crate::settings::{AppSettings, GroupBy, Language, ThemePreference};
         use gpui_component::setting::{
             SettingField, SettingGroup, SettingItem, SettingPage, Settings,
         };
@@ -490,16 +511,21 @@ impl Workspace {
             .iter()
             .map(|g| (g.key().into(), g.label().into()))
             .collect();
-        // Only providers this build can actually construct: offering Anthropic
-        // on a machine with no key would be a setting that silently does
-        // nothing.
+        // Every schema is listed, not only the ones with a key present: the
+        // point of choosing one is often to configure it, and a dropdown that
+        // hides the option until its environment variable exists gives the user
+        // nowhere to start. The description names the variable each needs.
         let mut provider_options: Vec<(SharedString, SharedString)> =
             vec![("".into(), "Best available".into())];
         provider_options.extend(
-            Provider::available()
+            Provider::ALL
                 .into_iter()
                 .map(|p| (p.key().into(), p.label().into())),
         );
+        let language_options: Vec<(SharedString, SharedString)> = Language::ALL
+            .iter()
+            .map(|l| (l.key().into(), l.label().into()))
+            .collect();
 
         Settings::new("settings")
             .page(
@@ -570,7 +596,37 @@ impl Workspace {
                                 .default_value(crate::theme::DEFAULT_DARK.to_string()),
                             )
                             .description("Used whenever the effective mode is dark."),
-                        ])),
+                        ]))
+                    .group(
+                        SettingGroup::new().title("Language").item(
+                            SettingItem::new(
+                                "Language",
+                                SettingField::dropdown(
+                                    language_options,
+                                    |cx: &App| AppSettings::global(cx).language.key().into(),
+                                    {
+                                        let workspace = workspace.clone();
+                                        move |value: SharedString, cx: &mut App| {
+                                            AppSettings::update(cx, |settings| {
+                                                settings.language = Language::from_key(&value)
+                                            });
+                                            // Labels are resolved during render,
+                                            // so every view holding one has to be
+                                            // asked to draw again — the settings
+                                            // page itself would otherwise be the
+                                            // only thing that changed.
+                                            workspace.update(cx, |this, cx| this.relabel(cx));
+                                        }
+                                    },
+                                )
+                                .default_value(Language::default().key().to_string()),
+                            )
+                            .description(
+                                "The language of the interface. Separate from the \
+                                 translation target below, which is about documents.",
+                            ),
+                        ),
+                    ),
             )
             .page(
                 SettingPage::new("Translation")
@@ -591,9 +647,29 @@ impl Workspace {
                                 ),
                             )
                             .description(
-                                "Only providers this machine can reach are listed. \
-                                 Anthropic needs ANTHROPIC_API_KEY in the environment — \
-                                 an API key is never written to this settings file.",
+                                "The wire format to speak. Anthropic Messages reads \
+                                 ANTHROPIC_API_KEY; both OpenAI schemas read \
+                                 OPENAI_API_KEY. A key is only ever read from the \
+                                 environment, never written to this settings file.",
+                            ),
+                            SettingItem::new(
+                                "Base URL",
+                                SettingField::input(
+                                    |cx: &App| {
+                                        AppSettings::global(cx).translate_base_url.clone().into()
+                                    },
+                                    |value: SharedString, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.translate_base_url = value.to_string()
+                                        });
+                                    },
+                                ),
+                            )
+                            .description(
+                                "Leave empty for the vendor's own endpoint. Set it to \
+                                 reach an OpenAI-compatible server — vLLM, Ollama, \
+                                 OpenRouter, LM Studio, Azure — which needs nothing \
+                                 else, since the wire format is the same.",
                             ),
                             SettingItem::new(
                                 "Model",
@@ -744,7 +820,7 @@ impl Workspace {
             self.set_status("No translation provider is configured".into(), cx);
             return;
         };
-        let service = match provider.build_with(Some(&settings.translate_model)) {
+        let service = match provider.build_with(&settings) {
             Ok(service) => service,
             Err(err) => {
                 self.set_status(format!("Translation unavailable: {err}"), cx);
@@ -946,19 +1022,18 @@ impl Workspace {
                         this.side_panel = SidePanel::ALL[*ix];
                         cx.notify();
                     }))
-                    .children(SidePanel::ALL.map(|p| Tab::new().label(p.label()))),
+                    .children(SidePanel::ALL.map(|p| Tab::new().label(i18n::t(p.label(), cx)))),
             )
             .child(div().flex_1().min_h_0().map(|this| match self.side_panel {
                 SidePanel::Files => match &self.explorer {
                     Some(explorer) => this.child(explorer.clone()),
-                    None => this.child(empty_hint(cx, "Open a folder to begin.")),
+                    None => this.child(empty_hint(cx, i18n::t(i18n::Key::OpenFolderToBegin, cx))),
                 },
                 SidePanel::Harness => match &self.harness {
                     Some(harness) => this.child(harness.clone()),
-                    None => this.child(empty_hint(
-                        cx,
-                        "Open a folder to discover skills and instruction files.",
-                    )),
+                    None => {
+                        this.child(empty_hint(cx, i18n::t(i18n::Key::OpenFolderToDiscover, cx)))
+                    }
                 },
                 SidePanel::Outline => this.child(self.render_outline(cx)),
             }))
@@ -970,12 +1045,13 @@ impl Workspace {
     /// with the page numbers torn off.
     fn render_outline(&self, cx: &Context<Self>) -> AnyElement {
         let Some(doc) = self.active_document() else {
-            return empty_hint(cx, "Open a document to see its outline.").into_any_element();
+            return empty_hint(cx, i18n::t(i18n::Key::OpenDocumentForOutline, cx))
+                .into_any_element();
         };
         let doc = doc.read(cx);
         let outline = doc.document().outline();
         if outline.is_empty() {
-            return empty_hint(cx, "This document has no headings.").into_any_element();
+            return empty_hint(cx, i18n::t(i18n::Key::NoHeadings, cx)).into_any_element();
         }
 
         v_flex()
@@ -1152,7 +1228,11 @@ impl Render for Workspace {
                     .justify_center()
                     .gap_2()
                     .child(Icon::new(IconName::BookOpen))
-                    .child(div().text_sm().child("Open a Markdown file to begin."))
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(i18n::t(i18n::Key::OpenAMarkdownFile, cx).to_string()),
+                    )
                     .into_any_element(),
             }
         };
@@ -1204,7 +1284,7 @@ impl Render for Workspace {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
                                     Button::new("open-folder")
-                                        .label("Open Folder")
+                                        .label(i18n::t(i18n::Key::OpenFolder, cx))
                                         .xsmall()
                                         .ghost()
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1218,7 +1298,7 @@ impl Render for Workspace {
                                     // the whole document otherwise avoids a
                                     // menu for a two-case choice.
                                     Button::new("translate")
-                                        .label("Translate")
+                                        .label(i18n::t(i18n::Key::Translate, cx))
                                         .xsmall()
                                         .ghost()
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1247,7 +1327,7 @@ impl Render for Workspace {
                                         .xsmall()
                                         .ghost()
                                         .when(self.settings_open, |b| b.primary())
-                                        .tooltip("Settings")
+                                        .tooltip(i18n::t(i18n::Key::Settings, cx))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.on_open_settings(&OpenSettings, window, cx)
                                         })),

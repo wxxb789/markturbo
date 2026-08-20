@@ -57,6 +57,50 @@ impl ThemePreference {
     }
 }
 
+/// Which language the interface is written in.
+///
+/// Separate from `translate_to`, which is about documents: a user may well read
+/// the UI in Chinese while translating documents into Japanese.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Language {
+    #[default]
+    #[serde(rename = "en-us")]
+    English,
+    #[serde(rename = "zh-cn")]
+    Chinese,
+}
+
+impl Language {
+    pub const ALL: [Language; 2] = [Language::English, Language::Chinese];
+
+    /// The language's own name, written in itself.
+    ///
+    /// A picker that lists "Chinese" in English is unreadable to exactly the
+    /// person who needs it; every UI that gets this right uses endonyms.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::English => "English",
+            Language::Chinese => "简体中文",
+        }
+    }
+
+    /// BCP-47 tag, which is also the settings key.
+    pub fn key(self) -> &'static str {
+        match self {
+            Language::English => "en-us",
+            Language::Chinese => "zh-cn",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|l| l.key().eq_ignore_ascii_case(key))
+            .unwrap_or_default()
+    }
+}
+
 /// How to group the Skills list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -122,12 +166,20 @@ pub struct AppSettings {
     pub theme_light: String,
     /// Preset id used when the effective mode is dark.
     pub theme_dark: String,
+    /// Which language the interface itself is written in.
+    pub language: Language,
     /// Target language for translation, e.g. `zh`.
     pub translate_to: String,
     /// Provider id, matching [`crate::translate::Provider::key`].
     pub translate_provider: String,
     /// Model id for providers that take one.
     pub translate_model: String,
+    /// Base URL of the translation endpoint.
+    ///
+    /// Empty means the schema's own default. Setting it is what points the app
+    /// at a self-hosted or proxied server — the wire format is the same, so an
+    /// OpenAI-compatible endpoint needs nothing else.
+    pub translate_base_url: String,
     /// Search the harness global directories as well as the workspace.
     pub skills_include_global: bool,
     /// Show skills marked `metadata.internal: true`.
@@ -141,11 +193,13 @@ impl Default for AppSettings {
             theme: ThemePreference::default(),
             theme_light: crate::theme::DEFAULT_LIGHT.into(),
             theme_dark: crate::theme::DEFAULT_DARK.into(),
+            language: Language::default(),
             translate_to: "zh".into(),
             // Empty means "whatever is configured and available", so a machine
             // that gains an API key starts using it without editing settings.
             translate_provider: String::new(),
             translate_model: String::new(),
+            translate_base_url: String::new(),
             skills_include_global: true,
             skills_include_internal: false,
             skills_group_by: GroupBy::default(),
@@ -417,7 +471,9 @@ mod tests {
             theme: ThemePreference::Light,
             theme_light: "sepia".into(),
             theme_dark: "nord".into(),
+            language: Language::Chinese,
             translate_provider: "anthropic".into(),
+            translate_base_url: "https://gw.invalid/openai".into(),
             translate_model: "claude-sonnet-5".into(),
             skills_include_internal: true,
             skills_include_global: false,

@@ -22,6 +22,7 @@ use gpui_component::{
 use mt_doc::{DocType, Document, Severity};
 
 use crate::fs::{self, LoadedFile, SaveError};
+use crate::i18n;
 use crate::metrics;
 use crate::renderer::RendererRegistry;
 use crate::views::{PreviewKind, ViewMode};
@@ -483,8 +484,10 @@ impl DocumentView {
                 h_flex()
                     .gap(metrics::gap())
                     .children(ViewMode::ALL.map(|mode| {
+                        // The id keeps the untranslated name so it stays
+                        // stable across languages; only the label translates.
                         Button::new(SharedString::from(format!("mode-{}", mode.label())))
-                            .label(mode.label())
+                            .label(i18n::t(mode.label_key(), cx))
                             .xsmall()
                             .when(self.mode == mode, |b| b.primary())
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -536,8 +539,8 @@ impl DocumentView {
                 this.child(
                     Button::new("trust")
                         .label(match trust {
-                            Trust::Restricted => "Trust this document",
-                            Trust::Trusted => "Trusted ✓",
+                            Trust::Restricted => i18n::t(i18n::Key::TrustThisDocument, cx),
+                            Trust::Trusted => i18n::t(i18n::Key::Trusted, cx),
                         })
                         .xsmall()
                         .when(trust == Trust::Trusted, |b| b.primary())
@@ -554,7 +557,7 @@ impl DocumentView {
             })
             .child(
                 Button::new("save")
-                    .label("Save")
+                    .label(i18n::t(i18n::Key::Save, cx))
                     .xsmall()
                     .when(self.dirty, |b| b.primary())
                     .on_click(cx.listener(|this, _, _, cx| this.save(false, cx))),
@@ -584,17 +587,17 @@ impl DocumentView {
                     div()
                         .flex_1()
                         .text_sm()
-                        .child("This file changed on disk since it was opened."),
+                        .child(i18n::t(i18n::Key::FileChangedOnDisk, cx)),
                 )
                 .child(
                     Button::new("reload")
-                        .label("Reload from disk")
+                        .label(i18n::t(i18n::Key::ReloadFromDisk, cx))
                         .xsmall()
                         .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
                 )
                 .child(
                     Button::new("overwrite")
-                        .label("Overwrite")
+                        .label(i18n::t(i18n::Key::Overwrite, cx))
                         .xsmall()
                         .danger()
                         .on_click(cx.listener(|this, _, _, cx| this.save(true, cx))),

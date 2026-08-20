@@ -21,6 +21,7 @@ use gpui_component::{
 };
 use mt_doc::{Instruction, Origin, Severity, Skill, instruction, skill};
 
+use crate::i18n;
 use crate::metrics;
 use crate::settings::{AppSettings, GroupBy};
 
@@ -40,10 +41,10 @@ pub enum Section {
 impl Section {
     const ALL: [Section; 2] = [Section::Skills, Section::Instructions];
 
-    fn label(self) -> &'static str {
+    fn label(self) -> crate::i18n::Key {
         match self {
-            Section::Skills => "Skills",
-            Section::Instructions => "Instructions",
+            Section::Skills => crate::i18n::Key::SectionSkills,
+            Section::Instructions => crate::i18n::Key::SectionInstructions,
         }
     }
 }
@@ -199,7 +200,7 @@ impl HarnessView {
     fn render_instructions(&self, cx: &Context<Self>) -> AnyElement {
         if self.instructions.is_empty() {
             let hint = if self.scanning {
-                "Scanning…".to_string()
+                i18n::t(i18n::Key::Scanning, cx).to_string()
             } else {
                 format!(
                     "No instruction files found.\n\nSearched {} workspace \
@@ -295,7 +296,7 @@ impl HarnessView {
                     )
                     .child(
                         Button::new("open-instruction")
-                            .label("Open")
+                            .label(i18n::t(i18n::Key::Open, cx))
                             .xsmall()
                             .primary()
                             .on_click(cx.listener(move |_, _, _, cx| {
@@ -303,17 +304,25 @@ impl HarnessView {
                             })),
                     ),
             )
-            .children(field(cx, "Kind", entry.doc_type.label()))
-            .children(field(cx, "Origin", entry.origin.label()))
             .children(field(
                 cx,
-                "Location",
+                i18n::t(i18n::Key::Kind, cx),
+                entry.doc_type.label(),
+            ))
+            .children(field(
+                cx,
+                i18n::t(i18n::Key::Origin, cx),
+                entry.origin.label(),
+            ))
+            .children(field(
+                cx,
+                i18n::t(i18n::Key::Location, cx),
                 &located(&self.root, entry.origin, &entry.path),
             ))
             .children((!entry.aliases.is_empty()).then(|| {
                 v_flex()
                     .gap_0p5()
-                    .child(label(cx, "Also linked from"))
+                    .child(label(cx, i18n::t(i18n::Key::AlsoLinkedFrom, cx)))
                     .children(entry.aliases.iter().map(|alias| {
                         div()
                             .text_xs()
@@ -327,7 +336,7 @@ impl HarnessView {
     fn render_list(&self, cx: &Context<Self>) -> impl IntoElement {
         if self.skills.is_empty() {
             let hint = if self.scanning {
-                "Scanning…".to_string()
+                i18n::t(i18n::Key::Scanning, cx).to_string()
             } else {
                 format!(
                     "No skills found.\n\nSearched {} workspace conventions \
@@ -443,7 +452,7 @@ impl HarnessView {
                     .child(div().flex_1())
                     .child(
                         Button::new("open-skill")
-                            .label("Open SKILL.md")
+                            .label(i18n::t(i18n::Key::OpenSkillMd, cx))
                             .xsmall()
                             .primary()
                             .on_click(cx.listener(move |_, _, _, cx| {
@@ -452,15 +461,19 @@ impl HarnessView {
                     ),
             )
             .child(div().text_xs().child(skill.summary().to_string()))
-            .children(field(cx, "Origin", skill.origin.label()))
             .children(field(
                 cx,
-                "Location",
+                i18n::t(i18n::Key::Origin, cx),
+                skill.origin.label(),
+            ))
+            .children(field(
+                cx,
+                i18n::t(i18n::Key::Location, cx),
                 &located(&self.root, skill.origin, &skill.dir),
             ))
             .children(field(
                 cx,
-                "Discovered in",
+                i18n::t(i18n::Key::DiscoveredIn, cx),
                 &located(&self.root, skill.origin, &skill.root),
             ))
             // The same skill reached by several paths — typically a harness
@@ -516,7 +529,7 @@ impl HarnessView {
                 v_flex()
                     .gap_0p5()
                     .mt_1()
-                    .child(label(cx, "Files"))
+                    .child(label(cx, i18n::t(i18n::Key::Files, cx)))
                     .children(
                         std::iter::once(
                             div()
@@ -543,7 +556,7 @@ impl HarnessView {
                 v_flex()
                     .gap_0p5()
                     .mt_1()
-                    .child(label(cx, "Validation"))
+                    .child(label(cx, i18n::t(i18n::Key::Validation, cx)))
                     .children(skill.diagnostics.iter().map(|d| {
                         let color = match d.severity {
                             Severity::Error => cx.theme().danger,
@@ -719,7 +732,7 @@ impl Render for HarnessView {
                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
                         this.set_section(Section::ALL[*ix], cx);
                     }))
-                    .children(Section::ALL.map(|s| Tab::new().label(s.label()))),
+                    .children(Section::ALL.map(|s| Tab::new().label(i18n::t(s.label(), cx)))),
             )
             .child(
                 h_flex()
@@ -753,7 +766,7 @@ impl Render for HarnessView {
                             .icon(IconName::Redo)
                             .xsmall()
                             .ghost()
-                            .tooltip("Rescan")
+                            .tooltip(i18n::t(i18n::Key::Rescan, cx))
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
             )
@@ -772,7 +785,7 @@ impl Render for HarnessView {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Group by"),
+                                .child(i18n::t(i18n::Key::GroupBy, cx)),
                         )
                         .children(GroupBy::ALL.map(|option| {
                             Button::new(SharedString::from(format!("group-{}", option.key())))
@@ -826,11 +839,22 @@ mod tests {
         // The panel is one surface over two artifact kinds; a section that
         // cannot be selected, or that shares a label, is a section that does
         // not exist as far as the user is concerned.
-        let labels: Vec<&str> = Section::ALL.iter().map(|s| s.label()).collect();
-        assert_eq!(labels.len(), 2);
-        assert_ne!(labels[0], labels[1]);
-        assert!(labels.contains(&"Skills"));
-        assert!(labels.contains(&"Instructions"));
+        use crate::i18n::{Key, text};
+        use crate::settings::Language;
+
+        let keys: Vec<Key> = Section::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1], "the two sections share a label key");
+        // …and the strings behind them differ in every language, which is what
+        // the user actually sees.
+        for language in Language::ALL {
+            assert_ne!(
+                text(keys[0], language),
+                text(keys[1], language),
+                "{}",
+                language.label()
+            );
+        }
     }
 
     fn skill(name: &str, origin: Origin, root: &str, valid: bool) -> Skill {

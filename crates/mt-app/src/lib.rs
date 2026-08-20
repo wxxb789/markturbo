@@ -9,6 +9,7 @@
 //! assets     icons + the fonts GPUI's SVG renderer needs
 //! settings   user preferences, persisted as JSON
 //! metrics    layout scale — insets, row heights, gaps
+//! i18n       interface strings, en-US and zh-CN
 //! theme      preset palettes, driving GPUI and the Web preview alike
 //! fs         load/save with conflict protection
 //! workspace  directory tree
@@ -20,6 +21,7 @@
 
 pub mod assets;
 pub mod fs;
+pub mod i18n;
 pub mod metrics;
 pub mod renderer;
 pub mod settings;
