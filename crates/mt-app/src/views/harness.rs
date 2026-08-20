@@ -1,9 +1,11 @@
-//! Skills Explorer and Inspector.
+//! The Harness panel: skills and instruction files.
 //!
-//! Agent Skills are first-class here: a skill is a directory, not a filename.
-//! The list shows every skill discovered across the workspace's conventional
-//! roots; selecting one exposes its metadata, validation state, and files, then
-//! opens `SKILL.md` in the document view.
+//! Both are agent artifacts and both are discovered from the same harness
+//! conventions, so they belong in one panel rather than two. A skill is a
+//! directory with a `SKILL.md`; an instruction file is what a harness reads
+//! unprompted — `CLAUDE.md`, `AGENTS.md`, a Cursor rule. Selecting a skill
+//! exposes its metadata, validation state, and files; selecting either opens the
+//! underlying document.
 
 use std::path::{Path, PathBuf};
 
@@ -14,35 +16,58 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
+    tab::{Tab, TabBar},
     v_flex,
 };
-use mt_doc::{Origin, Severity, Skill, skill};
+use mt_doc::{Instruction, Origin, Severity, Skill, instruction, skill};
 
 use crate::settings::{AppSettings, GroupBy};
 
-/// Emitted when the user wants to open a skill's entry document.
+/// Emitted when the user wants to open an artifact's document.
 #[derive(Debug, Clone)]
-pub enum SkillsEvent {
+pub enum HarnessEvent {
     OpenFile(PathBuf),
 }
 
-pub struct SkillsView {
+/// Which kind of artifact the panel is listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Skills,
+    Instructions,
+}
+
+impl Section {
+    const ALL: [Section; 2] = [Section::Skills, Section::Instructions];
+
+    fn label(self) -> &'static str {
+        match self {
+            Section::Skills => "Skills",
+            Section::Instructions => "Instructions",
+        }
+    }
+}
+
+pub struct HarnessView {
     focus_handle: FocusHandle,
     root: PathBuf,
+    section: Section,
     skills: Vec<Skill>,
+    instructions: Vec<Instruction>,
     selected: Option<usize>,
     /// True until the first scan lands, so an empty list is not mistaken for
-    /// "no skills" while the scan is still running.
+    /// "nothing installed" while the scan is still running.
     scanning: bool,
     _scan: Option<Task<()>>,
 }
 
-impl SkillsView {
+impl HarnessView {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             root,
+            section: Section::Skills,
             skills: Vec::new(),
+            instructions: Vec::new(),
             selected: None,
             scanning: true,
             _scan: None,
@@ -51,51 +76,97 @@ impl SkillsView {
         this
     }
 
-    /// Rediscover skills from disk, off the UI thread.
+    /// Rediscover skills and instruction files from disk, off the UI thread.
     ///
-    /// Discovery now covers every harness's workspace directory plus the global
+    /// Discovery covers every harness's workspace directory plus the global
     /// ones, and it runs on a filesystem-watcher tick — doing that synchronously
-    /// would stutter the window on every save.
+    /// would stutter the window on every save. Both scans share one task: they
+    /// walk overlapping directories, so running them together keeps the
+    /// filesystem cache warm and halves the notify traffic.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let root = self.root.clone();
         let settings = AppSettings::global(cx);
+        let global = settings.skills_include_global;
         let options = mt_doc::Discovery {
-            global: settings.skills_include_global,
+            global,
             include_internal: settings.skills_include_internal,
         };
         self.scanning = true;
         // Replacing the task cancels any scan still in flight, so a burst of
         // filesystem events costs one scan rather than one per event.
         self._scan = Some(cx.spawn(async move |this, cx| {
-            let skills = cx
-                .background_spawn(async move { skill::discover_with(&root, options) })
+            let found = cx
+                .background_spawn(async move {
+                    (
+                        skill::discover_with(&root, options),
+                        instruction::discover_with(&root, global),
+                    )
+                })
                 .await;
-            crate::views::try_update(&this, cx, |this, cx| this.apply(skills, cx));
+            crate::views::try_update(&this, cx, |this, cx| this.apply(found.0, found.1, cx));
         }));
         cx.notify();
     }
 
-    fn apply(&mut self, skills: Vec<Skill>, cx: &mut Context<Self>) {
+    fn apply(
+        &mut self,
+        skills: Vec<Skill>,
+        instructions: Vec<Instruction>,
+        cx: &mut Context<Self>,
+    ) {
         // Remember the selection by identity, not index: a rediscovery can
-        // reorder the list.
-        let previous = self
-            .selected
-            .and_then(|ix| self.skills.get(ix))
-            .map(|s| s.dir.clone());
+        // reorder either list.
+        let previous = self.selected_path();
         self.skills = skills;
+        self.instructions = instructions;
         self.scanning = false;
         self.selected = previous
-            .and_then(|dir| self.skills.iter().position(|s| s.dir == dir))
-            .or(if self.skills.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
+            .and_then(|path| self.position_of(&path))
+            .or_else(|| (!self.is_empty()).then_some(0));
+        cx.notify();
+    }
+
+    /// The path identifying the current selection, whichever section is showing.
+    fn selected_path(&self) -> Option<PathBuf> {
+        let ix = self.selected?;
+        match self.section {
+            Section::Skills => self.skills.get(ix).map(|s| s.dir.clone()),
+            Section::Instructions => self.instructions.get(ix).map(|i| i.path.clone()),
+        }
+    }
+
+    fn position_of(&self, path: &Path) -> Option<usize> {
+        match self.section {
+            Section::Skills => self.skills.iter().position(|s| s.dir == path),
+            Section::Instructions => self.instructions.iter().position(|i| i.path == path),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self.section {
+            Section::Skills => self.skills.is_empty(),
+            Section::Instructions => self.instructions.is_empty(),
+        }
+    }
+
+    fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        if self.section == section {
+            return;
+        }
+        self.section = section;
+        // The selection indexes into whichever list was showing, so it cannot
+        // carry across. Selecting the first row beats leaving the inspector on
+        // an artifact the list no longer contains.
+        self.selected = (!self.is_empty()).then_some(0);
         cx.notify();
     }
 
     pub fn skills(&self) -> &[Skill] {
         &self.skills
+    }
+
+    pub fn instructions(&self) -> &[Instruction] {
+        &self.instructions
     }
 
     /// Redraw without rescanning.
@@ -108,7 +179,141 @@ impl SkillsView {
     }
 
     fn selected_skill(&self) -> Option<&Skill> {
-        self.selected.and_then(|ix| self.skills.get(ix))
+        (self.section == Section::Skills)
+            .then(|| self.selected.and_then(|ix| self.skills.get(ix)))
+            .flatten()
+    }
+
+    fn selected_instruction(&self) -> Option<&Instruction> {
+        (self.section == Section::Instructions)
+            .then(|| self.selected.and_then(|ix| self.instructions.get(ix)))
+            .flatten()
+    }
+
+    /// The list of instruction files.
+    ///
+    /// Flat rather than grouped: there are a handful of these, not a hundred,
+    /// and the origin heading is the only grouping that would apply — which the
+    /// per-row origin badge already carries.
+    fn render_instructions(&self, cx: &Context<Self>) -> AnyElement {
+        if self.instructions.is_empty() {
+            let hint = if self.scanning {
+                "Scanning…".to_string()
+            } else {
+                format!(
+                    "No instruction files found.\n\nSearched {} workspace \
+                     directories (the root, .claude, .cursor, .github, …) for \
+                     AGENTS.md, CLAUDE.md, rules and scoped instructions.",
+                    instruction::project_roots().len(),
+                )
+            };
+            return v_flex()
+                .p_4()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(hint),
+                )
+                .into_any_element();
+        }
+
+        v_flex()
+            .p_1()
+            .gap_0p5()
+            .children(self.instructions.iter().enumerate().map(|(ix, entry)| {
+                let selected = self.selected == Some(ix);
+                ListItem::new(("instruction", ix))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded(cx.theme().radius)
+                    .selected(selected)
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(Icon::new(IconName::BookOpen).small())
+                                    .child(div().flex_1().text_sm().truncate().child(entry.label()))
+                                    .when(!entry.aliases.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!("+{}", entry.aliases.len())),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(entry.doc_type.label())
+                                    .child(entry.origin.label()),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(ix);
+                        cx.notify();
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    /// The inspector for the selected instruction file.
+    ///
+    /// Thinner than the skill inspector on purpose: an instruction file has no
+    /// schema to validate against, so what is worth showing is where it came
+    /// from and a way to open it.
+    fn render_instruction_inspector(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(entry) = self.selected_instruction() else {
+            return div().into_any_element();
+        };
+        let path = entry.path.clone();
+
+        v_flex()
+            .p_3()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().text_sm().font_bold().child(entry.label()))
+                    .child(
+                        Button::new("open-instruction")
+                            .label("Open")
+                            .xsmall()
+                            .primary()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(HarnessEvent::OpenFile(path.clone()));
+                            })),
+                    ),
+            )
+            .children(field(cx, "Kind", entry.doc_type.label()))
+            .children(field(cx, "Origin", entry.origin.label()))
+            .children(field(
+                cx,
+                "Location",
+                &located(&self.root, entry.origin, &entry.path),
+            ))
+            .children((!entry.aliases.is_empty()).then(|| {
+                v_flex()
+                    .gap_0p5()
+                    .child(label(cx, "Also linked from"))
+                    .children(entry.aliases.iter().map(|alias| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(located(&self.root, entry.origin, alias))
+                    }))
+            }))
+            .into_any_element()
     }
 
     fn render_list(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -231,7 +436,7 @@ impl SkillsView {
                             .xsmall()
                             .primary()
                             .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(SkillsEvent::OpenFile(entry.clone()));
+                                cx.emit(HarnessEvent::OpenFile(entry.clone()));
                             })),
                     ),
             )
@@ -469,26 +674,42 @@ fn abbreviate_home(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-impl EventEmitter<SkillsEvent> for SkillsView {}
+impl EventEmitter<HarnessEvent> for HarnessView {}
 
-impl Focusable for SkillsView {
+impl Focusable for HarnessView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for SkillsView {
+impl Render for HarnessView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.skills.len();
+        let skills = self.skills.len();
         let invalid = self.skills.iter().filter(|s| !s.is_valid()).count();
         let group_by = AppSettings::global(cx).skills_group_by;
+        let section = self.section;
 
         v_flex()
-            .id("skills")
+            .id("harness")
             .role(gpui::Role::List)
-            .aria_label("Agent skills")
+            .aria_label("Harness artifacts")
             .track_focus(&self.focus_handle)
             .size_full()
+            // Skills and instruction files are both harness artifacts, but they
+            // have nothing in common row-for-row — one has a schema to validate,
+            // the other is prose. Two sections rather than one merged list.
+            .child(
+                TabBar::new("harness-sections")
+                    .segmented()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .selected_index(Section::ALL.iter().position(|s| *s == section).unwrap_or(0))
+                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                        this.set_section(Section::ALL[*ix], cx);
+                    }))
+                    .children(Section::ALL.map(|s| Tab::new().label(s.label()))),
+            )
             .child(
                 h_flex()
                     .px_3()
@@ -500,9 +721,14 @@ impl Render for SkillsView {
                             .flex_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!("SKILLS ({count})")),
+                            .child(match section {
+                                Section::Skills => format!("SKILLS ({skills})"),
+                                Section::Instructions => {
+                                    format!("INSTRUCTIONS ({})", self.instructions.len())
+                                }
+                            }),
                     )
-                    .when(invalid > 0, |this| {
+                    .when(section == Section::Skills && invalid > 0, |this| {
                         this.child(
                             div()
                                 .text_xs()
@@ -515,50 +741,60 @@ impl Render for SkillsView {
                             .icon(IconName::Redo)
                             .xsmall()
                             .ghost()
+                            .tooltip("Rescan")
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
             )
             // Grouping is a view choice, so it belongs next to the list rather
             // than buried in settings — but it persists there, because a user
-            // who groups by harness means it next time too.
-            .child(
-                h_flex()
-                    .px_3()
-                    .pb_2()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Group by"),
-                    )
-                    .children(GroupBy::ALL.map(|option| {
-                        Button::new(SharedString::from(format!("group-{}", option.key())))
-                            .label(option.label())
-                            .xsmall()
-                            .when(option == group_by, |b| b.primary())
-                            .when(option != group_by, |b| b.ghost())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                AppSettings::update(cx, |settings| {
-                                    settings.skills_group_by = option
-                                });
-                                // Grouping only reorders what is already
-                                // loaded; rescanning the filesystem for a view
-                                // change would be gratuitous.
-                                this.keep_selection_stable(cx);
-                            }))
-                    })),
-            )
+            // who groups by harness means it next time too. Instruction files
+            // are a flat handful, so it only applies to skills.
+            .when(section == Section::Skills, |this| {
+                this.child(
+                    h_flex()
+                        .px_3()
+                        .pb_2()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Group by"),
+                        )
+                        .children(GroupBy::ALL.map(|option| {
+                            Button::new(SharedString::from(format!("group-{}", option.key())))
+                                .label(option.label())
+                                .xsmall()
+                                .when(option == group_by, |b| b.primary())
+                                .when(option != group_by, |b| b.ghost())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    AppSettings::update(cx, |settings| {
+                                        settings.skills_group_by = option
+                                    });
+                                    // Grouping only reorders what is already
+                                    // loaded; rescanning the filesystem for a
+                                    // view change would be gratuitous.
+                                    this.keep_selection_stable(cx);
+                                }))
+                        })),
+                )
+            })
             .child(
                 div()
-                    .id("skill-list")
+                    .id("harness-list")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(self.render_list(cx)),
+                    .map(|this| match section {
+                        Section::Skills => this.child(self.render_list(cx)),
+                        Section::Instructions => this.child(self.render_instructions(cx)),
+                    }),
             )
-            .child(self.render_inspector(cx))
+            .map(|this| match section {
+                Section::Skills => this.child(self.render_inspector(cx)),
+                Section::Instructions => this.child(self.render_instruction_inspector(cx)),
+            })
     }
 }
 
@@ -567,11 +803,23 @@ mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{Row, group};
+    use super::{Row, Section, group};
     use crate::settings::GroupBy;
     use mt_doc::skill::{Skill, SkillMeta};
     use mt_doc::{Diagnostic, Origin};
     use std::path::PathBuf;
+
+    #[test]
+    fn both_sections_are_reachable_and_named_distinctly() {
+        // The panel is one surface over two artifact kinds; a section that
+        // cannot be selected, or that shares a label, is a section that does
+        // not exist as far as the user is concerned.
+        let labels: Vec<&str> = Section::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), 2);
+        assert_ne!(labels[0], labels[1]);
+        assert!(labels.contains(&"Skills"));
+        assert!(labels.contains(&"Instructions"));
+    }
 
     fn skill(name: &str, origin: Origin, root: &str, valid: bool) -> Skill {
         Skill {
@@ -668,5 +916,31 @@ mod tests {
         for option in GroupBy::ALL {
             assert!(group(&[], option).is_empty(), "{}", option.label());
         }
+    }
+
+    /// Switching sections must reset the selection.
+    ///
+    /// A source-level check rather than a runtime one: `selected` is a bare
+    /// index into whichever list is showing, so carrying it across a section
+    /// change points the inspector at an unrelated artifact — or, when the
+    /// other list is shorter, at nothing while the row still looks selected.
+    /// The bug is invisible until someone selects the eighth skill and switches
+    /// to a panel with three instruction files, which is not a state a unit
+    /// test reaches without a window.
+    #[test]
+    fn changing_section_resets_the_selection() {
+        // `include_str!` resolves relative to this file at compile time, so it
+        // works regardless of the test runner's working directory.
+        let source = include_str!("harness.rs");
+        let body = source
+            .split_once("fn set_section")
+            .expect("set_section must exist")
+            .1;
+        let body = body.split("\n    pub fn ").next().unwrap_or(body);
+        assert!(
+            body.contains("self.selected ="),
+            "set_section must reassign the selection; it indexes a list that \
+             just changed underneath it"
+        );
     }
 }

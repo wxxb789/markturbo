@@ -27,7 +27,7 @@ use crate::renderer::RendererRegistry;
 use crate::translate::Provider;
 use crate::views::document::{DocumentEvent, DocumentView};
 use crate::views::explorer::{Explorer, ExplorerEvent};
-use crate::views::skills::{SkillsEvent, SkillsView};
+use crate::views::harness::{HarnessEvent, HarnessView};
 use crate::watcher::Watcher;
 
 actions!(
@@ -47,17 +47,17 @@ actions!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidePanel {
     Files,
-    Skills,
+    Harness,
     Outline,
 }
 
 impl SidePanel {
-    const ALL: [SidePanel; 3] = [SidePanel::Files, SidePanel::Skills, SidePanel::Outline];
+    const ALL: [SidePanel; 3] = [SidePanel::Files, SidePanel::Harness, SidePanel::Outline];
 
     fn label(self) -> &'static str {
         match self {
             SidePanel::Files => "Files",
-            SidePanel::Skills => "Skills",
+            SidePanel::Harness => "Harness",
             SidePanel::Outline => "Outline",
         }
     }
@@ -86,7 +86,7 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     root: Option<PathBuf>,
     explorer: Option<Entity<Explorer>>,
-    skills: Option<Entity<SkillsView>>,
+    harness: Option<Entity<HarnessView>>,
     side_panel: SidePanel,
     documents: Vec<Entity<DocumentView>>,
     active: usize,
@@ -135,7 +135,7 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             root: None,
             explorer: None,
-            skills: None,
+            harness: None,
             side_panel: SidePanel::Files,
             documents: Vec::new(),
             active: 0,
@@ -215,7 +215,7 @@ impl Workspace {
         }
 
         let explorer = cx.new(|cx| Explorer::new(path.clone(), window, cx));
-        let skills = cx.new(|cx| SkillsView::new(path.clone(), cx));
+        let harness = cx.new(|cx| HarnessView::new(path.clone(), cx));
 
         // Kept apart from `_subscriptions`: this set is replaced wholesale on
         // every folder change, and folding it into the general one would take
@@ -231,10 +231,10 @@ impl Workspace {
                 },
             ),
             cx.subscribe_in(
-                &skills,
+                &harness,
                 window,
-                |this: &mut Self, _, event: &SkillsEvent, window, cx| {
-                    let SkillsEvent::OpenFile(path) = event;
+                |this: &mut Self, _, event: &HarnessEvent, window, cx| {
+                    let HarnessEvent::OpenFile(path) = event;
                     this.open_file(path.clone(), window, cx);
                 },
             ),
@@ -249,7 +249,7 @@ impl Workspace {
         };
 
         self.explorer = Some(explorer);
-        self.skills = Some(skills);
+        self.harness = Some(harness);
         self.root = Some(path);
         cx.notify();
     }
@@ -328,9 +328,9 @@ impl Workspace {
     }
 
     /// Rediscover skills, e.g. after a setting changed what is in scope.
-    fn rescan_skills(&mut self, cx: &mut Context<Self>) {
-        if let Some(skills) = &self.skills {
-            skills.update(cx, |skills, cx| skills.refresh(cx));
+    fn rescan_harness(&mut self, cx: &mut Context<Self>) {
+        if let Some(harness) = &self.harness {
+            harness.update(cx, |harness, cx| harness.refresh(cx));
         }
     }
 
@@ -383,9 +383,17 @@ impl Workspace {
         }
 
         let tree_changed = changes.iter().any(|c| c.affects_tree());
-        let skills_changed = changes
-            .iter()
-            .any(|c| c.path().to_string_lossy().to_lowercase().contains("skill"));
+        // Skills live under `skills`-named directories; instruction files are
+        // named for what they instruct, so both spellings have to be watched or
+        // editing a CLAUDE.md would never refresh the panel listing it.
+        let harness_changed = changes.iter().any(|c| {
+            let path = c.path().to_string_lossy().to_lowercase();
+            path.contains("skill")
+                || path.contains("agents.md")
+                || path.contains("claude.md")
+                || path.contains("instructions.md")
+                || path.contains("rules")
+        });
 
         // Flag every open document whose file changed. Never reload silently:
         // the user's unsaved edits are theirs to keep or discard.
@@ -401,10 +409,10 @@ impl Workspace {
         if tree_changed && let Some(explorer) = &self.explorer {
             explorer.update(cx, |explorer, cx| explorer.refresh(cx));
         }
-        if (tree_changed || skills_changed)
-            && let Some(skills) = &self.skills
+        if (tree_changed || harness_changed)
+            && let Some(harness) = &self.harness
         {
-            skills.update(cx, |skills, cx| skills.refresh(cx));
+            harness.update(cx, |harness, cx| harness.refresh(cx));
         }
         cx.notify();
     }
@@ -618,7 +626,8 @@ impl Workspace {
             .page(
                 SettingPage::new("Skills")
                     .icon(Icon::new(IconName::Bot))
-                    .group(SettingGroup::new().title("Discovery").items(vec![
+                    .group(
+                        SettingGroup::new().title("Discovery").items(vec![
                             SettingItem::new(
                                 "Include global skills",
                                 SettingField::switch(
@@ -631,7 +640,8 @@ impl Workspace {
                                             });
                                             // Discovery scope changed, so the
                                             // list is now wrong until rescanned.
-                                            workspace.update(cx, |this, cx| this.rescan_skills(cx));
+                                            workspace
+                                                .update(cx, |this, cx| this.rescan_harness(cx));
                                         }
                                     },
                                 )
@@ -651,7 +661,8 @@ impl Workspace {
                                             AppSettings::update(cx, |settings| {
                                                 settings.skills_include_internal = value
                                             });
-                                            workspace.update(cx, |this, cx| this.rescan_skills(cx));
+                                            workspace
+                                                .update(cx, |this, cx| this.rescan_harness(cx));
                                         }
                                     },
                                 )
@@ -675,7 +686,8 @@ impl Workspace {
                                 .default_value(GroupBy::Origin.key().to_string()),
                             )
                             .description("How the Skills list is organized."),
-                        ])),
+                        ]),
+                    ),
             )
             .into_any_element()
     }
@@ -941,9 +953,12 @@ impl Workspace {
                     Some(explorer) => this.child(explorer.clone()),
                     None => this.child(empty_hint(cx, "Open a folder to begin.")),
                 },
-                SidePanel::Skills => match &self.skills {
-                    Some(skills) => this.child(skills.clone()),
-                    None => this.child(empty_hint(cx, "Open a folder to discover skills.")),
+                SidePanel::Harness => match &self.harness {
+                    Some(harness) => this.child(harness.clone()),
+                    None => this.child(empty_hint(
+                        cx,
+                        "Open a folder to discover skills and instruction files.",
+                    )),
                 },
                 SidePanel::Outline => this.child(self.render_outline(cx)),
             }))

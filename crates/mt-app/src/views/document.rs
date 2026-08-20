@@ -909,6 +909,12 @@ impl Render for DocumentView {
 
         v_flex()
             .id("document")
+            // A focusable element with an id but no role makes assistive
+            // technology announce the whole window instead of the document —
+            // gpui logs exactly that. `Group` is the right one for a container
+            // holding a toolbar, an editor and a preview.
+            .role(gpui::Role::Group)
+            .aria_label(self.title())
             .track_focus(&self.focus_handle)
             .size_full()
             .child(self.render_toolbar(cx))

@@ -5,7 +5,7 @@
 
 pub mod document;
 pub mod explorer;
-pub mod skills;
+pub mod harness;
 pub mod workspace;
 
 /// Update an entity from an async task, skipping the update if the `App` is
