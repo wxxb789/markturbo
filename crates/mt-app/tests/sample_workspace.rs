@@ -170,8 +170,9 @@ fn translation_preserves_what_the_readme_promises() {
     use mt_doc::translate::Scope;
 
     let doc = open("README.md");
-    let service = mt_app::translate::Provider::Echo.build().unwrap();
-    let out = mt_doc::translate::translate(&doc, &Scope::Document, "zh", service.as_ref()).unwrap();
+    let service = MarkingTranslator;
+    let service: &dyn mt_doc::translate::TranslationService = &service;
+    let out = mt_doc::translate::translate(&doc, &Scope::Document, "zh", service).unwrap();
 
     // The README names exactly these as untouched. Verify each.
     assert!(
@@ -267,5 +268,25 @@ fn the_sample_uses_lf_endings_so_it_looks_the_same_everywhere() {
             !bytes.windows(2).any(|w| w == b"\r\n"),
             "{relative} contains CRLF"
         );
+    }
+}
+
+/// A translator that marks rather than translates.
+///
+/// What this test actually checks is the *split* — which fragments the engine
+/// considers translatable and how the untouched markup is stitched back — so a
+/// real provider would only add a network round trip and a nondeterministic
+/// answer. Marking makes the boundary visible in the output.
+///
+/// It lives here rather than shipping in the app: an offline pseudo-provider
+/// in the product is a translation command that appears to work and does not.
+struct MarkingTranslator;
+
+impl mt_doc::translate::TranslationService for MarkingTranslator {
+    fn translate(&self, texts: &[String], target_lang: &str) -> anyhow::Result<Vec<String>> {
+        Ok(texts
+            .iter()
+            .map(|t| format!("[{target_lang}] {}", t.trim()))
+            .collect())
     }
 }

@@ -82,24 +82,23 @@ PlantUML is the one renderer that needs a local install (it requires Java):
 Without it, PlantUML blocks show an install hint inline and the status bar notes
 the renderer as unavailable. Nothing else is affected.
 
-## Optional: real translation
+## Translation
 
-Translation works offline out of the box using the **Echo** provider, which
-marks each translatable fragment so you can see exactly what would be sent
-without any credentials. It tags fragments as `[zh?] …` — it does not translate.
-
-For real translation, set a key in the environment and pick a schema in
-Settings:
+Translation needs an API key. Set one in Settings, or export it:
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...   # Anthropic Messages
-export OPENAI_API_KEY=sk-...          # both OpenAI schemas
+export OPENAI_API_KEY=sk-...          # both OpenAI formats
 ```
+
+A key set in Settings takes priority over the environment. The environment
+remains the option if you would rather a key never touched disk — the settings
+file stores it as plain text.
 
 Three wire formats are supported, which between them cover essentially every
 hosted and self-hosted endpoint:
 
-| Schema | Endpoint | Key |
+| Provider | Endpoint | Key |
 |---|---|---|
 | Anthropic Messages | `/v1/messages` | `ANTHROPIC_API_KEY` |
 | OpenAI Chat Completions | `/v1/chat/completions` | `OPENAI_API_KEY` |
@@ -109,9 +108,8 @@ Set **Base URL** to reach an OpenAI-compatible server — vLLM, Ollama,
 OpenRouter, LM Studio, Azure. The wire format is the same, so picking Chat
 Completions and pasting a URL is all that is needed.
 
-The target language, model, and base URL live in Settings. An API key never
-does: it is read from the environment only, so it cannot end up in a settings
-file that gets backed up or screenshotted.
+Without a key, the Translate command reports that one is missing rather than
+doing something that looks like a translation and is not.
 
 ## Settings
 

@@ -648,9 +648,25 @@ impl Workspace {
                             )
                             .description(
                                 "The wire format to speak. Anthropic Messages reads \
-                                 ANTHROPIC_API_KEY; both OpenAI schemas read \
-                                 OPENAI_API_KEY. A key is only ever read from the \
-                                 environment, never written to this settings file.",
+                                 ANTHROPIC_API_KEY; both OpenAI formats read \
+                                 OPENAI_API_KEY — unless an API key is set below, \
+                                 which takes priority.",
+                            ),
+                            SettingItem::new(
+                                "API key",
+                                SettingField::input(
+                                    |cx: &App| {
+                                        AppSettings::global(cx).translate_api_key.clone().into()
+                                    },
+                                    |value: SharedString, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.translate_api_key = value.to_string()
+                                        });
+                                    },
+                                ),
+                            )
+                            .description(
+                                "Takes priority over the environment variable. Leave                                  empty to use that instead — a key in the environment                                  never touches disk, which is the safer option if you                                  want it. Stored as plain text in settings.json.",
                             ),
                             SettingItem::new(
                                 "Base URL",
@@ -843,7 +859,14 @@ impl Workspace {
         };
         let settings = crate::settings::AppSettings::global(cx).clone();
         let Some(provider) = Provider::resolve(&settings) else {
-            self.set_status("No translation provider is configured".into(), cx);
+            // Naming the fix rather than the symptom: "not configured" leaves
+            // the user hunting through Settings for which field is missing.
+            self.set_status(
+                "No translation API key. Set one in Settings (Ctrl/Cmd+,), or export \
+                 ANTHROPIC_API_KEY / OPENAI_API_KEY."
+                    .into(),
+                cx,
+            );
             return;
         };
         let service = match provider.build_with(&settings) {
@@ -868,19 +891,7 @@ impl Workspace {
         let text = doc.read(cx).text(cx);
         let doc_type = doc.read(cx).document().doc_type();
 
-        self.set_status(
-            if provider.is_real() {
-                format!("Translating via {}…", provider.label())
-            } else {
-                // Echo tags segments, it does not translate. Saying so up front
-                // beats the user discovering it in the diff.
-                format!(
-                    "{} does not translate — marking translatable segments only",
-                    provider.label()
-                )
-            },
-            cx,
-        );
+        self.set_status(format!("Translating via {}…", provider.label()), cx);
 
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -896,18 +907,15 @@ impl Workspace {
                         doc.replace_text(translation.text, window, cx);
                     });
                     this.set_status(
-                        if provider.is_real() {
-                            format!("Translated via {}", provider.label())
-                        } else {
-                            format!(
-                                "Marked {} segment(s) — not translated",
-                                translation
-                                    .segments
-                                    .iter()
-                                    .filter(|s| s.translatable)
-                                    .count()
-                            )
-                        },
+                        format!(
+                            "Translated {} segment(s) via {}",
+                            translation
+                                .segments
+                                .iter()
+                                .filter(|s| s.translatable)
+                                .count(),
+                            provider.label()
+                        ),
                         cx,
                     );
                 }

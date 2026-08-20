@@ -174,6 +174,14 @@ pub struct AppSettings {
     pub translate_provider: String,
     /// Model id for providers that take one.
     pub translate_model: String,
+    /// API key for the translation endpoint.
+    ///
+    /// Takes priority over the provider's environment variable: a key typed
+    /// into Settings is an explicit choice, and there is otherwise no way to
+    /// override what the shell exported from inside the app. Empty falls back
+    /// to the environment, which remains the option for anyone who would rather
+    /// a key never touched disk.
+    pub translate_api_key: String,
     /// Base URL of the translation endpoint.
     ///
     /// Empty means the schema's own default. Setting it is what points the app
@@ -205,6 +213,7 @@ impl Default for AppSettings {
             // that gains an API key starts using it without editing settings.
             translate_provider: String::new(),
             translate_model: String::new(),
+            translate_api_key: String::new(),
             translate_base_url: String::new(),
             split_sync_scroll: false,
             skills_include_global: true,
@@ -481,6 +490,7 @@ mod tests {
             language: Language::Chinese,
             split_sync_scroll: true,
             translate_provider: "anthropic".into(),
+            translate_api_key: "sk-test".into(),
             translate_base_url: "https://gw.invalid/openai".into(),
             translate_model: "claude-sonnet-5".into(),
             skills_include_internal: true,
