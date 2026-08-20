@@ -609,6 +609,46 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Open files dropped onto the window.
+    ///
+    /// A directory becomes the workspace; documents open as pinned tabs, since
+    /// dragging a file in is as deliberate as double-clicking one. Anything the
+    /// document pipeline cannot show is reported rather than silently ignored —
+    /// a drop that appears to do nothing reads as a broken window.
+    fn on_drop_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let mut opened = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
+
+        for path in paths {
+            if path.is_dir() {
+                self.open_folder(path.clone(), window, cx);
+                opened += 1;
+            } else if mt_doc::DocType::of(path).is_document() {
+                // With no folder open, adopt the file's parent as the
+                // workspace — the same thing a path argument does, and it is
+                // what makes the tree useful after a bare drop.
+                if self.root.is_none()
+                    && let Some(parent) = path.parent()
+                {
+                    self.open_folder(parent.to_path_buf(), window, cx);
+                }
+                self.open_file(path.clone(), window, cx);
+                opened += 1;
+            } else {
+                skipped.push(
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+
+        if opened == 0 && !skipped.is_empty() {
+            self.set_status(format!("Cannot open {}", skipped.join(", ")), cx);
+        }
+    }
+
     /// The path of whichever tab the context menu belongs to.
     ///
     /// Falls back to the active tab: the menu is also reachable by keybinding,
@@ -1562,6 +1602,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_copy_path))
             .on_action(cx.listener(Self::on_copy_relative_path))
+            // Dropping a file or folder onto the window opens it. The whole
+            // window is the target rather than the document area: a drop is
+            // aimed at the app, and making the user find a hot zone would be a
+            // puzzle rather than a feature.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.on_drop_paths(paths.paths(), window, cx);
+            }))
             .on_action(cx.listener(Self::on_translate_document))
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
@@ -1813,6 +1860,42 @@ mod tests {
         assert!(
             body.contains("is_dirty"),
             "a preview with unsaved edits must be kept, not silently discarded"
+        );
+    }
+
+    /// A dropped path must be classified before it is opened.
+    ///
+    /// Source-level: a real drop needs a window and an OS drag. What makes the
+    /// feature work rather than appear to is that a directory becomes the
+    /// workspace, a document opens, and anything else is *reported* — a drop
+    /// that silently does nothing reads as a broken window.
+    #[test]
+    fn dropping_paths_handles_all_three_cases() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("fn on_drop_paths")
+            .expect("on_drop_paths must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// The path of whichever tab")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("is_dir()"),
+            "a folder must open as a workspace"
+        );
+        assert!(
+            body.contains("is_document()"),
+            "a non-document must not be handed to the document pipeline"
+        );
+        assert!(
+            body.contains("set_status"),
+            "an unopenable drop must say so rather than doing nothing visible"
+        );
+        assert!(
+            body.contains("self.root.is_none()"),
+            "a bare file drop should adopt its parent as the workspace"
         );
     }
 
