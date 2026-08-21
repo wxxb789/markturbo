@@ -71,9 +71,15 @@ pub enum Key {
     ModeSplitWeb,
     TrustThisDocument,
     Trusted,
+    HtmlNeedsTrust,
     FileChangedOnDisk,
     ReloadFromDisk,
     Overwrite,
+
+    // Status bar
+    Watching,
+    AutoRefresh,
+    AutoRefreshOn,
 
     // Inspector fields
     Origin,
@@ -171,9 +177,17 @@ fn english(key: Key) -> &'static str {
         Key::ModeSplitWeb => "Split · Web",
         Key::TrustThisDocument => "Trust this document",
         Key::Trusted => "Trusted ✓",
+        Key::HtmlNeedsTrust => {
+            "This HTML file is shown in a sandbox, so images and stylesheets it loads from disk \
+             are blocked. Trust this document to load them."
+        }
         Key::FileChangedOnDisk => "This file changed on disk since it was opened.",
         Key::ReloadFromDisk => "Reload from disk",
         Key::Overwrite => "Overwrite",
+
+        Key::Watching => "Watching",
+        Key::AutoRefresh => "Auto-refresh on external change",
+        Key::AutoRefreshOn => "Auto-refresh is on",
 
         Key::Origin => "Origin",
         Key::Location => "Location",
@@ -258,9 +272,16 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::ModeSplitWeb => "分栏 · Web",
         Key::TrustThisDocument => "信任此文档",
         Key::Trusted => "已信任 ✓",
+        Key::HtmlNeedsTrust => {
+            "此 HTML 文件在沙箱中显示，它从磁盘加载的图片和样式表被阻止。信任此文档以加载它们。"
+        }
         Key::FileChangedOnDisk => "此文件自打开后已在磁盘上被修改。",
         Key::ReloadFromDisk => "从磁盘重新加载",
         Key::Overwrite => "覆盖",
+
+        Key::Watching => "监视中",
+        Key::AutoRefresh => "外部修改时自动刷新",
+        Key::AutoRefreshOn => "自动刷新已开启",
 
         Key::Origin => "来源",
         Key::Location => "位置",
@@ -340,9 +361,13 @@ mod tests {
         Key::ModeSplitWeb,
         Key::TrustThisDocument,
         Key::Trusted,
+        Key::HtmlNeedsTrust,
         Key::FileChangedOnDisk,
         Key::ReloadFromDisk,
         Key::Overwrite,
+        Key::Watching,
+        Key::AutoRefresh,
+        Key::AutoRefreshOn,
         Key::Origin,
         Key::Location,
         Key::DiscoveredIn,
@@ -403,6 +428,14 @@ mod tests {
         // English: the result must still be a readable label.
         assert_eq!(text(Key::ModeWeb, Language::Chinese), "Web");
         assert!(!text(Key::ModeWeb, Language::Chinese).contains("Key::"));
+    }
+
+    #[test]
+    fn the_html_sandbox_banner_names_the_way_out() {
+        // A banner that says only "blocked" leaves the user with a broken page
+        // and no next step; both languages must point at Trust.
+        assert!(text(Key::HtmlNeedsTrust, Language::English).contains("Trust"));
+        assert!(text(Key::HtmlNeedsTrust, Language::Chinese).contains("信任"));
     }
 
     #[test]

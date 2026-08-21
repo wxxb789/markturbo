@@ -95,8 +95,13 @@ pub struct DocumentView {
     /// Set when the file changed on disk while open.
     externally_changed: bool,
     registry: Arc<RendererRegistry>,
-    /// Cached WebView HTML, rebuilt on reparse. Held here rather than in the
+    /// Cached WebView payload, rebuilt on reparse. Held here rather than in the
     /// WebView so switching modes does not re-render.
+    ///
+    /// Usually HTML, which the workspace turns into a `data:` URL. A trusted
+    /// HTML file instead holds the `file://` URL itself — `to_data_url` passes
+    /// one through — because loading that file from disk is the only way its
+    /// relative images and stylesheets can resolve.
     web_html: Option<String>,
     /// The first visible editor row the last time the preview was synced.
     ///
@@ -115,6 +120,13 @@ pub struct DocumentView {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     webview: Option<Entity<gpui_wry::WebView>>,
     _reparse: Option<Task<()>>,
+    /// The in-flight background reload, deliberately not sharing `_reparse`.
+    ///
+    /// Sharing the slot would let a keystroke cancel a reload, and a reload
+    /// that never lands never runs its second dirty check — which is the thing
+    /// that raises the conflict banner for a document the user started typing
+    /// into while the parse was still running.
+    _reload: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -130,7 +142,7 @@ impl DocumentView {
 
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
-                .language(editor_language(doc_type))
+                .language(editor_language(&file.path))
                 .line_number(true)
                 .soft_wrap(true)
                 .tab_size(TabSize {
@@ -153,9 +165,10 @@ impl DocumentView {
             },
         )];
 
-        // Markdown opens in Native: reading is the common case, and it is the
-        // fast path.
-        let layout = Layout::Native;
+        // Markdown opens in Native and HTML in Web: reading is the common case.
+        // A `.rs` has no rendered form, so it opens in the editor rather than
+        // in a preview pane that would have nothing to draw.
+        let layout = Layout::default_for(doc_type);
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -173,6 +186,7 @@ impl DocumentView {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
             _reparse: None,
+            _reload: None,
             _subscriptions: subscriptions,
         };
         this.rebuild_derived(cx);
@@ -418,23 +432,126 @@ impl DocumentView {
     }
 
     /// Re-read the file from disk, discarding unsaved edits.
+    ///
+    /// Synchronous, and deliberately so: this is the conflict banner's button.
+    /// The user asked for it, it happens once, and a freeze they initiated is
+    /// one they can attribute. The *automatic* path is
+    /// [`Self::reload_if_clean`], which is involuntary and repeats on every
+    /// external write — that one must not block the window.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match fs::load(&self.file.path) {
             Ok(file) => {
-                let text = file.text.clone();
-                self.file = file;
-                self.editor.update(cx, |state, cx| {
-                    state.set_value(text, window, cx);
-                });
-                self.dirty = false;
-                self.externally_changed = false;
-                self.rebuild_derived(cx);
-                cx.emit(DocumentEvent::DirtyChanged);
-                cx.emit(DocumentEvent::Status("Reloaded from disk".into()));
+                let document = Document::with_type(self.document.doc_type(), file.text.clone());
+                self.apply_reload(file, document, window, cx);
             }
-            Err(err) => cx.emit(DocumentEvent::Status(format!("Reload failed: {err}"))),
+            Err(err) => {
+                cx.emit(DocumentEvent::Status(format!("Reload failed: {err}")));
+                cx.notify();
+            }
         }
+    }
+
+    /// Swap in a freshly loaded file and the parse that goes with it.
+    ///
+    /// Takes the `Document` rather than deriving it: the background path has
+    /// already paid for the parse, and [`Self::rebuild_derived`] would repeat it
+    /// on the UI thread — which is the whole thing that path exists to avoid.
+    fn apply_reload(
+        &mut self,
+        file: LoadedFile,
+        document: Document,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = file.text.clone();
+        self.file = file;
+        // `set_value` suppresses the `Change` event, so this does not re-enter
+        // `on_edit` and mark the document dirty again.
+        self.editor.update(cx, |state, cx| {
+            state.set_value(text.clone(), window, cx);
+        });
+        self.dirty = false;
+        self.externally_changed = false;
+        self.document = document;
+        self.preview.update(cx, |state, cx| {
+            state.set_text(&text, cx);
+        });
+        self.refresh_web(cx);
+        cx.emit(DocumentEvent::DirtyChanged);
+        cx.emit(DocumentEvent::Status("Reloaded from disk".into()));
         cx.notify();
+    }
+
+    /// Start an automatic reload, if there is nothing to lose. Returns whether
+    /// it started.
+    ///
+    /// This is the data-loss guard for auto-refresh: [`Self::reload`] discards
+    /// unsaved edits, which is the right answer when the user clicked the
+    /// banner's button and the wrong one when a file watcher fired. A dirty
+    /// document keeps its text and gets `false`, which is the caller's signal to
+    /// raise the banner and let the user choose.
+    ///
+    /// **The read and the parse both run off the UI thread.** The watcher fires
+    /// on every external write, so this runs involuntarily and repeatedly — and
+    /// `Document::with_type` is markdown-rs, measured at 23.4s on the 100K-line
+    /// fixture. Inline, an agent rewriting a file in a loop would freeze the
+    /// window once per write. See [`Self::schedule_reparse`], which is the same
+    /// hazard reached from the other direction.
+    ///
+    /// `true` means *started*, not *finished*: the user can begin typing during
+    /// the parse, so the result checks the dirty flag a second time on landing
+    /// and raises the banner itself if it has to.
+    pub fn reload_if_clean(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.dirty {
+            return false;
+        }
+        let path = self.file.path.clone();
+        let doc_type = self.document.doc_type();
+
+        self._reload = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    let file = fs::load(&path)?;
+                    let document = Document::with_type(doc_type, file.text.clone());
+                    Ok::<_, std::io::Error>((file, document))
+                })
+                .await;
+
+            crate::views::try_update_in(&this, cx, |this, window, cx| match loaded {
+                Ok((file, document)) => this.finish_reload(file, document, window, cx),
+                Err(err) => cx.emit(DocumentEvent::Status(format!("Reload failed: {err}"))),
+            });
+        }));
+        true
+    }
+
+    /// Apply a background reload, or decline to.
+    ///
+    /// Two things can have changed while the parse ran, and each has exactly one
+    /// safe answer:
+    ///
+    /// * The user started typing. Applying would discard their text, which is
+    ///   the one outcome auto-refresh must never produce — so the banner goes up
+    ///   instead and they choose.
+    /// * The file was written again. The parse is then of a version that no
+    ///   longer exists; the watcher has already queued that write, so dropping
+    ///   this result costs one poll tick and avoids showing text that is not on
+    ///   disk.
+    fn finish_reload(
+        &mut self,
+        file: LoadedFile,
+        document: Document,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dirty {
+            self.mark_externally_changed(cx);
+            return;
+        }
+        if !file.stamp.matches(&file.path) {
+            return;
+        }
+        self.apply_reload(file, document, window, cx);
     }
 
     /// Save to disk, refusing to clobber an external change unless `force`.
@@ -543,6 +660,28 @@ impl DocumentView {
             self.web_html = Some(oversize_notice(self.document.source().len()));
             return;
         }
+        if self.document.doc_type() == DocType::Html {
+            // **The sandbox boundary.** A `file://` document has a real origin,
+            // so `<img src="logo.png">` and `<link rel=stylesheet>` resolve
+            // against the file's own directory — and so does everything else
+            // the user can read. That is why it is gated behind an explicit
+            // Trust action, exactly as MDX script execution is.
+            //
+            // Restricted stores the file's own text instead, which the
+            // workspace encodes as a `data:` URL like every other document:
+            // that origin is opaque and cannot reach the filesystem at all.
+            // Encoding it here as well would percent-encode the payload twice.
+            //
+            // ponytail: a trusted preview does not refresh on edit — the URL
+            // is unchanged, so the workspace's "same payload" check skips the
+            // reload. `file://` shows what is on disk, which is honest but not
+            // live; making it live needs a cache-buster the WebView will accept.
+            self.web_html = Some(match self.trust {
+                Trust::Trusted => web::to_file_url(&self.file.path),
+                Trust::Restricted => web::build_html_raw(&self.document, self.trust),
+            });
+            return;
+        }
         // Paint the preview with the app's own preset rather than letting the
         // browser follow the OS: otherwise an explicit Nord shows a generic dark
         // preview next to Nord-colored chrome.
@@ -564,7 +703,8 @@ impl DocumentView {
         cx.notify();
     }
 
-    /// The HTML currently destined for the WebView, if any.
+    /// The HTML — or, for a trusted HTML file, the `file://` URL — currently
+    /// destined for the WebView.
     pub fn web_html(&self) -> Option<&str> {
         self.web_html.as_deref()
     }
@@ -629,8 +769,11 @@ impl DocumentView {
                     .tooltip(i18n::t(i18n::Key::ViewLayout, cx))
                     .dropdown_menu({
                         let current = self.layout;
+                        // Only the layouts this document can actually be shown
+                        // in: offering Native for a `.rs` offers a blank pane.
+                        let available = Layout::available_for(doc_type);
                         move |menu, _window, _cx| {
-                            Layout::ALL.iter().fold(menu, |menu, layout| {
+                            available.iter().fold(menu, |menu, layout| {
                                 menu.menu_with_check(
                                     i18n::text(
                                         layout.label_key(),
@@ -664,7 +807,11 @@ impl DocumentView {
                         .child(format!("{errors} issue(s)")),
                 )
             })
-            .when(doc_type == DocType::Mdx, |this| {
+            // The two types Trust means something for, and it means a different
+            // thing for each: MDX gains script execution, HTML gains filesystem
+            // access. Both are things a cloned repository must not get without
+            // the user asking.
+            .when(matches!(doc_type, DocType::Mdx | DocType::Html), |this| {
                 let trust = self.trust;
                 this.child(
                     Button::new("trust")
@@ -1036,13 +1183,31 @@ fn first_line_title(text: &str) -> String {
     stripped.to_string()
 }
 
-/// Which syntax-highlighting language the editor uses for a document type.
-fn editor_language(doc_type: DocType) -> Language {
-    match doc_type {
-        // gpui-component maps "mdx" onto its Markdown grammar; MDX-specific
-        // highlighting would need a grammar this build does not ship.
-        DocType::Mdx => Language::Markdown,
-        _ => Language::Markdown,
+/// Which syntax-highlighting language the editor uses for a file.
+///
+/// Keyed on the path, not the [`DocType`]: the doc type answers "how is this
+/// document rendered", and every text file shares one answer to that while
+/// needing a different grammar here.
+fn editor_language(path: &std::path::Path) -> Language {
+    // The Markdown family reaches this by name as often as by extension —
+    // `AGENTS.md`, `*.instructions.md`, a `.mdc` cursor rule — and
+    // gpui-component maps "mdx" onto the Markdown grammar anyway, so the whole
+    // family resolves to the one language.
+    if DocType::of(path).renders() {
+        return Language::Markdown;
+    }
+    // No extension table of our own: `Language::from_str` already is one, over
+    // exactly the grammars the `tree-sitter-languages` feature compiles in, and
+    // it falls back to `Plain` for anything it does not know. The file name is
+    // the second try because `Path::extension` is `None` for a `Makefile`.
+    let name = |part: Option<&std::ffi::OsStr>| {
+        part.and_then(|p| p.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default()
+    };
+    match Language::from_str(&name(path.extension())) {
+        Language::Plain => Language::from_str(&name(path.file_name())),
+        language => language,
     }
 }
 
@@ -1111,7 +1276,23 @@ impl Render for DocumentView {
 mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
-    use super::first_line_title;
+    use super::{Layout, editor_language, first_line_title};
+    use gpui_component::highlighter::Language;
+    use mt_doc::DocType;
+    use std::path::Path;
+
+    /// This file's source between `signature` and the next `end` marker.
+    ///
+    /// The source-level checks below all need one function's body, and the
+    /// hand-rolled `find`/slice pair was already repeated once per test.
+    fn fn_body(signature: &str, end: &str) -> &'static str {
+        let source = include_str!("document.rs");
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let body = &source[start..];
+        &body[..body.find(end).unwrap_or(body.len())]
+    }
 
     #[test]
     fn a_buffer_is_named_by_its_first_line() {
@@ -1274,6 +1455,268 @@ mod tests {
             body.contains("if(h>0)"),
             "a preview shorter than its viewport has nothing to scroll, and \
              dividing by its zero height would be a NaN offset"
+        );
+    }
+
+    #[test]
+    fn the_editor_highlights_a_file_by_its_extension() {
+        // The bug this replaces: every file was opened with the Markdown
+        // grammar, so a `.rs` was syntax-highlighted as prose.
+        assert_eq!(editor_language(Path::new("src/main.rs")), Language::Rust);
+        assert_eq!(editor_language(Path::new("app.py")), Language::Python);
+        assert_eq!(
+            editor_language(Path::new("pkg/package.json")),
+            Language::Json
+        );
+        assert_eq!(editor_language(Path::new("Cargo.toml")), Language::Toml);
+        // Uppercase on disk is the same language.
+        assert_eq!(editor_language(Path::new("Main.RS")), Language::Rust);
+    }
+
+    #[test]
+    fn the_whole_markdown_family_keeps_the_markdown_grammar() {
+        // These are Markdown by name rather than by extension, and `.mdc` has
+        // no grammar of its own at all — falling through to `from_str` would
+        // highlight a cursor rule as plain text.
+        for path in [
+            "README.md",
+            "AGENTS.md",
+            "page.mdx",
+            "x/rust.instructions.md",
+            "repo/.cursor/rules/style.mdc",
+        ] {
+            assert_eq!(
+                editor_language(Path::new(path)),
+                Language::Markdown,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_grammar_falls_back_to_plain() {
+        // Never a panic and never a wrong grammar: an unknown extension gets
+        // no highlighting rather than someone else's.
+        assert_eq!(editor_language(Path::new("data.qqq")), Language::Plain);
+        assert_eq!(editor_language(Path::new("no_extension")), Language::Plain);
+        // A conventional name the extension lookup cannot see, because
+        // `Path::extension` is `None` for it.
+        assert_eq!(editor_language(Path::new("Makefile")), Language::Make);
+    }
+
+    /// A text file must open in the editor, not in an empty preview.
+    ///
+    /// Source-level: constructing a `DocumentView` needs a `Window`. What is
+    /// being asserted is the wiring — `Layout::available_for` and
+    /// `default_for` are unit-tested in `views/mod.rs`, and this is the call
+    /// site that was hard-coded to `Layout::Native` for every document.
+    #[test]
+    fn a_document_opens_in_the_layout_its_type_defaults_to() {
+        let source = include_str!("document.rs");
+        let start = source.find("pub fn new(").expect("DocumentView::new");
+        let body = &source[start..];
+        let end = body.find("\n    pub fn path(").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("Layout::default_for(doc_type)"),
+            "hard-coding the opening layout opens a `.rs` in a preview pane \
+             that has nothing to draw"
+        );
+        // And the type it defaults to for a text file is the editor.
+        assert_eq!(Layout::default_for(DocType::Text), Layout::Source);
+    }
+
+    /// The layout dropdown must not offer layouts that show nothing.
+    #[test]
+    fn the_layout_dropdown_offers_only_what_the_document_supports() {
+        let source = include_str!("document.rs");
+        let start = source.find("fn render_toolbar").expect("render_toolbar");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// The banner shown")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("Layout::available_for(doc_type)"),
+            "iterating `Layout::ALL` offers a text file four layouts that \
+             render an empty pane"
+        );
+        assert!(
+            !body.contains("Layout::ALL"),
+            "one of the two lists has to go, or they drift"
+        );
+    }
+
+    /// Trust is offered for both things it can unlock.
+    ///
+    /// Source-level for the same reason as the others — this is a render body.
+    /// The two meanings are different (MDX gains scripts, HTML gains the
+    /// filesystem) but the control is one, and HTML's was simply missing.
+    #[test]
+    fn the_trust_button_is_offered_to_html_as_well_as_mdx() {
+        let source = include_str!("document.rs");
+        let start = source.find("fn render_toolbar").expect("render_toolbar");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// The banner shown")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("DocType::Mdx | DocType::Html"),
+            "without the button an HTML file's relative images can never load"
+        );
+    }
+
+    /// `file://` is reachable only for a document the user trusted.
+    ///
+    /// This is the security boundary, and it is the kind that is easy to widen
+    /// by accident while refactoring: a `file://` page can read anything the
+    /// user can. Source-level because the alternative needs a real WebView.
+    #[test]
+    fn only_a_trusted_document_is_given_filesystem_access() {
+        let source = include_str!("document.rs");
+        let start = source.find("fn rebuild_web").expect("rebuild_web");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Rebuild the Web payload")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let file_url = body.find("to_file_url").expect("the trusted path");
+        let trusted = body.find("Trust::Trusted =>").expect("the trust match");
+        assert!(
+            trusted < file_url,
+            "`to_file_url` must sit under the `Trusted` arm"
+        );
+        assert!(
+            body.contains("Trust::Restricted =>") && body.contains("build_html_raw"),
+            "restricted HTML must be served as text for the workspace to turn \
+             into an opaque-origin `data:` URL, which cannot reach the \
+             filesystem at all"
+        );
+        assert!(
+            !body.contains("to_data_url"),
+            "the workspace already encodes the payload; doing it here too \
+             percent-encodes it twice and shows the user a URL as text"
+        );
+        assert!(
+            body.contains("DocType::Html"),
+            "HTML must not go through the themed shell, which would nest a \
+             whole document inside another one"
+        );
+    }
+
+    /// Auto-refresh must never discard typed text.
+    ///
+    /// Source-level: the guard's whole job is to return *before* it starts any
+    /// work, and there is no observable state to assert that against — a
+    /// document that refused is byte-identical to one nothing happened to.
+    #[test]
+    fn reload_if_clean_refuses_to_touch_a_dirty_document() {
+        let body = fn_body(
+            "pub fn reload_if_clean",
+            "\n    /// Apply a background reload",
+        );
+
+        let guard = body.find("if self.dirty").expect("the dirty guard");
+        let spawn = body.find("cx.spawn(").expect("the reload task");
+        assert!(
+            guard < spawn,
+            "the guard must come first, or an automatic refresh discards \
+             unsaved edits before anyone can object"
+        );
+        assert!(
+            body[guard..spawn].contains("return false"),
+            "a dirty document must change nothing and say so, which is what \
+             leaves the banner up"
+        );
+    }
+
+    /// The automatic reload must not parse on the UI thread.
+    ///
+    /// The defect this replaces: `drain_watcher` -> `reload_if_clean` ->
+    /// `reload` -> `Document::set_source` -> `reparse`, all inline. That parse
+    /// is markdown-rs and superlinear — **measured at 23.4s on
+    /// `fixtures/perf/huge-100k.md`** in a release build, 665ms on a 1MB file —
+    /// and it froze the window for the whole of it. The watcher fires on every
+    /// external write, so an agent rewriting a file in a loop froze the window
+    /// once per poll tick. `mt-doc/tests/performance.rs`'s
+    /// `a_huge_document_is_slow_enough_to_require_background_parsing` asserts
+    /// the parse stays slow precisely so nobody moves it back here.
+    ///
+    /// Source-level for the same reason as its neighbours: reproducing it needs
+    /// a real window, a 100K-line file, and a stopwatch on the frame time.
+    #[test]
+    fn the_automatic_reload_parses_off_the_ui_thread() {
+        let body = fn_body(
+            "pub fn reload_if_clean",
+            "\n    /// Apply a background reload",
+        );
+
+        assert!(
+            body.contains("background_spawn"),
+            "the read and the parse must run off the UI thread; inline they \
+             freeze the window for 23.4s on the 100K-line fixture, once per \
+             external write"
+        );
+        assert!(
+            !body.contains("self.reload("),
+            "`reload` is the synchronous, user-initiated path — routing the \
+             watcher through it is the freeze this test exists to prevent"
+        );
+        assert!(
+            body.contains("try_update_in"),
+            "the result lands after an await, where the infallible borrow \
+             panics mid-draw"
+        );
+    }
+
+    /// A background reload lands into a document that may have moved on.
+    ///
+    /// Both checks are one-line and both are load-bearing: without the second
+    /// dirty check a reload started while clean clobbers text typed during the
+    /// parse — the exact data loss `reload_if_clean` exists to prevent — and
+    /// without the stamp check the editor shows a version that is no longer on
+    /// disk.
+    #[test]
+    fn a_landing_reload_rechecks_the_document_and_the_file() {
+        let body = fn_body("fn finish_reload", "\n    /// Save to disk");
+
+        let dirty = body.find("if self.dirty").expect("the second dirty check");
+        let apply = body.find("self.apply_reload").expect("the apply");
+        assert!(
+            dirty < apply,
+            "the user can start typing during the parse; applying without \
+             re-checking discards what they typed"
+        );
+        assert!(
+            body[dirty..apply].contains("mark_externally_changed"),
+            "a document that went dirty mid-parse must still get its banner, \
+             or the change goes unnoticed"
+        );
+        assert!(
+            body.contains("stamp.matches"),
+            "a result parsed from a version that has since been overwritten is \
+             stale; the watcher has already queued the newer write"
+        );
+    }
+
+    /// The manual reload stays synchronous, and must stay cheap to tell apart.
+    #[test]
+    fn the_manual_reload_is_the_one_the_banner_button_calls() {
+        let source = include_str!("document.rs");
+        let start = source
+            .find("fn render_conflict_banner")
+            .expect("the banner");
+        let body = &source[start..];
+        let end = body.find("\n    fn render_editor").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("this.reload(window, cx)"),
+            "the banner's button is user-initiated and one-shot, so it keeps \
+             the synchronous path; the watcher is the one that must not"
         );
     }
 }

@@ -3,6 +3,8 @@
 //! Views read the document engine; they never own document semantics. That
 //! keeps the engine reusable headless and keeps each view small.
 
+use mt_doc::DocType;
+
 pub mod document;
 pub mod explorer;
 pub mod harness;
@@ -40,6 +42,28 @@ where
     cx.with_window(entity.entity_id(), |_, app| app.update_entity(&entity, f))
 }
 
+/// [`try_update`] for a callback that also needs the `Window`.
+///
+/// `AsyncApp::update_in` is the infallible path: it reaches the same borrow
+/// through `AppCell::borrow_mut` and so panics on exactly the re-entrant draw
+/// described above. `with_window` hands out the `Window` from a
+/// `try_borrow_mut`, which is why the same work can be skipped instead.
+pub fn try_update_in<T, R>(
+    entity: &gpui::WeakEntity<T>,
+    cx: &mut gpui::AsyncApp,
+    f: impl FnOnce(&mut T, &mut gpui::Window, &mut gpui::Context<T>) -> R,
+) -> Option<R>
+where
+    T: 'static,
+{
+    use gpui::AppContext as _;
+
+    let entity = entity.upgrade()?;
+    cx.with_window(entity.entity_id(), |window, app| {
+        app.update_entity(&entity, |this, cx| f(this, window, cx))
+    })
+}
+
 /// How a document is laid out.
 ///
 /// One flat list rather than a mode plus a separate preview choice. The old
@@ -72,6 +96,42 @@ impl Layout {
         Layout::SplitNative,
         Layout::SplitWeb,
     ];
+
+    /// The layouts a document of `doc_type` can actually be shown in.
+    ///
+    /// A `.rs` file has no rendered form, so offering Native or Split for it
+    /// offers a blank pane; HTML has one, but only the WebView can produce it —
+    /// the native path is the Markdown `TextView`, not a general HTML engine.
+    ///
+    /// `&'static [Layout]` off consts because this is read once per dropdown
+    /// render and per tab open; a `Vec` here would allocate on every frame.
+    pub fn available_for(doc_type: DocType) -> &'static [Layout] {
+        const SOURCE_ONLY: [Layout; 1] = [Layout::Source];
+        const WEB_ONLY: [Layout; 2] = [Layout::Source, Layout::Web];
+
+        if doc_type.renders() {
+            &Self::ALL
+        } else if doc_type == DocType::Html {
+            &WEB_ONLY
+        } else {
+            &SOURCE_ONLY
+        }
+    }
+
+    /// The layout a document of this type opens in.
+    ///
+    /// The first entry of `available_for` would give Source for everything,
+    /// which is wrong for the two types that do render: opening a `README.md`
+    /// or an `.html` in the editor hides the thing the user came to look at.
+    pub fn default_for(doc_type: DocType) -> Layout {
+        if doc_type.renders() {
+            Layout::Native
+        } else if doc_type == DocType::Html {
+            Layout::Web
+        } else {
+            Layout::Source
+        }
+    }
 
     /// The string key for this layout's label.
     pub fn label_key(self) -> crate::i18n::Key {
@@ -283,5 +343,86 @@ mod tests {
                 layout.key()
             );
         }
+    }
+
+    /// Every `DocType`, so a variant added later cannot slip past the checks
+    /// below by simply not being listed.
+    const EVERY_DOC_TYPE: [DocType; 10] = [
+        DocType::Markdown,
+        DocType::Mdx,
+        DocType::Skill,
+        DocType::Agents,
+        DocType::Claude,
+        DocType::CursorRule,
+        DocType::Instructions,
+        DocType::Html,
+        DocType::Text,
+        DocType::Other,
+    ];
+
+    #[test]
+    fn every_doc_type_has_at_least_one_layout_to_open_in() {
+        // An empty slice means the layout dropdown renders nothing and the tab
+        // has no layout to fall back to, which is a document that cannot be
+        // displayed at all.
+        for doc_type in EVERY_DOC_TYPE {
+            assert!(
+                !Layout::available_for(doc_type).is_empty(),
+                "{:?} has no layouts",
+                doc_type
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_layout_is_always_one_the_document_offers() {
+        // Opening in a layout the dropdown does not list leaves the control
+        // showing a selection the user cannot get back to.
+        for doc_type in EVERY_DOC_TYPE {
+            let default = Layout::default_for(doc_type);
+            assert!(
+                Layout::available_for(doc_type).contains(&default),
+                "{:?} opens in {} but does not offer it",
+                doc_type,
+                default.key()
+            );
+        }
+    }
+
+    #[test]
+    fn html_is_offered_the_webview_and_never_the_native_preview() {
+        // GPUI renders Markdown through `TextView`, not arbitrary HTML, so a
+        // native preview of an `.html` file would be a blank pane.
+        assert_eq!(
+            Layout::available_for(DocType::Html),
+            [Layout::Source, Layout::Web]
+        );
+        assert_eq!(Layout::default_for(DocType::Html), Layout::Web);
+        for layout in Layout::available_for(DocType::Html) {
+            assert_ne!(layout.preview(), Some(PreviewKind::Native));
+        }
+    }
+
+    #[test]
+    fn plain_text_is_offered_the_editor_only() {
+        for doc_type in [DocType::Text, DocType::Other] {
+            assert_eq!(Layout::available_for(doc_type), [Layout::Source]);
+            assert_eq!(Layout::default_for(doc_type), Layout::Source);
+        }
+    }
+
+    #[test]
+    fn the_markdown_family_still_offers_all_five_layouts() {
+        for doc_type in EVERY_DOC_TYPE.into_iter().filter(|t| t.renders()) {
+            assert_eq!(
+                Layout::available_for(doc_type),
+                Layout::ALL,
+                "{:?}",
+                doc_type
+            );
+            assert_eq!(Layout::default_for(doc_type), Layout::Native);
+        }
+        // And the filter above is not vacuous.
+        assert!(Layout::available_for(DocType::Markdown).len() == 5);
     }
 }

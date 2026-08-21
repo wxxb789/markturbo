@@ -278,6 +278,12 @@ pub struct Workspace {
     /// vanished as the selection changed would resize the document under the
     /// user's cursor.
     right_panel_open: bool,
+    /// True while a translation request is in flight.
+    ///
+    /// The button reads it through `loading`, which also makes it inert — a
+    /// second request would overwrite the editor twice with two different
+    /// answers to the same text.
+    translating: bool,
     _tasks: Vec<Task<()>>,
     /// Subscriptions that live as long as the workspace does.
     _subscriptions: Vec<Subscription>,
@@ -321,6 +327,7 @@ impl Workspace {
             settings_open: false,
             left_panel_open: true,
             right_panel_open: true,
+            translating: false,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -689,12 +696,28 @@ impl Workspace {
                 || path.contains("rules")
         });
 
-        // Flag every open document whose file changed. Never reload silently:
-        // the user's unsaved edits are theirs to keep or discard.
+        // Every open document whose file changed. With auto-reload off, the
+        // flag and its banner are the whole response — the user's unsaved edits
+        // are theirs to keep or discard. With it on, a *clean* document is
+        // re-read; a dirty one is not, and `reload_if_clean` saying so is
+        // exactly the signal that the banner is still needed. Automatic refresh
+        // must never discard typed text.
+        //
+        // `reload_if_clean` returns whether it *started*: the read and the parse
+        // run on a background task, because markdown-rs is superlinear and this
+        // fires on every external write. A document that goes dirty while that
+        // parse runs is flagged by the task itself when the result lands.
+        let auto_reload = crate::settings::AppSettings::global(cx).watch_auto_reload;
         for change in &changes {
             let path = change.path();
-            for doc in &self.documents {
-                if doc.read(cx).path() == path {
+            // Cloned: `self.documents` cannot stay borrowed across the `&mut cx`
+            // that leasing each entity takes.
+            for doc in self.documents.clone() {
+                if doc.read(cx).path() != path {
+                    continue;
+                }
+                let reloaded = auto_reload && doc.update(cx, |doc, cx| doc.reload_if_clean(cx));
+                if !reloaded {
                     doc.update(cx, |doc, cx| doc.mark_externally_changed(cx));
                 }
             }
@@ -731,7 +754,7 @@ impl Workspace {
             else {
                 return;
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+            crate::views::try_update_in(&this, cx, |this, window, cx| {
                 this.open_folder(path, window, cx);
             });
         })
@@ -794,7 +817,7 @@ impl Workspace {
             if path.is_dir() {
                 self.open_folder(path.clone(), window, cx);
                 opened += 1;
-            } else if mt_doc::DocType::of(path).is_document() {
+            } else if crate::workspace::is_openable(path) {
                 // With no folder open, adopt the file's parent as the
                 // workspace — the same thing a path argument does, and it is
                 // what makes the tree useful after a bare drop.
@@ -1119,6 +1142,28 @@ impl Workspace {
                              eye expects.",
                             ),
                         ),
+                    )
+                    .group(
+                        SettingGroup::new().title("Watching").item(
+                            SettingItem::new(
+                                "Auto-refresh on external change",
+                                SettingField::switch(
+                                    |cx: &App| AppSettings::global(cx).watch_auto_reload,
+                                    |value: bool, cx: &mut App| {
+                                        AppSettings::update(cx, |settings| {
+                                            settings.watch_auto_reload = value
+                                        });
+                                    },
+                                )
+                                .default_value(false),
+                            )
+                            .description(
+                                "Re-read a document when its file changes on disk. A tab \
+                                 with unsaved edits is never refreshed — it keeps the \
+                                 reload/overwrite banner, because an automatic refresh \
+                                 must not discard typed text.",
+                            ),
+                        ),
                     ),
             )
             .page(
@@ -1194,6 +1239,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The button goes inert while `translating`, but the keybinding does
+        // not — and two requests over the same text race to overwrite the
+        // editor with two different answers.
+        if self.translating {
+            return;
+        }
         self.translate(Scope::Document, window, cx);
     }
 
@@ -1203,6 +1254,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.translating {
+            return;
+        }
         let Some(doc) = self.active_document() else {
             return;
         };
@@ -1220,6 +1274,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.translating {
+            return;
+        }
         let Some(doc) = self.active_document() else {
             return;
         };
@@ -1271,6 +1328,9 @@ impl Workspace {
         let doc_type = doc.read(cx).document().doc_type();
 
         self.set_status(format!("Translating via {}…", provider.label()), cx);
+        // Set before the spawn, not inside it: the button has to go inert on
+        // this frame, or the second click lands before the task even starts.
+        self.translating = true;
 
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -1280,25 +1340,33 @@ impl Workspace {
                 })
                 .await;
 
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(translation) => {
-                    doc.update(cx, |doc, cx| {
-                        doc.replace_text(translation.text, window, cx);
-                    });
-                    this.set_status(
-                        format!(
-                            "Translated {} segment(s) via {}",
-                            translation
-                                .segments
-                                .iter()
-                                .filter(|s| s.translatable)
-                                .count(),
-                            provider.label()
-                        ),
-                        cx,
-                    );
+            // `try_update_in` rather than `update_in`: this lands after an
+            // await and can arrive mid-draw, where the infallible borrow
+            // panics. Skipping costs one frame; panicking costs the session.
+            crate::views::try_update_in(&this, cx, |this, window, cx| {
+                // Cleared in both arms — a flag left set by the error path is a
+                // permanently dead button.
+                this.translating = false;
+                match result {
+                    Ok(translation) => {
+                        doc.update(cx, |doc, cx| {
+                            doc.replace_text(translation.text, window, cx);
+                        });
+                        this.set_status(
+                            format!(
+                                "Translated {} segment(s) via {}",
+                                translation
+                                    .segments
+                                    .iter()
+                                    .filter(|s| s.translatable)
+                                    .count(),
+                                provider.label()
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(err) => this.set_status(format!("Translation failed: {err}"), cx),
                 }
-                Err(err) => this.set_status(format!("Translation failed: {err}"), cx),
             });
         })
         .detach();
@@ -1349,11 +1417,18 @@ impl Workspace {
         let entity_id = cx.entity_id();
         cx.defer(move |cx| {
             cx.with_window(entity_id, |window, cx| {
-                this.update(cx, |this, cx| {
-                    this.webview_sync_pending = false;
-                    this.sync_webview(window, cx);
-                })
-                .ok();
+                if this
+                    .update(cx, |this, cx| {
+                        this.webview_sync_pending = false;
+                        this.sync_webview(window, cx);
+                    })
+                    .is_err()
+                {
+                    // Swallowing this left "the preview shows the previous
+                    // document" with nothing in the log to attribute it to. The
+                    // entity is gone, so the sync is moot — but say which one.
+                    log::debug!("skipped a WebView sync: the workspace was released");
+                }
             });
         });
     }
@@ -1444,16 +1519,26 @@ impl Workspace {
                 .border_l_1()
                 .border_color(cx.theme().border)
                 .child(
-                    div()
+                    h_flex()
                         .h(metrics::title_bar())
                         .flex_shrink_0()
                         .px(metrics::inset())
-                        .flex()
                         .items_center()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(i18n::t(i18n::Key::Details, cx)),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(i18n::t(i18n::Key::Details, cx)),
+                        )
+                        // The collapse control belongs where the panel is, not
+                        // across the window in the title bar: the click that
+                        // opened it and the click that closes it should land in
+                        // the same place. No `stop_propagation` — this panel is
+                        // not a `WindowControlArea::Drag` region.
+                        .child(self.render_right_toggle(cx)),
                 )
                 .child(
                     div()
@@ -1487,16 +1572,27 @@ impl Workspace {
                     .flex_shrink_0()
                     .flex()
                     .items_center()
+                    .pl(metrics::inset())
+                    .gap(metrics::gap())
+                    // The collapse control moves in here while the panel is
+                    // open, so the click that closes it lands where the click
+                    // that opened it did. Left of the strip, on the side it
+                    // governs. No `stop_propagation` — this is not a
+                    // `WindowControlArea::Drag` region, only the title bar is.
+                    .child(self.render_left_toggle(cx))
                     .child(
                         TabBar::new("side-tabs")
                             .underline()
-                            .w_full()
-                            // The full inset, not one reduced by the row
-                            // padding: a tab strip has no row padding of its
-                            // own, so subtracting it put `Files` four pixels
-                            // from the window edge while everything below it
-                            // started twelve.
-                            .px(metrics::inset())
+                            // `flex_1`, not `w_full`: the toggle beside it is a
+                            // sibling now, and a strip claiming the full width
+                            // of the row would push itself off the panel.
+                            .flex_1()
+                            .min_w_0()
+                            // The inset is on the row now, so `Files` still
+                            // lines up with everything below it. Only the far
+                            // end is padded here — a second left inset would
+                            // push the strip a toggle plus an inset in.
+                            .pr(metrics::inset())
                             .selected_index(
                                 SidePanel::ALL
                                     .iter()
@@ -1750,6 +1846,37 @@ impl Workspace {
             .collect()
     }
 
+    /// The left panel's toggle.
+    ///
+    /// One definition with two homes: the title bar carries it while the panel
+    /// is collapsed, and the panel's own header takes it back once it is open.
+    /// A control that jumps to the far side of the window the moment it is used
+    /// makes the user hunt for it to undo the click they just made.
+    fn render_left_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
+        Button::new("toggle-left-panel")
+            .icon(IconName::PanelLeft)
+            .xsmall()
+            .ghost()
+            .when(self.left_panel_open, |b| b.primary())
+            .tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
+            }))
+    }
+
+    /// The right panel's toggle, on the same two-homes rule as the left one.
+    fn render_right_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
+        Button::new("toggle-right-panel")
+            .icon(IconName::PanelRight)
+            .xsmall()
+            .ghost()
+            .when(self.right_panel_open, |b| b.primary())
+            .tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
+            }))
+    }
+
     /// Back and Forward, at the far left of the bar.
     ///
     /// A disabled button rather than a hidden one: the pair is a fixed landmark
@@ -1941,24 +2068,18 @@ impl Workspace {
                     // panel it governs; the right one at the right edge, above
                     // that one. A control whose position contradicts what it
                     // opens is a control the user has to read rather than
-                    // recognize.
-                    .child(
-                        h_flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(
-                                Button::new("toggle-left-panel")
-                                    .icon(IconName::PanelLeft)
-                                    .xsmall()
-                                    .ghost()
-                                    .when(self.left_panel_open, |b| b.primary())
-                                    .tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
-                                    })),
-                            ),
-                    )
+                    // recognize. Each is here only while its panel is closed —
+                    // an open panel carries its own copy in its header, which
+                    // is where the eye already is.
+                    .when(!self.left_panel_open, |this| {
+                        this.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(self.render_left_toggle(cx)),
+                        )
+                    })
                     .child(
                         h_flex()
                             .flex_1()
@@ -2035,6 +2156,11 @@ impl Workspace {
                                     .label(i18n::t(i18n::Key::Translate, cx))
                                     .xsmall()
                                     .ghost()
+                                    // Swaps the icon for a spinner and makes the
+                                    // button inert, so the round-trip is visible
+                                    // and a second request cannot be started
+                                    // over the same text.
+                                    .loading(self.translating)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         let has_selection = this
                                             .active_document()
@@ -2054,6 +2180,12 @@ impl Workspace {
                                         }
                                     })),
                             )
+                            // Immediately left of Settings while the panel is
+                            // closed; the panel's own header carries it once it
+                            // is open.
+                            .when(!self.right_panel_open, |this| {
+                                this.child(self.render_right_toggle(cx))
+                            })
                             .child(
                                 Button::new("settings")
                                     .icon(IconName::Settings)
@@ -2063,17 +2195,6 @@ impl Workspace {
                                     .tooltip(i18n::t(i18n::Key::Settings, cx))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.on_open_settings(&OpenSettings, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-right-panel")
-                                    .icon(IconName::PanelRight)
-                                    .xsmall()
-                                    .ghost()
-                                    .when(self.right_panel_open, |b| b.primary())
-                                    .tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
                                     })),
                             ),
                     ),
@@ -2088,6 +2209,7 @@ impl Workspace {
             .filter(|(_, a)| !a.is_available())
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
+        let watching = crate::settings::AppSettings::global(cx).watch_auto_reload;
 
         h_flex()
             .w_full()
@@ -2119,6 +2241,35 @@ impl Workspace {
                         .child(format!("{} unavailable", renderers.join(", "))),
                 )
             })
+            // Last, so it lands at the right end of the bar. Watching is a mode
+            // rather than a command, and a mode needs somewhere to show that it
+            // is on — an eye that is lit is the whole indicator, so the same
+            // control both sets and reports it.
+            .child(
+                Button::new("toggle-auto-refresh")
+                    .icon(if watching {
+                        IconName::Eye
+                    } else {
+                        IconName::EyeOff
+                    })
+                    .xsmall()
+                    .ghost()
+                    .when(watching, |b| b.primary())
+                    .tooltip(i18n::t(
+                        if watching {
+                            i18n::Key::AutoRefreshOn
+                        } else {
+                            i18n::Key::AutoRefresh
+                        },
+                        cx,
+                    ))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        crate::settings::AppSettings::update(cx, |settings| {
+                            settings.watch_auto_reload = !settings.watch_auto_reload
+                        });
+                        cx.notify();
+                    })),
+            )
     }
 }
 
@@ -2417,8 +2568,12 @@ mod tests {
             "a folder must open as a workspace"
         );
         assert!(
-            body.contains("is_document()"),
-            "a non-document must not be handed to the document pipeline"
+            body.contains("is_openable("),
+            "a dropped file must go through the same gate the file tree uses. \
+             `DocType::of(..).is_document()` is not that gate: it judges the \
+             extension alone, so a NUL-filled `.log` passes, loads through \
+             `from_utf8_lossy` as replacement characters, and the first Ctrl+S \
+             writes that back over the original bytes"
         );
         assert!(
             body.contains("set_status"),
@@ -2578,12 +2733,14 @@ mod tests {
         );
     }
 
-    /// Each panel's toggle sits above the panel it governs.
+    /// Each panel's toggle sits above the panel it governs, and moves inside it.
     ///
-    /// Source-level: pure layout, invisible to any runtime assertion. What it
-    /// guards is that the two buttons stay on opposite ends of the bar — put
-    /// together, a control's position contradicts what it opens, and the user
-    /// has to read the icon rather than recognize the side.
+    /// Source-level: pure layout, invisible to any runtime assertion. Two things
+    /// are guarded. The sides — put together, a control's position contradicts
+    /// what it opens, and the user reads the icon instead of recognizing the
+    /// side. And the handoff — a toggle rendered in both places at once is two
+    /// buttons with the same element id, and one rendered in neither leaves an
+    /// open panel with no way to close it.
     #[test]
     fn each_panel_toggle_sits_on_its_own_side() {
         let source = include_str!("workspace.rs");
@@ -2597,10 +2754,10 @@ mod tests {
         let body = &body[..end];
 
         let left = body
-            .find("toggle-left-panel")
+            .find("render_left_toggle")
             .expect("the left panel toggle");
         let right = body
-            .find("toggle-right-panel")
+            .find("render_right_toggle")
             .expect("the right panel toggle");
         let tabs = body.find("self.render_tabs(cx)").expect("the tab strip");
         assert!(
@@ -2610,6 +2767,175 @@ mod tests {
         assert!(
             right > tabs,
             "the right panel's toggle must come after the tabs, at the right edge"
+        );
+        // The user asked for this position exactly: immediately left of
+        // Settings, not after it at the very corner.
+        let settings = body
+            .find("Button::new(\"settings\")")
+            .expect("the settings button");
+        assert!(
+            right < settings,
+            "the right panel's toggle must sit immediately left of Settings"
+        );
+
+        // Each is in the bar only while its panel is closed. The guard is
+        // checked against the toggle that follows it, so swapping the two
+        // conditions cannot pass.
+        for (guard, toggle) in [
+            ("when(!self.left_panel_open", "render_left_toggle"),
+            ("when(!self.right_panel_open", "render_right_toggle"),
+        ] {
+            let at = body.find(guard).unwrap_or_else(|| {
+                panic!("`{guard}` must gate the bar's copy, or the toggle is drawn twice")
+            });
+            let after = &body[at..];
+            let next = after
+                .find("render_left_toggle")
+                .into_iter()
+                .chain(after.find("render_right_toggle"))
+                .min()
+                .expect("a toggle after its guard");
+            assert!(
+                after[next..].starts_with(toggle),
+                "`{guard}` must gate `{toggle}`, not the other side's"
+            );
+        }
+
+        // And each open panel carries its own copy, or opening a panel hides
+        // the only control that closes it again.
+        for (renderer, toggle) in [
+            ("fn render_side_panel", "render_left_toggle"),
+            ("fn render_right_panel", "render_right_toggle"),
+        ] {
+            let start = source
+                .find(renderer)
+                .unwrap_or_else(|| panic!("{renderer}"));
+            let body = &source[start..];
+            let end = body.find("\n    /// ").unwrap_or(body.len());
+            assert!(
+                body[..end].contains(toggle),
+                "{renderer} must carry `{toggle}` in its header"
+            );
+        }
+    }
+
+    /// Nothing in this file may reach the App through the infallible windowed
+    /// borrow.
+    ///
+    /// Source-level because the failure only reproduces when the platform
+    /// re-enters the window procedure mid-draw. `update_in` bottoms out in
+    /// `AppCell::borrow_mut`, which panics on that re-entrant borrow; every
+    /// caller here runs after an `await`, so every caller here can land in one.
+    /// `try_update_in` takes the same borrow through `try_borrow_mut` and skips
+    /// the frame instead. The literal in the log is `RefCell already borrowed`.
+    ///
+    /// Checked over the whole file rather than per spawn body: there is no
+    /// legitimate `update_in` here, and matching async block extents textually
+    /// is how a source check quietly stops asserting anything.
+    #[test]
+    fn no_async_task_updates_through_the_infallible_borrow() {
+        let source = include_str!("workspace.rs");
+        // Only the code, not this test's own description of it.
+        let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
+
+        assert!(
+            !code.contains(".update_in("),
+            "an update goes through the infallible windowed borrow, which \
+             panics when it lands mid-draw. Use `crate::views::try_update_in`."
+        );
+        assert_eq!(
+            code.matches("try_update_in(&this").count(),
+            2,
+            "the folder prompt and the translation both land after an await and \
+             both need the fallible path"
+        );
+        assert!(
+            code.contains("try_update(&this, cx, |this, cx| this.drain_watcher(cx))"),
+            "the watcher poll lands after an await too; it needs no `Window`, \
+             so it takes the windowless fallible path"
+        );
+    }
+
+    /// Auto-refresh must never discard typed text.
+    ///
+    /// Source-level: reproducing it needs a window, a real editor and a file
+    /// changing underneath it. What makes it safe rather than merely working is
+    /// that a document refusing to reload — which is what a dirty one does —
+    /// still gets flagged, so the conflict banner appears instead. Someone
+    /// simplifying the `if !reloaded` away silently loses the banner on exactly
+    /// the documents that need it.
+    #[test]
+    fn auto_refresh_never_reloads_a_document_with_unsaved_edits() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("fn drain_watcher")
+            .expect("drain_watcher must exist");
+        let body = &source[start..];
+        let end = body.find("\n    // --- Actions").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("watch_auto_reload"),
+            "reloading must be opt-in, not the default"
+        );
+        assert!(
+            body.contains("reload_if_clean"),
+            "the reload must go through the guard that refuses a dirty document"
+        );
+        assert!(
+            body.contains("if !reloaded") && body.contains("mark_externally_changed"),
+            "a document that refused to reload must still be flagged, or the \
+             conflict banner never appears and the change goes unnoticed"
+        );
+    }
+
+    /// A translation in flight must show it and refuse a second request.
+    ///
+    /// Source-level: the failure needs a real network round-trip. Two requests
+    /// over the same text race to overwrite the editor with two different
+    /// answers, and the flag is only half the guard — the keybindings bypass
+    /// the button entirely, and a flag left set by the error path is a
+    /// permanently dead button.
+    #[test]
+    fn a_translation_in_flight_blocks_a_second_one() {
+        let source = include_str!("workspace.rs");
+        // Only the code: this test names the literals it looks for, and would
+        // otherwise count itself.
+        let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
+        let start = code.find("fn translate(").expect("translate must exist");
+        let body = &code[start..];
+        let end = body.find("\n    // --- WebView").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("self.translating = true"),
+            "the flag must be set before the spawn, or the second click lands \
+             before the task starts"
+        );
+        assert!(
+            body.contains("this.translating = false"),
+            "and cleared when the result arrives"
+        );
+        // Cleared once, above the match on the result, rather than per arm —
+        // which is what keeps the error path from leaving a dead button.
+        let cleared = body.find("this.translating = false").expect("the clear");
+        let matched = body.find("match result").expect("the result match");
+        assert!(
+            cleared < matched,
+            "the flag must be cleared for both outcomes; an error path that \
+             leaves it set is a permanently dead button"
+        );
+
+        // The button goes inert, and so do the keybindings that bypass it.
+        assert!(
+            code.contains(".loading(self.translating)"),
+            "the Translate button must show the request and go inert"
+        );
+        assert_eq!(
+            code.matches("if self.translating {").count(),
+            3,
+            "all three translate actions must return early, or a keybinding \
+             starts a second request the inert button cannot"
         );
     }
 

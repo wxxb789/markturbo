@@ -86,6 +86,27 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// becomes the memory problem the file-size cap was meant to prevent.
 const MAX_LINE_CHARS: usize = 300;
 
+/// The share of the result cap any one file may take, as a divisor.
+///
+/// Measured on this repository, where the corpus is 1,070 files: without this,
+/// a single vendored `Cargo.lock` took **430 of 500** results for `name` and
+/// **478 of 500** for `version`, and the user's own `crates/` contributed
+/// **nothing at all**. [`document_paths`] sorts for stability, so the walk is
+/// alphabetical and one large generated file reached early spends the whole
+/// budget before anything after it is read.
+///
+/// Deliberately not a denylist of `Cargo.lock` and friends: the failure is
+/// monopolization, not file identity, and the next generated file has a
+/// different name. A tenth of the cap spreads the same 500 results over at
+/// least ten files while still showing more of any one file than a person
+/// scrolls before refining the query.
+const PER_FILE_SHARE: usize = 10;
+
+/// How many results one file may contribute out of `limit`.
+fn per_file_limit(limit: usize) -> usize {
+    (limit / PER_FILE_SHARE).max(1)
+}
+
 /// What a search found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Results {
@@ -204,10 +225,19 @@ fn clip(line: &str) -> String {
 /// `skip` names documents whose text the caller already has — the open tabs,
 /// whose unsaved edits make the file on disk the wrong thing to read. The
 /// caller passes those to [`search_text`] instead.
+///
+/// No single file may take more than [`per_file_limit`] of the budget. Without
+/// that, the result list is decided by walk order rather than by relevance:
+/// [`document_paths`] sorts, so one large generated file early in the alphabet
+/// fills the cap and every file after it is read but never seen. A file that
+/// hits its share is logged and marks the results [`Results::truncated`], the
+/// same signal the global cap uses — a bounded search that quietly returns less
+/// than it found reads as "we searched everything" when it did not.
 pub fn search_files(paths: &[PathBuf], query: &Query, limit: usize, out: &mut Results) {
     if !query.is_runnable() {
         return;
     }
+    let share = per_file_limit(limit);
     for path in paths {
         if out.matches.len() >= limit {
             out.truncated = true;
@@ -225,7 +255,14 @@ pub fn search_files(paths: &[PathBuf], query: &Query, limit: usize, out: &mut Re
             continue;
         };
         let text = String::from_utf8_lossy(&bytes);
-        search_text(path, &text, query, limit, out);
+        let before = out.matches.len();
+        search_text(path, &text, query, limit.min(before + share), out);
+        if out.matches.len() - before >= share {
+            log::debug!(
+                "search: {} hit its {share}-result share; the rest of its matches are not listed",
+                path.display()
+            );
+        }
     }
 }
 
@@ -252,9 +289,15 @@ const MAX_WALK_DEPTH: usize = 12;
 
 /// Every document under `root`, in a stable order.
 ///
-/// Only what [`DocType::is_document`] accepts: searching a folder means
-/// searching the documents in it, and a binary that happens to contain the
-/// query bytes is not a result anyone wants.
+/// Only what [`DocType::is_document`] accepts — Markdown, the agent artifacts,
+/// HTML, and the source/config text the allowlist names. Searching a folder
+/// means searching the readable files in it, and a binary that happens to
+/// contain the query bytes is not a result anyone wants.
+///
+/// That exclusion is load-bearing and it rests on the allowlist being an
+/// allowlist: `.png`, `.exe`, `.zip` are not rejected by any rule here, they
+/// are simply never admitted. A denylist would admit every extension nobody
+/// thought to name, which on a repository is where the megabytes are.
 pub fn document_paths(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     walk(root, 0, &mut found);
@@ -423,6 +466,8 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("README.md"), "x").unwrap();
         std::fs::write(root.join("notes.txt"), "x").unwrap();
+        std::fs::write(root.join("logo.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(root.join("app.exe"), b"MZ\x90\x00").unwrap();
         std::fs::create_dir_all(root.join("docs/deep")).unwrap();
         std::fs::write(root.join("docs/deep/guide.md"), "x").unwrap();
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
@@ -436,12 +481,26 @@ mod tests {
         assert!(names.contains(&"README.md".to_string()));
         assert!(names.contains(&"guide.md".to_string()), "must descend");
         assert!(
+            names.contains(&"notes.txt".to_string()),
+            "text files are searchable documents now, not noise"
+        );
+        assert!(
             !paths
                 .iter()
                 .any(|p| p.components().any(|c| c.as_os_str() == "node_modules")),
             "node_modules is where a documentation search goes to die"
         );
-        assert!(!names.contains(&"notes.txt".to_string()));
+        // The corpus widened to text files; it did not widen to everything. A
+        // binary contributes only bytes that look like a match by accident, and
+        // it is excluded by never being on the allowlist rather than by a rule
+        // here — so this is the assertion that notices if the allowlist stops
+        // being one.
+        for binary in ["logo.png", "app.exe"] {
+            assert!(
+                !names.contains(&binary.to_string()),
+                "{binary} is not something anyone greps"
+            );
+        }
     }
 
     #[test]
@@ -481,6 +540,73 @@ mod tests {
             out.is_empty(),
             "a 4MB document is a generated artifact, not something being read"
         );
+    }
+
+    /// One file must not spend the whole result budget.
+    ///
+    /// This is the folder-search failure in miniature. `document_paths` sorts,
+    /// so the walk is alphabetical, and on this repository a single vendored
+    /// `Cargo.lock` took 430 of 500 results for `name` while the user's own
+    /// `crates/` contributed none. Here `a-generated.lock` is the lockfile and
+    /// `z-source.rs` is the file the person was actually looking for: it sorts
+    /// last, so without the per-file share it is read and then dropped.
+    #[test]
+    fn one_large_file_cannot_consume_the_whole_result_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let hog = dir.path().join("a-generated.lock");
+        let wanted = dir.path().join("z-source.rs");
+        std::fs::write(&hog, "needle\n".repeat(400)).unwrap();
+        std::fs::write(&wanted, "// the one needle a person was looking for\n").unwrap();
+
+        let mut out = Results::default();
+        search_files(
+            &[hog.clone(), wanted.clone()],
+            &Query::new("needle"),
+            100,
+            &mut out,
+        );
+
+        assert!(
+            out.matches.iter().any(|m| m.path == wanted),
+            "the second file's match must survive the first file's 400; got {} \
+             match(es), all from {:?}",
+            out.matches.len(),
+            out.matches.first().map(|m| &m.path)
+        );
+        assert_eq!(
+            out.matches.iter().filter(|m| m.path == hog).count(),
+            10,
+            "one file's share of a cap of 100 is a tenth of it"
+        );
+        assert!(
+            out.truncated,
+            "dropping the rest of a file's matches must be visible to the \
+             caller, or a shortened list reads as a complete one"
+        );
+        assert_eq!(out.files, 2);
+    }
+
+    /// The share is a share of the cap, and never zero.
+    #[test]
+    fn the_per_file_share_is_a_tenth_of_the_cap_but_at_least_one() {
+        assert_eq!(per_file_limit(DEFAULT_LIMIT), 50);
+        assert_eq!(per_file_limit(100), 10);
+        // A caller asking for fewer results than the divisor still gets a
+        // search: a share of zero would match nothing at all.
+        assert_eq!(per_file_limit(5), 1);
+        assert_eq!(per_file_limit(1), 1);
+    }
+
+    /// Searching one document is not subject to the share.
+    ///
+    /// The Document scope runs [`search_text`] against a single file, where
+    /// "all matches in this document" is the entire point. The share belongs to
+    /// the multi-file loop, which is where one file can crowd out another.
+    #[test]
+    fn searching_a_single_document_still_reports_every_match() {
+        let out = run(&"needle\n".repeat(200), "needle");
+        assert_eq!(out.matches.len(), 200);
+        assert!(!out.truncated);
     }
 
     /// Searching must be linear in the document, not quadratic.

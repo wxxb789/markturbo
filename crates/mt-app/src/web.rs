@@ -9,6 +9,12 @@
 //! files, cannot reach `file://`, and has no ambient credentials. Combined with
 //! a restrictive CSP, this is the v0.1 trust boundary — untrusted MDX cannot
 //! silently exfiltrate the workspace.
+//!
+//! [`to_file_url`] is the one documented way out of that sandbox, and it is
+//! reachable only for an HTML file the user explicitly trusted — see
+//! `DocumentView::rebuild_web`.
+
+use std::path::Path;
 
 use mt_doc::{Block, BlockKind, Document};
 
@@ -136,11 +142,81 @@ fn csp_meta(trust: Trust) -> String {
 }
 
 fn trust_banner(doc: &Document, trust: Trust) -> String {
-    // Only MDX can execute anything, so only MDX needs the warning.
-    if doc.doc_type() != mt_doc::DocType::Mdx || trust.allows_scripts() {
+    if trust.allows_scripts() {
         return String::new();
     }
-    "<div class=\"mt-banner\">This MDX document is not trusted. Components are shown as placeholders and no code runs. Use <b>Trust this document</b> to enable full rendering.</div>".to_string()
+    match doc.doc_type() {
+        // Only MDX can execute anything, so only MDX needs the scripting warning.
+        mt_doc::DocType::Mdx => "<div class=\"mt-banner\">This MDX document is not trusted. Components are shown as placeholders and no code runs. Use <b>Trust this document</b> to enable full rendering.</div>".to_string(),
+        // HTML executes nothing here; what Trust buys it is filesystem access,
+        // so the warning is about the missing images and stylesheets rather
+        // than about code.
+        //
+        // Inline styles, not `.mt-banner`: this banner is inserted into the
+        // user's *own* document, which never saw [`STYLE`], so a class would
+        // render as an unstyled line of text.
+        //
+        // English regardless of the UI language: `build_html`'s signature is
+        // fixed by callers outside this crate, so there is no `App` here to
+        // read the setting from — the same limitation the MDX banner above has
+        // always had.
+        mt_doc::DocType::Html => format!(
+            "<div style=\"background:rgba(240,173,78,.18);border:1px solid rgba(240,173,78,.6);\
+             border-radius:8px;padding:10px 14px;margin:0 0 1.5em;font-size:.92em;\
+             font-family:system-ui,sans-serif\">{}</div>",
+            crate::i18n::text(
+                crate::i18n::Key::HtmlNeedsTrust,
+                crate::settings::Language::default()
+            )
+        ),
+        _ => String::new(),
+    }
+}
+
+/// Serve an HTML file's own text, with the sandbox's two additions.
+///
+/// [`build_html_themed`] would wrap this in the app's `<html><head><style>`
+/// shell, nesting a complete document inside another one — the parser keeps
+/// only the first `<head>`, so the file's own stylesheet, `<title>` and
+/// `<meta charset>` silently stop applying.
+///
+/// Restricted still gets a CSP and a banner, because a verbatim document would
+/// otherwise carry no CSP at all and the module's "no document can phone home"
+/// invariant would hold for every path except this one. Both go in at the
+/// head/body seam so the file's own `<head>` survives ahead of them.
+pub fn build_html_raw(doc: &Document, trust: Trust) -> String {
+    let source = doc.source();
+    if trust.allows_scripts() {
+        // Trusted is the whole point of trusting: the file runs as its author
+        // wrote it, which is also why it is the only level allowed `file://`.
+        return source.to_string();
+    }
+    let (head, body) = source.split_at(head_end(source));
+    format!(
+        "{head}{}{}{body}",
+        csp_meta(trust),
+        trust_banner(doc, trust)
+    )
+}
+
+/// Byte offset of the seam our additions go into: just before `</head>`.
+///
+/// Inserting at the very top instead would reparent the file's own `<head>`
+/// children into `<body>` — the parser closes the head it built as soon as it
+/// sees the banner's `<div>` — which is how a `<meta charset>` stops being
+/// read. A document with no `</head>` has no head content to protect, so it
+/// takes the offset just past its doctype: an element ahead of the declaration
+/// puts the browser in quirks mode, changing the box model of the very page we
+/// are trying to show faithfully.
+fn head_end(source: &str) -> usize {
+    let lower = source.to_ascii_lowercase();
+    if let Some(at) = lower.find("</head>") {
+        return at;
+    }
+    match lower.trim_start().starts_with("<!doctype") {
+        true => lower.find('>').map_or(0, |at| at + 1),
+        false => 0,
+    }
 }
 
 /// Render an ordinary Markdown document to HTML.
@@ -284,7 +360,17 @@ fn escape(s: &str) -> String {
 /// Percent-encoding rather than base64 keeps the payload debuggable and avoids
 /// pulling in an encoder. The opaque origin of a `data:` URL is the point: it
 /// has no filesystem or same-origin access to anything in the workspace.
+///
+/// A string that is **already** a `file://` URL passes through untouched. The
+/// workspace's WebView sync is one call site that encodes whatever the active
+/// document built, so this is what lets a trusted HTML file arrive as the URL
+/// [`to_file_url`] produced; encoding it again would show the text of a URL
+/// instead of loading the file it names. Markup can never be mistaken for one —
+/// a document starts with `<`.
 pub fn to_data_url(html: &str) -> String {
+    if html.starts_with("file://") {
+        return html.to_string();
+    }
     let mut out = String::with_capacity(html.len() * 2 + 32);
     out.push_str("data:text/html;charset=utf-8,");
     for byte in html.as_bytes() {
@@ -295,6 +381,39 @@ pub fn to_data_url(html: &str) -> String {
             other => out.push_str(&format!("%{other:02X}")),
         }
     }
+    out
+}
+
+/// Encode `path` as a `file://` URL for `WebView::load_url`.
+///
+/// **This is the sandbox boundary.** Unlike [`to_data_url`], a `file://`
+/// document has a real origin: it can load its own directory's images and
+/// stylesheets — which is the point — and therefore also anything else the user
+/// can read. Only an explicit Trust action may reach this, exactly as with MDX
+/// script execution.
+///
+/// Windows separators become `/` and the drive letter's `:` survives, because
+/// `file:///C:/Users/...` is the form every engine accepts; `C:\Users` is not a
+/// URL path at all. Everything outside the unreserved set is percent-encoded,
+/// so a space or a `#` in a folder name cannot truncate the path.
+pub fn to_file_url(path: &Path) -> String {
+    let mut out = String::from("file://");
+    let mut encoded = String::new();
+    for byte in path.to_string_lossy().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                encoded.push(*byte as char)
+            }
+            b'\\' => encoded.push('/'),
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    // A POSIX path already supplies the third slash; a Windows one starts at
+    // the drive letter and would otherwise read as a hostname.
+    if !encoded.starts_with('/') {
+        out.push('/');
+    }
+    out.push_str(&encoded);
     out
 }
 
@@ -583,5 +702,126 @@ mod tests {
             "blocks out of order in:
 {body}"
         );
+    }
+
+    fn html_doc(src: &str) -> Document {
+        Document::with_type(DocType::Html, src.to_string())
+    }
+
+    #[test]
+    fn an_html_file_is_served_as_its_own_document() {
+        // Through `build_html_themed` this would end up as a whole document
+        // nested inside another one, and the parser keeps only the first
+        // `<head>` — taking the file's own stylesheet and metadata with it.
+        let src =
+            "<!doctype html><html><head><title>Mine</title></head><body><p>Hi</p></body></html>";
+        let out = build_html_raw(&html_doc(src), Trust::Trusted);
+        assert_eq!(out, src, "a trusted file is served byte for byte");
+        assert_eq!(out.matches("<html").count(), 1, "no nesting");
+    }
+
+    #[test]
+    fn an_untrusted_html_file_still_gets_a_csp() {
+        // A verbatim document would carry none, and "no document can phone
+        // home" would hold for every path but this one.
+        let src = "<!doctype html><html><head></head><body><p>Hi</p></body></html>";
+        let out = build_html_raw(&html_doc(src), Trust::Restricted);
+        assert!(out.contains("default-src 'none'"), "got {out}");
+        assert!(out.contains("script-src 'none'"));
+    }
+
+    #[test]
+    fn an_untrusted_html_file_is_told_why_its_images_are_missing() {
+        let src = "<!doctype html>\n<html><head></head><body><img src=\"logo.png\"></body></html>";
+        let out = build_html_raw(&html_doc(src), Trust::Restricted);
+        assert!(out.contains("Trust this document"), "got {out}");
+        // The banner is inserted into someone else's document, which never saw
+        // our stylesheet, so a bare class name would render as unstyled text.
+        assert!(!out.contains("class=\"mt-banner\""));
+        assert!(out.contains("style="));
+        // The document's own markup survives the insertion.
+        assert!(out.contains("<img src=\"logo.png\">"));
+    }
+
+    #[test]
+    fn the_files_own_head_survives_the_insertion() {
+        // The failure this guards: inserting at the top closes the head the
+        // parser built, and every one of the file's own head children is
+        // reparented into `<body>` — a `<meta charset>` among them, which is
+        // how a correctly-encoded page turns into mojibake.
+        let src = "<!doctype html><html><head><meta charset=\"utf-8\">\
+                   <title>Mine</title></head><body>x</body></html>";
+        let out = build_html_raw(&html_doc(src), Trust::Restricted);
+        let charset = out.find("charset=\"utf-8\"").expect("the file's charset");
+        let ours = out.find("Content-Security-Policy").expect("our CSP");
+        let head_close = out.to_ascii_lowercase().find("</head>").expect("</head>");
+        assert!(charset < ours, "our insertion displaced the file's head");
+        assert!(ours < head_close, "our additions must land inside the head");
+    }
+
+    #[test]
+    fn a_document_without_a_head_keeps_its_doctype_first() {
+        // Anything before the declaration puts the browser into quirks mode,
+        // which changes the box model of the very page we are showing.
+        let out = build_html_raw(
+            &html_doc("<!DOCTYPE HTML>\n<body>x</body>"),
+            Trust::Restricted,
+        );
+        let doctype = out.to_ascii_lowercase().find("<!doctype").expect("doctype");
+        let ours = out.find("Content-Security-Policy").expect("our CSP");
+        assert!(doctype < ours, "insertion ahead of the doctype in {out}");
+        // A fragment with neither is prepended to, which is already valid.
+        let out = build_html_raw(&html_doc("<p>fragment</p>"), Trust::Restricted);
+        assert!(out.ends_with("<p>fragment</p>"), "got {out}");
+    }
+
+    #[test]
+    fn a_file_url_passes_through_the_data_url_encoder() {
+        // The workspace's WebView sync encodes whatever the active document
+        // built, and a trusted HTML file builds a URL rather than markup.
+        // Without the pass-through the WebView is handed a `data:` document
+        // whose entire content is the text of a `file://` URL.
+        let url = to_file_url(Path::new(r"C:\a\page.html"));
+        assert_eq!(to_data_url(&url), url);
+        // Markup is still encoded — it cannot be mistaken for a URL because a
+        // document starts with `<`.
+        assert!(to_data_url("<p>file://not-a-url</p>").starts_with("data:"));
+    }
+
+    #[test]
+    fn a_windows_path_becomes_a_three_slash_file_url() {
+        // `C:\Users\a\page.html` is not a URL path: the separators have to turn
+        // around and the drive letter needs the third slash ahead of it, or the
+        // `C:` reads as a scheme and `Users` as a hostname.
+        let url = to_file_url(Path::new(r"C:\Users\a\page.html"));
+        assert_eq!(url, "file:///C:/Users/a/page.html");
+    }
+
+    #[test]
+    fn a_posix_path_keeps_its_leading_slash() {
+        // Already absolute, so the third slash is the path's own — doubling it
+        // would make an empty first segment.
+        assert_eq!(
+            to_file_url(Path::new("/home/a/page.html")),
+            "file:///home/a/page.html"
+        );
+    }
+
+    #[test]
+    fn a_file_url_encodes_what_would_truncate_the_path() {
+        // A space ends the URL in several parsers and a `#` starts a fragment;
+        // either one silently loads a different file, or none.
+        let url = to_file_url(Path::new(r"C:\My Docs\a#b\page.html"));
+        assert!(!url.contains(' '), "got {url}");
+        assert!(!url.contains('#'), "got {url}");
+        assert_eq!(url, "file:///C:/My%20Docs/a%23b/page.html");
+    }
+
+    #[test]
+    fn a_file_url_survives_a_non_ascii_directory() {
+        let url = to_file_url(Path::new(r"C:\文档\page.html"));
+        assert!(url.starts_with("file:///C:/%"), "got {url}");
+        assert!(url.ends_with("/page.html"));
+        assert!(url.is_ascii(), "a URL with raw UTF-8 in it is not one");
     }
 }

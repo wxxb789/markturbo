@@ -200,7 +200,12 @@ impl Explorer {
         if path.is_dir() || id.ends_with("\0loading") {
             return;
         }
-        if mt_doc::DocType::of(&path).is_document() {
+        // Sniffed here rather than in `read_dir` because this is one file the
+        // user just picked, not every entry in the directory: the same check
+        // costs one read instead of thousands. It has to happen somewhere —
+        // `fs::load` decodes lossily and `Save` has no dirty gate, so opening a
+        // binary and pressing Ctrl+S rewrites it as U+FFFD.
+        if workspace::is_openable(&path) {
             cx.emit(ExplorerEvent::OpenFile { path, preview });
         }
     }
@@ -333,5 +338,29 @@ mod tests {
     fn directory_icons_reflect_expansion() {
         assert_ne!(icon("d", true, false), icon("d", true, true));
         assert_ne!(icon("d", true, false), icon("f.md", false, false));
+    }
+
+    /// The click handler is the only production open gate in this view, so the
+    /// content sniff has to sit on it or it protects nothing.
+    ///
+    /// What broke before: `on_click` gated on `DocType::of(..).is_document()`
+    /// alone, which is an extension allowlist, so a NUL-filled `.log` opened as
+    /// U+FFFD — and `Save` has no dirty check, so Ctrl+S then wrote that back
+    /// over the original bytes. `workspace::is_openable` was computed for every
+    /// tree entry and read by nobody. Asserted against the source because
+    /// reaching the handler needs a real window.
+    #[test]
+    fn opening_a_file_goes_through_the_binary_check() {
+        let source = include_str!("explorer.rs");
+        let start = source.find("fn on_click").expect("the click handler");
+        let body = &source[start..];
+        let end = body.find("\n}").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("workspace::is_openable"),
+            "the open gate must sniff contents; `DocType::of` alone is an \
+             extension allowlist and admits a binary wearing a text extension"
+        );
     }
 }

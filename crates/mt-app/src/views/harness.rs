@@ -8,6 +8,7 @@
 //! underlying document.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -59,11 +60,21 @@ pub struct HarnessView {
     skills: Vec<Skill>,
     instructions: Vec<Instruction>,
     selected: Option<usize>,
-    /// True until the first scan lands, so an empty list is not mistaken for
-    /// "nothing installed" while the scan is still running.
+    /// True while a scan is in flight — which is both what keeps an empty list
+    /// from reading as "nothing installed" before the first scan lands, and
+    /// what spins the rescan button.
     scanning: bool,
     _scan: Option<Task<()>>,
 }
+
+/// The shortest time the rescan button stays in its loading state.
+///
+/// Discovery over a small workspace returns in a few milliseconds, so the
+/// spinner would appear and vanish inside a frame or two — which reads as a
+/// glitch rather than as feedback, and leaves the "did my click register?"
+/// question the button exists to answer still unanswered. Same 250ms as the
+/// search debounce: a shorter state change is not perceived as one.
+const SPINNER_FLOOR: Duration = Duration::from_millis(250);
 
 impl HarnessView {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
@@ -100,6 +111,9 @@ impl HarnessView {
         // Replacing the task cancels any scan still in flight, so a burst of
         // filesystem events costs one scan rather than one per event.
         self._scan = Some(cx.spawn(async move |this, cx| {
+            // Started before the scan, so the floor is measured from the click
+            // rather than from the moment the results happen to land.
+            let floor = cx.background_executor().timer(SPINNER_FLOOR);
             let found = cx
                 .background_spawn(async move {
                     (
@@ -109,6 +123,13 @@ impl HarnessView {
                 })
                 .await;
             crate::views::try_update(&this, cx, |this, cx| this.apply(found.0, found.1, cx));
+            // Only the spinner waits out the floor; the lists above are already
+            // on screen.
+            floor.await;
+            crate::views::try_update(&this, cx, |this, cx| {
+                this.scanning = false;
+                cx.notify();
+            });
         }));
         cx.notify();
     }
@@ -124,7 +145,6 @@ impl HarnessView {
         let previous = self.selected_path();
         self.skills = skills;
         self.instructions = instructions;
-        self.scanning = false;
         self.selected = previous
             .and_then(|path| self.position_of(&path))
             .or_else(|| (!self.is_empty()).then_some(0));
@@ -817,6 +837,10 @@ impl Render for HarnessView {
                             .icon(Icon::empty().path("icons/refresh-cw.svg"))
                             .xsmall()
                             .ghost()
+                            // Swaps the icon for a spinner and makes the button
+                            // inert, which is also what stops a second click
+                            // from queueing a redundant scan mid-flight.
+                            .loading(self.scanning)
                             .tooltip(i18n::t(i18n::Key::Rescan, cx))
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
@@ -1024,6 +1048,69 @@ mod tests {
             body.contains("self.selected ="),
             "set_section must reassign the selection; it indexes a list that \
              just changed underneath it"
+        );
+    }
+
+    /// The rescan button must spin while a scan is in flight.
+    ///
+    /// Source-level because the assertion is about a rendered `Button`, and
+    /// building one needs a `Window`. The failure it guards is the reported
+    /// one: with no visible state change a click is indistinguishable from a
+    /// hung app, and the user clicks again.
+    #[test]
+    fn the_rescan_button_reflects_the_scanning_flag() {
+        let source = include_str!("harness.rs");
+        let button = source
+            .split_once("Button::new(\"rescan\")")
+            .expect("the rescan button must exist")
+            .1;
+        let button = button.split("on_click").next().unwrap_or(button);
+        assert!(
+            button.contains(".loading(self.scanning)"),
+            "a rescan with no visible state reads as an app that ignored the click"
+        );
+    }
+
+    /// …and it must stay spinning long enough to be seen.
+    #[test]
+    fn the_spinner_has_a_minimum_visible_duration() {
+        let source = include_str!("harness.rs");
+        let body = source
+            .split_once("pub fn refresh")
+            .expect("refresh must exist")
+            .1;
+        let body = body.split("\n    fn apply").next().unwrap_or(body);
+        assert!(
+            body.contains("timer(SPINNER_FLOOR)"),
+            "a scan that returns in 3ms would flash the spinner for one frame, \
+             which reads as a glitch rather than as feedback"
+        );
+        // The results must not wait on the floor — only the flag does.
+        let (before_apply, after_apply) = body
+            .split_once("this.apply(")
+            .expect("refresh must apply the scan results");
+        assert!(
+            !before_apply.contains("floor.await"),
+            "the floor must delay the spinner, never the results"
+        );
+        assert!(
+            after_apply.contains("floor.await"),
+            "the flag must be cleared after the floor elapses, not before"
+        );
+    }
+
+    #[test]
+    fn the_spinner_floor_is_long_enough_to_perceive_and_short_enough_to_ignore() {
+        use super::SPINNER_FLOOR;
+        use std::time::Duration;
+
+        assert!(
+            SPINNER_FLOOR >= Duration::from_millis(150),
+            "below ~150ms a state change is not reliably perceived"
+        );
+        assert!(
+            SPINNER_FLOOR <= Duration::from_millis(500),
+            "a floor long enough to notice as a delay would make rescan feel slow"
         );
     }
 }

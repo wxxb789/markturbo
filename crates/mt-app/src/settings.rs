@@ -194,6 +194,14 @@ pub struct AppSettings {
     /// tall diagram the preview moves further than the eye expects. A user who
     /// wants the panes locked together says so.
     pub split_sync_scroll: bool,
+    /// Reload an open document when the file changes on disk.
+    ///
+    /// Off by default: a reload the user did not ask for replaces what is on
+    /// screen mid-read, so the safe version of this feature is the one they opt
+    /// into. Even then the reload skips documents with unsaved edits — those
+    /// keep the conflict banner, because automatic refresh must never discard
+    /// typed text.
+    pub watch_auto_reload: bool,
     /// Search the harness global directories as well as the workspace.
     pub skills_include_global: bool,
     /// Show skills marked `metadata.internal: true`.
@@ -216,6 +224,7 @@ impl Default for AppSettings {
             translate_api_key: String::new(),
             translate_base_url: String::new(),
             split_sync_scroll: false,
+            watch_auto_reload: false,
             skills_include_global: true,
             skills_include_internal: false,
             skills_group_by: GroupBy::default(),
@@ -461,6 +470,24 @@ mod tests {
     }
 
     #[test]
+    fn auto_reload_is_off_until_the_user_asks_for_it() {
+        // A reload nobody asked for swaps the document out from under the
+        // reader, so this one must stay opt-in — and a settings file written
+        // before the field existed must not turn it on.
+        assert!(!AppSettings::default().watch_auto_reload);
+        let back: AppSettings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(!back.watch_auto_reload);
+
+        let settings = AppSettings {
+            watch_auto_reload: true,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(back.watch_auto_reload);
+    }
+
+    #[test]
     fn a_malformed_file_falls_back_rather_than_failing_to_start() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -489,6 +516,7 @@ mod tests {
             theme_dark: "nord".into(),
             language: Language::Chinese,
             split_sync_scroll: true,
+            watch_auto_reload: true,
             translate_provider: "anthropic".into(),
             translate_api_key: "sk-test".into(),
             translate_base_url: "https://gw.invalid/openai".into(),

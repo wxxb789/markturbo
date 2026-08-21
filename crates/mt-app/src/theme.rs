@@ -14,7 +14,7 @@
 //! adding a preset stays a single row here.
 
 use gpui::{App, Hsla, Window, px, rgb};
-use gpui_component::{Theme, ThemeMode};
+use gpui_component::{Theme, ThemeMode, ThemeTokens};
 
 /// The document colors a preset authors.
 ///
@@ -285,6 +285,76 @@ struct Chrome {
     on_accent: u32,
 }
 
+/// The least opaque a selection fill may be.
+///
+/// [`selection_fill`] normally derives the alpha from the preset, but a preset
+/// whose selection barely differs from its page would derive one near zero and
+/// produce a highlight nobody can see. This is the floor under that.
+const SELECTION_ALPHA_FLOOR: f32 = 0.15;
+
+/// The selection fill for a preset, as a translucent color.
+///
+/// Translucency here is not decoration, and it is not one value. Two renderers
+/// read `Theme::selection` and they composite it in *opposite orders*:
+///
+/// * The native preview paints the text run and then the selection over it
+///   (`gpui-component`'s `text/inline.rs`). An opaque fill hides the very words
+///   it highlights — that is what made selecting text there look broken.
+/// * The Source editor paints the selection first and the glyphs on top
+///   (`gpui-base`'s `input/base/element.rs`). There a translucent fill is
+///   simply a lighter background, and dropping it too far makes the selection
+///   invisible instead.
+///
+/// One field feeds both, so the alpha has to satisfy both readings: opaque
+/// enough that the editor's band is legible, sheer enough that the preview's
+/// glyphs survive under it. A single hard-coded value cannot: 0.3 washes out
+/// Midnight's selection, which needs 0.45 against a `#000000` page, while
+/// forcing Sepia three times more opaque than its palette asks for.
+///
+/// So it is solved rather than chosen. Each preset authors the color it wants
+/// the selection to *look like* over its own page, and this returns the most
+/// translucent fill that still composites to exactly that:
+///
+/// ```text
+/// alpha * fill + (1 - alpha) * background == authored
+/// ```
+///
+/// Taking the largest alpha any channel requires is what keeps `fill` inside
+/// 0..255 — a smaller one would need a channel brighter than white. The result
+/// is exact for every preset in [`PRESETS`], which
+/// `the_selection_fill_reproduces_what_the_preset_authored` asserts.
+fn selection_fill(t: Tokens) -> Hsla {
+    let channels = [16u32, 8, 0];
+    let ch = |value: u32, shift: u32| ((value >> shift) & 0xff) as f32;
+
+    // The alpha a channel needs to reach its authored value from the page.
+    // Mixing can only move a channel toward the fill, so the further the
+    // authored color sits from the background, the more opaque it has to be.
+    let alpha = channels
+        .iter()
+        .map(|&shift| {
+            let (want, bg) = (ch(t.selection, shift), ch(t.bg, shift));
+            if want > bg {
+                // Headroom toward white.
+                (want - bg) / (255. - bg).max(1.)
+            } else {
+                // Headroom toward black.
+                (bg - want) / bg.max(1.)
+            }
+        })
+        .fold(SELECTION_ALPHA_FLOOR, f32::max)
+        .min(1.);
+
+    let solve = |shift: u32| {
+        let (want, bg) = (ch(t.selection, shift), ch(t.bg, shift));
+        (((want - (1. - alpha) * bg) / alpha).clamp(0., 255.)).round() as u32
+    };
+    let fill = (solve(16) << 16) | (solve(8) << 8) | solve(0);
+
+    let color: Hsla = rgb(fill).into();
+    color.alpha(alpha)
+}
+
 /// Apply a preset to GPUI's global theme.
 ///
 /// Called after `Theme::change`, which resets every color to the built-in
@@ -341,7 +411,13 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
     theme.input = h(t.border);
     theme.ring = h(t.accent);
     theme.caret = h(t.text);
-    theme.selection = h(t.selection);
+    // Translucent, and that is not a style choice. The selection quad is painted
+    // *after* the glyphs (`text/inline.rs` paints the run, then the selection),
+    // so an opaque fill covers the very words it is meant to highlight — which
+    // is what made selection in the native preview look broken. `rgb()` always
+    // yields alpha 1.0, so the preset's hex can never supply this itself.
+    // 0.3 is upstream's own ceiling for the same field (`theme/schema.rs`).
+    theme.selection = selection_fill(t);
 
     theme.popover = h(mix(t.bg, t.text, 0.03));
     theme.popover_foreground = h(t.text);
@@ -367,6 +443,10 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
     theme.tab = gpui::transparent_black();
     theme.tab_bar = h(c.subtle);
     theme.tab_bar_segmented = h(c.subtle);
+    // The page background, so the active tab and the document below it read as
+    // one continuous plane while every inactive tab sits on the recessed bar.
+    // That contrast *is* the "which tab am I on" signal — matching the bar here
+    // would leave the strip flat.
     theme.tab_active = h(t.bg);
     theme.tab_foreground = h(t.text_muted);
     theme.tab_active_foreground = h(t.text);
@@ -407,6 +487,48 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
     // `Scrolling` — overlay bars that fade — which is what these narrow panels
     // want; a permanent gutter would cost a visible slice of every file name.
 
+    // `Theme` carries **two** parallel color surfaces, and every assignment
+    // above reached only the first: the fields are on `ThemeColor`, which
+    // `Theme` exposes through `DerefMut`, while `Theme::tokens` keeps whatever
+    // `Theme::change` derived from the built-in light/dark config a moment ago.
+    //
+    // That split is invisible until you notice which components read which.
+    // `cx.theme().tab_active` is the first; `cx.theme().tokens.tab_active` is
+    // the second — and the tab bar, the active tab, and every list row read the
+    // second. Without this line they keep the stock palette forever, so
+    // switching to Nord recolored the document and left the tab strip and the
+    // Harness list on the previous theme.
+    theme.tokens = ThemeTokens::from(&theme.colors);
+
+    // The Source editor does not read any of the above. Its canvas, gutter and
+    // active-line band come from `Theme::highlight_theme` — a *third* surface,
+    // a sibling field rather than part of `colors` or `tokens` — which
+    // `Theme::change` fills from the stock light/dark theme and nothing here
+    // touched. That is why the editor pane followed light/dark but not the
+    // preset: on Nord the document was Nord and the editor behind it was still
+    // generic dark.
+    //
+    // Only the `editor.*` colors are overridden. The syntax palette underneath
+    // is left exactly as upstream ships it, and that is deliberate rather than
+    // laziness: a preset here authors thirteen document tokens, which is a
+    // description of a page — not the twenty-odd keyword/string/comment hues a
+    // syntax theme needs. Deriving those from an accent would produce code
+    // colored by arithmetic. The page follows the preset; the code keeps a
+    // palette someone chose.
+    let mut highlight = (*theme.highlight_theme).clone();
+    highlight.style.editor_background = Some(h(t.bg));
+    highlight.style.editor_foreground = Some(h(t.text));
+    highlight.style.editor_line_number = Some(h(t.text_muted));
+    highlight.style.editor_active_line_number = Some(h(t.text));
+    // The active line and the invisibles are the two that must stay *barely*
+    // there. `subtle` is one step off the page, which is the same distance the
+    // list hover uses — enough to locate the caret's line, not enough to read
+    // as a selection.
+    highlight.style.editor_active_line = Some(h(c.subtle));
+    highlight.style.editor_invisible = Some(h(t.text_muted).alpha(0.4));
+    highlight.style.editor_gutter_background = Some(h(t.bg));
+    theme.highlight_theme = std::sync::Arc::new(highlight);
+
     // The theme's colors reach the scrollbar and resize handles only through the
     // Base layer, which caches them — without this the scrollbar keeps the
     // colors of whichever theme was applied last.
@@ -416,6 +538,7 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_component::ThemeColor;
 
     #[test]
     fn every_preset_has_a_unique_id_within_its_mode() {
@@ -516,6 +639,208 @@ mod tests {
         assert_eq!(font("sepia"), BodyFont::Serif);
         assert_eq!(font("elegant"), BodyFont::Serif);
         assert_eq!(font("light"), BodyFont::Sans);
+    }
+
+    #[test]
+    fn rebuilding_tokens_carries_every_color_a_component_reads() {
+        // The whole of the token rebuild rests on `ThemeTokens::from` being a
+        // field-wise copy. If upstream ever derived one of these from something
+        // other than its own `ThemeColor` field, `apply` would go back to
+        // leaving the tab bar and the list rows on the stock palette while the
+        // document recolored — the exact split that made switching to Nord
+        // recolor half the window.
+        let h = |value: u32| -> Hsla { rgb(value).into() };
+        for preset in PRESETS {
+            let t = preset.tokens;
+            let c = preset.chrome();
+            // The same five values `apply` writes, in the same way.
+            let colors = ThemeColor {
+                background: h(t.bg),
+                selection: selection_fill(t),
+                tab_bar: h(c.subtle),
+                tab_active: h(t.bg),
+                list_active: h(c.active),
+                ..Default::default()
+            };
+
+            let tokens = ThemeTokens::from(&colors);
+            for (name, token, expected) in [
+                ("background", tokens.background, colors.background),
+                ("selection", tokens.selection, colors.selection),
+                ("tab_bar", tokens.tab_bar, colors.tab_bar),
+                ("tab_active", tokens.tab_active, colors.tab_active),
+                ("list_active", tokens.list_active, colors.list_active),
+            ] {
+                assert_eq!(token.color, expected, "{}'s {name}", preset.id);
+                // Components fill with `token.background`, not `token.color`,
+                // so a token agreeing on only the color would still paint the
+                // stock surface.
+                assert_eq!(
+                    token.background,
+                    expected.into(),
+                    "{}'s {name} fill",
+                    preset.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_selection_fill_reproduces_what_the_preset_authored() {
+        // The whole justification for solving the alpha instead of picking one:
+        // compositing the derived fill over the page must land back on the
+        // color the preset actually wrote. If this drifts, every preset's
+        // selection is quietly a different color than its table says.
+        for preset in PRESETS {
+            let t = preset.tokens;
+            let fill = selection_fill(t);
+            let rgba = gpui::Rgba::from(fill);
+            let a = rgba.a;
+
+            for (shift, got, want) in [
+                (16u32, rgba.r, ((t.selection >> 16) & 0xff) as f32 / 255.),
+                (8, rgba.g, ((t.selection >> 8) & 0xff) as f32 / 255.),
+                (0, rgba.b, (t.selection & 0xff) as f32 / 255.),
+            ] {
+                let bg = ((t.bg >> shift) & 0xff) as f32 / 255.;
+                let composited = a * got + (1. - a) * bg;
+                assert!(
+                    (composited - want).abs() < 0.01,
+                    "{}: channel {shift} composites to {composited:.3}, but the \
+                     preset authored {want:.3}",
+                    preset.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_selection_never_paints_over_the_words_it_highlights() {
+        // The native preview paints the fill *after* the glyphs, so anything
+        // approaching opaque is a solid block where the selected text should
+        // be. Invisible to any test that cannot take a screenshot, trivial to
+        // assert here.
+        //
+        // Half is the ceiling rather than a tighter bound because Midnight
+        // genuinely needs 0.45: its page is `#000000`, so reaching any visible
+        // tint at all takes that much fill. Below `1.0` the glyphs still read
+        // through; a preset needing more than half would have to be reporting
+        // a selection color too far from its own background to be plausible.
+        for preset in PRESETS {
+            let a = gpui::Rgba::from(selection_fill(preset.tokens)).a;
+            assert!(
+                a <= 0.5,
+                "{}'s selection is {a} opaque, which veils the glyphs under it",
+                preset.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_is_never_so_sheer_it_disappears() {
+        // The other renderer, and the opposite failure. The Source editor
+        // paints the fill *under* the glyphs, where a near-zero alpha is not a
+        // subtle highlight but no highlight — the user selects a line and
+        // nothing happens. The floor is what a preset whose selection barely
+        // differs from its page would otherwise fall through.
+        for preset in PRESETS {
+            let a = gpui::Rgba::from(selection_fill(preset.tokens)).a;
+            assert!(
+                a >= SELECTION_ALPHA_FLOOR,
+                "{}'s selection is {a} opaque, which is not a visible band",
+                preset.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_tab_strip_is_not_flat() {
+        // `apply` gives the active tab the page background and the bar the
+        // derived `subtle`. That difference *is* the "which tab am I on"
+        // signal, so a preset whose `subtle` collapsed back onto its own
+        // background would ship a strip with no active tab at all.
+        for preset in PRESETS {
+            let c = preset.chrome();
+            assert_ne!(
+                c.subtle, preset.tokens.bg,
+                "{}'s tab bar is the page background",
+                preset.id
+            );
+        }
+    }
+
+    /// The token rebuild must be the last color `apply` writes.
+    ///
+    /// Source-level because the failure needs a real window to see: a
+    /// `theme.<field> = …` added *below* the rebuild lands in `colors` alone
+    /// and never reaches `tokens`, which is precisely the bug the rebuild
+    /// exists to fix. Ordering against `sync_base` matters for the same reason
+    /// in the other direction — it projects the theme onto the Base layer, so
+    /// a rebuild after it would never reach the scrollbar.
+    #[test]
+    fn the_token_rebuild_is_the_last_word_on_color() {
+        let source = include_str!("theme.rs");
+        let body = source
+            .split_once("pub fn apply(")
+            .expect("apply must exist")
+            .1;
+        // Stop before this module, or the assertions below match themselves.
+        let body = body.split_once("\n#[cfg(test)]").map_or(body, |(b, _)| b);
+
+        assert!(
+            body.contains("theme.tab_active = h(t.bg)"),
+            "the active tab must carry the page background, or it does not \
+             read as continuous with the document below it"
+        );
+        assert!(
+            body.contains("theme.tab_bar = h(c.subtle)"),
+            "the tab bar must stay recessed relative to the active tab; giving \
+             it `t.bg` too is what leaves the strip flat"
+        );
+
+        let rebuild = body
+            .find("theme.tokens =")
+            .expect("`tokens` must be rebuilt from `colors`");
+        let sync = body
+            .find("Theme::sync_base")
+            .expect("the Base layer must be synced");
+        assert!(
+            rebuild < sync,
+            "the rebuild must precede `sync_base`, which caches what it projects"
+        );
+
+        // Every *color* assignment must precede the rebuild. `highlight_theme`
+        // is deliberately exempt and it is not an oversight: it is a sibling
+        // field on `Theme`, not one of `colors`, so the rebuild neither reads
+        // nor carries it. Listing the exemption here rather than loosening the
+        // scan is what keeps this assertion meaningful — the next field added
+        // after the rebuild has to be justified the same way or it fails.
+        let after = &body[rebuild..];
+        let stray: Vec<&str> = after
+            .match_indices("\n    theme.")
+            .map(|(at, _)| {
+                let rest = &after[at + 11..];
+                rest.split(['.', ' ', '=']).next().unwrap_or_default()
+            })
+            .filter(|field| !matches!(*field, "tokens" | "highlight_theme"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "`theme.{}` is assigned after the token rebuild; a color written \
+             there reaches `colors` only, so the tab bar, the active tab and \
+             every list row keep the stock palette",
+            stray.join("`, `theme.")
+        );
+
+        // And the editor's own surface must be set at all. It reads none of the
+        // fields above — its canvas, gutter and active line come from
+        // `highlight_theme` — which is why the editor pane followed light/dark
+        // but not the preset.
+        assert!(
+            body.contains("theme.highlight_theme ="),
+            "the Source editor's canvas comes from `highlight_theme`; without \
+             it the editor keeps the stock background under a themed document"
+        );
     }
 
     #[test]
