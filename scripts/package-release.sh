@@ -66,7 +66,42 @@ markturbo /path/to/NOTES.md      # a file opens with its folder as the workspace
 markturbo                        # no argument: the current directory
 ```
 
+Or drag a file or folder onto the window. A folder becomes the workspace; a
+document opens in a tab, adopting its parent folder as the workspace if none is
+open yet.
+
 `markturbo --help` lists every option.
+
+## The window
+
+One bar across the top: window controls, the open document tabs, and the
+commands. Hover a tab for its full path; right-click one to copy that path, or
+the path relative to the open folder.
+
+Tabs follow the editor convention you already know. A **single click** in the
+file tree or the Harness panel opens a *preview* tab — shown in italics, reusing
+one slot, replaced by the next single click — so browsing a tree does not leave
+forty tabs behind. A **double click** pins it. A preview with unsaved edits is
+never replaced.
+
+The left panel holds Files, Harness, and Outline. The right panel holds the
+details of whatever is selected on the left; toggle it from the button in the
+title bar.
+
+## Views
+
+The **View** dropdown in the document toolbar picks one of five layouts:
+
+| Layout | Shows |
+|---|---|
+| Source | The editor alone |
+| Native | GPUI-rendered preview — the fast path |
+| Web | WebView preview — the compatibility path |
+| Split · Native | Editor beside the native preview |
+| Split · Web | Editor beside the WebView preview |
+
+Clicking a heading in the Outline jumps there in whichever layout is showing. A
+preview-only layout scrolls its preview rather than switching away from it.
 
 ## Optional: PlantUML
 
@@ -142,9 +177,9 @@ preview, so the two never disagree.
 translation target, which is about documents.
 
 **Editor → Sync scrolling** — off by default. On, the preview follows the editor
-in Split view, and follows an outline click. The mapping is proportional, so a
-document with one tall diagram moves further than the eye expects. It drives the
-Web preview; the native preview does not expose a scroll handle yet.
+in Split view. The mapping is proportional, so a document with one tall diagram
+moves further than the eye expects. It drives the Web preview; the native
+preview does not expose a scroll handle yet.
 
 ## The Harness panel
 
