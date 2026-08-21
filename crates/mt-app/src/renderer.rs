@@ -194,6 +194,33 @@ fn cache() -> &'static Mutex<HashMap<String, RenderOutcome>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Pay MathJax's start-up cost now, on a thread nobody is waiting on.
+///
+/// `mathjax-svg-rs` builds its JS engine lazily behind a `OnceLock` and parses
+/// the whole MathJax bundle the first time anything asks it to render. Measured
+/// on this machine at **~640ms**, against ~60ms for every formula after it —
+/// and that first bill lands on whoever opens the first document containing a
+/// formula, which reads as "clicking a file in the tree takes a second".
+///
+/// Spawned rather than awaited: nothing here needs the result, and the render
+/// path is unchanged either way. It just finds the engine already warm.
+///
+/// One thread rather than a background task, because the point is to run before
+/// the executor has anything queued on it — and `OnceLock` makes a concurrent
+/// real render wait for this one rather than duplicating it.
+pub fn warm_up() {
+    std::thread::Builder::new()
+        .name("mt-renderer-warmup".into())
+        .spawn(|| {
+            // A trivially small formula: the cost is parsing the bundle, not
+            // typesetting, so anything valid warms the same engine.
+            let _ = mathjax_svg_rs::render_tex("x", &Default::default());
+        })
+        // A failure to spawn only means the cost is paid later, in line.
+        .map(|_| ())
+        .unwrap_or_else(|err| log::debug!("renderer warm-up not started: {err}"));
+}
+
 // ---------------------------------------------------------------------------
 // Pure-Rust renderers
 // ---------------------------------------------------------------------------
@@ -857,6 +884,35 @@ mod tests {
             Availability::Missing("install x".into())
                 .summary()
                 .contains("install x")
+        );
+    }
+
+    /// Warming up must be non-blocking and must leave the engine usable.
+    ///
+    /// The cost it moves is real and measured: MathJax's engine start-up is
+    /// ~640ms on this machine, against ~60ms per formula afterwards. What the
+    /// test pins is the two properties that make moving it safe — the call
+    /// returns immediately, and a render after it still produces SVG rather
+    /// than tripping over a half-initialized engine.
+    #[test]
+    fn warming_up_returns_immediately_and_leaves_math_working() {
+        let start = std::time::Instant::now();
+        super::warm_up();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "warm_up blocked for {elapsed:?}; it must not be on the caller's \
+             thread, or it has simply moved the stall to start-up"
+        );
+
+        // Concurrent with the warm-up thread, which is the interesting case:
+        // `OnceLock` must make one wait for the other rather than both
+        // building an engine.
+        let out = registry().render("math", "x^2");
+        assert!(
+            out.svg().is_some_and(|svg| svg.contains("<svg")),
+            "math must still render after a warm-up: {:?}",
+            out.diagnostic()
         );
     }
 }

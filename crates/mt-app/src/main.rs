@@ -93,6 +93,10 @@ fn main() {
         }
     };
 
+    // Before the window, so MathJax's ~640ms engine start-up overlaps with it
+    // rather than landing on the first document that contains a formula.
+    mt_app::renderer::warm_up();
+
     let app = gpui_platform::application().with_assets(Assets);
 
     app.run(move |cx| {

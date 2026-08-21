@@ -34,6 +34,8 @@ pub enum Key {
     Rescan,
     ViewLayout,
     Details,
+    ToggleLeftPanel,
+    ToggleRightPanel,
     CopyPath,
     CopyRelativePath,
 
@@ -120,6 +122,8 @@ fn english(key: Key) -> &'static str {
         Key::Rescan => "Rescan",
         Key::ViewLayout => "View",
         Key::Details => "Details",
+        Key::ToggleLeftPanel => "Toggle the side panel",
+        Key::ToggleRightPanel => "Toggle the details panel",
         Key::CopyPath => "Copy path",
         Key::CopyRelativePath => "Copy relative path",
 
@@ -191,6 +195,8 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::Rescan => "重新扫描",
         Key::ViewLayout => "视图",
         Key::Details => "详情",
+        Key::ToggleLeftPanel => "显示/隐藏侧边栏",
+        Key::ToggleRightPanel => "显示/隐藏详情栏",
         Key::CopyPath => "复制路径",
         Key::CopyRelativePath => "复制相对路径",
 
@@ -261,6 +267,8 @@ mod tests {
         Key::Rescan,
         Key::ViewLayout,
         Key::Details,
+        Key::ToggleLeftPanel,
+        Key::ToggleRightPanel,
         Key::CopyPath,
         Key::CopyRelativePath,
         Key::OpenFolderToBegin,

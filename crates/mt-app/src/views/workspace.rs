@@ -45,7 +45,9 @@ actions!(
         TranslateSelection,
         TranslateBlock,
         CopyPath,
-        CopyRelativePath
+        CopyRelativePath,
+        ToggleLeftPanel,
+        ToggleRightPanel
     ]
 );
 
@@ -158,6 +160,8 @@ pub struct Workspace {
     preview_tab: Option<PathBuf>,
     /// True while the settings page is showing.
     settings_open: bool,
+    /// True while the file/harness/outline panel is showing on the left.
+    left_panel_open: bool,
     /// True while the details panel is showing on the right.
     ///
     /// Not derived from whether anything is selected: a panel that appeared and
@@ -203,6 +207,7 @@ impl Workspace {
             menu_tab: None,
             preview_tab: None,
             settings_open: false,
+            left_panel_open: true,
             right_panel_open: true,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
@@ -605,6 +610,30 @@ impl Workspace {
         self.settings_open = !self.settings_open;
         // The WebView's visibility depends on this flag, and it is an OS child
         // window that will not notice a re-render on its own.
+        self.web_dirty(cx);
+        cx.notify();
+    }
+
+    fn on_toggle_left_panel(
+        &mut self,
+        _: &ToggleLeftPanel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.left_panel_open = !self.left_panel_open;
+        // The WebView is an OS child window; it does not notice the document
+        // pane resizing under it.
+        self.web_dirty(cx);
+        cx.notify();
+    }
+
+    fn on_toggle_right_panel(
+        &mut self,
+        _: &ToggleRightPanel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_panel_open = !self.right_panel_open;
         self.web_dirty(cx);
         cx.notify();
     }
@@ -1249,6 +1278,10 @@ impl Workspace {
     /// `None` rather than an empty panel: a column of blank space next to the
     /// document is worse than no column, and the toggle in the title bar is
     /// what says whether the panel is wanted at all.
+    ///
+    /// No header row of its own. The panel runs from the top of the window to
+    /// the bottom, so a header inside it would sit at the same height as the
+    /// title bar and read as a second, competing one.
     fn render_right_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.right_panel_open || self.settings_open {
             return None;
@@ -1270,8 +1303,11 @@ impl Workspace {
                 .border_color(cx.theme().border)
                 .child(
                     div()
+                        .h(metrics::title_bar())
+                        .flex_shrink_0()
                         .px(metrics::inset())
-                        .py(metrics::header_pad_y())
+                        .flex()
+                        .items_center()
                         .text_xs()
                         .font_medium()
                         .text_color(cx.theme().muted_foreground)
@@ -1289,6 +1325,14 @@ impl Workspace {
         )
     }
 
+    /// The left panel: Files / Harness / Outline.
+    ///
+    /// Its own tab strip stands in for a header, and the strip is [`TITLE_BAR`]
+    /// tall so it lines up with the title bar across the gap — the panel runs
+    /// the full height of the window, so the two are side by side rather than
+    /// stacked.
+    ///
+    /// [`TITLE_BAR`]: crate::metrics::TITLE_BAR
     fn render_side_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
@@ -1296,25 +1340,35 @@ impl Workspace {
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                TabBar::new("side-tabs")
-                    .underline()
-                    .w_full()
-                    // The full inset, not one reduced by the row padding: a tab
-                    // strip has no row padding of its own, so subtracting it put
-                    // `Files` four pixels from the window edge while everything
-                    // below it started twelve.
-                    .px(metrics::inset())
-                    .selected_index(
-                        SidePanel::ALL
-                            .iter()
-                            .position(|p| *p == self.side_panel)
-                            .unwrap_or(0),
-                    )
-                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                        this.side_panel = SidePanel::ALL[*ix];
-                        cx.notify();
-                    }))
-                    .children(SidePanel::ALL.map(|p| Tab::new().label(i18n::t(p.label(), cx)))),
+                div()
+                    .h(metrics::title_bar())
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .child(
+                        TabBar::new("side-tabs")
+                            .underline()
+                            .w_full()
+                            // The full inset, not one reduced by the row
+                            // padding: a tab strip has no row padding of its
+                            // own, so subtracting it put `Files` four pixels
+                            // from the window edge while everything below it
+                            // started twelve.
+                            .px(metrics::inset())
+                            .selected_index(
+                                SidePanel::ALL
+                                    .iter()
+                                    .position(|p| *p == self.side_panel)
+                                    .unwrap_or(0),
+                            )
+                            .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                                this.side_panel = SidePanel::ALL[*ix];
+                                cx.notify();
+                            }))
+                            .children(
+                                SidePanel::ALL.map(|p| Tab::new().label(i18n::t(p.label(), cx))),
+                            ),
+                    ),
             )
             .child(div().flex_1().min_h_0().map(|this| match self.side_panel {
                 SidePanel::Files => match &self.explorer {
@@ -1408,7 +1462,10 @@ impl Workspace {
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
         let root = self.root.clone();
         TabBar::new("document-tabs")
-            .w_full()
+            // Not `w_full`: the bar sits inside the title bar, and a strip that
+            // claims the whole width leaves no slack for dragging the window.
+            // Shrink-to-fit means the tabs take what they need and the rest of
+            // the bar stays a drag handle.
             .selected_index(self.active)
             .children(self.documents.iter().enumerate().map(|(ix, doc)| {
                 let doc = doc.read(cx);
@@ -1489,6 +1546,158 @@ impl Workspace {
                 this.web_dirty(cx);
                 cx.notify();
             }))
+    }
+
+    /// The one bar across the top of the document column.
+    ///
+    /// Window title row and document tab strip merged: stacked, they spent 80
+    /// vertical pixels on chrome and read as two competing headers, and every
+    /// modern editor puts the tabs in the title bar. The app name yields to
+    /// them — the window title already says what this is.
+    ///
+    /// It spans the document and the details panel but **not** the left panel,
+    /// which runs the full height of the window beside it. That is what makes
+    /// the panels read as the main view extending sideways rather than as
+    /// content parked under a bar.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        TitleBar::new()
+            // `TitleBar` hard-codes its own 34px height; the side panels put a
+            // header at [`metrics::TITLE_BAR`] beside it, and two chrome rows
+            // that disagree by six pixels is exactly the ragged seam this
+            // arrangement exists to avoid.
+            .h(metrics::title_bar())
+            .child(
+                h_flex()
+                    .w_full()
+                    .h_full()
+                    .pl(metrics::inset())
+                    .gap(metrics::gap_group())
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            // The tabs claim the press; the slack beside them does
+                            // not. `stop_propagation` on a `flex_1` wrapper covered
+                            // the whole bar and killed **both** ways the window
+                            // moves: GPUI's, because `TitleBar`'s own
+                            // `on_mouse_down` -> `start_window_move` never sees a
+                            // stopped event, and Windows', because
+                            // `handle_nc_mouse_down_msg` returns `Some(0)` for a
+                            // handled press and `DefWindowProc` never gets the
+                            // `HTCAPTION`. So the handler goes on a box sized to
+                            // the tabs, and what is left over stays a drag handle.
+                            .when(!self.documents.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .min_w_0()
+                                        .max_w_full()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .child(self.render_tabs(cx)),
+                                )
+                            })
+                            // With nothing open the name stands in for the tabs,
+                            // and is itself part of the drag handle.
+                            .when(self.documents.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("markturbo"),
+                                )
+                            })
+                            // Whatever is left of the bar. No handler, so a press
+                            // here reaches the title bar and moves the window.
+                            .child(div().flex_1().min_w_0().h_full()),
+                    )
+                    .child(
+                        // The title bar is a `WindowControlArea::Drag` region,
+                        // which Windows hit-tests as `HTCAPTION`: a press there
+                        // becomes a window drag and never reaches GPUI's mouse
+                        // dispatch, so buttons inside it silently do nothing.
+                        // Claiming the press back is what upstream's own example
+                        // does (gpui-component `story/src/title_bar.rs`).
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap(metrics::gap())
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("open-folder")
+                                    .label(i18n::t(i18n::Key::OpenFolder, cx))
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_open_folder(&OpenFolder, window, cx)
+                                    })),
+                            )
+                            .child(
+                                // Translating the selection when there is one is
+                                // what a user means by "Translate" with text
+                                // highlighted; falling back to the whole document
+                                // otherwise avoids a menu for a two-case choice.
+                                Button::new("translate")
+                                    .label(i18n::t(i18n::Key::Translate, cx))
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let has_selection = this
+                                            .active_document()
+                                            .is_some_and(|d| !d.read(cx).selection(cx).is_empty());
+                                        if has_selection {
+                                            this.on_translate_selection(
+                                                &TranslateSelection,
+                                                window,
+                                                cx,
+                                            )
+                                        } else {
+                                            this.on_translate_document(
+                                                &TranslateDocument,
+                                                window,
+                                                cx,
+                                            )
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("toggle-left-panel")
+                                    .icon(IconName::PanelLeft)
+                                    .xsmall()
+                                    .ghost()
+                                    .when(self.left_panel_open, |b| b.primary())
+                                    .tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("toggle-right-panel")
+                                    .icon(IconName::PanelRight)
+                                    .xsmall()
+                                    .ghost()
+                                    .when(self.right_panel_open, |b| b.primary())
+                                    .tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("settings")
+                                    .icon(IconName::Settings)
+                                    .xsmall()
+                                    .ghost()
+                                    .when(self.settings_open, |b| b.primary())
+                                    .tooltip(i18n::t(i18n::Key::Settings, cx))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_open_settings(&OpenSettings, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1587,6 +1796,17 @@ impl Render for Workspace {
             }
         };
 
+        // All three built before the tree, because each takes a borrow of `cx`:
+        // the details panel leases the harness entity, and the title bar and
+        // side panel read the active document through it. Building them inline
+        // would overlap those borrows with the `&mut Context` the element chain
+        // already holds.
+        let right_panel = self.render_right_panel(cx);
+        let title_bar = self.render_title_bar(cx).into_any_element();
+        let side_panel = self
+            .left_panel_open
+            .then(|| self.render_side_panel(cx).into_any_element());
+
         v_flex()
             .id("workspace")
             // Without a role the whole window is announced instead of the
@@ -1602,6 +1822,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_copy_path))
             .on_action(cx.listener(Self::on_copy_relative_path))
+            .on_action(cx.listener(Self::on_toggle_left_panel))
+            .on_action(cx.listener(Self::on_toggle_right_panel))
             // Dropping a file or folder onto the window opens it. The whole
             // window is the target rather than the document area: a drop is
             // aimed at the app, and making the user find a hot zone would be a
@@ -1613,139 +1835,41 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
             .size_full()
-            // One bar, not two. The window title row and the document tab strip
-            // were stacked, which spent 80 vertical pixels on chrome and read as
-            // two competing headers; every modern editor puts the tabs in the
-            // title bar. The app name yields to them — the window title already
-            // says what this is.
-            .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .h(metrics::title_bar())
-                        .pl(metrics::inset())
-                        .gap(metrics::gap_group())
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                // Tabs have to claim the press back from the
-                                // title bar for the same reason the buttons
-                                // below do.
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .when(!self.documents.is_empty(), |this| {
-                                    this.child(self.render_tabs(cx))
-                                })
-                                // With nothing open the space is the drag
-                                // handle, so the window can still be moved.
-                                .when(self.documents.is_empty(), |this| {
-                                    this.child(
-                                        div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("markturbo"),
-                                    )
-                                }),
-                        )
-                        .child(
-                            // The title bar is a `WindowControlArea::Drag`
-                            // region, which Windows hit-tests as `HTCAPTION`:
-                            // a press there becomes a window drag and never
-                            // reaches GPUI's mouse dispatch, so buttons inside
-                            // it silently do nothing. Claiming the press back
-                            // is what upstream's own example does
-                            // (gpui-component `story/src/title_bar.rs`).
-                            h_flex()
-                                .flex_shrink_0()
-                                .gap(metrics::gap())
-                                .items_center()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new("open-folder")
-                                        .label(i18n::t(i18n::Key::OpenFolder, cx))
-                                        .xsmall()
-                                        .ghost()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.on_open_folder(&OpenFolder, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    // Translating the selection when there is
-                                    // one is what a user means by "Translate"
-                                    // with text highlighted; falling back to
-                                    // the whole document otherwise avoids a
-                                    // menu for a two-case choice.
-                                    Button::new("translate")
-                                        .label(i18n::t(i18n::Key::Translate, cx))
-                                        .xsmall()
-                                        .ghost()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            let has_selection =
-                                                this.active_document().is_some_and(|d| {
-                                                    !d.read(cx).selection(cx).is_empty()
-                                                });
-                                            if has_selection {
-                                                this.on_translate_selection(
-                                                    &TranslateSelection,
-                                                    window,
-                                                    cx,
-                                                )
-                                            } else {
-                                                this.on_translate_document(
-                                                    &TranslateDocument,
-                                                    window,
-                                                    cx,
-                                                )
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("toggle-right-panel")
-                                        .icon(IconName::PanelRight)
-                                        .xsmall()
-                                        .ghost()
-                                        .when(self.right_panel_open, |b| b.primary())
-                                        .tooltip(i18n::t(i18n::Key::Details, cx))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.right_panel_open = !this.right_panel_open;
-                                            // The WebView is an OS child window
-                                            // that will not notice the document
-                                            // pane resizing under it.
-                                            this.web_dirty(cx);
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("settings")
-                                        .icon(IconName::Settings)
-                                        .xsmall()
-                                        .ghost()
-                                        .when(self.settings_open, |b| b.primary())
-                                        .tooltip(i18n::t(i18n::Key::Settings, cx))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.on_open_settings(&OpenSettings, window, cx)
-                                        })),
-                                ),
-                        ),
-                ),
-            )
+            // The panels run the full height of the window, with the title bar
+            // spanning only the column between them. tty7's arrangement, and
+            // the reason for it: a bar drawn across the panels too makes them
+            // read as content parked underneath it, where this reads as the
+            // main view extending sideways.
             .child(
                 div().flex_1().min_h_0().child(
                     h_resizable("workspace-split")
+                        .when_some(side_panel, |group, panel| {
+                            group.child(
+                                resizable_panel()
+                                    .size(metrics::side_panel())
+                                    .size_range(px(metrics::SIDE_PANEL_MIN)..px(640.))
+                                    .child(panel),
+                            )
+                        })
                         .child(
-                            resizable_panel()
-                                .size(metrics::side_panel())
-                                .child(self.render_side_panel(cx)),
+                            resizable_panel().child(
+                                v_flex()
+                                    .size_full()
+                                    .child(title_bar)
+                                    .child(div().flex_1().min_h_0().child(content)),
+                            ),
                         )
-                        .child(resizable_panel().child(div().size_full().child(content)))
                         // The details of whatever is selected on the left, on
                         // the right. They used to sit under the list in the same
                         // 268px column, which left the list and the details both
                         // too short to read.
-                        .when_some(self.render_right_panel(cx), |this, panel| {
-                            this.child(resizable_panel().size(metrics::side_panel()).child(panel))
+                        .when_some(right_panel, |this, panel| {
+                            this.child(
+                                resizable_panel()
+                                    .size(metrics::right_panel())
+                                    .size_range(px(metrics::SIDE_PANEL_MIN)..px(720.))
+                                    .child(panel),
+                            )
                         }),
                 ),
             )
@@ -1773,6 +1897,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-l", TranslateSelection, None),
         KeyBinding::new("cmd-shift-b", TranslateBlock, None),
         KeyBinding::new("ctrl-shift-b", TranslateBlock, None),
+        // The panels, on the bindings VS Code uses for the same two.
+        KeyBinding::new("cmd-b", ToggleLeftPanel, None),
+        KeyBinding::new("ctrl-b", ToggleLeftPanel, None),
+        KeyBinding::new("cmd-alt-b", ToggleRightPanel, None),
+        KeyBinding::new("ctrl-alt-b", ToggleRightPanel, None),
     ]);
 }
 
@@ -1931,6 +2060,93 @@ mod tests {
         assert!(
             source.contains("fn schedule_webview_sync"),
             "the deferred path must still exist"
+        );
+    }
+
+    /// The title bar must leave somewhere to grab the window.
+    ///
+    /// Source-level because reproducing it needs a real `WM_NCHITTEST` against
+    /// a laid-out bar. What broke: the tab strip was wrapped in a `flex_1` div
+    /// carrying `stop_propagation`, so the wrapper covered the whole bar and
+    /// killed *both* drag paths — GPUI's, because `TitleBar`'s own
+    /// `on_mouse_down` never saw a stopped event, and Windows', because
+    /// `handle_nc_mouse_down_msg` returns `Some(0)` for a handled press and
+    /// `DefWindowProc` never receives the `HTCAPTION`. The window simply stopped
+    /// moving, with nothing in the log.
+    #[test]
+    fn the_title_bar_keeps_a_drag_handle() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("fn render_title_bar")
+            .expect("render_title_bar must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn render_status_bar")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        // The press-claiming handler must not cover the whole bar. Checked by
+        // counting rather than by matching indentation, which `cargo fmt`
+        // rewrites — an assertion pinned to whitespace silently becomes an
+        // assertion about nothing.
+        let claims = body.matches("cx.stop_propagation()").count();
+        assert_eq!(
+            claims, 2,
+            "expected exactly two press-claiming regions — the tabs and the \
+             button group. A third (or one moved onto a flex_1 wrapper) covers \
+             the slack the window is dragged by."
+        );
+        assert!(
+            body.contains("div().flex_1().min_w_0().h_full()"),
+            "the bar needs a handler-free filler, or every pixel beside the \
+             tabs is claimed and the window cannot be dragged"
+        );
+
+        // And the tab strip itself must shrink to its content rather than
+        // claiming the width.
+        let start = source.find("fn render_tabs").expect("render_tabs");
+        let tabs = &source[start..];
+        let end = tabs.find("\n    /// The one bar").unwrap_or(tabs.len());
+        let tabs = &tabs[..end];
+        assert!(
+            !tabs.contains(".w_full()"),
+            "a full-width tab strip leaves no slack in the title bar to drag"
+        );
+    }
+
+    /// The panels run the full height of the window, beside the title bar.
+    ///
+    /// Source-level: this is pure layout, invisible to any runtime assertion.
+    /// What it guards is the arrangement itself — a title bar drawn across the
+    /// panels makes them read as content parked underneath it, where this reads
+    /// as the main view extending sideways, which is the whole point.
+    #[test]
+    fn the_side_panels_span_the_full_window_height() {
+        let source = include_str!("workspace.rs");
+        let render = source
+            .split_once("impl Render for Workspace")
+            .expect("the Render impl")
+            .1;
+        let body = render.split("\n/// Keybindings").next().unwrap_or(render);
+
+        let split = body.find("h_resizable(").expect("the workspace split");
+        let title = body.find(".child(title_bar)").expect("the title bar");
+        assert!(
+            split < title,
+            "the title bar must be built inside the resizable split, not above \
+             it — above it, the bar spans the panels and they stop looking like \
+             the main view extending sideways"
+        );
+
+        // Both panels are collapsible, and the split is what makes them
+        // resizable rather than fixed.
+        assert!(
+            body.contains("when_some(side_panel"),
+            "the left panel must be omittable, not merely narrow"
+        );
+        assert!(
+            body.contains("when_some(right_panel"),
+            "the right panel must be omittable"
         );
     }
 }

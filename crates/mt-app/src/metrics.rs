@@ -52,6 +52,14 @@ pub const INDENT: f32 = 14.;
 /// Default width of the side panel.
 pub const SIDE_PANEL: f32 = 268.;
 
+/// Default width of the right details panel.
+///
+/// Wider than the left: the left column holds names, which elide gracefully,
+/// while the right holds label/value pairs whose label column alone is 96px.
+/// At 268 the value beside it had barely 140px, so every path and every tool
+/// list wrapped — which is what made the panel look broken rather than narrow.
+pub const RIGHT_PANEL: f32 = 340.;
+
 /// Smallest useful side panel width. Below this, file names are all ellipsis.
 pub const SIDE_PANEL_MIN: f32 = 180.;
 
@@ -114,6 +122,10 @@ pub fn side_panel() -> Pixels {
     px(SIDE_PANEL)
 }
 
+pub fn right_panel() -> Pixels {
+    px(RIGHT_PANEL)
+}
+
 pub fn status_bar() -> Pixels {
     px(STATUS_BAR)
 }
@@ -140,6 +152,7 @@ mod tests {
             ("GAP_GROUP", GAP_GROUP),
             ("HEADER_PAD_Y", HEADER_PAD_Y),
             ("RADIUS", RADIUS),
+            ("RIGHT_PANEL", RIGHT_PANEL),
         ] {
             assert_eq!(value % 4., 0., "{name} = {value} is off the grid");
         }
@@ -158,6 +171,9 @@ mod tests {
         // 160px a file name is all ellipsis.
         assert!(SIDE_PANEL > SIDE_PANEL_MIN);
         assert!(SIDE_PANEL_MIN >= 160.);
+        // The details panel holds a 96px label column plus its value, so it
+        // needs to be the wider of the two or every field wraps.
+        assert!(RIGHT_PANEL > SIDE_PANEL);
         // Windows draws 32px caption buttons; a shorter bar leaves them
         // overhanging the content below.
         assert!(TITLE_BAR >= 32.);
