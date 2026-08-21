@@ -26,6 +26,7 @@ pub enum Key {
 
     // Side panels
     PanelFiles,
+    PanelSearch,
     PanelHarness,
     PanelOutline,
     SectionSkills,
@@ -38,6 +39,21 @@ pub enum Key {
     ToggleRightPanel,
     CopyPath,
     CopyRelativePath,
+
+    // Search
+    ScopeDocument,
+    ScopeOpenTabs,
+    ScopeFolder,
+    ScopeHarness,
+    Searching,
+    TypeToSearch,
+    NoMatches,
+
+    // Tabs
+    Untitled,
+    UnsavedChanges,
+    NavigateBack,
+    NavigateForward,
 
     // Empty states
     OpenFolderToBegin,
@@ -114,6 +130,7 @@ fn english(key: Key) -> &'static str {
         Key::Save => "Save",
 
         Key::PanelFiles => "Files",
+        Key::PanelSearch => "Search",
         Key::PanelHarness => "Harness",
         Key::PanelOutline => "Outline",
         Key::SectionSkills => "Skills",
@@ -126,6 +143,19 @@ fn english(key: Key) -> &'static str {
         Key::ToggleRightPanel => "Toggle the details panel",
         Key::CopyPath => "Copy path",
         Key::CopyRelativePath => "Copy relative path",
+
+        Key::ScopeDocument => "This file",
+        Key::ScopeOpenTabs => "Open tabs",
+        Key::ScopeFolder => "Folder",
+        Key::ScopeHarness => "Harness",
+        Key::Searching => "Searching…",
+        Key::TypeToSearch => "Type to search.",
+        Key::NoMatches => "No matches.",
+
+        Key::Untitled => "Untitled",
+        Key::UnsavedChanges => "Unsaved changes",
+        Key::NavigateBack => "Back",
+        Key::NavigateForward => "Forward",
 
         Key::OpenFolderToBegin => "Open a folder to begin.",
         Key::OpenFolderToDiscover => "Open a folder to discover skills and instruction files.",
@@ -187,6 +217,7 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::Save => "保存",
 
         Key::PanelFiles => "文件",
+        Key::PanelSearch => "搜索",
         Key::PanelHarness => "Harness",
         Key::PanelOutline => "大纲",
         Key::SectionSkills => "Skills",
@@ -199,6 +230,19 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::ToggleRightPanel => "显示/隐藏详情栏",
         Key::CopyPath => "复制路径",
         Key::CopyRelativePath => "复制相对路径",
+
+        Key::ScopeDocument => "当前文件",
+        Key::ScopeOpenTabs => "已打开标签",
+        Key::ScopeFolder => "文件夹",
+        Key::ScopeHarness => "Harness",
+        Key::Searching => "搜索中…",
+        Key::TypeToSearch => "输入以搜索。",
+        Key::NoMatches => "没有匹配项。",
+
+        Key::Untitled => "未命名",
+        Key::UnsavedChanges => "有未保存的更改",
+        Key::NavigateBack => "后退",
+        Key::NavigateForward => "前进",
 
         Key::OpenFolderToBegin => "打开一个文件夹以开始。",
         Key::OpenFolderToDiscover => "打开一个文件夹以发现 skills 和指令文件。",
@@ -259,6 +303,7 @@ mod tests {
         Key::Settings,
         Key::Save,
         Key::PanelFiles,
+        Key::PanelSearch,
         Key::PanelHarness,
         Key::PanelOutline,
         Key::SectionSkills,
@@ -271,6 +316,17 @@ mod tests {
         Key::ToggleRightPanel,
         Key::CopyPath,
         Key::CopyRelativePath,
+        Key::ScopeDocument,
+        Key::ScopeOpenTabs,
+        Key::ScopeFolder,
+        Key::ScopeHarness,
+        Key::Searching,
+        Key::TypeToSearch,
+        Key::NoMatches,
+        Key::Untitled,
+        Key::UnsavedChanges,
+        Key::NavigateBack,
+        Key::NavigateForward,
         Key::OpenFolderToBegin,
         Key::OpenFolderToDiscover,
         Key::OpenDocumentForOutline,

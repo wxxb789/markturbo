@@ -75,25 +75,65 @@ open yet.
 ## The window
 
 The side panels run the full height of the window; the bar across the top spans
-only the document beside them. Left panel: Files, Harness, Outline. Right panel:
-the details of whatever is selected on the left. Each collapses from its button
-in the bar, or with a key:
+only the document beside them. Left panel: Files, Search, Harness, Outline.
+Right panel: the details of whatever is selected on the left. Each toggle sits
+above the panel it governs — left button at the left edge, right at the right —
+or use a key:
 
 | Key | Panel |
 |---|---|
 | `Ctrl/Cmd+B` | The side panel |
 | `Ctrl/Cmd+Alt+B` | The details panel |
 
-Drag either edge to resize. The bar holds the open document tabs and the
-commands — hover a tab for its full path; right-click one to copy that path, or
-the path relative to the open folder. The empty space beside the tabs drags the
-window, as a title bar should.
+Panel widths are a share of the window rather than a fixed column, so the layout
+reads the same on a laptop and on a large display. Drag either edge to override
+it; the app remembers nothing, so reopening restores the proportion.
+
+The bar holds Back and Forward, then the open document tabs, then the commands.
+Hover a tab for its full path; right-click one to copy that path, or the path
+relative to the open folder. The empty space beside the tabs drags the window,
+as a title bar should.
 
 Tabs follow the editor convention you already know. A **single click** in the
-file tree or the Harness panel opens a *preview* tab — shown in italics, reusing
-one slot, replaced by the next single click — so browsing a tree does not leave
-forty tabs behind. A **double click** pins it. A preview with unsaved edits is
-never replaced.
+file tree, the Harness panel, or a search result opens a *preview* tab — shown
+in italics, reusing one slot, replaced by the next single click — so browsing
+does not leave forty tabs behind. A **double click** pins it. A preview with
+unsaved edits is never replaced. A tab with unsaved changes shows a dot in place
+of its close button; a document not yet on disk is named by its first line, or
+`Untitled` if it has none.
+
+Back and Forward walk the positions you have visited, not just the tabs — so
+following a search result and pressing Back returns you to where you were
+reading, not merely to the previous file.
+
+| Key | Navigation |
+|---|---|
+| `Alt+Left` / `Ctrl+Alt+-` | Back |
+| `Alt+Right` / `Ctrl+Alt+Shift+-` | Forward |
+
+## Search
+
+`Ctrl/Cmd+Shift+F` opens the Search panel and puts the caret in its field. Four
+scopes, on tabs above the results:
+
+| Scope | Searches |
+|---|---|
+| This file | The active document |
+| Open tabs | Every open document |
+| Folder | Every document under the open folder |
+| Harness | Every discovered skill directory and instruction file |
+
+The last is the one an ordinary editor cannot offer: it reaches the global
+harness directories (`~/.claude/skills`, `~/.agents/skills`, …), which are not
+under the open folder at all, and it covers a skill's whole directory rather
+than only its `SKILL.md`.
+
+Open documents are searched as you have them, unsaved edits included, rather
+than as they sit on disk. Matching ignores case. Results are capped; when the
+cap is reached the summary says so rather than presenting a partial answer as a
+complete one. Clicking a result opens it as a preview tab, at the line.
+
+`Ctrl/Cmd+F` is separate and unchanged: it finds within the editor you are in.
 
 ## Views
 
@@ -204,6 +244,12 @@ errors, each with the line it came from.
 **Instructions** lists `AGENTS.md`, `CLAUDE.md`, Cursor rules, and scoped
 `*.instructions.md` — the files a harness reads unprompted.
 
+The harness table covers ~80 conventions, transcribed from `vercel-labs/skills`
+plus DeepSeek Harness (`dsh`), which that registry does not list. `dsh` resolves
+two independent roots: `$DSH_HOME` (default `~/.dsh`) for its own skills, and
+`$DSH_AGENTS_HOME` (default `~/.agents`) for the shared ones — relocating the
+first does not move the second.
+
 ## Keyboard
 
 | Key | Action |
@@ -214,7 +260,9 @@ errors, each with the line it came from.
 | `Ctrl/Cmd+,` | Settings |
 | `Ctrl/Cmd+B` | Toggle the side panel |
 | `Ctrl/Cmd+Alt+B` | Toggle the details panel |
+| `Ctrl/Cmd+Shift+F` | Search the workspace |
 | `Ctrl/Cmd+F` | Find in the editor |
+| `Alt+Left` / `Alt+Right` | Back / forward |
 | `Ctrl/Cmd+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl/Cmd+Shift+T` | Translate document |
 | `Ctrl/Cmd+Shift+L` | Translate selection |

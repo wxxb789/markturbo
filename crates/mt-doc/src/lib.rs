@@ -13,6 +13,7 @@ pub mod frontmatter;
 pub mod harness;
 pub mod instruction;
 pub mod outline;
+pub mod search;
 pub mod skill;
 pub mod translate;
 
@@ -23,4 +24,5 @@ pub use doctype::DocType;
 pub use harness::{GlobalRoot, Harness};
 pub use instruction::Instruction;
 pub use outline::{Heading, Outline};
+pub use search::{Match, Query, Results};
 pub use skill::{Discovery, Origin, Skill, SkillMeta};

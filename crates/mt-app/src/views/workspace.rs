@@ -12,7 +12,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
@@ -32,6 +32,7 @@ use crate::translate::Provider;
 use crate::views::document::{DocumentEvent, DocumentView};
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::harness::{HarnessEvent, HarnessView};
+use crate::views::search::{Corpus, SearchEvent, SearchView};
 use crate::watcher::Watcher;
 
 actions!(
@@ -47,7 +48,10 @@ actions!(
         CopyPath,
         CopyRelativePath,
         ToggleLeftPanel,
-        ToggleRightPanel
+        ToggleRightPanel,
+        FocusSearch,
+        NavigateBack,
+        NavigateForward
     ]
 );
 
@@ -85,21 +89,124 @@ fn elide_tab_label(name: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidePanel {
     Files,
+    Search,
     Harness,
     Outline,
 }
 
 impl SidePanel {
-    const ALL: [SidePanel; 3] = [SidePanel::Files, SidePanel::Harness, SidePanel::Outline];
+    const ALL: [SidePanel; 4] = [
+        SidePanel::Files,
+        SidePanel::Search,
+        SidePanel::Harness,
+        SidePanel::Outline,
+    ];
 
     /// The string key for this panel, resolved against the chosen language
     /// at render time rather than baked in here.
     fn label(self) -> crate::i18n::Key {
         match self {
             SidePanel::Files => crate::i18n::Key::PanelFiles,
+            SidePanel::Search => crate::i18n::Key::PanelSearch,
             SidePanel::Harness => crate::i18n::Key::PanelHarness,
             SidePanel::Outline => crate::i18n::Key::PanelOutline,
         }
+    }
+}
+
+/// Where the user has been, so Back and Forward mean something.
+///
+/// Positions rather than tabs: two visits to the same document at different
+/// offsets are two entries, which is what makes Back useful after following a
+/// search result or an outline click. VS Code and every browser work this way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Visit {
+    path: PathBuf,
+    offset: usize,
+}
+
+/// How many visits to remember.
+///
+/// Bounded because this grows with every click in a result list and nobody
+/// navigates back through hundreds of them.
+const HISTORY_LIMIT: usize = 64;
+
+/// Back/forward over [`Visit`]s.
+///
+/// A cursor into one list rather than two stacks: the two-stack version is the
+/// same thing with more places to forget to clear the forward half.
+#[derive(Debug, Default)]
+struct History {
+    visits: Vec<Visit>,
+    /// Index of the current position. `None` before anything is visited.
+    cursor: Option<usize>,
+    /// Set while navigating, so the resulting open does not record itself as a
+    /// new visit and truncate the forward half we are moving through.
+    navigating: bool,
+}
+
+impl History {
+    /// Record arriving somewhere.
+    ///
+    /// Everything after the cursor is dropped: going back and then somewhere
+    /// new abandons the branch you left, which is what every browser does and
+    /// what makes Forward mean "where I was" rather than "where I once was".
+    fn push(&mut self, visit: Visit) {
+        if self.navigating {
+            return;
+        }
+        if self.current() == Some(&visit) {
+            return;
+        }
+        match self.cursor {
+            Some(ix) => self.visits.truncate(ix + 1),
+            None => self.visits.clear(),
+        }
+        self.visits.push(visit);
+        if self.visits.len() > HISTORY_LIMIT {
+            self.visits.remove(0);
+        }
+        self.cursor = Some(self.visits.len() - 1);
+    }
+
+    fn current(&self) -> Option<&Visit> {
+        self.visits.get(self.cursor?)
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.cursor.is_some_and(|ix| ix > 0)
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.cursor.is_some_and(|ix| ix + 1 < self.visits.len())
+    }
+
+    fn back(&mut self) -> Option<Visit> {
+        let ix = self.cursor?.checked_sub(1)?;
+        self.cursor = Some(ix);
+        self.visits.get(ix).cloned()
+    }
+
+    fn forward(&mut self) -> Option<Visit> {
+        let ix = self.cursor? + 1;
+        let visit = self.visits.get(ix).cloned()?;
+        self.cursor = Some(ix);
+        Some(visit)
+    }
+
+    /// Drop every visit to `path`, e.g. when its tab closes.
+    ///
+    /// Without this, Back reopens a tab the user just closed — which reads as
+    /// the close button not working.
+    fn forget(&mut self, path: &Path) {
+        let current = self.current().cloned();
+        self.visits.retain(|v| v.path != path);
+        self.cursor = match current {
+            // Keep pointing at the same visit if it survived; otherwise land on
+            // the end, which is where "most recent" lives.
+            Some(current) if current.path != path => self.visits.iter().position(|v| *v == current),
+            _ => self.visits.len().checked_sub(1),
+        };
     }
 }
 
@@ -127,9 +234,12 @@ pub struct Workspace {
     root: Option<PathBuf>,
     explorer: Option<Entity<Explorer>>,
     harness: Option<Entity<HarnessView>>,
+    search: Entity<SearchView>,
     side_panel: SidePanel,
     documents: Vec<Entity<DocumentView>>,
     active: usize,
+    /// Back/forward across visited positions.
+    history: History,
     registry: Arc<RendererRegistry>,
     watcher: Option<Watcher>,
     status: Option<String>,
@@ -198,9 +308,11 @@ impl Workspace {
             root: None,
             explorer: None,
             harness: None,
+            search: cx.new(|cx| SearchView::new(window, cx)),
             side_panel: SidePanel::Files,
             documents: Vec::new(),
             active: 0,
+            history: History::default(),
             registry: Arc::new(RendererRegistry::with_defaults()),
             watcher: None,
             status: None,
@@ -226,6 +338,24 @@ impl Workspace {
             Some(window),
             cx,
         );
+
+        // The search view cannot gather its own corpus — the open tabs' text is
+        // in their editors and the harness paths in the harness view — so it
+        // asks, and this answers.
+        let search = this.search.clone();
+        this._subscriptions.push(cx.subscribe_in(
+            &search,
+            window,
+            |this: &mut Self, _, event: &SearchEvent, window, cx| match event {
+                SearchEvent::Ready => {
+                    let corpus = this.search_corpus(cx);
+                    this.search.update(cx, |search, cx| search.run(corpus, cx));
+                }
+                SearchEvent::Reveal { path, offset } => {
+                    this.reveal_in(path.clone(), *offset, window, cx);
+                }
+            },
+        ));
         // Following the system means following it *while running*, not only at
         // startup — someone whose OS flips at sunset expects the app to flip
         // with it. An explicit preference ignores the event.
@@ -317,6 +447,11 @@ impl Workspace {
         self.explorer = Some(explorer);
         self.harness = Some(harness);
         self.root = Some(path);
+        // Any results on screen came from the folder that was open a moment
+        // ago. Leaving them would present another project's matches as this
+        // one's, which is worse than an empty list.
+        let search = self.search.clone();
+        search.update(cx, |search, cx| search.rerun(cx));
         cx.notify();
     }
 
@@ -384,6 +519,7 @@ impl Workspace {
             .position(|d| d.read(cx).path() == path)
         {
             self.active = ix;
+            self.record_visit(path.to_path_buf(), 0);
             self.web_dirty(cx);
             cx.notify();
         }
@@ -400,6 +536,7 @@ impl Workspace {
             .position(|d| d.read(cx).path() == path)
         {
             self.active = ix;
+            self.record_visit(path, 0);
             self.web_dirty(cx);
             cx.notify();
             return;
@@ -437,6 +574,7 @@ impl Workspace {
 
         self.documents.push(view);
         self.active = self.documents.len() - 1;
+        self.record_visit(path, 0);
         self.web_dirty(cx);
         cx.notify();
     }
@@ -447,8 +585,12 @@ impl Workspace {
         }
         // ponytail: closing a dirty tab drops its edits. A confirm dialog is
         // the obvious next step; the file on disk is never touched either way.
+        let closed = self.documents[ix].read(cx).path().to_path_buf();
         self.documents.remove(ix);
         self.active = self.active.min(self.documents.len().saturating_sub(1));
+        // Otherwise Back reopens the tab that was just closed, which reads as
+        // the close button not working.
+        self.history.forget(&closed);
         self.web_dirty(cx);
         cx.notify();
     }
@@ -1375,6 +1517,10 @@ impl Workspace {
                     Some(explorer) => this.child(explorer.clone()),
                     None => this.child(empty_hint(cx, i18n::t(i18n::Key::OpenFolderToBegin, cx))),
                 },
+                // No folder needed: "this file" and "open tabs" work the
+                // moment a document is open, so gating the whole panel on a
+                // workspace would hide two of its four scopes for no reason.
+                SidePanel::Search => this.child(self.search.clone()),
                 SidePanel::Harness => match &self.harness {
                     Some(harness) => this.child(harness.clone()),
                     None => {
@@ -1456,7 +1602,190 @@ impl Workspace {
         let Some(doc) = self.active_document().cloned() else {
             return;
         };
+        // The outline and the search results both land here, and both are the
+        // kind of jump a user expects Back to undo.
+        self.record_visit(doc.read(cx).path().to_path_buf(), offset);
         doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
+    }
+
+    /// Open `path` (as a preview) and put the cursor at `offset`.
+    ///
+    /// The search-result path. A preview open because scanning a result list is
+    /// exactly the browsing a preview tab exists for; a double click in the
+    /// tree or an edit still promotes it.
+    fn reveal_in(
+        &mut self,
+        path: PathBuf,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file_as(path.clone(), true, window, cx);
+        let Some(doc) = self.active_document().cloned() else {
+            return;
+        };
+        // Guard against the open having failed — landing the cursor in whatever
+        // tab happened to be active would be worse than doing nothing.
+        if doc.read(cx).path() != path {
+            return;
+        }
+        self.record_visit(path, offset);
+        doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
+    }
+
+    /// Note that the user is now at `offset` in `path`.
+    fn record_visit(&mut self, path: PathBuf, offset: usize) {
+        self.history.push(Visit { path, offset });
+    }
+
+    /// Go to `visit`, without recording the move as a new visit.
+    fn go_to(&mut self, visit: Visit, window: &mut Window, cx: &mut Context<Self>) {
+        // The flag is what keeps Back from truncating the forward half it is
+        // walking through.
+        self.history.navigating = true;
+        self.open_file_as(visit.path.clone(), true, window, cx);
+        if let Some(doc) = self.active_document().cloned()
+            && doc.read(cx).path() == visit.path
+        {
+            doc.update(cx, |doc, cx| doc.reveal_offset(visit.offset, window, cx));
+        }
+        self.history.navigating = false;
+        cx.notify();
+    }
+
+    fn on_navigate_back(&mut self, _: &NavigateBack, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(visit) = self.history.back() {
+            self.go_to(visit, window, cx);
+        }
+    }
+
+    fn on_navigate_forward(
+        &mut self,
+        _: &NavigateForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(visit) = self.history.forward() {
+            self.go_to(visit, window, cx);
+        }
+    }
+
+    /// Show the Search panel and put the caret in its field.
+    fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.side_panel = SidePanel::Search;
+        // Opening the panel is not enough: the point of the binding is to type
+        // a query immediately, and a panel that appears without focus makes the
+        // user click into it first.
+        self.left_panel_open = true;
+        // Cloned first: leasing the entity through `update` takes its own
+        // borrow of `cx`, which cannot overlap one held through `self`.
+        let search = self.search.clone();
+        search.update(cx, |search, cx| search.focus_query(window, cx));
+        self.web_dirty(cx);
+        cx.notify();
+    }
+
+    /// The documents the current search scope covers.
+    ///
+    /// Built here rather than in the search view because only the workspace can
+    /// see all four sources — and because the open tabs must contribute their
+    /// *editor* text, not the file on disk, or a search misses everything the
+    /// user has typed since the last save.
+    ///
+    /// Directories are handed over unwalked. This runs on the UI thread, and
+    /// walking a real vault is seconds — measured at 2.4s for 6,642 documents
+    /// — so expanding a root here would freeze the window on every settled
+    /// keystroke. [`Corpus::roots`] is walked on the search's own task.
+    fn search_corpus(&self, cx: &App) -> Corpus {
+        use crate::views::search::Scope;
+
+        let mut corpus = Corpus::default();
+        let add_open_tabs = |corpus: &mut Corpus| {
+            for doc in &self.documents {
+                let doc = doc.read(cx);
+                corpus.open.push((doc.path().to_path_buf(), doc.text(cx)));
+            }
+        };
+
+        match self.search.read(cx).scope() {
+            Scope::Document => {
+                if let Some(doc) = self.active_document() {
+                    let doc = doc.read(cx);
+                    corpus.open.push((doc.path().to_path_buf(), doc.text(cx)));
+                }
+            }
+            Scope::OpenTabs => add_open_tabs(&mut corpus),
+            Scope::Folder => {
+                add_open_tabs(&mut corpus);
+                corpus.roots.extend(self.root.clone());
+            }
+            Scope::Harness => {
+                add_open_tabs(&mut corpus);
+                // The whole point of this scope: a skill's own directory holds
+                // references and scripts beside its SKILL.md, and those are as
+                // much a part of the skill as its entry document.
+                if let Some(harness) = &self.harness {
+                    let harness = harness.read(cx);
+                    corpus
+                        .roots
+                        .extend(harness.skills().iter().map(|s| s.dir.clone()));
+                    corpus
+                        .files
+                        .extend(harness.instructions().iter().map(|i| i.path.clone()));
+                }
+            }
+        }
+        // The open tabs are already in `corpus.open` with their unsaved text;
+        // reading them again would report every match twice.
+        let open = self.open_paths(cx);
+        corpus.files.retain(|p| !open.contains(p));
+        corpus
+    }
+
+    /// Paths of every open tab.
+    fn open_paths(&self, cx: &App) -> Vec<PathBuf> {
+        self.documents
+            .iter()
+            .map(|d| d.read(cx).path().to_path_buf())
+            .collect()
+    }
+
+    /// Back and Forward, at the far left of the bar.
+    ///
+    /// A disabled button rather than a hidden one: the pair is a fixed landmark
+    /// that the tabs start after, and one that appears and disappears would
+    /// shift every tab sideways as the user navigates. Disabled says "there is
+    /// nowhere to go" — which is the actual state — where absent says nothing.
+    fn render_navigator(&self, cx: &Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_0p5()
+            // The bar is a `WindowControlArea::Drag` region, so a press here
+            // becomes a window drag unless it is claimed back.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new("nav-back")
+                    .icon(IconName::ArrowLeft)
+                    .xsmall()
+                    .ghost()
+                    .disabled(!self.history.can_go_back())
+                    .tooltip(i18n::t(i18n::Key::NavigateBack, cx))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_navigate_back(&NavigateBack, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("nav-forward")
+                    .icon(IconName::ArrowRight)
+                    .xsmall()
+                    .ghost()
+                    .disabled(!self.history.can_go_forward())
+                    .tooltip(i18n::t(i18n::Key::NavigateForward, cx))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_navigate_forward(&NavigateForward, window, cx)
+                    })),
+            )
     }
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1478,9 +1807,10 @@ impl Workspace {
                     .and_then(|root| path.strip_prefix(root).ok())
                     .map(|rest| rest.to_string_lossy().replace('\\', "/"));
                 let is_preview = self.preview_tab.as_deref() == Some(path.as_path());
+                let dirty = doc.is_dirty();
 
                 Tab::new()
-                    .label(elide_tab_label(&doc.title()))
+                    .label(elide_tab_label(&doc.title(cx)))
                     .icon(if doc.is_externally_changed() {
                         IconName::TriangleAlert
                     } else {
@@ -1534,15 +1864,48 @@ impl Workspace {
                     // before it happens rather than after.
                     .when(is_preview, |tab| tab.italic())
                     .suffix(
-                        Button::new(SharedString::from(format!("close-{ix}")))
-                            .icon(IconName::Close)
-                            .xsmall()
-                            .ghost()
-                            .on_click(cx.listener(move |this, _, _, cx| this.close_tab(ix, cx))),
+                        // Unsaved work shows a dot where the close button
+                        // would be, which is the convention every editor uses
+                        // and the reason the marker is here rather than
+                        // appended to the label: a long name elides, and the
+                        // one tab that most needs the warning was the one
+                        // losing it.
+                        if dirty {
+                            div()
+                                .id(SharedString::from(format!("dirty-{ix}")))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(metrics::target())
+                                .tooltip({
+                                    move |window, cx| {
+                                        Tooltip::new(i18n::t(i18n::Key::UnsavedChanges, cx))
+                                            .build(window, cx)
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .size(metrics::dirty_dot())
+                                        .rounded_full()
+                                        .bg(cx.theme().primary),
+                                )
+                                .into_any_element()
+                        } else {
+                            Button::new(SharedString::from(format!("close-{ix}")))
+                                .icon(IconName::Close)
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| this.close_tab(ix, cx)))
+                                .into_any_element()
+                        },
                     )
             }))
             .on_click(cx.listener(|this, ix: &usize, _, cx| {
                 this.active = *ix;
+                if let Some(doc) = this.documents.get(*ix) {
+                    let path = doc.read(cx).path().to_path_buf();
+                    this.record_visit(path, 0);
+                }
                 this.web_dirty(cx);
                 cx.notify();
             }))
@@ -1560,6 +1923,7 @@ impl Workspace {
     /// the panels read as the main view extending sideways rather than as
     /// content parked under a bar.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let navigator = self.render_navigator(cx);
         TitleBar::new()
             // `TitleBar` hard-codes its own 34px height; the side panels put a
             // header at [`metrics::TITLE_BAR`] beside it, and two chrome rows
@@ -1573,11 +1937,38 @@ impl Workspace {
                     .pl(metrics::inset())
                     .gap(metrics::gap_group())
                     .items_center()
+                    // The left panel's toggle sits at the left edge, above the
+                    // panel it governs; the right one at the right edge, above
+                    // that one. A control whose position contradicts what it
+                    // opens is a control the user has to read rather than
+                    // recognize.
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("toggle-left-panel")
+                                    .icon(IconName::PanelLeft)
+                                    .xsmall()
+                                    .ghost()
+                                    .when(self.left_panel_open, |b| b.primary())
+                                    .tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
+                                    })),
+                            ),
+                    )
                     .child(
                         h_flex()
                             .flex_1()
                             .min_w_0()
                             .items_center()
+                            .gap(metrics::gap())
+                            // Back and Forward first, then the tabs — the
+                            // arrangement Zed and every browser use, because
+                            // navigation is about the strip that follows it.
+                            .child(navigator)
                             // The tabs claim the press; the slack beside them does
                             // not. `stop_propagation` on a `flex_1` wrapper covered
                             // the whole bar and killed **both** ways the window
@@ -1664,14 +2055,14 @@ impl Workspace {
                                     })),
                             )
                             .child(
-                                Button::new("toggle-left-panel")
-                                    .icon(IconName::PanelLeft)
+                                Button::new("settings")
+                                    .icon(IconName::Settings)
                                     .xsmall()
                                     .ghost()
-                                    .when(self.left_panel_open, |b| b.primary())
-                                    .tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
+                                    .when(self.settings_open, |b| b.primary())
+                                    .tooltip(i18n::t(i18n::Key::Settings, cx))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
+                                        this.on_open_settings(&OpenSettings, window, cx)
                                     })),
                             )
                             .child(
@@ -1683,17 +2074,6 @@ impl Workspace {
                                     .tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("settings")
-                                    .icon(IconName::Settings)
-                                    .xsmall()
-                                    .ghost()
-                                    .when(self.settings_open, |b| b.primary())
-                                    .tooltip(i18n::t(i18n::Key::Settings, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_open_settings(&OpenSettings, window, cx)
                                     })),
                             ),
                     ),
@@ -1770,11 +2150,17 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The WebView is deliberately NOT touched here: it is an OS child
         // window, and mutating it during a draw re-enters the window procedure
         // with the App already borrowed. `schedule_webview_sync` runs it after
         // the effect cycle instead.
+
+        // Panel widths are a share of the window rather than a fixed column, so
+        // the same layout reads the same on a laptop and on a 4K display. The
+        // viewport is only available here, which is why the widths are resolved
+        // in `render` rather than baked into a constant.
+        let viewport = window.viewport_size().width;
 
         let content: AnyElement = if self.settings_open {
             self.render_settings(cx)
@@ -1824,6 +2210,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_copy_relative_path))
             .on_action(cx.listener(Self::on_toggle_left_panel))
             .on_action(cx.listener(Self::on_toggle_right_panel))
+            .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_navigate_back))
+            .on_action(cx.listener(Self::on_navigate_forward))
             // Dropping a file or folder onto the window opens it. The whole
             // window is the target rather than the document area: a drop is
             // aimed at the app, and making the user find a hot zone would be a
@@ -1846,8 +2235,8 @@ impl Render for Workspace {
                         .when_some(side_panel, |group, panel| {
                             group.child(
                                 resizable_panel()
-                                    .size(metrics::side_panel())
-                                    .size_range(px(metrics::SIDE_PANEL_MIN)..px(640.))
+                                    .size(metrics::SIDE_PANEL.resolve(viewport))
+                                    .size_range(metrics::SIDE_PANEL.drag_range())
                                     .child(panel),
                             )
                         })
@@ -1861,13 +2250,13 @@ impl Render for Workspace {
                         )
                         // The details of whatever is selected on the left, on
                         // the right. They used to sit under the list in the same
-                        // 268px column, which left the list and the details both
-                        // too short to read.
+                        // narrow column, which left the list and the details
+                        // both too short to read.
                         .when_some(right_panel, |this, panel| {
                             this.child(
                                 resizable_panel()
-                                    .size(metrics::right_panel())
-                                    .size_range(px(metrics::SIDE_PANEL_MIN)..px(720.))
+                                    .size(metrics::RIGHT_PANEL.resolve(viewport))
+                                    .size_range(metrics::RIGHT_PANEL.drag_range())
                                     .child(panel),
                             )
                         }),
@@ -1902,6 +2291,19 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-b", ToggleLeftPanel, None),
         KeyBinding::new("cmd-alt-b", ToggleRightPanel, None),
         KeyBinding::new("ctrl-alt-b", ToggleRightPanel, None),
+        // Workspace search. `Ctrl/Cmd+F` stays with the editor's own find —
+        // one searches the document you are in, the other searches everywhere,
+        // and giving the second the first's binding would take away the more
+        // frequently wanted of the two.
+        KeyBinding::new("cmd-shift-f", FocusSearch, None),
+        KeyBinding::new("ctrl-shift-f", FocusSearch, None),
+        // Back and forward, on the bindings every editor and IDE uses.
+        KeyBinding::new("ctrl-alt--", NavigateBack, None),
+        KeyBinding::new("ctrl-alt-shift--", NavigateForward, None),
+        KeyBinding::new("cmd-alt-left", NavigateBack, None),
+        KeyBinding::new("cmd-alt-right", NavigateForward, None),
+        KeyBinding::new("alt-left", NavigateBack, None),
+        KeyBinding::new("alt-right", NavigateForward, None),
     ]);
 }
 
@@ -2085,17 +2487,43 @@ mod tests {
             .unwrap_or(body.len());
         let body = &body[..end];
 
-        // The press-claiming handler must not cover the whole bar. Checked by
-        // counting rather than by matching indentation, which `cargo fmt`
-        // rewrites — an assertion pinned to whitespace silently becomes an
-        // assertion about nothing.
-        let claims = body.matches("cx.stop_propagation()").count();
-        assert_eq!(
-            claims, 2,
-            "expected exactly two press-claiming regions — the tabs and the \
-             button group. A third (or one moved onto a flex_1 wrapper) covers \
-             the slack the window is dragged by."
+        // Every press-claiming region must be sized to its own content. The
+        // count is not the invariant — the bar legitimately grew a third claim
+        // when the navigator arrived — what matters is that no claim sits on a
+        // box that grows to fill the bar, because that box is the drag handle.
+        //
+        // Checked by walking backwards from each handler to the `h_flex()` or
+        // `div()` that opens its element, rather than by matching indentation:
+        // `cargo fmt` rewrites whitespace, and an assertion pinned to it
+        // silently becomes an assertion about nothing.
+        let claims: Vec<usize> = body
+            .match_indices("cx.stop_propagation()")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            claims.len() >= 2,
+            "the buttons must claim their presses back, or they do nothing \
+             inside a WindowControlArea::Drag region"
         );
+        for at in claims {
+            let opener = body[..at]
+                .rfind("h_flex()")
+                .into_iter()
+                .chain(body[..at].rfind("div()"))
+                .max()
+                .expect("every handler is on some element");
+            let element = &body[opener..at];
+            assert!(
+                !element.contains(".flex_1()"),
+                "a press-claiming region sits on a flex_1 box, which covers the \
+                 whole bar and kills both drag paths: GPUI's, because \
+                 `TitleBar`'s own `on_mouse_down` never sees a stopped event, \
+                 and Windows', because `handle_nc_mouse_down_msg` returns \
+                 `Some(0)` for a handled press so `DefWindowProc` never gets \
+                 the `HTCAPTION`.\nOffending element: {element}"
+            );
+        }
+
         assert!(
             body.contains("div().flex_1().min_w_0().h_full()"),
             "the bar needs a handler-free filler, or every pixel beside the \
@@ -2147,6 +2575,221 @@ mod tests {
         assert!(
             body.contains("when_some(right_panel"),
             "the right panel must be omittable"
+        );
+    }
+
+    /// Each panel's toggle sits above the panel it governs.
+    ///
+    /// Source-level: pure layout, invisible to any runtime assertion. What it
+    /// guards is that the two buttons stay on opposite ends of the bar — put
+    /// together, a control's position contradicts what it opens, and the user
+    /// has to read the icon rather than recognize the side.
+    #[test]
+    fn each_panel_toggle_sits_on_its_own_side() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("fn render_title_bar")
+            .expect("render_title_bar must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn render_status_bar")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let left = body
+            .find("toggle-left-panel")
+            .expect("the left panel toggle");
+        let right = body
+            .find("toggle-right-panel")
+            .expect("the right panel toggle");
+        let tabs = body.find("self.render_tabs(cx)").expect("the tab strip");
+        assert!(
+            left < tabs,
+            "the left panel's toggle must come before the tabs, at the left edge"
+        );
+        assert!(
+            right > tabs,
+            "the right panel's toggle must come after the tabs, at the right edge"
+        );
+    }
+
+    /// The navigator leads the tab strip, and its buttons disable rather than
+    /// disappear.
+    ///
+    /// A hidden button would shift every tab sideways as the user navigates,
+    /// which is exactly the kind of motion that makes a strip hard to aim at.
+    #[test]
+    fn the_navigator_leads_the_tabs_and_never_vanishes() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("fn render_navigator")
+            .expect("render_navigator must exist");
+        let body = &source[start..];
+        let end = body.find("\n    fn render_tabs").unwrap_or(body.len());
+        let nav = &body[..end];
+
+        assert!(
+            nav.contains("can_go_back()") && nav.contains("can_go_forward()"),
+            "both directions must reflect whether there is anywhere to go"
+        );
+        assert_eq!(
+            nav.matches(".disabled(").count(),
+            2,
+            "both buttons must disable rather than be conditionally rendered"
+        );
+        assert!(
+            !nav.contains(".when(") || !nav.contains("Button::new(\"nav-"),
+            "a conditionally-present button shifts the tabs as the user navigates"
+        );
+
+        // And it is childed before the tab strip.
+        let bar_start = source
+            .find("fn render_title_bar")
+            .expect("render_title_bar");
+        let bar = &source[bar_start..];
+        let navigator = bar.find(".child(navigator)").expect("the navigator");
+        let tabs = bar.find("self.render_tabs(cx)").expect("the tab strip");
+        assert!(navigator < tabs, "Back/Forward come before the tabs");
+    }
+
+    /// Closing a tab must not leave it reachable through Back.
+    ///
+    /// Runtime rather than source-level, because the history is plain data with
+    /// no GPUI in it — and the failure is subtle enough to deserve a real
+    /// assertion: without `forget`, Back reopens the tab the user just closed,
+    /// which reads as the close button not working.
+    #[test]
+    fn closing_a_document_forgets_its_visits() {
+        use super::{History, Visit};
+        use std::path::PathBuf;
+
+        let mut history = History::default();
+        for (path, offset) in [("a.md", 0), ("b.md", 0), ("a.md", 40), ("c.md", 0)] {
+            history.push(Visit {
+                path: PathBuf::from(path),
+                offset,
+            });
+        }
+        history.forget(std::path::Path::new("a.md"));
+        assert!(
+            !history
+                .visits
+                .iter()
+                .any(|v| v.path.as_path() == std::path::Path::new("a.md")),
+            "every visit to the closed document must go, not just the latest"
+        );
+        // And the cursor still points inside the list.
+        assert!(history.cursor.is_some_and(|ix| ix < history.visits.len()));
+    }
+
+    /// Going back and then somewhere new abandons the forward branch.
+    ///
+    /// The behavior every browser has, and the reason Forward means "where I
+    /// was" rather than "where I once was". Getting this wrong produces a
+    /// Forward button that jumps somewhere the user never went from here.
+    #[test]
+    fn a_new_visit_after_going_back_truncates_the_forward_half() {
+        use super::{History, Visit};
+        use std::path::PathBuf;
+
+        let visit = |name: &str| Visit {
+            path: PathBuf::from(name),
+            offset: 0,
+        };
+        let mut history = History::default();
+        history.push(visit("a.md"));
+        history.push(visit("b.md"));
+        history.push(visit("c.md"));
+
+        assert_eq!(history.back().map(|v| v.path), Some(PathBuf::from("b.md")));
+        assert!(history.can_go_forward());
+
+        history.push(visit("d.md"));
+        assert!(
+            !history.can_go_forward(),
+            "c.md is on a branch the user left; Forward must not go there"
+        );
+        assert_eq!(history.back().map(|v| v.path), Some(PathBuf::from("b.md")));
+    }
+
+    /// Navigating must not record the navigation as a new visit.
+    ///
+    /// Without the guard, pressing Back records arriving at the previous entry,
+    /// which truncates everything after it — so Back works once and Forward is
+    /// dead from then on.
+    #[test]
+    fn navigating_does_not_rewrite_the_history_it_walks() {
+        use super::{History, Visit};
+        use std::path::PathBuf;
+
+        let visit = |name: &str| Visit {
+            path: PathBuf::from(name),
+            offset: 0,
+        };
+        let mut history = History::default();
+        history.push(visit("a.md"));
+        history.push(visit("b.md"));
+        history.push(visit("c.md"));
+
+        let target = history.back().expect("somewhere to go back to");
+        // What `go_to` does around the open it triggers.
+        history.navigating = true;
+        history.push(target);
+        history.navigating = false;
+
+        assert!(
+            history.can_go_forward(),
+            "walking back must leave the forward half intact"
+        );
+        assert_eq!(
+            history.forward().map(|v| v.path),
+            Some(PathBuf::from("c.md"))
+        );
+    }
+
+    /// Search must never search a stale copy of an open document, and must
+    /// never walk the filesystem on the UI thread.
+    ///
+    /// Source-level: reproducing either needs a window, an editor and a real
+    /// vault. Both failures are real and were measured — walking the 6,642-file
+    /// vault takes 2.4s, which as a UI-thread cost is a frozen window on every
+    /// settled keystroke; and reading an open tab from disk misses everything
+    /// typed since the last save.
+    #[test]
+    fn the_search_corpus_is_cheap_to_build_and_prefers_editor_text() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("fn search_corpus")
+            .expect("search_corpus must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Paths of every open tab")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("corpus.open.push"),
+            "open tabs must contribute their editor text"
+        );
+        assert!(
+            !body.contains("document_paths("),
+            "walking a directory here runs on the UI thread — measured at 2.4s \
+             on a 6,642-document vault. Hand the directory over in \
+             `Corpus::roots` and let the background task walk it."
+        );
+        assert!(
+            body.contains("corpus.roots"),
+            "directories must be passed unwalked"
+        );
+        assert!(
+            body.contains("!open.contains(p)"),
+            "files already contributed as editor text must be filtered out, or \
+             every match in an open document is reported twice"
+        );
+        assert!(
+            body.contains("skills().iter().map(|s| s.dir.clone())"),
+            "the Harness scope must cover a skill's whole directory, not only \
+             its SKILL.md — references and scripts are part of the skill"
         );
     }
 }

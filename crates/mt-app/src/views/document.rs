@@ -183,19 +183,38 @@ impl DocumentView {
         &self.file.path
     }
 
-    pub fn title(&self) -> String {
-        let name = self
-            .file
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("untitled")
-            .to_string();
-        if self.dirty {
-            format!("{name} •")
-        } else {
-            name
+    /// Whether this document exists on disk.
+    ///
+    /// A tab for a file that was never saved has no name to show, so the label
+    /// falls back to the first line — see [`Self::title`].
+    pub fn is_on_disk(&self) -> bool {
+        self.file.path.is_file()
+    }
+
+    /// The tab label.
+    ///
+    /// A file on disk is named by its file name. A buffer that is not is named
+    /// by its first line, the way every note-taking app does it — the first
+    /// line of a new document is almost always its heading, and `Untitled 3`
+    /// tells the reader nothing about which of three drafts it is. An empty or
+    /// blank first line has nothing to offer, so that falls back to `Untitled`.
+    ///
+    /// The dirty marker is **not** here. It used to be appended as ` •`, which
+    /// made it part of the string that gets elided — a long name pushed the
+    /// marker out of the label entirely, so the one tab that most needed the
+    /// warning was the one that lost it. The tab draws it as its own element
+    /// now; see `workspace::render_tabs`.
+    pub fn title(&self, cx: &App) -> String {
+        if self.is_on_disk() {
+            return self
+                .file
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("untitled")
+                .to_string();
         }
+        first_line_title(&self.text(cx))
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -997,6 +1016,26 @@ fn oversize_notice(len: usize) -> String {
     )
 }
 
+/// A tab label derived from a buffer's first line.
+///
+/// Markdown heading markers are stripped: a document whose first line is
+/// `# Design notes` is called "Design notes", not "# Design notes". The hash is
+/// syntax, and a tab strip full of them reads as noise.
+fn first_line_title(text: &str) -> String {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let stripped = first.trim_start_matches('#').trim();
+    if stripped.is_empty() {
+        // Not "untitled": this is a label a person reads, and it is the same
+        // word every editor uses for the same state.
+        return "Untitled".to_string();
+    }
+    stripped.to_string()
+}
+
 /// Which syntax-highlighting language the editor uses for a document type.
 fn editor_language(doc_type: DocType) -> Language {
     match doc_type {
@@ -1017,6 +1056,10 @@ impl Focusable for DocumentView {
 
 impl Render for DocumentView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Before the element chain: `title` reads the editor through `&App`,
+        // which cannot overlap the `&mut Context` the chain holds.
+        let title = self.title(cx);
+
         let body = if self.layout.is_split() {
             h_resizable("split")
                 .child(resizable_panel().child(self.render_editor(cx)))
@@ -1055,7 +1098,7 @@ impl Render for DocumentView {
             // gpui logs exactly that. `Group` is the right one for a container
             // holding a toolbar, an editor and a preview.
             .role(gpui::Role::Group)
-            .aria_label(self.title())
+            .aria_label(title)
             .track_focus(&self.focus_handle)
             .size_full()
             .child(self.render_toolbar(cx))
@@ -1068,6 +1111,37 @@ impl Render for DocumentView {
 mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
+    use super::first_line_title;
+
+    #[test]
+    fn a_buffer_is_named_by_its_first_line() {
+        assert_eq!(first_line_title("Design notes\nbody\n"), "Design notes");
+    }
+
+    #[test]
+    fn heading_markers_are_not_part_of_the_name() {
+        // `# ` is syntax, and a tab strip full of hashes reads as noise.
+        assert_eq!(first_line_title("# Design notes\n"), "Design notes");
+        assert_eq!(first_line_title("### Deep\n"), "Deep");
+    }
+
+    #[test]
+    fn leading_blank_lines_are_skipped() {
+        // A buffer that starts with a blank line still has a name; taking
+        // `lines().next()` literally would call it "Untitled".
+        assert_eq!(first_line_title("\n\n  Real title\n"), "Real title");
+    }
+
+    #[test]
+    fn a_buffer_with_nothing_to_say_is_untitled() {
+        for text in ["", "\n\n\n", "   \n\t\n", "#\n", "###   \n"] {
+            assert_eq!(
+                first_line_title(text),
+                "Untitled",
+                "{text:?} should have no name to show"
+            );
+        }
+    }
 
     /// The Web pane must place the `WebView` in the element tree.
     ///

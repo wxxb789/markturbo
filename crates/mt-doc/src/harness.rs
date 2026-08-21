@@ -16,6 +16,11 @@
 //!
 //! Getting those wrong is not cosmetic: they are exactly the harnesses whose
 //! skills would silently fail to appear.
+//!
+//! One harness is **not** from that transcription. DeepSeek Harness (`dsh`) is
+//! absent from upstream's registry, so its rows were read from the installed
+//! `@deepseek-ai/dsh-skill-filesystem` plugin, which resolves two independent
+//! roots — see the table entry for the exact variables.
 
 use std::path::PathBuf;
 
@@ -141,6 +146,13 @@ pub const HARNESSES: &[Harness] = &[
     h("crush", ".crush/skills", GlobalRoot::Home(".config/crush/skills")),
     h("cursor", ".agents/skills", GlobalRoot::Home(".cursor/skills")),
     h("deepagents", ".agents/skills", GlobalRoot::Home(".deepagents/agent/skills")),
+    // Not in `vercel-labs/skills`. Read from the installed plugin instead:
+    // `@deepseek-ai/dsh-skill-filesystem` resolves `$DSH_HOME` (default
+    // `~/.dsh`) and, separately, `$DSH_AGENTS_HOME` (default `~/.agents`).
+    // The project roots it walks are `.dsh/skills` then `.agents/skills`; the
+    // second is already in the table, so only the first is new.
+    h("deepseek-harness", ".dsh/skills", GlobalRoot::Env { var: "DSH_HOME", suffix: "skills", fallback: ".dsh/skills" }),
+    h("deepseek-harness-agents", ".agents/skills", GlobalRoot::Env { var: "DSH_AGENTS_HOME", suffix: "skills", fallback: ".agents/skills" }),
     h("devin", ".devin/skills", GlobalRoot::XdgConfig("devin/skills")),
     h("dexto", ".agents/skills", GlobalRoot::Home(".agents/skills")),
     h("droid", ".factory/skills", GlobalRoot::Home(".factory/skills")),
@@ -446,6 +458,49 @@ mod tests {
             let harness = HARNESSES.iter().find(|h| h.id == id).unwrap();
             assert_eq!(harness.global.resolve(), None, "{id} must be project-only");
         }
+    }
+
+    /// DeepSeek Harness resolves two roots from two independent variables.
+    ///
+    /// Pinned because this row is the one that cannot be diffed against
+    /// `vercel-labs/skills` — that registry has no deepseek entry, so these
+    /// paths came from reading `@deepseek-ai/dsh-skill-filesystem` and nothing
+    /// else would catch them drifting. `$DSH_HOME` governs `.dsh` only:
+    /// pointing it somewhere must not move `~/.agents/skills` with it, or a
+    /// relocated dsh install silently loses every shared skill.
+    #[test]
+    fn deepseek_harness_resolves_its_two_roots_independently() {
+        let dsh = HARNESSES
+            .iter()
+            .find(|h| h.id == "deepseek-harness")
+            .expect("the dsh row");
+        let agents = HARNESSES
+            .iter()
+            .find(|h| h.id == "deepseek-harness-agents")
+            .expect("the dsh shared-agents row");
+        assert_eq!(dsh.project, ".dsh/skills");
+        assert_eq!(agents.project, ".agents/skills");
+
+        // SAFETY: single-threaded test; both variables are restored below.
+        unsafe { std::env::set_var("DSH_HOME", "/tmp/dsh-elsewhere") };
+        unsafe { std::env::remove_var("DSH_AGENTS_HOME") };
+
+        let moved = dsh.global.resolve().unwrap();
+        assert!(
+            moved.to_string_lossy().contains("dsh-elsewhere"),
+            "$DSH_HOME must relocate the dsh root, got {}",
+            moved.display()
+        );
+        let shared = agents.global.resolve().unwrap();
+        assert!(
+            !shared.to_string_lossy().contains("dsh-elsewhere"),
+            "$DSH_HOME must not drag ~/.agents/skills with it, got {}",
+            shared.display()
+        );
+        assert!(shared.ends_with(rel(".agents/skills")));
+
+        unsafe { std::env::remove_var("DSH_HOME") };
+        assert!(dsh.global.resolve().unwrap().ends_with(rel(".dsh/skills")));
     }
 
     #[test]
