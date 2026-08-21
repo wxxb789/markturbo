@@ -1,6 +1,6 @@
 //! Reading and writing workspace files safely.
 //!
-//! Two invariants:
+//! Three invariants:
 //!
 //! * A save never clobbers a change made outside the app. We record the
 //!   modification time and size seen when the file was loaded, and refuse to
@@ -8,9 +8,14 @@
 //! * Files stay ordinary files. No proprietary format, no reformatting, no
 //!   forced newline conversion — a document written back unchanged is
 //!   byte-identical to what was read.
+//! * A file this app cannot decode is never silently rewritten as something
+//!   else. Text is decoded through its detected encoding and re-encoded in the
+//!   same one on save, so a GBK document opened and saved untouched stays GBK.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+use encoding_rs::{Encoding, UTF_8};
 
 /// What we knew about a file when we last read or wrote it.
 ///
@@ -48,6 +53,13 @@ pub struct LoadedFile {
     pub newline: Newline,
     /// True when the file began with a UTF-8 BOM, which must be written back.
     pub had_bom: bool,
+    /// The encoding the bytes were decoded from, so a save re-encodes in it.
+    ///
+    /// Almost always UTF-8. The exception is what this field exists for: a
+    /// legacy GBK or Shift-JIS document decoded as UTF-8 becomes a wall of
+    /// U+FFFD, and saving that back destroys the file. Carrying the encoding
+    /// makes the round trip lossless instead.
+    pub encoding: &'static Encoding,
 }
 
 /// Which line ending the file uses.
@@ -80,18 +92,50 @@ impl Newline {
     }
 }
 
+/// Decide which encoding a file's bytes are in.
+///
+/// A BOM wins outright — it is a declaration, not a guess. Otherwise, valid
+/// UTF-8 is taken at face value, because on a developer's machine that is what
+/// almost every file is and running a detector over it can only introduce
+/// error. Only bytes that are *not* valid UTF-8 reach the detector, which is
+/// exactly the population it was built for: legacy content with no label.
+///
+/// Returns the encoding, the body with any BOM removed, and whether there was
+/// one.
+fn sniff_encoding(bytes: &[u8]) -> (&'static Encoding, &[u8], bool) {
+    if let Some((encoding, bom_len)) = Encoding::for_bom(bytes) {
+        return (encoding, &bytes[bom_len..], true);
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return (UTF_8, bytes, false);
+    }
+    // `Iso2022JpDetection::Allow`: the security reason for denying it is that a
+    // browser can be tricked into running script from a mis-detected page. This
+    // is a text editor with no script engine, and denying it would misdecode
+    // exactly the Japanese mail archives the encoding still appears in.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
+    detector.feed(bytes, true);
+    // `Deny` — UTF-8 was already ruled out above, and letting the detector
+    // return it anyway would put us back to lossy decoding.
+    (
+        detector.guess(None, chardetng::Utf8Detection::Deny),
+        bytes,
+        false,
+    )
+}
+
 /// Read a file for editing.
 ///
 /// Line endings are normalized to `\n` in memory — the editor and every parser
-/// want one convention — and restored on save. Invalid UTF-8 is replaced rather
-/// than rejected so a file with one bad byte still opens.
+/// want one convention — and restored on save. Undecodable bytes are replaced
+/// rather than rejected so a file with one bad byte still opens.
 pub fn load(path: &Path) -> std::io::Result<LoadedFile> {
     let bytes = std::fs::read(path)?;
     let stamp = FileStamp::of(path)?;
 
-    let had_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
-    let body = if had_bom { &bytes[3..] } else { &bytes[..] };
-    let raw = String::from_utf8_lossy(body).into_owned();
+    let (encoding, body, had_bom) = sniff_encoding(&bytes);
+    let (raw, _) = encoding.decode_without_bom_handling(body);
+    let raw = raw.into_owned();
 
     let newline = Newline::detect(&raw);
     let text = if newline == Newline::Crlf {
@@ -106,6 +150,7 @@ pub fn load(path: &Path) -> std::io::Result<LoadedFile> {
         stamp,
         newline,
         had_bom,
+        encoding,
     })
 }
 
@@ -139,7 +184,7 @@ pub fn save(file: &LoadedFile, text: &str, force: bool) -> Result<FileStamp, Sav
     if !force && file.path.exists() && !file.stamp.matches(&file.path) {
         return Err(SaveError::Conflict);
     }
-    write(&file.path, text, file.newline, file.had_bom).map_err(SaveError::Io)
+    write(&file.path, text, file.newline, file.had_bom, file.encoding).map_err(SaveError::Io)
 }
 
 /// Write to a new path (Save As). No conflict check: the caller chose the path.
@@ -149,35 +194,75 @@ pub fn save_as(
     newline: Newline,
     had_bom: bool,
 ) -> std::io::Result<FileStamp> {
-    write(path, text, newline, had_bom)
+    write(path, text, newline, had_bom, UTF_8)
 }
 
-fn write(path: &Path, text: &str, newline: Newline, had_bom: bool) -> std::io::Result<FileStamp> {
-    let mut bytes = Vec::with_capacity(text.len() + 3);
-    if had_bom {
-        bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-    }
-    if newline == Newline::Crlf {
+fn write(
+    path: &Path,
+    text: &str,
+    newline: Newline,
+    had_bom: bool,
+    encoding: &'static Encoding,
+) -> std::io::Result<FileStamp> {
+    let restored;
+    let text = if newline == Newline::Crlf {
         // The in-memory text uses `\n`; restore the file's convention. Guard
         // against a stray `\r\n` already present so we never emit `\r\r\n`.
-        bytes.extend_from_slice(text.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes());
+        restored = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        restored.as_str()
     } else {
-        bytes.extend_from_slice(text.as_bytes());
+        text
+    };
+
+    let mut bytes = Vec::with_capacity(text.len() + 3);
+    if had_bom {
+        // The BOM that belongs to *this* encoding, not always UTF-8's. A
+        // UTF-16 file written back with a UTF-8 BOM would be undecodable by
+        // whatever reads it next.
+        bytes.extend_from_slice(match encoding.name() {
+            "UTF-16LE" => &[0xFF, 0xFE][..],
+            "UTF-16BE" => &[0xFE, 0xFF][..],
+            _ => &[0xEF, 0xBB, 0xBF][..],
+        });
+    }
+
+    match encoding.name() {
+        // `encoding_rs` has no UTF-16 *encoder*: `Encoding::encode` silently
+        // falls back to UTF-8 output for these two, which would write a
+        // UTF-8 body under a UTF-16 BOM — a file nothing can read. Encoding
+        // the code units directly is the whole of what the encoder would do.
+        name @ ("UTF-16LE" | "UTF-16BE") => {
+            let big_endian = name == "UTF-16BE";
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                });
+            }
+        }
+        // Never fails: an unmappable character becomes a numeric character
+        // reference. Lossy, but lossy in a way the target encoding can
+        // represent, which beats refusing to save.
+        _ => {
+            let (encoded, _, _) = encoding.encode(text);
+            bytes.extend_from_slice(&encoded);
+        }
     }
 
     // Write to a sibling temp file then rename, so a crash mid-write cannot
     // truncate the user's document. Same directory keeps the rename atomic.
-    let temp = path.with_extension(format!(
-        "{}.markturbo-tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("")
-    ));
-    std::fs::write(&temp, &bytes)?;
-    if let Err(err) = std::fs::rename(&temp, path) {
-        // Windows rename fails if the destination exists and is locked; clean
-        // up rather than leaving a stray temp file behind.
-        let _ = std::fs::remove_file(&temp);
-        return Err(err);
-    }
+    //
+    // `NamedTempFile` rather than a name derived from the target: the derived
+    // name was deterministic, so two saves of the same document raced on one
+    // temp path, and a file with no extension produced `README..markturbo-tmp`.
+    // `persist` also handles the Windows case where the destination exists.
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".markturbo-")
+        .tempfile_in(dir)?;
+    std::io::Write::write_all(&mut temp, &bytes)?;
+    temp.persist(path).map_err(|e| e.error)?;
     FileStamp::of(path)
 }
 
@@ -295,7 +380,7 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains("markturbo-tmp"))
+            .filter(|n| n != "a.md")
             .collect();
         assert!(leftovers.is_empty(), "found {leftovers:?}");
     }
@@ -313,6 +398,100 @@ mod tests {
         let path = write_file(dir.path(), "a.md", b"valid \xFF\xFE invalid\n");
         let file = load(&path).unwrap();
         assert!(file.text.contains("valid"), "must not fail to open");
+    }
+
+    #[test]
+    fn a_gbk_document_survives_an_open_and_save() {
+        // The data-loss path this closes: decoding through `from_utf8_lossy`
+        // turned every GBK byte into U+FFFD, and `save` wrote that back — so
+        // opening a legacy Chinese document and pressing Ctrl+S destroyed it.
+        let dir = tempfile::tempdir().unwrap();
+        // "中文" in GBK. Not valid UTF-8, which is what routes it to the detector.
+        let original = b"\xD6\xD0\xCE\xC4\r\n";
+        let path = write_file(dir.path(), "legacy.txt", original);
+
+        let file = load(&path).unwrap();
+        assert_eq!(file.encoding.name(), "GBK", "detected as GBK, not UTF-8");
+        assert_eq!(file.text, "中文\n", "decoded, not replaced");
+        assert!(
+            !file.text.contains('\u{FFFD}'),
+            "no replacement characters: {:?}",
+            file.text
+        );
+
+        save(&file, &file.text, false).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "an untouched save is byte-identical, still GBK"
+        );
+    }
+
+    #[test]
+    fn a_utf16_document_keeps_its_encoding_and_its_bom() {
+        // `encoding_rs` has no UTF-16 encoder — `Encoding::encode` silently
+        // emits UTF-8 for it. Writing a UTF-8 body under a UTF-16 BOM produces
+        // a file nothing can read, so `write` encodes the code units itself.
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"\xFF\xFEh\x00i\x00\n\x00";
+        let path = write_file(dir.path(), "a.txt", original);
+
+        let file = load(&path).unwrap();
+        assert_eq!(file.encoding.name(), "UTF-16LE");
+        assert!(file.had_bom);
+        assert_eq!(file.text, "hi\n");
+
+        save(&file, &file.text, false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn a_utf8_file_is_never_handed_to_the_detector() {
+        // Valid UTF-8 is taken at face value. A detector run over it can only
+        // introduce error, and on a developer's machine nearly every file is
+        // UTF-8 — including ones whose bytes a detector would happily read as
+        // some legacy single-byte encoding.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "a.md", "café ünicode ①②③\n".as_bytes());
+        let file = load(&path).unwrap();
+        assert_eq!(file.encoding.name(), "UTF-8");
+        assert_eq!(file.text, "café ünicode ①②③\n");
+    }
+
+    #[test]
+    fn two_saves_of_one_file_cannot_collide_on_a_temp_path() {
+        // The temp name used to be derived from the target, so it was the same
+        // on every save: two concurrent writers truncated each other's temp
+        // file and one of them renamed a half-written document into place.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "a.md", b"start\n");
+        let file = load(&path).unwrap();
+
+        let source = include_str!("fs.rs");
+        let body = source
+            .split_once("fn write(")
+            .expect("write must exist")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .map(|(body, _)| body)
+            .unwrap_or(source);
+        assert!(
+            !body.contains("with_extension"),
+            "the temp path must not be derived from the target name: a \
+             deterministic name is the same on every save, so two saves of one \
+             document race on it"
+        );
+        assert!(
+            body.contains("tempfile::Builder"),
+            "the temp file must come from `tempfile`, which randomizes the name"
+        );
+
+        // And a file with no extension no longer produces `README..markturbo-tmp`.
+        let plain = write_file(dir.path(), "README", b"x\n");
+        let plain_file = load(&plain).unwrap();
+        save(&plain_file, "y\n", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "y\n");
+        assert!(file.path.exists());
     }
 
     #[test]

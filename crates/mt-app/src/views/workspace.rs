@@ -33,6 +33,7 @@ use crate::views::document::{DocumentEvent, DocumentView};
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::harness::{HarnessEvent, HarnessView};
 use crate::views::search::{Corpus, SearchEvent, SearchView};
+use crate::views::tabs::Tabs;
 use crate::watcher::Watcher;
 
 actions!(
@@ -216,6 +217,12 @@ impl History {
 /// detected change reaches the UI.
 const WATCH_POLL: Duration = Duration::from_millis(500);
 
+/// How long a status message stays on the bar.
+///
+/// Long enough to read a save confirmation without looking for it, short enough
+/// that the bar is not still claiming "Saved" when the user comes back.
+const STATUS_LINGER: Duration = Duration::from_secs(6);
+
 /// What the WebView should be showing.
 ///
 /// `Unchanged` is not "do nothing because nothing happened" — it means the
@@ -236,13 +243,26 @@ pub struct Workspace {
     harness: Option<Entity<HarnessView>>,
     search: Entity<SearchView>,
     side_panel: SidePanel,
-    documents: Vec<Entity<DocumentView>>,
-    active: usize,
+    /// The open tabs, the active one, the preview slot, and the menu target.
+    ///
+    /// One field rather than five: the index arithmetic between them is where
+    /// closing a tab used to switch documents, leak subscriptions, and strand
+    /// the preview slot. [`Tabs`] owns those rules and tests them without a
+    /// window.
+    tabs: Tabs<DocumentTab>,
     /// Back/forward across visited positions.
     history: History,
     registry: Arc<RendererRegistry>,
     watcher: Option<Watcher>,
     status: Option<String>,
+    /// Bumped by every [`Workspace::set_status`], so a timer can tell whether
+    /// the message it was started for is still the one on screen.
+    status_generation: u64,
+    /// The timer that clears the current status message.
+    ///
+    /// One slot rather than a detached task per message: replacing it cancels
+    /// the previous timer, which is the other half of the generation check.
+    _status_timer: Option<Task<()>>,
     /// The single WebView for this window. It is an OS-level child window, so
     /// one is shared by every tab rather than created per document.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -253,21 +273,8 @@ pub struct Workspace {
     webview_sync_pending: bool,
     /// What the WebView is currently showing, so we do not reload identical
     /// content on every frame.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     web_current: Option<String>,
-    /// Which tab the context menu was opened on.
-    ///
-    /// Not the active tab: right-clicking a tab opens its menu without
-    /// selecting it, so the copy actions would otherwise act on whichever
-    /// document happened to be focused.
-    menu_tab: Option<usize>,
-    /// The tab opened as a preview, if any.
-    ///
-    /// VS Code's rule: a single click opens a document in italics and reuses
-    /// that slot for the next single click, so browsing a tree does not leave
-    /// forty tabs behind. A double click, an edit, or an explicit open promotes
-    /// it. Exactly one slot, identified by path rather than index so it survives
-    /// tabs closing to its left.
-    preview_tab: Option<PathBuf>,
     /// True while the settings page is showing.
     settings_open: bool,
     /// True while the file/harness/outline panel is showing on the left.
@@ -286,10 +293,38 @@ pub struct Workspace {
     translating: bool,
     _tasks: Vec<Task<()>>,
     /// Subscriptions that live as long as the workspace does.
+    ///
+    /// Per-document subscriptions are *not* here — they ride in
+    /// [`DocumentTab`], so closing a tab drops them with it.
     _subscriptions: Vec<Subscription>,
     /// Subscriptions to the current folder's explorer and skills views,
     /// replaced wholesale when the folder changes.
     _panel_subscriptions: Vec<Subscription>,
+}
+
+/// What an open tab carries besides its path.
+///
+/// The subscriptions live here rather than in a workspace-wide `Vec` because
+/// that `Vec` was only ever appended to: closing a tab removed the document and
+/// left two subscriptions to it alive for the rest of the session.
+struct DocumentTab {
+    view: Entity<DocumentView>,
+    _subscriptions: [Subscription; 2],
+}
+
+impl Workspace {
+    /// Every open document, cloned.
+    ///
+    /// Cloned because every caller is about to `update` each one through the
+    /// same `&mut Context` that borrows `self`.
+    fn document_views(&self) -> Vec<Entity<DocumentView>> {
+        self.tabs.iter().map(|t| t.payload.view.clone()).collect()
+    }
+
+    /// The document in the tab at `ix`.
+    fn document_at(&self, ix: usize) -> Option<&Entity<DocumentView>> {
+        self.tabs.get(ix).map(|t| &t.payload.view)
+    }
 }
 
 impl Workspace {
@@ -316,14 +351,13 @@ impl Workspace {
             harness: None,
             search: cx.new(|cx| SearchView::new(window, cx)),
             side_panel: SidePanel::Files,
-            documents: Vec::new(),
-            active: 0,
+            tabs: Tabs::default(),
             history: History::default(),
             registry: Arc::new(RendererRegistry::with_defaults()),
             watcher: None,
             status: None,
-            menu_tab: None,
-            preview_tab: None,
+            status_generation: 0,
+            _status_timer: None,
             settings_open: false,
             left_panel_open: true,
             right_panel_open: true,
@@ -332,6 +366,7 @@ impl Workspace {
             webview: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview_sync_pending: false,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             web_current: None,
             _tasks: vec![poll],
             _subscriptions: Vec::new(),
@@ -383,7 +418,7 @@ impl Workspace {
                 // recoloring GPUI alone would leave it on the old theme.
                 if let Some(this) = handle.upgrade() {
                     this.update(cx, |this, cx| {
-                        for doc in this.documents.clone() {
+                        for doc in this.document_views() {
                             doc.update(cx, |doc, cx| doc.theme_changed(cx));
                         }
                         this.web_dirty(cx);
@@ -484,14 +519,12 @@ impl Workspace {
         // Opening the file that is already the preview, by double click, is how
         // it gets promoted — the tab is already right, only its status changes.
         if preview {
-            if let Some(current) = &self.preview_tab
-                && current == &path
-            {
+            if self.tabs.is_preview(&path) {
                 self.focus_path(&path, cx);
                 return;
             }
-        } else if self.preview_tab.as_deref() == Some(path.as_path()) {
-            self.preview_tab = None;
+        } else if self.tabs.is_preview(&path) {
+            self.tabs.set_preview(None);
             self.focus_path(&path, cx);
             return;
         }
@@ -500,13 +533,14 @@ impl Workspace {
         // are the one thing that must not be discarded silently, so a dirty
         // preview is kept and simply stops being one.
         if preview
-            && let Some(current) = self.preview_tab.take()
-            && let Some(ix) = self
-                .documents
-                .iter()
-                .position(|d| d.read(cx).path() == current)
+            && let Some(current) = self.tabs.take_preview()
+            && let Some(ix) = self.tabs.index_of(&current)
         {
-            if self.documents[ix].read(cx).is_dirty() {
+            if self
+                .tabs
+                .get(ix)
+                .is_some_and(|t| t.payload.view.read(cx).is_dirty())
+            {
                 // Keep it: promoting beats losing unsaved work.
             } else {
                 self.close_tab(ix, cx);
@@ -514,18 +548,13 @@ impl Workspace {
         }
 
         self.open_file_inner(path.clone(), window, cx);
-        self.preview_tab = preview.then_some(path);
+        self.tabs.set_preview(preview.then_some(path));
         cx.notify();
     }
 
     /// Focus the tab showing `path`, if it is open.
     fn focus_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Some(ix) = self
-            .documents
-            .iter()
-            .position(|d| d.read(cx).path() == path)
-        {
-            self.active = ix;
+        if self.tabs.focus_path(path) {
             self.record_visit(path.to_path_buf(), 0);
             self.web_dirty(cx);
             cx.notify();
@@ -537,12 +566,7 @@ impl Workspace {
         // document, or the click in the explorer looks like it did nothing.
         self.settings_open = false;
 
-        if let Some(ix) = self
-            .documents
-            .iter()
-            .position(|d| d.read(cx).path() == path)
-        {
-            self.active = ix;
+        if self.tabs.focus_path(&path) {
             self.record_visit(path, 0);
             self.web_dirty(cx);
             cx.notify();
@@ -560,41 +584,49 @@ impl Workspace {
         let registry = self.registry.clone();
         let view = cx.new(|cx| DocumentView::new(file, registry, window, cx));
 
-        self._subscriptions.push(cx.subscribe_in(
-            &view,
-            window,
-            |this: &mut Self, _, event: &DocumentEvent, _, cx| match event {
-                DocumentEvent::Status(message) => this.set_status(message.clone(), cx),
-                DocumentEvent::Conflict => this.set_status(
-                    "This file changed on disk. Reload or overwrite from the banner.".into(),
-                    cx,
-                ),
-                DocumentEvent::DirtyChanged => cx.notify(),
-            },
-        ));
-        // A document notifies on mode change, trust change, and after a
-        // reparse — every event that can alter what the WebView should show.
-        // Observing is what replaces the old sync-from-render.
-        self._subscriptions.push(cx.observe(&view, |this, _, cx| {
-            this.web_dirty(cx);
-        }));
+        // Both subscriptions ride with the tab, so closing it drops them.
+        let subscriptions = [
+            cx.subscribe_in(
+                &view,
+                window,
+                |this: &mut Self, _, event: &DocumentEvent, _, cx| match event {
+                    DocumentEvent::Status(message) => this.set_status(message.clone(), cx),
+                    DocumentEvent::Conflict => this.set_status(
+                        "This file changed on disk. Reload or overwrite from the banner.".into(),
+                        cx,
+                    ),
+                    DocumentEvent::DirtyChanged => cx.notify(),
+                },
+            ),
+            // A document notifies on mode change, trust change, and after a
+            // reparse — every event that can alter what the WebView should
+            // show. Observing is what replaces the old sync-from-render.
+            cx.observe(&view, |this, _, cx| {
+                this.web_dirty(cx);
+            }),
+        ];
 
-        self.documents.push(view);
-        self.active = self.documents.len() - 1;
+        self.tabs.push(
+            path.clone(),
+            DocumentTab {
+                view,
+                _subscriptions: subscriptions,
+            },
+        );
         self.record_visit(path, 0);
         self.web_dirty(cx);
         cx.notify();
     }
 
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.documents.len() {
-            return;
-        }
         // ponytail: closing a dirty tab drops its edits. A confirm dialog is
         // the obvious next step; the file on disk is never touched either way.
-        let closed = self.documents[ix].read(cx).path().to_path_buf();
-        self.documents.remove(ix);
-        self.active = self.active.min(self.documents.len().saturating_sub(1));
+        //
+        // `Tabs::close` also shifts the active index, empties the preview slot
+        // if it named this tab, and drops the tab's two subscriptions with it.
+        let Some((closed, _dropped)) = self.tabs.close(ix) else {
+            return;
+        };
         // Otherwise Back reopens the tab that was just closed, which reads as
         // the close button not working.
         self.history.forget(&closed);
@@ -622,7 +654,7 @@ impl Workspace {
         if let Some(harness) = &self.harness {
             harness.update(cx, |_, cx| cx.notify());
         }
-        for doc in self.documents.clone() {
+        for doc in self.document_views() {
             doc.update(cx, |_, cx| cx.notify());
         }
         cx.notify();
@@ -650,7 +682,7 @@ impl Workspace {
     fn reapply_theme(&mut self, cx: &mut Context<Self>) {
         let preference = crate::settings::AppSettings::global(cx).theme;
         crate::settings::apply_theme(preference, None, cx);
-        for doc in self.documents.clone() {
+        for doc in self.document_views() {
             doc.update(cx, |doc, cx| doc.theme_changed(cx));
         }
         self.web_dirty(cx);
@@ -658,21 +690,29 @@ impl Workspace {
     }
 
     fn active_document(&self) -> Option<&Entity<DocumentView>> {
-        self.documents.get(self.active)
+        self.document_at(self.tabs.active_index())
     }
 
     fn set_status(&mut self, message: String, cx: &mut Context<Self>) {
+        // Each message gets its own generation, and only the timer whose
+        // generation is still current clears the bar. Without it, two messages
+        // inside the window meant the first message's timer wiped the second
+        // one off the screen early — and every message spawned a task that
+        // outlived its own relevance.
+        self.status_generation = self.status_generation.wrapping_add(1);
+        let generation = self.status_generation;
         self.status = Some(message);
         cx.notify();
         // Clear after a few seconds so the bar does not hold a stale message.
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(6)).await;
+        self._status_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATUS_LINGER).await;
             crate::views::try_update(&this, cx, |this, cx| {
-                this.status = None;
-                cx.notify();
+                if this.status_generation == generation {
+                    this.status = None;
+                    cx.notify();
+                }
             });
-        })
-        .detach();
+        }));
     }
 
     /// Apply pending filesystem changes.
@@ -712,7 +752,7 @@ impl Workspace {
             let path = change.path();
             // Cloned: `self.documents` cannot stay borrowed across the `&mut cx`
             // that leasing each entity takes.
-            for doc in self.documents.clone() {
+            for doc in self.document_views() {
                 if doc.read(cx).path() != path {
                     continue;
                 }
@@ -768,7 +808,7 @@ impl Workspace {
     }
 
     fn on_close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_tab(self.active, cx);
+        self.close_tab(self.tabs.active_index(), cx);
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
@@ -846,10 +886,12 @@ impl Workspace {
     /// The path of whichever tab the context menu belongs to.
     ///
     /// Falls back to the active tab: the menu is also reachable by keybinding,
-    /// where no tab was right-clicked.
+    /// where no tab was right-clicked. [`Tabs`] is what makes that fallback
+    /// real — it drops the recorded index when the menu closes and when the tab
+    /// list changes, so a stale index can never answer here.
     fn menu_target(&self, cx: &App) -> Option<PathBuf> {
-        let ix = self.menu_tab.unwrap_or(self.active);
-        Some(self.documents.get(ix)?.read(cx).path().to_path_buf())
+        let _ = cx;
+        self.tabs.menu_target().map(|t| t.path.clone())
     }
 
     fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
@@ -1481,8 +1523,8 @@ impl Workspace {
     /// bounds on the same child window every frame.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn lend_webview(&mut self, webview: Option<Entity<gpui_wry::WebView>>, cx: &mut Context<Self>) {
-        let active = self.active;
-        for (ix, doc) in self.documents.clone().into_iter().enumerate() {
+        let active = self.tabs.active_index();
+        for (ix, doc) in self.document_views().into_iter().enumerate() {
             let lent = (ix == active).then(|| webview.clone()).flatten();
             doc.update(cx, |doc, cx| doc.set_webview(lent, cx));
         }
@@ -1797,9 +1839,9 @@ impl Workspace {
 
         let mut corpus = Corpus::default();
         let add_open_tabs = |corpus: &mut Corpus| {
-            for doc in &self.documents {
-                let doc = doc.read(cx);
-                corpus.open.push((doc.path().to_path_buf(), doc.text(cx)));
+            for tab in self.tabs.iter() {
+                let doc = tab.payload.view.read(cx);
+                corpus.open.push((tab.path.clone(), doc.text(cx)));
             }
         };
 
@@ -1840,10 +1882,8 @@ impl Workspace {
 
     /// Paths of every open tab.
     fn open_paths(&self, cx: &App) -> Vec<PathBuf> {
-        self.documents
-            .iter()
-            .map(|d| d.read(cx).path().to_path_buf())
-            .collect()
+        let _ = cx;
+        self.tabs.paths().map(Path::to_path_buf).collect()
     }
 
     /// The left panel's toggle.
@@ -1922,10 +1962,10 @@ impl Workspace {
             // claims the whole width leaves no slack for dragging the window.
             // Shrink-to-fit means the tabs take what they need and the rest of
             // the bar stays a drag handle.
-            .selected_index(self.active)
-            .children(self.documents.iter().enumerate().map(|(ix, doc)| {
-                let doc = doc.read(cx);
-                let path = doc.path().to_path_buf();
+            .selected_index(self.tabs.active_index())
+            .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
+                let doc = tab.payload.view.read(cx);
+                let path = tab.path.clone();
                 let full = path.to_string_lossy().replace('\\', "/");
                 // Relative only makes sense with a folder open, and only for a
                 // file actually under it — a globally-discovered skill is not.
@@ -1933,7 +1973,7 @@ impl Workspace {
                     .as_ref()
                     .and_then(|root| path.strip_prefix(root).ok())
                     .map(|rest| rest.to_string_lossy().replace('\\', "/"));
-                let is_preview = self.preview_tab.as_deref() == Some(path.as_path());
+                let is_preview = self.tabs.is_preview(&path);
                 let dirty = doc.is_dirty();
 
                 Tab::new()
@@ -1964,7 +2004,7 @@ impl Workspace {
                                     // The menu acts on whichever tab was
                                     // right-clicked, which is not necessarily
                                     // the active one.
-                                    this.menu_tab = Some(ix);
+                                    this.tabs.set_menu(ix);
                                     cx.notify();
                                 })
                             })
@@ -2028,9 +2068,10 @@ impl Workspace {
                     )
             }))
             .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                this.active = *ix;
-                if let Some(doc) = this.documents.get(*ix) {
-                    let path = doc.read(cx).path().to_path_buf();
+                if this.tabs.focus(*ix)
+                    && let Some(tab) = this.tabs.get(*ix)
+                {
+                    let path = tab.path.clone();
                     this.record_visit(path, 0);
                 }
                 this.web_dirty(cx);
@@ -2100,7 +2141,7 @@ impl Workspace {
                             // handled press and `DefWindowProc` never gets the
                             // `HTCAPTION`. So the handler goes on a box sized to
                             // the tabs, and what is left over stays a drag handle.
-                            .when(!self.documents.is_empty(), |this| {
+                            .when(!self.tabs.is_empty(), |this| {
                                 this.child(
                                     div()
                                         .min_w_0()
@@ -2113,7 +2154,7 @@ impl Workspace {
                             })
                             // With nothing open the name stands in for the tabs,
                             // and is itself part of the drag handle.
-                            .when(self.documents.is_empty(), |this| {
+                            .when(self.tabs.is_empty(), |this| {
                                 this.child(
                                     div()
                                         .text_sm()
@@ -2521,6 +2562,10 @@ mod tests {
     /// Source-level: the behavior needs a window and a real click sequence, but
     /// what makes it work is that `open_file_as` takes the outgoing preview and
     /// closes it. Someone simplifying that away gets forty tabs back.
+    ///
+    /// The *slot's* own rules — closing the preview tab empties it, closing a
+    /// different one leaves it — are plain data and are tested for real in
+    /// [`crate::views::tabs`].
     #[test]
     fn opening_a_preview_replaces_the_previous_one() {
         let source = include_str!("workspace.rs");
@@ -2532,7 +2577,7 @@ mod tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("self.preview_tab.take()"),
+            body.contains("take_preview()"),
             "the outgoing preview must be taken, or previews accumulate"
         );
         assert!(
@@ -2545,7 +2590,60 @@ mod tests {
         );
     }
 
-    /// A dropped path must be classified before it is opened.
+    /// Per-document subscriptions must die with their tab.
+    ///
+    /// Source-level because the leak is invisible to any assertion: the
+    /// subscriptions stayed alive and simply fired against a document nobody
+    /// could see. What prevents it is that they are *owned by the tab* rather
+    /// than pushed onto a workspace-wide `Vec` that only ever grows.
+    #[test]
+    fn a_closed_tab_takes_its_subscriptions_with_it() {
+        let source = include_str!("workspace.rs");
+        let start = source
+            .find("fn open_file_inner")
+            .expect("open_file_inner must exist");
+        let body = &source[start..];
+        let end = body.find("\n    fn close_tab").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            !body.contains("_subscriptions.push"),
+            "a per-document subscription must not go into the workspace-wide \
+             list: that list is never pruned, so closing the tab left two \
+             subscriptions to a released document alive for the session"
+        );
+        assert!(
+            body.contains("DocumentTab {"),
+            "they belong to the tab, which drops them when it closes"
+        );
+    }
+
+    /// A status message must not be cleared by the previous message's timer.
+    ///
+    /// Source-level: the failure needs six seconds of wall clock and two
+    /// messages, which is not a test worth having. What prevents it is the
+    /// generation check plus a single timer slot — a detached task per message
+    /// meant every one of them cleared the bar unconditionally when it fired,
+    /// so the second message vanished on the first one's schedule.
+    #[test]
+    fn a_status_message_outlives_the_one_before_it() {
+        let source = include_str!("workspace.rs");
+        let start = source.find("fn set_status").expect("set_status must exist");
+        let body = &source[start..];
+        let end = body.find("\n    /// Apply pending").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            !body.contains(".detach()"),
+            "the timer must be held in a slot, so a new message cancels the \
+             old one's timer rather than leaving it to fire"
+        );
+        assert!(
+            body.contains("status_generation == generation"),
+            "and the timer must check it is still clearing its own message"
+        );
+    }
+
     ///
     /// Source-level: a real drop needs a window and an OS drag. What makes the
     /// feature work rather than appear to is that a directory becomes the

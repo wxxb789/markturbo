@@ -30,6 +30,13 @@ gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "b77f35
 anyhow = "1"
 env_logger = "0.11"
 log = "0.4"
+# Already in the graph via gpui-component; naming it here costs no extra
+# compilation and closes the data-loss path where a legacy-encoded document
+# was decoded lossily and saved back as U+FFFD.
+encoding_rs = "0.8"
+# Its detector half. Same author as encoding_rs — this is Firefox's own
+# detector, and it is only consulted for bytes that are not valid UTF-8.
+chardetng = "1"
 d2-little = "0.7.1-1"
 markdown = "1.0"
 mathjax-svg-rs = "0.4"

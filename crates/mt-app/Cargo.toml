@@ -19,12 +19,14 @@ path = "src/main.rs"
 mt-doc.workspace = true
 
 anyhow.workspace = true
+chardetng.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 log.workspace = true
 d2-little.workspace = true
+encoding_rs.workspace = true
 env_logger.workspace = true
 markdown.workspace = true
 mathjax-svg-rs.workspace = true
@@ -35,6 +37,7 @@ rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 gpui-wry.workspace = true
