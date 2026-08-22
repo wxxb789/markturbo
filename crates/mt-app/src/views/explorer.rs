@@ -356,7 +356,7 @@ mod tests {
     /// a real window.
     #[test]
     fn opening_a_file_goes_through_the_binary_check() {
-        let source = include_str!("explorer.rs");
+        let source = crate::views::production_source(include_str!("explorer.rs"));
         let start = source.find("fn on_click").expect("the click handler");
         let body = &source[start..];
         let end = body.find("\n}").unwrap_or(body.len());

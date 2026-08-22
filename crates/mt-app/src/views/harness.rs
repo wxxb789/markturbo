@@ -1038,7 +1038,7 @@ mod tests {
     fn changing_section_resets_the_selection() {
         // `include_str!` resolves relative to this file at compile time, so it
         // works regardless of the test runner's working directory.
-        let source = include_str!("harness.rs");
+        let source = crate::views::production_source(include_str!("harness.rs"));
         let body = source
             .split_once("fn set_section")
             .expect("set_section must exist")
@@ -1059,7 +1059,7 @@ mod tests {
     /// hung app, and the user clicks again.
     #[test]
     fn the_rescan_button_reflects_the_scanning_flag() {
-        let source = include_str!("harness.rs");
+        let source = crate::views::production_source(include_str!("harness.rs"));
         let button = source
             .split_once("Button::new(\"rescan\")")
             .expect("the rescan button must exist")
@@ -1074,7 +1074,7 @@ mod tests {
     /// …and it must stay spinning long enough to be seen.
     #[test]
     fn the_spinner_has_a_minimum_visible_duration() {
-        let source = include_str!("harness.rs");
+        let source = crate::views::production_source(include_str!("harness.rs"));
         let body = source
             .split_once("pub fn refresh")
             .expect("refresh must exist")

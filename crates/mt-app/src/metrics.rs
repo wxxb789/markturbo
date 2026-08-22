@@ -336,9 +336,18 @@ mod tests {
     #[test]
     fn the_panels_share_one_horizontal_inset() {
         let sources = [
-            ("explorer.rs", include_str!("views/explorer.rs")),
-            ("harness.rs", include_str!("views/harness.rs")),
-            ("workspace.rs", include_str!("views/workspace.rs")),
+            (
+                "explorer.rs",
+                crate::views::production_source(include_str!("views/explorer.rs")),
+            ),
+            (
+                "harness.rs",
+                crate::views::production_source(include_str!("views/harness.rs")),
+            ),
+            (
+                "workspace.rs",
+                crate::views::production_source(include_str!("views/workspace.rs")),
+            ),
         ];
         for (name, source) in sources {
             assert!(
@@ -357,8 +366,14 @@ mod tests {
     #[test]
     fn list_rows_share_one_padding() {
         for (name, source) in [
-            ("explorer.rs", include_str!("views/explorer.rs")),
-            ("harness.rs", include_str!("views/harness.rs")),
+            (
+                "explorer.rs",
+                crate::views::production_source(include_str!("views/explorer.rs")),
+            ),
+            (
+                "harness.rs",
+                crate::views::production_source(include_str!("views/harness.rs")),
+            ),
         ] {
             assert!(
                 source.contains("metrics::row_pad()"),

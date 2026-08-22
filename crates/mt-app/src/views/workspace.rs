@@ -824,6 +824,11 @@ impl Workspace {
         let Some(path) = self.menu_target(cx) else {
             return;
         };
+        // The menu is done with; releasing it restores the keyboard fallback to
+        // the active tab. Without this the recorded index outlives its menu and
+        // every later keyboard Copy Path acts on whichever tab was last
+        // right-clicked, which is what `menu_target` documents it will not do.
+        self.tabs.clear_menu();
         let text = path.to_string_lossy().replace(char::from(92), "/");
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         self.set_status(format!("Copied {text}"), cx);
@@ -838,6 +843,7 @@ impl Workspace {
         let Some(path) = self.menu_target(cx) else {
             return;
         };
+        self.tabs.clear_menu();
         // Without a folder open there is nothing to be relative *to*, so this
         // reports rather than silently copying the absolute path — which would
         // look like the other menu item misbehaving.
@@ -1944,7 +1950,7 @@ mod tests {
     /// [`crate::views::tabs`].
     #[test]
     fn opening_a_preview_replaces_the_previous_one() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("pub fn open_file_as")
             .expect("open_file_as must exist");
@@ -1974,7 +1980,7 @@ mod tests {
     /// than pushed onto a workspace-wide `Vec` that only ever grows.
     #[test]
     fn a_closed_tab_takes_its_subscriptions_with_it() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn open_file_inner")
             .expect("open_file_inner must exist");
@@ -2003,7 +2009,7 @@ mod tests {
     /// so the second message vanished on the first one's schedule.
     #[test]
     fn a_status_message_outlives_the_one_before_it() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source.find("fn set_status").expect("set_status must exist");
         let body = &source[start..];
         let end = body.find("\n    /// Apply pending").unwrap_or(body.len());
@@ -2027,7 +2033,7 @@ mod tests {
     /// that silently does nothing reads as a broken window.
     #[test]
     fn dropping_paths_handles_all_three_cases() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn on_drop_paths")
             .expect("on_drop_paths must exist");
@@ -2073,7 +2079,7 @@ mod tests {
     /// moving, with nothing in the log.
     #[test]
     fn the_title_bar_keeps_a_drag_handle() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn render_title_bar")
             .expect("render_title_bar must exist");
@@ -2146,7 +2152,7 @@ mod tests {
     /// as the main view extending sideways, which is the whole point.
     #[test]
     fn the_side_panels_span_the_full_window_height() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let render = source
             .split_once("impl Render for Workspace")
             .expect("the Render impl")
@@ -2184,7 +2190,7 @@ mod tests {
     /// open panel with no way to close it.
     #[test]
     fn each_panel_toggle_sits_on_its_own_side() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn render_title_bar")
             .expect("render_title_bar must exist");
@@ -2275,7 +2281,7 @@ mod tests {
     /// is how a source check quietly stops asserting anything.
     #[test]
     fn no_async_task_updates_through_the_infallible_borrow() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         // Only the code, not this test's own description of it.
         let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
 
@@ -2307,7 +2313,7 @@ mod tests {
     /// the documents that need it.
     #[test]
     fn auto_refresh_never_reloads_a_document_with_unsaved_edits() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn drain_watcher")
             .expect("drain_watcher must exist");
@@ -2339,7 +2345,7 @@ mod tests {
     /// permanently dead button.
     #[test]
     fn a_translation_in_flight_blocks_a_second_one() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         // Only the code: this test names the literals it looks for, and would
         // otherwise count itself.
         let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
@@ -2372,12 +2378,28 @@ mod tests {
             code.contains(".loading(self.translating)"),
             "the Translate button must show the request and go inert"
         );
-        assert_eq!(
-            code.matches("if self.translating {").count(),
-            3,
-            "all three translate actions must return early, or a keybinding \
-             starts a second request the inert button cannot"
-        );
+        // Every translate action guards, whatever their number. Pinning the
+        // count instead — it was 3 — meant that adding a fourth scope failed a
+        // test with nothing to say about the new scope, while a fourth action
+        // that forgot its guard could pass as long as some other one had gained
+        // a second.
+        let mut actions = 0;
+        for (at, _) in code.match_indices("fn on_translate_") {
+            let body = &code[at..];
+            let end = body.find("\n    fn ").unwrap_or(body.len());
+            let name: String = body
+                .chars()
+                .skip("fn ".len())
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                body[..end].contains("if self.translating {"),
+                "{name} must return early while a request is in flight, or a \
+                 keybinding starts a second one the inert button cannot"
+            );
+            actions += 1;
+        }
+        assert!(actions >= 3, "and the loop above must not be vacuous");
     }
 
     /// Search must never search a stale copy of an open document, and must
@@ -2390,7 +2412,7 @@ mod tests {
     /// typed since the last save.
     #[test]
     fn the_search_corpus_is_cheap_to_build_and_prefers_editor_text() {
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn search_corpus")
             .expect("search_corpus must exist");

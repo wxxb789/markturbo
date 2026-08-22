@@ -245,7 +245,7 @@ mod tests {
     fn render_does_not_touch_the_webview() {
         // `include_str!` resolves relative to this file at compile time, so it
         // works regardless of the test runner's working directory.
-        let source = include_str!("../workspace.rs");
+        let source = crate::views::production_source(include_str!("../workspace.rs"));
         let render = source
             .split_once("impl Render for Workspace")
             .expect("the Render impl")
@@ -281,7 +281,7 @@ mod tests {
     /// because the callback can still land mid-draw.
     #[test]
     fn the_sync_is_deferred_coalesced_and_reached_fallibly() {
-        let source = include_str!("web_surface.rs");
+        let source = crate::views::production_source(include_str!("web_surface.rs"));
         let start = source.find("fn mark_dirty").expect("mark_dirty must exist");
         let body = &source[start..];
         let end = body.find("\nimpl Workspace").unwrap_or(body.len());
@@ -312,7 +312,7 @@ mod tests {
     /// constructed with, which is exactly "the Web view does not work".
     #[test]
     fn the_webview_is_lent_to_exactly_one_tab() {
-        let source = include_str!("web_surface.rs");
+        let source = crate::views::production_source(include_str!("web_surface.rs"));
         let start = source
             .find("fn lend_webview")
             .expect("lend_webview must exist");

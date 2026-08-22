@@ -475,7 +475,7 @@ mod tests {
     /// unknown and larger, which is the one thing a search must not do.
     #[test]
     fn a_capped_result_list_says_so() {
-        let source = include_str!("search.rs");
+        let source = crate::views::production_source(include_str!("search.rs"));
         let start = source
             .find("fn render_summary")
             .expect("render_summary must exist");
@@ -501,7 +501,7 @@ mod tests {
     /// search being wrong rather than late.
     #[test]
     fn a_slow_search_cannot_overwrite_a_newer_one() {
-        let source = include_str!("search.rs");
+        let source = crate::views::production_source(include_str!("search.rs"));
         let start = source.find("pub fn run").expect("run must exist");
         let body = &source[start..];
         let end = body.find("\n    fn render_scopes").unwrap_or(body.len());
@@ -520,7 +520,7 @@ mod tests {
     /// Typing must not read the corpus once per keystroke.
     #[test]
     fn the_query_is_debounced() {
-        let source = include_str!("search.rs");
+        let source = crate::views::production_source(include_str!("search.rs"));
         let start = source.find("fn schedule").expect("schedule must exist");
         let body = &source[start..];
         let end = body.find("\n    /// Run `query`").unwrap_or(body.len());

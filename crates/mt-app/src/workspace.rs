@@ -228,7 +228,7 @@ mod tests {
         // `stat`. Measured over a flat 5,000-file folder it cost 4.36s against
         // 4.0ms for the `read_dir` alone. Asserted against the source because
         // the cost is a syscall count, which no return value exposes.
-        let source = include_str!("workspace.rs");
+        let source = crate::views::production_source(include_str!("workspace.rs"));
         let body = source
             .split_once("pub fn read_dir(")
             .expect("read_dir must exist")

@@ -1286,7 +1286,7 @@ mod tests {
     /// The source-level checks below all need one function's body, and the
     /// hand-rolled `find`/slice pair was already repeated once per test.
     fn fn_body(signature: &str, end: &str) -> &'static str {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source
             .find(signature)
             .unwrap_or_else(|| panic!("{signature} must exist"));
@@ -1337,7 +1337,7 @@ mod tests {
     /// `Rect::default()` from `WebView::new` — loaded, visible, and invisible.
     #[test]
     fn the_web_pane_renders_the_webview_entity() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source
             .find("fn render_web_preview")
             .expect("the Web pane renderer");
@@ -1365,7 +1365,7 @@ mod tests {
     /// none may silently switch to a different preview.
     #[test]
     fn reveal_offset_moves_something_in_every_layout() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source.find("pub fn reveal_offset").expect("reveal_offset");
         let body = &source[start..];
         let end = body
@@ -1402,7 +1402,7 @@ mod tests {
     /// attribute after the fact.
     #[test]
     fn scroll_sync_is_driven_only_from_the_editor() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source
             .find("fn sync_preview_scroll")
             .expect("sync_preview_scroll");
@@ -1432,7 +1432,7 @@ mod tests {
     /// The injected script must tolerate a document that has not loaded.
     #[test]
     fn the_scroll_script_is_guarded() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source
             .find("fn scroll_preview_to")
             .expect("scroll_preview_to");
@@ -1512,7 +1512,7 @@ mod tests {
     /// site that was hard-coded to `Layout::Native` for every document.
     #[test]
     fn a_document_opens_in_the_layout_its_type_defaults_to() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source.find("pub fn new(").expect("DocumentView::new");
         let body = &source[start..];
         let end = body.find("\n    pub fn path(").unwrap_or(body.len());
@@ -1530,7 +1530,7 @@ mod tests {
     /// The layout dropdown must not offer layouts that show nothing.
     #[test]
     fn the_layout_dropdown_offers_only_what_the_document_supports() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source.find("fn render_toolbar").expect("render_toolbar");
         let body = &source[start..];
         let end = body
@@ -1556,7 +1556,7 @@ mod tests {
     /// filesystem) but the control is one, and HTML's was simply missing.
     #[test]
     fn the_trust_button_is_offered_to_html_as_well_as_mdx() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source.find("fn render_toolbar").expect("render_toolbar");
         let body = &source[start..];
         let end = body
@@ -1577,7 +1577,7 @@ mod tests {
     /// user can. Source-level because the alternative needs a real WebView.
     #[test]
     fn only_a_trusted_document_is_given_filesystem_access() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source.find("fn rebuild_web").expect("rebuild_web");
         let body = &source[start..];
         let end = body
@@ -1707,7 +1707,7 @@ mod tests {
     /// The manual reload stays synchronous, and must stay cheap to tell apart.
     #[test]
     fn the_manual_reload_is_the_one_the_banner_button_calls() {
-        let source = include_str!("document.rs");
+        let source = crate::views::production_source(include_str!("document.rs"));
         let start = source
             .find("fn render_conflict_banner")
             .expect("the banner");

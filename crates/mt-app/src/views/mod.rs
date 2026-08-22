@@ -221,9 +221,68 @@ pub enum PreviewKind {
     Web,
 }
 
+/// The production half of a source file: everything above its test module.
+///
+/// Several behaviours in these views are only reachable with a live window — a
+/// drag, a WebView2 message pump, a re-entrant draw — so the tests for them
+/// read this file's own source and assert on what it contains. That works, and
+/// it has one failure mode that is worse than no test at all.
+///
+/// A test searching for `"fn render_side_panel"` finds it twice: once as the
+/// function, once as a string literal inside the test that names it. Delete the
+/// function and the search silently relocates to the test's own source, where
+/// the assertion trivially holds — so the test passes while the thing it guards
+/// no longer exists. Verified by deleting each anchor and re-running: thirteen
+/// tests passed against nothing.
+///
+/// Cutting the test module off first makes that impossible: the anchor is
+/// either in the production code or it is missing, and missing is a panic.
+#[cfg(test)]
+pub fn production_source(source: &str) -> &str {
+    let end = source
+        .find("\n#[cfg(test)]")
+        .expect("every source-scanning file has a test module to cut off");
+    &source[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The source-scanning tests must fail loudly when their subject is gone.
+    ///
+    /// This is the defect that motivated `production_source`, and it is worse
+    /// than a missing test: a scan for `"fn render_side_panel"` finds the
+    /// function *and* the string literal naming it inside the test that guards
+    /// it. Delete the function and `.find()` silently relocates to the test's
+    /// own source, where the assertion trivially holds. Thirteen tests in this
+    /// crate passed against nothing before the cut.
+    #[test]
+    fn a_source_scan_cannot_match_the_test_that_guards_it() {
+        let source = "fn real() {}
+#[cfg(test)]
+mod tests {
+    fn scan() { let _ = (\"fn real\", \"expected\"); }
+}
+";
+        let production = production_source(source);
+        assert!(
+            production.contains("fn real"),
+            "the real definition survives"
+        );
+        assert!(
+            !production.contains("expected"),
+            "but nothing from the test module does: {production:?}"
+        );
+
+        // With the definition deleted, the anchor is simply absent — which is a
+        // panic at the `.expect()` every caller writes, not a quiet pass.
+        let deleted = source.replace("fn real() {}", "");
+        assert!(
+            !production_source(&deleted).contains("fn real"),
+            "the literal inside the test module must not stand in for it"
+        );
+    }
 
     #[test]
     fn layout_visibility() {
