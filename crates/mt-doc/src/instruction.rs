@@ -96,9 +96,6 @@ const NESTED: &[&str] = &["rules", "instructions", "memories"];
 /// directly, and a deeper walk would start picking up unrelated Markdown.
 const NESTED_DEPTH: usize = 1;
 
-/// Directories that are never worth descending. Same list the skill walker uses.
-const SKIP_DIRS: &[&str] = &["node_modules", ".git", "dist", "build", "__pycache__"];
-
 /// Instruction directories no skills root points at.
 ///
 /// The derivation below covers every harness that keeps skills *and*
@@ -225,7 +222,7 @@ fn walk(root: &Path, dir: &Path, harness: &str, origin: Origin, depth: usize, ou
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_none_or(|n| !SKIP_DIRS.contains(&n))
+                .is_none_or(|n| !crate::walk::is_noise_dir(n))
         })
         .collect();
     children.sort();

@@ -16,6 +16,7 @@ pub mod outline;
 pub mod search;
 pub mod skill;
 pub mod translate;
+pub mod walk;
 
 pub use block::{Block, BlockKind, DiagramKind};
 pub use diagnostic::{Diagnostic, Severity};
@@ -26,3 +27,4 @@ pub use instruction::Instruction;
 pub use outline::{Heading, Outline};
 pub use search::{Match, Query, Results};
 pub use skill::{Discovery, Origin, Skill, SkillMeta};
+pub use walk::is_openable;

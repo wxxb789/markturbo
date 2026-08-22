@@ -896,7 +896,8 @@ impl Workspace {
             // the user hunting through Settings for which field is missing.
             self.set_status(
                 "No translation API key. Set one in Settings (Ctrl/Cmd+,), or export \
-                 ANTHROPIC_API_KEY / OPENAI_API_KEY."
+                 ANTHROPIC_API_KEY / OPENAI_API_KEY. A local server that wants no key \
+                 still needs a placeholder."
                     .into(),
                 cx,
             );
@@ -2020,9 +2021,11 @@ mod tests {
             body.contains("is_openable("),
             "a dropped file must go through the same gate the file tree uses. \
              `DocType::of(..).is_document()` is not that gate: it judges the \
-             extension alone, so a NUL-filled `.log` passes, loads through \
-             `from_utf8_lossy` as replacement characters, and the first Ctrl+S \
-             writes that back over the original bytes"
+             extension alone, so a NUL-filled `.log` passes, is decoded into \
+             the editor's `String`, and the first Ctrl+S re-encodes from that \
+             `String` — dropping every byte the decoder could not map. The \
+             conflict check in `fs::save` guards a different failure: nothing \
+             changed on disk, so that write is authorized"
         );
         assert!(
             body.contains("set_status"),

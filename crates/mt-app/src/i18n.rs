@@ -255,9 +255,9 @@ fn english(key: Key) -> &'static str {
              is about documents."
         }
         Key::ProviderHelp => {
-            "The wire format to speak. Anthropic Messages reads ANTHROPIC_API_KEY; both OpenAI \
-             formats read OPENAI_API_KEY — unless an API key is set below, which takes \
-             priority."
+            "The wire format to speak, not the vendor — any server that speaks one works. \
+             Anthropic Messages reads ANTHROPIC_API_KEY; both OpenAI formats read \
+             OPENAI_API_KEY — unless an API key is set below, which takes priority."
         }
         Key::ApiKeyHelp => {
             "Takes priority over the environment variable. Leave empty to use that instead — a \
@@ -267,7 +267,8 @@ fn english(key: Key) -> &'static str {
         Key::BaseUrlHelp => {
             "Leave empty for the vendor's own endpoint. Set it to reach an OpenAI-compatible \
              server — vLLM, Ollama, OpenRouter, LM Studio, Azure — which needs nothing else, \
-             since the wire format is the same."
+             since the wire format is the same. Include the version segment, e.g. \
+             `http://localhost:11434/v1`."
         }
         Key::ModelHelp => "Leave empty for the provider's default.",
         Key::TargetLanguageHelp => "A language name or code, e.g. `zh`, `ja`, `German`.",
@@ -394,8 +395,9 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::DarkThemeHelp => "当实际模式为深色时使用。",
         Key::LanguageHelp => "界面所用的语言。与下方的翻译目标语言无关，后者针对的是文档。",
         Key::ProviderHelp => {
-            "要使用的接口格式。Anthropic Messages 读取 ANTHROPIC_API_KEY，两种 OpenAI 格式都读取 \
-             OPENAI_API_KEY —— 除非在下方填写了 API key，那将优先生效。"
+            "要使用的接口格式，而非服务商 —— 任何使用该格式的服务都可用。Anthropic Messages 读取 \
+             ANTHROPIC_API_KEY，两种 OpenAI 格式都读取 OPENAI_API_KEY —— 除非在下方填写了 \
+             API key，那将优先生效。"
         }
         Key::ApiKeyHelp => {
             "优先于环境变量。留空则改用环境变量 —— 环境中的 key 不会写入磁盘，若你在意这一点，那是更安全的选择。\
@@ -403,7 +405,8 @@ fn chinese(key: Key) -> Option<&'static str> {
         }
         Key::BaseUrlHelp => {
             "留空则使用服务商自己的接口地址。填写后可指向任何 OpenAI 兼容的服务 —— vLLM、Ollama、\
-             OpenRouter、LM Studio、Azure —— 因为接口格式相同，无需其他配置。"
+             OpenRouter、LM Studio、Azure —— 因为接口格式相同，无需其他配置。需包含版本路径，\
+             例如 `http://localhost:11434/v1`。"
         }
         Key::ModelHelp => "留空则使用服务商的默认模型。",
         Key::TargetLanguageHelp => "语言名称或代码，例如 `zh`、`ja`、`German`。",

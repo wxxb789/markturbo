@@ -38,6 +38,12 @@ serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
 tempfile.workspace = true
+genai.workspace = true
+# Neither is called directly. They are here to pin genai's TLS to pure Rust:
+# see the comment on `genai` in the workspace manifest.
+reqwest.workspace = true
+rustls.workspace = true
+tokio.workspace = true
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 gpui-wry.workspace = true

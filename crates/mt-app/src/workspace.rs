@@ -17,83 +17,30 @@ pub struct FileNode {
     pub children: Vec<FileNode>,
     /// `None` for directories.
     pub doc_type: Option<DocType>,
+    /// True when the entry is a symlink or junction, whatever it points at.
+    ///
+    /// Recorded during the read because [`read_dir`] already holds the
+    /// [`std::fs::FileType`]; deriving it later would cost a
+    /// `symlink_metadata` per directory, which is the per-entry syscall this
+    /// module is built to avoid. [`read_dir_deep`] is what consults it.
+    pub is_symlink: bool,
 }
 
 impl FileNode {
     /// True when opening this file in the document view makes sense.
     ///
-    /// Delegates to [`is_openable`], which reads the file — see its note on
-    /// where this may be called from.
+    /// **This reads the file** — see [`mt_doc::walk::is_openable`] on where
+    /// that is affordable. Never call it while listing a directory.
     pub fn is_openable(&self) -> bool {
         !self.is_dir && is_openable(&self.path)
     }
 }
 
-/// True when opening `path` in the document view makes sense.
-///
-/// Two gates, cheapest first: [`DocType`] is an allowlist, so `.png`, `.zip`
-/// and every other extension nobody edits here are rejected on the name alone,
-/// and [`looks_binary`] then settles what a name cannot.
-///
-/// **This reads the file.** Call it when the user picks one thing, never while
-/// listing a directory. Over a flat 5,000-file folder the sniff measures 4.36s
-/// against 4.0ms for the `read_dir` alone — ~1000x — and per-entry is exactly
-/// how it was first written, one screenful below the `file_type` call that
-/// exists to avoid a per-entry `stat`.
-pub fn is_openable(path: &Path) -> bool {
-    DocType::of(path).is_document() && !looks_binary(path)
-}
-
-/// True when the first 8 KB of `path` contain a NUL byte.
-///
-/// The heuristic `git` uses, and it is one read rather than a table of magic
-/// numbers. A NUL cannot appear in valid UTF-8 text that anyone edits, and
-/// every common binary format emits one within its first few hundred bytes;
-/// bounding the sniff keeps it a fixed cost on a file that may be gigabytes.
-///
-/// What this prevents is data loss, not mojibake. [`crate::fs::load`] reads
-/// through `String::from_utf8_lossy`, so every byte that is not valid UTF-8
-/// becomes U+FFFD in the buffer, and `Save` writes that buffer back with no
-/// dirty check — one stray Ctrl+S on a wrongly-opened binary overwrites the
-/// original bytes irrecoverably. Refusing the open is the only point at which
-/// that is still cheap to stop.
-///
-/// An unreadable file is reported as *not* binary: the open will fail again
-/// when the user clicks it, and that failure carries its own message. Hiding
-/// the entry here instead would make a permission problem look like a missing
-/// file.
-fn looks_binary(path: &Path) -> bool {
-    use std::io::Read as _;
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut head = [0u8; 8 * 1024];
-    let Ok(read) = file.read(&mut head) else {
-        return false;
-    };
-    head[..read].contains(&0)
-}
-
-/// Directory names never worth showing: they are large, machine-owned, and
-/// contain no documents a user edits here.
-const IGNORED_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".next",
-    ".turbo",
-    "dist",
-    "build",
-    ".DS_Store",
-];
-
-fn is_ignored(name: &str) -> bool {
-    IGNORED_DIRS.contains(&name)
-}
+/// Re-exported so this module stays the file tree's whole vocabulary: the
+/// explorer's click handler and the drop handler both reach for
+/// `workspace::is_openable`, and the gate itself belongs in `mt-doc` because
+/// the folder search applies the same one.
+pub use mt_doc::walk::is_openable;
 
 /// Read one directory level.
 ///
@@ -109,21 +56,28 @@ pub fn read_dir(path: &Path) -> std::io::Result<Vec<FileNode>> {
         let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if is_ignored(name) {
+        if mt_doc::walk::is_noise_dir(name) {
             continue;
         }
         // `file_type` avoids a stat per entry on Windows; fall back to metadata
         // only when it fails (broken symlink, permission).
-        let is_dir = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => entry_path.is_dir(),
-            Ok(ft) => ft.is_dir(),
-            Err(_) => continue,
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_symlink = file_type.is_symlink();
+        // A symlink's own type says only that it is a link; `is_dir` follows it
+        // to answer what the tree must show.
+        let is_dir = if is_symlink {
+            entry_path.is_dir()
+        } else {
+            file_type.is_dir()
         };
 
         let doc_type = (!is_dir).then(|| DocType::of(&entry_path));
         let node = FileNode {
             name: name.to_string(),
             is_dir,
+            is_symlink,
             doc_type,
             children: Vec::new(),
             path: entry_path,
@@ -154,10 +108,18 @@ pub fn read_dir(path: &Path) -> std::io::Result<Vec<FileNode>> {
 ///
 /// Used for the initial tree so the first screen is not empty, and for
 /// expanding a node.
+///
+/// Symlinked directories are listed but never descended into, which is what
+/// [`mt_doc::search::document_paths`] already does and this did not. A junction
+/// pointing at an ancestor — `node_modules/.bin` on Windows, a `latest -> .` in
+/// a build tree — otherwise makes every branch below it `depth` levels deep
+/// again, and the read the explorer runs on a background task never returns.
+/// `depth` alone bounds the *recursion*, not the *work*: a cycle at depth 1 of
+/// a depth-3 walk still multiplies out.
 pub fn read_dir_deep(path: &Path, depth: usize) -> std::io::Result<Vec<FileNode>> {
     let mut nodes = read_dir(path)?;
     if depth > 0 {
-        for node in nodes.iter_mut().filter(|n| n.is_dir) {
+        for node in nodes.iter_mut().filter(|n| n.is_dir && !n.is_symlink) {
             node.children = read_dir_deep(&node.path, depth - 1).unwrap_or_default();
         }
     }
@@ -240,9 +202,13 @@ mod tests {
     #[test]
     fn binaries_are_listed_but_never_openable() {
         // Listed, because a tree that hides a file the user can see in their
-        // own file manager looks broken. Not openable, because `fs::load`
-        // decodes lossily and `Save` writes the buffer back unconditionally —
-        // opening one and pressing Ctrl+S replaces its bytes with U+FFFD.
+        // own file manager looks broken. Not openable, because the round trip
+        // is not lossless for a binary: `fs::load` detects an encoding for it
+        // (a detector fed executable bytes returns *something*), decodes, and
+        // `fs::save` re-encodes from the editor's `String` — so every byte the
+        // decoder could not map is gone. The stamp check in `save` catches an
+        // external rewrite, not this: nothing changed on disk, so the write is
+        // authorized and destroys the file it was authorized to write.
         let dir = fixture();
         let nodes = read_dir(dir.path()).unwrap();
         let png = node(&nodes, "logo.png");
@@ -277,51 +243,63 @@ mod tests {
         );
     }
 
+    /// Every walker in the repo skips the same directories.
+    ///
+    /// The defect this catches: five separate lists, four distinct contents.
+    /// The file tree's had `.venv` and `.next`; the skill and instruction
+    /// walkers' did not, so a `.venv` full of vendored packages next to a
+    /// skills root was walked in full. Consolidation only holds if the tree
+    /// keeps consulting the shared list rather than growing a private one.
     #[test]
-    fn the_open_gate_sniffs_contents_not_just_the_extension() {
-        // `is_openable` is what the explorer's click handler calls, so this is
-        // the path a real open takes. An extension-only gate would admit both
-        // of the last two.
+    fn the_tree_skips_exactly_what_every_other_walker_skips() {
         let dir = tempfile::tempdir().unwrap();
-        let write = |name: &str, bytes: &[u8]| {
-            let path = dir.path().join(name);
-            std::fs::write(&path, bytes).unwrap();
-            path
-        };
+        let root = dir.path();
+        std::fs::write(root.join("keep.md"), "x").unwrap();
+        for noise in mt_doc::walk::SKIP_DIRS {
+            std::fs::create_dir(root.join(noise)).unwrap();
+        }
 
-        assert!(is_openable(&write("README.md", b"# Hi\n")));
-        assert!(is_openable(&write("main.rs", b"fn main() {}\n")));
-        assert!(!is_openable(&write("logo.png", b"\x89PNG\r\n\x1a\n\0")));
-        assert!(!is_openable(&write("blob.log", b"gz\0\x01\x02binary")));
+        let names: Vec<String> = read_dir(root)
+            .unwrap()
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert_eq!(names, vec!["keep.md".to_string()], "got {names:?}");
     }
 
     #[test]
-    fn a_nul_byte_is_what_separates_binary_from_text() {
+    fn a_symlinked_directory_is_listed_but_never_descended() {
+        // The defect this catches: `read_dir_deep` had no cycle guard, while
+        // `mt_doc::search`'s walk did. A junction pointing at an ancestor makes
+        // every branch below it `depth` levels deep again — `depth` bounds the
+        // recursion, not the work — and the explorer's background read never
+        // returns. Listed rather than hidden, so the user can still see the
+        // link exists in a tree that matches their file manager.
         let dir = tempfile::tempdir().unwrap();
-        let write = |name: &str, bytes: &[u8]| {
-            let path = dir.path().join(name);
-            std::fs::write(&path, bytes).unwrap();
-            path
-        };
+        let root = dir.path();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/a.md"), "x").unwrap();
 
-        assert!(looks_binary(&write("has-nul", b"text\0more")));
-        assert!(looks_binary(&write("leading-nul", b"\0")));
-        assert!(!looks_binary(&write("ascii", b"fn main() {}\n")));
-        // Multibyte UTF-8 never produces a NUL byte, so CJK prose must not be
-        // mistaken for binary — the failure would hide a user's own notes.
-        assert!(!looks_binary(&write(
-            "cjk",
-            "标题\n中文正文。\n".as_bytes()
-        )));
-        assert!(!looks_binary(&write("emoji", "🚀 ship it\n".as_bytes())));
-        assert!(!looks_binary(&write("empty", b"")));
-        // A NUL past the sniff window is not worth a longer read: every format
-        // that matters declares itself in its first bytes.
-        let mut late = vec![b'a'; 9 * 1024];
-        late.push(0);
-        assert!(!looks_binary(&write("late-nul", &late)));
-        // A missing file is not binary — the open reports its own error.
-        assert!(!looks_binary(&dir.path().join("absent")));
+        // Windows needs Developer Mode or elevation for `symlink_dir`, so this
+        // reports and returns rather than failing on an unprivileged machine.
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(root.join("real"), root.join("link")).is_ok();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(root.join("real"), root.join("link")).is_ok();
+        #[cfg(not(any(windows, unix)))]
+        let made = false;
+        if !made {
+            eprintln!("skipping: this session cannot create directory symlinks");
+            return;
+        }
+
+        let nodes = read_dir_deep(root, 2).unwrap();
+        let link = node(&nodes, "link");
+        assert!(link.is_dir, "a link to a directory shows as a directory");
+        assert!(link.is_symlink);
+        assert!(link.children.is_empty(), "a link must not be walked");
+        // …and the real directory still is, or the guard went too far.
+        assert_eq!(node(&nodes, "real").children.len(), 1);
     }
 
     #[test]

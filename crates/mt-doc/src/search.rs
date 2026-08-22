@@ -249,11 +249,23 @@ pub fn search_files(paths: &[PathBuf], query: &Query, limit: usize, out: &mut Re
         if meta.len() > MAX_FILE_BYTES {
             continue;
         }
-        // Lossy rather than skipping on invalid UTF-8: a document with one bad
-        // byte still opens in this app, so it should still be searchable.
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
+        // The second half of the open gate, paid for here because the bytes
+        // are already in hand. [`document_paths`] admits on the extension
+        // allowlist alone, which is a name-level judgement: a NUL-filled
+        // `.log` is on that allowlist, and searching it produces "matching
+        // lines" that are runs of raw bytes clipped to 300 characters. The
+        // file tree has always applied both halves; this is the same gate.
+        if crate::walk::bytes_look_binary(&bytes) {
+            continue;
+        }
+        // Lossy rather than skipping on invalid UTF-8: a legacy-encoded
+        // document opens in this app — `mt_app::fs::load` detects its encoding
+        // and decodes properly — so it should still be findable here. A
+        // mis-decoded byte costs a missed match on one line, which is a far
+        // better failure than the whole file being unsearchable.
         let text = String::from_utf8_lossy(&bytes);
         let before = out.matches.len();
         search_text(path, &text, query, limit.min(before + share), out);
@@ -266,28 +278,13 @@ pub fn search_files(paths: &[PathBuf], query: &Query, limit: usize, out: &mut Re
     }
 }
 
-/// Directories never worth walking. Same list the skill and instruction
-/// walkers use, plus the build outputs a documentation search would drown in.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".next",
-    ".turbo",
-];
-
 /// How deep to walk a folder looking for documents.
 ///
 /// Deep enough for a real repository's `docs/guides/advanced/x.md`, bounded so
 /// a search cannot wander into a vendored tree that the skip list missed.
 const MAX_WALK_DEPTH: usize = 12;
 
-/// Every document under `root`, in a stable order.
+/// Every candidate document under `root`, in a stable order.
 ///
 /// Only what [`DocType::is_document`] accepts — Markdown, the agent artifacts,
 /// HTML, and the source/config text the allowlist names. Searching a folder
@@ -298,6 +295,13 @@ const MAX_WALK_DEPTH: usize = 12;
 /// allowlist: `.png`, `.exe`, `.zip` are not rejected by any rule here, they
 /// are simply never admitted. A denylist would admit every extension nobody
 /// thought to name, which on a repository is where the megabytes are.
+///
+/// *Candidate*, because the name is only half the gate. A file wearing a text
+/// extension can still be binary, and [`search_files`] settles that when it
+/// reads the bytes. The sniff deliberately does not happen here: this walk
+/// touches every entry in the tree and would have to open each one, which is
+/// the cost `mt_app::workspace::read_dir` measured at 4.36s against 4.0ms
+/// over 5,000 files.
 pub fn document_paths(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     walk(root, 0, &mut found);
@@ -327,7 +331,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         // directory pointing at an ancestor would otherwise be walked until the
         // depth cap on every branch.
         if file_type.is_dir() {
-            if SKIP_DIRS.contains(&name) || file_type.is_symlink() {
+            if crate::walk::is_noise_dir(name) || file_type.is_symlink() {
                 continue;
             }
             walk(&path, depth + 1, out);
@@ -501,6 +505,59 @@ mod tests {
                 "{binary} is not something anyone greps"
             );
         }
+    }
+
+    /// A binary wearing a text extension is not a search result.
+    ///
+    /// The defect this catches: `document_paths` admitted on
+    /// `DocType::of(..).is_document()` alone, which judges the name. `.log` is
+    /// on the text allowlist, so a NUL-filled log file was read, searched, and
+    /// its "matching line" — a clipped run of raw bytes — put in the result
+    /// list. The file tree rejected the same file; the search did not.
+    ///
+    /// It also pins *where* the check lives. `document_paths` must still list
+    /// the file: moving the sniff into the walk would open every entry in the
+    /// tree, which is the per-entry cost the file tree is forbidden to pay.
+    #[test]
+    fn a_binary_wearing_a_text_extension_is_not_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.log");
+        let real = dir.path().join("notes.log");
+        std::fs::write(&blob, b"needle\0\x01\x02 needle needle").unwrap();
+        std::fs::write(&real, "a needle in prose\n").unwrap();
+
+        let paths = document_paths(dir.path());
+        assert!(
+            paths.contains(&blob),
+            "the walk must stay name-only; sniffing here opens every entry"
+        );
+
+        let mut out = Results::default();
+        search_files(&paths, &Query::new("needle"), DEFAULT_LIMIT, &mut out);
+        assert!(
+            out.matches.iter().all(|m| m.path == real),
+            "a NUL-filled file contributed a result: {:?}",
+            out.matches.iter().map(|m| &m.path).collect::<Vec<_>>()
+        );
+        assert_eq!(out.files, 1);
+    }
+
+    /// A legacy-encoded document stays searchable.
+    ///
+    /// The risk in adding a binary gate is over-rejection. GBK bytes are not
+    /// valid UTF-8, and `mt_app::fs::load` opens such a file correctly by
+    /// detecting the encoding — so refusing to search it would make a document
+    /// the app can open invisible to search. Only a NUL disqualifies.
+    #[test]
+    fn a_non_utf8_text_document_is_still_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.txt");
+        // "中文" in GBK, around an ASCII needle the query can still reach.
+        std::fs::write(&path, b"\xD6\xD0 needle \xCE\xC4\n").unwrap();
+
+        let mut out = Results::default();
+        search_files(&[path], &Query::new("needle"), DEFAULT_LIMIT, &mut out);
+        assert_eq!(out.matches.len(), 1, "legacy encodings are not binaries");
     }
 
     #[test]

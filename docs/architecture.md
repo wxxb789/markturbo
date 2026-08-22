@@ -268,8 +268,9 @@ Ordered by how cheap they are:
 1. **A diagram technology** — implement `BlockRenderer`, register it, add the
    fence language. Nothing else changes.
 2. **A skill discovery convention** — one line in `skill::DISCOVERY_ROOTS`.
-3. **A translation provider** — implement `TranslationService`, add a
-   `Provider` variant.
+3. **A translation wire format** — add a `Provider` variant and map it to a
+   `genai::adapter::AdapterKind`. A vendor that speaks an existing format needs
+   only a base URL, which is a settings change, not a code one.
 4. **A document type** — a `DocType` variant plus its recognition rule.
 5. **A split layout** — a `Layout` variant plus its entry in `available_for`.
    `Layout` names its own renderer (`Layout::preview`), so "which pane shows

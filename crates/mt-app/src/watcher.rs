@@ -110,19 +110,15 @@ impl Watcher {
     }
 }
 
-/// Directory names whose churn is never interesting to this app.
+/// Directory churn this app never reports.
 ///
-/// Without this, a `cargo build` or an `npm install` inside the workspace
-/// floods the UI with reload prompts.
-const NOISE: &[&str] = &[".git", "node_modules", "target", ".next", ".turbo", "dist"];
-
-fn is_noise(path: &Path, root: &Path) -> bool {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .any(|c| NOISE.contains(&c))
-}
+/// Without it, a `cargo build` or an `npm install` inside the workspace floods
+/// the UI with reload prompts. The list is [`mt_doc::walk::SKIP_DIRS`] — a
+/// directory the file tree will not show and the search will not walk has no
+/// business waking the app up either, and this list having been the shortest
+/// of the five meant `.venv` and `__pycache__` churn reached the UI while the
+/// tree that would have displayed it did not.
+use mt_doc::walk::is_noise_path as is_noise;
 
 fn classify(event: &DebouncedEvent, root: &Path) -> Vec<Change> {
     use notify::EventKind;
@@ -283,5 +279,11 @@ mod tests {
         assert!(is_noise(Path::new("/w/a/node_modules/b/c.md"), root));
         assert!(is_noise(Path::new("/w/.git/HEAD"), root));
         assert!(!is_noise(Path::new("/w/docs/target-audience.md"), root));
+        // The defect consolidation fixes here: this list used to be the
+        // shortest of five, so a `pip install` into `.venv` or a Python run
+        // filling `__pycache__` produced reload prompts for files the tree
+        // does not even show.
+        assert!(is_noise(Path::new("/w/.venv/lib/x.py"), root));
+        assert!(is_noise(Path::new("/w/src/__pycache__/m.pyc"), root));
     }
 }

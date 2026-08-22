@@ -51,6 +51,45 @@ serde_yaml = "0.9"
 wry = { version = "0.53.3", package = "lb-wry" }
 smol = "2"
 tempfile = "3"
+# The translation transport. Pulls reqwest/hyper/tokio (43 crates), which is
+# the price of not hand-writing three request shapes and three response shapes
+# per provider — genai owns both, and keeps owning them as APIs drift.
+#
+# `default-features = false` to escape `rustls-tls`, which selects `aws-lc-rs`
+# and therefore `aws-lc-sys` — a C library needing cmake and nasm. The two
+# entries below put the same TLS back in pure Rust; measured, that removes every
+# `aws-lc` crate from the graph.
+genai = { version = "0.6.5", default-features = false }
+# Not used directly: this is genai's transport, named here only to choose its
+# TLS. `rustls-no-provider` is the feature that does not pick a crypto backend.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "json",
+    "stream",
+    "gzip",
+    "charset",
+] }
+# The backend `rustls-no-provider` declines to choose. `ring` is pure Rust.
+#
+# The cost of choosing here rather than letting reqwest choose: nothing installs
+# a default provider, so `install_default` has to run before the first client is
+# built. That failure is a runtime panic on the first translation, not a compile
+# error — see `translate::transport`.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# genai is async-only and its transport is reqwest, which needs a tokio reactor
+# running. `rt-multi-thread` rather than `rt`: a current_thread runtime can only
+# be driven by whichever thread calls block_on, and gpui hands each
+# background_spawn an arbitrary pool thread. Nothing else in the app is async.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+] }
 
 [profile.dev]
 codegen-units = 16

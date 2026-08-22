@@ -7,18 +7,33 @@
 //!
 //! Three wire formats are supported, which between them cover essentially every
 //! hosted and self-hosted model endpoint: Anthropic's Messages API, OpenAI's
-//! Chat Completions, and OpenAI's newer Responses API. They differ only in how
-//! the request is shaped, how the key is presented, and where the reply text
-//! sits — so [`Provider`] owns those three answers and everything else is
-//! shared.
+//! Chat Completions, and OpenAI's newer Responses API. [`genai`] speaks all
+//! three, so this file no longer shapes requests or digs text out of replies —
+//! it decides *which* endpoint, with *which* key, for *which* model, and hands
+//! genai a fully resolved [`ServiceTarget`].
+//!
+//! Resolving the target ourselves rather than letting genai infer it is the
+//! whole point. genai normally picks the provider by sniffing the model name,
+//! and falls back to Ollama for anything it does not recognise — so a vLLM
+//! server asked for `Qwen/Qwen3-32B` would be handed to the wrong adapter.
+//! [`ModelSpec::Target`] skips inference entirely, which is what keeps
+//! [`Provider`] meaning "the wire format" and keeps "point base_url at any
+//! OpenAI-compatible server" true.
 //!
 //! The API key is read from settings first and the environment second. Storing
 //! one is the user's explicit choice, so it outranks whatever the shell
 //! happened to export; but the environment stays supported, because a key that
-//! never touches disk is the safer default for anyone who wants it.
+//! never touches disk is the safer default for anyone who wants it. genai's own
+//! `AuthResolver` hook is deliberately unused: it exists for the inference path,
+//! and on the target path an [`AuthData::Key`] is simply carried through.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
+use genai::adapter::AdapterKind;
+use genai::chat::{ChatMessage, ChatRequest};
+use genai::resolver::{AuthData, Endpoint};
+use genai::{Client, ModelIden, ServiceTarget, WebConfig};
 use mt_doc::translate::TranslationService;
 
 use crate::settings::AppSettings;
@@ -68,29 +83,27 @@ impl Provider {
     }
 
     /// The base URL used when the user has not set one.
+    ///
+    /// The trailing slash is load-bearing — see [`base_url`].
     pub fn default_base_url(self) -> &'static str {
         match self {
-            Provider::AnthropicMessages => "https://api.anthropic.com",
-            Provider::OpenAiChat | Provider::OpenAiResponses => "https://api.openai.com",
+            Provider::AnthropicMessages => "https://api.anthropic.com/v1/",
+            Provider::OpenAiChat | Provider::OpenAiResponses => "https://api.openai.com/v1/",
         }
     }
 
-    /// The path appended to the base URL.
-    fn path(self) -> &'static str {
-        match self {
-            Provider::AnthropicMessages => "/v1/messages",
-            Provider::OpenAiChat => "/v1/chat/completions",
-            Provider::OpenAiResponses => "/v1/responses",
-        }
-    }
-
-    /// The full URL to POST to.
+    /// The genai adapter that speaks this wire format.
     ///
-    /// Users paste base URLs with and without a trailing slash; leaving one in
-    /// produces `//v1/messages`, which some gateways route differently and
-    /// others reject outright.
-    fn endpoint(self, base_url: &str) -> String {
-        format!("{}{}", base_url.trim_end_matches('/'), self.path())
+    /// This mapping is the reason [`Provider`] still exists. genai would
+    /// otherwise pick an adapter by sniffing the model name and land on Ollama
+    /// for anything unfamiliar, which is exactly wrong for a self-hosted server
+    /// serving a model named after its weights.
+    fn adapter(self) -> AdapterKind {
+        match self {
+            Provider::AnthropicMessages => AdapterKind::Anthropic,
+            Provider::OpenAiChat => AdapterKind::OpenAI,
+            Provider::OpenAiResponses => AdapterKind::OpenAIResp,
+        }
     }
 
     /// The environment variable the API key falls back to.
@@ -121,86 +134,6 @@ impl Provider {
             Provider::OpenAiChat | Provider::OpenAiResponses => "gpt-5",
         }
     }
-
-    /// How the key is presented.
-    fn auth_headers(self, key: &str) -> Vec<(String, String)> {
-        match self {
-            Provider::AnthropicMessages => vec![
-                ("x-api-key".to_string(), key.to_string()),
-                ("anthropic-version".to_string(), "2023-06-01".to_string()),
-            ],
-            Provider::OpenAiChat | Provider::OpenAiResponses => {
-                vec![("authorization".to_string(), format!("Bearer {key}"))]
-            }
-        }
-    }
-
-    /// Build the request body.
-    fn request(self, model: &str, system: &str, user: &str) -> serde_json::Value {
-        match self {
-            Provider::AnthropicMessages => serde_json::json!({
-                "model": model,
-                "max_tokens": 8192,
-                "system": system,
-                "messages": [{ "role": "user", "content": user }],
-            }),
-            Provider::OpenAiChat => serde_json::json!({
-                "model": model,
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": user },
-                ],
-            }),
-            Provider::OpenAiResponses => serde_json::json!({
-                "model": model,
-                "instructions": system,
-                "input": user,
-            }),
-        }
-    }
-
-    /// Pull the assistant's text out of a reply.
-    ///
-    /// Each shape is tried in the order the API documents, and the raw response
-    /// goes into the error when none matches — an endpoint that answered with a
-    /// shape we do not know about is worth seeing rather than guessing at.
-    fn extract_text(self, response: &serde_json::Value) -> anyhow::Result<String> {
-        let text = match self {
-            Provider::AnthropicMessages => response
-                .get("content")
-                .and_then(|c| c.as_array())
-                .and_then(|items| items.iter().find_map(|i| i.get("text")?.as_str()))
-                .map(str::to_string),
-            Provider::OpenAiChat => response
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|items| items.first())
-                .and_then(|choice| choice.get("message")?.get("content")?.as_str())
-                .map(str::to_string),
-            Provider::OpenAiResponses => response
-                // Some servers include the SDK's flattened convenience field.
-                .get("output_text")
-                .and_then(|t| t.as_str())
-                .map(str::to_string)
-                .or_else(|| {
-                    // The documented shape: output[] → content[] → output_text.
-                    response
-                        .get("output")?
-                        .as_array()?
-                        .iter()
-                        .find_map(|item| {
-                            item.get("content")?
-                                .as_array()?
-                                .iter()
-                                .find_map(|part| part.get("text")?.as_str())
-                        })
-                        .map(str::to_string)
-                }),
-        };
-        text.ok_or_else(|| {
-            anyhow::anyhow!("unexpected {} response shape: {response}", self.label())
-        })
-    }
 }
 
 /// Build a service, or explain why it is unavailable.
@@ -219,18 +152,36 @@ impl Provider {
             )
         })?;
 
-        let base_url = non_empty(&settings.translate_base_url)
-            .unwrap_or_else(|| self.default_base_url().to_string());
+        let base_url = base_url(
+            &non_empty(&settings.translate_base_url)
+                .unwrap_or_else(|| self.default_base_url().to_string()),
+        );
         let model = non_empty(&settings.translate_model)
             .or_else(|| non_empty_env("MARKTURBO_TRANSLATE_MODEL"))
             .unwrap_or_else(|| self.default_model().to_string());
 
-        Ok(Arc::new(ApiTranslator {
-            provider: self,
-            base_url,
-            api_key,
-            model,
+        // Fail here rather than on the first translation: a runtime that cannot
+        // start is a configuration problem, and reporting it at build time puts
+        // it in the same status message as a missing key.
+        transport().map_err(|e| e.to_string())?;
+
+        Ok(Arc::new(GenAiTranslator {
+            target: self.service_target(&base_url, &api_key, &model),
+            label: self.label(),
         }))
+    }
+
+    /// The endpoint, key, and model, resolved into the shape genai executes.
+    ///
+    /// Pure and total, which is the point: every routing decision this app makes
+    /// is visible in the returned value, so the mapping is testable without a
+    /// socket. The `curl` version could only be checked by making a request.
+    fn service_target(self, base_url: &str, api_key: &str, model: &str) -> ServiceTarget {
+        ServiceTarget {
+            endpoint: Endpoint::from_owned(base_url),
+            auth: AuthData::Key(api_key.to_string()),
+            model: ModelIden::new(self.adapter(), model.to_string()),
+        }
     }
 
     /// Providers with a usable key right now, in table order.
@@ -265,19 +216,34 @@ fn non_empty_env(var: &str) -> Option<String> {
     non_empty(&std::env::var(var).ok()?)
 }
 
+/// Force a trailing slash onto a base URL.
+///
+/// genai joins the endpoint with `Url::join`, which *replaces* the final path
+/// segment when there is no trailing slash: `https://host/v1` + `messages`
+/// resolves to `https://host/messages`, silently dropping the `/v1`, and a
+/// gateway mounted at `/openai/v1` loses its mount point the same way. Users
+/// paste base URLs both ways, so normalise rather than document.
+fn base_url(raw: &str) -> String {
+    if raw.ends_with('/') {
+        raw.to_string()
+    } else {
+        format!("{raw}/")
+    }
+}
+
 /// A translator over any of the supported wire formats.
 ///
 /// Segments are sent as a JSON array and returned as one, so the provider
 /// cannot merge or reorder them without the count check in
 /// [`mt_doc::translate::translate`] catching it.
-struct ApiTranslator {
-    provider: Provider,
-    base_url: String,
-    api_key: String,
-    model: String,
+struct GenAiTranslator {
+    target: ServiceTarget,
+    /// Only for error messages; naming the provider is what makes a failure
+    /// actionable when several are configured.
+    label: &'static str,
 }
 
-impl TranslationService for ApiTranslator {
+impl TranslationService for GenAiTranslator {
     fn translate(&self, texts: &[String], target_lang: &str) -> anyhow::Result<Vec<String>> {
         let user = format!(
             "Target language: {target_lang}\n\nTranslate each element of this JSON array. \
@@ -285,21 +251,66 @@ impl TranslationService for ApiTranslator {
             texts.len(),
             serde_json::to_string(texts)?,
         );
-        let payload = self.provider.request(&self.model, SYSTEM_PROMPT, &user);
+        let request =
+            ChatRequest::from_system(SYSTEM_PROMPT).append_message(ChatMessage::user(user));
 
-        let headers = self.provider.auth_headers(&self.api_key);
-        let headers: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+        let (runtime, client) = transport()?;
+        // `block_on` and not a spawn: this already runs on a gpui background
+        // thread (see `Workspace::translate`), so blocking it is the intended
+        // cost. The runtime exists solely because reqwest needs a reactor.
+        let response = runtime
+            .block_on(client.exec_chat(self.target.clone(), request, None))
+            .map_err(|e| anyhow::anyhow!("{} request failed: {e}", self.label))?;
 
-        let url = self.provider.endpoint(&self.base_url);
-        let response = post_json(&url, &payload, &headers)?;
-
-        let text = self.provider.extract_text(&response)?;
+        let text = response
+            .into_first_text()
+            .ok_or_else(|| anyhow::anyhow!("{} returned no text", self.label))?;
         let parsed: Vec<String> = serde_json::from_str(extract_json_array(&text))
             .map_err(|e| anyhow::anyhow!("could not parse translation response: {e}"))?;
         Ok(parsed)
+    }
+}
+
+/// The tokio runtime and genai client, built once.
+///
+/// genai is async and its transport is reqwest, which panics with "there is no
+/// reactor running" if its futures are polled outside tokio — and gpui's
+/// executor is not tokio. A private runtime is the smallest thing that bridges
+/// that without making [`TranslationService`] async, which would drag a runtime
+/// dependency into `mt-doc` and rewrite six test doubles for no gain.
+///
+/// Shared rather than per-translator so the connection pool survives between
+/// requests: a document translated twice reuses one TLS handshake, which the
+/// `curl` process it replaces could never do.
+///
+/// `rt-multi-thread` with one worker, not `current_thread`: a current-thread
+/// runtime can only be driven by whichever thread calls `block_on`, and gpui
+/// hands each background task an arbitrary pool thread.
+fn transport() -> anyhow::Result<&'static (tokio::runtime::Runtime, Client)> {
+    static TRANSPORT: OnceLock<std::io::Result<(tokio::runtime::Runtime, Client)>> =
+        OnceLock::new();
+    match TRANSPORT.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("markturbo-translate")
+            .enable_all()
+            .build()?;
+        // Before the client, not merely before the request: `build()` is what
+        // constructs reqwest's client, and reqwest panics there if no provider
+        // is installed. We opted out of its default one to keep `aws-lc-sys`
+        // and its C toolchain out of the build, so installing one is ours to
+        // do. Ignoring the error is correct — it only reports that a provider
+        // was already installed, which is the outcome we want either way.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // The timeout `curl --max-time 120` used to supply. Without it a
+        // half-open connection leaves the Translate button inert forever.
+        let client = Client::builder()
+            .with_web_config(WebConfig::default().with_timeout(Duration::from_secs(120)))
+            .build();
+        Ok((runtime, client))
+    }) {
+        Ok(transport) => Ok(transport),
+        Err(err) => anyhow::bail!("cannot start the translation runtime: {err}"),
     }
 }
 
@@ -322,65 +333,6 @@ fn extract_json_array(text: &str) -> &str {
         (Some(start), Some(end)) if end > start => &trimmed[start..=end],
         _ => trimmed,
     }
-}
-
-/// Minimal blocking JSON POST via `curl`.
-///
-/// The app does not otherwise need an HTTP stack, and adding one to the
-/// dependency graph for a single optional feature is not worth the build cost.
-/// `curl` ships with Windows 10+, macOS, and every Linux distribution that can
-/// run this app.
-///
-/// ponytail: shells out to curl; swap for a real client if translation grows
-/// beyond one endpoint per request.
-fn post_json(
-    url: &str,
-    payload: &serde_json::Value,
-    headers: &[(&str, &str)],
-) -> anyhow::Result<serde_json::Value> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut command = Command::new("curl");
-    command
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--fail-with-body")
-        .arg("--max-time")
-        .arg("120")
-        .arg("-H")
-        .arg("content-type: application/json")
-        .arg("--data-binary")
-        // Read the body from stdin so the API key and document text never
-        // appear in the process command line, where other users could see them.
-        .arg("@-")
-        .arg(url);
-    for (name, value) in headers {
-        command.arg("-H").arg(format!("{name}: {value}"));
-    }
-
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("cannot run curl: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("cannot write request body"))?
-        .write_all(serde_json::to_string(payload)?.as_bytes())?;
-    drop(child.stdin.take());
-
-    let output = child.wait_with_output()?;
-    let body = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        anyhow::bail!(
-            "translation request failed: {}{body}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(serde_json::from_str(&body)?)
 }
 
 #[cfg(test)]
@@ -548,135 +500,67 @@ mod tests {
     }
 
     #[test]
-    fn each_schema_builds_the_body_its_api_documents() {
-        let body = Provider::AnthropicMessages.request("m", "sys", "hi");
-        assert_eq!(body["system"], "sys", "Anthropic takes a top-level system");
-        assert_eq!(body["messages"][0]["content"], "hi");
-        assert!(body["max_tokens"].is_number(), "Anthropic requires it");
-
-        let body = Provider::OpenAiChat.request("m", "sys", "hi");
-        assert_eq!(body["messages"][0]["role"], "system");
-        assert_eq!(body["messages"][0]["content"], "sys");
-        assert_eq!(body["messages"][1]["role"], "user");
-        assert_eq!(body["messages"][1]["content"], "hi");
-
-        let body = Provider::OpenAiResponses.request("m", "sys", "hi");
-        assert_eq!(body["instructions"], "sys");
-        assert_eq!(body["input"], "hi");
-
-        for schema in Provider::ALL {
-            assert_eq!(schema.request("the-model", "s", "u")["model"], "the-model");
-        }
-    }
-
-    #[test]
-    fn each_schema_finds_the_text_in_its_own_response_shape() {
-        let reply = serde_json::json!({
-            "content": [{ "type": "text", "text": "hello" }]
-        });
+    fn a_base_url_without_a_trailing_slash_would_lose_its_path_prefix() {
+        // genai joins the endpoint with `Url::join`, which *replaces* the last
+        // path segment when there is no trailing slash: `https://h/v1` becomes
+        // `https://h/chat/completions`, silently dropping the `/v1`, and a
+        // gateway mounted at `/openai/v1` loses its mount point the same way.
+        // Both forms must normalise to the one genai can join onto.
         assert_eq!(
-            Provider::AnthropicMessages.extract_text(&reply).unwrap(),
-            "hello"
+            base_url("https://gw.invalid/openai/v1"),
+            base_url("https://gw.invalid/openai/v1/")
         );
-
-        let reply = serde_json::json!({
-            "choices": [{ "message": { "role": "assistant", "content": "hello" } }]
-        });
-        assert_eq!(Provider::OpenAiChat.extract_text(&reply).unwrap(), "hello");
-
-        // The documented Responses shape.
-        let reply = serde_json::json!({
-            "output": [{
-                "type": "message",
-                "content": [{ "type": "output_text", "text": "hello" }]
-            }]
-        });
-        assert_eq!(
-            Provider::OpenAiResponses.extract_text(&reply).unwrap(),
-            "hello"
-        );
-        // …and the flattened convenience field some servers add.
-        let reply = serde_json::json!({ "output_text": "hello" });
-        assert_eq!(
-            Provider::OpenAiResponses.extract_text(&reply).unwrap(),
-            "hello"
-        );
+        assert!(base_url("https://example.invalid/v1").ends_with("/v1/"));
+        // And normalising must not double up on a URL that already ends in one.
+        assert!(!base_url("https://example.invalid/v1/").ends_with("//"));
     }
 
     #[test]
-    fn an_unrecognized_response_is_an_error_carrying_the_body() {
-        // A wrong-schema reply is the likeliest misconfiguration — pointing an
-        // OpenAI base URL at the Anthropic schema, say — and the error has to
-        // show what came back or it is unactionable.
-        let reply = serde_json::json!({ "error": { "message": "nope" } });
-        for schema in Provider::ALL {
-            let err = schema.extract_text(&reply).unwrap_err().to_string();
-            assert!(err.contains("nope"), "{schema:?}: {err}");
-        }
-    }
-
-    #[test]
-    fn each_schema_authenticates_the_way_its_api_expects() {
-        let headers = Provider::AnthropicMessages.auth_headers("secret");
-        assert!(
-            headers
-                .iter()
-                .any(|(k, v)| k == "x-api-key" && v == "secret")
+    fn each_wire_format_maps_to_the_adapter_that_speaks_it() {
+        // The mapping is why `Provider` still exists. genai would otherwise pick
+        // an adapter by sniffing the model name and fall back to Ollama for
+        // anything unfamiliar — so a vLLM server serving `Qwen/Qwen3-32B` would
+        // be handed to the wrong adapter and speak the wrong protocol.
+        let target = Provider::OpenAiChat.service_target(
+            "https://vllm.invalid/v1/",
+            "sk-test",
+            "Qwen/Qwen3-32B",
         );
-        assert!(headers.iter().any(|(k, _)| k == "anthropic-version"));
+        assert_eq!(target.model.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(target.endpoint.base_url(), "https://vllm.invalid/v1/");
 
-        for schema in [Provider::OpenAiChat, Provider::OpenAiResponses] {
-            let headers = schema.auth_headers("secret");
-            assert!(
-                headers
-                    .iter()
-                    .any(|(k, v)| k == "authorization" && v == "Bearer secret"),
-                "{schema:?}: {headers:?}"
-            );
-        }
-    }
+        // A model named after a vendor must not drag the request onto that
+        // vendor's protocol: the wire format the user picked is what decides.
+        let target =
+            Provider::OpenAiChat.service_target("https://gw.invalid/v1/", "k", "claude-sonnet-5");
+        assert_eq!(target.model.adapter_kind, AdapterKind::OpenAI);
 
-    #[test]
-    fn the_two_openai_schemas_target_different_endpoints() {
-        // They share a base URL and a key, so the path is the only thing that
-        // distinguishes them — getting it wrong would silently send Responses
-        // bodies to Chat Completions.
-        assert_ne!(
-            Provider::OpenAiChat.path(),
-            Provider::OpenAiResponses.path()
-        );
-        let paths: std::collections::HashSet<&str> =
-            Provider::ALL.iter().map(|s| s.path()).collect();
-        assert_eq!(paths.len(), Provider::ALL.len());
-    }
+        // The three formats must reach three distinct adapters, or two of them
+        // would post identical bodies to the same URL.
+        let adapters: std::collections::HashSet<AdapterKind> =
+            Provider::ALL.iter().map(|p| p.adapter()).collect();
+        assert_eq!(adapters.len(), Provider::ALL.len());
 
-    #[test]
-    fn a_trailing_slash_on_the_base_url_does_not_double_up() {
-        // Users paste base URLs with and without one; `//v1/messages` is routed
-        // differently by some gateways and rejected by others.
-        for schema in Provider::ALL {
-            let with = schema.endpoint("https://example.invalid/");
-            let without = schema.endpoint("https://example.invalid");
-            assert_eq!(with, without, "{schema:?}");
-            assert!(!with.contains("invalid//"), "{with}");
-            assert!(with.ends_with(schema.path()), "{with}");
-        }
-        // A base URL carrying a path prefix (a gateway mount point) is kept.
-        assert_eq!(
-            Provider::OpenAiChat.endpoint("https://gw.invalid/openai"),
-            "https://gw.invalid/openai/v1/chat/completions"
-        );
+        // The key comes from the argument, never the environment — the whole
+        // reason the settings field outranks the shell.
+        let target =
+            Provider::AnthropicMessages.service_target("https://h/v1/", "sk-settings", "m");
+        assert!(matches!(target.auth, AuthData::Key(k) if k == "sk-settings"));
     }
 
     #[test]
     fn every_schema_has_usable_defaults() {
         // A user who picks a schema and nothing else must get a working
-        // endpoint, so none of these may be empty.
+        // endpoint, so none of these may be empty — and the trailing slash is
+        // required, or genai joins the path over the top of it.
         for schema in Provider::ALL {
             assert!(schema.default_base_url().starts_with("https://"));
+            assert!(
+                schema.default_base_url().ends_with('/'),
+                "{schema:?}: genai would drop the last segment"
+            );
             assert!(!schema.default_model().is_empty());
             assert!(schema.key_env().ends_with("_API_KEY"));
-            assert!(schema.path().starts_with("/v1/"));
         }
     }
 
@@ -687,6 +571,141 @@ mod tests {
         assert_eq!(
             extract_json_array("Here you go:\n[\"a\", \"b\"]\nHope that helps."),
             "[\"a\", \"b\"]"
+        );
+    }
+
+    /// A one-request HTTP server, returning `body` with a JSON content type.
+    ///
+    /// Returns its address and a receiver for what the request actually
+    /// contained. Hand-rolled on a `TcpListener` rather than pulling in a test
+    /// server crate: the whole exchange is one request and one response, and
+    /// what is being checked is that our bytes reach a socket at all.
+    fn one_shot_server(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let addr = listener.local_addr().expect("a bound address");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(&stream);
+            let mut request = String::new();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if let Some(value) = line
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                {
+                    length = value;
+                }
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut payload = vec![0u8; length];
+            let _ = std::io::Read::read_exact(&mut reader, &mut payload);
+            request.push_str(&String::from_utf8_lossy(&payload));
+            let _ = tx.send(request);
+
+            let mut stream = &stream;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.flush();
+        });
+
+        (format!("http://{addr}/v1/"), rx)
+    }
+
+    /// The transport reaches a socket, carrying the key and the prose.
+    ///
+    /// This test could not exist before. The `curl` version put the request
+    /// together inside a subprocess, so the only way to see what it sent was to
+    /// make a real call to a real provider — which is why 300 lines of tests in
+    /// this file covered every decision *around* the request and nothing about
+    /// the request itself.
+    ///
+    /// It is also the regression test for the crypto provider: reqwest is built
+    /// with `rustls-no-provider`, so if `transport` ever stops calling
+    /// `install_default`, this panics with "No rustls crypto provider is
+    /// configured" — at runtime, on the first translation, which is exactly the
+    /// failure a user would otherwise find first.
+    #[test]
+    fn a_translation_request_reaches_the_wire_with_its_key_and_its_prose() {
+        let (base_url, requests) = one_shot_server(
+            r#"{"choices":[{"message":{"role":"assistant","content":"[\"bonjour\"]"}}]}"#,
+        );
+
+        let translator = GenAiTranslator {
+            target: Provider::OpenAiChat.service_target(&base_url, "key-from-settings", "gpt-5"),
+            label: Provider::OpenAiChat.label(),
+        };
+        let out = translator
+            .translate(&["hello".to_string()], "fr")
+            .expect("the local server answers");
+        assert_eq!(out, vec!["bonjour".to_string()]);
+
+        let request = requests
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the request reached the socket");
+        assert!(
+            request.contains("POST /v1/chat/completions"),
+            "the schema's path is appended to the base URL: {request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("bearer key-from-settings"),
+            "the key from settings is what authenticates, not one from the environment"
+        );
+        assert!(
+            request.contains("hello"),
+            "the prose to translate is in the body"
+        );
+        assert!(request.contains("fr"), "and so is the target language");
+    }
+
+    /// A provider error carries the server's own explanation.
+    ///
+    /// `curl --fail-with-body` was doing this, and losing it would be a
+    /// regression that only shows up when something is already wrong: an
+    /// unhelpful "request failed" instead of the sentence naming the bad model
+    /// or the expired key.
+    #[test]
+    fn a_failed_request_reports_the_providers_own_message() {
+        // No response at all: the socket accepts and closes. Whatever the error
+        // is, it must name the provider so a user with several configured knows
+        // which one answered.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let addr = listener.local_addr().expect("a bound address");
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let base_url = format!("http://{addr}/v1/");
+        let translator = GenAiTranslator {
+            target: Provider::AnthropicMessages.service_target(&base_url, "k", "claude-sonnet-5"),
+            label: Provider::AnthropicMessages.label(),
+        };
+        let err = translator
+            .translate(&["hello".to_string()], "fr")
+            .expect_err("a closed socket is not a translation");
+        let message = err.to_string();
+        assert!(
+            message.contains(Provider::AnthropicMessages.label()),
+            "the failure must name which provider produced it: {message}"
         );
     }
 }

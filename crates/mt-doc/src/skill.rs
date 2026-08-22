@@ -454,13 +454,6 @@ const SUPPORT_DIRS: &[&str] = &["scripts", "references", "assets"];
 /// folders (`root/category/skill/SKILL.md`) without scanning a whole repo.
 const MAX_DEPTH: usize = 3;
 
-/// Directories never worth descending into.
-///
-/// From the reference walker's `SKIP_DIRS`. Load-bearing once global roots are
-/// in scope: a harness directory can sit next to a `node_modules` an order of
-/// magnitude larger than everything else combined.
-const SKIP_DIRS: &[&str] = &["node_modules", ".git", "dist", "build", "__pycache__"];
-
 /// What to search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Discovery {
@@ -608,7 +601,7 @@ fn walk(root: &Path, dir: &Path, origin: Origin, depth: usize, out: &mut Found) 
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_none_or(|n| !SKIP_DIRS.contains(&n))
+                .is_none_or(|n| !crate::walk::is_noise_dir(n))
         })
         .collect();
     children.sort();

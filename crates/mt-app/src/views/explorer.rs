@@ -203,8 +203,10 @@ impl Explorer {
         // Sniffed here rather than in `read_dir` because this is one file the
         // user just picked, not every entry in the directory: the same check
         // costs one read instead of thousands. It has to happen somewhere —
-        // `fs::load` decodes lossily and `Save` has no dirty gate, so opening a
-        // binary and pressing Ctrl+S rewrites it as U+FFFD.
+        // `fs` round-trips through a `String`, so a binary that reaches the
+        // editor is re-encoded on save and every unmappable byte is lost. The
+        // stamp check in `fs::save` does not help: nothing changed on disk, so
+        // the write is authorized and destroys the file anyway.
         if workspace::is_openable(&path) {
             cx.emit(ExplorerEvent::OpenFile { path, preview });
         }
@@ -344,11 +346,14 @@ mod tests {
     /// content sniff has to sit on it or it protects nothing.
     ///
     /// What broke before: `on_click` gated on `DocType::of(..).is_document()`
-    /// alone, which is an extension allowlist, so a NUL-filled `.log` opened as
-    /// U+FFFD — and `Save` has no dirty check, so Ctrl+S then wrote that back
-    /// over the original bytes. `workspace::is_openable` was computed for every
-    /// tree entry and read by nobody. Asserted against the source because
-    /// reaching the handler needs a real window.
+    /// alone, which is an extension allowlist, so a NUL-filled `.log` reached
+    /// the editor as a decoded `String` — and saving re-encodes from that
+    /// `String`, so every byte the decoder could not map was gone. `fs::save`
+    /// does refuse a write when the file changed on disk, which is a different
+    /// failure and no help here: nothing changed, so the write goes through.
+    /// `workspace::is_openable` was computed for every tree entry and read by
+    /// nobody. Asserted against the source because reaching the handler needs
+    /// a real window.
     #[test]
     fn opening_a_file_goes_through_the_binary_check() {
         let source = include_str!("explorer.rs");
