@@ -48,6 +48,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 raw-window-handle = "0.6"
 serde_yaml = "0.9"
+# The settings format. TOML rather than JSON because a settings file is meant to
+# be hand-edited: it takes comments, which JSON cannot, and it does not punish a
+# trailing comma. Already in the native tree via gpui-component, so naming it
+# costs no extra compilation.
+toml = "0.8"
+# The platform's own configuration directory. Replaces four hand-rolled
+# branches, one of which was wrong: macOS is not an XDG platform, and a file in
+# ~/.config there is invisible to every macOS convention for finding it.
+dirs = "6"
 wry = { version = "0.53.3", package = "lb-wry" }
 smol = "2"
 tempfile = "3"

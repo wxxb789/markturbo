@@ -5145,6 +5145,7 @@ dependencies = [
  "anyhow",
  "chardetng",
  "d2-little",
+ "dirs",
  "encoding_rs",
  "env_logger",
  "genai",
@@ -5170,6 +5171,7 @@ dependencies = [
  "smol",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]

@@ -199,8 +199,9 @@ doing something that looks like a translation and is not.
 
 | Platform | Location |
 |---|---|
-| Windows | `%APPDATA%\markturbo\settings.json` |
-| macOS / Linux | `$XDG_CONFIG_HOME/markturbo/settings.json`, else `~/.config/markturbo/settings.json` |
+| Windows | `%APPDATA%\markturbo\settings.toml` |
+| macOS | `~/Library/Application Support/markturbo/settings.toml` |
+| Linux | `$XDG_CONFIG_HOME/markturbo/settings.toml`, else `~/.config/markturbo/settings.toml` |
 
 Set `MARKTURBO_CONFIG_DIR` to put it somewhere else — useful for a portable
 install. The file is plain JSON and safe to edit by hand; if it cannot be

@@ -1,8 +1,15 @@
-//! User settings: one global, persisted as JSON.
+//! User settings: one global, persisted as TOML.
 //!
 //! Kept in `mt-app` rather than `mt-doc` because these are application
 //! preferences (theme, provider, list grouping) — the document engine stays
 //! headless and has no opinion about them.
+//!
+//! TOML rather than JSON because a settings file is something a person opens.
+//! It takes comments, which JSON cannot, and it does not fail on a trailing
+//! comma. The format has one rule that constrains this file: every scalar must
+//! be written before any table, so [`AppSettings`] must stay flat — a nested
+//! struct or map would serialize to a document `toml` refuses to read back.
+//! `the_settings_document_is_flat_enough_for_toml_to_read_back` holds that.
 //!
 //! Persistence is best-effort by design: a corrupt or unreadable settings file
 //! must never stop the app opening. A bad file falls back to defaults, and the
@@ -250,6 +257,12 @@ impl AppSettings {
 
     /// Apply `edit`, then persist. Every setter goes through this so no change
     /// can be made that is forgotten on restart.
+    ///
+    /// Observers registered with `cx.observe_global::<AppSettings>` are notified
+    /// automatically: `global_mut` pushes a `NotifyGlobalObservers` effect, so
+    /// there is nothing to call here. That is what replaced every setter
+    /// hand-appending its own `relabel`/`rescan` follow-up — and forgetting to
+    /// for eight of the fourteen settings.
     pub fn update(cx: &mut App, edit: impl FnOnce(&mut AppSettings)) {
         edit(Self::global_mut(cx));
         let settings = Self::global(cx).clone();
@@ -269,7 +282,7 @@ impl AppSettings {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
         };
-        match serde_json::from_str(&text) {
+        match toml::from_str(&text) {
             Ok(settings) => settings,
             Err(err) => {
                 // Do not delete or rewrite it: the user may have hand-edited it
@@ -293,9 +306,9 @@ impl AppSettings {
             log::warn!("cannot create {}: {err}", parent.display());
             return;
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(json) => {
-                if let Err(err) = std::fs::write(path, json) {
+        match toml::to_string_pretty(self) {
+            Ok(text) => {
+                if let Err(err) = std::fs::write(path, text) {
                     log::warn!("cannot write {}: {err}", path.display());
                 }
             }
@@ -307,10 +320,17 @@ impl AppSettings {
 /// Where settings live.
 ///
 /// `$MARKTURBO_CONFIG_DIR` first so a test or a portable install can redirect
-/// it, then the platform convention: `%APPDATA%` on Windows, `$XDG_CONFIG_HOME`
-/// (or `~/.config`) elsewhere.
+/// it — the tests rely on that and would otherwise write to the developer's own
+/// configuration. Otherwise the platform's own answer, via `dirs`:
+/// `%APPDATA%\markturbo` on Windows, `~/Library/Application Support/markturbo`
+/// on macOS, `$XDG_CONFIG_HOME/markturbo` (or `~/.config/markturbo`) elsewhere.
+///
+/// The macOS path is a deliberate change from the `~/.config` this used to
+/// hand-roll. `~/.config` is the XDG answer and macOS is not an XDG platform;
+/// a file there is invisible to every macOS convention for finding, backing up,
+/// or migrating application data.
 pub fn settings_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("settings.json"))
+    Some(config_dir()?.join("settings.toml"))
 }
 
 /// Apply the theme preference.
@@ -323,7 +343,7 @@ pub fn settings_path() -> Option<PathBuf> {
 /// an `App`.
 ///
 /// This recolors GPUI. It does *not* rebuild the Web preview, which caches HTML
-/// with the palette baked in; see `Workspace::set_theme`.
+/// with the palette baked in; see `Workspace::reapply_theme`.
 pub fn apply_theme(preference: ThemePreference, window: Option<&mut gpui::Window>, cx: &mut App) {
     let dark = resolve_dark(preference, window.as_deref(), cx);
     let settings = AppSettings::global(cx);
@@ -380,14 +400,10 @@ fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = env_path("MARKTURBO_CONFIG_DIR") {
         return Some(dir);
     }
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = env_path("APPDATA") {
-        return Some(appdata.join("markturbo"));
-    }
-    if let Some(xdg) = env_path("XDG_CONFIG_HOME") {
-        return Some(xdg.join("markturbo"));
-    }
-    Some(home()?.join(".config").join("markturbo"))
+    // `dirs` rather than four hand-rolled branches: it is the same answer this
+    // file used to compute on Windows and Linux, and the *correct* one on macOS,
+    // which the hand-rolled version got wrong by treating it as an XDG platform.
+    Some(dirs::config_dir()?.join("markturbo"))
 }
 
 /// An environment variable as a path, treating blank as unset — a variable set
@@ -396,10 +412,6 @@ fn env_path(var: &str) -> Option<PathBuf> {
     let value = std::env::var(var).ok()?;
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
-}
-
-fn home() -> Option<PathBuf> {
-    env_path("HOME").or_else(|| env_path("USERPROFILE"))
 }
 
 #[cfg(test)]
@@ -428,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_round_trip_through_json() {
+    fn settings_round_trip_through_toml() {
         let settings = AppSettings {
             theme: ThemePreference::Dark,
             translate_to: "ja".into(),
@@ -436,15 +448,59 @@ mod tests {
             ..AppSettings::default()
         };
 
-        let json = serde_json::to_string(&settings).unwrap();
-        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        let text = toml::to_string_pretty(&settings).unwrap();
+        let back: AppSettings = toml::from_str(&text).unwrap();
         assert_eq!(back, settings);
+    }
+
+    /// TOML cannot represent this struct if it ever gains a nested one.
+    ///
+    /// The rule that bites: every scalar must be emitted before any table, so a
+    /// struct mixing scalars with a nested struct or map serializes to a
+    /// document `toml` itself refuses to re-parse — or errors outright on the
+    /// way out. Today every field is a scalar, and this fails the moment one is
+    /// not, which is the point.
+    #[test]
+    fn the_settings_document_is_flat_enough_for_toml_to_read_back() {
+        let text = toml::to_string_pretty(&AppSettings::default()).unwrap();
+        assert!(
+            !text.contains('['),
+            "a table appeared; TOML needs every scalar above it:
+{text}"
+        );
+        toml::from_str::<AppSettings>(&text).expect("its own output must parse");
+    }
+
+    /// The unit enums must land as plain strings, under kebab-case names.
+    ///
+    /// `#[serde(rename_all = "kebab-case")]` on the struct renames the *fields*,
+    /// so it is `theme-light`, not `theme_light` — a test asserting the latter
+    /// would pass against JSON and lie about TOML.
+    #[test]
+    fn enums_and_field_names_survive_as_the_user_would_type_them() {
+        let settings = AppSettings {
+            theme: ThemePreference::Dark,
+            language: Language::Chinese,
+            skills_group_by: GroupBy::Harness,
+            ..AppSettings::default()
+        };
+        let text = toml::to_string_pretty(&settings).unwrap();
+
+        assert!(text.contains(r#"theme = "dark""#), "{text}");
+        assert!(text.contains(r#"language = "zh-cn""#), "{text}");
+        assert!(text.contains(r#"skills-group-by = "harness""#), "{text}");
+        assert!(text.contains("theme-light = "), "{text}");
+        assert!(
+            !text.contains("theme_light"),
+            "field names are kebab-case, not snake:
+{text}"
+        );
     }
 
     #[test]
     fn a_partial_file_keeps_the_defaults_for_missing_fields() {
         // What a settings file written by an older build looks like.
-        let back: AppSettings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        let back: AppSettings = toml::from_str(r#"theme = "dark""#).unwrap();
         assert_eq!(back.theme, ThemePreference::Dark);
         assert_eq!(back.translate_to, AppSettings::default().translate_to);
         assert_eq!(back.skills_group_by, GroupBy::Origin);
@@ -475,23 +531,23 @@ mod tests {
         // reader, so this one must stay opt-in — and a settings file written
         // before the field existed must not turn it on.
         assert!(!AppSettings::default().watch_auto_reload);
-        let back: AppSettings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        let back: AppSettings = toml::from_str(r#"theme = "dark""#).unwrap();
         assert!(!back.watch_auto_reload);
 
         let settings = AppSettings {
             watch_auto_reload: true,
             ..AppSettings::default()
         };
-        let json = serde_json::to_string(&settings).unwrap();
-        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        let text = toml::to_string_pretty(&settings).unwrap();
+        let back: AppSettings = toml::from_str(&text).unwrap();
         assert!(back.watch_auto_reload);
     }
 
     #[test]
     fn a_malformed_file_falls_back_rather_than_failing_to_start() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-        std::fs::write(&path, "{ this is not json").unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "this = is not [ valid toml").unwrap();
 
         assert_eq!(AppSettings::load_from(&path), AppSettings::default());
         // The bad file is left alone: the user may have hand-edited it.
@@ -501,14 +557,14 @@ mod tests {
     #[test]
     fn a_missing_file_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("never-written.json");
+        let path = dir.path().join("never-written.toml");
         assert_eq!(AppSettings::load_from(&path), AppSettings::default());
     }
 
     #[test]
     fn save_then_load_preserves_every_field() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("settings.json");
+        let path = dir.path().join("nested").join("settings.toml");
 
         let settings = AppSettings {
             theme: ThemePreference::Light,
@@ -539,7 +595,7 @@ mod tests {
         let path = settings_path().expect("a platform default is always available");
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
-            Some("settings.json")
+            Some("settings.toml")
         );
         assert!(
             path.parent().is_some_and(|p| p.ends_with("markturbo")),

@@ -313,6 +313,25 @@ impl Workspace {
                 SettingsEvent::SkillScopeChanged => this.rescan_harness(cx),
             },
         ));
+        // And the backstop, for the writers that are not the settings page.
+        //
+        // The status bar's watching toggle and the Harness panel's group-by
+        // button both call `AppSettings::update` directly, and neither emits a
+        // `SettingsEvent` — so before this, a setting changed from anywhere but
+        // the settings page repainted only whichever view happened to own the
+        // control. `global_mut` already pushes `NotifyGlobalObservers`, so
+        // subscribing is the whole of what was missing.
+        //
+        // A plain redraw, not `relabel`: this fires for *every* settings write,
+        // including the ones the subscription above is about to handle
+        // specifically, and doing the expensive work twice would make each
+        // dropdown change rebuild every open document's HTML.
+        this._subscriptions.push(
+            cx.observe_global::<crate::settings::AppSettings>(|this, cx| {
+                let _ = &this;
+                cx.notify();
+            }),
+        );
         // Following the system means following it *while running*, not only at
         // startup — someone whose OS flips at sunset expects the app to flip
         // with it. An explicit preference ignores the event.
@@ -561,6 +580,11 @@ impl Workspace {
         if let Some(harness) = &self.harness {
             harness.update(cx, |_, cx| cx.notify());
         }
+        // The search view resolves its own labels through `i18n::t` at render
+        // time — its scope names, its "no matches" line — and it was missing
+        // from this list, so switching language left that one panel in the old
+        // one until something else happened to redraw it.
+        self.search.update(cx, |_, cx| cx.notify());
         for doc in self.document_views() {
             doc.update(cx, |_, cx| cx.notify());
         }

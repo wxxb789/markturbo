@@ -262,7 +262,7 @@ fn english(key: Key) -> &'static str {
         Key::ApiKeyHelp => {
             "Takes priority over the environment variable. Leave empty to use that instead — a \
              key in the environment never touches disk, which is the safer option if you want \
-             it. Stored as plain text in settings.json."
+             it. Stored as plain text in settings.toml."
         }
         Key::BaseUrlHelp => {
             "Leave empty for the vendor's own endpoint. Set it to reach an OpenAI-compatible \
@@ -401,7 +401,7 @@ fn chinese(key: Key) -> Option<&'static str> {
         }
         Key::ApiKeyHelp => {
             "优先于环境变量。留空则改用环境变量 —— 环境中的 key 不会写入磁盘，若你在意这一点，那是更安全的选择。\
-             此处填写的内容以明文存储在 settings.json 中。"
+             此处填写的内容以明文存储在 settings.toml 中。"
         }
         Key::BaseUrlHelp => {
             "留空则使用服务商自己的接口地址。填写后可指向任何 OpenAI 兼容的服务 —— vLLM、Ollama、\

@@ -20,6 +20,7 @@ mt-doc.workspace = true
 
 anyhow.workspace = true
 chardetng.workspace = true
+dirs.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
@@ -38,6 +39,7 @@ serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 genai.workspace = true
 # Neither is called directly. They are here to pin genai's TLS to pure Rust:
 # see the comment on `genai` in the workspace manifest.
