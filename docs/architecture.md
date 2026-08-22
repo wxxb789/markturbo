@@ -25,6 +25,7 @@ Filesystem
 │   block      renderer dispatch keys      │
 │   diagnostic problems, never panics      │
 │   skill      Agent Skills model          │
+│   search     find across documents       │
 │   translate  what is translatable        │
 └────────────────────┬─────────────────────┘
                      │
@@ -32,10 +33,23 @@ Filesystem
      │               │               │              │
   mt-app::fs   mt-app::renderer  mt-app::web   mt-app::views
   load/save    diagram + math    WebView       GPUI
-  conflicts    registry          + trust       ↓
-                                          explorer · document
-                                          skills · workspace
+  encoding     registry          + trust       ↓
+  conflicts                                    │
+                                               │
+     ┌─────────────────────────────────────────┤
+     │                                         │
+  workspace ────────────────────────────┐   panels
+  the wiring layer                      │   explorer · harness
+     ├── tabs         open set, preview │   search   · document
+     ├── history      back / forward    │   settings_page
+     └── web_surface  the OS child window
 ```
+
+Each of those four under `workspace` was a cluster of fields inside it. They
+moved out because nothing else touched them — which is also what made their
+rules testable without a window. `tabs` is the clearest case: "closing a tab to
+the left must not switch documents" was a real defect, and it is now an
+assertion rather than something you find by clicking.
 
 ## Why these boundaries
 
@@ -141,11 +155,22 @@ and never opens the network.
 
 The filesystem is the source of truth, and agents write to it concurrently. A
 save records the file's mtime and size at load; if disk no longer matches, the
-save is refused and the user chooses reload or overwrite. Writes go to a sibling
-temp file and are renamed, so a crash cannot truncate a document.
+save is refused and the user chooses reload or overwrite. Writes go to a
+randomly-named sibling temp file and are renamed, so a crash cannot truncate a
+document and two concurrent saves of one file cannot collide on one temp path.
 
-Line endings and BOM are detected on load and restored on save, so a file this
-app opens and saves untouched is byte-identical.
+Three properties of the bytes survive a round trip: **line endings**, **BOM**,
+and **encoding**. The third was the expensive one to get wrong. Reading every
+file through `String::from_utf8_lossy` meant a GBK or Shift-JIS document became
+a wall of U+FFFD in the editor — and since a save writes the buffer back, one
+Ctrl+S replaced the file with those replacement characters irrecoverably. A BOM
+now decides the encoding outright, valid UTF-8 is taken at face value, and only
+bytes that are neither reach the detector. The encoding travels with the loaded
+file so the save re-encodes in it.
+
+`encoding_rs` has no UTF-16 *encoder* — `Encoding::encode` silently emits UTF-8
+for those two, which would write a UTF-8 body under a UTF-16 BOM and produce a
+file nothing can read. They encode their own code units instead.
 
 ### Background parsing
 
@@ -184,11 +209,57 @@ Also not built, and why:
 
 - **A dock/panel system.** `h_resizable` covers the required layout. `DockArea`
   is available upstream if freeform panels are ever wanted.
-- **An HTTP client.** Translation shells out to `curl`, which ships on every
-  supported platform. Adding a TLS stack to the graph for one optional endpoint
-  is not worth the build cost.
 - **A generic plugin platform.** The renderer registry is the extension point
   that was actually needed.
+
+### Reversed: the HTTP client
+
+This section used to say translation shells out to `curl`, and that adding a
+TLS stack for one optional endpoint was not worth the build cost. That was a
+defensible answer to the question as it stood — one endpoint, one wire format.
+The question changed to *many providers, robustly*, and the reasoning did not
+survive it.
+
+What the original decision underweighted was not aesthetics. It was this:
+`post_json` had **zero test coverage**, in a file with 307 lines of tests.
+Everything around it was tested — provider selection, key precedence, endpoint
+construction, response shapes — and the one part that talked to the network was
+not, because testing it needed a real `curl` binary and a real server. "What
+does a 401 turn into for the user?" was unanswerable without going online. A
+library client is pointed at a local `TcpListener`, so that question now has a
+test.
+
+Two lesser failures came with it. `--max-time 120` is a *total transfer*
+timeout, so it cannot distinguish a dead host from a large document that is
+legitimately still streaming — and it is uncancellable, so a user who clicked
+Translate waited the full two minutes for a typo'd hostname. And the error text
+was `curl`'s, not the application's.
+
+The replacement is [`genai`], a multi-provider client covering Anthropic,
+OpenAI (both Chat Completions and Responses), Gemini, Ollama, Bedrock, Vertex,
+Groq, DeepSeek, xAI, OpenRouter and more — so provider knowledge that used to
+live in this repository as hand-written request shapes and response extractors
+now lives upstream, where it is maintained.
+
+**The cost, stated plainly:** 42 new crates, including `tokio`, `reqwest`,
+`hyper`, and `rustls`. That is a real trade and it is bigger than the one this
+section originally declined to make. Two things bound it:
+
+- **No C toolchain.** `genai`'s default feature reaches `reqwest/rustls`, which
+  selects `aws-lc-rs` and therefore `aws-lc-sys` — a C library needing `cmake`
+  and `nasm` on Windows. Selecting `reqwest/rustls-no-provider` with `rustls`'s
+  `ring` provider instead removes every `aws-lc` crate from the graph. The
+  trade is that nothing installs a crypto provider automatically, so
+  `rustls::crypto::ring::default_provider().install_default()` runs at startup
+  — *before* the first client is built, which is where the omission would
+  otherwise surface as a runtime panic rather than a compile error.
+- **No second runtime in the UI.** `genai` is async and this application has no
+  async runtime but GPUI's. `TranslationService` therefore stays **synchronous**:
+  a shared current-thread `tokio` runtime is driven with `block_on` from the
+  background task that already runs the translation. `mt-doc` never learns that
+  `tokio` exists, which is the boundary that matters — see the hard rule above.
+
+[`genai`]: https://crates.io/crates/genai
 
 ## Extension points
 
@@ -200,8 +271,9 @@ Ordered by how cheap they are:
 3. **A translation provider** — implement `TranslationService`, add a
    `Provider` variant.
 4. **A document type** — a `DocType` variant plus its recognition rule.
-5. **A split layout** (`Native | Web`, `Original | Translation`) — `ViewMode`
-   and `PreviewKind` are already separate for this reason.
+5. **A split layout** — a `Layout` variant plus its entry in `available_for`.
+   `Layout` names its own renderer (`Layout::preview`), so "which pane shows
+   what" is answerable from the layout alone rather than from a second control.
 
 ## Known limits
 

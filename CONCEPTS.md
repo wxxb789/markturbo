@@ -22,6 +22,12 @@ parsing never rewrites it, and every derived structure carries byte offsets back
 original, so the exact input is always recoverable. Replacing the source is the only way
 to mutate a Document, which is what keeps derived state from drifting from the text.
 
+### Preserved Property
+Something about a file's bytes that survives an open-and-save untouched: its line-ending
+convention, its byte-order mark, and the character encoding it was written in. Each is
+detected on load and restored on write. They are grouped because they fail the same way —
+silently, at save time, on a file the user only meant to read.
+
 ### Block
 A top-level span of a document classified for rendering — prose, code, math, diagram, raw
 HTML, or an MDX construct. A Block carries its exact source range, so it can be rendered,
@@ -96,6 +102,10 @@ The boundary between deciding *what* may be translated and actually translating 
 Document Engine owns the decision; a provider behind this boundary performs the work and
 is never named by the document model.
 
+The boundary is synchronous on purpose. The client library behind it is async, but making
+the trait async would push a runtime dependency into the Document Engine — the one crate
+that must stay free of any such thing.
+
 ### Segment
 A slice of a document classified as either translatable prose or verbatim content.
 Segments tile their range exactly — concatenating them reproduces the source byte for byte
@@ -120,9 +130,17 @@ so the boundary limits what content can *load*, not everything it could reach.
 ## View
 
 ### View Mode
-Which combination of editor and preview is showing for an open document. The choice of
-mode is kept separate from the choice of which renderer fills a preview pane, so new
-side-by-side arrangements do not require reworking the mode concept.
+Which combination of editor and preview is showing for an open document. Exactly one is
+active at a time and each names exactly one preview renderer, so "which renderer is
+showing" is answerable from the mode alone rather than from a second control that only
+appears once a split is chosen.
+
+### Preview Tab
+The single slot a browsed-but-not-committed document occupies. One click opens a document
+there and the next click reuses that slot; editing it, or opening it deliberately,
+promotes it to an ordinary tab. Reading down a tree or a result list therefore does not
+leave forty tabs behind. The slot names a path rather than a position, so it survives
+tabs closing beside it.
 
 ## Dependencies
 
