@@ -23,9 +23,9 @@ OPTIONS:
     -V, --version    Print the version
 
 ENVIRONMENT:
-    ANTHROPIC_API_KEY           Enables the Anthropic translation provider
-    MARKTURBO_TRANSLATE_TO      Target language (default: zh)
-    MARKTURBO_TRANSLATE_MODEL   Model id (default: claude-sonnet-5)
+    ANTHROPIC_API_KEY           Anthropic key, if not set in Settings
+    OPENAI_API_KEY              OpenAI key, if not set in Settings
+    MARKTURBO_TRANSLATE_MODEL   Model id, if not set in Settings
     RUST_LOG                    Log filter, e.g. RUST_LOG=debug
 ";
 

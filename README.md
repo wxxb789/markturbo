@@ -14,10 +14,15 @@ Built with Rust, [GPUI](https://github.com/zed-industries/zed), and
 
 - Open a directory as a workspace; browse it in a native file tree.
 - Open Markdown, MDX, and agent artifacts in tabs.
-- Read in **Source / Native / Web / Split** views.
+- Read in **Source / Native / Web / Split·Native / Split·Web** layouts, each
+  offered only where it makes sense: a `.rs` file gets Source alone, an `.html`
+  gets the WebView.
 - Render Mermaid, D2, PlantUML, and LaTeX from document source.
-- Discover Agent Skills across the ecosystem's conventional roots, parse and
-  validate `SKILL.md` frontmatter, and inspect them in a dedicated view.
+- Discover Agent Skills and agent instruction files across the conventional
+  roots of 80+ harnesses, project-local and global, parse and validate
+  `SKILL.md` frontmatter, and inspect them in the Harness panel.
+- Search the open tabs, the whole project, or every discovered skill and
+  instruction file — including the directories outside the open folder.
 - Translate a selection, a block, or a whole document while preserving code,
   URLs, diagram source, math, and markup.
 - Detect external filesystem changes and refuse to overwrite them silently.
@@ -56,6 +61,8 @@ mt-doc  ── document engine, no GPUI dependency
     ├── mt-app::renderer   block renderer registry (Mermaid, D2, PlantUML, math)
     ├── mt-app::web        WebView compatibility path
     └── mt-app::views      GPUI views
+            explorer · harness · search · document · settings_page
+            workspace + tabs / history / web_surface
 ```
 
 `mt-doc` has no GPUI dependency, so the same model can later drive CLI tooling,
@@ -80,15 +87,27 @@ and add the fence language to `DiagramKind::from_lang`. No parser or view change
 
 ## Translation
 
-`TranslationService` is a trait in `mt-doc`; providers live in `mt-app`. The
-document engine decides *what* is translatable — prose only, never code, URLs,
-link targets, frontmatter keys, diagram source, math, or block markup — and the
-provider only ever sees prose fragments.
+`TranslationService` is a trait in `mt-doc`; the client lives in `mt-app` and is
+built on [`genai`](https://crates.io/crates/genai). The document engine decides
+*what* is translatable — prose only, never code, URLs, link targets, frontmatter
+keys, diagram source, math, or block markup — and the provider only ever sees
+prose fragments.
 
-- **Echo** (default, offline): tags each translatable segment, so structure
-  preservation is visible without any credentials.
-- **Anthropic**: set `ANTHROPIC_API_KEY`. Optional:
-  `MARKTURBO_TRANSLATE_MODEL`, `MARKTURBO_TRANSLATE_TO` (default `zh`).
+Providers are named for the wire format they speak, not the vendor, so any
+compatible server (vLLM, Ollama, OpenRouter, LM Studio, Azure) works by pointing
+the base URL at it:
+
+| Provider | Endpoint | Key |
+|---|---|---|
+| Anthropic Messages | `/v1/messages` | `ANTHROPIC_API_KEY` |
+| OpenAI Chat Completions | `/v1/chat/completions` | `OPENAI_API_KEY` |
+| OpenAI Responses | `/v1/responses` | `OPENAI_API_KEY` |
+
+Configure the provider, key, model, base URL, and target language in Settings
+(`Ctrl/Cmd+,`). A key set there outranks the environment. With no key anywhere,
+translation reports that it is unconfigured rather than pretending to run —
+there is no offline stand-in that could stand in for a translation without lying
+about it.
 
 ## Security
 
@@ -117,7 +136,7 @@ network.
 cargo test --release
 ```
 
-198 tests across 7 suites, over checked-in fixtures in `fixtures/`: Markdown
+435 tests across 11 binaries, over checked-in fixtures in `fixtures/`: Markdown
 constructs including CJK and Unicode, valid and invalid examples of each diagram
 technology, MDX (Markdown-only, components, invalid, untrusted), skills (valid,
 missing metadata, malformed YAML, nested, multiple roots, name collisions),

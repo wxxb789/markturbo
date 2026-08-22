@@ -25,6 +25,9 @@ Filesystem
 │   block      renderer dispatch keys      │
 │   diagnostic problems, never panics      │
 │   skill      Agent Skills model          │
+│   harness    where skills live, per tool │
+│   instruction agent instruction files    │
+│   walk       which files are openable    │
 │   search     find across documents       │
 │   translate  what is translatable        │
 └────────────────────┬─────────────────────┘
@@ -175,7 +178,7 @@ file nothing can read. They encode their own code units instead.
 ### Background parsing
 
 `markdown-rs` is superlinear in the *number of blocks*: on this repo's fixtures,
-10x the input costs ~50x the time (~13s for 100K lines). This is upstream — the
+10x the input costs ~65x the time (~13s for 100K lines). This is upstream — the
 same curve appears with the parser's own default constructs, and a single huge
 paragraph with the same byte count scales linearly.
 
@@ -241,23 +244,35 @@ Groq, DeepSeek, xAI, OpenRouter and more — so provider knowledge that used to
 live in this repository as hand-written request shapes and response extractors
 now lives upstream, where it is maintained.
 
-**The cost, stated plainly:** 42 new crates, including `tokio`, `reqwest`,
-`hyper`, and `rustls`. That is a real trade and it is bigger than the one this
-section originally declined to make. Two things bound it:
+**The cost, stated plainly:** 41 crates that were not being compiled before,
+including `reqwest`, `tower`, `mio`, and `ring`. That is a real trade and it is
+bigger than the one this section originally declined to make.
+
+One thing makes it smaller than it looks, and the honest version says so:
+`tokio`, `hyper`, `h2` and `rustls` were already in the dependency graph, pulled
+in by `gpui-component-assets` through `zed-reqwest`. Measured across every
+target rather than just this one, the addition is 21 crates — the async stack
+was already paid for, and what is new is mostly the client on top of it. Two
+things bound the rest:
 
 - **No C toolchain.** `genai`'s default feature reaches `reqwest/rustls`, which
   selects `aws-lc-rs` and therefore `aws-lc-sys` — a C library needing `cmake`
   and `nasm` on Windows. Selecting `reqwest/rustls-no-provider` with `rustls`'s
   `ring` provider instead removes every `aws-lc` crate from the graph. The
   trade is that nothing installs a crypto provider automatically, so
-  `rustls::crypto::ring::default_provider().install_default()` runs at startup
-  — *before* the first client is built, which is where the omission would
-  otherwise surface as a runtime panic rather than a compile error.
+  `rustls::crypto::ring::default_provider().install_default()` runs inside the
+  same `OnceLock` that builds the client, immediately before `Client::builder()`
+  — which is the only ordering that works, because reqwest panics during client
+  construction rather than at request time when no provider is installed.
 - **No second runtime in the UI.** `genai` is async and this application has no
   async runtime but GPUI's. `TranslationService` therefore stays **synchronous**:
-  a shared current-thread `tokio` runtime is driven with `block_on` from the
-  background task that already runs the translation. `mt-doc` never learns that
-  `tokio` exists, which is the boundary that matters — see the hard rule above.
+  one shared `tokio` runtime, built with `rt-multi-thread` and a single worker,
+  is driven with `block_on` from the background task that already runs the
+  translation. Multi-thread rather than current-thread is not a preference: a
+  current-thread runtime is driven only by whichever thread calls `block_on`,
+  and GPUI hands each background task an arbitrary pool thread. `mt-doc` never
+  learns that `tokio` exists, which is the boundary that matters — see the hard
+  rule above.
 
 [`genai`]: https://crates.io/crates/genai
 
@@ -267,7 +282,9 @@ Ordered by how cheap they are:
 
 1. **A diagram technology** — implement `BlockRenderer`, register it, add the
    fence language. Nothing else changes.
-2. **A skill discovery convention** — one line in `skill::DISCOVERY_ROOTS`.
+2. **A skill discovery convention** — one row in `harness::HARNESSES`, which is
+   what `skill::discovery_roots` reads. A harness that shares an existing
+   directory costs nothing further; dedup collapses the overlap.
 3. **A translation wire format** — add a `Provider` variant and map it to a
    `genai::adapter::AdapterKind`. A vendor that speaks an existing format needs
    only a base URL, which is a settings change, not a code one.
@@ -286,3 +303,7 @@ Ordered by how cheap they are:
 - Live web preview pauses above 512KB; the editor and native preview stay live.
 - Closing a tab with unsaved edits discards them without a prompt. The file on
   disk is never touched.
+- Translation is the one feature that leaves the machine, and only when the user
+  invokes it with a key configured. It is unrelated to the WebView trust
+  boundary above: document *content* still cannot fetch anything at any trust
+  level. What crosses the wire is prose the user asked to have translated.

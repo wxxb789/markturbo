@@ -89,11 +89,19 @@ a particular name. The distinction is load-bearing: a skill's supporting scripts
 references, and assets are part of it, and treating the entry document alone as the skill
 loses them.
 
+### Harness
+An agent tool that reads skills and instruction files from the filesystem — a coding
+agent, an editor extension, a CLI. Each declares its own conventional directories, both
+inside a project and globally for the user, and many share the same ones. The term is
+load-bearing because the project treats the set of harnesses as data rather than as
+special cases: it is what the Harness panel lists, and adding support for a new tool is a
+row in a table.
+
 ### Discovery Root
-A conventional directory, relative to the workspace, where skills are found. Several
-coexist because the ecosystem has several conventions; a skill records which root it came
-from, so identically-named skills from different roots stay distinguishable rather than
-one silently shadowing the other.
+A conventional directory where skills are found — relative to the workspace, or global to
+the user. Several coexist because each Harness declares its own and the ecosystem never
+agreed on one; a skill records which root it came from, so identically-named skills from
+different roots stay distinguishable rather than one silently shadowing the other.
 
 ## Translation
 
@@ -129,7 +137,7 @@ so the boundary limits what content can *load*, not everything it could reach.
 
 ## View
 
-### View Mode
+### Layout
 Which combination of editor and preview is showing for an open document. Exactly one is
 active at a time and each names exactly one preview renderer, so "which renderer is
 showing" is answerable from the mode alone rather than from a second control that only

@@ -51,7 +51,8 @@ serde_yaml = "0.9"
 wry = { version = "0.53.3", package = "lb-wry" }
 smol = "2"
 tempfile = "3"
-# The translation transport. Pulls reqwest/hyper/tokio (43 crates), which is
+# The translation transport. Pulls reqwest and its stack (41 crates that were
+# not compiled before; tokio and hyper were already here via gpui), which is
 # the price of not hand-writing three request shapes and three response shapes
 # per provider — genai owns both, and keeps owning them as APIs drift.
 #
