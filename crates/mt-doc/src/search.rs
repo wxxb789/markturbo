@@ -327,11 +327,15 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        // Symlinked directories are not followed: a junctioned harness
-        // directory pointing at an ancestor would otherwise be walked until the
-        // depth cap on every branch.
+        // A symlinked directory is not followed. `file_type` does not traverse
+        // the link, so a symlink reports `is_dir() == false` and simply falls
+        // through to the file arm below, where `DocType::of` rejects it unless
+        // it happens to look like a document — at which point it is one path,
+        // not a subtree. That is what bounds a junction pointing at an
+        // ancestor, which would otherwise be walked to the depth cap on every
+        // branch.
         if file_type.is_dir() {
-            if crate::walk::is_noise_dir(name) || file_type.is_symlink() {
+            if crate::walk::is_noise_dir(name) {
                 continue;
             }
             walk(&path, depth + 1, out);
@@ -692,6 +696,48 @@ mod tests {
             elapsed < std::time::Duration::from_secs(3),
             "searching 50K lines took {elapsed:?}; the line number is being \
              recomputed from the start of the document per line"
+        );
+    }
+
+    /// A directory symlinked to its own ancestor must not be walked twice.
+    ///
+    /// The failure it prevents is a walk that redoes the whole subtree on every
+    /// branch until the depth cap — on a real vault, seconds of work and a
+    /// result list full of the same document under a dozen paths. The guard is
+    /// subtle enough to be worth pinning: `file_type` does not traverse the
+    /// link, so a symlinked directory reports `is_dir() == false` and never
+    /// reaches the recursive arm at all. Someone "fixing" that to use
+    /// `path.is_dir()` — which does traverse — reintroduces the loop, and this
+    /// is what would catch them.
+    #[cfg(windows)]
+    #[test]
+    fn a_symlink_pointing_at_its_own_ancestor_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/note.md"),
+            "# note
+",
+        )
+        .unwrap();
+
+        // Creating a symlink needs Developer Mode or elevation on Windows. If
+        // it is refused there is nothing to test, and failing here would make
+        // the suite depend on the machine's security policy.
+        if std::os::windows::fs::symlink_dir(&root, root.join("docs/loop")).is_err() {
+            return;
+        }
+
+        let found = document_paths(&root);
+        assert_eq!(
+            found.len(),
+            1,
+            "the loop was followed: {:?}",
+            found
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
         );
     }
 }

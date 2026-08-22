@@ -344,6 +344,49 @@ mod tests {
     }
 
     #[test]
+    fn a_noise_directory_is_not_searched_for_instructions() {
+        // Instruction discovery had no skip-directory coverage at all — not one
+        // name — even though it walks nested directories under every harness
+        // root. A `node_modules` inside `.claude/` holding a vendored
+        // `CLAUDE.md` would be listed as the user's own instruction file, and a
+        // `target/` there is where a repository keeps its megabytes.
+        //
+        // The whole shared list, so a name dropped from `walk::SKIP_DIRS` is
+        // caught here rather than only wherever it happened to be tested.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join(".claude/AGENTS.md"),
+            "# real
+",
+        );
+        for noise in crate::walk::SKIP_DIRS {
+            write(
+                &root.join(".claude").join(noise).join("AGENTS.md"),
+                "# noise
+",
+            );
+        }
+
+        let found = discover(root);
+        assert_eq!(
+            found.len(),
+            1,
+            "only the real one: {:?}",
+            found.iter().map(|i| &i.path).collect::<Vec<_>>()
+        );
+        assert!(found[0].path.ends_with("AGENTS.md"));
+        assert!(
+            found[0]
+                .path
+                .parent()
+                .is_some_and(|p| p.ends_with(".claude")),
+            "the one under .claude itself, not one nested inside noise: {:?}",
+            found[0].path
+        );
+    }
+
+    #[test]
     fn finds_the_common_instruction_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
