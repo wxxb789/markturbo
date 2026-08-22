@@ -9,6 +9,7 @@ pub mod document;
 pub mod explorer;
 pub mod harness;
 pub mod search;
+pub mod settings_page;
 pub mod tabs;
 pub mod workspace;
 

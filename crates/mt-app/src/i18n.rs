@@ -109,6 +109,30 @@ pub enum Key {
     IncludeGlobalSkills,
     ShowInternalSkills,
     SyncScrolling,
+    ApiKey,
+    Editor,
+    SplitView,
+    ProviderBestAvailable,
+
+    // Settings descriptions
+    //
+    // Their own block: a description is the sentence that says what a toggle
+    // costs, and leaving fourteen of them hard-coded English while the label
+    // above them translated was the split this replaces.
+    ModeHelp,
+    LightThemeHelp,
+    DarkThemeHelp,
+    LanguageHelp,
+    ProviderHelp,
+    ApiKeyHelp,
+    BaseUrlHelp,
+    ModelHelp,
+    TargetLanguageHelp,
+    SyncScrollingHelp,
+    AutoRefreshHelp,
+    IncludeGlobalSkillsHelp,
+    ShowInternalSkillsHelp,
+    GroupByHelp,
 }
 
 /// The string for `key` in the language the user picked.
@@ -215,6 +239,57 @@ fn english(key: Key) -> &'static str {
         Key::IncludeGlobalSkills => "Include global skills",
         Key::ShowInternalSkills => "Show internal skills",
         Key::SyncScrolling => "Sync scrolling in Split",
+        Key::ApiKey => "API key",
+        Key::Editor => "Editor",
+        Key::SplitView => "Split view",
+        Key::ProviderBestAvailable => "Best available",
+
+        Key::ModeHelp => {
+            "System follows the operating system, and keeps following it while the app is \
+             running."
+        }
+        Key::LightThemeHelp => "Used whenever the effective mode is light.",
+        Key::DarkThemeHelp => "Used whenever the effective mode is dark.",
+        Key::LanguageHelp => {
+            "The language of the interface. Separate from the translation target below, which \
+             is about documents."
+        }
+        Key::ProviderHelp => {
+            "The wire format to speak. Anthropic Messages reads ANTHROPIC_API_KEY; both OpenAI \
+             formats read OPENAI_API_KEY — unless an API key is set below, which takes \
+             priority."
+        }
+        Key::ApiKeyHelp => {
+            "Takes priority over the environment variable. Leave empty to use that instead — a \
+             key in the environment never touches disk, which is the safer option if you want \
+             it. Stored as plain text in settings.json."
+        }
+        Key::BaseUrlHelp => {
+            "Leave empty for the vendor's own endpoint. Set it to reach an OpenAI-compatible \
+             server — vLLM, Ollama, OpenRouter, LM Studio, Azure — which needs nothing else, \
+             since the wire format is the same."
+        }
+        Key::ModelHelp => "Leave empty for the provider's default.",
+        Key::TargetLanguageHelp => "A language name or code, e.g. `zh`, `ja`, `German`.",
+        Key::SyncScrollingHelp => {
+            "Scroll the preview to follow the editor, and to follow an outline click. The \
+             mapping is proportional, so a document with one tall diagram moves further than \
+             the eye expects."
+        }
+        Key::AutoRefreshHelp => {
+            "Re-read a document when its file changes on disk. A tab with unsaved edits is \
+             never refreshed — it keeps the reload/overwrite banner, because an automatic \
+             refresh must not discard typed text."
+        }
+        Key::IncludeGlobalSkillsHelp => {
+            "Search every harness's global directory (~/.claude/skills, ~/.agents/skills, …) \
+             as well as this workspace."
+        }
+        Key::ShowInternalSkillsHelp => {
+            "Skills marked `metadata.internal: true`, which the reference tooling hides by \
+             default."
+        }
+        Key::GroupByHelp => "How the Skills list is organized.",
     }
 }
 
@@ -309,6 +384,43 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::IncludeGlobalSkills => "包含全局 skills",
         Key::ShowInternalSkills => "显示内部 skills",
         Key::SyncScrolling => "分栏时同步滚动",
+        Key::ApiKey => "API key",
+        Key::Editor => "编辑器",
+        Key::SplitView => "分栏视图",
+        Key::ProviderBestAvailable => "自动选择",
+
+        Key::ModeHelp => "“系统”跟随操作系统，并在应用运行期间持续跟随。",
+        Key::LightThemeHelp => "当实际模式为浅色时使用。",
+        Key::DarkThemeHelp => "当实际模式为深色时使用。",
+        Key::LanguageHelp => "界面所用的语言。与下方的翻译目标语言无关，后者针对的是文档。",
+        Key::ProviderHelp => {
+            "要使用的接口格式。Anthropic Messages 读取 ANTHROPIC_API_KEY，两种 OpenAI 格式都读取 \
+             OPENAI_API_KEY —— 除非在下方填写了 API key，那将优先生效。"
+        }
+        Key::ApiKeyHelp => {
+            "优先于环境变量。留空则改用环境变量 —— 环境中的 key 不会写入磁盘，若你在意这一点，那是更安全的选择。\
+             此处填写的内容以明文存储在 settings.json 中。"
+        }
+        Key::BaseUrlHelp => {
+            "留空则使用服务商自己的接口地址。填写后可指向任何 OpenAI 兼容的服务 —— vLLM、Ollama、\
+             OpenRouter、LM Studio、Azure —— 因为接口格式相同，无需其他配置。"
+        }
+        Key::ModelHelp => "留空则使用服务商的默认模型。",
+        Key::TargetLanguageHelp => "语言名称或代码，例如 `zh`、`ja`、`German`。",
+        Key::SyncScrollingHelp => {
+            "让预览跟随编辑器滚动，也跟随大纲点击。映射按比例进行，因此含有大幅图表的文档滚动幅度会超出预期。"
+        }
+        Key::AutoRefreshHelp => {
+            "当文件在磁盘上发生变化时重新读取文档。有未保存修改的标签页永不刷新 —— 它会保留“重新加载/覆盖”\
+             提示条，因为自动刷新绝不能丢弃已输入的文本。"
+        }
+        Key::IncludeGlobalSkillsHelp => {
+            "除本工作区外，同时搜索各 harness 的全局目录（~/.claude/skills、~/.agents/skills 等）。"
+        }
+        Key::ShowInternalSkillsHelp => {
+            "标记了 `metadata.internal: true` 的 skills，参考工具默认将其隐藏。"
+        }
+        Key::GroupByHelp => "Skills 列表的组织方式。",
     })
 }
 
@@ -393,6 +505,24 @@ mod tests {
         Key::IncludeGlobalSkills,
         Key::ShowInternalSkills,
         Key::SyncScrolling,
+        Key::ApiKey,
+        Key::Editor,
+        Key::SplitView,
+        Key::ProviderBestAvailable,
+        Key::ModeHelp,
+        Key::LightThemeHelp,
+        Key::DarkThemeHelp,
+        Key::LanguageHelp,
+        Key::ProviderHelp,
+        Key::ApiKeyHelp,
+        Key::BaseUrlHelp,
+        Key::ModelHelp,
+        Key::TargetLanguageHelp,
+        Key::SyncScrollingHelp,
+        Key::AutoRefreshHelp,
+        Key::IncludeGlobalSkillsHelp,
+        Key::ShowInternalSkillsHelp,
+        Key::GroupByHelp,
     ];
 
     #[test]

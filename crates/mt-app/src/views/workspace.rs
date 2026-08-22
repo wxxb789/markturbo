@@ -4,6 +4,12 @@
 //! Owns the open-document set, the filesystem watcher, the Web preview surface,
 //! and the commands (open folder, save, translate). Individual views stay
 //! narrow; this is where they are wired together.
+//!
+//! Two clusters live in submodules because neither belongs to the wiring.
+//! [`history`] is plain data plus the two buttons that read it; [`web_surface`]
+//! is the OS child window and the re-entrancy rules for touching it. Both add
+//! their methods to `Workspace` from there, so `self.web_dirty(cx)` reads the
+//! same here as it did before the split.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +18,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
@@ -33,8 +39,15 @@ use crate::views::document::{DocumentEvent, DocumentView};
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::harness::{HarnessEvent, HarnessView};
 use crate::views::search::{Corpus, SearchEvent, SearchView};
+use crate::views::settings_page::{SettingsEvent, SettingsView};
 use crate::views::tabs::Tabs;
 use crate::watcher::Watcher;
+
+mod history;
+mod web_surface;
+
+use self::history::History;
+use self::web_surface::WebSurface;
 
 actions!(
     markturbo,
@@ -115,102 +128,6 @@ impl SidePanel {
     }
 }
 
-/// Where the user has been, so Back and Forward mean something.
-///
-/// Positions rather than tabs: two visits to the same document at different
-/// offsets are two entries, which is what makes Back useful after following a
-/// search result or an outline click. VS Code and every browser work this way.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Visit {
-    path: PathBuf,
-    offset: usize,
-}
-
-/// How many visits to remember.
-///
-/// Bounded because this grows with every click in a result list and nobody
-/// navigates back through hundreds of them.
-const HISTORY_LIMIT: usize = 64;
-
-/// Back/forward over [`Visit`]s.
-///
-/// A cursor into one list rather than two stacks: the two-stack version is the
-/// same thing with more places to forget to clear the forward half.
-#[derive(Debug, Default)]
-struct History {
-    visits: Vec<Visit>,
-    /// Index of the current position. `None` before anything is visited.
-    cursor: Option<usize>,
-    /// Set while navigating, so the resulting open does not record itself as a
-    /// new visit and truncate the forward half we are moving through.
-    navigating: bool,
-}
-
-impl History {
-    /// Record arriving somewhere.
-    ///
-    /// Everything after the cursor is dropped: going back and then somewhere
-    /// new abandons the branch you left, which is what every browser does and
-    /// what makes Forward mean "where I was" rather than "where I once was".
-    fn push(&mut self, visit: Visit) {
-        if self.navigating {
-            return;
-        }
-        if self.current() == Some(&visit) {
-            return;
-        }
-        match self.cursor {
-            Some(ix) => self.visits.truncate(ix + 1),
-            None => self.visits.clear(),
-        }
-        self.visits.push(visit);
-        if self.visits.len() > HISTORY_LIMIT {
-            self.visits.remove(0);
-        }
-        self.cursor = Some(self.visits.len() - 1);
-    }
-
-    fn current(&self) -> Option<&Visit> {
-        self.visits.get(self.cursor?)
-    }
-
-    fn can_go_back(&self) -> bool {
-        self.cursor.is_some_and(|ix| ix > 0)
-    }
-
-    fn can_go_forward(&self) -> bool {
-        self.cursor.is_some_and(|ix| ix + 1 < self.visits.len())
-    }
-
-    fn back(&mut self) -> Option<Visit> {
-        let ix = self.cursor?.checked_sub(1)?;
-        self.cursor = Some(ix);
-        self.visits.get(ix).cloned()
-    }
-
-    fn forward(&mut self) -> Option<Visit> {
-        let ix = self.cursor? + 1;
-        let visit = self.visits.get(ix).cloned()?;
-        self.cursor = Some(ix);
-        Some(visit)
-    }
-
-    /// Drop every visit to `path`, e.g. when its tab closes.
-    ///
-    /// Without this, Back reopens a tab the user just closed — which reads as
-    /// the close button not working.
-    fn forget(&mut self, path: &Path) {
-        let current = self.current().cloned();
-        self.visits.retain(|v| v.path != path);
-        self.cursor = match current {
-            // Keep pointing at the same visit if it survived; otherwise land on
-            // the end, which is where "most recent" lives.
-            Some(current) if current.path != path => self.visits.iter().position(|v| *v == current),
-            _ => self.visits.len().checked_sub(1),
-        };
-    }
-}
-
 /// How often to drain the filesystem watcher.
 ///
 /// The watcher itself is already debounced; this only governs how quickly a
@@ -223,25 +140,20 @@ const WATCH_POLL: Duration = Duration::from_millis(500);
 /// that the bar is not still claiming "Saved" when the user comes back.
 const STATUS_LINGER: Duration = Duration::from_secs(6);
 
-/// What the WebView should be showing.
-///
-/// `Unchanged` is not "do nothing because nothing happened" — it means the
-/// answer is not known yet (a Web pane is wanted but its HTML has not been
-/// built), and leaving the WebView alone beats flashing the previous document.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WebIntent {
-    Hide,
-    Show(String),
-    Unchanged,
-}
-
 pub struct Workspace {
     focus_handle: FocusHandle,
     root: Option<PathBuf>,
     explorer: Option<Entity<Explorer>>,
     harness: Option<Entity<HarnessView>>,
     search: Entity<SearchView>,
+    /// The settings page, built once rather than per open.
+    ///
+    /// Eager like [`Self::search`] and for the same reason: the subscription
+    /// that carries its events has to be set up somewhere, and a lazily-created
+    /// entity would mean re-subscribing on every open — the pattern that leaks
+    /// a subscription per click. It is stateless, so an unopened one costs a
+    /// focus handle.
+    settings: Entity<SettingsView>,
     side_panel: SidePanel,
     /// The open tabs, the active one, the preview slot, and the menu target.
     ///
@@ -263,18 +175,12 @@ pub struct Workspace {
     /// One slot rather than a detached task per message: replacing it cancels
     /// the previous timer, which is the other half of the generation check.
     _status_timer: Option<Task<()>>,
-    /// The single WebView for this window. It is an OS-level child window, so
-    /// one is shared by every tab rather than created per document.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    webview: Option<Entity<gpui_wry::WebView>>,
-    /// Set while a deferred WebView sync is queued, so a burst of notifications
-    /// coalesces into one.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    webview_sync_pending: bool,
-    /// What the WebView is currently showing, so we do not reload identical
-    /// content on every frame.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    web_current: Option<String>,
+    /// The window's single WebView and what it is showing.
+    ///
+    /// One field rather than three, and no `#[cfg]` here: the platform split
+    /// is inside [`WebSurface`], which is empty on Linux. That is what keeps
+    /// the dozen `web_dirty` call sites free of one.
+    web: WebSurface,
     /// True while the settings page is showing.
     settings_open: bool,
     /// True while the file/harness/outline panel is showing on the left.
@@ -350,6 +256,7 @@ impl Workspace {
             explorer: None,
             harness: None,
             search: cx.new(|cx| SearchView::new(window, cx)),
+            settings: cx.new(SettingsView::new),
             side_panel: SidePanel::Files,
             tabs: Tabs::default(),
             history: History::default(),
@@ -362,12 +269,7 @@ impl Workspace {
             left_panel_open: true,
             right_panel_open: true,
             translating: false,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            webview: None,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            webview_sync_pending: false,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            web_current: None,
+            web: WebSurface::default(),
             _tasks: vec![poll],
             _subscriptions: Vec::new(),
             _panel_subscriptions: Vec::new(),
@@ -396,6 +298,19 @@ impl Workspace {
                 SearchEvent::Reveal { path, offset } => {
                     this.reveal_in(path.clone(), *offset, window, cx);
                 }
+            },
+        ));
+        // The page writes the setting; what it cannot do is repaint the rest of
+        // the app. Each event names what changed, and the response is chosen
+        // here — the WebView caches HTML with the palette baked in, which is not
+        // something a settings page should have to know.
+        let settings = this.settings.clone();
+        this._subscriptions.push(cx.subscribe(
+            &settings,
+            |this: &mut Self, _, event: &SettingsEvent, cx| match event {
+                SettingsEvent::ThemeChanged => this.reapply_theme(cx),
+                SettingsEvent::LanguageChanged => this.relabel(cx),
+                SettingsEvent::SkillScopeChanged => this.rescan_harness(cx),
             },
         ));
         // Following the system means following it *while running*, not only at
@@ -634,14 +549,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Note that the WebView may need to change. Cheap and idempotent.
-    fn web_dirty(&mut self, cx: &mut Context<Self>) {
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        self.schedule_webview_sync(cx);
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let _ = cx;
-    }
-
     /// Redraw everything after the interface language changed.
     ///
     /// Labels are resolved from the string table during render, so nothing is
@@ -667,18 +574,13 @@ impl Workspace {
         }
     }
 
-    /// Apply a theme preference and rebuild anything that bakes it in.
-    fn set_theme(&mut self, preference: crate::settings::ThemePreference, cx: &mut Context<Self>) {
-        crate::settings::AppSettings::update(cx, |settings| settings.theme = preference);
-        self.reapply_theme(cx);
-    }
-
     /// Re-resolve the saved theme and repaint everything that caches it.
     ///
     /// The Web preview renders in its own browser context and caches its HTML
     /// with the palette baked in, so it does not pick up a GPUI theme change on
     /// its own. Called for both a mode change and a preset change — the two are
-    /// separate settings that land in the same place.
+    /// separate settings that land in the same place, and the settings page has
+    /// already written whichever one moved.
     fn reapply_theme(&mut self, cx: &mut Context<Self>) {
         let preference = crate::settings::AppSettings::global(cx).theme;
         crate::settings::apply_theme(preference, None, cx);
@@ -928,353 +830,6 @@ impl Workspace {
         self.set_status(format!("Copied {text}"), cx);
     }
 
-    /// The settings page, shown in place of the workspace body.
-    ///
-    /// A takeover rather than a dialog: settings here are mostly toggles the
-    /// user wants to see take effect on the document behind them, and a modal
-    /// covering that document would hide the feedback.
-    fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        use crate::settings::{AppSettings, GroupBy, Language, ThemePreference};
-        use gpui_component::setting::{
-            SettingField, SettingGroup, SettingItem, SettingPage, Settings,
-        };
-
-        let workspace = cx.entity();
-
-        let theme_options: Vec<(SharedString, SharedString)> = ThemePreference::ALL
-            .iter()
-            .map(|p| (p.key().into(), p.label().into()))
-            .collect();
-        let light_presets: Vec<(SharedString, SharedString)> = crate::theme::for_mode(false)
-            .map(|p| (p.id.into(), p.name.into()))
-            .collect();
-        let dark_presets: Vec<(SharedString, SharedString)> = crate::theme::for_mode(true)
-            .map(|p| (p.id.into(), p.name.into()))
-            .collect();
-        let group_options: Vec<(SharedString, SharedString)> = GroupBy::ALL
-            .iter()
-            .map(|g| (g.key().into(), g.label().into()))
-            .collect();
-        // Every schema is listed, not only the ones with a key present: the
-        // point of choosing one is often to configure it, and a dropdown that
-        // hides the option until its environment variable exists gives the user
-        // nowhere to start. The description names the variable each needs.
-        let mut provider_options: Vec<(SharedString, SharedString)> =
-            vec![("".into(), "Best available".into())];
-        provider_options.extend(
-            Provider::ALL
-                .into_iter()
-                .map(|p| (p.key().into(), p.label().into())),
-        );
-        let language_options: Vec<(SharedString, SharedString)> = Language::ALL
-            .iter()
-            .map(|l| (l.key().into(), l.label().into()))
-            .collect();
-
-        Settings::new("settings")
-            .page(
-                SettingPage::new("Appearance")
-                    .icon(Icon::new(IconName::Palette))
-                    .default_open(true)
-                    .group(SettingGroup::new().title("Theme").items(vec![
-                            SettingItem::new(
-                                "Mode",
-                                SettingField::dropdown(
-                                    theme_options,
-                                    |cx: &App| AppSettings::global(cx).theme.key().into(),
-                                    {
-                                        let workspace = workspace.clone();
-                                        move |value: SharedString, cx: &mut App| {
-                                            let preference = ThemePreference::from_key(&value);
-                                            // Through the workspace so the Web
-                                            // preview, which bakes the palette into
-                                            // cached HTML, rebuilds too.
-                                            workspace.update(cx, |this, cx| {
-                                                this.set_theme(preference, cx)
-                                            });
-                                        }
-                                    },
-                                )
-                                .default_value(ThemePreference::System.key().to_string()),
-                            )
-                            .description(
-                                "System follows the operating system, and keeps following it \
-                                 while the app is running.",
-                            ),
-                            // Two presets rather than one: the mode above can be
-                            // System, so a machine that flips at sunset has to
-                            // know which preset to land on either side.
-                            SettingItem::new(
-                                "Light theme",
-                                SettingField::dropdown(
-                                    light_presets,
-                                    |cx: &App| AppSettings::global(cx).theme_light.clone().into(),
-                                    {
-                                        let workspace = workspace.clone();
-                                        move |value: SharedString, cx: &mut App| {
-                                            AppSettings::update(cx, |settings| {
-                                                settings.theme_light = value.to_string()
-                                            });
-                                            workspace.update(cx, |this, cx| this.reapply_theme(cx));
-                                        }
-                                    },
-                                )
-                                .default_value(crate::theme::DEFAULT_LIGHT.to_string()),
-                            )
-                            .description("Used whenever the effective mode is light."),
-                            SettingItem::new(
-                                "Dark theme",
-                                SettingField::dropdown(
-                                    dark_presets,
-                                    |cx: &App| AppSettings::global(cx).theme_dark.clone().into(),
-                                    {
-                                        let workspace = workspace.clone();
-                                        move |value: SharedString, cx: &mut App| {
-                                            AppSettings::update(cx, |settings| {
-                                                settings.theme_dark = value.to_string()
-                                            });
-                                            workspace.update(cx, |this, cx| this.reapply_theme(cx));
-                                        }
-                                    },
-                                )
-                                .default_value(crate::theme::DEFAULT_DARK.to_string()),
-                            )
-                            .description("Used whenever the effective mode is dark."),
-                        ]))
-                    .group(
-                        SettingGroup::new().title("Language").item(
-                            SettingItem::new(
-                                "Language",
-                                SettingField::dropdown(
-                                    language_options,
-                                    |cx: &App| AppSettings::global(cx).language.key().into(),
-                                    {
-                                        let workspace = workspace.clone();
-                                        move |value: SharedString, cx: &mut App| {
-                                            AppSettings::update(cx, |settings| {
-                                                settings.language = Language::from_key(&value)
-                                            });
-                                            // Labels are resolved during render,
-                                            // so every view holding one has to be
-                                            // asked to draw again — the settings
-                                            // page itself would otherwise be the
-                                            // only thing that changed.
-                                            workspace.update(cx, |this, cx| this.relabel(cx));
-                                        }
-                                    },
-                                )
-                                .default_value(Language::default().key().to_string()),
-                            )
-                            .description(
-                                "The language of the interface. Separate from the \
-                                 translation target below, which is about documents.",
-                            ),
-                        ),
-                    ),
-            )
-            .page(
-                SettingPage::new("Translation")
-                    .icon(Icon::new(IconName::Globe))
-                    .groups(vec![SettingGroup::new().title("Provider").items(vec![
-                            SettingItem::new(
-                                "Provider",
-                                SettingField::dropdown(
-                                    provider_options,
-                                    |cx: &App| {
-                                        AppSettings::global(cx).translate_provider.clone().into()
-                                    },
-                                    |value: SharedString, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.translate_provider = value.to_string()
-                                        });
-                                    },
-                                ),
-                            )
-                            .description(
-                                "The wire format to speak. Anthropic Messages reads \
-                                 ANTHROPIC_API_KEY; both OpenAI formats read \
-                                 OPENAI_API_KEY — unless an API key is set below, \
-                                 which takes priority.",
-                            ),
-                            SettingItem::new(
-                                "API key",
-                                SettingField::input(
-                                    |cx: &App| {
-                                        AppSettings::global(cx).translate_api_key.clone().into()
-                                    },
-                                    |value: SharedString, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.translate_api_key = value.to_string()
-                                        });
-                                    },
-                                ),
-                            )
-                            .description(
-                                "Takes priority over the environment variable. Leave                                  empty to use that instead — a key in the environment                                  never touches disk, which is the safer option if you                                  want it. Stored as plain text in settings.json.",
-                            ),
-                            SettingItem::new(
-                                "Base URL",
-                                SettingField::input(
-                                    |cx: &App| {
-                                        AppSettings::global(cx).translate_base_url.clone().into()
-                                    },
-                                    |value: SharedString, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.translate_base_url = value.to_string()
-                                        });
-                                    },
-                                ),
-                            )
-                            .description(
-                                "Leave empty for the vendor's own endpoint. Set it to \
-                                 reach an OpenAI-compatible server — vLLM, Ollama, \
-                                 OpenRouter, LM Studio, Azure — which needs nothing \
-                                 else, since the wire format is the same.",
-                            ),
-                            SettingItem::new(
-                                "Model",
-                                SettingField::input(
-                                    |cx: &App| {
-                                        AppSettings::global(cx).translate_model.clone().into()
-                                    },
-                                    |value: SharedString, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.translate_model = value.to_string()
-                                        });
-                                    },
-                                ),
-                            )
-                            .description("Leave empty for the provider's default."),
-                            SettingItem::new(
-                                "Target language",
-                                SettingField::input(
-                                    |cx: &App| AppSettings::global(cx).translate_to.clone().into(),
-                                    |value: SharedString, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.translate_to = value.to_string()
-                                        });
-                                    },
-                                )
-                                .default_value("zh"),
-                            )
-                            .description("A language name or code, e.g. `zh`, `ja`, `German`."),
-                        ])]),
-            )
-            .page(
-                SettingPage::new("Editor")
-                    .icon(Icon::new(IconName::LayoutDashboard))
-                    .group(
-                        SettingGroup::new().title("Split view").item(
-                            SettingItem::new(
-                                "Sync scrolling",
-                                SettingField::switch(
-                                    |cx: &App| AppSettings::global(cx).split_sync_scroll,
-                                    |value: bool, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.split_sync_scroll = value
-                                        });
-                                    },
-                                )
-                                .default_value(false),
-                            )
-                            .description(
-                                "Scroll the preview to follow the editor, and to follow \
-                             an outline click. The mapping is proportional, so a \
-                             document with one tall diagram moves further than the \
-                             eye expects.",
-                            ),
-                        ),
-                    )
-                    .group(
-                        SettingGroup::new().title("Watching").item(
-                            SettingItem::new(
-                                "Auto-refresh on external change",
-                                SettingField::switch(
-                                    |cx: &App| AppSettings::global(cx).watch_auto_reload,
-                                    |value: bool, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.watch_auto_reload = value
-                                        });
-                                    },
-                                )
-                                .default_value(false),
-                            )
-                            .description(
-                                "Re-read a document when its file changes on disk. A tab \
-                                 with unsaved edits is never refreshed — it keeps the \
-                                 reload/overwrite banner, because an automatic refresh \
-                                 must not discard typed text.",
-                            ),
-                        ),
-                    ),
-            )
-            .page(
-                SettingPage::new("Skills")
-                    .icon(Icon::new(IconName::Bot))
-                    .group(SettingGroup::new().title("Discovery").items(vec![
-                            SettingItem::new(
-                                "Include global skills",
-                                SettingField::switch(
-                                    |cx: &App| AppSettings::global(cx).skills_include_global,
-                                    {
-                                        let workspace = workspace.clone();
-                                        move |value: bool, cx: &mut App| {
-                                            AppSettings::update(cx, |settings| {
-                                                settings.skills_include_global = value
-                                            });
-                                            // Discovery scope changed, so the
-                                            // list is now wrong until rescanned.
-                                            workspace
-                                                .update(cx, |this, cx| this.rescan_harness(cx));
-                                        }
-                                    },
-                                )
-                                .default_value(true),
-                            )
-                            .description(
-                                "Search every harness's global directory (~/.claude/skills, \
-                                 ~/.agents/skills, …) as well as this workspace.",
-                            ),
-                            SettingItem::new(
-                                "Show internal skills",
-                                SettingField::switch(
-                                    |cx: &App| AppSettings::global(cx).skills_include_internal,
-                                    {
-                                        let workspace = workspace.clone();
-                                        move |value: bool, cx: &mut App| {
-                                            AppSettings::update(cx, |settings| {
-                                                settings.skills_include_internal = value
-                                            });
-                                            workspace
-                                                .update(cx, |this, cx| this.rescan_harness(cx));
-                                        }
-                                    },
-                                )
-                                .default_value(false),
-                            )
-                            .description(
-                                "Skills marked `metadata.internal: true`, which the reference \
-                                 tooling hides by default.",
-                            ),
-                            SettingItem::new(
-                                "Group by",
-                                SettingField::dropdown(
-                                    group_options,
-                                    |cx: &App| AppSettings::global(cx).skills_group_by.key().into(),
-                                    |value: SharedString, cx: &mut App| {
-                                        AppSettings::update(cx, |settings| {
-                                            settings.skills_group_by = GroupBy::from_key(&value)
-                                        });
-                                    },
-                                )
-                                .default_value(GroupBy::Origin.key().to_string()),
-                            )
-                            .description("How the Skills list is organized."),
-                        ])),
-            )
-            .into_any_element()
-    }
-
     fn on_translate_document(
         &mut self,
         _: &TranslateDocument,
@@ -1412,122 +967,6 @@ impl Workspace {
             });
         })
         .detach();
-    }
-
-    // --- WebView ----------------------------------------------------------
-
-    /// What the WebView should be showing, as a pure read of current state.
-    ///
-    /// Separated from applying it because deciding is safe during a draw and
-    /// applying is not — see [`Self::sync_webview`].
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn webview_intent(&self, cx: &App) -> WebIntent {
-        // The WebView is an OS child window drawn over GPUI's surface, not an
-        // element in the tree — it would float on top of the settings page.
-        if self.settings_open {
-            return WebIntent::Hide;
-        }
-        let Some(doc) = self.active_document() else {
-            return WebIntent::Hide;
-        };
-        let doc = doc.read(cx);
-        if !doc.layout().uses_webview() {
-            return WebIntent::Hide;
-        }
-        match doc.web_html() {
-            Some(html) => WebIntent::Show(html.to_string()),
-            // The mode wants the WebView but the HTML has not been built yet;
-            // leaving it as-is avoids a flash of the previous document.
-            None => WebIntent::Unchanged,
-        }
-    }
-
-    /// Schedule a WebView sync for after the current effect cycle.
-    ///
-    /// **Never call the sync itself from `render`.** The WebView is an OS child
-    /// window driven by `wry`, and on Windows WebView2 pumps messages: touching
-    /// it re-enters the window procedure while the `App` is already mutably
-    /// borrowed for the draw, which panics in `AppCell::borrow_mut`. `defer`
-    /// runs the work at the end of the effect cycle, with no borrow held.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn schedule_webview_sync(&mut self, cx: &mut Context<Self>) {
-        if self.webview_sync_pending {
-            return;
-        }
-        self.webview_sync_pending = true;
-        let this = cx.entity().downgrade();
-        let entity_id = cx.entity_id();
-        cx.defer(move |cx| {
-            cx.with_window(entity_id, |window, cx| {
-                if this
-                    .update(cx, |this, cx| {
-                        this.webview_sync_pending = false;
-                        this.sync_webview(window, cx);
-                    })
-                    .is_err()
-                {
-                    // Swallowing this left "the preview shows the previous
-                    // document" with nothing in the log to attribute it to. The
-                    // entity is gone, so the sync is moot — but say which one.
-                    log::debug!("skipped a WebView sync: the workspace was released");
-                }
-            });
-        });
-    }
-
-    /// Apply the current intent to the WebView. Must run outside a draw.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn sync_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let intent = self.webview_intent(cx);
-
-        let html = match intent {
-            WebIntent::Unchanged => return,
-            WebIntent::Hide => {
-                if let Some(webview) = &self.webview {
-                    webview.update(cx, |webview, _| webview.hide());
-                }
-                self.lend_webview(None, cx);
-                self.web_current = None;
-                return;
-            }
-            WebIntent::Show(html) => html,
-        };
-
-        let webview = match &self.webview {
-            Some(webview) => webview.clone(),
-            None => {
-                let Some(webview) = create_webview(window, cx) else {
-                    return;
-                };
-                self.webview = Some(webview.clone());
-                webview
-            }
-        };
-
-        // The WebView must be *in the active tab's element tree*, not merely
-        // alive: its OS child window is positioned by `WebViewElement::prepaint`
-        // and stays at the 0x0 `Rect::default()` it was built with otherwise.
-        self.lend_webview(Some(webview.clone()), cx);
-
-        webview.update(cx, |webview, _| webview.show());
-        if self.web_current.as_deref() != Some(html.as_str()) {
-            let url = crate::web::to_data_url(&html);
-            webview.update(cx, |webview, _| webview.load_url(&url));
-            self.web_current = Some(html);
-        }
-    }
-
-    /// Give the WebView to the active tab and take it from every other one.
-    ///
-    /// Exactly one document may render it at a time — two would set conflicting
-    /// bounds on the same child window every frame.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn lend_webview(&mut self, webview: Option<Entity<gpui_wry::WebView>>, cx: &mut Context<Self>) {
-        let active = self.tabs.active_index();
-        for (ix, doc) in self.document_views().into_iter().enumerate() {
-            let lent = (ix == active).then(|| webview.clone()).flatten();
-            doc.update(cx, |doc, cx| doc.set_webview(lent, cx));
-        }
     }
 
     // --- Rendering --------------------------------------------------------
@@ -1771,43 +1210,6 @@ impl Workspace {
         doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
     }
 
-    /// Note that the user is now at `offset` in `path`.
-    fn record_visit(&mut self, path: PathBuf, offset: usize) {
-        self.history.push(Visit { path, offset });
-    }
-
-    /// Go to `visit`, without recording the move as a new visit.
-    fn go_to(&mut self, visit: Visit, window: &mut Window, cx: &mut Context<Self>) {
-        // The flag is what keeps Back from truncating the forward half it is
-        // walking through.
-        self.history.navigating = true;
-        self.open_file_as(visit.path.clone(), true, window, cx);
-        if let Some(doc) = self.active_document().cloned()
-            && doc.read(cx).path() == visit.path
-        {
-            doc.update(cx, |doc, cx| doc.reveal_offset(visit.offset, window, cx));
-        }
-        self.history.navigating = false;
-        cx.notify();
-    }
-
-    fn on_navigate_back(&mut self, _: &NavigateBack, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(visit) = self.history.back() {
-            self.go_to(visit, window, cx);
-        }
-    }
-
-    fn on_navigate_forward(
-        &mut self,
-        _: &NavigateForward,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(visit) = self.history.forward() {
-            self.go_to(visit, window, cx);
-        }
-    }
-
     /// Show the Search panel and put the caret in its field.
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.side_panel = SidePanel::Search;
@@ -1915,44 +1317,6 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
             }))
-    }
-
-    /// Back and Forward, at the far left of the bar.
-    ///
-    /// A disabled button rather than a hidden one: the pair is a fixed landmark
-    /// that the tabs start after, and one that appears and disappears would
-    /// shift every tab sideways as the user navigates. Disabled says "there is
-    /// nowhere to go" — which is the actual state — where absent says nothing.
-    fn render_navigator(&self, cx: &Context<Self>) -> impl IntoElement {
-        h_flex()
-            .flex_shrink_0()
-            .items_center()
-            .gap_0p5()
-            // The bar is a `WindowControlArea::Drag` region, so a press here
-            // becomes a window drag unless it is claimed back.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                Button::new("nav-back")
-                    .icon(IconName::ArrowLeft)
-                    .xsmall()
-                    .ghost()
-                    .disabled(!self.history.can_go_back())
-                    .tooltip(i18n::t(i18n::Key::NavigateBack, cx))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_navigate_back(&NavigateBack, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("nav-forward")
-                    .icon(IconName::ArrowRight)
-                    .xsmall()
-                    .ghost()
-                    .disabled(!self.history.can_go_forward())
-                    .tooltip(i18n::t(i18n::Key::NavigateForward, cx))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_navigate_forward(&NavigateForward, window, cx)
-                    })),
-            )
     }
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -2322,19 +1686,6 @@ fn empty_hint(cx: &App, text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// Create the window's WebView.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn create_webview(window: &mut Window, cx: &mut App) -> Option<Entity<gpui_wry::WebView>> {
-    use raw_window_handle::HasWindowHandle as _;
-
-    let handle = window.window_handle().ok()?;
-    let builder = wry::WebViewBuilder::new();
-    #[cfg(debug_assertions)]
-    let builder = builder.with_devtools(true);
-    let webview = builder.build_as_child(&handle).ok()?;
-    Some(cx.new(|cx| gpui_wry::WebView::new(webview, window, cx)))
-}
-
 impl Focusable for Workspace {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2345,7 +1696,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The WebView is deliberately NOT touched here: it is an OS child
         // window, and mutating it during a draw re-enters the window procedure
-        // with the App already borrowed. `schedule_webview_sync` runs it after
+        // with the App already borrowed. `WebSurface::mark_dirty` runs it after
         // the effect cycle instead.
 
         // Panel widths are a share of the window rather than a fixed column, so
@@ -2355,7 +1706,7 @@ impl Render for Workspace {
         let viewport = window.viewport_size().width;
 
         let content: AnyElement = if self.settings_open {
-            self.render_settings(cx)
+            self.settings.clone().into_any_element()
         } else {
             match self.active_document() {
                 Some(doc) => doc.clone().into_any_element(),
@@ -2683,41 +2034,6 @@ mod tests {
         );
     }
 
-    /// `Workspace::render` must not mutate the WebView.
-    ///
-    /// This is a source-level check rather than a runtime one on purpose: the
-    /// failure it guards is a `RefCell` panic that only reproduces when the
-    /// platform re-enters the window procedure mid-draw (WebView2 pumping
-    /// messages, a screen reader attaching). It is not reliably reachable from
-    /// a test, but it is trivially reintroducible by someone "simplifying" the
-    /// deferred sync back into `render` — which is exactly what this catches.
-    #[test]
-    fn render_does_not_touch_the_webview() {
-        // `include_str!` resolves relative to this file at compile time, so it
-        // works regardless of the test runner's working directory.
-        let source = include_str!("workspace.rs");
-        let render = source
-            .split_once("impl Render for Workspace")
-            .expect("the Render impl")
-            .1;
-        // Stop at the next top-level item so this only reads `render`'s body.
-        let body = render.split("\n/// Keybindings").next().unwrap_or(render);
-
-        for forbidden in ["sync_webview(", "webview.update(", "create_webview("] {
-            assert!(
-                !body.contains(forbidden),
-                "`{forbidden}` is called from render; the WebView is an OS child \
-                 window and touching it during a draw re-enters the window \
-                 procedure with the App already borrowed. Use \
-                 `schedule_webview_sync` instead."
-            );
-        }
-        assert!(
-            source.contains("fn schedule_webview_sync"),
-            "the deferred path must still exist"
-        );
-    }
-
     /// The title bar must leave somewhere to grab the window.
     ///
     /// Source-level because reproducing it needs a real `WM_NCHITTEST` against
@@ -3002,7 +2318,7 @@ mod tests {
         let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
         let start = code.find("fn translate(").expect("translate must exist");
         let body = &code[start..];
-        let end = body.find("\n    // --- WebView").unwrap_or(body.len());
+        let end = body.find("\n    // --- Rendering").unwrap_or(body.len());
         let body = &body[..end];
 
         assert!(
@@ -3034,140 +2350,6 @@ mod tests {
             3,
             "all three translate actions must return early, or a keybinding \
              starts a second request the inert button cannot"
-        );
-    }
-
-    /// The navigator leads the tab strip, and its buttons disable rather than
-    /// disappear.
-    ///
-    /// A hidden button would shift every tab sideways as the user navigates,
-    /// which is exactly the kind of motion that makes a strip hard to aim at.
-    #[test]
-    fn the_navigator_leads_the_tabs_and_never_vanishes() {
-        let source = include_str!("workspace.rs");
-        let start = source
-            .find("fn render_navigator")
-            .expect("render_navigator must exist");
-        let body = &source[start..];
-        let end = body.find("\n    fn render_tabs").unwrap_or(body.len());
-        let nav = &body[..end];
-
-        assert!(
-            nav.contains("can_go_back()") && nav.contains("can_go_forward()"),
-            "both directions must reflect whether there is anywhere to go"
-        );
-        assert_eq!(
-            nav.matches(".disabled(").count(),
-            2,
-            "both buttons must disable rather than be conditionally rendered"
-        );
-        assert!(
-            !nav.contains(".when(") || !nav.contains("Button::new(\"nav-"),
-            "a conditionally-present button shifts the tabs as the user navigates"
-        );
-
-        // And it is childed before the tab strip.
-        let bar_start = source
-            .find("fn render_title_bar")
-            .expect("render_title_bar");
-        let bar = &source[bar_start..];
-        let navigator = bar.find(".child(navigator)").expect("the navigator");
-        let tabs = bar.find("self.render_tabs(cx)").expect("the tab strip");
-        assert!(navigator < tabs, "Back/Forward come before the tabs");
-    }
-
-    /// Closing a tab must not leave it reachable through Back.
-    ///
-    /// Runtime rather than source-level, because the history is plain data with
-    /// no GPUI in it — and the failure is subtle enough to deserve a real
-    /// assertion: without `forget`, Back reopens the tab the user just closed,
-    /// which reads as the close button not working.
-    #[test]
-    fn closing_a_document_forgets_its_visits() {
-        use super::{History, Visit};
-        use std::path::PathBuf;
-
-        let mut history = History::default();
-        for (path, offset) in [("a.md", 0), ("b.md", 0), ("a.md", 40), ("c.md", 0)] {
-            history.push(Visit {
-                path: PathBuf::from(path),
-                offset,
-            });
-        }
-        history.forget(std::path::Path::new("a.md"));
-        assert!(
-            !history
-                .visits
-                .iter()
-                .any(|v| v.path.as_path() == std::path::Path::new("a.md")),
-            "every visit to the closed document must go, not just the latest"
-        );
-        // And the cursor still points inside the list.
-        assert!(history.cursor.is_some_and(|ix| ix < history.visits.len()));
-    }
-
-    /// Going back and then somewhere new abandons the forward branch.
-    ///
-    /// The behavior every browser has, and the reason Forward means "where I
-    /// was" rather than "where I once was". Getting this wrong produces a
-    /// Forward button that jumps somewhere the user never went from here.
-    #[test]
-    fn a_new_visit_after_going_back_truncates_the_forward_half() {
-        use super::{History, Visit};
-        use std::path::PathBuf;
-
-        let visit = |name: &str| Visit {
-            path: PathBuf::from(name),
-            offset: 0,
-        };
-        let mut history = History::default();
-        history.push(visit("a.md"));
-        history.push(visit("b.md"));
-        history.push(visit("c.md"));
-
-        assert_eq!(history.back().map(|v| v.path), Some(PathBuf::from("b.md")));
-        assert!(history.can_go_forward());
-
-        history.push(visit("d.md"));
-        assert!(
-            !history.can_go_forward(),
-            "c.md is on a branch the user left; Forward must not go there"
-        );
-        assert_eq!(history.back().map(|v| v.path), Some(PathBuf::from("b.md")));
-    }
-
-    /// Navigating must not record the navigation as a new visit.
-    ///
-    /// Without the guard, pressing Back records arriving at the previous entry,
-    /// which truncates everything after it — so Back works once and Forward is
-    /// dead from then on.
-    #[test]
-    fn navigating_does_not_rewrite_the_history_it_walks() {
-        use super::{History, Visit};
-        use std::path::PathBuf;
-
-        let visit = |name: &str| Visit {
-            path: PathBuf::from(name),
-            offset: 0,
-        };
-        let mut history = History::default();
-        history.push(visit("a.md"));
-        history.push(visit("b.md"));
-        history.push(visit("c.md"));
-
-        let target = history.back().expect("somewhere to go back to");
-        // What `go_to` does around the open it triggers.
-        history.navigating = true;
-        history.push(target);
-        history.navigating = false;
-
-        assert!(
-            history.can_go_forward(),
-            "walking back must leave the forward half intact"
-        );
-        assert_eq!(
-            history.forward().map(|v| v.path),
-            Some(PathBuf::from("c.md"))
         );
     }
 
