@@ -51,7 +51,7 @@ pub struct Translation {
 /// Resolve a scope to a byte range in `doc`.
 pub fn resolve_scope(doc: &Document, scope: &Scope) -> Range<usize> {
     match scope {
-        Scope::Selection(range) => clamp(range.clone(), doc.source().len()),
+        Scope::Selection(range) => clamp(range.clone(), doc.source()),
         Scope::Block(offset) => doc
             .block_at(*offset)
             .map(|b| b.range.clone())
@@ -326,9 +326,32 @@ fn push_verbatim(out: &mut Vec<Segment>, source: &str, range: Range<usize>) {
     });
 }
 
-fn clamp(range: Range<usize>, len: usize) -> Range<usize> {
-    let start = range.start.min(len);
-    let end = range.end.clamp(start, len);
+/// Bound a requested range to the document, on character boundaries.
+///
+/// Clamping to the length alone is not enough. Every slice below is
+/// `&source[range]`, which panics when an endpoint lands inside a multi-byte
+/// character — and a selection is a *byte* range that arrives from the editor,
+/// so on any CJK, accented, or emoji text the caller can hand us one. Widening
+/// to the enclosing boundary rather than narrowing keeps the user's selection
+/// whole: a half-selected character is translated, not silently dropped.
+fn clamp(range: Range<usize>, source: &str) -> Range<usize> {
+    let len = source.len();
+    let floor = |i: usize| {
+        let mut i = i.min(len);
+        while i > 0 && !source.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let ceil = |i: usize| {
+        let mut i = i.min(len);
+        while i < len && !source.is_char_boundary(i) {
+            i += 1;
+        }
+        i
+    };
+    let start = floor(range.start);
+    let end = ceil(range.end.max(start));
     start..end
 }
 
@@ -633,5 +656,46 @@ mod tests {
         let d = doc("short\n");
         let out = translate(&d, &Scope::Selection(0..9999), "zh", &Upper).unwrap();
         assert_eq!(out.text, "SHORT\n");
+    }
+    /// A selection that cuts a character in half must not take the app down.
+    ///
+    /// A selection arrives from the editor as a *byte* range, and every slice
+    /// in this module is `&source[range]` — which panics, not errors, when an
+    /// endpoint lands inside a multi-byte character. Clamping to the document
+    /// length alone left that hole wide open on exactly the documents this app
+    /// exists to translate: one drag across Chinese text, and translating the
+    /// selection killed the window.
+    ///
+    /// Widening rather than narrowing, so a half-selected character is
+    /// translated instead of silently dropped.
+    #[test]
+    fn a_selection_that_splits_a_character_is_widened_rather_than_panicking() {
+        let d = doc("中文段落
+");
+
+        // Every byte offset, including the ones inside each character.
+        for start in 0..=d.source().len() {
+            for end in start..=d.source().len() {
+                let range = resolve_scope(&d, &Scope::Selection(start..end));
+                assert!(
+                    d.source().is_char_boundary(range.start)
+                        && d.source().is_char_boundary(range.end),
+                    "{start}..{end} resolved to {range:?}, which splits a character"
+                );
+                // The slice the segmenter will take must not panic.
+                let _ = &d.source()[range.clone()];
+                // And it must still cover what was asked for.
+                assert!(range.start <= start && range.end >= end.min(d.source().len()));
+            }
+        }
+
+        // The whole path, not just the resolution: this is what a user does.
+        let out = translate(&d, &Scope::Selection(1..7), "zh", &Upper).unwrap();
+        assert_eq!(
+            out.text,
+            "中文段落
+",
+            "an identity provider changes nothing"
+        );
     }
 }

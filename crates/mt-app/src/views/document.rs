@@ -495,7 +495,7 @@ impl DocumentView {
     /// on every external write, so this runs involuntarily and repeatedly — and
     /// `Document::with_type` is markdown-rs, measured at 23.4s on the 100K-line
     /// fixture. Inline, an agent rewriting a file in a loop would freeze the
-    /// window once per write. See [`Self::schedule_reparse`], which is the same
+    /// window once per write. See `schedule_reparse`, which is the same
     /// hazard reached from the other direction.
     ///
     /// `true` means *started*, not *finished*: the user can begin typing during

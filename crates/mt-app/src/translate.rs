@@ -16,7 +16,7 @@
 //! whole point. genai normally picks the provider by sniffing the model name,
 //! and falls back to Ollama for anything it does not recognise — so a vLLM
 //! server asked for `Qwen/Qwen3-32B` would be handed to the wrong adapter.
-//! [`ModelSpec::Target`] skips inference entirely, which is what keeps
+//! genai's `ModelSpec::Target` skips inference entirely, which is what keeps
 //! [`Provider`] meaning "the wire format" and keeps "point base_url at any
 //! OpenAI-compatible server" true.
 //!
@@ -84,7 +84,8 @@ impl Provider {
 
     /// The base URL used when the user has not set one.
     ///
-    /// The trailing slash is load-bearing — see [`base_url`].
+    /// The trailing slash is load-bearing: genai appends only the leaf path,
+    /// so a base URL without one loses its last segment. See `base_url`.
     pub fn default_base_url(self) -> &'static str {
         match self {
             Provider::AnthropicMessages => "https://api.anthropic.com/v1/",
@@ -218,11 +219,24 @@ fn non_empty_env(var: &str) -> Option<String> {
 
 /// Force a trailing slash onto a base URL.
 ///
-/// genai joins the endpoint with `Url::join`, which *replaces* the final path
-/// segment when there is no trailing slash: `https://host/v1` + `messages`
-/// resolves to `https://host/messages`, silently dropping the `/v1`, and a
-/// gateway mounted at `/openai/v1` loses its mount point the same way. Users
-/// paste base URLs both ways, so normalise rather than document.
+/// genai appends only the leaf path, and the two adapter families get there
+/// differently — measured against a local socket, not inferred:
+///
+/// | base   | OpenAI                 | Anthropic      |
+/// |--------|------------------------|----------------|
+/// | `/v1/` | `/v1/chat/completions` | `/v1/messages` |
+/// | `/v1`  | `/chat/completions`    | `/v1messages`  |
+///
+/// The OpenAI adapters use `Url::join`, which *replaces* the last path segment
+/// when there is no trailing slash, so `/v1` vanishes. The Anthropic adapter
+/// concatenates, so `/v1` survives but fuses onto the path — a 404 rather than
+/// a silently wrong endpoint. Neither is what the user meant, and users paste
+/// base URLs both ways, so normalise.
+///
+/// What this cannot repair is a base URL with no version segment at all: `/`
+/// reaches `/chat/completions`, which is simply the wrong endpoint for a server
+/// mounting under `/v1`. That is why the setting's help names the version
+/// segment rather than only the slash.
 fn base_url(raw: &str) -> String {
     if raw.ends_with('/') {
         raw.to_string()
@@ -675,6 +689,79 @@ mod tests {
             "the prose to translate is in the body"
         );
         assert!(request.contains("fr"), "and so is the target language");
+    }
+
+    /// A base URL keeps its version segment through to the wire.
+    ///
+    /// The defect this catches is silent and adapter-specific. genai appends
+    /// only the leaf path, and the two families get there differently — the
+    /// OpenAI adapters use `Url::join`, which DROPS a final segment with no
+    /// trailing slash, so `/v1` becomes nothing; the Anthropic one concatenates,
+    /// so `/v1` fuses into `/v1messages`. A user who pastes
+    /// `http://localhost:8000/v1` — the form every vLLM and Ollama README
+    /// prints — would otherwise reach an endpoint that is not there, with no
+    /// way to diagnose it.
+    ///
+    /// Asserted against a real socket, because the failure is in what genai
+    /// puts on the wire rather than in anything this crate computes.
+    #[test]
+    fn a_pasted_base_url_reaches_the_endpoint_the_user_meant() {
+        for (provider, model, want) in [
+            (Provider::OpenAiChat, "gpt-5", "/v1/chat/completions"),
+            (Provider::OpenAiResponses, "gpt-5", "/v1/responses"),
+            (
+                Provider::AnthropicMessages,
+                "claude-sonnet-5",
+                "/v1/messages",
+            ),
+        ] {
+            // With and without the trailing slash: both are forms users paste.
+            for suffix in ["/v1", "/v1/"] {
+                let (base, requests) = one_shot_server(
+                    r#"{"choices":[{"message":{"role":"assistant","content":"[]"}}]}"#,
+                );
+                let base = base.trim_end_matches("/v1/").to_string() + suffix;
+
+                let translator = GenAiTranslator {
+                    target: provider.service_target(&base_url(&base), "k", model),
+                    label: provider.label(),
+                };
+                let _ = translator.translate(&["x".to_string()], "fr");
+
+                let request = requests
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the request reached the socket");
+                let line = request.lines().next().unwrap_or_default().to_string();
+                assert!(
+                    line.contains(want),
+                    "{provider:?} with base {suffix} must POST to {want}, got: {line}"
+                );
+            }
+        }
+    }
+
+    /// A 200 whose body is the wrong shape is an error, not an empty result.
+    ///
+    /// The likeliest misconfiguration in the feature: a base URL pointing at
+    /// something that answers 200 with JSON which is not a chat completion — a
+    /// gateway's health page, a proxy's error envelope, the wrong API version.
+    /// Yielding no text would look to the user like a translation that produced
+    /// nothing, with no way to tell why. That case is genai's now rather than
+    /// ours, so this pins that it is still treated as a failure.
+    #[test]
+    fn a_well_formed_reply_of_the_wrong_shape_is_reported_rather_than_ignored() {
+        let (base, _requests) = one_shot_server(r#"{"status":"ok","uptime":41}"#);
+        let translator = GenAiTranslator {
+            target: Provider::OpenAiChat.service_target(&base, "k", "gpt-5"),
+            label: Provider::OpenAiChat.label(),
+        };
+        let err = translator
+            .translate(&["hello".to_string()], "fr")
+            .expect_err("a health page is not a translation");
+        assert!(
+            err.to_string().contains(Provider::OpenAiChat.label()),
+            "and it must say which provider answered: {err}"
+        );
     }
 
     /// A provider error carries the server's own explanation.

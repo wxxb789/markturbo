@@ -226,7 +226,7 @@ fn clip(line: &str) -> String {
 /// whose unsaved edits make the file on disk the wrong thing to read. The
 /// caller passes those to [`search_text`] instead.
 ///
-/// No single file may take more than [`per_file_limit`] of the budget. Without
+/// No single file may take more than `per_file_limit` of the budget. Without
 /// that, the result list is decided by walk order rather than by relevance:
 /// [`document_paths`] sorts, so one large generated file early in the alphabet
 /// fills the cap and every file after it is read but never seen. A file that

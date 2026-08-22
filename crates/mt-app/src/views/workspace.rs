@@ -6,7 +6,7 @@
 //! narrow; this is where they are wired together.
 //!
 //! Two clusters live in submodules because neither belongs to the wiring.
-//! [`history`] is plain data plus the two buttons that read it; [`web_surface`]
+//! `history` is plain data plus the two buttons that read it; `web_surface`
 //! is the OS child window and the re-entrancy rules for touching it. Both add
 //! their methods to `Workspace` from there, so `self.web_dirty(cx)` reads the
 //! same here as it did before the split.

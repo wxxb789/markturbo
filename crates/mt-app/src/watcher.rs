@@ -60,7 +60,7 @@ impl Watcher {
     ///
     /// The cache buys one thing: correlating a rename's two halves by file id
     /// when the platform supplies no rename tracker. Windows and macOS both do
-    /// supply one, and [`classify`] derives the same answer from whether the
+    /// supply one, and `classify` derives the same answer from whether the
     /// path still exists — so the walk paid for a fallback that is never
     /// reached.
     pub fn new(root: &Path) -> anyhow::Result<Self> {
