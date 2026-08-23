@@ -21,8 +21,65 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "wayland",
     "runtime_shaders",
 ] }
+# Grammars named one at a time, not `tree-sitter-languages`. That feature is
+# gpui-component's "everything" switch — 34 generated C parse tables, and they
+# are `.rdata` rather than code, which is why the binary's `.rdata` used to be
+# larger than its `.text`. Kotlin alone is an 11.9MB static library; C# 11.0MB,
+# Swift 8.3MB, C++ 7.4MB, SQL 5.5MB.
+#
+# Measured on x86_64-pc-windows-msvc: 82,848,000 -> 54,269,952 bytes, **-34.5%**,
+# with no code change. `.rdata` alone went 47,887KB -> 17,161KB.
+#
+# **This list is chosen by what appears in a ``` fence, not by what files the
+# app opens.** That distinction is the whole reason the list is not shorter.
+# A fenced block inside a Markdown document is highlighted through the same
+# grammars: `CodeBlock::styles` -> `SyntaxHighlighter::new(lang)` ->
+# `LanguageRegistry::singleton().language(lang)`, and that registry is built
+# from `Language::all()` — the same cfg-gated enum. So dropping
+# `tree-sitter-rust` does not merely stop highlighting `.rs` files, it renders
+# every ```rust block in every README as flat grey text. Counted across this
+# repository's Markdown: 8606 ```rust, 77 ```bash, 23 ```toml, 6 ```json,
+# 4 ```yaml, 4 ```diff — which is what this list is.
+#
+# Trimming to `tree-sitter-markdown` alone was measured too: 49,107,456 bytes,
+# a further 5.2MB. It is rejected on both counts — the fences go unhighlighted,
+# and it does not even compile (see the cfg note below).
+#
+# Three things to know before editing this list:
+#
+# * A grammar feature gates the `Language` enum **variant**, not just its
+#   highlighting. `#[cfg(feature = "tree-sitter-rust")]` sits on the variant,
+#   on its `name()` arm and on its `from_name` arm alike, so removing a feature
+#   whose variant is named anywhere is an E0599 compile error, not a silent
+#   downgrade. Removing all but markdown produces 5 of them in `document.rs`.
+# * `tree-sitter-json` is not a feature name. JSON comes in via the base
+#   `tree-sitter` feature, which every grammar feature below enables, so
+#   `Language::Json` still resolves.
+# * `tree-sitter-make` is here for `a_file_with_no_grammar_falls_back_to_plain`,
+#   which asserts a `Makefile` maps to `Language::Make`. Dropping it is a test
+#   failure, not a silent loss.
+#
+# Adding a grammar is one line. A fence language absent from this list falls
+# back to `Language::Plain` at runtime — no highlighting, never a wrong grammar
+# and never a panic (`SyntaxHighlighter::new` logs and builds an inert
+# highlighter). `tree-sitter-tsx` is the one addition that costs 0 bytes: it
+# reuses the `tree-sitter-typescript` parse table already compiled in.
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364", features = [
-    "tree-sitter-languages",
+    # Markdown itself, plus the inline grammar it needs. One feature, two variants.
+    "tree-sitter-markdown",
+    # The rest are fence languages, ordered by how often they appear in one.
+    "tree-sitter-rust",
+    "tree-sitter-bash",
+    "tree-sitter-toml",
+    "tree-sitter-yaml",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-html",
+    "tree-sitter-css",
+    # Not a fence language: `a_file_with_no_grammar_falls_back_to_plain` names
+    # `Language::Make`, and the variant only exists with this feature on.
+    "tree-sitter-make",
 ] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364" }
 gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364" }
@@ -124,6 +181,10 @@ strip = "symbols"
 # One codegen unit lets LLVM inline across the whole crate. Slower to build,
 # and worth it here because the parse/render paths are the bottleneck.
 codegen-units = 1
+# `thin`, not `fat`. Measured rather than assumed: `fat` produces a 53,003,264
+# byte binary against `thin`'s 54,269,952 — 1.2MB, 2.3% — and takes 15m24s to
+# link against 5m21s. Tripling the build for 2% is not a trade worth making,
+# and recording it here is what stops the experiment being re-run.
 lto = "thin"
 # REQUIRED, not a default: the renderer registry wraps third-party renderers in
 # `catch_unwind` so a panic in a diagram backend becomes an inline diagnostic

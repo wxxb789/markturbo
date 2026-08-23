@@ -1197,9 +1197,16 @@ fn editor_language(path: &std::path::Path) -> Language {
         return Language::Markdown;
     }
     // No extension table of our own: `Language::from_str` already is one, over
-    // exactly the grammars the `tree-sitter-languages` feature compiles in, and
-    // it falls back to `Plain` for anything it does not know. The file name is
-    // the second try because `Path::extension` is `None` for a `Makefile`.
+    // exactly the grammars the workspace manifest enables, and it falls back to
+    // `Plain` for anything it does not know. The file name is the second try
+    // because `Path::extension` is `None` for a `Makefile`.
+    //
+    // That list is short by design and is chosen for *fence* languages — see
+    // the comment on `gpui-component` in the workspace `Cargo.toml`. A source
+    // file whose grammar is not compiled in opens in Source with no
+    // highlighting, which is the intended outcome for a Markdown workspace:
+    // highlighting other languages' files is not this app's job, but
+    // highlighting a ```rust block inside a README is.
     let name = |part: Option<&std::ffi::OsStr>| {
         part.and_then(|p| p.to_str())
             .map(str::to_ascii_lowercase)
@@ -1502,6 +1509,58 @@ mod tests {
         // A conventional name the extension lookup cannot see, because
         // `Path::extension` is `None` for it.
         assert_eq!(editor_language(Path::new("Makefile")), Language::Make);
+    }
+
+    /// The fence languages a Markdown document actually contains must have a
+    /// grammar compiled in.
+    ///
+    /// This is the test the manifest's grammar list exists for, and it guards a
+    /// non-obvious dependency: a ```rust block inside a README is highlighted
+    /// through the *same* cfg-gated grammars as a `.rs` file. `CodeBlock::styles`
+    /// reaches `SyntaxHighlighter::new(lang)`, which asks
+    /// `LanguageRegistry::singleton()`, which is built from `Language::all()`.
+    /// So trimming a grammar because "markturbo does not highlight other
+    /// languages' files" also un-highlights every fence in every document — the
+    /// opposite of what a Markdown workspace wants.
+    ///
+    /// The list below is the fence languages measured across this repository's
+    /// own Markdown, most frequent first. `Language::from_name` is `pub(crate)`
+    /// upstream, so this goes through `from_str`, which is the same table.
+    ///
+    /// A failure here means someone removed a grammar feature from
+    /// `Cargo.toml`. Restore it, or delete the fence language from this list
+    /// deliberately — do not "fix" it by asserting `Plain`.
+    #[test]
+    fn every_fence_language_used_in_documents_has_a_grammar() {
+        for (fence, expected) in [
+            ("rust", Language::Rust),
+            ("rs", Language::Rust),
+            ("bash", Language::Bash),
+            ("sh", Language::Bash),
+            ("toml", Language::Toml),
+            ("yaml", Language::Yaml),
+            ("yml", Language::Yaml),
+            ("json", Language::Json),
+            ("python", Language::Python),
+            ("py", Language::Python),
+            ("js", Language::JavaScript),
+            ("ts", Language::TypeScript),
+            ("html", Language::Html),
+            ("css", Language::Css),
+            ("md", Language::Markdown),
+        ] {
+            assert_eq!(
+                Language::from_str(fence),
+                expected,
+                "```{fence} lost its grammar — a fence in every document that \
+                 uses it now renders as flat text. See the grammar list in the \
+                 workspace Cargo.toml."
+            );
+        }
+
+        // `text` is the deliberate no-highlighting fence and must stay Plain,
+        // which is also what proves the assertions above are not vacuous.
+        assert_eq!(Language::from_str("text"), Language::Plain);
     }
 
     /// A text file must open in the editor, not in an empty preview.
