@@ -14,7 +14,7 @@ metadata:
 This is a real Agent Skill: a **directory** whose entry document is `SKILL.md`,
 not just a file with a particular name.
 
-Open the **Skills** tab in the sidebar to see its parsed metadata, the discovery
+Open the **Harness** tab in the sidebar to see its parsed metadata, the discovery
 root it was found under, and its supporting directories.
 
 ## Structure

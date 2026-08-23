@@ -35,8 +35,10 @@ explicitly, along with `font-kit` and `runtime_shaders`.
 
 > Only supports macOS and Windows currently.
 
-Its `build_as_child` path is compiled only for Windows, macOS, iOS, and Android.
-The crate is therefore a target-specific dependency here:
+`build_as_child` is not gated by a `cfg` — it compiles everywhere and documents
+that it *panics* on Linux when `gtk::init` was not called on the thread. A
+compile-time gate is therefore ours to impose, which is why the crate is a
+target-specific dependency here:
 
 ```toml
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
@@ -74,7 +76,7 @@ cargo run --release
 On Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libssl-dev \
+sudo apt install build-essential pkg-config \
   libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
   libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
   libasound2-dev libfontconfig-dev libvulkan-dev
@@ -85,6 +87,27 @@ cargo run --release
 ```
 
 Vulkan drivers are required — gpui renders through Vulkan on Linux.
+
+No TLS development package is listed, and that is deliberate: the translation
+client is built on `rustls` with the `ring` provider, so nothing links OpenSSL.
+The only match for "openssl" in the graph is `openssl-probe`, which reads the
+system certificate *paths* and links nothing.
+
+## Where settings live
+
+`dirs::config_dir()` decides, so each platform gets its own convention rather
+than an XDG answer imposed on all three:
+
+| Platform | Path |
+|---|---|
+| Windows | `%APPDATA%\markturbo\settings.toml` (Roaming) |
+| macOS | `~/Library/Application Support/markturbo/settings.toml` |
+| Linux | `$XDG_CONFIG_HOME/markturbo/settings.toml`, else `~/.config/markturbo/settings.toml` |
+
+`$MARKTURBO_CONFIG_DIR` overrides all three. The macOS row is the one worth
+noting: this used to be `~/.config/markturbo`, which is the XDG answer on a
+platform that is not XDG — a file there is invisible to every macOS convention
+for finding, backing up, or migrating application data.
 
 ## Optional per-platform tooling
 

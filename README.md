@@ -109,13 +109,56 @@ translation reports that it is unconfigured rather than pretending to run —
 there is no offline stand-in that could stand in for a translation without lying
 about it.
 
+A base URL must include the version segment — `http://localhost:11434/v1`, not
+`http://localhost:11434`. Only the leaf path is appended, so one without it
+reaches an endpoint that is not there.
+
+## Settings
+
+Settings are a TOML file, written when something changes:
+
+| Platform | Path |
+|---|---|
+| Windows | `%APPDATA%\markturbo\settings.toml` |
+| macOS | `~/Library/Application Support/markturbo/settings.toml` |
+| Linux | `$XDG_CONFIG_HOME/markturbo/settings.toml`, else `~/.config/markturbo/settings.toml` |
+
+TOML because the file is meant to be opened: it takes comments, and it does not
+fail on a trailing comma. `$MARKTURBO_CONFIG_DIR` overrides the directory, which
+is what keeps a portable install — and the test suite — out of the real one.
+
+Every environment variable the app reads:
+
+| Variable | Effect |
+|---|---|
+| `ANTHROPIC_API_KEY` | Key for the Anthropic Messages provider, if none is set in Settings |
+| `OPENAI_API_KEY` | Key for both OpenAI providers, likewise |
+| `MARKTURBO_TRANSLATE_MODEL` | Model id, if none is set in Settings |
+| `MARKTURBO_CONFIG_DIR` | Overrides where `settings.toml` lives |
+| `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug` |
+
+A value in Settings always outranks the environment. Nothing else is read —
+there is no hidden configuration.
+
 ## Security
 
-MDX can contain executable code. The WebView loads content from an opaque
-`data:` origin under a CSP that blocks **all** network access at both trust
-levels; `Restricted` (the default for every document) also blocks scripts.
-Trusting a document is an explicit per-document action and never opens the
-network.
+MDX can contain executable code, and a local HTML file can reference its own
+directory. Every document markturbo renders itself is served to the WebView from
+an opaque `data:` origin under a CSP that blocks **all** network access;
+`Restricted` — the default for every document — also blocks scripts.
+
+Trust is explicit and per-document, and it means something different for each of
+the two kinds:
+
+| | Restricted (default) | Trusted |
+|---|---|---|
+| Markdown / MDX | `data:` origin, no scripts, no network | `data:` origin, scripts run, still no network |
+| HTML | `data:` origin with an injected CSP | loaded from `file://` |
+
+The HTML row is the one to know: a trusted `.html` is loaded from disk so its
+relative images and stylesheets resolve, which is the whole reason to trust one
+— and that gives it a real origin rather than an opaque one. Trusting is never
+implicit, and no trust level lets a document markturbo renders reach the network.
 
 ## Keyboard
 
@@ -124,8 +167,14 @@ network.
 | `Ctrl/Cmd+O` | Open folder |
 | `Ctrl/Cmd+S` | Save |
 | `Ctrl/Cmd+W` | Close tab |
+| `Ctrl/Cmd+,` | Settings |
 | `Ctrl/Cmd+F` | Find in editor |
+| `Ctrl/Cmd+Shift+F` | Search the workspace |
 | `Ctrl/Cmd+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl/Cmd+B` | Side panel |
+| `Ctrl/Cmd+Alt+B` | Details panel |
+| `Alt+Left` / `Ctrl+Alt+-` | Back |
+| `Alt+Right` / `Ctrl+Alt+Shift+-` | Forward |
 | `Ctrl/Cmd+Shift+T` | Translate document |
 | `Ctrl/Cmd+Shift+L` | Translate selection |
 | `Ctrl/Cmd+Shift+B` | Translate block at cursor |
@@ -136,11 +185,14 @@ network.
 cargo test --release
 ```
 
-435 tests across 11 binaries, over checked-in fixtures in `fixtures/`: Markdown
+443 tests across 11 binaries, over checked-in fixtures in `fixtures/`: Markdown
 constructs including CJK and Unicode, valid and invalid examples of each diagram
 technology, MDX (Markdown-only, components, invalid, untrusted), skills (valid,
 missing metadata, malformed YAML, nested, multiple roots, name collisions),
 filesystem round-trips, and ~10K/~100K-line performance documents.
+
+`--release` is the gate rather than a preference: two performance tests assert
+wall-clock bounds that a debug build cannot meet.
 
 ## License
 

@@ -22,6 +22,7 @@ Filesystem
 │   doctype    what kind of artifact       │
 │   frontmatter YAML header extraction     │
 │   doc        source + blocks + outline   │
+│   outline    headings + MDX structure    │
 │   block      renderer dispatch keys      │
 │   diagnostic problems, never panics      │
 │   skill      Agent Skills model          │
@@ -146,13 +147,34 @@ the authority on JS validity.
 
 ### Trust boundary
 
-MDX can contain executable code, so the boundary had to be decided now even
-though no runtime ships in v0.1. Content is served to the WebView as a `data:`
-URL — an opaque origin with no filesystem access, no `file://` reach, and no
-ambient credentials — under a CSP where `default-src 'none'` blocks **all**
-network access at both trust levels. `Restricted`, the default for every
-document, additionally blocks scripts. Trusting is explicit and per-document,
-and never opens the network.
+MDX can contain executable code and a local HTML file can reference its own
+directory, so the boundary had to be decided now even though no MDX runtime
+ships in v0.1.
+
+Everything markturbo *renders itself* is served to the WebView as a `data:` URL
+— an opaque origin with no filesystem access, no `file://` reach, and no ambient
+credentials — under a CSP where `default-src 'none'` blocks **all** network
+access at both trust levels. `Restricted`, the default for every document,
+additionally blocks scripts.
+
+Trust is explicit and per-document, and it grants a different power to each of
+the two types it applies to:
+
+| | Restricted | Trusted |
+|---|---|---|
+| MDX | `data:`, no scripts, no network | `data:`, scripts run, still no network |
+| HTML | `data:` with an injected CSP | `file://`, loaded from disk |
+
+The HTML row is the actual boundary, and it is deliberate: a trusted `.html` is
+loaded through `web::to_file_url` so its relative images and stylesheets
+resolve, which is the only reason a user would trust one. That gives it a real
+origin, read access to whatever the user can read, and whatever CSP the file
+itself carries — which may be none. `to_file_url`'s doc comment says so in those
+words, and `only_a_trusted_document_is_given_filesystem_access` pins it.
+
+So the honest summary is not "content can never reach anything". It is: nothing
+reaches the filesystem or the network unless the user trusted that specific
+document, and for HTML, trusting is exactly the act of handing it the disk.
 
 ### Save safety
 
@@ -174,6 +196,35 @@ file so the save re-encodes in it.
 `encoding_rs` has no UTF-16 *encoder* — `Encoding::encode` silently emits UTF-8
 for those two, which would write a UTF-8 body under a UTF-16 BOM and produce a
 file nothing can read. They encode their own code units instead.
+
+### Settings: a file a person opens
+
+Settings are TOML, at whatever `dirs::config_dir()` returns, plus `markturbo`.
+Both halves of that were once hand-rolled and both were changed for the same
+reason — the file is a user-facing artifact, not an internal cache.
+
+TOML over JSON because a settings file is something people edit: it takes
+comments, and it does not fail on a trailing comma. The format imposes one
+constraint on the code, which is worth knowing before adding a field: every
+scalar must be written before any table, so `AppSettings` must stay flat. A
+nested struct or map would serialize to a document `toml` itself refuses to read
+back. `the_settings_document_is_flat_enough_for_toml_to_read_back` holds that.
+
+The directory comes from `dirs` rather than four `cfg` branches. Windows and
+Linux land where they did; macOS moved from `~/.config/markturbo` to
+`~/Library/Application Support/markturbo`, which is the correction — macOS is
+not an XDG platform, and a file in `~/.config` there is invisible to every macOS
+convention for finding, backing up, or migrating application data.
+
+There is no migration. An existing `settings.json` is not read and not deleted;
+the user starts from defaults. That is the standing rule for this stage rather
+than an oversight, and the packaged `RUNNING.md` says so where a user will see
+it.
+
+`AppSettings::update` is the only writer, and `global_mut` already pushes a
+`NotifyGlobalObservers` effect — so the notification was always being sent and
+nobody was listening. A single `observe_global` subscription is the backstop for
+the writers that are not the settings page.
 
 ### Background parsing
 
@@ -245,15 +296,21 @@ live in this repository as hand-written request shapes and response extractors
 now lives upstream, where it is maintained.
 
 **The cost, stated plainly:** 41 crates that were not being compiled before,
-including `reqwest`, `tower`, `mio`, and `ring`. That is a real trade and it is
-bigger than the one this section originally declined to make.
+including `tokio`, `hyper`, `reqwest`, `tower`, `mio`, and `ring`. That is a
+real trade and it is bigger than the one this section originally declined to
+make.
 
-One thing makes it smaller than it looks, and the honest version says so:
-`tokio`, `hyper`, `h2` and `rustls` were already in the dependency graph, pulled
-in by `gpui-component-assets` through `zed-reqwest`. Measured across every
-target rather than just this one, the addition is 21 crates — the async stack
-was already paid for, and what is new is mostly the client on top of it. Two
-things bound the rest:
+An earlier draft of this paragraph claimed the async stack was already paid for
+— that `tokio`, `hyper` and `rustls` arrived via `gpui-component-assets` and so
+cost nothing here. That was wrong, and it is worth recording why, because the
+mistake is easy to repeat: `gpui-component-assets` declares `reqwest` only under
+`[target.'cfg(target_family = "wasm")']`, so on every target this application
+actually builds for, none of it was ever compiled. `cargo tree --target all`
+folds the wasm branch in and reports a smaller delta; measuring the target you
+ship is the only number that means anything. Measured on
+`x86_64-pc-windows-msvc`, the mt-app dependency set goes from 510 to 551.
+
+Two things bound it:
 
 - **No C toolchain.** `genai`'s default feature reaches `reqwest/rustls`, which
   selects `aws-lc-rs` and therefore `aws-lc-sys` — a C library needing `cmake`
@@ -303,7 +360,9 @@ Ordered by how cheap they are:
 - Live web preview pauses above 512KB; the editor and native preview stay live.
 - Closing a tab with unsaved edits discards them without a prompt. The file on
   disk is never touched.
-- Translation is the one feature that leaves the machine, and only when the user
-  invokes it with a key configured. It is unrelated to the WebView trust
-  boundary above: document *content* still cannot fetch anything at any trust
-  level. What crosses the wire is prose the user asked to have translated.
+- Translation is the one feature that leaves the machine *on its own*, and only
+  when the user invokes it with a key configured. What crosses the wire is prose
+  the user asked to have translated. Document content is separate: it cannot
+  fetch anything at any trust level — except a trusted HTML file, which is
+  loaded from `file://` outside markturbo's CSP and is therefore bounded by the
+  browser engine rather than by us. See the trust boundary above.

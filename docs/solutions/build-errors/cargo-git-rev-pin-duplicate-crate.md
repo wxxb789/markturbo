@@ -304,9 +304,26 @@ output.
 > `Cargo.lock`; `e0931d5a…` appears in neither, and that absence is precisely the point
 > being made above.
 
+## Does anything else in this graph have the same shape?
+
+Asked again after the workspace gained `genai`, `reqwest`, `rustls`, `tokio`,
+`toml`, `dirs`, `encoding_rs`, `chardetng`, and `tempfile` as direct
+dependencies. `cargo tree -d` reports duplicates, but a duplicate is only *this*
+bug when the two copies exchange types across an API boundary.
+
+Only one of the new dependencies is duplicated at all: `toml` resolves to both
+`0.8.23` and `1.1.4`. It is harmless, and for the reason that matters — the two
+never meet. `1.1.4` is reached as a build-dependency; `mt-app` and
+gpui-component's `rust-i18n-support` both link `0.8.23`, and no `toml` type
+crosses between this crate and any other. `gpui` itself is not duplicated,
+which is the invariant this document exists to protect.
+
+The general test, when adding a dependency to a workspace that already shares a
+git dependency: a duplicate matters if and only if one copy's types are passed
+into code compiled against the other. Version skew in a leaf crate is noise.
+
 ## Related Issues
 
 - `docs/platforms.md` — "Notes and caveats" carries a short operational form of this rule
   for someone setting up a build. This doc is the diagnosis-and-prevention version; that
   one is the heads-up.
-- No GitHub issue search was performed: this repository has no remote.

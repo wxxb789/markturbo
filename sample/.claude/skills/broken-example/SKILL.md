@@ -6,7 +6,7 @@ model: opus
 # Broken Example
 
 This skill is deliberately non-conformant, so you can see what validation
-reports. Open the **Skills** tab: it is flagged, and the inspector lists every
+reports. Open the **Harness** tab: it is flagged, and the inspector lists every
 problem.
 
 Three things are wrong:

@@ -127,13 +127,16 @@ or the whole document. Content outside the scope is left byte-identical.
 ## Trust
 
 ### Trust Level
-How much of a document's own content the Web Renderer is permitted to execute. Every
-document starts at the restricted level, on the premise that a file obtained by cloning a
+How much of a document's own content the Web Renderer is permitted to do. Every document
+starts at the restricted level, on the premise that a file obtained by cloning a
 repository is not automatically trustworthy; raising it is an explicit, per-document act.
 
-*Subresource* network access is refused at every level — trusted content may execute but
-cannot fetch or load anything remote. Top-level navigation is not currently constrained,
-so the boundary limits what content can *load*, not everything it could reach.
+What trust grants depends on the document type, and the difference is the whole boundary.
+For MDX it is script execution, still under a policy that refuses all *subresource*
+network access — trusted content may run but cannot fetch or load anything remote. For a
+local HTML file it is instead the filesystem: the file is loaded from disk rather than
+from an opaque origin, so its own relative images and stylesheets resolve, which is the
+only reason to trust one. That also places it outside the policy above.
 
 ## View
 
@@ -145,10 +148,14 @@ appears once a split is chosen.
 
 ### Preview Tab
 The single slot a browsed-but-not-committed document occupies. One click opens a document
-there and the next click reuses that slot; editing it, or opening it deliberately,
-promotes it to an ordinary tab. Reading down a tree or a result list therefore does not
-leave forty tabs behind. The slot names a path rather than a position, so it survives
-tabs closing beside it.
+there and the next click reuses that slot, so reading down a tree or a result list does
+not leave forty tabs behind. Opening the same document deliberately — a double click —
+takes it out of the slot and makes it an ordinary tab.
+
+Unsaved edits are protected at the moment of replacement rather than by promotion: when
+an incoming preview would evict one that is dirty, the dirty tab is kept and simply stops
+being the preview. The slot names a path rather than a position, so it survives tabs
+closing beside it, and closing the previewed tab itself empties it.
 
 ## Dependencies
 

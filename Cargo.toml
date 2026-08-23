@@ -60,10 +60,12 @@ dirs = "6"
 wry = { version = "0.53.3", package = "lb-wry" }
 smol = "2"
 tempfile = "3"
-# The translation transport. Pulls reqwest and its stack (41 crates that were
-# not compiled before; tokio and hyper were already here via gpui), which is
-# the price of not hand-writing three request shapes and three response shapes
-# per provider — genai owns both, and keeps owning them as APIs drift.
+# The translation transport. Pulls reqwest and its stack — 41 crates that were
+# not compiled before, measured on x86_64-pc-windows-msvc (510 -> 551). tokio
+# and hyper are among them: gpui-component-assets declares reqwest only under
+# `cfg(target_family = "wasm")`, so none of it built on a desktop target.
+# `cargo tree --target all` folds that wasm branch in and reports a smaller
+# delta; it is not the number you ship.
 #
 # `default-features = false` to escape `rustls-tls`, which selects `aws-lc-rs`
 # and therefore `aws-lc-sys` — a C library needing cmake and nasm. The two

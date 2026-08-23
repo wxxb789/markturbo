@@ -204,9 +204,15 @@ doing something that looks like a translation and is not.
 | Linux | `$XDG_CONFIG_HOME/markturbo/settings.toml`, else `~/.config/markturbo/settings.toml` |
 
 Set `MARKTURBO_CONFIG_DIR` to put it somewhere else — useful for a portable
-install. The file is plain JSON and safe to edit by hand; if it cannot be
-parsed, markturbo logs a warning, starts with defaults, and leaves your file
-alone rather than overwriting it.
+install. The file is TOML and meant to be edited by hand: it takes comments, and
+it does not fail on a trailing comma. If it cannot be parsed, markturbo logs a
+warning, starts with defaults, and leaves your file alone rather than
+overwriting it.
+
+Upgrading from an earlier build: the settings file used to be `settings.json`,
+and on macOS it used to live in `~/.config/markturbo`. Neither is read any more.
+Nothing is lost — the old file is left where it is — but the settings in it are
+not carried over.
 
 **Appearance** — twelve preset themes, six light and six dark:
 
