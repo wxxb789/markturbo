@@ -198,7 +198,7 @@ fn cache() -> &'static Mutex<HashMap<String, RenderOutcome>> {
 ///
 /// `mathjax-svg-rs` builds its JS engine lazily behind a `OnceLock` and parses
 /// the whole MathJax bundle the first time anything asks it to render. Measured
-/// on this machine at **~640ms**, against ~60ms for every formula after it —
+/// on this machine at **~870ms**, against ~50ms for every formula after it —
 /// and that first bill lands on whoever opens the first document containing a
 /// formula, which reads as "clicking a file in the tree takes a second".
 ///
@@ -890,7 +890,7 @@ mod tests {
     /// Warming up must be non-blocking and must leave the engine usable.
     ///
     /// The cost it moves is real and measured: MathJax's engine start-up is
-    /// ~640ms on this machine, against ~60ms per formula afterwards. What the
+    /// ~870ms on this machine, against ~50ms per formula afterwards. What the
     /// test pins is the two properties that make moving it safe — the call
     /// returns immediately, and a render after it still produces SVG rather
     /// than tripping over a half-initialized engine.

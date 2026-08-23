@@ -93,7 +93,7 @@ fn main() {
         }
     };
 
-    // Before the window, so MathJax's ~640ms engine start-up overlaps with it
+    // Before the window, so MathJax's ~870ms engine start-up overlaps with it
     // rather than landing on the first document that contains a formula.
     mt_app::renderer::warm_up();
 
