@@ -152,10 +152,18 @@ pub fn search_text(path: &Path, text: &str, query: &Query, limit: usize, out: &m
     let mut offset = 0usize;
     for (index, line_text) in text.split_inclusive('\n').enumerate() {
         let line_number = index + 1;
-        let haystack = if query.case_sensitive {
-            line_text.to_string()
+        // `Cow`, not `String`: a case-sensitive search needs no copy at all —
+        // it can search the borrowed line directly — and an all-ASCII line
+        // with no uppercase already *is* its own lowercase. Only a line that
+        // actually changes under `to_lowercase` gets allocated. The old
+        // spelling allocated a `String` per line in both branches, which on a
+        // 100K-line document is 100K allocations to find nothing.
+        let borrowable = query.case_sensitive
+            || (line_text.is_ascii() && !line_text.bytes().any(|b| b.is_ascii_uppercase()));
+        let haystack: std::borrow::Cow<'_, str> = if borrowable {
+            std::borrow::Cow::Borrowed(line_text)
         } else {
-            line_text.to_lowercase()
+            std::borrow::Cow::Owned(line_text.to_lowercase())
         };
 
         // Byte indices into the lowercased line map back onto the original only
