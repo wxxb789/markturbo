@@ -48,8 +48,26 @@ Fixed constraints, set by the user and not open for re-litigation:
   by building the extensions once in `DocumentView::new` and cloning per frame.
   Measured over 60s with no user input on a 4,228-byte document: 300-750% CPU
   before, 0-1.2% after.
+- [03 — The WebView covers every GPUI overlay in Web mode](issues/03-webview-covers-overlays.md):
+  the WebView is an OS child window above everything GPUI draws, so the layout
+  menu was both invisible and unclickable. Fixed by hiding it while an overlay
+  is open. The `RefCell already borrowed` flood is a separate, upstream problem
+  in gpui's own frame loop and is not fixed.
 
 ## Not yet specified
+
+- **DirectComposition, and the Z-order it decides.** `main.rs` disables it so
+  the WebView is visible at all; the price is that the child window is then
+  permanently above GPUI, which is what ticket 03 works around by hiding it.
+  Putting both surfaces in one Z-order would remove the workaround and the
+  blank-preview cost with it — but it is a change to the gpui/wry integration,
+  and the comment in `main.rs` notes that gpui-component's own webview example
+  does not solve it either.
+- **`ERROR gpui::window RefCell already borrowed`.** WebView2 pumps messages and
+  re-enters the window procedure mid-draw; gpui's `request_frame` callback takes
+  the borrow infallibly and drops the frame. This project already solved the
+  same hazard at its own layer (`views::try_update`), but gpui's internal draw
+  path is not reachable from here. Needs an upstream patch or issue.
 
 - **macOS and Linux.** Every number in this effort is from one Windows machine
   with no GPU. Whether the memory floor, the binary arithmetic, and the diagram

@@ -530,6 +530,7 @@ impl Workspace {
                         cx,
                     ),
                     DocumentEvent::DirtyChanged => cx.notify(),
+                    DocumentEvent::OverlayOpen(open) => this.overlay_changed(*open, cx),
                 },
             ),
             // A document notifies on mode change, trust change, and after a

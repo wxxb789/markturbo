@@ -15,7 +15,8 @@ use gpui_component::{
     h_flex,
     highlighter::Language,
     input::{Editor, EditorState, InputEvent, TabSize},
-    menu::DropdownMenu as _,
+    menu::PopupMenu,
+    popover::Popover,
     resizable::{h_resizable, resizable_panel},
     text::{TextView, TextViewState, TextViewStyle},
     v_flex,
@@ -78,6 +79,12 @@ pub enum DocumentEvent {
     Conflict,
     /// Something worth telling the user.
     Status(String),
+    /// A GPUI overlay opened (`true`) or closed (`false`) over the document.
+    ///
+    /// The workspace hides the WebView while one is open. It has to be an event
+    /// rather than something the document handles itself: the WebView belongs to
+    /// the window, not to the tab — see `workspace::web_surface`.
+    OverlayOpen(bool),
 }
 
 pub struct DocumentView {
@@ -780,19 +787,32 @@ impl DocumentView {
             // one value and opens to reveal the rest is the honest shape — and
             // the old toggle only appeared once Split was selected, which hid
             // half the choices behind the other half.
-            .child(
-                Button::new("layout")
-                    .label(i18n::t(self.layout.label_key(), cx))
-                    .icon(IconName::ChevronDown)
-                    .xsmall()
-                    .ghost()
-                    .tooltip(i18n::t(i18n::Key::ViewLayout, cx))
-                    .dropdown_menu({
-                        let current = self.layout;
-                        // Only the layouts this document can actually be shown
-                        // in: offering Native for a `.rs` offers a blank pane.
-                        let available = Layout::available_for(doc_type);
-                        move |menu, _window, _cx| {
+            //
+            // Built from `Popover` rather than `Button::dropdown_menu`, which is
+            // otherwise the same thing: only `Popover` exposes `on_open_change`,
+            // and the workspace needs that to hide the WebView while the menu is
+            // up. The child window is above everything GPUI draws, so without it
+            // this menu is covered by the preview and its clicks are eaten. See
+            // `workspace::web_surface::WebSurface::overlays`.
+            .child({
+                let current = self.layout;
+                // Only the layouts this document can actually be shown in:
+                // offering Native for a `.rs` offers a blank pane.
+                let available = Layout::available_for(doc_type);
+                Popover::new("layout")
+                    .appearance(false)
+                    .overlay_closable(false)
+                    .anchor(Anchor::TopLeft)
+                    .trigger(
+                        Button::new("layout")
+                            .label(i18n::t(self.layout.label_key(), cx))
+                            .icon(IconName::ChevronDown)
+                            .xsmall()
+                            .ghost()
+                            .tooltip(i18n::t(i18n::Key::ViewLayout, cx)),
+                    )
+                    .content(move |_, window, cx| {
+                        PopupMenu::build(window, cx, move |menu, _window, _cx| {
                             available.iter().fold(menu, |menu, layout| {
                                 menu.menu_with_check(
                                     i18n::text(
@@ -803,9 +823,12 @@ impl DocumentView {
                                     layout_action(*layout),
                                 )
                             })
-                        }
-                    }),
-            )
+                        })
+                    })
+                    .on_open_change(cx.listener(|_, open: &bool, _, cx| {
+                        cx.emit(DocumentEvent::OverlayOpen(*open));
+                    }))
+            })
             .child(div().flex_1())
             // Document type is a first-class label: an AGENTS.md is not just
             // "a Markdown file".

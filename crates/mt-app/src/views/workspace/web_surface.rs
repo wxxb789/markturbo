@@ -68,6 +68,27 @@ pub(super) struct WebSurface {
     /// content on every frame.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     current: Option<String>,
+    /// Number of GPUI overlays currently open over the document.
+    ///
+    /// The WebView is an OS child window, and this application disables
+    /// DirectComposition on Windows (`main.rs`) so that the child window is
+    /// visible through GPUI's swap chain at all. The cost of that trade is the
+    /// reverse: the child window is *always* above GPUI, and it does not
+    /// participate in GPUI's Z-order. Anything GPUI draws over the document —
+    /// a dropdown menu, a context menu, a tooltip — is covered by it, and the
+    /// clicks land on the WebView rather than on the menu.
+    ///
+    /// Measured on this machine with an HTML document open in Web: the window
+    /// spans `317,123` to `1731,1030` and the `WRY_WEBVIEW` child spans
+    /// `552,202` by `912x796`. A hit test walking down the toolbar's column
+    /// returns `Zed::Window` through y=198 and `Chrome_RenderWidgetHostHWND`
+    /// from y=203 — so the trigger button is clickable and the menu that opens
+    /// beneath it is not.
+    ///
+    /// A counter rather than a flag: overlays nest (a menu can open a submenu),
+    /// and the first one to close must not reveal the WebView under the second.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    overlays: usize,
 }
 
 impl WebSurface {
@@ -126,12 +147,58 @@ impl Workspace {
         self.web.mark_dirty(cx);
     }
 
+    /// Note that a GPUI overlay opened or closed over the document.
+    ///
+    /// The WebView is hidden while any overlay is open, because it is an OS
+    /// child window that sits above everything GPUI draws — see
+    /// [`WebSurface::overlays`] for the measurement. Hiding it is what makes a
+    /// dropdown menu both visible and clickable in Web and Split Web.
+    ///
+    /// `gpui_wry::WebView::hide` also calls `focus_parent`, which is the other
+    /// half: without it the menu is visible but the keyboard still belongs to
+    /// the browser process.
+    ///
+    /// The preview blanks for as long as the menu is open. That is the accepted
+    /// cost of this fix; the alternative — moving the child window off-screen —
+    /// makes WebView2 treat itself as occluded and stop rendering, which trades
+    /// a blank pane for a stale one.
+    pub(super) fn overlay_changed(&mut self, open: bool, cx: &mut Context<Self>) {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let before = self.web.overlays;
+            self.web.overlays = if open {
+                before.saturating_add(1)
+            } else {
+                // Saturating rather than wrapping: a close without a matching
+                // open would otherwise leave the count at `usize::MAX` and hide
+                // the preview for the rest of the session.
+                before.saturating_sub(1)
+            };
+            // Only the transitions matter. A submenu opening over a menu must
+            // not re-hide an already-hidden WebView, and the outer menu closing
+            // must not reveal it while the inner one is still up.
+            if (before == 0) != (self.web.overlays == 0) {
+                self.web_dirty(cx);
+            }
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            let _ = (open, cx);
+        }
+    }
+
     /// What the WebView should be showing, as a pure read of current state.
     ///
     /// Separated from applying it because deciding is safe during a draw and
     /// applying is not — see [`Self::sync_webview`].
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn webview_intent(&self, cx: &App) -> WebIntent {
+        // An open menu, context menu or tooltip is drawn by GPUI and would be
+        // underneath the child window. Hiding beats drawing a menu the user
+        // cannot see or click.
+        if self.web.overlays > 0 {
+            return WebIntent::Hide;
+        }
         // The WebView is an OS child window drawn over GPUI's surface, not an
         // element in the tree — it would float on top of the settings page.
         if self.settings_open {
@@ -302,6 +369,92 @@ mod tests {
             "the deferred callback can land mid-draw, so it must take the \
              window through `with_window`'s `try_borrow_mut` and report the \
              conflict rather than aborting"
+        );
+    }
+
+    /// An open overlay must hide the WebView, and nested overlays must not
+    /// uncover it early.
+    ///
+    /// A source-level check because the failure needs a real WebView2 runtime
+    /// and a real click. What it guards is measurable, though: with an HTML
+    /// document open in Web on this machine, the window spans `317,123` to
+    /// `1731,1030` and the `WRY_WEBVIEW` child spans `552,202` by `912x796`.
+    /// `WindowFromPoint` walking down the toolbar's column returns
+    /// `Zed::Window` through y=198 and `Chrome_RenderWidgetHostHWND` from
+    /// y=203 — so the trigger is clickable and every row of the menu that
+    /// opens under it is not.
+    #[test]
+    fn an_open_overlay_hides_the_webview() {
+        let source = crate::views::production_source(include_str!("web_surface.rs"));
+
+        let start = source
+            .find("fn overlay_changed")
+            .expect("overlay_changed must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// What the WebView")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("saturating_add") && body.contains("saturating_sub"),
+            "the overlay count must saturate: a close without a matching open \
+             would wrap to usize::MAX and hide the preview for the session"
+        );
+        assert!(
+            body.contains("(before == 0) != (self.web.overlays == 0)"),
+            "only the transitions may sync — a submenu opening over a menu \
+             must not re-hide an already-hidden WebView, and the outer menu \
+             closing must not reveal it while the inner one is still up"
+        );
+
+        let start = source
+            .find("fn webview_intent")
+            .expect("webview_intent must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Apply the current")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("if self.web.overlays > 0"),
+            "the intent must be Hide while an overlay is open; the child window \
+             is above everything GPUI draws and eats the clicks meant for it"
+        );
+    }
+
+    /// The layout dropdown must report its open state.
+    ///
+    /// `Button::dropdown_menu` is otherwise the same control and is the obvious
+    /// simplification, which is exactly why this is pinned: it does not expose
+    /// `on_open_change`, so switching back to it silently restores a menu the
+    /// user can see but not click in Web and Split Web.
+    #[test]
+    fn the_layout_menu_reports_when_it_opens() {
+        let source = crate::views::production_source(include_str!("../document.rs"));
+        let start = source
+            .find("fn render_toolbar")
+            .expect("render_toolbar must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// The banner shown")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("on_open_change"),
+            "the layout menu must tell the workspace when it opens, or the \
+             WebView stays on top of it"
+        );
+        assert!(
+            body.contains("DocumentEvent::OverlayOpen"),
+            "the report goes to the workspace as an event: the WebView belongs \
+             to the window, not to the tab"
+        );
+        assert!(
+            !body.contains(".dropdown_menu("),
+            "`dropdown_menu` does not expose `on_open_change`; using it leaves \
+             the menu covered by the WebView child window"
         );
     }
 
