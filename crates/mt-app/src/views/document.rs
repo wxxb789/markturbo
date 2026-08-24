@@ -89,6 +89,25 @@ pub struct DocumentView {
     editor: Entity<EditorState>,
     /// Native preview state. Rebuilt from `document` on reparse.
     preview: Entity<TextViewState>,
+    /// The diagram/math block extensions handed to the preview's `TextView`.
+    ///
+    /// Built once and cloned per frame, never rebuilt in `render`. Upstream
+    /// stamps every `MarkdownExtensions` with a process-global revision on
+    /// construction (`markdown_ext.rs`, an `AtomicU64::fetch_add` inside
+    /// `push_block_parser`), and `TextViewState::set_markdown_extensions`
+    /// short-circuits only when the revision it already holds matches. A fresh
+    /// one per frame therefore never matches: every frame reparsed the whole
+    /// document and re-ran the registry over every fence.
+    ///
+    /// Above upstream's 4 KiB `MAX_SYNC_FULL_REPLACE_BYTES` the reparse goes
+    /// async and ends with a `cx.notify()`, which redraws, which reparses —
+    /// a self-sustaining loop. Measured on the release binary with no user
+    /// input, a 4,200-byte document burned 251% of a core indefinitely while a
+    /// 4,000-byte one sat at 0.2%.
+    ///
+    /// `Clone` copies the revision rather than minting a new one, which is what
+    /// makes the guard match from the second frame onwards.
+    preview_extensions: gpui_component::text::MarkdownExtensions,
     layout: Layout,
     trust: Trust,
     dirty: bool,
@@ -176,6 +195,7 @@ impl DocumentView {
             document,
             editor,
             preview,
+            preview_extensions: diagram_extensions(registry.clone()),
             layout,
             trust: Trust::Restricted,
             dirty: false,
@@ -897,7 +917,6 @@ impl DocumentView {
     /// renderer for diagrams and math. That registry — not a hard-coded match
     /// on "mermaid" — is what makes another technology a registration.
     fn render_native_preview(&self, cx: &Context<Self>) -> impl IntoElement {
-        let registry = self.registry.clone();
         let diagnostics = self.render_diagnostics(cx);
 
         v_flex()
@@ -909,7 +928,10 @@ impl DocumentView {
                     .style(preview_style(cx))
                     .selectable(true)
                     .scrollable(true)
-                    .markdown_extensions(crate::views::document::diagram_extensions(registry))
+                    // Cloned, never rebuilt: a fresh `MarkdownExtensions` here
+                    // carries a new revision and defeats upstream's guard, which
+                    // reparses the whole document every frame. See the field.
+                    .markdown_extensions(self.preview_extensions.clone())
                     .flex_1()
                     .p_5(),
             )
@@ -1361,6 +1383,57 @@ mod tests {
         assert!(
             source.contains("pub fn set_webview"),
             "the workspace needs a way to lend the WebView to the active tab"
+        );
+    }
+
+    /// The native preview must reuse one `MarkdownExtensions`, never build one
+    /// in `render`.
+    ///
+    /// A source-level check because the failure needs a real window and a
+    /// document over 4 KiB: below that threshold upstream parses synchronously
+    /// and the waste is merely a full reparse per frame; above it the parse goes
+    /// async, ends in `cx.notify()`, and the notify schedules the frame that
+    /// starts the next parse. Measured on the release binary with no user input
+    /// at all, a 4,200-byte document held 251% of a core indefinitely while a
+    /// 4,000-byte one sat at 0.2%.
+    ///
+    /// The mechanism is upstream and invisible from here:
+    /// `MarkdownExtensions::push_block_parser` calls `bump_revision`, which is
+    /// `MARKDOWN_EXTENSIONS_REVISION.fetch_add(1, Relaxed)` on a process-global
+    /// `AtomicU64`. `TextViewState::set_markdown_extensions` returns early only
+    /// when the revision matches the one it holds, so a value built fresh in
+    /// `render` can never match — while a `Clone` of one built once copies the
+    /// revision and matches from the second frame on.
+    #[test]
+    fn the_native_preview_does_not_rebuild_its_extensions_per_frame() {
+        let source = crate::views::production_source(include_str!("document.rs"));
+        let start = source
+            .find("fn render_native_preview")
+            .expect("the native preview renderer");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Inline diagnostics")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            !body.contains("diagram_extensions("),
+            "`render_native_preview` runs every frame and must not call \
+             `diagram_extensions`: each call mints a new global revision, which \
+             defeats upstream's `set_markdown_extensions` guard and reparses the \
+             whole document every frame. Clone `self.preview_extensions` instead."
+        );
+        assert!(
+            body.contains("self.preview_extensions.clone()"),
+            "the preview must reuse the extensions built in `new`; `Clone` \
+             copies the revision, which is what lets the guard match"
+        );
+        // And it is built exactly once, where the cost is paid per document
+        // rather than per frame.
+        assert_eq!(
+            source.matches("diagram_extensions(registry").count(),
+            1,
+            "`diagram_extensions` must be called once, from `DocumentView::new`"
         );
     }
 
