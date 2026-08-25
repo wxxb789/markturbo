@@ -14,8 +14,9 @@
 //!   vendors add their own (`model`, `paths`, `icon`, …) to otherwise valid
 //!   skills.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::frontmatter;
@@ -53,7 +54,7 @@ pub struct SkillMeta {
 }
 
 /// A discovered skill: a directory whose entry document is `SKILL.md`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     /// The skill directory.
     pub dir: PathBuf,
@@ -493,6 +494,164 @@ impl Discovery {
     }
 }
 
+/// Parsed global discovery results that survive ordinary refreshes.
+///
+/// Workspace roots are deliberately not cached: their watcher events describe
+/// the project the user is actively editing, and their scan is already cheap.
+/// Global roots are the expensive part, so each one is reused only while every
+/// directory visited by the previous walk and every discovered entry document
+/// still has the same filesystem stamp.
+#[derive(Debug, Default)]
+pub struct DiscoveryCache {
+    global_roots: BTreeMap<PathBuf, CachedRoot>,
+    #[cfg(test)]
+    global_scans: usize,
+}
+
+impl DiscoveryCache {
+    /// Force the next discovery to rescan every global root.
+    pub fn clear(&mut self) {
+        self.global_roots.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedRoot {
+    fingerprint: RootFingerprint,
+    skills: Vec<KeyedSkill>,
+}
+
+#[derive(Debug, Clone)]
+struct KeyedSkill {
+    canonical_dir: PathBuf,
+    skill: Skill,
+}
+
+#[derive(Debug, Clone)]
+enum RootFingerprint {
+    Missing,
+    Present {
+        canonical_root: PathBuf,
+        directories: Vec<PathStamp>,
+        entries: Vec<PathStamp>,
+    },
+}
+
+impl RootFingerprint {
+    fn matches(&self, root: &Path) -> bool {
+        match self {
+            Self::Missing => match std::fs::metadata(root) {
+                Ok(metadata) => !metadata.is_dir(),
+                Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+            },
+            Self::Present {
+                canonical_root,
+                directories,
+                entries,
+            } => {
+                std::fs::canonicalize(root).ok().as_ref() == Some(canonical_root)
+                    && directories.iter().all(PathStamp::matches_directory)
+                    && entries.iter().all(PathStamp::matches_file)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathStamp {
+    path: PathBuf,
+    modified: SystemTime,
+    len: Option<u64>,
+}
+
+impl PathStamp {
+    fn directory(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            modified: metadata.modified().ok()?,
+            len: None,
+        })
+    }
+
+    fn file(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            modified: metadata.modified().ok()?,
+            len: Some(metadata.len()),
+        })
+    }
+
+    fn matches_directory(&self) -> bool {
+        Self::directory(&self.path).as_ref() == Some(self)
+    }
+
+    fn matches_file(&self) -> bool {
+        Self::file(&self.path).as_ref() == Some(self)
+    }
+}
+
+struct FingerprintBuilder {
+    canonical_root: Option<PathBuf>,
+    directories: Vec<PathStamp>,
+    entries: Vec<PathStamp>,
+    cacheable: bool,
+}
+
+impl FingerprintBuilder {
+    fn new(root: &Path) -> Self {
+        Self {
+            canonical_root: std::fs::canonicalize(root).ok(),
+            directories: Vec::new(),
+            entries: Vec::new(),
+            cacheable: true,
+        }
+    }
+
+    fn record_directory(&mut self, path: &Path) -> bool {
+        match PathStamp::directory(path) {
+            Some(stamp) => {
+                self.directories.push(stamp);
+                true
+            }
+            None => {
+                self.cacheable = false;
+                false
+            }
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.cacheable = false;
+    }
+
+    fn record_entry(&mut self, before: Option<PathStamp>, path: &Path, read_ok: bool) {
+        let after = PathStamp::file(path);
+        match (read_ok, before, after) {
+            (true, Some(before), Some(after)) if before == after => self.entries.push(after),
+            _ => self.cacheable = false,
+        }
+    }
+
+    fn finish(self) -> Option<RootFingerprint> {
+        if !self.cacheable {
+            return None;
+        }
+        Some(RootFingerprint::Present {
+            canonical_root: self.canonical_root?,
+            directories: self.directories,
+            entries: self.entries,
+        })
+    }
+}
+
 /// Discover skills under `workspace`.
 ///
 /// Searches the workspace's own conventional directories only. Use
@@ -509,21 +668,157 @@ pub fn discover(workspace: &Path) -> Vec<Skill> {
 /// visited, matching the documented "shallower shadows nested" rule. Results
 /// are sorted by origin then name so the explorer is stable across runs.
 pub fn discover_with(workspace: &Path, options: Discovery) -> Vec<Skill> {
+    let workspace_roots: Vec<PathBuf> = crate::harness::project_roots()
+        .into_iter()
+        .map(|root| workspace.join(rel_path(root)))
+        .collect();
+    let global_roots = options
+        .global
+        .then(crate::harness::global_roots)
+        .unwrap_or_default();
+
+    discover_uncached(&workspace_roots, &global_roots, options.include_internal)
+}
+
+/// Discover skills while reusing unchanged global roots.
+pub fn discover_with_cache(
+    workspace: &Path,
+    options: Discovery,
+    cache: &mut DiscoveryCache,
+) -> Vec<Skill> {
+    let workspace_roots: Vec<PathBuf> = crate::harness::project_roots()
+        .into_iter()
+        .map(|root| workspace.join(rel_path(root)))
+        .collect();
+    let global_roots = options
+        .global
+        .then(crate::harness::global_roots)
+        .unwrap_or_default();
+
+    discover_from_roots(
+        &workspace_roots,
+        &global_roots,
+        options.include_internal,
+        cache,
+    )
+}
+
+fn discover_uncached(
+    workspace_roots: &[PathBuf],
+    global_roots: &[PathBuf],
+    include_internal: bool,
+) -> Vec<Skill> {
     let mut found = Found::default();
 
-    for root_rel in crate::harness::project_roots() {
-        let root = workspace.join(rel_path(root_rel));
-        walk(&root, &root, Origin::Workspace, 0, &mut found);
+    for root in workspace_roots {
+        walk(root, root, Origin::Workspace, 0, &mut found, None);
     }
 
-    if options.global {
-        for root in crate::harness::global_roots() {
-            walk(&root, &root, Origin::Global, 0, &mut found);
+    for root in global_roots {
+        walk(root, root, Origin::Global, 0, &mut found, None);
+    }
+
+    finish_discovery(found, include_internal)
+}
+
+fn discover_from_roots(
+    workspace_roots: &[PathBuf],
+    global_roots: &[PathBuf],
+    include_internal: bool,
+    cache: &mut DiscoveryCache,
+) -> Vec<Skill> {
+    // Turning global discovery off is a view choice, not an invalidation. Keep
+    // the snapshots so turning it back on does not cold-scan every harness.
+    if !global_roots.is_empty() {
+        cache
+            .global_roots
+            .retain(|root, _| global_roots.contains(root));
+    }
+
+    let mut found = Found::default();
+    for root in workspace_roots {
+        walk(root, root, Origin::Workspace, 0, &mut found, None);
+    }
+
+    for root in global_roots {
+        for keyed in cached_root(root, cache) {
+            found.insert_keyed(keyed.canonical_dir, keyed.skill);
         }
     }
 
+    finish_discovery(found, include_internal)
+}
+
+fn cached_root(root: &Path, cache: &mut DiscoveryCache) -> Vec<KeyedSkill> {
+    if let Some(cached) = cache.global_roots.get(root)
+        && cached.fingerprint.matches(root)
+    {
+        return cached.skills.clone();
+    }
+
+    #[cfg(test)]
+    {
+        cache.global_scans += 1;
+    }
+
+    let (skills, fingerprint) = scan_root(root);
+    publish_root_scan(root, cache, skills, fingerprint)
+}
+
+fn publish_root_scan(
+    root: &Path,
+    cache: &mut DiscoveryCache,
+    skills: Vec<KeyedSkill>,
+    fingerprint: Option<RootFingerprint>,
+) -> Vec<KeyedSkill> {
+    match fingerprint {
+        Some(fingerprint) => {
+            cache.global_roots.insert(
+                root.to_path_buf(),
+                CachedRoot {
+                    fingerprint,
+                    skills: skills.clone(),
+                },
+            );
+        }
+        None => {
+            return cache
+                .global_roots
+                .get(root)
+                .map(|cached| cached.skills.clone())
+                .unwrap_or_default();
+        }
+    }
+    skills
+}
+
+fn scan_root(root: &Path) -> (Vec<KeyedSkill>, Option<RootFingerprint>) {
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return (Vec::new(), Some(RootFingerprint::Missing)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Some(RootFingerprint::Missing));
+        }
+        Err(_) => return (Vec::new(), None),
+    }
+
+    let mut found = Found::default();
+    let mut fingerprint = FingerprintBuilder::new(root);
+    walk(
+        root,
+        root,
+        Origin::Global,
+        0,
+        &mut found,
+        Some(&mut fingerprint),
+    );
+    (found.into_keyed(), fingerprint.finish())
+}
+
+fn finish_discovery(found: Found, include_internal: bool) -> Vec<Skill> {
     let mut skills = found.skills;
-    if !options.include_internal {
+
+    if !include_internal {
         skills.retain(|s| !s.is_internal());
     }
     skills.sort_by(|a, b| {
@@ -546,6 +841,7 @@ struct Found {
     skills: Vec<Skill>,
     /// Canonical directory of each accepted skill, parallel to `skills`.
     keys: Vec<PathBuf>,
+    key_indices: HashMap<PathBuf, usize>,
 }
 
 impl Found {
@@ -560,15 +856,33 @@ impl Found {
     /// cross-root revisits that aliases are made of.
     fn insert(&mut self, skill: Skill) {
         let key = canonical(&skill.dir);
-        if let Some(ix) = self.keys.iter().position(|k| *k == key) {
+        self.insert_keyed(key, skill);
+    }
+
+    fn insert_keyed(&mut self, key: PathBuf, skill: Skill) {
+        if let Some(&ix) = self.key_indices.get(&key) {
             let existing = &mut self.skills[ix];
-            if existing.dir != skill.dir && !existing.aliases.contains(&skill.dir) {
-                existing.aliases.push(skill.dir);
+            for alias in std::iter::once(skill.dir).chain(skill.aliases) {
+                if existing.dir != alias && !existing.aliases.contains(&alias) {
+                    existing.aliases.push(alias);
+                }
             }
             return;
         }
+        self.key_indices.insert(key.clone(), self.skills.len());
         self.keys.push(key);
         self.skills.push(skill);
+    }
+
+    fn into_keyed(self) -> Vec<KeyedSkill> {
+        self.keys
+            .into_iter()
+            .zip(self.skills)
+            .map(|(canonical_dir, skill)| KeyedSkill {
+                canonical_dir,
+                skill,
+            })
+            .collect()
     }
 }
 
@@ -582,31 +896,93 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn walk(root: &Path, dir: &Path, origin: Origin, depth: usize, out: &mut Found) {
-    if depth > MAX_DEPTH || !dir.is_dir() {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    origin: Origin,
+    depth: usize,
+    out: &mut Found,
+    mut fingerprint: Option<&mut FingerprintBuilder>,
+) {
+    if depth > MAX_DEPTH {
         return;
     }
-    if let Some(skill) = load_with_origin(root, dir, origin) {
+    if let Some(fingerprint) = fingerprint.as_deref_mut() {
+        if !fingerprint.record_directory(dir) {
+            return;
+        }
+    } else if !dir.is_dir() {
+        return;
+    }
+    if let Some(skill) = load_with_origin_recorded(root, dir, origin, fingerprint.as_deref_mut()) {
         // Leaf: do not descend into a skill's own subdirectories.
         out.insert(skill);
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            if let Some(fingerprint) = fingerprint.as_deref_mut() {
+                fingerprint.cacheable = false;
+            }
+            return;
+        }
     };
-    let mut children: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .filter(|p| {
-            p.file_name()
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                if let Some(fingerprint) = fingerprint.as_deref_mut() {
+                    fingerprint.invalidate();
+                }
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                if let Some(fingerprint) = fingerprint.as_deref_mut() {
+                    fingerprint.invalidate();
+                }
+                continue;
+            }
+        };
+        let path = entry.path();
+        let is_dir = if file_type.is_dir() {
+            true
+        } else if file_type.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(_) => {
+                    if let Some(fingerprint) = fingerprint.as_deref_mut() {
+                        fingerprint.invalidate();
+                    }
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if is_dir
+            && path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .is_none_or(|n| !crate::walk::is_noise_dir(n))
-        })
-        .collect();
+        {
+            children.push(path);
+        }
+    }
     children.sort();
     for child in children {
-        walk(root, &child, origin, depth + 1, out);
+        walk(
+            root,
+            &child,
+            origin,
+            depth + 1,
+            out,
+            fingerprint.as_deref_mut(),
+        );
     }
 }
 
@@ -616,19 +992,45 @@ pub fn load(root: &Path, dir: &Path) -> Option<Skill> {
 }
 
 fn load_with_origin(root: &Path, dir: &Path, origin: Origin) -> Option<Skill> {
-    let entry = entry_path(dir)?;
-    let dir_name = dir.file_name()?.to_str()?.to_string();
+    load_with_origin_recorded(root, dir, origin, None)
+}
 
-    let (meta, mut diagnostics) = match std::fs::read_to_string(&entry) {
-        Ok(source) => parse(&source, &dir_name),
+fn load_with_origin_recorded(
+    root: &Path,
+    dir: &Path,
+    origin: Origin,
+    mut fingerprint: Option<&mut FingerprintBuilder>,
+) -> Option<Skill> {
+    let entry = match entry_path(dir) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return None,
+        Err(_) => {
+            if let Some(fingerprint) = fingerprint.as_deref_mut() {
+                fingerprint.invalidate();
+            }
+            return None;
+        }
+    };
+    let dir_name = dir.file_name()?.to_str()?.to_string();
+    let before = fingerprint.as_ref().and_then(|_| PathStamp::file(&entry));
+
+    let (meta, mut diagnostics, read_ok) = match std::fs::read_to_string(&entry) {
+        Ok(source) => {
+            let (meta, diagnostics) = parse(&source, &dir_name);
+            (meta, diagnostics, true)
+        }
         Err(err) => (
             SkillMeta::default(),
             vec![Diagnostic::error(
                 "skill",
                 format!("cannot read {}: {err}", entry.display()),
             )],
+            false,
         ),
     };
+    if let Some(fingerprint) = fingerprint.as_deref_mut() {
+        fingerprint.record_entry(before, &entry, read_ok);
+    }
 
     let name = meta
         .name
@@ -638,11 +1040,20 @@ fn load_with_origin(root: &Path, dir: &Path, origin: Origin) -> Option<Skill> {
         .unwrap_or(&dir_name)
         .to_string();
 
-    let support_dirs: Vec<PathBuf> = SUPPORT_DIRS
-        .iter()
-        .map(|d| dir.join(d))
-        .filter(|p| p.is_dir())
-        .collect();
+    let mut support_dirs = Vec::new();
+    for name in SUPPORT_DIRS {
+        let path = dir.join(name);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => support_dirs.push(path),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                if let Some(fingerprint) = fingerprint.as_deref_mut() {
+                    fingerprint.invalidate();
+                }
+            }
+        }
+    }
 
     diagnostics.sort_by_key(|d| d.severity);
 
@@ -662,19 +1073,24 @@ fn load_with_origin(root: &Path, dir: &Path, origin: Origin) -> Option<Skill> {
 /// Find a skill's entry document. `SKILL.md` is canonical; `skill.md` is
 /// accepted because the reference parser does and case-insensitive filesystems
 /// make the distinction meaningless anyway.
-fn entry_path(dir: &Path) -> Option<PathBuf> {
+fn entry_path(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     for name in ["SKILL.md", "skill.md"] {
         let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(candidate)),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     fn errors(diags: &[Diagnostic]) -> Vec<&str> {
         diags
@@ -904,5 +1320,413 @@ mod tests {
             "demo",
         );
         assert_eq!(meta.allowed_tools, vec!["Read", "Write"]);
+    }
+
+    fn write_skill(root: &Path, name: &str, description: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn stub_skill(root: &Path, dir: &Path, aliases: Vec<PathBuf>) -> Skill {
+        Skill {
+            dir: dir.to_path_buf(),
+            entry: dir.join("SKILL.md"),
+            root: root.to_path_buf(),
+            origin: Origin::Global,
+            aliases,
+            name: "alpha".to_string(),
+            meta: SkillMeta::default(),
+            diagnostics: Vec::new(),
+            support_dirs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cached_root_merge_preserves_uncached_alias_semantics() {
+        let root_one = PathBuf::from("one");
+        let root_two = PathBuf::from("two");
+        let primary = root_one.join("alpha");
+        let second = root_two.join("alpha");
+        let second_alias_one = root_two.join("alias-one");
+        let second_alias_two = root_two.join("alias-two");
+        let key = PathBuf::from("canonical-alpha");
+
+        let mut uncached = Found::default();
+        for dir in [
+            &primary,
+            &second,
+            &second_alias_one,
+            &primary,
+            &second_alias_one,
+            &second_alias_two,
+        ] {
+            uncached.insert_keyed(key.clone(), stub_skill(&root_one, dir, Vec::new()));
+        }
+
+        let mut cached = Found::default();
+        cached.insert_keyed(key.clone(), stub_skill(&root_one, &primary, Vec::new()));
+        cached.insert_keyed(
+            key,
+            stub_skill(
+                &root_two,
+                &second,
+                vec![second_alias_one, primary.clone(), second_alias_two],
+            ),
+        );
+
+        assert_eq!(
+            cached.skills[0].aliases, uncached.skills[0].aliases,
+            "a cached root must contribute its primary path and every nested alias exactly once"
+        );
+    }
+
+    #[test]
+    fn cached_and_uncached_discovery_results_are_identical() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        write_skill(&global, "alpha", "first");
+        let detour = global.join("detour");
+        fs::create_dir_all(&detour).unwrap();
+        let roots = vec![global.clone(), detour.join("..")];
+
+        let uncached = discover_uncached(&[], &roots, false);
+        let mut cache = DiscoveryCache::default();
+        let cold = discover_from_roots(&[], &roots, false, &mut cache);
+        let warm = discover_from_roots(&[], &roots, false, &mut cache);
+
+        assert_eq!(cold, uncached);
+        assert_eq!(warm, uncached);
+        assert_eq!(uncached.len(), 1);
+        assert_eq!(uncached[0].aliases, vec![roots[1].join("alpha")]);
+    }
+
+    #[test]
+    fn traversal_io_failure_is_never_cached() {
+        let temp = tempdir().unwrap();
+        let invalid_root = temp.path().join("invalid\0root");
+        let mut cache = DiscoveryCache::default();
+
+        let first =
+            discover_from_roots(&[], std::slice::from_ref(&invalid_root), false, &mut cache);
+        let second = discover_from_roots(&[], &[invalid_root], false, &mut cache);
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert_eq!(
+            cache.global_scans, 2,
+            "an I/O failure must be retried instead of cached as a missing root"
+        );
+    }
+
+    #[test]
+    fn entry_probe_io_failure_makes_the_root_uncacheable() {
+        let temp = tempdir().unwrap();
+        let invalid_dir = temp.path().join("invalid\0entry");
+        let mut fingerprint = FingerprintBuilder::new(temp.path());
+
+        let loaded = load_with_origin_recorded(
+            temp.path(),
+            &invalid_dir,
+            Origin::Global,
+            Some(&mut fingerprint),
+        );
+
+        assert!(loaded.is_none());
+        assert!(
+            fingerprint.finish().is_none(),
+            "an entry probe error must prevent the partial root scan from being cached"
+        );
+    }
+
+    #[test]
+    fn a_normally_missing_entry_keeps_an_empty_root_cacheable() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        fs::create_dir_all(global.join("empty")).unwrap();
+        let mut cache = DiscoveryCache::default();
+
+        let first = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        let second = discover_from_roots(&[], &[global], false, &mut cache);
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert_eq!(cache.global_scans, 1);
+    }
+
+    #[test]
+    fn failed_rescan_keeps_the_last_successful_snapshot_and_retries() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        fs::create_dir_all(&global).unwrap();
+        let old_dir = global.join("old");
+        let partial_dir = global.join("partial");
+        let old = KeyedSkill {
+            canonical_dir: old_dir.clone(),
+            skill: stub_skill(&global, &old_dir, Vec::new()),
+        };
+        let partial = KeyedSkill {
+            canonical_dir: partial_dir.clone(),
+            skill: stub_skill(&global, &partial_dir, Vec::new()),
+        };
+        let mut cache = DiscoveryCache::default();
+        cache.global_roots.insert(
+            global.clone(),
+            CachedRoot {
+                fingerprint: RootFingerprint::Missing,
+                skills: vec![old],
+            },
+        );
+
+        let published = publish_root_scan(&global, &mut cache, vec![partial], None);
+
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].skill.dir, old_dir);
+        assert_eq!(cache.global_roots[&global].skills[0].skill.dir, old_dir);
+
+        let retried = cached_root(&global, &mut cache);
+        assert!(retried.is_empty());
+        assert_eq!(cache.global_scans, 1);
+    }
+
+    #[test]
+    fn failed_initial_scan_publishes_nothing_and_can_retry() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        write_skill(&global, "alpha", "complete");
+        let partial_dir = global.join("partial");
+        let partial = KeyedSkill {
+            canonical_dir: partial_dir.clone(),
+            skill: stub_skill(&global, &partial_dir, Vec::new()),
+        };
+        let mut cache = DiscoveryCache::default();
+
+        let published = publish_root_scan(&global, &mut cache, vec![partial], None);
+
+        assert!(published.is_empty());
+        assert!(!cache.global_roots.contains_key(&global));
+
+        let retried = cached_root(&global, &mut cache);
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].skill.name, "alpha");
+        assert_eq!(cache.global_scans, 1);
+    }
+
+    #[test]
+    fn unchanged_global_root_reuses_its_cached_scan() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        write_skill(&global, "alpha", "first");
+        let mut cache = DiscoveryCache::default();
+
+        let first = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        let second = discover_from_roots(&[], &[global], false, &mut cache);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            cache.global_scans, 1,
+            "the warm refresh must not walk the root again"
+        );
+    }
+
+    #[test]
+    fn editing_a_skill_invalidates_the_cache_without_a_root_mtime_change() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        let skill_dir = write_skill(&global, "alpha", "first");
+        let root_mtime = fs::metadata(&global).unwrap().modified().unwrap();
+        let mut cache = DiscoveryCache::default();
+
+        let first = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: alpha\ndescription: second and longer\n---\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&global).unwrap().modified().unwrap(),
+            root_mtime,
+            "editing a descendant must leave the root directory stamp unchanged for this proof"
+        );
+
+        let second = discover_from_roots(&[], &[global], false, &mut cache);
+
+        assert_eq!(first[0].summary(), "first");
+        assert_eq!(second[0].summary(), "second and longer");
+        assert_eq!(
+            cache.global_scans, 2,
+            "the entry stamp must invalidate the root snapshot"
+        );
+    }
+
+    #[test]
+    fn only_the_changed_global_root_is_rescanned() {
+        let temp = tempdir().unwrap();
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        write_skill(&one, "alpha", "first");
+        let changed = write_skill(&two, "beta", "first");
+        let mut cache = DiscoveryCache::default();
+
+        let _ = discover_from_roots(&[], &[one.clone(), two.clone()], false, &mut cache);
+        fs::write(
+            changed.join("SKILL.md"),
+            "---\nname: beta\ndescription: changed and longer\n---\n",
+        )
+        .unwrap();
+        let skills = discover_from_roots(&[], &[one, two], false, &mut cache);
+
+        assert_eq!(skills.len(), 2);
+        assert_eq!(
+            cache.global_scans, 3,
+            "two cold roots plus the one dirty root"
+        );
+    }
+
+    #[test]
+    fn category_directory_changes_invalidate_added_renamed_and_deleted_skills() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        let category = global.join("category");
+        let alpha = write_skill(&category, "alpha", "first");
+        let mut cache = DiscoveryCache::default();
+
+        let initial = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        assert_eq!(initial.len(), 1);
+
+        let beta = write_skill(&category, "beta", "second");
+        let added = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        assert_eq!(
+            added
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+
+        let renamed = category.join("renamed-alpha");
+        fs::rename(&alpha, &renamed).unwrap();
+        let after_rename =
+            discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        assert_eq!(after_rename.len(), 2);
+        assert!(after_rename.iter().any(|skill| skill.dir == renamed));
+        assert!(!after_rename.iter().any(|skill| skill.dir == alpha));
+
+        fs::remove_dir_all(&beta).unwrap();
+        let after_delete = discover_from_roots(&[], &[global], false, &mut cache);
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].dir, renamed);
+        assert_eq!(
+            cache.global_scans, 4,
+            "each category entry change must invalidate the cached root"
+        );
+    }
+
+    #[test]
+    fn clearing_the_cache_forces_every_active_root_to_rescan() {
+        let temp = tempdir().unwrap();
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        write_skill(&one, "alpha", "first");
+        write_skill(&two, "beta", "second");
+        let roots = vec![one, two];
+        let mut cache = DiscoveryCache::default();
+
+        let initial = discover_from_roots(&[], &roots, false, &mut cache);
+        let warm = discover_from_roots(&[], &roots, false, &mut cache);
+        assert_eq!(initial, warm);
+        assert_eq!(cache.global_scans, 2);
+
+        cache.clear();
+        let rescanned = discover_from_roots(&[], &roots, false, &mut cache);
+
+        assert_eq!(rescanned, initial);
+        assert_eq!(cache.global_scans, 4);
+    }
+
+    #[test]
+    fn restoring_an_evicted_global_root_rescans_only_that_root() {
+        let temp = tempdir().unwrap();
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        write_skill(&one, "alpha", "first");
+        write_skill(&two, "beta", "second");
+        let both = vec![one.clone(), two.clone()];
+        let mut cache = DiscoveryCache::default();
+
+        let initial = discover_from_roots(&[], &both, false, &mut cache);
+        let reduced = discover_from_roots(&[], std::slice::from_ref(&one), false, &mut cache);
+        let restored = discover_from_roots(&[], &both, false, &mut cache);
+
+        assert_eq!(initial.len(), 2);
+        assert_eq!(
+            reduced
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        assert_eq!(restored, initial);
+        assert_eq!(
+            cache.global_scans, 3,
+            "the retained root stays warm while the restored root scans once"
+        );
+    }
+
+    #[test]
+    fn disabling_global_discovery_keeps_the_cache_warm() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        write_skill(&global, "alpha", "first");
+        let mut cache = DiscoveryCache::default();
+
+        let _ = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        let hidden = discover_from_roots(&[], &[], false, &mut cache);
+        let restored = discover_from_roots(&[], &[global], false, &mut cache);
+
+        assert!(hidden.is_empty());
+        assert_eq!(restored.len(), 1);
+        assert_eq!(cache.global_scans, 1);
+    }
+
+    #[test]
+    fn internal_filtering_reuses_the_unfiltered_snapshot() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        let dir = write_skill(&global, "private", "hidden");
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: private\ndescription: hidden\nmetadata:\n  internal: true\n---\n",
+        )
+        .unwrap();
+        let mut cache = DiscoveryCache::default();
+
+        let hidden = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        let shown = discover_from_roots(&[], &[global], true, &mut cache);
+
+        assert!(hidden.is_empty());
+        assert_eq!(shown.len(), 1);
+        assert_eq!(cache.global_scans, 1);
+    }
+
+    #[test]
+    fn a_missing_global_root_is_rechecked_when_it_appears() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("later");
+        let mut cache = DiscoveryCache::default();
+
+        let missing = discover_from_roots(&[], std::slice::from_ref(&global), false, &mut cache);
+        write_skill(&global, "alpha", "appeared");
+        let present = discover_from_roots(&[], &[global], false, &mut cache);
+
+        assert!(missing.is_empty());
+        assert_eq!(present.len(), 1);
+        assert_eq!(cache.global_scans, 2);
     }
 }
