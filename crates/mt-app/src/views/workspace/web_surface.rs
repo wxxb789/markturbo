@@ -9,8 +9,12 @@ use gpui::*;
 
 use super::Workspace;
 
+#[cfg(target_os = "macos")]
+use std::cell::Cell;
 #[cfg(target_os = "windows")]
 use std::num::NonZeroIsize;
+#[cfg(target_os = "macos")]
+use std::rc::Rc;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "windows")]
@@ -57,6 +61,8 @@ pub(super) struct WebSurface {
     starting: bool,
     #[cfg(target_os = "macos")]
     webview: Option<Entity<gpui_wry::WebView>>,
+    #[cfg(target_os = "macos")]
+    navigation_in_flight: Rc<Cell<bool>>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     sync_pending: bool,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -210,6 +216,10 @@ impl Workspace {
             WebIntent::Unchanged => return,
             WebIntent::Hide => {
                 let was_visible = self.web.begin_hide();
+                #[cfg(target_os = "windows")]
+                if was_visible && !focus_native_window(window) {
+                    log::debug!("failed to restore native focus before hiding Web preview");
+                }
                 if was_visible
                     && let Some(webview) = &self.web.webview
                     && !hide_webview(webview, cx)
@@ -241,10 +251,24 @@ impl Workspace {
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    let Some(webview) = create_webview(window, cx) else {
+                    let navigation_in_flight = Rc::new(Cell::new(false));
+                    let (page_loaded, page_events) = smol::channel::unbounded();
+                    let Some(webview) =
+                        create_webview(window, navigation_in_flight.clone(), page_loaded, cx)
+                    else {
                         return;
                     };
+                    self.web.navigation_in_flight = navigation_in_flight;
                     self.web.webview = Some(webview.clone());
+                    let this = cx.entity().downgrade();
+                    cx.spawn(async move |_, cx| {
+                        while page_events.recv().await.is_ok() {
+                            crate::views::try_update(&this, cx, |this, cx| {
+                                this.webview_page_loaded(cx);
+                            });
+                        }
+                    })
+                    .detach();
                     webview
                 }
             }
@@ -266,15 +290,16 @@ impl Workspace {
             let navigation = self.web.begin_navigation(key);
             #[cfg(target_os = "windows")]
             let _ = navigation;
+            #[cfg(target_os = "macos")]
+            self.web.navigation_in_flight.set(true);
             if !load_webview(&webview, crate::web::to_data_url(&html), cx) {
+                #[cfg(target_os = "macos")]
+                self.web.navigation_in_flight.set(false);
                 self.webview_connection_lost("navigating", cx);
                 return;
             }
             #[cfg(target_os = "macos")]
-            {
-                let _ = navigation;
-                self.web.finish_navigation();
-            }
+            let _ = navigation;
         }
 
         if let Some(fraction) = self.web.ready_scroll(key) {
@@ -293,6 +318,10 @@ impl Workspace {
         self.web.visible = false;
         self.web.loading = None;
         self.web.loaded = None;
+        #[cfg(target_os = "macos")]
+        {
+            self.web.navigation_in_flight = Rc::new(Cell::new(false));
+        }
         #[cfg(target_os = "windows")]
         {
             self.web.starting = false;
@@ -305,6 +334,13 @@ impl Workspace {
             cx,
         );
         self.web_dirty(cx);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn webview_page_loaded(&mut self, cx: &mut Context<Self>) {
+        if self.web.finish_navigation().is_some() {
+            self.web_dirty(cx);
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -374,11 +410,7 @@ impl Workspace {
             return;
         }
         match event {
-            WorkerEvent::PageLoaded => {
-                if self.web.finish_navigation().is_some() {
-                    self.web_dirty(cx);
-                }
-            }
+            WorkerEvent::PageLoaded => self.webview_page_loaded(cx),
         }
     }
 
@@ -402,11 +434,20 @@ type PlatformWebView = WindowsWebView;
 type PlatformWebView = Entity<gpui_wry::WebView>;
 
 #[cfg(target_os = "macos")]
-fn create_webview(window: &mut Window, cx: &mut App) -> Option<Entity<gpui_wry::WebView>> {
+fn create_webview(
+    window: &mut Window,
+    navigation_in_flight: Rc<Cell<bool>>,
+    page_loaded: smol::channel::Sender<()>,
+    cx: &mut App,
+) -> Option<Entity<gpui_wry::WebView>> {
     use raw_window_handle::HasWindowHandle as _;
 
     let handle = window.window_handle().ok()?;
-    let builder = wry::WebViewBuilder::new();
+    let builder = wry::WebViewBuilder::new().with_on_page_load_handler(move |event, _url| {
+        if matches!(event, wry::PageLoadEvent::Finished) && navigation_in_flight.replace(false) {
+            let _ = page_loaded.try_send(());
+        }
+    });
     #[cfg(debug_assertions)]
     let builder = builder.with_devtools(true);
     let webview = builder.build_as_child(&handle).ok()?;
@@ -416,6 +457,29 @@ fn create_webview(window: &mut Window, cx: &mut App) -> Option<Entity<gpui_wry::
 #[cfg(target_os = "windows")]
 fn hide_webview(webview: &WindowsWebView, _: &mut App) -> bool {
     webview.send(WorkerCommand::Hide).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn focus_native_window(window: &Window) -> bool {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+        return false;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return false;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut _);
+
+    // Wry's parent is the worker-owned WebHost, so `focus_parent` would leave
+    // native focus on a child that is about to be hidden. Run this on GPUI's
+    // thread and hand focus directly to the application's main HWND instead.
+    unsafe {
+        let _ = SetFocus(Some(hwnd));
+        GetFocus() == hwnd
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1210,13 +1274,54 @@ mod tests {
             .find("fn apply_worker_command")
             .map(|start| &source[start..])
             .expect("worker command application");
+        let native_focus = source
+            .find("fn focus_native_window")
+            .map(|start| &source[start..])
+            .expect("native focus helper");
+        let native_focus_end = native_focus
+            .find("\n#[cfg(target_os = \"macos\")]\nfn hide_webview")
+            .unwrap_or(native_focus.len());
+        let native_focus = &native_focus[..native_focus_end];
 
         assert!(sync_body.contains("let was_visible = self.web.begin_hide()"));
         assert!(sync_body.contains("if was_visible"));
+        assert_eq!(sync_body.matches("focus_native_window(window)").count(), 1);
+        assert!(
+            sync_body.find("focus_native_window(window)")
+                < sync_body.find("hide_webview(webview, cx)")
+        );
         assert!(sync_body.contains("window.focus(&self.focus_handle, cx)"));
         assert!(sync_body.contains("self.web.begin_navigation(key)"));
         assert!(sync_body.contains("self.web.ready_scroll(key)"));
-        assert!(!apply.contains("focus_parent()"));
+        assert!(native_focus.contains("SetFocus(Some(hwnd))"));
+        assert!(native_focus.contains("GetFocus() == hwnd"));
+        assert!(!apply.contains("focus_parent()") && !apply.contains("SetFocus("));
+    }
+
+    #[test]
+    fn macos_navigation_completion_is_event_driven() {
+        let source = crate::views::production_source(include_str!("web_surface.rs"));
+        let sync = source.find("fn sync_webview").expect("sync_webview");
+        let sync_body = &source[sync..];
+        let sync_end = sync_body
+            .find("\n    #[cfg(any(target_os = \"windows\", target_os = \"macos\"))]\n    fn webview_connection_lost")
+            .expect("connection-loss handler");
+        let sync_body = &sync_body[..sync_end];
+        let create = source
+            .find("fn create_webview")
+            .map(|start| &source[start..])
+            .expect("macOS WebView creation");
+        let create_end = create
+            .find("\n#[cfg(target_os = \"windows\")]\nfn hide_webview")
+            .expect("Windows hide helper");
+        let create = &create[..create_end];
+
+        assert!(sync_body.contains("self.web.navigation_in_flight.set(true)"));
+        assert!(!sync_body.contains("self.web.finish_navigation()"));
+        assert!(create.contains("with_on_page_load_handler"));
+        assert!(create.contains("wry::PageLoadEvent::Finished"));
+        assert!(create.contains("navigation_in_flight.replace(false)"));
+        assert!(create.contains("page_loaded.try_send(())"));
     }
 
     #[test]
