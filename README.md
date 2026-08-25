@@ -138,6 +138,7 @@ Every environment variable the app reads:
 | `OPENAI_API_KEY` | Key for both OpenAI providers, likewise |
 | `MARKTURBO_TRANSLATE_MODEL` | Model id, if none is set in Settings |
 | `MARKTURBO_CONFIG_DIR` | Overrides where `settings.toml` lives |
+| `MT_MATH_FONT_DIR` | Folder holding the KaTeX `.ttf` faces, when they are neither beside the executable nor installed |
 | `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug` |
 
 A value in Settings always outranks the environment. Nothing else is read —

@@ -1397,25 +1397,41 @@ mod tests {
     /// thousand formulas, against MathJax's 87.5MB paid unconditionally.
     #[test]
     fn constructing_the_registry_does_not_load_a_font() {
-        let start = std::time::Instant::now();
         let registry = RendererRegistry::with_defaults();
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "building the registry took {elapsed:?}; something is loading a \
-             font or starting an engine, which an empty workspace must not pay"
-        );
-        // `availability()` runs from `render_status_bar` on every frame, so it
-        // may stat but must not read: half a megabyte of font on the first
-        // frame of a workspace that may never show a formula.
+
+        // The property, observed rather than timed: `availability()` may stat —
+        // it runs from `render_status_bar` on every frame — but must not read.
+        // A wall-clock bound alone would pass just as well if a font *were*
+        // loaded quickly, and would flake on a cold cache.
+        //
+        // `External(dir)` proves the directory was found by stat, and that no
+        // face was parsed: parsing happens in `fonts()`, behind its own
+        // `OnceLock`, which `availability()` never reaches.
+        match registry
+            .availability_report()
+            .iter()
+            .find(|(n, _)| *n == "LaTeX")
+        {
+            Some((_, Availability::External(dir))) => assert!(
+                dir.is_dir(),
+                "reported {dir:?} without stat-ing it into existence"
+            ),
+            Some((_, Availability::Missing(_))) => {}
+            other => panic!("math reported {other:?}, which hides when a font loads"),
+        }
+
+        // Repeated reports must be free: the `OnceLock` means one directory
+        // search per process, not one per frame. Nineteen `is_file()` calls per
+        // candidate directory, sixty times a second, would be a real cost.
         let start = std::time::Instant::now();
-        for _ in 0..100 {
+        for _ in 0..1_000 {
             let _ = registry.availability_report();
         }
         let elapsed = start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "100 availability reports took {elapsed:?}; this runs per frame"
+            elapsed < std::time::Duration::from_millis(200),
+            "1000 availability reports took {elapsed:?}; the directory search \
+             is meant to be behind a OnceLock, so this is re-stat-ing per call"
         );
     }
 
@@ -1484,9 +1500,15 @@ mod tests {
     fn glyph_colour_defaults_to_currentcolor_and_textcolor_survives() {
         let registry = registry();
         let Some(plain) = registry.render("math", "x+y").svg().map(str::to_string) else {
-            // No KaTeX fonts on this machine: `availability()` says so and the
-            // renderer diagnoses rather than drawing. Nothing to assert about
-            // colour in that state.
+            // No KaTeX fonts on this machine, so there is no colour to assert
+            // about. Say so rather than passing silently: this repository has
+            // already had thirty-seven source-scanning tests pass against
+            // nothing, and a green test that asserted nothing is the same bug.
+            eprintln!(
+                "SKIPPED glyph_colour_defaults_to_currentcolor_and_textcolor_survives: \
+                 no KaTeX fonts found. Set MT_MATH_FONT_DIR or run from the repository, \
+                 which carries them in fonts/katex."
+            );
             return;
         };
         assert!(

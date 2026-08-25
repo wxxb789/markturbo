@@ -170,10 +170,21 @@ The **View** dropdown in the document toolbar picks one of five layouts:
 Clicking a heading in the Outline jumps there in whichever layout is showing. A
 preview-only layout scrolls its preview rather than switching away from it.
 
-## Optional: PlantUML
+## Renderers
 
-Mermaid, D2, and LaTeX/math are compiled into the binary and always work.
-PlantUML is the one renderer that needs a local install (it requires Java):
+Mermaid and D2 are compiled into the binary and always work.
+
+Math renders in the binary too, but its glyph shapes come from the KaTeX fonts
+in the `fonts/` folder beside `markturbo` — this application embeds no font it
+can ship next to itself instead. Keep that folder with the executable when you
+move it. If it goes missing, formulas show an install hint rather than
+disappearing, and `MT_MATH_FONT_DIR` can point at wherever you put the fonts:
+
+```sh
+MT_MATH_FONT_DIR=/path/to/katex/fonts markturbo
+```
+
+PlantUML is the one renderer that needs a separate install (it requires Java):
 
 | Platform | Install |
 |---|---|

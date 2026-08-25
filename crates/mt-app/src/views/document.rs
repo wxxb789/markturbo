@@ -1105,6 +1105,48 @@ pub fn diagram_extensions(
 }
 
 /// A block after the registry has had a go at it.
+/// Give a rendered SVG the theme's foreground colour.
+///
+/// Renderers emit `fill="currentColor"` so one cached SVG can serve twelve
+/// themes and follow the OS light/dark switch. That works in the Web pane
+/// because `web.rs` sets `color` on the body — but the native pane hands the
+/// markup to `Image::from_bytes(ImageFormat::Svg, …)`, which rasterizes through
+/// usvg, and usvg resolves `currentColor` by walking for a `color` attribute and
+/// **falling back to black** when it finds none (`parser/style.rs`). Measured:
+/// an SVG with no `color` rasterizes to `(0, 0, 0)` and is invisible on the six
+/// dark presets, which is what a first launch shows, since the default theme
+/// preference is `System`.
+///
+/// gpui's `svg()` element tints through `style.text.color`, but `img()` — the
+/// element that can display arbitrary SVG markup — has no colour handling at
+/// all, so the colour has to be in the document.
+///
+/// Injected here rather than at render time on purpose: the renderer cache is
+/// keyed on `(id, source)` with no theme in it, so baking a colour into the
+/// cached string would serve the previous theme's colour after a switch. This
+/// runs per frame on an already-rendered string and costs one `replacen`.
+fn themed_svg(markup: &str, cx: &App) -> String {
+    let fg = cx.theme().foreground.to_rgb();
+    let ch = |c: f32| (c.clamp(0., 1.) * 255.).round() as u8;
+    let color = format!("#{:02x}{:02x}{:02x}", ch(fg.r), ch(fg.g), ch(fg.b));
+    // Only the root element, and only when it does not already say: a renderer
+    // that sets its own `color` has made a deliberate choice.
+    match markup.find("<svg") {
+        Some(_) if markup[..markup.find('>').unwrap_or(markup.len())].contains("color=") => {
+            markup.to_string()
+        }
+        Some(start) => {
+            let insert = start + "<svg".len();
+            format!(
+                "{} color=\"{color}\"{}",
+                &markup[..insert],
+                &markup[insert..]
+            )
+        }
+        None => markup.to_string(),
+    }
+}
+
 #[derive(Clone)]
 struct RenderedBlock {
     id: String,
@@ -1125,7 +1167,7 @@ fn render_block(block: &RenderedBlock, cx: &mut App) -> AnyElement {
             .child(
                 img(Arc::new(Image::from_bytes(
                     ImageFormat::Svg,
-                    markup.clone().into_bytes(),
+                    themed_svg(markup, cx).into_bytes(),
                 )))
                 .object_fit(ObjectFit::Contain)
                 .max_w_full(),
@@ -1427,6 +1469,58 @@ mod tests {
     /// when the revision matches the one it holds, so a value built fresh in
     /// `render` can never match — while a `Clone` of one built once copies the
     /// revision and matches from the second frame on.
+    #[test]
+    /// The native pane must give a `currentColor` SVG a colour to inherit.
+    ///
+    /// usvg resolves `currentColor` by walking for a `color` attribute and
+    /// falling back to **black** when it finds none, so an SVG that relies on
+    /// inheritance rasterizes invisible on the six dark presets — which is what
+    /// a first launch shows, since the default theme preference is `System`.
+    /// Measured with usvg 0.45: no `color` gives `(0, 0, 0)`; `color="#e6edf3"`
+    /// gives the light foreground, and an explicit `fill="#ff0000"` still wins.
+    ///
+    /// The Web pane is unaffected — `web.rs` sets `color` on the body — which is
+    /// exactly why this was invisible in review: the same SVG is correct on one
+    /// path and black on the other.
+    #[test]
+    fn the_native_pane_gives_a_currentcolor_svg_a_colour() {
+        let source = crate::views::production_source(include_str!("document.rs"));
+
+        let start = source
+            .find("fn render_block")
+            .expect("render_block must exist");
+        let body = &source[start..];
+        let end = body.find("\n/// ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("themed_svg(markup, cx)"),
+            "`render_block` must theme the markup before handing it to \
+             `Image::from_bytes`; usvg has no other way to resolve \
+             `currentColor` and defaults it to black"
+        );
+        assert!(
+            !body.contains("markup.clone().into_bytes()"),
+            "handing the raw markup straight to usvg is the bug this replaces"
+        );
+
+        // And the injection itself must not clobber a renderer that already
+        // chose a colour, and must not corrupt markup that has no `<svg` at all.
+        let start = source.find("fn themed_svg").expect("themed_svg must exist");
+        let body = &source[start..];
+        let end = body.find("\n#[derive").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains(r#"contains("color=")"#),
+            "an SVG that already carries a `color` has made a deliberate \
+             choice and must be left alone"
+        );
+        assert!(
+            body.contains("None => markup.to_string()"),
+            "markup with no root element must pass through untouched rather \
+             than being mangled by an offset into it"
+        );
+    }
+
     #[test]
     fn the_native_preview_does_not_rebuild_its_extensions_per_frame() {
         let source = crate::views::production_source(include_str!("document.rs"));

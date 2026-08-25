@@ -67,6 +67,13 @@ Fixed constraints, set by the user and not open for re-litigation:
 
 ## Not yet specified
 
+- **Every other GPUI overlay in Web mode.** Ticket 03 wired `OverlayOpen` to the
+  layout dropdown only. The tab context menu (`workspace.rs:1407`) and the tab
+  tooltips (`:1394`, `:1443`) open into the same WebView rectangle and are still
+  covered and unclickable. The commit message conceded the general case; only
+  the one control was fixed. Each needs the same UIA-driven click test that
+  proved the dropdown, which is why this is its own ticket rather than a
+  one-line addition.
 - **CJK inside math on macOS and Linux.** Math glyphs are `<path>` outlines from
   the bundled KaTeX faces and so are platform-independent, but a CJK character
   inside `\text` falls through to `<text>` and is resolved by usvg against the

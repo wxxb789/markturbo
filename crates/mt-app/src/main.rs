@@ -26,6 +26,8 @@ ENVIRONMENT:
     ANTHROPIC_API_KEY           Anthropic key, if not set in Settings
     OPENAI_API_KEY              OpenAI key, if not set in Settings
     MARKTURBO_TRANSLATE_MODEL   Model id, if not set in Settings
+    MT_MATH_FONT_DIR            Folder holding the KaTeX fonts, if they are
+                                not beside the executable or installed
     RUST_LOG                    Log filter, e.g. RUST_LOG=debug
 ";
 
