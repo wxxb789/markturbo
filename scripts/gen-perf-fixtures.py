@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 """Regenerate the performance fixtures under fixtures/perf/.
 
 The fixtures are committed, so a fresh clone can run `cargo test` without
@@ -7,7 +11,7 @@ note that the performance thresholds in crates/mt-doc/tests/performance.rs were
 calibrated against the current output, so changing the generator means
 re-checking those numbers.
 
-    python3 scripts/gen-perf-fixtures.py
+    uv run scripts/gen-perf-fixtures.py
 
 Determinism matters: the seed is fixed so a regeneration produces identical
 bytes, and a regenerated fixture therefore does not show up as a spurious diff.

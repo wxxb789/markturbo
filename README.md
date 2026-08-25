@@ -189,7 +189,7 @@ implicit, and no trust level lets a document markturbo renders reach the network
 cargo test --release
 ```
 
-443 tests across 11 binaries, over checked-in fixtures in `fixtures/`: Markdown
+452 tests across 11 binaries, over checked-in fixtures in `fixtures/`: Markdown
 constructs including CJK and Unicode, valid and invalid examples of each diagram
 technology, MDX (Markdown-only, components, invalid, untrusted), skills (valid,
 missing metadata, malformed YAML, nested, multiple roots, name collisions),
@@ -197,6 +197,15 @@ filesystem round-trips, and ~10K/~100K-line performance documents.
 
 `--release` is the gate rather than a preference: two performance tests assert
 wall-clock bounds that a debug build cannot meet.
+
+Measurement lives in `scripts/` — memory, idle CPU, child windows and hit
+testing against a running build. See `scripts/README.md`.
+
+## Contributing
+
+[AGENTS.md](AGENTS.md) is how work gets done here: what to measure and how, what
+a test owes you, and the handful of structural rules whose violation breaks
+something guaranteed elsewhere. `CLAUDE.md` symlinks to it.
 
 ## License
 
