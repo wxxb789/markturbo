@@ -96,7 +96,25 @@ encoding_rs = "0.8"
 chardetng = "1"
 d2-little = "0.7.1-1"
 markdown = "1.0"
-mathjax-svg-rs = "0.4"
+# LaTeX math. RaTeX minus its own SVG emitter: `ratex-svg` is the natural
+# dependency and is deliberately absent, because the only way to get `<path>`
+# rather than `<text>` out of it is its `standalone` feature — and `standalone`
+# reaches `ratex-unicode-font` through two independent edges, a direct optional
+# dep and a non-optional dep of `ratex-font-loader`. No feature combination
+# avoids it. That crate prints past the `log` crate with `eprintln!`, hardcodes
+# five distro font paths, and reads a system CJK font it never frees: measured
+# 4.5MB -> 52.0MB resident on the first CJK glyph, retained for the process.
+#
+# Emitting the SVG here instead is ~250 lines in `renderer.rs` and deletes all
+# three at the source. Measured after: 4.34MB baseline, 4.55MB after 1000 CJK
+# renders, zero stderr lines, no platform font path in the binary.
+ratex-parser = "=0.1.14"
+ratex-layout = "=0.1.14"
+ratex-types = "=0.1.14"
+ratex-font = "=0.1.14"
+# Reads the KaTeX `.ttf` files and yields glyph outlines. `FontRef` borrows the
+# bytes rather than copying them, so a 17.7MB face costs 0.02MB to parse.
+ab_glyph = "0.2"
 mermaid-svg = "0.7"
 notify = "8"
 notify-debouncer-full = "0.6"
@@ -164,6 +182,23 @@ tokio = { version = "1", default-features = false, features = [
 codegen-units = 16
 debug = "limited"
 split-debuginfo = "unpacked"
+
+[patch.crates-io]
+# `ratex-parser` 0.1.14 plus one 25-line clamp. `\begin{alignat}{N}` allocates
+# `N * 2` 64-byte `AlignSpec` values with no bound, so a 45-byte document
+# requests 68GB and dies with an allocation abort — the one failure class
+# `catch_unwind` below cannot contain.
+#
+# The clamp has to be inside the parser rather than in `MathRenderer`: a guard
+# over the source text was tried and cannot work, because the parser
+# macro-expands before reading the argument. `\begin {alignat}{1e9}` with a
+# space, a comment between the two, `\def\N{1000000000}...{\N}`, and a
+# macro-supplied environment name all defeat a prefilter, and a prefilter also
+# rejects `\begin{cases}{-1} & x<0`, which is ordinary LaTeX.
+#
+# Delete this stanza and `vendor/ratex-parser` once a release carries the clamp.
+# See vendor/ratex-parser/README.markturbo.md.
+ratex-parser = { path = "vendor/ratex-parser" }
 
 [profile.dev.package]
 # Rendering / layout hot paths are unusable in debug builds otherwise.

@@ -125,12 +125,62 @@ Verified against crates.io rather than assumed:
 |---|---|---|
 | Mermaid | `mermaid-svg` 0.7 | Pure Rust, 23 diagram types |
 | D2 | `d2-little` 0.7.1-1 | Pure Rust including layout. The version needs the exact prerelease tag; 0.7.2/0.7.3 are yanked |
-| Math | `mathjax-svg-rs` 0.4 | MathJax on an embedded JS engine. Emits glyph outlines (`<path>`), not `<text>`, so it renders under resvg with no fonts installed — which the native path needs |
+| Math | `ratex-parser` / `-layout` / `-types` / `-font` 0.1.14 | Pure Rust, no JS engine. The SVG is emitted here rather than by `ratex-svg` — see below |
 | PlantUML | `plantuml` CLI | `plantuml-little` depends on `graphviz-anywhere`, which *fails at build time* on Windows. Rejected |
 
-Rejected for math: `latex2mathml` (abandoned 2020), `pulldown-latex` (MathML
-only — resvg cannot draw MathML, so the native path would show nothing),
-`mathjax_svg` 3.2 (embeds V8).
+Rejected for math: `latex2mathml` (abandoned 2020), `pulldown-latex`, `Temml`
+and `math-core` (all MathML only — resvg drops every non-SVG-namespaced element
+at `usvg/parser/svgtree/parse.rs:139`, so the native path would show nothing),
+`mathjax_svg` 3.2 (embeds V8), ReX (69/90 on a KaTeX corpus against RaTeX's
+89/90, and unpublished).
+
+### Math: RaTeX, minus its SVG emitter
+
+`ratex-svg` is the obvious dependency and is deliberately absent. The only way
+to get `<path>` rather than `<text>` out of it is its `standalone` feature, and
+`standalone` reaches `ratex-unicode-font` through two independent edges — a
+direct optional dependency, and a non-optional dependency of
+`ratex-font-loader`. No feature combination avoids it.
+
+That crate does three things this application cannot accept: it prints with
+`eprintln!` past the `log` crate, so `RUST_LOG` cannot filter it; it hardcodes
+five distro-specific font paths, which is how a font loader works on the
+author's machine and nowhere else; and it reads a system CJK font it never
+frees — measured 4.5MB to 52.0MB resident on the first CJK glyph, retained for
+the process.
+
+Emitting the SVG in `renderer.rs` instead is about 250 lines and removes all
+three at the source. Measured after: 4.34MB at startup, 4.55MB after a thousand
+formulas, zero lines on stderr, and no platform font path in the binary.
+
+The emitter writes `<path>` for every glyph a KaTeX face covers — which is all
+of mathematics — and falls through to `<text>` for the rest, meaning CJK inside
+`\text` and emoji. Those resolve against the font database gpui already
+populates from the system, so the two render paths keep sharing one SVG string.
+
+Every fill is `currentColor` unless `\textcolor` or `\color` said otherwise,
+which is what lets one rendered formula serve twelve themes and follow the OS
+light/dark switch without re-rendering.
+
+**The fonts are not embedded.** This application embeds no font it can instead
+ship beside the executable; `assets.rs` is the one exception, and a different
+case, because gpui requests those two by exact path and diagram labels come out
+blank without them. The nineteen KaTeX faces live in `fonts/katex/`,
+`package-release.sh` stages them next to the binary, and
+`renderer.rs::font_dir_candidates` searches there first. When none of the
+candidate directories holds all nineteen, `availability()` reports `Missing`
+with an install hint and every formula becomes a diagnostic — the same shape
+PlantUML has always used for a missing binary.
+
+**`ratex-parser` is vendored under a `[patch.crates-io]`**, carrying one
+25-line clamp. `\begin{alignat}{N}` allocates `N * 2` 64-byte values with no
+bound, so a 45-byte document requests 68GB and dies with an allocation abort —
+the one failure class the `catch_unwind` in `RendererRegistry::render` cannot
+contain. The clamp has to live inside the parser because it macro-expands before
+reading the argument: `\begin {alignat}{1e9}` with a space, a comment between
+the two, `\def\N{1000000000}...{\N}` and a macro-supplied environment name all
+defeat a guard written over the source text. See
+`vendor/ratex-parser/README.markturbo.md`.
 
 ### MDX: structure natively, fidelity in the WebView
 

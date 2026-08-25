@@ -48,6 +48,17 @@ Fixed constraints, set by the user and not open for re-litigation:
   by building the extensions once in `DocumentView::new` and cloning per frame.
   Measured over 60s with no user input on a 4,228-byte document: 300-750% CPU
   before, 0-1.2% after.
+- [02 — Replace MathJax with RaTeX, lazily, embedding no fonts](issues/02-ratex-replaces-mathjax.md):
+  RaTeX minus `ratex-svg` — its `standalone` feature is the only route to
+  `<path>` output and it reaches `ratex-unicode-font` through two edges, so the
+  SVG is emitted in `renderer.rs` instead. Deletes an `eprintln!` past the `log`
+  crate, five hardcoded distro font paths, and a 46 MB system font that was
+  never freed. `ratex-parser` is vendored with a 25-line clamp: an unbounded
+  `\begin{alignat}{N}` allocation aborts, which `catch_unwind` cannot contain.
+  Measured: empty-workspace RSS 148.8 MB → **81.9 MB**, binary 54,310,400 →
+  **46,766,080** bytes, per formula ~146 ms → 0.50–0.92 ms, KaTeX corpus 87/90 →
+  **89/90**. Also fixes `\mathbb`, `\mathcal`, `\mathfrak`, `\mathsf`,
+  `\mathtt`, `\ell`, `\Re` and `\Im`, which MathJax failed permanently.
 - [03 — The WebView covers every GPUI overlay in Web mode](issues/03-webview-covers-overlays.md):
   the WebView is an OS child window above everything GPUI draws, so the layout
   menu was both invisible and unclickable. Fixed by hiding it while an overlay
@@ -56,6 +67,12 @@ Fixed constraints, set by the user and not open for re-litigation:
 
 ## Not yet specified
 
+- **CJK inside math on macOS and Linux.** Math glyphs are `<path>` outlines from
+  the bundled KaTeX faces and so are platform-independent, but a CJK character
+  inside `\text` falls through to `<text>` and is resolved by usvg against the
+  font database gpui populates from the system. On Windows that was measured
+  working (`Fallback from Arial to DengXian`). What the other two platforms
+  resolve it to, or whether they resolve it at all, is untested.
 - **DirectComposition, and the Z-order it decides.** `main.rs` disables it so
   the WebView is visible at all; the price is that the child window is then
   permanently above GPUI, which is what ticket 03 works around by hiding it.

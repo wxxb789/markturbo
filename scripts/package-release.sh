@@ -6,8 +6,10 @@
 #
 #     ./scripts/package-release.sh
 #
-# The archive is self-contained apart from the optional PlantUML dependency;
-# Mermaid, D2, and math renderers are compiled in.
+# The archive is self-contained apart from the optional PlantUML dependency.
+# Mermaid and D2 are compiled in; math is compiled in too, but its glyph
+# outlines come from the KaTeX faces staged beside the binary — this application
+# embeds no font it can ship instead.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -41,6 +43,24 @@ cp "$BUILT" "$OUT/"
 cp README.md LICENSE "$OUT/" 2>/dev/null || cp README.md "$OUT/"
 mkdir -p "$OUT/docs"
 cp docs/architecture.md docs/platforms.md "$OUT/docs/"
+
+# The math fonts, beside the executable rather than inside it.
+#
+# `renderer.rs::font_dir_candidates` looks in `<exe dir>/fonts` first, so a user
+# who unpacks this archive gets working math with nothing to install. The binary
+# carries none of these bytes — that is the whole point of shipping them here.
+#
+# All nineteen faces `FONT_FILES` names must arrive, or the directory fails the
+# search and every formula becomes an install hint. Checking here turns that
+# into a build failure rather than a bug report.
+echo "==> Staging the math fonts"
+mkdir -p "$OUT/fonts"
+cp fonts/katex/*.ttf fonts/katex/LICENSE.md "$OUT/fonts/"
+FONT_COUNT="$(find "$OUT/fonts" -name 'KaTeX_*.ttf' | wc -l)"
+[ "$FONT_COUNT" -ge 19 ] || {
+  echo "error: staged $FONT_COUNT KaTeX faces, expected at least 19" >&2
+  exit 1
+}
 
 # The sample workspace is what a new user opens first, so it ships too.
 cp -r sample "$OUT/sample"

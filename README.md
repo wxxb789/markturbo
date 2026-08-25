@@ -74,13 +74,16 @@ MCP tools, or headless rendering without touching the UI.
 |---|---|---|
 | Mermaid | `mermaid-svg` (pure Rust) | Always |
 | D2 | `d2-little` (pure Rust, own layout) | Always |
-| LaTeX / math | `mathjax-svg-rs` (MathJax on an embedded JS engine) | Always |
+| LaTeX / math | RaTeX (pure Rust, no JS engine) | Fonts ship beside the binary |
 | PlantUML | `plantuml` CLI | Requires a local install (Java) |
 
-Three of the four need no external dependency. PlantUML has no usable pure-Rust
-implementation today; when the binary is absent, blocks show an install hint
-instead of failing. A renderer that errors or panics produces an inline
-diagnostic with the original source preserved — never a crash.
+Mermaid and D2 need nothing installed. Math needs the KaTeX faces, which the
+release archive stages next to the executable — nothing to install, and none of
+their bytes are in the binary, because this application embeds no font it can
+ship instead. PlantUML has no usable pure-Rust implementation today. When
+either dependency is absent, blocks show an install hint rather than failing. A
+renderer that errors or panics produces an inline diagnostic with the original
+source preserved — never a crash.
 
 Adding a technology is a registration: implement `BlockRenderer`, register it,
 and add the fence language to `DiagramKind::from_lang`. No parser or view change.

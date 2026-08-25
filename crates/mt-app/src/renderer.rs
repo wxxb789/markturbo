@@ -6,16 +6,19 @@
 //! `renderer_id()`, so adding one is a registration — the Markdown parser and
 //! the view code do not change.
 //!
-//! Three of the four required technologies (Mermaid, D2, LaTeX) render in pure
-//! Rust with no external dependency, so they are always available. PlantUML has
-//! no usable pure-Rust implementation and falls back to a locally installed
-//! binary; when it is absent the block gets an install hint, never a crash.
+//! Mermaid and D2 render in pure Rust with no external dependency, so they are
+//! always available. Math renders in pure Rust too, but its glyph outlines come
+//! from the KaTeX faces shipped beside the executable — this application embeds
+//! no font it can ask the user to install instead. PlantUML has no usable
+//! pure-Rust implementation and falls back to a locally installed binary. When
+//! either dependency is absent the block gets an install hint, never a crash.
 //!
 //! Every renderer is fallible by design. A missing tool or a syntax error
 //! produces a [`RenderOutcome::Failed`] carrying a diagnostic; nothing panics,
 //! and the original source is always preserved for display.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -126,8 +129,8 @@ impl RendererRegistry {
     ///
     /// Results are cached by `(id, source)`. Scrolling a document must not
     /// re-render every frame, and a large document may hold many repeated
-    /// diagrams. MathJax in particular costs seconds to warm up and ~90ms per
-    /// formula, so this cache is load-bearing, not an optimization.
+    /// diagrams. D2 costs ~7ms a diagram, so this cache is load-bearing rather
+    /// than an optimization.
     pub fn render(&self, id: &str, source: &str) -> RenderOutcome {
         let Some(renderer) = self.get(id) else {
             return RenderOutcome::Failed(Diagnostic::warning(
@@ -194,42 +197,171 @@ fn cache() -> &'static Mutex<HashMap<String, RenderOutcome>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Pay MathJax's start-up cost now, on a thread nobody is waiting on.
-///
-/// `mathjax-svg-rs` builds its JS engine lazily behind a `OnceLock` and parses
-/// the whole MathJax bundle the first time anything asks it to render. Measured
-/// on this machine at **~870ms**, against ~50ms for every formula after it —
-/// and that first bill lands on whoever opens the first document containing a
-/// formula, which reads as "clicking a file in the tree takes a second".
-///
-/// Spawned rather than awaited: nothing here needs the result, and the render
-/// path is unchanged either way. It just finds the engine already warm.
-///
-/// One thread rather than a background task, because the point is to run before
-/// the executor has anything queued on it — and `OnceLock` makes a concurrent
-/// real render wait for this one rather than duplicating it.
-pub fn warm_up() {
-    std::thread::Builder::new()
-        .name("mt-renderer-warmup".into())
-        .spawn(|| {
-            // A trivially small formula: the cost is parsing the bundle, not
-            // typesetting, so anything valid warms the same engine.
-            let _ = mathjax_svg_rs::render_tex("x", &Default::default());
-        })
-        // A failure to spawn only means the cost is paid later, in line.
-        .map(|_| ())
-        .unwrap_or_else(|err| log::debug!("renderer warm-up not started: {err}"));
-}
-
 // ---------------------------------------------------------------------------
 // Pure-Rust renderers
 // ---------------------------------------------------------------------------
 
-/// LaTeX math via MathJax on an embedded JS engine.
+/// KaTeX faces RaTeX's layout can ask for, and the file each lives in.
 ///
-/// Emits glyph outlines (`<path>`) rather than `<text>`, so it renders
-/// correctly under resvg with no fonts installed — which is exactly what the
-/// native path needs.
+/// Mirrors `ratex-font-loader`'s own `FONT_MAP`. These are not embedded: see
+/// [`MATH_FONTS_HINT`] for where they come from.
+const FONT_FILES: &[(ratex_font::FontId, &str)] = {
+    use ratex_font::FontId as F;
+    &[
+        (F::MainRegular, "KaTeX_Main-Regular.ttf"),
+        (F::MainBold, "KaTeX_Main-Bold.ttf"),
+        (F::MainItalic, "KaTeX_Main-Italic.ttf"),
+        (F::MainBoldItalic, "KaTeX_Main-BoldItalic.ttf"),
+        (F::MathItalic, "KaTeX_Math-Italic.ttf"),
+        (F::MathBoldItalic, "KaTeX_Math-BoldItalic.ttf"),
+        (F::AmsRegular, "KaTeX_AMS-Regular.ttf"),
+        (F::CaligraphicRegular, "KaTeX_Caligraphic-Regular.ttf"),
+        (F::FrakturRegular, "KaTeX_Fraktur-Regular.ttf"),
+        (F::FrakturBold, "KaTeX_Fraktur-Bold.ttf"),
+        (F::SansSerifRegular, "KaTeX_SansSerif-Regular.ttf"),
+        (F::SansSerifBold, "KaTeX_SansSerif-Bold.ttf"),
+        (F::SansSerifItalic, "KaTeX_SansSerif-Italic.ttf"),
+        (F::ScriptRegular, "KaTeX_Script-Regular.ttf"),
+        (F::TypewriterRegular, "KaTeX_Typewriter-Regular.ttf"),
+        (F::Size1Regular, "KaTeX_Size1-Regular.ttf"),
+        (F::Size2Regular, "KaTeX_Size2-Regular.ttf"),
+        (F::Size3Regular, "KaTeX_Size3-Regular.ttf"),
+        (F::Size4Regular, "KaTeX_Size4-Regular.ttf"),
+    ]
+};
+
+/// What to tell a user who has no math fonts.
+///
+/// This application embeds no fonts it can ask the user to install instead —
+/// the two in `assets.rs` are there because gpui requests them by exact path
+/// and diagram labels come out blank without them, which is a different case.
+/// The release archive ships these beside the executable, so a packaged build
+/// finds them without the user doing anything; this hint is for a build run
+/// from the source tree.
+pub const MATH_FONTS_HINT: &str = "install the KaTeX fonts: download \
+     https://github.com/KaTeX/KaTeX/releases/latest and install the `KaTeX_*.ttf` \
+     files under katex/fonts/, or set MT_MATH_FONT_DIR to the folder holding them";
+
+/// Directories that may hold the KaTeX `.ttf` files, most specific first.
+///
+/// No hardcoded distro paths beyond the conventional per-user and system font
+/// folders: a fixed list is what makes a font loader work on the author's
+/// machine and nowhere else.
+fn font_dir_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(explicit) = std::env::var_os("MT_MATH_FONT_DIR") {
+        dirs.push(PathBuf::from(explicit));
+    }
+    // Beside the executable: this is where `package-release.sh` puts them.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        dirs.push(parent.join("fonts"));
+        // And where `cargo run` / `cargo test` leave it: the executable is in
+        // `target/<profile>/` or `target/<profile>/deps/`, so the repository's
+        // own `fonts/katex` is two or three levels up. Without this a build
+        // from source finds no font and every formula is a diagnostic, which
+        // reads as "math is broken" rather than "math is not packaged yet".
+        for up in [2, 3] {
+            if let Some(root) = parent.ancestors().nth(up) {
+                dirs.push(root.join("fonts/katex"));
+            }
+        }
+    }
+    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    if cfg!(windows) {
+        dirs.extend(env("LOCALAPPDATA").map(|p| p.join("Microsoft/Windows/Fonts")));
+        dirs.extend(env("SYSTEMROOT").map(|p| p.join("Fonts")));
+    } else if cfg!(target_os = "macos") {
+        dirs.extend(env("HOME").map(|p| p.join("Library/Fonts")));
+        dirs.push(PathBuf::from("/Library/Fonts"));
+    } else {
+        dirs.extend(env("HOME").map(|p| p.join(".local/share/fonts")));
+        dirs.extend(env("HOME").map(|p| p.join(".fonts")));
+        dirs.push(PathBuf::from("/usr/share/fonts/truetype/katex"));
+        dirs.push(PathBuf::from("/usr/share/fonts"));
+    }
+    dirs
+}
+
+/// The first candidate directory holding all nineteen faces.
+///
+/// **Stat only.** `availability()` reaches this from `render_status_bar`, which
+/// runs every frame, so reading a single byte here would put half a megabyte of
+/// font on the first frame of a workspace that may never show a formula.
+fn font_dir() -> Option<&'static PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        font_dir_candidates()
+            .into_iter()
+            .find(|dir| FONT_FILES.iter().all(|(_, f)| dir.join(f).is_file()))
+    })
+    .as_ref()
+}
+
+/// The KaTeX faces, read and parsed once.
+///
+/// Nothing here runs until the first math block is rendered — there is no
+/// warm-up and an empty workspace pays nothing. Measured: 4.34MB at startup,
+/// 4.55MB after a thousand formulas.
+///
+/// The bytes are leaked deliberately. They live for the process either way, and
+/// `FontRef` borrows rather than copies, so the alternative is re-parsing every
+/// face on every formula.
+struct Fonts {
+    faces: HashMap<ratex_font::FontId, ab_glyph::FontRef<'static>>,
+}
+
+fn fonts() -> Option<&'static Fonts> {
+    static FONTS: OnceLock<Option<Fonts>> = OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let dir = font_dir()?;
+            let faces: HashMap<_, _> = FONT_FILES
+                .iter()
+                .filter_map(|(id, f)| {
+                    let bytes: &'static [u8] =
+                        Box::leak(std::fs::read(dir.join(f)).ok()?.into_boxed_slice());
+                    Some((*id, ab_glyph::FontRef::try_from_slice(bytes).ok()?))
+                })
+                .collect();
+            // A directory that passed the stat check but holds a truncated or
+            // corrupt face is not usable; reporting it as available would show
+            // half a formula.
+            (faces.len() == FONT_FILES.len()).then_some(Fonts { faces })
+        })
+        .as_ref()
+}
+
+/// The largest math source this will parse.
+///
+/// Every formula in the 90-case KaTeX corpus is under 1KB, and the largest math
+/// block in this repository is 171 bytes. The inputs that make the parser and
+/// the emitter do unbounded work — a 200,000-cell matrix is 424ms to parse,
+/// 794ms to lay out, and a ~289MB SVG string — start around 300KB. The cap is
+/// one comparison and turns "the background parse never returns" into a
+/// diagnostic.
+const MAX_MATH_BYTES: usize = 16 * 1024;
+
+/// Type size for rendered math, and the padding around it.
+const FONT_SIZE: f64 = 20.0;
+const PADDING: f64 = 2.0;
+/// Stroke width for unfilled paths, matching RaTeX's own default.
+const STROKE_WIDTH: f64 = 1.5;
+
+/// LaTeX math via RaTeX: parse, lay out, then emit the SVG here.
+///
+/// A ZST. RaTeX keeps what state it has behind its own `OnceLock`s, so the
+/// renderer holds none and needs no initialization — which is why there is no
+/// warm-up to spawn.
+///
+/// **`ratex-svg` is deliberately not a dependency.** The only way to get
+/// `<path>` rather than `<text>` out of it is its `standalone` feature, and
+/// `standalone` reaches `ratex-unicode-font` through two independent edges. That
+/// crate prints past the `log` crate, hardcodes five distro font paths, and
+/// reads a system CJK font it never frees — measured at 4.5MB to 52.0MB
+/// resident on the first CJK glyph. Emitting the SVG here costs ~250 lines and
+/// removes all three.
 struct MathRenderer;
 
 impl BlockRenderer for MathRenderer {
@@ -240,13 +372,350 @@ impl BlockRenderer for MathRenderer {
         "LaTeX"
     }
     fn availability(&self) -> Availability {
-        Availability::Builtin
+        match font_dir() {
+            Some(dir) => Availability::External(dir.clone()),
+            None => Availability::Missing(MATH_FONTS_HINT.to_string()),
+        }
     }
     fn render(&self, source: &str) -> RenderOutcome {
-        match mathjax_svg_rs::render_tex(source.trim(), &Default::default()) {
-            Ok(svg) => RenderOutcome::Svg(svg),
-            Err(err) => RenderOutcome::Failed(diagnose("math", "LaTeX", &err)),
+        let source = source.trim();
+        if source.len() > MAX_MATH_BYTES {
+            return RenderOutcome::Failed(Diagnostic::error(
+                "math",
+                format!(
+                    "LaTeX rendering failed\n\nformula is {} bytes; the limit is \
+                     {MAX_MATH_BYTES}",
+                    source.len()
+                ),
+            ));
         }
+        // Not reached through `availability()`: that one only stats, and a
+        // directory can pass the stat check and still hold a corrupt face.
+        let Some(fonts) = fonts() else {
+            return RenderOutcome::Failed(Diagnostic::warning(
+                "math",
+                format!("LaTeX fonts not found: {MATH_FONTS_HINT}"),
+            ));
+        };
+        let nodes = match ratex_parser::parse(source) {
+            Ok(nodes) => nodes,
+            Err(err) => return RenderOutcome::Failed(diagnose_math(source, &err)),
+        };
+        let list = ratex_layout::to_display_list(&ratex_layout::layout(
+            &nodes,
+            &ratex_layout::LayoutOptions::default(),
+        ));
+        RenderOutcome::Svg(emit_svg(&list, fonts, FONT_SIZE, PADDING))
+    }
+}
+
+/// A RaTeX `ParseError` carries a byte range; turn it into a 1-based line.
+///
+/// Separate from [`diagnose`], which reads a line number out of a renderer's
+/// error *text* — RaTeX reports position structurally, so guessing is not
+/// needed here.
+fn diagnose_math(source: &str, err: &ratex_parser::ParseError) -> Diagnostic {
+    let diag = Diagnostic::error("math", format!("LaTeX rendering failed\n\n{}", err.message));
+    match &err.loc {
+        Some(loc) => diag.at_line(source[..loc.start.min(source.len())].lines().count().max(1)),
+        None => diag,
+    }
+}
+
+/// The paint for one display item.
+///
+/// Black — RaTeX's default, and the overwhelming majority — becomes
+/// `currentColor` so a formula inherits the surrounding text colour. That is
+/// what lets one rendered SVG serve twelve themes and follow the OS light/dark
+/// switch: the web pane sets `color` on the body and the native path sets it on
+/// the root `<svg>`. Anything else came from `\textcolor` or `\color` and is
+/// emitted literally.
+fn paint(c: &ratex_types::color::Color) -> String {
+    if *c == ratex_types::color::Color::BLACK {
+        "currentColor".into()
+    } else {
+        c.to_string()
+    }
+}
+
+/// Display list to SVG.
+///
+/// `<path>` for every glyph a KaTeX face covers, which is all of maths;
+/// `<text>` for the rest — CJK inside `\text`, emoji — which resvg resolves
+/// against the font database gpui already populates from the system.
+fn emit_svg(
+    list: &ratex_types::display_item::DisplayList,
+    fonts: &Fonts,
+    em: f64,
+    pad: f64,
+) -> String {
+    use ratex_types::display_item::DisplayItem;
+
+    let mut body = String::new();
+    let tx = |v: f64| num(v * em + pad);
+
+    for item in &list.items {
+        let (x, y, scale, font, char_code, color) = match item {
+            DisplayItem::GlyphPath {
+                x,
+                y,
+                scale,
+                font,
+                char_code,
+                color,
+            } => (x, y, scale, font, char_code, color),
+            // Fraction bars, `\overline`, `\hline`. A zero-thickness rect draws
+            // nothing at all, so the floor is load-bearing rather than tidy.
+            DisplayItem::Line {
+                x,
+                y,
+                width,
+                thickness,
+                dashed,
+                color,
+            } => {
+                let t = (thickness * em).max(1e-6);
+                let _ = if *dashed {
+                    write!(
+                        body,
+                        r#"<line x1="{}" y1="{y1}" x2="{}" y2="{y1}" stroke="{c}" stroke-width="{}" stroke-dasharray="{d} {d}"/>"#,
+                        tx(*x),
+                        tx(x + width),
+                        num(t),
+                        c = paint(color),
+                        y1 = tx(*y),
+                        d = num(t * 3.0)
+                    )
+                } else {
+                    write!(
+                        body,
+                        r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{}"/>"#,
+                        tx(*x),
+                        num(y * em + pad - t / 2.0),
+                        num(width * em),
+                        num(t),
+                        paint(color)
+                    )
+                };
+                continue;
+            }
+            // `\colorbox` and `\fbox` backgrounds.
+            DisplayItem::Rect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => {
+                let _ = write!(
+                    body,
+                    r#"<rect x="{}" y="{}" width="{}" height="{}" fill="{}"/>"#,
+                    tx(*x),
+                    tx(*y),
+                    num(width * em),
+                    num(height * em),
+                    paint(color)
+                );
+                continue;
+            }
+            // Radical signs and large delimiters, which arrive already in path
+            // form rather than as glyphs.
+            DisplayItem::Path {
+                x,
+                y,
+                commands,
+                fill,
+                color,
+            } => {
+                let d = path_d(x * em + pad, y * em + pad, em, commands);
+                if !d.is_empty() {
+                    let _ = if *fill {
+                        write!(
+                            body,
+                            r#"<path d="{d}" fill="{}" fill-rule="nonzero" stroke="none"/>"#,
+                            paint(color)
+                        )
+                    } else {
+                        write!(
+                            body,
+                            r#"<path d="{d}" fill="none" stroke="{}" stroke-width="{}" stroke-linecap="round" stroke-linejoin="round"/>"#,
+                            paint(color),
+                            num(STROKE_WIDTH)
+                        )
+                    };
+                }
+                continue;
+            }
+        };
+
+        let id = ratex_font::FontId::parse(font).unwrap_or(ratex_font::FontId::MainRegular);
+        let ch = ratex_font::katex_ttf_glyph_char(id, *char_code);
+        let outline = fonts
+            .faces
+            .get(&id)
+            .or_else(|| fonts.faces.get(&ratex_font::FontId::MainRegular))
+            .and_then(|f| {
+                use ab_glyph::Font as _;
+                let g = f.glyph_id(ch);
+                // Glyph 0 is `.notdef` — a box, which is worse than falling
+                // through to the SVG renderer's own font stack.
+                (g.0 != 0).then(|| {
+                    outline_d(
+                        (*x * em + pad) as f32,
+                        (*y * em + pad) as f32,
+                        (*scale * em) as f32,
+                        f,
+                        g,
+                    )
+                })?
+            });
+
+        let _ = match outline {
+            Some(d) => write!(
+                body,
+                r#"<path d="{d}" fill="{}" stroke="none"/>"#,
+                paint(color)
+            ),
+            None => write!(
+                body,
+                r#"<text x="{}" y="{}" font-family="sans-serif" font-size="{}" fill="{}">{}</text>"#,
+                tx(*x),
+                tx(*y),
+                num(*scale * em),
+                paint(color),
+                escape_xml(ch)
+            ),
+        };
+    }
+
+    let w = list.width * em + 2.0 * pad;
+    let h = (list.height + list.depth) * em + 2.0 * pad;
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}pt" height="{h}pt" fill="currentColor">{body}</svg>"#,
+        w = num(w),
+        h = num(h),
+    )
+}
+
+/// A `DisplayItem::Path`'s commands as an SVG path `d`.
+///
+/// Geometry ported from `ratex-svg` 0.1.14 (MIT), which this crate deliberately
+/// does not depend on — see [`MathRenderer`].
+fn path_d(
+    ox: f64,
+    oy: f64,
+    em: f64,
+    commands: &[ratex_types::path_command::PathCommand],
+) -> String {
+    use ratex_types::path_command::PathCommand as P;
+
+    let mut d = String::new();
+    for cmd in commands {
+        let _ = match cmd {
+            P::MoveTo { x, y } => write!(d, "M{} {} ", num(ox + x * em), num(oy + y * em)),
+            P::LineTo { x, y } => write!(d, "L{} {} ", num(ox + x * em), num(oy + y * em)),
+            P::QuadTo { x1, y1, x, y } => write!(
+                d,
+                "Q{} {} {} {} ",
+                num(ox + x1 * em),
+                num(oy + y1 * em),
+                num(ox + x * em),
+                num(oy + y * em)
+            ),
+            P::CubicTo {
+                x1,
+                y1,
+                x2,
+                y2,
+                x,
+                y,
+            } => write!(
+                d,
+                "C{} {} {} {} {} {} ",
+                num(ox + x1 * em),
+                num(oy + y1 * em),
+                num(ox + x2 * em),
+                num(oy + y2 * em),
+                num(ox + x * em),
+                num(oy + y * em)
+            ),
+            P::Close => write!(d, "Z "),
+        };
+    }
+    d.trim_end().to_string()
+}
+
+/// One glyph's outline as an SVG path `d`, y-flipped and scaled to `em`.
+///
+/// Geometry ported from `ratex-svg` 0.1.14 (MIT). The 0.01 tolerance is theirs:
+/// `ab_glyph` hands back a flat list of curves, and a start point that does not
+/// continue the previous end point begins a new closed subpath.
+fn outline_d(
+    px: f32,
+    py: f32,
+    em: f32,
+    font: &ab_glyph::FontRef<'_>,
+    gid: ab_glyph::GlyphId,
+) -> Option<String> {
+    use ab_glyph::{Font as _, OutlineCurve};
+
+    let outline = font.outline(gid)?;
+    let s = em / font.units_per_em().unwrap_or(1000.0);
+    let at = |p: &ab_glyph::Point| (px + p.x * s, py - p.y * s);
+
+    let mut d = String::new();
+    let mut last: Option<(f32, f32)> = None;
+    for curve in &outline.curves {
+        let (start, end) = match curve {
+            OutlineCurve::Line(a, b) => (at(a), at(b)),
+            OutlineCurve::Quad(a, _, b) => (at(a), at(b)),
+            OutlineCurve::Cubic(a, _, _, b) => (at(a), at(b)),
+        };
+        if last.is_none_or(|(lx, ly)| (lx - start.0).abs() > 0.01 || (ly - start.1).abs() > 0.01) {
+            if last.is_some() {
+                d.push_str("Z ");
+            }
+            let _ = write!(d, "M{} {} ", num(start.0 as f64), num(start.1 as f64));
+        }
+        let p = |q: &ab_glyph::Point| {
+            let (x, y) = at(q);
+            format!("{} {}", num(x as f64), num(y as f64))
+        };
+        let _ = match curve {
+            OutlineCurve::Line(_, b) => write!(d, "L{} ", p(b)),
+            OutlineCurve::Quad(_, c, b) => write!(d, "Q{} {} ", p(c), p(b)),
+            OutlineCurve::Cubic(_, c1, c2, b) => write!(d, "C{} {} {} ", p(c1), p(c2), p(b)),
+        };
+        last = Some(end);
+    }
+    if last.is_some() {
+        d.push('Z');
+    }
+    (!d.is_empty()).then(|| d.trim().to_string())
+}
+
+/// Shortest decimal that still places a glyph correctly at display sizes.
+fn num(n: f64) -> String {
+    let s = format!("{n:.4}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        "0".into()
+    } else {
+        s.into()
+    }
+}
+
+/// Escape a character for XML text content.
+///
+/// Only reached for the `<text>` fallback, and only for one character at a
+/// time — but a document is untrusted input on both render paths, so a `<` that
+/// survives is markup injection.
+fn escape_xml(c: char) -> String {
+    match c {
+        '&' => "&amp;".into(),
+        '<' => "&lt;".into(),
+        '>' => "&gt;".into(),
+        other => other.to_string(),
     }
 }
 
@@ -550,16 +1019,44 @@ mod tests {
         }
     }
 
+    /// The diagram backends need nothing installed; math needs its fonts.
+    ///
+    /// This used to assert all three of LaTeX, Mermaid and D2 were `Builtin`.
+    /// LaTeX no longer is, and the change is deliberate rather than a
+    /// regression: MathJax carried its own glyph outlines inside a 1.6MB
+    /// JavaScript bundle compiled into the binary, and this application now
+    /// embeds no font it could instead ship beside the executable. So math
+    /// reports where its fonts came from, exactly as PlantUML reports where its
+    /// binary came from.
+    ///
+    /// What must stay true is that math is never *silently* unavailable: either
+    /// a directory it found, or a `Missing` carrying an install hint.
     #[test]
-    fn three_of_four_renderers_are_always_available() {
+    fn the_diagram_backends_need_nothing_installed() {
         let report = registry().availability_report();
-        for name in ["LaTeX", "Mermaid", "D2"] {
+        for name in ["Mermaid", "D2"] {
             let entry = report.iter().find(|(n, _)| *n == name).unwrap();
             assert_eq!(
                 entry.1,
                 Availability::Builtin,
                 "{name} must need no external dependency"
             );
+        }
+
+        let math = report.iter().find(|(n, _)| *n == "LaTeX").unwrap();
+        match &math.1 {
+            Availability::External(dir) => assert!(
+                dir.join("KaTeX_Main-Regular.ttf").is_file(),
+                "reported {dir:?} as the font directory, but the faces are not there"
+            ),
+            Availability::Missing(hint) => assert!(
+                hint.contains("KaTeX") && hint.contains("MT_MATH_FONT_DIR"),
+                "the hint must say what to install and how to point at it: {hint}"
+            ),
+            Availability::Builtin => panic!(
+                "math no longer carries its own glyphs; reporting `Builtin` \
+                 would hide a missing font until the first formula"
+            ),
         }
     }
 
@@ -887,32 +1384,125 @@ mod tests {
         );
     }
 
-    /// Warming up must be non-blocking and must leave the engine usable.
+    /// Math must initialize nothing until a formula is actually rendered.
     ///
-    /// The cost it moves is real and measured: MathJax's engine start-up is
-    /// ~870ms on this machine, against ~50ms per formula afterwards. What the
-    /// test pins is the two properties that make moving it safe — the call
-    /// returns immediately, and a render after it still produces SVG rather
-    /// than tripping over a half-initialized engine.
+    /// This replaces `warming_up_returns_immediately_and_leaves_math_working`,
+    /// whose whole premise was a JS engine that cost ~870ms to start and so had
+    /// to be warmed on a thread before the window opened. RaTeX has no engine:
+    /// the renderer is a ZST and the fonts load on first use, so the property
+    /// worth pinning is the opposite one — that constructing the registry
+    /// touches no font and reads no file.
+    ///
+    /// Measured on the release build: 4.34MB at startup, 4.55MB after a
+    /// thousand formulas, against MathJax's 87.5MB paid unconditionally.
     #[test]
-    fn warming_up_returns_immediately_and_leaves_math_working() {
+    fn constructing_the_registry_does_not_load_a_font() {
         let start = std::time::Instant::now();
-        super::warm_up();
+        let registry = RendererRegistry::with_defaults();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "building the registry took {elapsed:?}; something is loading a \
+             font or starting an engine, which an empty workspace must not pay"
+        );
+        // `availability()` runs from `render_status_bar` on every frame, so it
+        // may stat but must not read: half a megabyte of font on the first
+        // frame of a workspace that may never show a formula.
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = registry.availability_report();
+        }
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(100),
-            "warm_up blocked for {elapsed:?}; it must not be on the caller's \
-             thread, or it has simply moved the stall to start-up"
+            "100 availability reports took {elapsed:?}; this runs per frame"
         );
+    }
 
-        // Concurrent with the warm-up thread, which is the interesting case:
-        // `OnceLock` must make one wait for the other rather than both
-        // building an engine.
-        let out = registry().render("math", "x^2");
+    /// The column-count bombs, which abort rather than panic.
+    ///
+    /// `\begin{alignat}{N}` allocates `N * 2` 64-byte values with no bound, so
+    /// an unclamped `N` is an allocation failure — and that aborts, which the
+    /// `catch_unwind` in [`RendererRegistry::render`] cannot contain. The clamp
+    /// lives in `vendor/ratex-parser`; this is what proves the patch is applied.
+    ///
+    /// Every shape here defeats a guard written over the source text, which is
+    /// why the clamp is in the parser instead: it sees the argument after macro
+    /// expansion.
+    #[test]
+    fn column_count_bombs_are_rejected_rather_than_aborting() {
+        let bombs = [
+            r"\begin{alignat}{1000000000} a &= b \end{alignat}".to_string(),
+            format!(
+                "{B}begin {{alignat}}{{1000000000}} a &= b {B}end{{alignat}}",
+                B = "\\"
+            ),
+            format!(
+                "{B}begin\n{{alignat}}{{1000000000}} a &= b {B}end{{alignat}}",
+                B = "\\"
+            ),
+            r"\begin{alignedat}{ 999999999 } a &= b \end{alignedat}".to_string(),
+            r"\def\N{1000000000}\begin{alignat}{\N} a &= b \end{alignat}".to_string(),
+            r"\def\EE{alignat}\begin{\EE}{300000000} a &= b \end{\EE}".to_string(),
+        ];
+        for bomb in &bombs {
+            assert!(
+                ratex_parser::parse(bomb).is_err(),
+                "must be rejected before allocating: {bomb}"
+            );
+        }
+        // Ordinary LaTeX a source-text guard would have false-positived on: the
+        // brace after `\begin{cases}` is a cell, not a column count.
+        for ok in [
+            r"\begin{alignat}{2} a &= b & c &= d \end{alignat}",
+            r"\begin{alignat}{256} a &= b \end{alignat}",
+            r"\begin{cases}{-1} & x<0 \\ {1} & x\ge 0\end{cases}",
+            r"\begin{pmatrix}{1000} & 0 \\ 0 & 1\end{pmatrix}",
+        ] {
+            assert!(ratex_parser::parse(ok).is_ok(), "must still parse: {ok}");
+        }
+    }
+
+    /// An oversized source is capped before the parser sees it.
+    ///
+    /// A 200,000-cell matrix costs 424ms to parse, 794ms to lay out and yields
+    /// a ~289MB string. The largest math block in this repository is 171 bytes.
+    #[test]
+    fn an_oversized_formula_is_capped() {
+        let out = registry().render("math", &"x+".repeat(MAX_MATH_BYTES));
         assert!(
-            out.svg().is_some_and(|svg| svg.contains("<svg")),
-            "math must still render after a warm-up: {:?}",
-            out.diagnostic()
+            out.diagnostic().is_some(),
+            "an oversized source must diagnose rather than run"
+        );
+    }
+
+    /// Math colour must follow the theme, and an explicit colour must survive.
+    ///
+    /// One rendered SVG serves twelve themes and the OS light/dark switch, so a
+    /// baked-in black would make every formula invisible on a dark background.
+    #[test]
+    fn glyph_colour_defaults_to_currentcolor_and_textcolor_survives() {
+        let registry = registry();
+        let Some(plain) = registry.render("math", "x+y").svg().map(str::to_string) else {
+            // No KaTeX fonts on this machine: `availability()` says so and the
+            // renderer diagnoses rather than drawing. Nothing to assert about
+            // colour in that state.
+            return;
+        };
+        assert!(
+            plain.contains("currentColor"),
+            "an uncoloured formula must inherit the theme"
+        );
+        assert!(!plain.contains("#000"), "no hardcoded black");
+        let red = registry
+            .render("math", r"\textcolor{red}{x}+y")
+            .svg()
+            .expect("fonts were present a moment ago")
+            .to_string();
+        assert!(red.contains("#ff0000"), "an explicit colour must survive");
+        assert!(
+            red.contains("currentColor"),
+            "the uncoloured half must still follow the theme"
         );
     }
 }
