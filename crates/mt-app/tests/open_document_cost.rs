@@ -50,22 +50,31 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// What warming up actually buys, measured rather than asserted.
+/// What the first formula in a process costs, against every one after it.
 ///
-/// Run this one alone — it has to observe a *cold* MathJax engine, and any
-/// other test in the same process that renders math warms it first:
+/// This used to measure MathJax's JS engine starting up — 792ms cold against
+/// ~146ms warm, which is why `main.rs` warmed it on a thread before the window
+/// opened. RaTeX has no engine, so the only first-call cost left is reading and
+/// parsing the nineteen KaTeX faces, and the warm-up is gone with it.
+///
+/// Still worth measuring, because it is what justifies *not* having a warm-up:
+/// if this ever grows back to hundreds of milliseconds, deferring it becomes a
+/// question again.
+///
+/// Run it alone — anything else in the same process that renders math loads the
+/// faces first:
 ///
 /// ```sh
 /// cargo test --release -p mt-app --test open_document_cost \
-///   cold_math -- --ignored --nocapture
+///   first_formula -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "must run in a process where nothing has rendered math yet"]
-fn cold_math_costs_far_more_than_warm_math() {
+fn first_formula_costs_little_more_than_the_rest() {
     let registry = mt_app::renderer::RendererRegistry::with_defaults();
 
     let start = Instant::now();
-    let _ = registry.render("math", "a^2 + b^2 = c^2");
+    let first = registry.render("math", "a^2 + b^2 = c^2");
     let cold = start.elapsed();
 
     // A different formula, so the result cache cannot serve it.
@@ -73,11 +82,18 @@ fn cold_math_costs_far_more_than_warm_math() {
     let _ = registry.render("math", "\\int_0^1 x\\,dx");
     let warm = start.elapsed();
 
-    println!("cold {cold:.1?}  warm {warm:.1?}");
+    println!("first {cold:.1?}  subsequent {warm:.1?}");
     println!(
-        "warm-up moves {:.1?} off whichever document is opened first",
+        "loading the faces costs {:.1?} once",
         cold.saturating_sub(warm)
     );
+    if first.diagnostic().is_some() {
+        println!(
+            "NOTE: math is unavailable here, so this measured the diagnostic \
+             path rather than a render — {:?}",
+            first.diagnostic().map(|d| &d.message)
+        );
+    }
 }
 
 #[test]

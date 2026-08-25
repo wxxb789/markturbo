@@ -1,6 +1,9 @@
 # Build output
 /target
 /dist
+# Anchored `/target` above only covers the workspace root. `vendor/ratex-parser`
+# is a crate in its own right, so `cargo` run from inside it leaves ~178MB here.
+vendor/*/target/
 
 # Upstream source cloned for API inspection, not part of this project.
 /.reference

@@ -1,5 +1,21 @@
 # markturbo — performance & binary size, measured
 
+> **Superseded in part, 2026-08-25.** This is the 2026-08-23 measurement pass and
+> is kept as the record of what was true then. Two of its conclusions have since
+> been overturned by measurement rather than argument:
+>
+> - **§2.1 and F6 — MathJax's warm-up.** MathJax is gone. `renderer::warm_up()`
+>   and its ~870ms are deleted; RaTeX's first formula costs 10.1ms once, so
+>   there is nothing left to warm. See
+>   `.scratch/perf-and-size/issues/02-ratex-replaces-mathjax.md`.
+> - **§3.5 — "Only by dropping MathJax … Keep."** That is exactly what happened.
+>   `boa_engine`, `boa_parser`, `boa_ast` and the 1.5MB JS bundle are all out of
+>   the graph, and the binary went 54,310,400 → 46,766,080 bytes.
+>
+> Its baseline figure of 54,269,952 bytes is also stale; rebuild before trusting
+> any size measurement here. Everything else — the harnesses in Part 1, the
+> tree-sitter finding, the search and data-URL fixes — still stands.
+
 Diagnosis run on 2026-08-23, Windows 11 x86_64-pc-windows-msvc, release builds
 throughout. Every number below came from a command in this repository; none is
 estimated. Where a fix was applied, the before/after are both measured.

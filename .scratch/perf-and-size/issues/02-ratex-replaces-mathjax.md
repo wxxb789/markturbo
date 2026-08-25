@@ -103,6 +103,19 @@ The vendored crate passes its own suite unchanged: 158 + 3 + 1 doctest, 0 failed
 megabyte of font on the first frame of a workspace that may never show a
 formula. The faces are read on first render, behind a second `OnceLock`.
 
+Measured by `first_formula_costs_little_more_than_the_rest`, which replaces the
+old `cold_math_costs_far_more_than_warm_math` harness — its premise was a cold
+JS engine and it was `#[ignore]`d, so nothing would have caught it going stale:
+
+```
+first 11.8ms  subsequent 1.7ms
+loading the faces costs 10.1ms once
+```
+
+Against MathJax's 792 ms. That is the number justifying the absence of a
+warm-up: 10 ms once is not worth deferring, and if it ever grows back to
+hundreds of milliseconds the harness will say so.
+
 ### Fonts
 
 Nineteen KaTeX faces, `fonts/katex/` in the repository, staged next to the
