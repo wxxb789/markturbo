@@ -56,5 +56,8 @@ gpui-wry.workspace = true
 raw-window-handle.workspace = true
 wry.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -58,18 +58,13 @@ fn resolve_target(args: &[String]) -> Result<Option<PathBuf>, (String, i32)> {
 }
 
 fn main() {
-    // GPUI composites its swap chain through DirectComposition, which sits on
-    // top of the WebView2 child HWND — the Web preview loads and paints, and
-    // then is covered by the window's own surface. Disabling composition puts
-    // the swap chain on the HWND directly and lets the child window through.
-    // This is what gpui-component's own webview example does, with the comment
-    // "Required this for Windows to render the WebView".
+    // GPUI's DirectComposition swap chain covers ordinary child HWNDs. The
+    // WebView worker therefore uses the compatibility compositor, matching
+    // gpui-component's WebView example, so its WS_CHILD host can remain inside
+    // the one application window.
     //
-    // The cost is transparent window backgrounds, which need a composition swap
-    // chain — this app only asks for those on Linux, so on Windows there is
-    // nothing to trade away.
-    //
-    // SAFETY: single-threaded, before any window or background executor exists.
+    // SAFETY: this is single-threaded startup, before the application or any
+    // worker exists.
     #[cfg(target_os = "windows")]
     unsafe {
         std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true")
@@ -166,6 +161,36 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Windows must use GPUI's child-HWND compatibility compositor.
+    #[test]
+    fn direct_composition_is_disabled_before_the_window_exists() {
+        let source = include_str!("main.rs");
+        let test_module = source
+            .find("\n#[cfg(test)]")
+            .expect("the test module marker");
+        let source = &source[..test_module];
+        let disable_key = ["GPUI_DISABLE_DIRECT_", "COMPOSITION"].concat();
+        let disable = source
+            .find(&format!("set_var(\"{disable_key}\""))
+            .expect("the compatibility switch");
+        let application = source
+            .find("gpui_platform::application()")
+            .expect("GPUI application initialization");
+
+        assert!(
+            disable < application,
+            "the compositor is selected before GPUI initializes"
+        );
+        assert!(
+            !source.contains("cfg(any(target_os = \"windows\", target_os = \"linux\"))"),
+            "Windows transparent backgrounds require DirectComposition and conflict with the compatibility path"
+        );
+        assert!(
+            source.contains("cx.new(|cx| Root::new(view, window, cx))"),
+            "the main window keeps one ordinary GPUI root"
+        );
     }
 
     #[test]
