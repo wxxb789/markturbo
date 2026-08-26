@@ -4927,6 +4927,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "windows 0.61.3",
 ]
 
 [[package]]

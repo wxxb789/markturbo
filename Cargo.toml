@@ -135,6 +135,16 @@ dirs = "6"
 wry = { version = "0.53.3", package = "lb-wry" }
 smol = "2"
 tempfile = "3"
+# Wry owns WebView2, but it does not expose the private WS_CHILD host or the
+# STA thread-message pump needed to keep that host inside GPUI's one window.
+# This is a target-gated capability dependency, not a size/performance trade.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 # The translation transport. Pulls reqwest and its stack — 41 crates that were
 # not compiled before, measured on x86_64-pc-windows-msvc (510 -> 551). tokio
 # and hyper are among them: gpui-component-assets declares reqwest only under
@@ -225,4 +235,3 @@ lto = "thin"
 # `catch_unwind` so a panic in a diagram backend becomes an inline diagnostic
 # instead of killing the app. `panic = "abort"` would silently defeat that.
 panic = "unwind"
-

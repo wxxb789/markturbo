@@ -15,9 +15,8 @@ use gpui_component::{
     h_flex,
     highlighter::Language,
     input::{Editor, EditorState, InputEvent, TabSize},
-    menu::PopupMenu,
-    popover::Popover,
     resizable::{h_resizable, resizable_panel},
+    tab::{Tab, TabBar},
     text::{TextView, TextViewState, TextViewStyle},
     v_flex,
 };
@@ -30,12 +29,11 @@ use crate::renderer::RendererRegistry;
 use crate::views::{Layout, PreviewKind};
 use crate::web::{self, Trust};
 
-// One action per layout.
-//
-// Unit actions rather than one carrying the layout: `PopupMenu` items are
-// actions, and a payload-carrying action needs `schemars` derives this crate
-// does not otherwise depend on. Five names is the cheaper trade, and it makes
-// each layout independently bindable to a key.
+#[cfg(target_os = "windows")]
+use crate::views::workspace::web_surface::WindowsWebView;
+
+// One unit action per layout keeps every mode independently bindable without a
+// payload-carrying action and its otherwise-unused `schemars` dependency.
 actions!(
     markturbo,
     [
@@ -47,15 +45,29 @@ actions!(
     ]
 );
 
-/// The action that selects `layout`.
-fn layout_action(layout: Layout) -> Box<dyn gpui::Action> {
-    match layout {
-        Layout::Source => Box::new(ViewSource),
-        Layout::Native => Box::new(ViewNative),
-        Layout::Web => Box::new(ViewWeb),
-        Layout::SplitNative => Box::new(ViewSplitNative),
-        Layout::SplitWeb => Box::new(ViewSplitWeb),
+fn platform_layout(layout: Layout) -> Layout {
+    #[cfg(target_os = "windows")]
+    if layout == Layout::SplitWeb {
+        return Layout::Web;
     }
+    layout
+}
+
+fn available_layouts(doc_type: DocType) -> &'static [Layout] {
+    let available = Layout::available_for(doc_type);
+    #[cfg(target_os = "windows")]
+    {
+        const WITHOUT_SPLIT_WEB: [Layout; 4] = [
+            Layout::Source,
+            Layout::Native,
+            Layout::Web,
+            Layout::SplitNative,
+        ];
+        if available.contains(&Layout::SplitWeb) {
+            return &WITHOUT_SPLIT_WEB;
+        }
+    }
+    available
 }
 
 /// How long after the last keystroke to reparse and refresh the preview.
@@ -79,12 +91,8 @@ pub enum DocumentEvent {
     Conflict,
     /// Something worth telling the user.
     Status(String),
-    /// A GPUI overlay opened (`true`) or closed (`false`) over the document.
-    ///
-    /// The workspace hides the WebView while one is open. It has to be an event
-    /// rather than something the document handles itself: the WebView belongs to
-    /// the window, not to the tab — see `workspace::web_surface`.
-    OverlayOpen(bool),
+    /// Scroll the worker-owned window WebView after the current draw.
+    ScrollWebPreview(f32),
 }
 
 pub struct DocumentView {
@@ -129,21 +137,27 @@ pub struct DocumentView {
     /// one through — because loading that file from disk is the only way its
     /// relative images and stylesheets can resolve.
     web_html: Option<String>,
+    /// Changes only when `web_html` changes or is invalidated.
+    ///
+    /// The workspace compares this before cloning the HTML, so notifications
+    /// unrelated to the preview stay a small-integer no-op.
+    web_revision: u64,
     /// The first visible editor row the last time the preview was synced.
     ///
     /// Sync is driven from render, which runs on every frame — without this the
     /// preview would be told to scroll to where it already is, sixty times a
     /// second, and each of those is a script evaluation in another process.
     synced_row: Option<usize>,
-    /// The window's single WebView, lent to this tab while it is the active one
-    /// showing a Web pane.
+    /// The window's single WebView, lent to this tab while it is active.
     ///
     /// It has to be *in this element tree* rather than merely alive: the OS
     /// child window's bounds are set by `WebViewElement::prepaint`, and a
     /// `WebView` that is never rendered keeps the `Rect::default()` it was
     /// constructed with — 0x0 at the origin, which is exactly "the Web view does
     /// not work".
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    webview: Option<WindowsWebView>,
+    #[cfg(target_os = "macos")]
     webview: Option<Entity<gpui_wry::WebView>>,
     _reparse: Option<Task<()>>,
     /// The in-flight background reload, deliberately not sharing `_reparse`.
@@ -209,6 +223,7 @@ impl DocumentView {
             externally_changed: false,
             registry,
             web_html: None,
+            web_revision: 0,
             synced_row: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
@@ -271,6 +286,7 @@ impl DocumentView {
     }
 
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
+        let layout = platform_layout(layout);
         if self.layout == layout {
             return;
         }
@@ -365,21 +381,7 @@ impl DocumentView {
     fn scroll_preview_to(&mut self, fraction: f32, cx: &mut Context<Self>) {
         match self.layout.preview().unwrap_or(PreviewKind::Native) {
             PreviewKind::Web => {
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                if let Some(webview) = &self.webview {
-                    // The preview is a separate browser context, so the only
-                    // way in is a script. `scrollingElement` covers both quirks
-                    // and standards mode; the guard makes a document that has
-                    // not finished loading a no-op rather than an exception.
-                    let script = format!(
-                        "(function(){{var e=document.scrollingElement||document.body;\
-                         if(!e)return;var h=e.scrollHeight-e.clientHeight;\
-                         if(h>0)e.scrollTop=h*{fraction};}})()"
-                    );
-                    let _ = webview.read(cx).raw().evaluate_script(&script);
-                }
-                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                let _ = fraction;
+                cx.emit(DocumentEvent::ScrollWebPreview(fraction));
             }
             // ponytail: the native preview is a `TextView`, which owns its
             // scroll handle and does not expose it. Syncing it needs an upstream
@@ -678,11 +680,14 @@ impl DocumentView {
         } else {
             // Invalidate so switching to Web later rebuilds rather than showing
             // a stale render.
-            self.web_html = None;
+            if self.web_html.take().is_some() {
+                self.web_revision = self.web_revision.wrapping_add(1);
+            }
         }
     }
 
     fn rebuild_web(&mut self, cx: &mut Context<Self>) {
+        self.web_revision = self.web_revision.wrapping_add(1);
         if self.document.source().len() > LIVE_PREVIEW_LIMIT {
             self.web_html = Some(oversize_notice(self.document.source().len()));
             return;
@@ -699,10 +704,10 @@ impl DocumentView {
             // that origin is opaque and cannot reach the filesystem at all.
             // Encoding it here as well would percent-encode the payload twice.
             //
-            // ponytail: a trusted preview does not refresh on edit — the URL
-            // is unchanged, so the workspace's "same payload" check skips the
-            // reload. `file://` shows what is on disk, which is honest but not
-            // live; making it live needs a cache-buster the WebView will accept.
+            // A revision still reloads this URL after an edit, but `file://`
+            // shows what is on disk rather than the unsaved editor buffer. A
+            // truly live trusted preview would need a temporary-file protocol,
+            // not a different cache key.
             self.web_html = Some(match self.trust {
                 Trust::Trusted => web::to_file_url(&self.file.path),
                 Trust::Restricted => web::build_html_raw(&self.document, self.trust),
@@ -736,13 +741,28 @@ impl DocumentView {
         self.web_html.as_deref()
     }
 
+    pub(crate) fn web_payload(&self) -> Option<(&str, u64)> {
+        self.web_html
+            .as_deref()
+            .map(|html| (html, self.web_revision))
+    }
+
     /// Lend this tab the window's WebView, or take it back.
     ///
     /// The workspace owns it — it is one OS child window per window, not per
     /// document — but only the tab currently rendering a Web pane may put it in
     /// its element tree, or two tabs would fight over its bounds.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub fn set_webview(
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_webview(&mut self, webview: Option<WindowsWebView>, cx: &mut Context<Self>) {
+        if self.webview == webview {
+            return;
+        }
+        self.webview = webview;
+        cx.notify();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_webview(
         &mut self,
         webview: Option<Entity<gpui_wry::WebView>>,
         cx: &mut Context<Self>,
@@ -757,12 +777,6 @@ impl DocumentView {
         }
         self.webview = webview;
         cx.notify();
-    }
-
-    /// Whether this tab currently holds the window's WebView.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub fn has_webview(&self) -> bool {
-        self.webview.is_some()
     }
 
     fn render_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -782,52 +796,27 @@ impl DocumentView {
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
-            // One dropdown rather than four buttons and a conditional toggle.
-            // The five layouts are mutually exclusive, so a control that shows
-            // one value and opens to reveal the rest is the honest shape — and
-            // the old toggle only appeared once Split was selected, which hid
-            // half the choices behind the other half.
-            //
-            // Built from `Popover` rather than `Button::dropdown_menu`, which is
-            // otherwise the same thing: only `Popover` exposes `on_open_change`,
-            // and the workspace needs that to hide the WebView while the menu is
-            // up. The child window is above everything GPUI draws, so without it
-            // this menu is covered by the preview and its clicks are eaten. See
-            // `workspace::web_surface::WebSurface::overlays`.
             .child({
                 let current = self.layout;
-                // Only the layouts this document can actually be shown in:
-                // offering Native for a `.rs` offers a blank pane.
-                let available = Layout::available_for(doc_type);
-                Popover::new("layout")
-                    .appearance(false)
-                    .overlay_closable(false)
-                    .anchor(Anchor::TopLeft)
-                    .trigger(
-                        Button::new("layout")
-                            .label(i18n::t(self.layout.label_key(), cx))
-                            .icon(IconName::ChevronDown)
-                            .xsmall()
-                            .ghost()
-                            .tooltip(i18n::t(i18n::Key::ViewLayout, cx)),
+                let available = available_layouts(doc_type);
+                TabBar::new("layout-modes")
+                    .segmented()
+                    .selected_index(
+                        available
+                            .iter()
+                            .position(|layout| *layout == current)
+                            .unwrap_or(0),
                     )
-                    .content(move |_, window, cx| {
-                        PopupMenu::build(window, cx, move |menu, _window, _cx| {
-                            available.iter().fold(menu, |menu, layout| {
-                                menu.menu_with_check(
-                                    i18n::text(
-                                        layout.label_key(),
-                                        crate::settings::Language::default(),
-                                    ),
-                                    *layout == current,
-                                    layout_action(*layout),
-                                )
-                            })
-                        })
-                    })
-                    .on_open_change(cx.listener(|_, open: &bool, _, cx| {
-                        cx.emit(DocumentEvent::OverlayOpen(*open));
+                    .on_click(cx.listener(move |this, ix: &usize, _, cx| {
+                        if let Some(layout) = available.get(*ix) {
+                            this.set_layout(*layout, cx);
+                        }
                     }))
+                    .children(
+                        available
+                            .iter()
+                            .map(|layout| Tab::new().label(i18n::t(layout.label_key(), cx))),
+                    )
             })
             .child(div().flex_1())
             // Document type is a first-class label: an AGENTS.md is not just
@@ -1002,12 +991,6 @@ impl DocumentView {
 
     /// The Web pane.
     ///
-    /// The `WebView` entity itself lives in the workspace (one per window,
-    /// reused across tabs, because each is an OS-level child window) and is
-    /// lent to the active tab via [`Self::set_webview`]. Childing it here is
-    /// load-bearing rather than decorative: `WebViewElement::prepaint` is the
-    /// only thing that ever calls `set_bounds` on the child window, so a
-    /// `WebView` outside the element tree stays 0x0 no matter what it loads.
     fn render_web_preview(&self, cx: &Context<Self>) -> impl IntoElement {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
@@ -1370,7 +1353,7 @@ impl Render for DocumentView {
 mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
-    use super::{Layout, editor_language, first_line_title};
+    use super::{Layout, available_layouts, editor_language, first_line_title, platform_layout};
     use gpui_component::highlighter::Language;
     use mt_doc::DocType;
     use std::path::Path;
@@ -1420,15 +1403,8 @@ mod tests {
 
     /// The Web pane must place the `WebView` in the element tree.
     ///
-    /// A source-level check, like `workspace.rs`'s companion, and for the same
-    /// reason: the failure needs a real window with a real WebView2 runtime, so
-    /// it is not reachable from a unit test — but it is trivially reintroducible
-    /// by anyone who reads `render_web_preview`'s empty div as the whole story.
-    ///
-    /// What broke: the WebView was created, shown, and given a `data:` URL, but
-    /// never childed anywhere. `WebViewElement::prepaint` is the only code that
-    /// calls `set_bounds` on the OS child window, so it kept the 0x0
-    /// `Rect::default()` from `WebView::new` — loaded, visible, and invisible.
+    /// A source-level check, because the failure needs a real window with a
+    /// real WebView2 runtime and is otherwise easy to reintroduce.
     #[test]
     fn the_web_pane_renders_the_webview_entity() {
         let source = crate::views::production_source(include_str!("document.rs"));
@@ -1439,16 +1415,8 @@ mod tests {
         let end = body.find("\n    fn render_preview").unwrap_or(body.len());
         let body = &body[..end];
 
-        assert!(
-            body.contains("self.webview"),
-            "`render_web_preview` must child the WebView entity; without it the \
-             OS child window is never laid out and stays 0x0 no matter what it \
-             loads"
-        );
-        assert!(
-            source.contains("pub fn set_webview"),
-            "the workspace needs a way to lend the WebView to the active tab"
-        );
+        assert!(body.contains("self.webview"));
+        assert!(source.contains("fn set_webview("));
     }
 
     /// The native preview must reuse one `MarkdownExtensions`, never build one
@@ -1469,7 +1437,6 @@ mod tests {
     /// when the revision matches the one it holds, so a value built fresh in
     /// `render` can never match — while a `Clone` of one built once copies the
     /// revision and matches from the second frame on.
-    #[test]
     /// The native pane must give a `currentColor` SVG a colour to inherit.
     ///
     /// usvg resolves `currentColor` by walking for a `color` attribute and
@@ -1629,14 +1596,10 @@ mod tests {
     /// The injected script must tolerate a document that has not loaded.
     #[test]
     fn the_scroll_script_is_guarded() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source
-            .find("fn scroll_preview_to")
-            .expect("scroll_preview_to");
-        let body = &source[start..];
-        let end = body
-            .find("\n    pub fn reveal_offset")
-            .unwrap_or(body.len());
+        let surface = crate::views::production_source(include_str!("workspace/web_surface.rs"));
+        let start = surface.find("fn scroll_script").expect("scroll_script");
+        let body = &surface[start..];
+        let end = body.find("\n}").unwrap_or(body.len());
         let body = &body[..end];
 
         assert!(
@@ -1647,6 +1610,20 @@ mod tests {
             body.contains("if(!e)return"),
             "a document mid-load has no scrolling element; without the guard \
              this throws inside the WebView"
+        );
+        let document = crate::views::production_source(include_str!("document.rs"));
+        let start = document
+            .find("fn scroll_preview_to")
+            .expect("scroll_preview_to");
+        let document = &document[start..];
+        let end = document
+            .find("\n    pub fn reveal_offset")
+            .unwrap_or(document.len());
+        let document = &document[..end];
+        assert!(document.contains("DocumentEvent::ScrollWebPreview"));
+        assert!(
+            !document.contains("evaluate_script"),
+            "render may queue a scroll, never call WebView2 directly"
         );
         assert!(
             body.contains("if(h>0)"),
@@ -1776,9 +1753,9 @@ mod tests {
         assert_eq!(Layout::default_for(DocType::Text), Layout::Source);
     }
 
-    /// The layout dropdown must not offer layouts that show nothing.
+    /// The fixed layout selector must not offer layouts that show nothing.
     #[test]
-    fn the_layout_dropdown_offers_only_what_the_document_supports() {
+    fn the_layout_selector_is_fixed_and_offers_only_supported_modes() {
         let source = crate::views::production_source(include_str!("document.rs"));
         let start = source.find("fn render_toolbar").expect("render_toolbar");
         let body = &source[start..];
@@ -1788,7 +1765,7 @@ mod tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("Layout::available_for(doc_type)"),
+            body.contains("available_layouts(doc_type)"),
             "iterating `Layout::ALL` offers a text file four layouts that \
              render an empty pane"
         );
@@ -1796,6 +1773,21 @@ mod tests {
             !body.contains("Layout::ALL"),
             "one of the two lists has to go, or they drift"
         );
+        assert!(
+            body.contains("TabBar::new(\"layout-modes\")") && body.contains(".segmented()"),
+            "Web mode needs a fixed selector; a popup can be covered by the child HWND"
+        );
+        assert!(
+            !body.contains(".dropdown_menu(") && !body.contains(".tooltip("),
+            "the document toolbar must not create an overlay above the Web preview"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_never_places_an_editor_beside_the_child_webview() {
+        assert!(!available_layouts(DocType::Markdown).contains(&Layout::SplitWeb));
+        assert_eq!(platform_layout(Layout::SplitWeb), Layout::Web);
     }
 
     /// Trust is offered for both things it can unlock.

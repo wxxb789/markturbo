@@ -12,7 +12,7 @@
 //! same here as it did before the split.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
@@ -44,7 +44,7 @@ use crate::views::tabs::Tabs;
 use crate::watcher::Watcher;
 
 mod history;
-mod web_surface;
+pub(crate) mod web_surface;
 
 use self::history::History;
 use self::web_surface::WebSurface;
@@ -145,6 +145,8 @@ pub struct Workspace {
     root: Option<PathBuf>,
     explorer: Option<Entity<Explorer>>,
     harness: Option<Entity<HarnessView>>,
+    /// Global skill roots outlive the folder-specific Harness view.
+    skill_cache: Arc<Mutex<mt_doc::skill::DiscoveryCache>>,
     search: Entity<SearchView>,
     /// The settings page, built once rather than per open.
     ///
@@ -255,6 +257,7 @@ impl Workspace {
             root: None,
             explorer: None,
             harness: None,
+            skill_cache: Arc::new(Mutex::new(mt_doc::skill::DiscoveryCache::default())),
             search: cx.new(|cx| SearchView::new(window, cx)),
             settings: cx.new(SettingsView::new),
             side_panel: SidePanel::Files,
@@ -387,7 +390,8 @@ impl Workspace {
         }
 
         let explorer = cx.new(|cx| Explorer::new(path.clone(), window, cx));
-        let harness = cx.new(|cx| HarnessView::new(path.clone(), cx));
+        let skill_cache = self.skill_cache.clone();
+        let harness = cx.new(|cx| HarnessView::new(path.clone(), skill_cache, cx));
 
         // Kept apart from `_subscriptions`: this set is replaced wholesale on
         // every folder change, and folding it into the general one would take
@@ -530,7 +534,9 @@ impl Workspace {
                         cx,
                     ),
                     DocumentEvent::DirtyChanged => cx.notify(),
-                    DocumentEvent::OverlayOpen(open) => this.overlay_changed(*open, cx),
+                    DocumentEvent::ScrollWebPreview(fraction) => {
+                        this.queue_web_scroll(*fraction, cx)
+                    }
                 },
             ),
             // A document notifies on mode change, trust change, and after a
@@ -618,6 +624,13 @@ impl Workspace {
 
     fn active_document(&self) -> Option<&Entity<DocumentView>> {
         self.document_at(self.tabs.active_index())
+    }
+
+    fn web_active(&self, cx: &App) -> bool {
+        !self.settings_open
+            && self
+                .active_document()
+                .is_some_and(|document| document.read(cx).layout().uses_webview())
     }
 
     fn set_status(&mut self, message: String, cx: &mut Context<Self>) {
@@ -752,6 +765,10 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.web_active(cx) {
+            self.set_status("Switch to Source or Native to use side panels.".into(), cx);
+            return;
+        }
         self.left_panel_open = !self.left_panel_open;
         // The WebView is an OS child window; it does not notice the document
         // pane resizing under it.
@@ -765,6 +782,10 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.web_active(cx) {
+            self.set_status("Switch to Source or Native to use side panels.".into(), cx);
+            return;
+        }
         self.right_panel_open = !self.right_panel_open;
         self.web_dirty(cx);
         cx.notify();
@@ -1244,6 +1265,13 @@ impl Workspace {
 
     /// Show the Search panel and put the caret in its field.
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.web_active(cx) {
+            self.set_status(
+                "Switch to Source or Native to search the workspace.".into(),
+                cx,
+            );
+            return;
+        }
         self.side_panel = SidePanel::Search;
         // Opening the panel is not enough: the point of the binding is to type
         // a query immediately, and a panel that appears without focus makes the
@@ -1353,6 +1381,7 @@ impl Workspace {
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
         let root = self.root.clone();
+        let web_active = self.web_active(cx);
         TabBar::new("document-tabs")
             // Not `w_full`: the bar sits inside the title bar, and a strip that
             // claims the whole width leaves no slack for dragging the window.
@@ -1371,57 +1400,55 @@ impl Workspace {
                     .map(|rest| rest.to_string_lossy().replace('\\', "/"));
                 let is_preview = self.tabs.is_preview(&path);
                 let dirty = doc.is_dirty();
+                let label = elide_tab_label(&doc.title(cx));
+                let aria_label = if dirty {
+                    format!("{label}, {}", i18n::t(i18n::Key::UnsavedChanges, cx))
+                } else {
+                    label.clone()
+                };
 
                 Tab::new()
-                    .label(elide_tab_label(&doc.title(cx)))
+                    .label(label)
+                    .aria_label(aria_label)
                     .icon(if doc.is_externally_changed() {
                         IconName::TriangleAlert
                     } else {
                         IconName::File
                     })
-                    .prefix(
-                        // The whole tab, wrapped: `Tab` is not interactive, so
-                        // the tooltip and the context menu need an element that
-                        // is. A zero-width prefix is the seam that gets one
-                        // without reimplementing the tab.
-                        div()
-                            .id(SharedString::from(format!("tab-affordances-{ix}")))
-                            .w_0()
-                            .h_full()
-                            // gpui's own `tooltip`, not gpui-component's
-                            // `managed_tooltip`: that extension trait is
-                            // private to the crate.
-                            .tooltip({
-                                let full = full.clone();
-                                move |window, cx| Tooltip::new(full.clone()).build(window, cx)
-                            })
-                            .on_mouse_down(MouseButton::Right, {
-                                cx.listener(move |this, _, _, cx| {
-                                    // The menu acts on whichever tab was
-                                    // right-clicked, which is not necessarily
-                                    // the active one.
-                                    this.tabs.set_menu(ix);
-                                    cx.notify();
+                    .when(!web_active, |tab| {
+                        tab.child(
+                            div()
+                                .id(SharedString::from(format!("tab-affordances-{ix}")))
+                                .absolute()
+                                .inset_0()
+                                .tooltip({
+                                    let full = full.clone();
+                                    move |window, cx| Tooltip::new(full.clone()).build(window, cx)
                                 })
-                            })
-                            .context_menu({
-                                let relative = relative.clone();
-                                move |menu, _window, cx| {
-                                    let menu = menu
-                                        .menu(i18n::t(i18n::Key::CopyPath, cx), Box::new(CopyPath));
-                                    // Only offered when there is one: a menu
-                                    // item that silently does nothing is worse
-                                    // than an absent one.
-                                    match relative {
-                                        Some(_) => menu.menu(
-                                            i18n::t(i18n::Key::CopyRelativePath, cx),
-                                            Box::new(CopyRelativePath),
-                                        ),
-                                        None => menu,
+                                .on_mouse_down(MouseButton::Right, {
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.tabs.set_menu(ix);
+                                        cx.notify();
+                                    })
+                                })
+                                .context_menu({
+                                    let relative = relative.clone();
+                                    move |menu, _window, cx| {
+                                        let menu = menu.menu(
+                                            i18n::t(i18n::Key::CopyPath, cx),
+                                            Box::new(CopyPath),
+                                        );
+                                        match relative {
+                                            Some(_) => menu.menu(
+                                                i18n::t(i18n::Key::CopyRelativePath, cx),
+                                                Box::new(CopyRelativePath),
+                                            ),
+                                            None => menu,
+                                        }
                                     }
-                                }
-                            }),
-                    )
+                                }),
+                        )
+                    })
                     // A preview tab is italic, the same signal VS Code uses, so
                     // "this will be replaced by the next click" is visible
                     // before it happens rather than after.
@@ -1440,11 +1467,11 @@ impl Workspace {
                                 .items_center()
                                 .justify_center()
                                 .size(metrics::target())
-                                .tooltip({
-                                    move |window, cx| {
+                                .when(!web_active, |this| {
+                                    this.tooltip(move |window, cx| {
                                         Tooltip::new(i18n::t(i18n::Key::UnsavedChanges, cx))
                                             .build(window, cx)
-                                    }
+                                    })
                                 })
                                 .child(
                                     div()
@@ -1475,6 +1502,61 @@ impl Workspace {
             }))
     }
 
+    fn render_web_path_controls(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if !self.web_active(cx) {
+            return None;
+        }
+        let path = self.active_document()?.read(cx).path().to_path_buf();
+        let full = path.to_string_lossy().replace('\\', "/");
+        let has_relative = self
+            .root
+            .as_ref()
+            .is_some_and(|root| path.strip_prefix(root).is_ok());
+
+        Some(
+            h_flex()
+                .id("web-path-commands")
+                .flex_shrink_0()
+                .min_w_0()
+                .gap(metrics::gap())
+                .items_center()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .max_w(px(200.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(full),
+                )
+                .child(
+                    Button::new("web-copy-path")
+                        .icon(IconName::Copy)
+                        .label(i18n::t(i18n::Key::CopyPath, cx))
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.tabs.clear_menu();
+                            this.on_copy_path(&CopyPath, window, cx);
+                        })),
+                )
+                .when(has_relative, |this| {
+                    this.child(
+                        Button::new("web-copy-relative-path")
+                            .icon(IconName::Copy)
+                            .label(i18n::t(i18n::Key::CopyRelativePath, cx))
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.tabs.clear_menu();
+                                this.on_copy_relative_path(&CopyRelativePath, window, cx);
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     /// The one bar across the top of the document column.
     ///
     /// Window title row and document tab strip merged: stacked, they spent 80
@@ -1487,7 +1569,13 @@ impl Workspace {
     /// the panels read as the main view extending sideways rather than as
     /// content parked under a bar.
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let navigator = self.render_navigator(cx);
+        let web_active = self.web_active(cx);
+        let navigator = if web_active {
+            div().into_any_element()
+        } else {
+            self.render_navigator(cx).into_any_element()
+        };
+        let web_path_controls = self.render_web_path_controls(cx);
         TitleBar::new()
             // `TitleBar` hard-codes its own 34px height; the side panels put a
             // header at [`metrics::TITLE_BAR`] beside it, and two chrome rows
@@ -1509,13 +1597,17 @@ impl Workspace {
                     // an open panel carries its own copy in its header, which
                     // is where the eye already is.
                     .when(!self.left_panel_open, |this| {
-                        this.child(
-                            h_flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(self.render_left_toggle(cx)),
-                        )
+                        this.when(!web_active, |this| {
+                            this.child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(self.render_left_toggle(cx)),
+                            )
+                        })
                     })
                     .child(
                         h_flex()
@@ -1563,78 +1655,82 @@ impl Workspace {
                             // here reaches the title bar and moves the window.
                             .child(div().flex_1().min_w_0().h_full()),
                     )
-                    .child(
-                        // The title bar is a `WindowControlArea::Drag` region,
-                        // which Windows hit-tests as `HTCAPTION`: a press there
-                        // becomes a window drag and never reaches GPUI's mouse
-                        // dispatch, so buttons inside it silently do nothing.
-                        // Claiming the press back is what upstream's own example
-                        // does (gpui-component `story/src/title_bar.rs`).
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap(metrics::gap())
-                            .items_center()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(
-                                Button::new("open-folder")
-                                    .label(i18n::t(i18n::Key::OpenFolder, cx))
-                                    .xsmall()
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_open_folder(&OpenFolder, window, cx)
-                                    })),
-                            )
-                            .child(
-                                // Translating the selection when there is one is
-                                // what a user means by "Translate" with text
-                                // highlighted; falling back to the whole document
-                                // otherwise avoids a menu for a two-case choice.
-                                Button::new("translate")
-                                    .label(i18n::t(i18n::Key::Translate, cx))
-                                    .xsmall()
-                                    .ghost()
-                                    // Swaps the icon for a spinner and makes the
-                                    // button inert, so the round-trip is visible
-                                    // and a second request cannot be started
-                                    // over the same text.
-                                    .loading(self.translating)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let has_selection = this
-                                            .active_document()
-                                            .is_some_and(|d| !d.read(cx).selection(cx).is_empty());
-                                        if has_selection {
-                                            this.on_translate_selection(
-                                                &TranslateSelection,
-                                                window,
-                                                cx,
-                                            )
-                                        } else {
-                                            this.on_translate_document(
-                                                &TranslateDocument,
-                                                window,
-                                                cx,
-                                            )
-                                        }
-                                    })),
-                            )
-                            // Immediately left of Settings while the panel is
-                            // closed; the panel's own header carries it once it
-                            // is open.
-                            .when(!self.right_panel_open, |this| {
-                                this.child(self.render_right_toggle(cx))
-                            })
-                            .child(
-                                Button::new("settings")
-                                    .icon(IconName::Settings)
-                                    .xsmall()
-                                    .ghost()
-                                    .when(self.settings_open, |b| b.primary())
-                                    .tooltip(i18n::t(i18n::Key::Settings, cx))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_open_settings(&OpenSettings, window, cx)
-                                    })),
-                            ),
-                    ),
+                    .when_some(web_path_controls, |this, controls| this.child(controls))
+                    .when(!web_active, |this| {
+                        this.child(
+                            // The title bar is a `WindowControlArea::Drag` region,
+                            // which Windows hit-tests as `HTCAPTION`: a press there
+                            // becomes a window drag and never reaches GPUI's mouse
+                            // dispatch, so buttons inside it silently do nothing.
+                            // Claiming the press back is what upstream's own example
+                            // does (gpui-component `story/src/title_bar.rs`).
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap(metrics::gap())
+                                .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Button::new("open-folder")
+                                        .label(i18n::t(i18n::Key::OpenFolder, cx))
+                                        .xsmall()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.on_open_folder(&OpenFolder, window, cx)
+                                        })),
+                                )
+                                .child(
+                                    // Translating the selection when there is one is
+                                    // what a user means by "Translate" with text
+                                    // highlighted; falling back to the whole document
+                                    // otherwise avoids a menu for a two-case choice.
+                                    Button::new("translate")
+                                        .label(i18n::t(i18n::Key::Translate, cx))
+                                        .xsmall()
+                                        .ghost()
+                                        // Swaps the icon for a spinner and makes the
+                                        // button inert, so the round-trip is visible
+                                        // and a second request cannot be started
+                                        // over the same text.
+                                        .loading(self.translating)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let has_selection =
+                                                this.active_document().is_some_and(|d| {
+                                                    !d.read(cx).selection(cx).is_empty()
+                                                });
+                                            if has_selection {
+                                                this.on_translate_selection(
+                                                    &TranslateSelection,
+                                                    window,
+                                                    cx,
+                                                )
+                                            } else {
+                                                this.on_translate_document(
+                                                    &TranslateDocument,
+                                                    window,
+                                                    cx,
+                                                )
+                                            }
+                                        })),
+                                )
+                                // Immediately left of Settings while the panel is
+                                // closed; the panel's own header carries it once it
+                                // is open.
+                                .when(!self.right_panel_open, |this| {
+                                    this.child(self.render_right_toggle(cx))
+                                })
+                                .child(
+                                    Button::new("settings")
+                                        .icon(IconName::Settings)
+                                        .xsmall()
+                                        .ghost()
+                                        .when(self.settings_open, |b| b.primary())
+                                        .tooltip(i18n::t(i18n::Key::Settings, cx))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.on_open_settings(&OpenSettings, window, cx)
+                                        })),
+                                ),
+                        )
+                    }),
             )
     }
 
@@ -1647,6 +1743,15 @@ impl Workspace {
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
         let watching = crate::settings::AppSettings::global(cx).watch_auto_reload;
+        let web_active = self.web_active(cx);
+        let auto_refresh_label = i18n::t(
+            if watching {
+                i18n::Key::AutoRefreshOn
+            } else {
+                i18n::Key::AutoRefresh
+            },
+            cx,
+        );
 
         h_flex()
             .w_full()
@@ -1692,14 +1797,10 @@ impl Workspace {
                     .xsmall()
                     .ghost()
                     .when(watching, |b| b.primary())
-                    .tooltip(i18n::t(
-                        if watching {
-                            i18n::Key::AutoRefreshOn
-                        } else {
-                            i18n::Key::AutoRefresh
-                        },
-                        cx,
-                    ))
+                    // A tooltip would open across the child HWND and be covered.
+                    // Web mode therefore names the command in fixed chrome.
+                    .when(web_active, |button| button.label(auto_refresh_label))
+                    .when(!web_active, |button| button.tooltip(auto_refresh_label))
                     .on_click(cx.listener(|_, _, _, cx| {
                         crate::settings::AppSettings::update(cx, |settings| {
                             settings.watch_auto_reload = !settings.watch_auto_reload
@@ -1736,6 +1837,7 @@ impl Render for Workspace {
         // viewport is only available here, which is why the widths are resolved
         // in `render` rather than baked into a constant.
         let viewport = window.viewport_size().width;
+        let web_active = self.web_active(cx);
 
         let content: AnyElement = if self.settings_open {
             self.settings.clone().into_any_element()
@@ -1762,10 +1864,13 @@ impl Render for Workspace {
         // side panel read the active document through it. Building them inline
         // would overlap those borrows with the `&mut Context` the element chain
         // already holds.
-        let right_panel = self.render_right_panel(cx);
+        let right_panel = if web_active {
+            None
+        } else {
+            self.render_right_panel(cx)
+        };
         let title_bar = self.render_title_bar(cx).into_any_element();
-        let side_panel = self
-            .left_panel_open
+        let side_panel = (!web_active && self.left_panel_open)
             .then(|| self.render_side_panel(cx).into_any_element());
 
         v_flex()
@@ -1893,6 +1998,99 @@ mod tests {
     fn short_names_are_left_alone() {
         for name in ["a.md", "README.md", "architecture.md"] {
             assert_eq!(elide_tab_label(name), name);
+        }
+    }
+
+    /// Tab overlays belong to the tab's own hitbox, never a prefix wrapper.
+    #[test]
+    fn tab_affordances_cover_the_tab() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let start = source.find("fn render_tabs").expect("render_tabs");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn render_web_path_controls")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        let gate = body
+            .find(".when(!web_active, |tab|")
+            .expect("the Web-active overlay gate");
+        let end = body[gate..]
+            .find("// A preview tab")
+            .map(|end| gate + end)
+            .unwrap_or(body.len());
+        let affordance = &body[gate..end];
+
+        assert!(affordance.contains(".tooltip(") && affordance.contains(".context_menu("));
+        assert!(affordance.contains("tab.child("));
+        assert!(affordance.contains(".absolute()") && affordance.contains(".inset_0()"));
+        assert!(!body.contains(".prefix("));
+        assert!(body.contains(".aria_label(aria_label)"));
+        assert!(
+            body.contains(".when(!web_active, |this|") && body.contains("UnsavedChanges"),
+            "the dirty marker tooltip needs its own Web-active gate"
+        );
+    }
+
+    #[test]
+    fn web_mode_builds_only_fixed_overlay_free_chrome() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let title = source
+            .find("fn render_title_bar")
+            .expect("render_title_bar");
+        let title_body = &source[title..];
+        let title_end = title_body
+            .find("\n    fn render_status_bar")
+            .unwrap_or(title_body.len());
+        let title_body = &title_body[..title_end];
+        let path = source
+            .find("fn render_web_path_controls")
+            .expect("fixed Web commands");
+        let path_body = &source[path..title];
+        let status = source
+            .find("fn render_status_bar")
+            .expect("render_status_bar");
+        let status_body = &source[status..];
+        let status_end = status_body
+            .find("\n}\n\nfn empty_hint")
+            .unwrap_or(status_body.len());
+        let status_body = &status_body[..status_end];
+        let render = source
+            .find("impl Render for Workspace")
+            .map(|start| &source[start..])
+            .expect("workspace render");
+
+        assert!(title_body.contains("let navigator = if web_active"));
+        assert!(title_body.contains("self.render_navigator(cx).into_any_element()"));
+        assert!(!path_body.contains(".tooltip(") && !path_body.contains(".context_menu("));
+        assert!(title_body.contains(".when(!web_active, |this| {"));
+        assert!(status_body.contains(".when(web_active, |button|"));
+        assert!(status_body.contains("button.label(auto_refresh_label)"));
+        assert!(status_body.contains(".when(!web_active, |button| button.tooltip("));
+        assert!(render.contains("!web_active && self.left_panel_open"));
+        assert!(render.contains("if web_active") && render.contains("render_right_panel"));
+        assert!(
+            render.contains(".child(self.render_status_bar(cx))"),
+            "the fixed status bar remains below the child HWND for command feedback"
+        );
+    }
+
+    #[test]
+    fn web_mode_never_focuses_hidden_side_panels() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        for (signature, next) in [
+            ("fn on_toggle_left_panel", "fn on_toggle_right_panel"),
+            ("fn on_toggle_right_panel", "/// Open files dropped"),
+            ("fn on_focus_search", "/// The documents the current search"),
+        ] {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let body = &source[start..];
+            let end = body.find(next).unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(body.contains("if self.web_active(cx)"));
+            assert!(body.contains("self.set_status("));
+            assert!(body.contains("return;"));
         }
     }
 

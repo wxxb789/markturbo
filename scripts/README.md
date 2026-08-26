@@ -5,7 +5,7 @@ nothing here is compiled into it.
 
 | Script | What it does |
 |---|---|
-| `probe.py` | Measures a running markturbo: memory, idle CPU, child windows, hit testing |
+| `probe.py` | Measures markturbo startup, memory, idle CPU, child windows, and hit testing |
 | `gen-perf-fixtures.py` | Regenerates the committed fixtures under `fixtures/perf/` |
 | `package-release.sh` | Builds and stages a distributable archive under `dist/` |
 
@@ -24,6 +24,55 @@ single-file script with inline dependencies:
 
 Run it as `uv run scripts/<name>.py`. There is no virtualenv to create and no
 requirements file to keep in sync; `uv` reads the header and does it.
+
+For the WebView single-window acceptance and paired startup comparison:
+
+```bash
+uv run scripts/probe.py windows --open page.html \
+  --expect-top-level 1 --expect-child-class WRY_WEBVIEW \
+  --expect-native-chrome-insets
+uv run scripts/probe.py quiet
+uv run scripts/probe.py startup --exe target/release-a/markturbo.exe \
+  --compare target/release-b/markturbo.exe --rounds 10
+uv run scripts/probe.py formula --exe target/release-a/open_document_cost.exe \
+  --compare target/release-b/open_document_cost.exe --rounds 10
+```
+
+The comparison launches in A-B-B-A order within every round and prints raw
+launches plus paired `B-A` deltas in milliseconds and percent. Run it only on a
+quiet machine; interleaving reduces drift but cannot remove competing load.
+
+`quiet` takes 60 one-second samples using `GetSystemTimes` and a low-overhead
+PDH disk counter. Its default gate is CPU median <=5%, CPU p95 <=10%, disk
+median <=2%, and disk p95 <=10%. Run it immediately before a small A/B decision;
+do not weaken the thresholds after seeing the result. `--wait-seconds 3600`
+waits for the first passing 60-second rolling window instead of accepting a
+noisy sample. `formula` runs the ignored first-formula test in fresh processes
+and uses the same A-B-B-A order as `startup`.
+
+The single-window count ignores only Windows' hidden zero-sized `IME` and
+`MSCTFIME UI` helpers. Hidden product windows and every non-zero top-level HWND
+still fail acceptance.
+
+`windows` counts every process-owned top-level window, including hidden and
+zero-sized windows. With `--expect-top-level 1`, the titled main window must be
+the only one. Each expected child must be visible, non-zero, and contained by
+the main client rectangle. The probe then alternates and restores the main size
+twice, requires expected child bounds to react, posts `WM_CLOSE`, and waits up
+to five seconds for a clean exit. It also fails if stderr contains
+`RefCell already borrowed`; without `--log`, stderr goes to a temporary file
+that is removed after the check. Use `--forbid-log-substring` for additional
+fatal text.
+
+`--expect-native-chrome-insets` is the Web-mode chrome contract: each expected
+child must leave both a positive top inset for native title/tab/document chrome
+and a positive bottom inset for native status chrome. Without this explicit
+flag, the generic child check continues to allow a child that fills the client.
+
+The harness deliberately does not synthesize `Ctrl+,` to toggle Settings.
+`SendInput` depends on foreground permission and keyboard layout, so it is not a
+stable headless acceptance mechanism. This command covers WebView `Bounds` and
+`Shutdown`; `Hide`/`Show` needs an in-process test or an interactive probe.
 
 **No PowerShell** in a committed script. PowerShell 5 and 7 differ in ways that
 bite exactly here — assembly loading, `Add-Type` reference resolution, quoting

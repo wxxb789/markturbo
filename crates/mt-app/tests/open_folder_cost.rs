@@ -65,10 +65,28 @@ fn attribute_the_cost_of_opening_a_folder() {
         format!("{} skills", mt_doc::skill::discover(&root).len())
     });
 
-    time("skill::discover_with (global)", &mut || {
-        let found = mt_doc::skill::discover_with(&root, mt_doc::Discovery::everything());
-        format!("{} skills", found.len())
-    });
+    let mut skill_cache = mt_doc::skill::DiscoveryCache::default();
+    for sample in 1..=3 {
+        skill_cache.clear();
+        time(&format!("skill cold {sample}"), &mut || {
+            let found = mt_doc::skill::discover_with_cache(
+                &root,
+                mt_doc::Discovery::everything(),
+                &mut skill_cache,
+            );
+            format!("{} skills", found.len())
+        });
+    }
+    for sample in 1..=5 {
+        time(&format!("skill warm {sample}"), &mut || {
+            let found = mt_doc::skill::discover_with_cache(
+                &root,
+                mt_doc::Discovery::everything(),
+                &mut skill_cache,
+            );
+            format!("{} skills", found.len())
+        });
+    }
 
     time("instruction::discover", &mut || {
         format!("{} files", mt_doc::instruction::discover(&root).len())
