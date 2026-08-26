@@ -59,39 +59,30 @@ Fixed constraints, set by the user and not open for re-litigation:
   **46,766,080** bytes, per formula ~146 ms → 0.50–0.92 ms, KaTeX corpus 87/90 →
   **89/90**. Also fixes `\mathbb`, `\mathcal`, `\mathfrak`, `\mathsf`,
   `\mathtt`, `\ell`, `\Re` and `\Im`, which MathJax failed permanently.
-- [03 — The WebView covers every GPUI overlay in Web mode](issues/03-webview-covers-overlays.md):
-  the WebView is an OS child window above everything GPUI draws, so the layout
-  menu was both invisible and unclickable. Fixed by hiding it while an overlay
-  is open. The `RefCell already borrowed` flood is a separate, upstream problem
-  in gpui's own frame loop and is not fixed.
+- [03 — Keep the WebView in one window without native-overlay conflicts](issues/03-webview-covers-overlays.md):
+  the WebView stays in the main window but moves to a dedicated STA worker and
+  private `WS_CHILD` host. Web mode uses fixed, overlay-free chrome and does not
+  offer `SplitWeb` on Windows. Runtime proof found one application top-level
+  window, a visible bounded `WRY_WEBVIEW`, 6/6 resize transitions, clean
+  shutdown, and zero `RefCell already borrowed` lines.
+- [04 — Incremental global skill discovery](issues/04-incremental-global-skill-discovery.md):
+  global roots are cached independently with visited-directory and entry-file
+  stamps, while workspace roots stay live. Measured over 257 skills: cold
+  median 268 ms, warm median 64 ms (76.12% lower).
+- [05 — Measure `opt-level = "s"`](issues/05-opt-level-s.md):
+  fresh builds confirmed a 20.65% size reduction. The host never passed the
+  pre-registered quiet-machine gate during a one-hour rolling wait, so the
+  formal startup and formula A-B-B-A comparison did not run. Runtime impact
+  remains inconclusive and `s` is not adopted.
 
 ## Not yet specified
 
-- **Every other GPUI overlay in Web mode.** Ticket 03 wired `OverlayOpen` to the
-  layout dropdown only. The tab context menu (`workspace.rs:1407`) and the tab
-  tooltips (`:1394`, `:1443`) open into the same WebView rectangle and are still
-  covered and unclickable. The commit message conceded the general case; only
-  the one control was fixed. Each needs the same UIA-driven click test that
-  proved the dropdown, which is why this is its own ticket rather than a
-  one-line addition.
 - **CJK inside math on macOS and Linux.** Math glyphs are `<path>` outlines from
   the bundled KaTeX faces and so are platform-independent, but a CJK character
   inside `\text` falls through to `<text>` and is resolved by usvg against the
   font database gpui populates from the system. On Windows that was measured
   working (`Fallback from Arial to DengXian`). What the other two platforms
   resolve it to, or whether they resolve it at all, is untested.
-- **DirectComposition, and the Z-order it decides.** `main.rs` disables it so
-  the WebView is visible at all; the price is that the child window is then
-  permanently above GPUI, which is what ticket 03 works around by hiding it.
-  Putting both surfaces in one Z-order would remove the workaround and the
-  blank-preview cost with it — but it is a change to the gpui/wry integration,
-  and the comment in `main.rs` notes that gpui-component's own webview example
-  does not solve it either.
-- **`ERROR gpui::window RefCell already borrowed`.** WebView2 pumps messages and
-  re-enters the window procedure mid-draw; gpui's `request_frame` callback takes
-  the borrow infallibly and drops the frame. This project already solved the
-  same hazard at its own layer (`views::try_update`), but gpui's internal draw
-  path is not reachable from here. Needs an upstream patch or issue.
 
 - **macOS and Linux.** Every number in this effort is from one Windows machine
   with no GPU. Whether the memory floor, the binary arithmetic, and the diagram
@@ -102,10 +93,6 @@ Fixed constraints, set by the user and not open for re-litigation:
   database is a plausible target, but it is upstream code and the fix shape is
   not yet clear. Blocked on knowing whether the floor is the same on real
   hardware.
-- **Incremental skill discovery.** The global scan is correctly backgrounded but
-  has no incrementality. The prior pass established that a root-directory mtime
-  check is not sufficient, because a skill edited inside an unchanged directory
-  would be missed. What *is* sufficient is not yet worked out.
 - **The renderer cache eviction policy.** Bounded at 512 entries with
   clear-on-full, carrying a `ponytail:` comment naming LRU as the upgrade path.
   Whether it matters has not been measured.

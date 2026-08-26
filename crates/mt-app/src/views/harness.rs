@@ -8,6 +8,7 @@
 //! underlying document.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
@@ -56,6 +57,7 @@ impl Section {
 pub struct HarnessView {
     focus_handle: FocusHandle,
     root: PathBuf,
+    skill_cache: Arc<Mutex<skill::DiscoveryCache>>,
     section: Section,
     skills: Vec<Skill>,
     instructions: Vec<Instruction>,
@@ -77,10 +79,15 @@ pub struct HarnessView {
 const SPINNER_FLOOR: Duration = Duration::from_millis(250);
 
 impl HarnessView {
-    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        skill_cache: Arc<Mutex<skill::DiscoveryCache>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             root,
+            skill_cache,
             section: Section::Skills,
             skills: Vec::new(),
             instructions: Vec::new(),
@@ -107,6 +114,7 @@ impl HarnessView {
             global,
             include_internal: settings.skills_include_internal,
         };
+        let skill_cache = self.skill_cache.clone();
         self.scanning = true;
         // Replacing the task cancels any scan still in flight, so a burst of
         // filesystem events costs one scan rather than one per event.
@@ -116,10 +124,13 @@ impl HarnessView {
             let floor = cx.background_executor().timer(SPINNER_FLOOR);
             let found = cx
                 .background_spawn(async move {
-                    (
-                        skill::discover_with(&root, options),
-                        instruction::discover_with(&root, global),
-                    )
+                    let skills = {
+                        let mut cache = skill_cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        skill::discover_with_cache(&root, options, &mut cache)
+                    };
+                    (skills, instruction::discover_with(&root, global))
                 })
                 .await;
             crate::views::try_update(&this, cx, |this, cx| this.apply(found.0, found.1, cx));
@@ -132,6 +143,15 @@ impl HarnessView {
             });
         }));
         cx.notify();
+    }
+
+    /// Force every global root to be read again.
+    fn rescan(&mut self, cx: &mut Context<Self>) {
+        self.skill_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.refresh(cx);
     }
 
     fn apply(
@@ -842,7 +862,7 @@ impl Render for HarnessView {
                             // from queueing a redundant scan mid-flight.
                             .loading(self.scanning)
                             .tooltip(i18n::t(i18n::Key::Rescan, cx))
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.rescan(cx))),
                     ),
             )
             // Grouping is a view choice, so it belongs next to the list rather
