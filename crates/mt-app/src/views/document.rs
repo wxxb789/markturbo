@@ -45,29 +45,17 @@ actions!(
     ]
 );
 
-fn platform_layout(layout: Layout) -> Layout {
-    #[cfg(target_os = "windows")]
-    if layout == Layout::SplitWeb {
-        return Layout::Web;
-    }
-    layout
-}
-
+/// The document's real layouts on every platform.
+///
+/// Windows WebView2 stays above GPUI only inside the bounds assigned to its
+/// preview element. A split editor and the workspace side panels occupy
+/// disjoint bounds, so removing `SplitWeb` was a broader restriction than the
+/// child-HWND constraint requires. The current editor's search UI stays inside
+/// its pane, its context menu is native, and no floating LSP providers are
+/// installed. Adding one must revisit this boundary rather than assuming it can
+/// paint over the child window.
 fn available_layouts(doc_type: DocType) -> &'static [Layout] {
-    let available = Layout::available_for(doc_type);
-    #[cfg(target_os = "windows")]
-    {
-        const WITHOUT_SPLIT_WEB: [Layout; 4] = [
-            Layout::Source,
-            Layout::Native,
-            Layout::Web,
-            Layout::SplitNative,
-        ];
-        if available.contains(&Layout::SplitWeb) {
-            return &WITHOUT_SPLIT_WEB;
-        }
-    }
-    available
+    Layout::available_for(doc_type)
 }
 
 /// How long after the last keystroke to reparse and refresh the preview.
@@ -286,7 +274,6 @@ impl DocumentView {
     }
 
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
-        let layout = platform_layout(layout);
         if self.layout == layout {
             return;
         }
@@ -1353,7 +1340,7 @@ impl Render for DocumentView {
 mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
-    use super::{Layout, available_layouts, editor_language, first_line_title, platform_layout};
+    use super::{Layout, available_layouts, editor_language, first_line_title};
     use gpui_component::highlighter::Language;
     use mt_doc::DocType;
     use std::path::Path;
@@ -1785,9 +1772,26 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_never_places_an_editor_beside_the_child_webview() {
-        assert!(!available_layouts(DocType::Markdown).contains(&Layout::SplitWeb));
-        assert_eq!(platform_layout(Layout::SplitWeb), Layout::Web);
+    fn windows_keeps_split_web_available() {
+        assert!(available_layouts(DocType::Markdown).contains(&Layout::SplitWeb));
+        let source = crate::views::production_source(include_str!("document.rs"));
+        let start = source.find("pub fn set_layout").expect("set_layout");
+        let body = &source[start..];
+        let end = body.find("pub fn set_trust").unwrap_or(body.len());
+        assert!(!body[..end].contains("platform_layout"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_split_web_has_no_floating_editor_provider() {
+        let source = crate::views::production_source(include_str!("document.rs"));
+        assert!(source.contains(".searchable(true)"));
+        for provider in ["CompletionProvider", "HoverProvider", "CodeActionProvider"] {
+            assert!(
+                !source.contains(provider),
+                "{provider} needs a WebView overlay strategy before Windows SplitWeb can use it"
+            );
+        }
     }
 
     /// Trust is offered for both things it can unlock.
