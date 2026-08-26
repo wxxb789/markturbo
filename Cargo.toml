@@ -14,7 +14,7 @@ mt-doc = { path = "crates/mt-doc" }
 # gpui must be specified EXACTLY as gpui-component specifies it (same URL, no
 # rev), or Cargo treats them as distinct sources and the graph ends up with two
 # incompatible gpui crates. Cargo.lock is what actually pins the revision.
-gpui = { git = "https://github.com/zed-industries/zed", features = ["profiler"] }
+gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",
     "x11",
@@ -64,7 +64,10 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
 # and never a panic (`SyntaxHighlighter::new` logs and builds an inert
 # highlighter). `tree-sitter-tsx` is the one addition that costs 0 bytes: it
 # reuses the `tree-sitter-typescript` parse table already compiled in.
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364", features = [
+# This is the first upstream revision that limits `gpui/profiler` to gpui-fps.
+# Older revisions enabled it workspace-wide, so downstream release builds could
+# not disable the profiler even with `default-features = false`.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0", features = [
     # Markdown itself, plus the inline grammar it needs. One feature, two variants.
     "tree-sitter-markdown",
     # The rest are fence languages, ordered by how often they appear in one.
@@ -81,8 +84,8 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
     # `Language::Make`, and the variant only exists with this feature on.
     "tree-sitter-make",
 ] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364" }
-gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
+gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
 
 anyhow = "1"
 env_logger = "0.11"

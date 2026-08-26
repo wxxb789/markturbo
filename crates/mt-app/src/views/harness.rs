@@ -214,6 +214,16 @@ impl HarnessView {
         &self.instructions
     }
 
+    /// Whether the current result set contains an artifact below `path`.
+    ///
+    /// A removed or renamed-out directory no longer answers `is_dir()`. The
+    /// watcher asks the last successful scan instead, so dotted directory names
+    /// remain distinguishable from ordinary removed files without restoring the
+    /// broad refresh-on-every-tree-change behavior.
+    pub fn has_artifact_under(&self, path: &Path) -> bool {
+        artifacts_under(&self.skills, &self.instructions, path)
+    }
+
     /// Redraw without rescanning.
     ///
     /// `selected` is an index into `self.skills`, which regrouping does not
@@ -681,6 +691,23 @@ struct Row {
     heading: Option<String>,
 }
 
+fn artifacts_under(skills: &[Skill], instructions: &[Instruction], path: &Path) -> bool {
+    skills.iter().any(|skill| {
+        skill.dir.starts_with(path)
+            || skill.aliases.iter().any(|alias| alias.starts_with(path))
+            || skill
+                .support_dirs
+                .iter()
+                .any(|directory| directory.starts_with(path))
+    }) || instructions.iter().any(|instruction| {
+        instruction.path.starts_with(path)
+            || instruction
+                .aliases
+                .iter()
+                .any(|alias| alias.starts_with(path))
+    })
+}
+
 /// Order `skills` for display and decide where headings fall.
 ///
 /// A pure function over indices rather than a method: grouping is the part with
@@ -919,10 +946,10 @@ mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{Row, Section, group};
+    use super::{Row, Section, artifacts_under, group};
     use crate::settings::GroupBy;
     use mt_doc::skill::{Skill, SkillMeta};
-    use mt_doc::{Diagnostic, Origin};
+    use mt_doc::{Diagnostic, DocType, Instruction, Origin};
     use std::path::PathBuf;
 
     #[test]
@@ -964,6 +991,36 @@ mod tests {
             },
             support_dirs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn removed_dotted_directories_are_matched_against_current_artifacts() {
+        let mut review = skill("review.v2", Origin::Workspace, "skills", true);
+        review.support_dirs.push(review.dir.join("references"));
+        let instruction = Instruction {
+            path: PathBuf::from(".cursor/rules/team.v2/AGENT.md"),
+            root: PathBuf::from(".cursor"),
+            harness_dir: ".cursor".into(),
+            origin: Origin::Workspace,
+            doc_type: DocType::Agents,
+            aliases: Vec::new(),
+        };
+
+        assert!(artifacts_under(
+            std::slice::from_ref(&review),
+            std::slice::from_ref(&instruction),
+            PathBuf::from("skills/review.v2").as_path(),
+        ));
+        assert!(artifacts_under(
+            std::slice::from_ref(&review),
+            std::slice::from_ref(&instruction),
+            PathBuf::from(".cursor/rules/team.v2").as_path(),
+        ));
+        assert!(!artifacts_under(
+            std::slice::from_ref(&review),
+            std::slice::from_ref(&instruction),
+            PathBuf::from("skills/other").as_path(),
+        ));
     }
 
     fn headings(rows: &[Row]) -> Vec<&str> {

@@ -541,6 +541,36 @@ struct PhysicalBounds {
 }
 
 #[cfg(target_os = "windows")]
+/// Keep independently rounded GPUI bounds inside the actual HWND client area.
+///
+/// At 125% DPI, the runtime probe measured a 1,382 px child in a 1,381 px
+/// client. Clamping here uses the OS boundary that `SetWindowPos` must honor.
+fn clamp_bounds_to_client(
+    bounds: PhysicalBounds,
+    client_width: i32,
+    client_height: i32,
+) -> PhysicalBounds {
+    let client_width = client_width.max(0);
+    let client_height = client_height.max(0);
+    let x = bounds.x.clamp(0, client_width);
+    let y = bounds.y.clamp(0, client_height);
+    let right = bounds
+        .x
+        .saturating_add(bounds.width.max(0))
+        .clamp(x, client_width);
+    let bottom = bounds
+        .y
+        .saturating_add(bounds.height.max(0))
+        .clamp(y, client_height);
+    PhysicalBounds {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
+}
+
+#[cfg(target_os = "windows")]
 enum WorkerCommand {
     Show,
     Hide,
@@ -889,7 +919,7 @@ fn run_windows_webview(
             break;
         }
         if message.message == WORKER_WAKE_MESSAGE {
-            if !drain_worker_commands(&rx, host_hwnd, &webview, &navigation_in_flight) {
+            if !drain_worker_commands(&rx, parent, host_hwnd, &webview, &navigation_in_flight) {
                 break;
             }
             continue;
@@ -960,6 +990,7 @@ fn create_web_host(
 #[cfg(target_os = "windows")]
 fn drain_worker_commands(
     rx: &mpsc::Receiver<WorkerCommand>,
+    parent: windows::Win32::Foundation::HWND,
     host: windows::Win32::Foundation::HWND,
     webview: &wry::WebView,
     navigation_in_flight: &AtomicBool,
@@ -970,7 +1001,7 @@ fn drain_worker_commands(
             Ok(WorkerCommand::Bounds(bounds)) => latest_bounds = Some(bounds),
             Ok(WorkerCommand::Shutdown) => return false,
             Ok(command) => {
-                if !apply_worker_command(command, host, webview, navigation_in_flight) {
+                if !apply_worker_command(command, parent, host, webview, navigation_in_flight) {
                     return false;
                 }
             }
@@ -981,6 +1012,7 @@ fn drain_worker_commands(
     if let Some(bounds) = latest_bounds {
         apply_worker_command(
             WorkerCommand::Bounds(bounds),
+            parent,
             host,
             webview,
             navigation_in_flight,
@@ -993,12 +1025,15 @@ fn drain_worker_commands(
 #[cfg(target_os = "windows")]
 fn apply_worker_command(
     command: WorkerCommand,
+    parent: windows::Win32::Foundation::HWND,
     host: windows::Win32::Foundation::HWND,
     webview: &wry::WebView,
     navigation_in_flight: &AtomicBool,
 ) -> bool {
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        HWND_TOP, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SetWindowPos, ShowWindow,
+        GetClientRect, HWND_TOP, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SetWindowPos,
+        ShowWindow,
     };
 
     match command {
@@ -1021,6 +1056,18 @@ fn apply_worker_command(
             }
         }
         WorkerCommand::Bounds(bounds) => {
+            let mut client = RECT::default();
+            let bounds = match unsafe { GetClientRect(parent, &mut client) } {
+                Ok(()) => clamp_bounds_to_client(
+                    bounds,
+                    client.right - client.left,
+                    client.bottom - client.top,
+                ),
+                Err(error) => {
+                    log::debug!("failed to read Web preview parent bounds: {error}");
+                    bounds
+                }
+            };
             let result = unsafe {
                 SetWindowPos(
                     host,
@@ -1045,6 +1092,47 @@ fn apply_worker_command(
 mod tests {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     use super::{Navigation, PendingScroll, WebPayloadKey, WebSurface};
+    #[cfg(target_os = "windows")]
+    use super::{PhysicalBounds, clamp_bounds_to_client};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn child_bounds_are_clamped_to_parent_client() {
+        let observed = PhysicalBounds {
+            x: 0,
+            y: 89,
+            width: 1_382,
+            height: 663,
+        };
+
+        assert_eq!(
+            clamp_bounds_to_client(observed, 1_381, 777),
+            PhysicalBounds {
+                x: 0,
+                y: 89,
+                width: 1_381,
+                height: 663,
+            }
+        );
+        assert_eq!(
+            clamp_bounds_to_client(
+                PhysicalBounds {
+                    x: -5,
+                    y: -7,
+                    width: 20,
+                    height: 30,
+                },
+                10,
+                10,
+            ),
+            PhysicalBounds {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            }
+        );
+    }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]

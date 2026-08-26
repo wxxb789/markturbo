@@ -134,6 +134,70 @@ impl SidePanel {
 /// detected change reaches the UI.
 const WATCH_POLL: Duration = Duration::from_millis(500);
 
+/// Whether a workspace path can change Harness discovery results.
+///
+/// The file tree reacts to every create/remove, but the Harness panel only
+/// depends on conventional skill and instruction roots. Treating an ordinary
+/// editor's temp-file rename as a Harness change restarted discovery and its
+/// 250ms loading state on every save, which made both sections blink.
+fn path_affects_harness(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let relative_text = relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let is_directory = path.is_dir() || relative.extension().is_none();
+
+    for root in mt_doc::skill::discovery_roots() {
+        let root = root.to_ascii_lowercase();
+        if root.starts_with(&format!("{relative_text}/")) || relative_text == root {
+            return true;
+        }
+        let Some(within) = relative_text.strip_prefix(&format!("{root}/")) else {
+            continue;
+        };
+        let components: Vec<&str> = within.split('/').collect();
+        let name = components.last().copied().unwrap_or_default();
+        if (components.len() <= 4 && name.eq_ignore_ascii_case("skill.md"))
+            || (components.len() <= 3 && is_directory)
+            || (components.len() <= 4 && matches!(name, "scripts" | "references" | "assets"))
+        {
+            return true;
+        }
+    }
+
+    let is_instruction = mt_doc::instruction::is_instruction(Path::new(&relative_text));
+    let affects_instruction_root = |within: &str| {
+        let components: Vec<&str> = within.split('/').collect();
+        let first = components.first().copied().unwrap_or_default();
+        let nested = matches!(first, "rules" | "instructions" | "memories");
+
+        (components.len() == 1 && (nested || is_instruction))
+            || (nested && components.len() <= 3 && is_instruction)
+            || (nested && components.len() == 2 && is_directory)
+    };
+    for root in mt_doc::instruction::project_roots()
+        .iter()
+        .filter(|root| !root.as_os_str().is_empty())
+    {
+        let root = root
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if root.starts_with(&format!("{relative_text}/")) || relative_text == root {
+            return true;
+        }
+        let Some(within) = relative_text.strip_prefix(&format!("{root}/")) else {
+            continue;
+        };
+        if affects_instruction_root(within) {
+            return true;
+        }
+    }
+
+    affects_instruction_root(&relative_text)
+}
+
 /// How long a status message stays on the bar.
 ///
 /// Long enough to read a save confirmation without looking for it, short enough
@@ -664,17 +728,16 @@ impl Workspace {
         }
 
         let tree_changed = changes.iter().any(|c| c.affects_tree());
-        // Skills live under `skills`-named directories; instruction files are
-        // named for what they instruct, so both spellings have to be watched or
-        // editing a CLAUDE.md would never refresh the panel listing it.
-        let harness_changed = changes.iter().any(|c| {
-            let path = c.path().to_string_lossy().to_lowercase();
-            path.contains("skill")
-                || path.contains("agents.md")
-                || path.contains("claude.md")
-                || path.contains("instructions.md")
-                || path.contains("rules")
+        let removed_artifact = self.harness.as_ref().is_some_and(|harness| {
+            let harness = harness.read(cx);
+            changes
+                .iter()
+                .any(|change| change.affects_tree() && harness.has_artifact_under(change.path()))
         });
+        let harness_changed = removed_artifact
+            || changes
+                .iter()
+                .any(|change| path_affects_harness(watcher.root(), change.path()));
 
         // Every open document whose file changed. With auto-reload off, the
         // flag and its banner are the whole response — the user's unsaved edits
@@ -706,9 +769,7 @@ impl Workspace {
         if tree_changed && let Some(explorer) = &self.explorer {
             explorer.update(cx, |explorer, cx| explorer.refresh(cx));
         }
-        if (tree_changed || harness_changed)
-            && let Some(harness) = &self.harness
-        {
+        if harness_changed && let Some(harness) = &self.harness {
             harness.update(cx, |harness, cx| harness.refresh(cx));
         }
         cx.notify();
@@ -765,10 +826,6 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.web_active(cx) {
-            self.set_status("Switch to Source or Native to use side panels.".into(), cx);
-            return;
-        }
         self.left_panel_open = !self.left_panel_open;
         // The WebView is an OS child window; it does not notice the document
         // pane resizing under it.
@@ -782,10 +839,6 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.web_active(cx) {
-            self.set_status("Switch to Source or Native to use side panels.".into(), cx);
-            return;
-        }
         self.right_panel_open = !self.right_panel_open;
         self.web_dirty(cx);
         cx.notify();
@@ -1072,7 +1125,7 @@ impl Workspace {
                         // opened it and the click that closes it should land in
                         // the same place. No `stop_propagation` — this panel is
                         // not a `WindowControlArea::Drag` region.
-                        .child(self.render_right_toggle(cx)),
+                        .child(self.render_right_toggle(!self.web_active(cx), cx)),
                 )
                 .child(
                     div()
@@ -1113,7 +1166,7 @@ impl Workspace {
                     // that opened it did. Left of the strip, on the side it
                     // governs. No `stop_propagation` — this is not a
                     // `WindowControlArea::Drag` region, only the title bar is.
-                    .child(self.render_left_toggle(cx))
+                    .child(self.render_left_toggle(!self.web_active(cx), cx))
                     .child(
                         TabBar::new("side-tabs")
                             .underline()
@@ -1265,13 +1318,6 @@ impl Workspace {
 
     /// Show the Search panel and put the caret in its field.
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        if self.web_active(cx) {
-            self.set_status(
-                "Switch to Source or Native to search the workspace.".into(),
-                cx,
-            );
-            return;
-        }
         self.side_panel = SidePanel::Search;
         // Opening the panel is not enough: the point of the binding is to type
         // a query immediately, and a panel that appears without focus makes the
@@ -1354,26 +1400,30 @@ impl Workspace {
     /// is collapsed, and the panel's own header takes it back once it is open.
     /// A control that jumps to the far side of the window the moment it is used
     /// makes the user hunt for it to undo the click they just made.
-    fn render_left_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_left_toggle(&self, tooltip: bool, cx: &Context<Self>) -> impl IntoElement {
         Button::new("toggle-left-panel")
             .icon(IconName::PanelLeft)
             .xsmall()
             .ghost()
             .when(self.left_panel_open, |b| b.primary())
-            .tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
+            .when(tooltip, |button| {
+                button.tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
+            })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
             }))
     }
 
     /// The right panel's toggle, on the same two-homes rule as the left one.
-    fn render_right_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_right_toggle(&self, tooltip: bool, cx: &Context<Self>) -> impl IntoElement {
         Button::new("toggle-right-panel")
             .icon(IconName::PanelRight)
             .xsmall()
             .ghost()
             .when(self.right_panel_open, |b| b.primary())
-            .tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
+            .when(tooltip, |button| {
+                button.tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
+            })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
             }))
@@ -1597,17 +1647,13 @@ impl Workspace {
                     // an open panel carries its own copy in its header, which
                     // is where the eye already is.
                     .when(!self.left_panel_open, |this| {
-                        this.when(!web_active, |this| {
-                            this.child(
-                                h_flex()
-                                    .flex_shrink_0()
-                                    .items_center()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .child(self.render_left_toggle(cx)),
-                            )
-                        })
+                        this.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(self.render_left_toggle(!web_active, cx)),
+                        )
                     })
                     .child(
                         h_flex()
@@ -1716,7 +1762,7 @@ impl Workspace {
                                 // closed; the panel's own header carries it once it
                                 // is open.
                                 .when(!self.right_panel_open, |this| {
-                                    this.child(self.render_right_toggle(cx))
+                                    this.child(self.render_right_toggle(true, cx))
                                 })
                                 .child(
                                     Button::new("settings")
@@ -1729,6 +1775,15 @@ impl Workspace {
                                             this.on_open_settings(&OpenSettings, window, cx)
                                         })),
                                 ),
+                        )
+                    })
+                    .when(web_active && !self.right_panel_open, |this| {
+                        this.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(self.render_right_toggle(false, cx)),
                         )
                     }),
             )
@@ -1837,8 +1892,6 @@ impl Render for Workspace {
         // viewport is only available here, which is why the widths are resolved
         // in `render` rather than baked into a constant.
         let viewport = window.viewport_size().width;
-        let web_active = self.web_active(cx);
-
         let content: AnyElement = if self.settings_open {
             self.settings.clone().into_any_element()
         } else {
@@ -1864,13 +1917,10 @@ impl Render for Workspace {
         // side panel read the active document through it. Building them inline
         // would overlap those borrows with the `&mut Context` the element chain
         // already holds.
-        let right_panel = if web_active {
-            None
-        } else {
-            self.render_right_panel(cx)
-        };
+        let right_panel = self.render_right_panel(cx);
         let title_bar = self.render_title_bar(cx).into_any_element();
-        let side_panel = (!web_active && self.left_panel_open)
+        let side_panel = self
+            .left_panel_open
             .then(|| self.render_side_panel(cx).into_any_element());
 
         v_flex()
@@ -1992,7 +2042,8 @@ mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{TAB_LABEL_MAX, elide_tab_label};
+    use super::{TAB_LABEL_MAX, elide_tab_label, path_affects_harness};
+    use std::path::Path;
 
     #[test]
     fn short_names_are_left_alone() {
@@ -2032,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn web_mode_builds_only_fixed_overlay_free_chrome() {
+    fn web_mode_keeps_fixed_chrome_and_side_panels() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let title = source
             .find("fn render_title_bar")
@@ -2063,11 +2114,17 @@ mod tests {
         assert!(title_body.contains("self.render_navigator(cx).into_any_element()"));
         assert!(!path_body.contains(".tooltip(") && !path_body.contains(".context_menu("));
         assert!(title_body.contains(".when(!web_active, |this| {"));
+        assert!(title_body.contains("render_left_toggle(!web_active, cx)"));
+        assert!(title_body.contains(".when(web_active && !self.right_panel_open"));
+        assert!(title_body.contains("render_right_toggle(false, cx)"));
         assert!(status_body.contains(".when(web_active, |button|"));
         assert!(status_body.contains("button.label(auto_refresh_label)"));
         assert!(status_body.contains(".when(!web_active, |button| button.tooltip("));
-        assert!(render.contains("!web_active && self.left_panel_open"));
-        assert!(render.contains("if web_active") && render.contains("render_right_panel"));
+        assert!(render.contains("let right_panel = self.render_right_panel(cx)"));
+        let side_panel = &render[render.find("let side_panel").expect("side panel")..];
+        let side_panel = &side_panel[..side_panel.find("v_flex()").unwrap_or(side_panel.len())];
+        assert!(side_panel.contains(".left_panel_open") && side_panel.contains(".then("));
+        assert!(!side_panel.contains("web_active"));
         assert!(
             render.contains(".child(self.render_status_bar(cx))"),
             "the fixed status bar remains below the child HWND for command feedback"
@@ -2075,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn web_mode_never_focuses_hidden_side_panels() {
+    fn web_mode_keeps_side_panel_actions_available() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         for (signature, next) in [
             ("fn on_toggle_left_panel", "fn on_toggle_right_panel"),
@@ -2088,9 +2145,71 @@ mod tests {
             let body = &source[start..];
             let end = body.find(next).unwrap_or(body.len());
             let body = &body[..end];
-            assert!(body.contains("if self.web_active(cx)"));
-            assert!(body.contains("self.set_status("));
-            assert!(body.contains("return;"));
+            assert!(!body.contains("if self.web_active(cx)"));
+        }
+    }
+
+    #[test]
+    fn unrelated_tree_changes_do_not_rescan_harness() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let start = source.find("fn drain_watcher").expect("drain_watcher");
+        let body = &source[start..];
+        let end = body.find("// --- Actions").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(!body.contains("tree_changed || harness_changed"));
+        assert!(body.contains("harness.has_artifact_under(change.path())"));
+    }
+
+    #[test]
+    fn only_harness_discovery_paths_trigger_a_rescan() {
+        let root = Path::new("workspace");
+
+        for unrelated in [
+            "src/widget.rs",
+            "src/rules_engine.rs",
+            "docs/skill-design.md",
+            ".github/workflows/build.yml",
+            ".claude/settings.json",
+            ".agents/skills/review/references/notes.md",
+            ".agents/skills/review/scripts/run.py",
+            "rules/engine.rs",
+            "instructions/data.json",
+            "memories/cache.txt",
+            "rules/category/deep/ignored.mdc",
+            "notes.tmp",
+        ] {
+            assert!(!path_affects_harness(root, &root.join(unrelated)));
+        }
+
+        for relevant in [
+            "AGENTS.md",
+            "GEMINI.md",
+            "QWEN.md",
+            "AGENT.md",
+            "rules/AGENT.md",
+            "rules/category",
+            "rules/category/agent.instructions.md",
+            ".cursor/rules/project.mdc",
+            ".cursor/rules/category",
+            ".github/instructions/rust.instructions.md",
+            ".claude/GEMINI.md",
+            ".agents/skills/review/SKILL.md",
+            ".agents/skills/review",
+            ".agents/skills/review/references",
+            "skills/new-skill",
+        ] {
+            assert!(
+                path_affects_harness(root, &root.join(relevant)),
+                "{relevant}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for relevant in ["skills/review.v2", ".cursor/rules/team.v2"] {
+            let path = dir.path().join(relevant);
+            std::fs::create_dir_all(&path).unwrap();
+            assert!(path_affects_harness(dir.path(), &path), "{relevant}");
         }
     }
 

@@ -93,30 +93,34 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", features = [...] }
 ```
 
-After — the current manifest at `Cargo.toml:14-26` (lines 27-28 pin two sibling crates the
-same way and are shown further down):
+After — the current workspace dependency block in `Cargo.toml` (the two sibling
+crates use the same `gpui-component` revision):
 
 ```toml
 # gpui must be specified EXACTLY as gpui-component specifies it (same URL, no
 # rev), or Cargo treats them as distinct sources and the graph ends up with two
 # incompatible gpui crates. Cargo.lock is what actually pins the revision.
-gpui = { git = "https://github.com/zed-industries/zed", features = ["profiler"] }
+gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit", "x11", "wayland", "runtime_shaders",
 ] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "b77f352589503a114cdf709507c0738a88e28364", features = [
-    "tree-sitter-languages",
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0", features = [
+    # Selected tree-sitter-* features.
 ] }
 ```
 
-The upstream side this must match is `.reference/gpui-component/Cargo.toml:43-44` (a local
-clone kept for API inspection, gitignored at `.gitignore:5-6`, so it may be absent from a
-fresh checkout):
+The upstream side this must match is the root `Cargo.toml` at the pinned
+`gpui-component` revision:
 
 ```toml
-gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed", features = ["profiler"] }
+gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 ```
+
+Revision `7885c416...` is also the first upstream commit that moves
+`gpui/profiler` from the shared workspace dependency to `gpui-fps`, the only
+crate that uses it. Earlier revisions forced the profiler into every downstream
+consumer through Cargo feature unification.
 
 ### "Exactly as specified" is narrower than it sounds
 
@@ -294,13 +298,13 @@ burden to you, and says nothing when you decline something you wanted.
 
 The workspace compiles with the unpinned declarations, and 198 tests pass across 7 suites
 (per this session's runs). The dependency-graph facts above are verified directly against
-`Cargo.toml`, `Cargo.lock`, `.reference/gpui-component/Cargo.toml`, and live `cargo tree`
-output.
+`Cargo.toml`, `Cargo.lock`, the root manifest at the pinned `gpui-component` revision, and
+live `cargo tree` output.
 
-> **On the revision hashes in this doc:** `314e0902…`, `e0931d5a…`, and `b77f3525…` are
+> **On the revision hashes in this doc:** `314e0902…`, `e0931d5a…`, and `7885c416…` are
 > commits in the **upstream** `zed-industries/zed` and `longbridge/gpui-component`
 > repositories, not in this one — a claims-checker run against this repo will not resolve
-> them, which is expected. `b77f3525…` appears in `Cargo.toml`, `314e0902…` in
+> them, which is expected. `7885c416…` appears in `Cargo.toml`, `314e0902…` in
 > `Cargo.lock`; `e0931d5a…` appears in neither, and that absence is precisely the point
 > being made above.
 

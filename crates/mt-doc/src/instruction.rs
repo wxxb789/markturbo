@@ -260,7 +260,7 @@ fn collect(root: &Path, dir: &Path, harness: &str, origin: Origin, out: &mut Fou
 /// Two ways to qualify: a name from [`INSTRUCTION_NAMES`], or a classification
 /// [`DocType`] already recognizes as an agent artifact that is not a skill (a
 /// `SKILL.md` belongs to the skill list, not here).
-fn is_instruction(path: &Path) -> bool {
+pub fn is_instruction(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -408,6 +408,13 @@ mod tests {
             !labels.iter().any(|l| l.contains("README")),
             "plain docs must not be listed: {labels:?}"
         );
+    }
+
+    #[test]
+    fn every_declared_instruction_name_is_recognized() {
+        for name in INSTRUCTION_NAMES {
+            assert!(is_instruction(Path::new(name)), "{name}");
+        }
     }
 
     #[test]

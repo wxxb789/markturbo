@@ -3008,7 +3008,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component?rev=b77f352589503a114cdf709507c0738a88e28364#b77f352589503a114cdf709507c0738a88e28364"
+source = "git+https://github.com/longbridge/gpui-component?rev=7885c41663c7a6cc68ad0c99b1ba33550f807ff0#7885c41663c7a6cc68ad0c99b1ba33550f807ff0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3040,7 +3040,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component?rev=b77f352589503a114cdf709507c0738a88e28364#b77f352589503a114cdf709507c0738a88e28364"
+source = "git+https://github.com/longbridge/gpui-component?rev=7885c41663c7a6cc68ad0c99b1ba33550f807ff0#7885c41663c7a6cc68ad0c99b1ba33550f807ff0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3098,7 +3098,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=b77f352589503a114cdf709507c0738a88e28364#b77f352589503a114cdf709507c0738a88e28364"
+source = "git+https://github.com/longbridge/gpui-component?rev=7885c41663c7a6cc68ad0c99b1ba33550f807ff0#7885c41663c7a6cc68ad0c99b1ba33550f807ff0"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3112,7 +3112,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=b77f352589503a114cdf709507c0738a88e28364#b77f352589503a114cdf709507c0738a88e28364"
+source = "git+https://github.com/longbridge/gpui-component?rev=7885c41663c7a6cc68ad0c99b1ba33550f807ff0#7885c41663c7a6cc68ad0c99b1ba33550f807ff0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3122,7 +3122,7 @@ dependencies = [
 [[package]]
 name = "gpui-wry"
 version = "0.5.0"
-source = "git+https://github.com/longbridge/gpui-component?rev=b77f352589503a114cdf709507c0738a88e28364#b77f352589503a114cdf709507c0738a88e28364"
+source = "git+https://github.com/longbridge/gpui-component?rev=7885c41663c7a6cc68ad0c99b1ba33550f807ff0#7885c41663c7a6cc68ad0c99b1ba33550f807ff0"
 dependencies = [
  "anyhow",
  "gpui",
