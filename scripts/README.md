@@ -59,10 +59,14 @@ zero-sized windows. With `--expect-top-level 1`, the titled main window must be
 the only one. Each expected child must be visible, non-zero, and contained by
 the main client rectangle. The probe then alternates and restores the main size
 twice, requires expected child bounds to react, posts `WM_CLOSE`, and waits up
-to five seconds for a clean exit. It also fails if stderr contains
-`RefCell already borrowed`; without `--log`, stderr goes to a temporary file
+to five seconds for a clean exit. It launches with an isolated
+copy of the executable and `MARKTURBO_DATA_DIR`, requires the per-process
+application log to contain its startup record, requires WebView2 to populate
+`webview2/` under that isolated root, rejects `<exe>.WebView2` beside the copied
+binary, and scans both the application log and stderr for
+`RefCell already borrowed`. Without `--log`, stderr goes to a temporary file
 that is removed after the check. Use `--forbid-log-substring` for additional
-fatal text.
+fatal text in either stream.
 
 `--expect-native-chrome-insets` is the Web-mode chrome contract: each expected
 child must leave both a positive top inset for native title/tab/document chrome

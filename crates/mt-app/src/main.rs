@@ -1,6 +1,14 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 //! markturbo — a native workspace for Markdown as the interface between humans
 //! and AI agents.
 
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 
 use gpui::*;
@@ -28,8 +36,47 @@ ENVIRONMENT:
     MARKTURBO_TRANSLATE_MODEL   Model id, if not set in Settings
     MT_MATH_FONT_DIR            Folder holding the KaTeX fonts, if they are
                                 not beside the executable or installed
+    MARKTURBO_DATA_DIR          Override the platform runtime-data directory
     RUST_LOG                    Log filter, e.g. RUST_LOG=debug
 ";
+
+fn open_log_file(path: &Path) -> Option<File> {
+    let parent = path.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+fn init_logging() {
+    let log_path = mt_app::app_paths::log_path();
+    let file = log_path.as_deref().and_then(open_log_file);
+    let active_path = file.as_ref().and(log_path);
+    let target = file
+        .map(|file| env_logger::Target::Pipe(Box::new(file)))
+        .unwrap_or_else(|| env_logger::Target::Pipe(Box::new(io::sink())));
+
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .write_style(env_logger::WriteStyle::Never)
+        .target(target)
+        .init();
+
+    #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("panic: {info}");
+        #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+        default_panic_hook(info);
+    }));
+    if let Some(path) = active_path {
+        log::info!(
+            "markturbo {} started; pid={}; log={}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            path.display()
+        );
+    }
+}
 
 /// Resolve the workspace to open from the command line.
 ///
@@ -71,11 +118,10 @@ fn main() {
     };
 
     // Renderers run on background tasks and are wrapped in `catch_unwind`; a
-    // panic there becomes an inline diagnostic. Logging it is still useful.
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
-        .init();
+    // panic there becomes an inline diagnostic. The logger and the process panic
+    // hook both write under the per-user application data directory, never to a
+    // release console window.
+    init_logging();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let target = match resolve_target(&args) {
@@ -84,6 +130,7 @@ fn main() {
             if code == 0 {
                 println!("{message}");
             } else {
+                log::error!("{message}");
                 eprintln!("{message}");
             }
             std::process::exit(code);
@@ -157,7 +204,8 @@ mod tests {
     // Import selectively: the `gpui::*` glob in the parent re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::resolve_target;
+    use super::{open_log_file, resolve_target};
+    use std::io::Write as _;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -191,6 +239,46 @@ mod tests {
             source.contains("cx.new(|cx| Root::new(view, window, cx))"),
             "the main window keeps one ordinary GPUI root"
         );
+    }
+
+    #[test]
+    fn release_windows_uses_gui_subsystem_and_file_logging() {
+        let source = include_str!("main.rs");
+        let test_module = source
+            .find("\n#[cfg(test)]")
+            .expect("the test module marker");
+        let source = &source[..test_module];
+
+        assert!(source.contains("all(target_os = \"windows\", not(debug_assertions))"));
+        assert!(source.contains("windows_subsystem = \"windows\""));
+        assert!(source.contains("mt_app::app_paths::log_path()"));
+        assert!(source.contains("env_logger::Target::Pipe"));
+        assert!(source.contains("io::sink()"));
+        assert!(!source.contains("env_logger::Target::Stderr"));
+        assert!(source.contains("std::panic::set_hook"));
+        assert!(source.contains("std::panic::take_hook"));
+
+        let logging = source
+            .find("\n    init_logging();")
+            .expect("file logging initialization");
+        let arguments = source
+            .find("std::env::args()")
+            .expect("command-line argument handling");
+        assert!(
+            logging < arguments,
+            "logging starts before argument handling"
+        );
+    }
+
+    #[test]
+    fn log_files_append_without_truncating_previous_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/markturbo-42.log");
+
+        open_log_file(&path).unwrap().write_all(b"one\n").unwrap();
+        open_log_file(&path).unwrap().write_all(b"two\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "one\ntwo\n");
     }
 
     #[test]

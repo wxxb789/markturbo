@@ -29,6 +29,7 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -490,7 +491,8 @@ def hit_test(x: int, y: int) -> str:
 
 
 def launch(exe: Path, target: str | None, settle: float,
-           log: Path | None = None) -> subprocess.Popen:
+           log: Path | None = None,
+           env: dict[str, str] | None = None) -> subprocess.Popen:
     args = [str(exe)] + ([target] if target else [])
     err = open(log, "wb") if log else None
     try:
@@ -498,6 +500,7 @@ def launch(exe: Path, target: str | None, settle: float,
             args,
             stdout=subprocess.DEVNULL,
             stderr=err if err is not None else subprocess.DEVNULL,
+            env=env,
         )
     finally:
         if err is not None:
@@ -535,17 +538,29 @@ def graceful_close(
     return None
 
 
-def forbidden_log_failures(path: Path, substrings: tuple[str, ...]) -> list[str]:
+def log_content_failures(
+    path: Path,
+    forbidden: tuple[str, ...],
+    *,
+    required: tuple[str, ...] = (),
+    label: str,
+) -> list[str]:
     try:
         contents = path.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
-        return [f"could not read stderr log {path}: {error}"]
-    return [
-        f"stderr contains forbidden substring {substring!r} "
+        return [f"could not read {label} {path}: {error}"]
+    failures = [
+        f"{label} contains forbidden substring {substring!r} "
         f"({contents.count(substring)} occurrence(s))"
-        for substring in substrings
+        for substring in forbidden
         if substring in contents
     ]
+    failures.extend(
+        f"{label} does not contain required substring {substring!r}"
+        for substring in required
+        if substring not in contents
+    )
+    return failures
 
 
 def child_geometry(
@@ -985,10 +1000,25 @@ def cmd_windows(a: argparse.Namespace) -> None:
     else:
         log_path = a.log
 
+    probe_root = tempfile.TemporaryDirectory(
+        prefix="markturbo-probe-data-", ignore_cleanup_errors=True
+    )
+    probe_root_dir = Path(probe_root.name)
+    runtime_data_dir = probe_root_dir / "data"
+    executable_dir = probe_root_dir / "bin"
+    executable_dir.mkdir()
+    probe_exe = Path(shutil.copy2(a.exe, executable_dir / a.exe.name))
+    env = os.environ.copy()
+    env["MARKTURBO_DATA_DIR"] = str(runtime_data_dir)
+    env["RUST_LOG"] = "info"
+    executable_webview_data = probe_exe.with_name(f"{probe_exe.name}.WebView2")
+
     failures: list[str] = []
     p: subprocess.Popen | None = None
+    app_log_path: Path | None = None
     try:
-        p = launch(a.exe, a.open, a.settle, log_path)
+        p = launch(probe_exe, a.open, a.settle, log_path, env)
+        app_log_path = runtime_data_dir / "logs" / f"markturbo-{p.pid}.log"
         hwnd = main_window(p.pid)
         if hwnd is None:
             failures.append(
@@ -1077,15 +1107,48 @@ def cmd_windows(a: argparse.Namespace) -> None:
             DEFAULT_FORBIDDEN_LOG_SUBSTRINGS
             + tuple(a.forbid_log_substring)
         ))
-        log_failures = forbidden_log_failures(log_path, forbidden)
-        failures.extend(log_failures)
-        if not log_failures:
-            print(f"stderr scan: {len(forbidden)} forbidden substring(s) absent PASS")
+        stderr_failures = log_content_failures(
+            log_path, forbidden, label="stderr log"
+        )
+        failures.extend(stderr_failures)
+        if not stderr_failures:
+            print(
+                f"stderr scan: {len(forbidden)} forbidden substring(s) absent PASS"
+            )
+
+        if app_log_path is None or p is None:
+            failures.append("process did not launch, so no application log was available")
+        else:
+            app_log_failures = log_content_failures(
+                app_log_path,
+                forbidden,
+                required=(f"pid={p.pid};",),
+                label="application log",
+            )
+            failures.extend(app_log_failures)
+            if not app_log_failures:
+                print(
+                    "application log scan: startup record present and "
+                    f"{len(forbidden)} forbidden substring(s) absent PASS"
+                )
+        webview_data_dir = runtime_data_dir / "webview2"
+        if webview_data_dir.is_dir() and any(webview_data_dir.iterdir()):
+            print(f"WebView data: {webview_data_dir} PASS")
+        else:
+            failures.append(
+                f"WebView did not populate its data directory: {webview_data_dir}"
+            )
+        if executable_webview_data.exists():
+            failures.append(
+                "WebView data was created beside the executable: "
+                f"{executable_webview_data}"
+            )
         if temporary_log:
             try:
                 log_path.unlink(missing_ok=True)
             except OSError as error:
                 failures.append(f"could not remove temporary stderr log: {error}")
+        probe_root.cleanup()
 
     if failures:
         print("\nacceptance: FAIL")

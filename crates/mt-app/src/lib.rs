@@ -19,6 +19,7 @@
 //! views      GPUI views
 //! ```
 
+pub mod app_paths;
 pub mod assets;
 pub mod fs;
 pub mod i18n;

@@ -109,6 +109,26 @@ noting: this used to be `~/.config/markturbo`, which is the XDG answer on a
 platform that is not XDG — a file there is invisible to every macOS convention
 for finding, backing up, or migrating application data.
 
+## Where runtime data and logs live
+
+Application logs on every platform, plus the Windows WebView2 profile, use
+`dirs::data_local_dir()`, separate from the settings above. They are local,
+potentially growing data and should neither roam between machines nor be
+created beside the executable:
+
+| Platform | Runtime data root |
+|---|---|
+| Windows | `%LOCALAPPDATA%\markturbo` |
+| macOS | `~/Library/Application Support/markturbo` |
+| Linux | `$XDG_DATA_HOME/markturbo`, else `~/.local/share/markturbo` |
+
+On Windows, all MarkTurbo instances share the persistent WebView2 profile at
+`webview2/` under that root. macOS continues to use WKWebView's system-managed
+browser storage. Every platform writes application logs under `logs/`, using
+one append-only `markturbo-<pid>.log` file per process so concurrent instances
+do not contend for one file. `$MARKTURBO_DATA_DIR` overrides this log root on
+every platform and the WebView2 profile root on Windows.
+
 ## Optional per-platform tooling
 
 Only PlantUML needs anything installed; Mermaid, D2, and math are pure Rust and
