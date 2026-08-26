@@ -186,45 +186,48 @@ fn segment_prose(source: &str, range: Range<usize>, out: &mut Vec<Segment>) {
         }
 
         // Inline math: $…$ (single-line only, matching CommonMark math ext).
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] != b' ' {
-            if let Some(rel_end) = text[i + 1..].find('$') {
-                let candidate = &text[i + 1..i + 1 + rel_end];
-                if !candidate.contains('\n') && !candidate.is_empty() {
-                    let end = i + 1 + rel_end + 1;
-                    flush_prose(out, source, base, prose_start, i);
-                    push_verbatim(out, source, base + i..base + end);
-                    i = end;
-                    prose_start = i;
-                    continue;
-                }
-            }
-        }
-
-        // Link/image target: `](target)` — the label before it stays
-        // translatable, the target does not.
-        if bytes[i] == b']' && text[i + 1..].starts_with('(') {
-            if let Some(rel_end) = text[i + 1..].find(')') {
+        if bytes[i] == b'$'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] != b' '
+            && let Some(rel_end) = text[i + 1..].find('$')
+        {
+            let candidate = &text[i + 1..i + 1 + rel_end];
+            if !candidate.contains('\n') && !candidate.is_empty() {
                 let end = i + 1 + rel_end + 1;
-                flush_prose(out, source, base, prose_start, i + 1);
-                push_verbatim(out, source, base + i + 1..base + end);
+                flush_prose(out, source, base, prose_start, i);
+                push_verbatim(out, source, base + i..base + end);
                 i = end;
                 prose_start = i;
                 continue;
             }
         }
 
+        // Link/image target: `](target)` — the label before it stays
+        // translatable, the target does not.
+        if bytes[i] == b']'
+            && text[i + 1..].starts_with('(')
+            && let Some(rel_end) = text[i + 1..].find(')')
+        {
+            let end = i + 1 + rel_end + 1;
+            flush_prose(out, source, base, prose_start, i + 1);
+            push_verbatim(out, source, base + i + 1..base + end);
+            i = end;
+            prose_start = i;
+            continue;
+        }
+
         // Autolink: <https://…> or <mailto:…>.
-        if bytes[i] == b'<' {
-            if let Some(rel_end) = text[i..].find('>') {
-                let inner = &text[i + 1..i + rel_end];
-                if is_uri_like(inner) {
-                    let end = i + rel_end + 1;
-                    flush_prose(out, source, base, prose_start, i);
-                    push_verbatim(out, source, base + i..base + end);
-                    i = end;
-                    prose_start = i;
-                    continue;
-                }
+        if bytes[i] == b'<'
+            && let Some(rel_end) = text[i..].find('>')
+        {
+            let inner = &text[i + 1..i + rel_end];
+            if is_uri_like(inner) {
+                let end = i + rel_end + 1;
+                flush_prose(out, source, base, prose_start, i);
+                push_verbatim(out, source, base + i..base + end);
+                i = end;
+                prose_start = i;
+                continue;
             }
         }
 
