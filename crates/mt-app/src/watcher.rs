@@ -5,7 +5,7 @@
 //! produces bursts of events, and re-reading per event would thrash.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
@@ -92,14 +92,9 @@ impl Watcher {
     /// a UI tick.
     pub fn poll(&self) -> Vec<Change> {
         let mut changes = Vec::new();
-        loop {
-            match self.rx.try_recv() {
-                Ok(events) => {
-                    for event in events {
-                        changes.extend(classify(&event, &self.root));
-                    }
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        while let Ok(events) = self.rx.try_recv() {
+            for event in events {
+                changes.extend(classify(&event, &self.root));
             }
         }
         dedup(changes)
