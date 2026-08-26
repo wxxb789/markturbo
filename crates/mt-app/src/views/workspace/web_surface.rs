@@ -866,6 +866,21 @@ fn run_windows_webview(
         TranslateMessage,
     };
 
+    let Some(data_dir) = crate::app_paths::webview_data_dir() else {
+        let _ = ready.send(Err(
+            "cannot resolve the MarkTurbo WebView data directory".to_string()
+        ));
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(&data_dir) {
+        let _ = ready.send(Err(format!(
+            "cannot create WebView data directory {}: {error}",
+            data_dir.display()
+        )));
+        return;
+    }
+    let mut web_context = wry::WebContext::new(Some(data_dir));
+
     let parent = HWND(parent as *mut _);
     let host_hwnd = match create_web_host(parent) {
         Ok(host) => host,
@@ -878,13 +893,14 @@ fn run_windows_webview(
     let page_events = events.clone();
     let navigation_in_flight = Arc::new(AtomicBool::new(false));
     let page_navigation_in_flight = navigation_in_flight.clone();
-    let builder = wry::WebViewBuilder::new().with_on_page_load_handler(move |event, _url| {
-        if matches!(event, wry::PageLoadEvent::Finished)
-            && page_navigation_in_flight.swap(false, Ordering::AcqRel)
-        {
-            let _ = page_events.try_send(WorkerEvent::PageLoaded);
-        }
-    });
+    let builder = wry::WebViewBuilder::new_with_web_context(&mut web_context)
+        .with_on_page_load_handler(move |event, _url| {
+            if matches!(event, wry::PageLoadEvent::Finished)
+                && page_navigation_in_flight.swap(false, Ordering::AcqRel)
+            {
+                let _ = page_events.try_send(WorkerEvent::PageLoaded);
+            }
+        });
     #[cfg(debug_assertions)]
     let builder = builder.with_devtools(true);
     // `lb-wry` calls `CoInitializeEx(..., COINIT_APARTMENTTHREADED)` from
@@ -1330,6 +1346,16 @@ mod tests {
                 "forbidden companion-window API: {forbidden}"
             );
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_persists_webview_data_under_app_data() {
+        let source = crate::views::production_source(include_str!("web_surface.rs"));
+
+        assert!(source.contains("crate::app_paths::webview_data_dir()"));
+        assert!(source.contains("wry::WebContext::new(Some(data_dir))"));
+        assert!(source.contains("WebViewBuilder::new_with_web_context(&mut web_context)"));
     }
 
     #[test]
