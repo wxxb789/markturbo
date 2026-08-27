@@ -161,7 +161,11 @@ jobs:
           fi
 
           if gh release view "$TAG" > /dev/null 2>&1; then
+            is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
             gh release upload "$TAG" dist/* --clobber
+            if [[ "$is_draft" == "true" ]]; then
+              gh release edit "$TAG" --draft=false
+            fi
           else
             gh release create "$TAG" dist/* \
               --verify-tag \

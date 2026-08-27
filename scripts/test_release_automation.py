@@ -132,6 +132,19 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertIn("--prerelease", release_step["run"])
         self.assertIn("gh release create", release_step["run"])
 
+    def test_existing_draft_release_is_published_after_assets_upload(self) -> None:
+        publish = self.release["jobs"]["publish"]
+        release_step = step_named(publish["steps"], "Publish GitHub release")
+        run = release_step["run"]
+
+        self.assertIn('gh release view "$TAG" --json isDraft --jq .isDraft', run)
+        self.assertIn('gh release upload "$TAG" dist/* --clobber', run)
+        self.assertIn('gh release edit "$TAG" --draft=false', run)
+        self.assertLess(
+            run.index('gh release upload "$TAG" dist/* --clobber'),
+            run.index('gh release edit "$TAG" --draft=false'),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
