@@ -35,12 +35,12 @@ use gpui::{Pixels, px};
 /// window title above it.
 pub const INSET: f32 = 12.;
 
-/// Space reserved by `gpui-component::TitleBar` before application chrome.
+/// Space reserved before application chrome by the platform title bar.
 ///
 /// This mirrors the pinned component's platform constants: 80px clears the
 /// macOS traffic lights, while the other client-decorated platforms use the
-/// regular 12px window inset. The title row subtracts it from the measured
-/// left-panel width so both rows meet at the same divider.
+/// regular 12px window inset. The leftmost workspace column applies the same
+/// inset while its column boundary remains owned by ordinary flex layout.
 #[cfg(target_os = "macos")]
 pub const TITLE_BAR_LEADING_INSET: f32 = 80.;
 #[cfg(not(target_os = "macos"))]
@@ -78,7 +78,7 @@ pub const ROW_PAD: f32 = 8.;
 /// Indentation per level in a tree.
 pub const INDENT: f32 = 14.;
 
-/// A panel width, expressed as a share of the window.
+/// A panel's initial width, expressed as a share of the window.
 ///
 /// The pixel bounds are not a second opinion about the width — they are the
 /// two places a fraction stops being right. Below `min` a file name is all
@@ -95,7 +95,7 @@ pub struct PanelWidth {
 }
 
 impl PanelWidth {
-    /// This panel's width in a window `viewport` wide.
+    /// This panel's initial width in a window `viewport` wide.
     pub fn resolve(self, viewport: Pixels) -> Pixels {
         let wanted = f32::from(viewport) * self.fraction;
         // A window narrower than `min` cannot honor the floor without hiding
@@ -150,11 +150,25 @@ pub const RIGHT_PANEL: PanelWidth = PanelWidth {
 /// Smallest useful side panel width. Below this, file names are all ellipsis.
 pub const SIDE_PANEL_MIN: f32 = 180.;
 
+/// Smallest useful document column while both side panels are visible.
+///
+/// At the 720px window minimum this leaves 180px for navigation, 260px for
+/// details, and 280px for the document instead of letting chrome consume the
+/// surface the panels exist to support.
+pub const DOCUMENT_MIN: f32 = 280.;
+
 /// Gap between related controls in a row — a button and its neighbour.
 pub const GAP: f32 = 6.;
 
 /// Gap between unrelated groups in the same row.
 pub const GAP_GROUP: f32 = 12.;
+
+/// Width reserved for the four fixed title-bar commands.
+///
+/// Four 24px targets, three 6px inter-command gaps, and 6px padding on both
+/// sides. Keeping the reservation derived from the rendered controls prevents
+/// tabs from sliding underneath an overlay whose identity must stay stable.
+pub const TITLE_COMMANDS: f32 = TARGET * 4. + GAP * 5.;
 
 /// Padding inside a panel's header row.
 pub const HEADER_PAD_Y: f32 = 8.;
@@ -213,6 +227,10 @@ pub fn gap_group() -> Pixels {
     px(GAP_GROUP)
 }
 
+pub fn title_commands() -> Pixels {
+    px(TITLE_COMMANDS)
+}
+
 pub fn target() -> Pixels {
     px(TARGET)
 }
@@ -244,6 +262,7 @@ mod tests {
             ("TARGET", TARGET),
             ("ROW", ROW),
             ("ROW_PAD", ROW_PAD),
+            ("DOCUMENT_MIN", DOCUMENT_MIN),
             ("GAP_GROUP", GAP_GROUP),
             ("HEADER_PAD_Y", HEADER_PAD_Y),
             ("RADIUS", RADIUS),
@@ -268,10 +287,12 @@ mod tests {
         // needs to be the wider of the two or every field wraps.
         assert!(RIGHT_PANEL.fraction > SIDE_PANEL.fraction);
         assert!(RIGHT_PANEL.min > SIDE_PANEL.min);
+        assert!(DOCUMENT_MIN >= RIGHT_PANEL.min);
         // Two panels at their default share must still leave the document the
         // majority of the window. This is the check that makes the fractions
         // reviewable as a set rather than one at a time.
         assert!(SIDE_PANEL.fraction + RIGHT_PANEL.fraction < 0.5);
+        assert!(TITLE_COMMANDS == TARGET * 4. + GAP * 5.);
         // Windows draws 32px caption buttons; a shorter bar leaves them
         // overhanging the content below.
         assert!(TITLE_BAR >= 32.);

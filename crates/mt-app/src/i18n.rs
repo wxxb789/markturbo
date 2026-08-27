@@ -37,6 +37,8 @@ pub enum Key {
     Details,
     ToggleLeftPanel,
     ToggleRightPanel,
+    SidePanelWidth,
+    DetailsPanelWidth,
     CopyPath,
     CopyRelativePath,
 
@@ -171,6 +173,8 @@ fn english(key: Key) -> &'static str {
         Key::Details => "Details",
         Key::ToggleLeftPanel => "Toggle the side panel",
         Key::ToggleRightPanel => "Toggle the details panel",
+        Key::SidePanelWidth => "Side panel width",
+        Key::DetailsPanelWidth => "Details panel width",
         Key::CopyPath => "Copy path",
         Key::CopyRelativePath => "Copy relative path",
 
@@ -318,6 +322,8 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::Details => "详情",
         Key::ToggleLeftPanel => "显示/隐藏侧边栏",
         Key::ToggleRightPanel => "显示/隐藏详情栏",
+        Key::SidePanelWidth => "侧边栏宽度",
+        Key::DetailsPanelWidth => "详情栏宽度",
         Key::CopyPath => "复制路径",
         Key::CopyRelativePath => "复制相对路径",
 
@@ -450,6 +456,8 @@ mod tests {
         Key::Details,
         Key::ToggleLeftPanel,
         Key::ToggleRightPanel,
+        Key::SidePanelWidth,
+        Key::DetailsPanelWidth,
         Key::CopyPath,
         Key::CopyRelativePath,
         Key::ScopeDocument,
