@@ -7,6 +7,7 @@ nothing here is compiled into it.
 |---|---|
 | `probe.py` | Measures markturbo startup, memory, idle CPU, child windows, and hit testing |
 | `gen-perf-fixtures.py` | Regenerates the committed fixtures under `fixtures/perf/` |
+| `test_release_automation.py` | Locks the `cargo-release` configuration and GitHub Actions release contract |
 | `package-release.sh` | Builds and stages a distributable archive under `dist/` |
 
 ## The rules

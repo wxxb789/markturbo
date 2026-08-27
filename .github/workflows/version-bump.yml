@@ -1,0 +1,98 @@
+name: Bump version
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version step
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - alpha
+          - beta
+          - rc
+          - release
+
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_RELEASE_VERSION: "1.1.5"
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: false
+
+      - name: Install cargo-release
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo install cargo-release --version "$CARGO_RELEASE_VERSION" --locked
+
+      - name: Verify release automation
+        run: uv run scripts/test_release_automation.py
+
+      - name: Bump workspace version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          cargo release version "$BUMP" --workspace --execute --no-confirm
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Cargo metadata
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
+      - name: Commit and tag
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          unexpected="$(git diff --name-only | grep -Ev '^(Cargo\.toml|Cargo\.lock)$' || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "error: version bump changed unexpected files:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): bump version to $VERSION"
+          git tag -a "$TAG" -m "markturbo $VERSION"
+          gh auth setup-git
+          git push --atomic origin "HEAD:$DEFAULT_BRANCH" "refs/tags/$TAG"
+
+  release:
+    needs: bump
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
