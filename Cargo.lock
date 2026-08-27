@@ -4902,6 +4902,7 @@ dependencies = [
  "env_logger",
  "genai",
  "gpui",
+ "gpui-base",
  "gpui-component",
  "gpui-component-assets",
  "gpui-wry",

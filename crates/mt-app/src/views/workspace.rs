@@ -17,13 +17,16 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_base::{Button as BaseButton, GlobalState, Toggle as BaseToggle};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TitleBar,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _,
+    TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
     menu::ContextMenuExt as _,
-    resizable::{h_resizable, resizable_panel},
+    resizable::{ResizableState, h_resizable, resizable_panel},
+    spinner::Spinner,
     tab::{Tab, TabBar},
     tooltip::Tooltip,
     v_flex,
@@ -124,6 +127,325 @@ impl SidePanel {
             SidePanel::Search => crate::i18n::Key::PanelSearch,
             SidePanel::Harness => crate::i18n::Key::PanelHarness,
             SidePanel::Outline => crate::i18n::Key::PanelOutline,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            SidePanel::Files => "side-panel-files",
+            SidePanel::Search => "side-panel-search",
+            SidePanel::Harness => "side-panel-harness",
+            SidePanel::Outline => "side-panel-outline",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            SidePanel::Files => IconName::Folder,
+            SidePanel::Search => IconName::Search,
+            SidePanel::Harness => IconName::Bot,
+            SidePanel::Outline => IconName::BookOpen,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WorkspacePanelWidths {
+    left: Pixels,
+    right: Pixels,
+}
+
+fn resolved_workspace_panel_widths(
+    workspace_sizes: &[Pixels],
+    details_sizes: &[Pixels],
+    saved_left: Option<Pixels>,
+    saved_right: Option<Pixels>,
+    left_visible: bool,
+    right_visible: bool,
+    viewport: Pixels,
+) -> WorkspacePanelWidths {
+    let requested_left = if left_visible {
+        workspace_sizes
+            .first()
+            .copied()
+            .filter(|_| workspace_sizes.len() == 2)
+            .or(saved_left)
+            .unwrap_or_else(|| metrics::SIDE_PANEL.resolve(viewport))
+    } else {
+        px(0.)
+    };
+    let requested_right = if right_visible {
+        details_sizes
+            .last()
+            .copied()
+            .filter(|_| details_sizes.len() == 2)
+            .or(saved_right)
+            .unwrap_or_else(|| metrics::RIGHT_PANEL.resolve(viewport))
+    } else {
+        px(0.)
+    };
+
+    let left_range = metrics::SIDE_PANEL.drag_range();
+    let right_range = metrics::RIGHT_PANEL.drag_range();
+    let mut left = requested_left.clamp(left_range.start, left_range.end);
+    let mut right = requested_right.clamp(right_range.start, right_range.end);
+    // A width chosen on a large display is still a preference after the window
+    // shrinks, not permission to squeeze the document out of existence. Reuse
+    // the side panel's established useful-width floor for the center column;
+    // when both panels are visible, distribute the remaining budget in the
+    // same proportion as the user's requested extra width above each minimum.
+    let side_budget = (viewport - px(metrics::SIDE_PANEL_MIN)).max(px(0.));
+    match (left_visible, right_visible) {
+        (true, true) => {
+            let minimum = left_range.start + right_range.start;
+            let total = left + right;
+            if total > side_budget {
+                if side_budget < minimum {
+                    left = if minimum > px(0.) {
+                        side_budget * (left_range.start / minimum)
+                    } else {
+                        px(0.)
+                    };
+                    right = side_budget - left;
+                    return WorkspacePanelWidths { left, right };
+                }
+                let left_extra = (left - left_range.start).max(px(0.));
+                let right_extra = (right - right_range.start).max(px(0.));
+                let total_extra = left_extra + right_extra;
+                let extra_budget = side_budget - minimum;
+                if total_extra > px(0.) {
+                    left = left_range.start + extra_budget * (left_extra / total_extra);
+                    right = side_budget - left;
+                } else {
+                    left = left_range.start;
+                    right = right_range.start;
+                }
+            }
+        }
+        (true, false) => {
+            left = left.min(side_budget);
+            right = px(0.);
+        }
+        (false, true) => {
+            let maximum = side_budget.min(right_range.end);
+            left = px(0.);
+            right = right.min(maximum);
+        }
+        (false, false) => {
+            left = px(0.);
+            right = px(0.);
+        }
+    }
+
+    WorkspacePanelWidths { left, right }
+}
+
+fn restored_panel_range(
+    width: Pixels,
+    configured: std::ops::Range<Pixels>,
+) -> std::ops::Range<Pixels> {
+    if width < configured.start {
+        px(0.)..width
+    } else {
+        configured
+    }
+}
+
+fn native_window_controls_width(window: &Window) -> Pixels {
+    if cfg!(target_os = "macos") || cfg!(target_family = "wasm") {
+        return px(0.);
+    }
+
+    #[cfg(target_os = "linux")]
+    if !matches!(window.window_decorations(), Decorations::Client { .. }) {
+        return px(0.);
+    }
+
+    let supported = window.window_controls();
+    let controls = 1 + usize::from(supported.minimize) + usize::from(supported.maximize);
+    COMPONENT_TITLE_BAR_HEIGHT * controls as f32
+}
+
+type ChromeClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// Icon-only workspace command with Base-owned focus, keyboard, and accessible
+/// naming, styled from the same theme tokens as gpui-component's ghost button.
+///
+/// The pinned styled `Button` derives its accessible name only from its visible
+/// label. This narrow composition keeps the requested icon-only presentation
+/// without leaving WebView mode with anonymous controls when popup tooltips are
+/// deliberately suppressed.
+#[derive(IntoElement)]
+pub(super) struct ChromeIconButton {
+    id: &'static str,
+    icon: IconName,
+    label: SharedString,
+    pressed: Option<bool>,
+    disabled: bool,
+    loading: bool,
+    tooltip: Option<SharedString>,
+    on_click: Option<ChromeClickHandler>,
+}
+
+impl ChromeIconButton {
+    pub(super) fn new(id: &'static str, icon: IconName, label: impl Into<SharedString>) -> Self {
+        Self {
+            id,
+            icon,
+            label: label.into(),
+            pressed: None,
+            disabled: false,
+            loading: false,
+            tooltip: None,
+            on_click: None,
+        }
+    }
+
+    pub(super) fn pressed(mut self, pressed: bool) -> Self {
+        self.pressed = Some(pressed);
+        self
+    }
+
+    pub(super) fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
+    }
+
+    pub(super) fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+
+    pub(super) fn on_click(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_click = Some(Box::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for ChromeIconButton {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus_handle = window
+            .use_keyed_state(self.id, cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        let is_focused = focus_handle.is_focused(window);
+        let normal_foreground = cx.theme().secondary_foreground;
+        let hover_background = cx.theme().tokens.secondary_hover.background;
+        let active_background = cx.theme().tokens.secondary_active.background;
+        let disabled_foreground = cx.theme().muted_foreground.opacity(0.5);
+        let icon = if self.loading {
+            Spinner::new().small().into_any_element()
+        } else {
+            Icon::new(self.icon).small().into_any_element()
+        };
+        let on_click = self.on_click;
+        let loading = self.loading;
+        let disabled = self.disabled;
+        let inert = disabled || loading;
+        let inactive_foreground = if loading {
+            normal_foreground
+        } else {
+            disabled_foreground
+        };
+        let button = match self.pressed {
+            Some(pressed) => BaseToggle::new(self.id)
+                .pressed(pressed)
+                .disabled(inert)
+                .accessibility_label(self.label)
+                .track_focus(&focus_handle)
+                .styles(|styles| {
+                    styles
+                        .pressed(|style| style.bg(active_background).text_color(normal_foreground))
+                        .disabled(|style| {
+                            style
+                                .bg(cx.theme().transparent)
+                                .text_color(inactive_foreground)
+                        })
+                })
+                .flex()
+                .flex_shrink_0()
+                .size_6()
+                .items_center()
+                .justify_center()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().transparent)
+                .text_color(normal_foreground)
+                .when(!inert && !pressed, |this| {
+                    this.hover(|style| style.bg(hover_background))
+                        .active(|style| style.bg(active_background))
+                })
+                .when(!inert, |this| {
+                    this.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        GlobalState::suppress_text_selection(cx);
+                    })
+                })
+                .when_some(on_click.filter(|_| !inert), |this, on_click| {
+                    this.on_change(move |_, event, window, cx| on_click(event, window, cx))
+                })
+                .child(icon)
+                .when(is_focused && !inert, |this| {
+                    this.focus_ring_style(window, cx)
+                })
+                .into_any_element(),
+            None => BaseButton::new(self.id)
+                .disabled(inert)
+                .accessibility_label(self.label)
+                .track_focus(&focus_handle)
+                .styles(|styles| {
+                    styles.disabled(|style| {
+                        style
+                            .bg(cx.theme().transparent)
+                            .text_color(inactive_foreground)
+                    })
+                })
+                .flex()
+                .flex_shrink_0()
+                .size_6()
+                .items_center()
+                .justify_center()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().transparent)
+                .text_color(normal_foreground)
+                .when(!inert, |this| {
+                    this.hover(|style| style.bg(hover_background))
+                        .active(|style| style.bg(active_background))
+                })
+                .when(loading, |this| this.opacity(0.8))
+                .when(!inert, |this| {
+                    this.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        GlobalState::suppress_text_selection(cx);
+                    })
+                })
+                .when_some(on_click.filter(|_| !inert), |this, on_click| {
+                    this.on_click(move |event, window, cx| on_click(event, window, cx))
+                })
+                .child(icon)
+                .when(is_focused && !inert, |this| {
+                    this.focus_ring_style(window, cx)
+                })
+                .into_any_element(),
+        };
+
+        if let Some(tooltip) = self.tooltip {
+            div()
+                .id(SharedString::from(format!("chrome-tooltip-{}", self.id)))
+                .flex()
+                .flex_shrink_0()
+                .child(button)
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .into_any_element()
+        } else {
+            button
         }
     }
 }
@@ -249,6 +571,19 @@ pub struct Workspace {
     web: WebSurface,
     /// True while the settings page is showing.
     settings_open: bool,
+    /// Measured geometry for the left-panel/document boundary.
+    workspace_split_state: Entity<ResizableState>,
+    /// Measured geometry for the document/details boundary.
+    details_split_state: Entity<ResizableState>,
+    /// Last observed sizes, kept here so repeated prepaint notifications do
+    /// not turn into a permanent Workspace redraw loop.
+    workspace_split_sizes: Vec<Pixels>,
+    details_split_sizes: Vec<Pixels>,
+    /// User-chosen widths survive collapsing a panel or temporarily replacing
+    /// the document with Settings; `ResizableState` itself cannot preserve the
+    /// first panel when the outer split drops from two children to one.
+    saved_left_panel_width: Option<Pixels>,
+    saved_right_panel_width: Option<Pixels>,
     /// True while the file/harness/outline panel is showing on the left.
     left_panel_open: bool,
     /// True while the details panel is showing on the right.
@@ -315,6 +650,8 @@ impl Workspace {
                 crate::views::try_update(&this, cx, |this, cx| this.drain_watcher(cx));
             }
         });
+        let workspace_split_state = cx.new(|_| ResizableState::default());
+        let details_split_state = cx.new(|_| ResizableState::default());
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -333,6 +670,12 @@ impl Workspace {
             status_generation: 0,
             _status_timer: None,
             settings_open: false,
+            workspace_split_state: workspace_split_state.clone(),
+            details_split_state: details_split_state.clone(),
+            workspace_split_sizes: Vec::new(),
+            details_split_sizes: Vec::new(),
+            saved_left_panel_width: None,
+            saved_right_panel_width: None,
             left_panel_open: true,
             right_panel_open: true,
             translating: false,
@@ -341,6 +684,45 @@ impl Workspace {
             _subscriptions: Vec::new(),
             _panel_subscriptions: Vec::new(),
         };
+
+        this._subscriptions
+            .push(cx.observe(&workspace_split_state, |this, state, cx| {
+                let sizes = state.read(cx).sizes().clone();
+                if sizes != this.workspace_split_sizes {
+                    if this.left_panel_open
+                        && sizes.len() == 2
+                        && let Some(width) = sizes.first().copied()
+                    {
+                        let range = metrics::SIDE_PANEL.drag_range();
+                        if width >= range.start && width <= range.end {
+                            this.saved_left_panel_width = Some(width);
+                        }
+                    }
+                    this.workspace_split_sizes = sizes;
+                    this.web_dirty(cx);
+                    cx.notify();
+                }
+            }));
+        this._subscriptions
+            .push(cx.observe(&details_split_state, |this, state, cx| {
+                let sizes = state.read(cx).sizes().clone();
+                if sizes != this.details_split_sizes {
+                    if this.right_panel_open
+                        && !this.settings_open
+                        && this.right_panel_available(cx)
+                        && sizes.len() == 2
+                        && let Some(width) = sizes.last().copied()
+                    {
+                        let range = metrics::RIGHT_PANEL.drag_range();
+                        if width >= range.start && width <= range.end {
+                            this.saved_right_panel_width = Some(width);
+                        }
+                    }
+                    this.details_split_sizes = sizes;
+                    this.web_dirty(cx);
+                    cx.notify();
+                }
+            }));
 
         // The saved preference, applied before the first frame so the window
         // never flashes the wrong theme.
@@ -478,6 +860,10 @@ impl Workspace {
                     this.open_file_as(path.clone(), *preview, window, cx);
                 },
             ),
+            cx.observe(&harness, |this, _, cx| {
+                this.web_dirty(cx);
+                cx.notify();
+            }),
         ];
 
         self.watcher = match Watcher::new(&path) {
@@ -697,6 +1083,40 @@ impl Workspace {
                 .is_some_and(|document| document.read(cx).layout().uses_webview())
     }
 
+    fn right_panel_available(&self, cx: &App) -> bool {
+        self.harness
+            .as_ref()
+            .is_some_and(|harness| harness.read(cx).has_selection())
+    }
+
+    fn reset_workspace_split(&mut self, cx: &mut Context<Self>) {
+        self.workspace_split_sizes.clear();
+        self.workspace_split_state
+            .update(cx, |state, _| state.clear());
+    }
+
+    fn reset_details_split(&mut self, cx: &mut Context<Self>) {
+        self.details_split_sizes.clear();
+        self.details_split_state
+            .update(cx, |state, _| state.clear());
+    }
+
+    fn workspace_panel_widths(
+        &self,
+        viewport: Pixels,
+        right_visible: bool,
+    ) -> WorkspacePanelWidths {
+        resolved_workspace_panel_widths(
+            &self.workspace_split_sizes,
+            &self.details_split_sizes,
+            self.saved_left_panel_width,
+            self.saved_right_panel_width,
+            self.left_panel_open,
+            right_visible,
+            viewport,
+        )
+    }
+
     fn set_status(&mut self, message: String, cx: &mut Context<Self>) {
         // Each message gets its own generation, and only the timer whose
         // generation is still current clears the bar. Without it, two messages
@@ -814,6 +1234,7 @@ impl Workspace {
 
     fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
+        self.reset_details_split(cx);
         // The WebView's visibility depends on this flag, and it is an OS child
         // window that will not notice a re-render on its own.
         self.web_dirty(cx);
@@ -827,6 +1248,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.left_panel_open = !self.left_panel_open;
+        self.reset_workspace_split(cx);
         // The WebView is an OS child window; it does not notice the document
         // pane resizing under it.
         self.web_dirty(cx);
@@ -839,7 +1261,11 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.right_panel_available(cx) {
+            return;
+        }
         self.right_panel_open = !self.right_panel_open;
+        self.reset_details_split(cx);
         self.web_dirty(cx);
         cx.notify();
     }
@@ -1077,27 +1503,14 @@ impl Workspace {
 
     // --- Rendering --------------------------------------------------------
 
-    /// The details panel, when there is something to show in it.
-    ///
-    /// `None` rather than an empty panel: a column of blank space next to the
-    /// document is worse than no column, and the toggle in the title bar is
-    /// what says whether the panel is wanted at all.
-    ///
-    /// No header row of its own. The panel runs from the top of the window to
-    /// the bottom, so a header inside it would sit at the same height as the
-    /// title bar and read as a second, competing one.
+    /// The selected Harness artifact's details, when one is available.
     fn render_right_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.right_panel_open || self.settings_open {
+        if !self.right_panel_open || self.settings_open || !self.right_panel_available(cx) {
             return None;
         }
         let harness = self.harness.clone()?;
-        if !harness.read(cx).has_selection() {
-            return None;
-        }
-        // Through `update` rather than `read`: the details carry an Open button
-        // whose click handler emits a `HarnessEvent`, which needs the harness
-        // view's own `Context`. This is the entity-lease path, not the
-        // `AppCell::borrow_mut` one, so it is safe during a draw.
+        // The details carry an Open button whose click handler emits a
+        // `HarnessEvent`, so rendering leases the entity context.
         let details = harness.update(cx, |harness, cx| harness.render_details(cx));
         Some(
             v_flex()
@@ -1107,7 +1520,7 @@ impl Workspace {
                 .border_color(cx.theme().border)
                 .child(
                     h_flex()
-                        .h(metrics::title_bar())
+                        .h(metrics::row())
                         .flex_shrink_0()
                         .px(metrics::inset())
                         .items_center()
@@ -1119,13 +1532,7 @@ impl Workspace {
                                 .font_medium()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(i18n::t(i18n::Key::Details, cx)),
-                        )
-                        // The collapse control belongs where the panel is, not
-                        // across the window in the title bar: the click that
-                        // opened it and the click that closes it should land in
-                        // the same place. No `stop_propagation` — this panel is
-                        // not a `WindowControlArea::Drag` region.
-                        .child(self.render_right_toggle(!self.web_active(cx), cx)),
+                        ),
                 )
                 .child(
                     div()
@@ -1139,14 +1546,7 @@ impl Workspace {
         )
     }
 
-    /// The left panel: Files / Harness / Outline.
-    ///
-    /// Its own tab strip stands in for a header, and the strip is [`TITLE_BAR`]
-    /// tall so it lines up with the title bar across the gap — the panel runs
-    /// the full height of the window, so the two are side by side rather than
-    /// stacked.
-    ///
-    /// [`TITLE_BAR`]: crate::metrics::TITLE_BAR
+    /// The left panel: persistent vertical navigation above the selected tool.
     fn render_side_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
@@ -1154,46 +1554,24 @@ impl Workspace {
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                div()
-                    .h(metrics::title_bar())
+                v_flex()
                     .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .pl(metrics::inset())
-                    .gap(metrics::gap())
-                    // The collapse control moves in here while the panel is
-                    // open, so the click that closes it lands where the click
-                    // that opened it did. Left of the strip, on the side it
-                    // governs. No `stop_propagation` — this is not a
-                    // `WindowControlArea::Drag` region, only the title bar is.
-                    .child(self.render_left_toggle(!self.web_active(cx), cx))
-                    .child(
-                        TabBar::new("side-tabs")
-                            .underline()
-                            // `flex_1`, not `w_full`: the toggle beside it is a
-                            // sibling now, and a strip claiming the full width
-                            // of the row would push itself off the panel.
-                            .flex_1()
-                            .min_w_0()
-                            // The inset is on the row now, so `Files` still
-                            // lines up with everything below it. Only the far
-                            // end is padded here — a second left inset would
-                            // push the strip a toggle plus an inset in.
-                            .pr(metrics::inset())
-                            .selected_index(
-                                SidePanel::ALL
-                                    .iter()
-                                    .position(|p| *p == self.side_panel)
-                                    .unwrap_or(0),
-                            )
-                            .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                                this.side_panel = SidePanel::ALL[*ix];
+                    .gap_0p5()
+                    .py_2()
+                    .children(SidePanel::ALL.map(|panel| {
+                        Button::new(panel.id())
+                            .icon(panel.icon())
+                            .label(i18n::t(panel.label(), cx))
+                            .small()
+                            .ghost()
+                            .w_full()
+                            .justify_start()
+                            .selected(panel == self.side_panel)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.side_panel = panel;
                                 cx.notify();
                             }))
-                            .children(
-                                SidePanel::ALL.map(|p| Tab::new().label(i18n::t(p.label(), cx))),
-                            ),
-                    ),
+                    })),
             )
             .child(div().flex_1().min_h_0().map(|this| match self.side_panel {
                 SidePanel::Files => match &self.explorer {
@@ -1322,7 +1700,10 @@ impl Workspace {
         // Opening the panel is not enough: the point of the binding is to type
         // a query immediately, and a panel that appears without focus makes the
         // user click into it first.
-        self.left_panel_open = true;
+        if !self.left_panel_open {
+            self.left_panel_open = true;
+            self.reset_workspace_split(cx);
+        }
         // Cloned first: leasing the entity through `update` takes its own
         // borrow of `cx`, which cannot overlap one held through `self`.
         let search = self.search.clone();
@@ -1396,37 +1777,39 @@ impl Workspace {
 
     /// The left panel's toggle.
     ///
-    /// One definition with two homes: the title bar carries it while the panel
-    /// is collapsed, and the panel's own header takes it back once it is open.
-    /// A control that jumps to the far side of the window the moment it is used
-    /// makes the user hunt for it to undo the click they just made.
+    /// Its fixed home is the global title bar, so opening the panel never moves
+    /// the control the user needs to close it again.
     fn render_left_toggle(&self, tooltip: bool, cx: &Context<Self>) -> impl IntoElement {
-        Button::new("toggle-left-panel")
-            .icon(IconName::PanelLeft)
-            .xsmall()
-            .ghost()
-            .when(self.left_panel_open, |b| b.primary())
-            .when(tooltip, |button| {
-                button.tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
-            })
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
-            }))
+        ChromeIconButton::new(
+            "toggle-left-panel",
+            IconName::PanelLeft,
+            i18n::t(i18n::Key::ToggleLeftPanel, cx),
+        )
+        .pressed(self.left_panel_open)
+        .when(tooltip, |button| {
+            button.tooltip(i18n::t(i18n::Key::ToggleLeftPanel, cx))
+        })
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.on_toggle_left_panel(&ToggleLeftPanel, window, cx)
+        }))
     }
 
-    /// The right panel's toggle, on the same two-homes rule as the left one.
+    /// The right panel's fixed toggle in the global title bar.
     fn render_right_toggle(&self, tooltip: bool, cx: &Context<Self>) -> impl IntoElement {
-        Button::new("toggle-right-panel")
-            .icon(IconName::PanelRight)
-            .xsmall()
-            .ghost()
-            .when(self.right_panel_open, |b| b.primary())
-            .when(tooltip, |button| {
-                button.tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
-            })
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
-            }))
+        let available = self.right_panel_available(cx);
+        ChromeIconButton::new(
+            "toggle-right-panel",
+            IconName::PanelRight,
+            i18n::t(i18n::Key::ToggleRightPanel, cx),
+        )
+        .pressed(self.right_panel_open && available)
+        .disabled(!available)
+        .when(tooltip, |button| {
+            button.tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
+        })
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.on_toggle_right_panel(&ToggleRightPanel, window, cx)
+        }))
     }
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1437,6 +1820,7 @@ impl Workspace {
             // claims the whole width leaves no slack for dragging the window.
             // Shrink-to-fit means the tabs take what they need and the rest of
             // the bar stays a drag handle.
+            .large()
             .selected_index(self.tabs.active_index())
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let doc = tab.payload.view.read(cx);
@@ -1460,10 +1844,8 @@ impl Workspace {
                 Tab::new()
                     .label(label)
                     .aria_label(aria_label)
-                    .icon(if doc.is_externally_changed() {
-                        IconName::TriangleAlert
-                    } else {
-                        IconName::File
+                    .when(doc.is_externally_changed(), |tab| {
+                        tab.icon(IconName::TriangleAlert)
                     })
                     .when(!web_active, |tab| {
                         tab.child(
@@ -1533,7 +1915,7 @@ impl Workspace {
                         } else {
                             Button::new(SharedString::from(format!("close-{ix}")))
                                 .icon(IconName::Close)
-                                .xsmall()
+                                .small()
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| this.close_tab(ix, cx)))
                                 .into_any_element()
@@ -1557,7 +1939,6 @@ impl Workspace {
             return None;
         }
         let path = self.active_document()?.read(cx).path().to_path_buf();
-        let full = path.to_string_lossy().replace('\\', "/");
         let has_relative = self
             .root
             .as_ref()
@@ -1568,22 +1949,14 @@ impl Workspace {
                 .id("web-path-commands")
                 .flex_shrink_0()
                 .min_w_0()
-                .gap(metrics::gap())
+                .gap_0p5()
                 .items_center()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .max_w(px(200.))
-                        .truncate()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(full),
-                )
                 .child(
                     Button::new("web-copy-path")
                         .icon(IconName::Copy)
                         .label(i18n::t(i18n::Key::CopyPath, cx))
-                        .xsmall()
+                        .small()
                         .ghost()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.tabs.clear_menu();
@@ -1595,7 +1968,7 @@ impl Workspace {
                         Button::new("web-copy-relative-path")
                             .icon(IconName::Copy)
                             .label(i18n::t(i18n::Key::CopyRelativePath, cx))
-                            .xsmall()
+                            .small()
                             .ghost()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.tabs.clear_menu();
@@ -1614,49 +1987,76 @@ impl Workspace {
     /// modern editor puts the tabs in the title bar. The app name yields to
     /// them — the window title already says what this is.
     ///
-    /// It spans the document and the details panel but **not** the left panel,
-    /// which runs the full height of the window beside it. That is what makes
-    /// the panels read as the main view extending sideways rather than as
-    /// content parked under a bar.
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// It spans the whole workspace. `TitleBar` appends the native window
+    /// controls after the application chrome, keeping the physical top-right
+    /// edge stable while either side panel resizes.
+    fn render_title_bar(
+        &self,
+        panel_widths: WorkspacePanelWidths,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let web_active = self.web_active(cx);
-        let navigator = if web_active {
-            div().into_any_element()
-        } else {
-            self.render_navigator(cx).into_any_element()
-        };
+        let navigator = self.render_navigator(!web_active, cx).into_any_element();
         let web_path_controls = self.render_web_path_controls(cx);
+        let left_panel_visible = panel_widths.left > px(0.);
+        let right_panel_visible = panel_widths.right > px(0.);
+        // `TitleBar` owns the platform leading inset and native controls. The
+        // application-owned pieces reserve only what remains, so the two panel
+        // dividers land on the exact same x coordinates in both rows.
+        let title_bar_leading_inset = metrics::title_bar_leading_inset()
+            + if window.is_fullscreen() {
+                // Pinned TitleBar adds `.pl_3()` to its inner drag bar in
+                // fullscreen. Subtract the same token or the divider shifts
+                // 12px away from the content split only in that state.
+                metrics::inset()
+            } else {
+                px(0.)
+            };
+        let left_chrome_width = (panel_widths.left - title_bar_leading_inset).max(px(0.));
+        let right_chrome_width =
+            (panel_widths.right - native_window_controls_width(window)).max(px(0.));
+
         TitleBar::new()
-            // `TitleBar` hard-codes its own 34px height; the side panels put a
-            // header at [`metrics::TITLE_BAR`] beside it, and two chrome rows
-            // that disagree by six pixels is exactly the ragged seam this
-            // arrangement exists to avoid.
             .h(metrics::title_bar())
+            // `TabBar` already owns the document-strip hairline. Letting the
+            // outer title bar add another one draws straight through the active
+            // tab instead of connecting that tab to the document surface.
+            .border_b_0()
+            .bg(cx.theme().title_bar)
             .child(
                 h_flex()
-                    .w_full()
+                    .flex_1()
+                    .min_w_0()
                     .h_full()
-                    .pl(metrics::inset())
-                    .gap(metrics::gap_group())
                     .items_center()
-                    // The left panel's toggle sits at the left edge, above the
-                    // panel it governs; the right one at the right edge, above
-                    // that one. A control whose position contradicts what it
-                    // opens is a control the user has to read rather than
-                    // recognize. Each is here only while its panel is closed —
-                    // an open panel carries its own copy in its header, which
-                    // is where the eye already is.
-                    .when(!self.left_panel_open, |this| {
-                        this.child(
-                            h_flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(self.render_left_toggle(!web_active, cx)),
-                        )
-                    })
                     .child(
                         h_flex()
+                            .h_full()
+                            .flex_shrink_0()
+                            .items_center()
+                            .when(left_panel_visible, |this| {
+                                this.w(left_chrome_width)
+                                    .justify_start()
+                                    .pr(metrics::gap())
+                                    .border_r_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().sidebar)
+                            })
+                            .when(!left_panel_visible, |this| this.pr(metrics::gap()))
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(self.render_left_toggle(!web_active, cx)),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .h_full()
                             .flex_1()
                             .min_w_0()
                             .items_center()
@@ -1699,93 +2099,100 @@ impl Workspace {
                             })
                             // Whatever is left of the bar. No handler, so a press
                             // here reaches the title bar and moves the window.
-                            .child(div().flex_1().min_w_0().h_full()),
+                            .child(div().flex_1().min_w_0().h_full())
+                            .when_some(web_path_controls, |this, controls| this.child(controls)),
                     )
-                    .when_some(web_path_controls, |this, controls| this.child(controls))
-                    .when(!web_active, |this| {
-                        this.child(
-                            // The title bar is a `WindowControlArea::Drag` region,
-                            // which Windows hit-tests as `HTCAPTION`: a press there
-                            // becomes a window drag and never reaches GPUI's mouse
-                            // dispatch, so buttons inside it silently do nothing.
-                            // Claiming the press back is what upstream's own example
-                            // does (gpui-component `story/src/title_bar.rs`).
-                            h_flex()
-                                .flex_shrink_0()
-                                .gap(metrics::gap())
-                                .items_center()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new("open-folder")
-                                        .label(i18n::t(i18n::Key::OpenFolder, cx))
-                                        .xsmall()
-                                        .ghost()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.on_open_folder(&OpenFolder, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    // Translating the selection when there is one is
-                                    // what a user means by "Translate" with text
-                                    // highlighted; falling back to the whole document
-                                    // otherwise avoids a menu for a two-case choice.
-                                    Button::new("translate")
-                                        .label(i18n::t(i18n::Key::Translate, cx))
-                                        .xsmall()
-                                        .ghost()
-                                        // Swaps the icon for a spinner and makes the
-                                        // button inert, so the round-trip is visible
-                                        // and a second request cannot be started
-                                        // over the same text.
+                    .child(
+                        h_flex()
+                            .h_full()
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_end()
+                            .px(metrics::gap())
+                            .when(right_panel_visible, |this| {
+                                this.w(right_chrome_width)
+                                    .border_l_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().sidebar)
+                            })
+                            .child(
+                                // `TitleBar` appends the native controls after
+                                // this content-sized claim, so application
+                                // commands stay at the physical top-right edge
+                                // without stealing the surrounding drag area.
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .gap_0p5()
+                                    .items_center()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        ChromeIconButton::new(
+                                            "open-folder",
+                                            IconName::FolderOpen,
+                                            i18n::t(i18n::Key::OpenFolder, cx),
+                                        )
+                                        .when(!web_active, |button| {
+                                            button.tooltip(i18n::t(i18n::Key::OpenFolder, cx))
+                                        })
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.on_open_folder(&OpenFolder, window, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        ChromeIconButton::new(
+                                            "translate",
+                                            IconName::Globe,
+                                            i18n::t(i18n::Key::Translate, cx),
+                                        )
                                         .loading(self.translating)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            let has_selection =
-                                                this.active_document().is_some_and(|d| {
-                                                    !d.read(cx).selection(cx).is_empty()
-                                                });
-                                            if has_selection {
-                                                this.on_translate_selection(
-                                                    &TranslateSelection,
-                                                    window,
-                                                    cx,
-                                                )
-                                            } else {
-                                                this.on_translate_document(
-                                                    &TranslateDocument,
-                                                    window,
-                                                    cx,
-                                                )
-                                            }
-                                        })),
-                                )
-                                // Immediately left of Settings while the panel is
-                                // closed; the panel's own header carries it once it
-                                // is open.
-                                .when(!self.right_panel_open, |this| {
-                                    this.child(self.render_right_toggle(true, cx))
-                                })
-                                .child(
-                                    Button::new("settings")
-                                        .icon(IconName::Settings)
-                                        .xsmall()
-                                        .ghost()
-                                        .when(self.settings_open, |b| b.primary())
-                                        .tooltip(i18n::t(i18n::Key::Settings, cx))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.on_open_settings(&OpenSettings, window, cx)
-                                        })),
-                                ),
-                        )
-                    })
-                    .when(web_active && !self.right_panel_open, |this| {
-                        this.child(
-                            h_flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(self.render_right_toggle(false, cx)),
-                        )
-                    }),
+                                        .when(!web_active, |button| {
+                                            button.tooltip(i18n::t(i18n::Key::Translate, cx))
+                                        })
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                let has_selection =
+                                                    this.active_document().is_some_and(|d| {
+                                                        !d.read(cx).selection(cx).is_empty()
+                                                    });
+                                                if has_selection {
+                                                    this.on_translate_selection(
+                                                        &TranslateSelection,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                } else {
+                                                    this.on_translate_document(
+                                                        &TranslateDocument,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                }
+                                            }),
+                                        ),
+                                    )
+                                    .child(self.render_right_toggle(!web_active, cx))
+                                    .child(
+                                        ChromeIconButton::new(
+                                            "settings",
+                                            IconName::Settings,
+                                            i18n::t(i18n::Key::Settings, cx),
+                                        )
+                                        .pressed(self.settings_open)
+                                        .when(!web_active, |button| {
+                                            button.tooltip(i18n::t(i18n::Key::Settings, cx))
+                                        })
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.on_open_settings(&OpenSettings, window, cx)
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    ),
             )
     }
 
@@ -1912,16 +2319,48 @@ impl Render for Workspace {
             }
         };
 
-        // All three built before the tree, because each takes a borrow of `cx`:
+        // All regions are built before the tree, because each takes a borrow of `cx`:
         // the details panel leases the harness entity, and the title bar and
         // side panel read the active document through it. Building them inline
         // would overlap those borrows with the `&mut Context` the element chain
         // already holds.
         let right_panel = self.render_right_panel(cx);
-        let title_bar = self.render_title_bar(cx).into_any_element();
+        let right_panel_visible = right_panel.is_some();
         let side_panel = self
             .left_panel_open
             .then(|| self.render_side_panel(cx).into_any_element());
+        let panel_widths = self.workspace_panel_widths(viewport, right_panel_visible);
+        let left_panel_range =
+            restored_panel_range(panel_widths.left, metrics::SIDE_PANEL.drag_range());
+        let right_panel_range =
+            restored_panel_range(panel_widths.right, metrics::RIGHT_PANEL.drag_range());
+        let title_bar = self
+            .render_title_bar(panel_widths, window, cx)
+            .into_any_element();
+        let details_split = h_resizable("details-split")
+            .with_state(&self.details_split_state)
+            .child(resizable_panel().child(div().size_full().child(content)))
+            .when_some(right_panel, |group, panel| {
+                group.child(
+                    resizable_panel()
+                        .size(panel_widths.right)
+                        .size_range(right_panel_range)
+                        .flex_none()
+                        .child(panel),
+                )
+            });
+        let workspace_split = h_resizable("workspace-split")
+            .with_state(&self.workspace_split_state)
+            .when_some(side_panel, |group, panel| {
+                group.child(
+                    resizable_panel()
+                        .size(panel_widths.left)
+                        .size_range(left_panel_range)
+                        .flex_none()
+                        .child(panel),
+                )
+            })
+            .child(resizable_panel().child(details_split));
 
         v_flex()
             .id("workspace")
@@ -1954,44 +2393,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
             .size_full()
-            // The panels run the full height of the window, with the title bar
-            // spanning only the column between them. tty7's arrangement, and
-            // the reason for it: a bar drawn across the panels too makes them
-            // read as content parked underneath it, where this reads as the
-            // main view extending sideways.
-            .child(
-                div().flex_1().min_h_0().child(
-                    h_resizable("workspace-split")
-                        .when_some(side_panel, |group, panel| {
-                            group.child(
-                                resizable_panel()
-                                    .size(metrics::SIDE_PANEL.resolve(viewport))
-                                    .size_range(metrics::SIDE_PANEL.drag_range())
-                                    .child(panel),
-                            )
-                        })
-                        .child(
-                            resizable_panel().child(
-                                v_flex()
-                                    .size_full()
-                                    .child(title_bar)
-                                    .child(div().flex_1().min_h_0().child(content)),
-                            ),
-                        )
-                        // The details of whatever is selected on the left, on
-                        // the right. They used to sit under the list in the same
-                        // narrow column, which left the list and the details
-                        // both too short to read.
-                        .when_some(right_panel, |this, panel| {
-                            this.child(
-                                resizable_panel()
-                                    .size(metrics::RIGHT_PANEL.resolve(viewport))
-                                    .size_range(metrics::RIGHT_PANEL.drag_range())
-                                    .child(panel),
-                            )
-                        }),
-                ),
-            )
+            .child(title_bar)
+            .child(div().flex_1().min_h_0().child(workspace_split))
             .child(self.render_status_bar(cx))
     }
 }
@@ -2042,7 +2445,112 @@ mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{TAB_LABEL_MAX, elide_tab_label, path_affects_harness};
+    use super::{
+        TAB_LABEL_MAX, elide_tab_label, path_affects_harness, resolved_workspace_panel_widths,
+        restored_panel_range,
+    };
+
+    #[test]
+    fn title_chrome_uses_the_measured_panel_widths() {
+        let widths = resolved_workspace_panel_widths(
+            &[gpui::px(224.), gpui::px(976.)],
+            &[gpui::px(912.), gpui::px(288.)],
+            None,
+            None,
+            true,
+            true,
+            gpui::px(1200.),
+        );
+
+        assert_eq!(widths.left, gpui::px(224.));
+        assert_eq!(widths.right, gpui::px(288.));
+
+        let collapsed = resolved_workspace_panel_widths(
+            &[gpui::px(1200.)],
+            &[gpui::px(1200.)],
+            None,
+            None,
+            false,
+            false,
+            gpui::px(1200.),
+        );
+        assert_eq!(collapsed.left, gpui::px(0.));
+        assert_eq!(collapsed.right, gpui::px(0.));
+
+        let restored = resolved_workspace_panel_widths(
+            &[],
+            &[],
+            Some(gpui::px(224.)),
+            Some(gpui::px(288.)),
+            true,
+            true,
+            gpui::px(1200.),
+        );
+        assert_eq!(restored.left, gpui::px(224.));
+        assert_eq!(restored.right, gpui::px(288.));
+
+        let narrowed = resolved_workspace_panel_widths(
+            &[],
+            &[],
+            Some(gpui::px(640.)),
+            Some(gpui::px(720.)),
+            true,
+            true,
+            gpui::px(720.),
+        );
+        assert_eq!(
+            narrowed.left + narrowed.right,
+            gpui::px(540.),
+            "restoring both panels must leave the document its existing 180px \
+             useful-width floor"
+        );
+        assert!(narrowed.left >= gpui::px(crate::metrics::SIDE_PANEL.min));
+        assert!(narrowed.right >= gpui::px(crate::metrics::RIGHT_PANEL.min));
+
+        let left_only = resolved_workspace_panel_widths(
+            &[],
+            &[],
+            Some(gpui::px(640.)),
+            None,
+            true,
+            false,
+            gpui::px(720.),
+        );
+        assert_eq!(left_only.left, gpui::px(540.));
+
+        for (viewport, expected_side_budget) in [(600., 420.), (300., 120.)] {
+            let forced = resolved_workspace_panel_widths(
+                &[],
+                &[],
+                Some(gpui::px(640.)),
+                Some(gpui::px(720.)),
+                true,
+                true,
+                gpui::px(viewport),
+            );
+            assert_eq!(
+                forced.left + forced.right,
+                gpui::px(expected_side_budget),
+                "forced viewport {viewport}px must preserve the document budget"
+            );
+        }
+
+        let tiny_right = resolved_workspace_panel_widths(
+            &[],
+            &[],
+            None,
+            Some(gpui::px(720.)),
+            false,
+            true,
+            gpui::px(300.),
+        );
+        assert_eq!(tiny_right.right, gpui::px(120.));
+        assert_eq!(
+            restored_panel_range(tiny_right.right, crate::metrics::RIGHT_PANEL.drag_range()),
+            gpui::px(0.)..gpui::px(120.),
+            "the runtime range must permit the budgeted width below the normal minimum"
+        );
+    }
     use std::path::Path;
 
     #[test]
@@ -2110,13 +2618,29 @@ mod tests {
             .map(|start| &source[start..])
             .expect("workspace render");
 
-        assert!(title_body.contains("let navigator = if web_active"));
-        assert!(title_body.contains("self.render_navigator(cx).into_any_element()"));
+        assert!(!title_body.contains("let navigator = if web_active"));
+        assert!(title_body.contains("self.render_navigator(!web_active, cx).into_any_element()"));
         assert!(!path_body.contains(".tooltip(") && !path_body.contains(".context_menu("));
-        assert!(title_body.contains(".when(!web_active, |this| {"));
         assert!(title_body.contains("render_left_toggle(!web_active, cx)"));
-        assert!(title_body.contains(".when(web_active && !self.right_panel_open"));
-        assert!(title_body.contains("render_right_toggle(false, cx)"));
+        assert!(title_body.contains("render_right_toggle(!web_active, cx)"));
+        assert!(!title_body.contains(".when(!self.left_panel_open"));
+        assert!(!title_body.contains(".when(!self.right_panel_open"));
+        assert!(!title_body.contains("web_active && !self.right_panel_open"));
+        assert!(title_body.contains("IconName::FolderOpen"));
+        assert!(title_body.contains("IconName::Globe"));
+        assert!(!title_body.contains(".label(i18n::t(i18n::Key::OpenFolder"));
+        assert!(!title_body.contains(".label(i18n::t(i18n::Key::Translate"));
+        for key in ["OpenFolder", "Translate", "Settings"] {
+            assert!(
+                title_body.contains(&format!("i18n::t(i18n::Key::{key}, cx)")),
+                "the {key} icon-only command must pass its localized name to \
+                 the shared accessible chrome button"
+            );
+        }
+        assert!(
+            !title_body.contains(".xsmall()"),
+            "title-bar commands must keep the repository's 24px pointer target"
+        );
         assert!(status_body.contains(".when(web_active, |button|"));
         assert!(status_body.contains("button.label(auto_refresh_label)"));
         assert!(status_body.contains(".when(!web_active, |button| button.tooltip("));
@@ -2462,14 +2986,15 @@ mod tests {
         );
     }
 
-    /// The panels run the full height of the window, beside the title bar.
+    /// The title bar spans every panel so global actions and window controls
+    /// remain at the physical top-right edge.
     ///
     /// Source-level: this is pure layout, invisible to any runtime assertion.
     /// What it guards is the arrangement itself — a title bar drawn across the
     /// panels makes them read as content parked underneath it, where this reads
     /// as the main view extending sideways, which is the whole point.
     #[test]
-    fn the_side_panels_span_the_full_window_height() {
+    fn the_title_bar_spans_the_workspace_split() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let render = source
             .split_once("impl Render for Workspace")
@@ -2477,13 +3002,77 @@ mod tests {
             .1;
         let body = render.split("\n/// Keybindings").next().unwrap_or(render);
 
-        let split = body.find("h_resizable(").expect("the workspace split");
-        let title = body.find(".child(title_bar)").expect("the title bar");
+        assert!(body.contains("let workspace_split = h_resizable("));
         assert!(
-            split < title,
-            "the title bar must be built inside the resizable split, not above \
-             it — above it, the bar spans the panels and they stop looking like \
-             the main view extending sideways"
+            body.contains(".with_state(&self.workspace_split_state)"),
+            "the content split needs an explicit state so the title row can use \
+             the same measured panel widths instead of drifting after a resize"
+        );
+        assert!(
+            body.contains(".with_state(&self.details_split_state)"),
+            "the document/details split needs the same persistent geometry \
+             contract as the left side"
+        );
+        assert!(
+            body.contains(".size(panel_widths.left)") && body.contains(".size(panel_widths.right)"),
+            "reopened panels must use their last measured widths rather than \
+             reverting to the fraction defaults"
+        );
+        assert!(
+            body.contains("self.workspace_panel_widths(")
+                && body.contains(".render_title_bar(panel_widths, window, cx)"),
+            "the tab strip must begin at the measured document-column edge, \
+             including after the left panel is dragged wider"
+        );
+        let title = body.find(".child(title_bar)").expect("the title bar");
+        let split = body
+            .find(".child(div().flex_1().min_h_0().child(workspace_split))")
+            .expect("the workspace split child");
+        assert!(
+            title < split,
+            "the title bar must be above the resizable split, or expanding the \
+             details panel moves Settings and the native window controls inward"
+        );
+        assert!(
+            body.contains(".child(title_bar)") && body.contains(".child(workspace_split)"),
+            "the full-width title bar and the three-pane workspace need explicit \
+             sibling ownership"
+        );
+        let title_renderer = source
+            .split_once("fn render_title_bar")
+            .expect("render_title_bar")
+            .1;
+        let title_renderer = title_renderer
+            .split("\n    fn render_status_bar")
+            .next()
+            .unwrap_or(title_renderer);
+        assert!(
+            title_renderer.contains(".border_b_0()"),
+            "the active document tab cannot connect to its content while the \
+             outer TitleBar paints another full-width bottom rule"
+        );
+        assert!(
+            title_renderer.contains("metrics::title_bar_leading_inset()")
+                && title_renderer.contains("window.is_fullscreen()")
+                && title_renderer.contains(".w(left_chrome_width)"),
+            "the title row must subtract TitleBar's platform inset before \
+             reserving the measured left-panel width, including its fullscreen inset"
+        );
+        assert!(
+            title_renderer.contains("native_window_controls_width(window)")
+                && title_renderer.contains(".w(right_chrome_width)"),
+            "the details chrome must reserve its measured width without \
+             counting the native controls that TitleBar appends separately"
+        );
+        assert!(
+            !title_renderer.contains(".pl(metrics::inset())"),
+            "TitleBar already owns platform chrome spacing; a second fixed inset \
+             breaks the shared alignment spine"
+        );
+        assert!(
+            !title_renderer.contains(".w_full()"),
+            "a full-width child competes with TitleBar's native controls and \
+             pushes the application actions plus min/max/close off the window"
         );
 
         // Both panels are collapsible, and the split is what makes them
@@ -2498,7 +3087,8 @@ mod tests {
         );
     }
 
-    /// Each panel's toggle sits above the panel it governs, and moves inside it.
+    /// Panel toggles stay in the global title bar instead of moving between two
+    /// homes as panels open and close.
     ///
     /// Source-level: pure layout, invisible to any runtime assertion. Two things
     /// are guarded. The sides — put together, a control's position contradicts
@@ -2507,7 +3097,7 @@ mod tests {
     /// buttons with the same element id, and one rendered in neither leaves an
     /// open panel with no way to close it.
     #[test]
-    fn each_panel_toggle_sits_on_its_own_side() {
+    fn panel_toggles_and_global_commands_stay_in_the_title_bar() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn render_title_bar")
@@ -2518,56 +3108,32 @@ mod tests {
             .unwrap_or(body.len());
         let body = &body[..end];
 
+        assert_eq!(body.matches("render_left_toggle").count(), 1);
+        assert_eq!(body.matches("render_right_toggle").count(), 1);
         let left = body
             .find("render_left_toggle")
             .expect("the left panel toggle");
+        let open = body
+            .find("\"open-folder\",")
+            .expect("the open-folder command");
+        let translate = body.find("\"translate\",").expect("the translate command");
         let right = body
             .find("render_right_toggle")
             .expect("the right panel toggle");
         let tabs = body.find("self.render_tabs(cx)").expect("the tab strip");
         assert!(
             left < tabs,
-            "the left panel's toggle must come before the tabs, at the left edge"
+            "the panel switchers should lead the document tabs"
         );
         assert!(
-            right > tabs,
-            "the right panel's toggle must come after the tabs, at the right edge"
+            tabs < open && open < translate && translate < right,
+            "global commands need one stable order between the tabs and Settings"
         );
-        // The user asked for this position exactly: immediately left of
-        // Settings, not after it at the very corner.
-        let settings = body
-            .find("Button::new(\"settings\")")
-            .expect("the settings button");
+        let settings = body.find("\"settings\",").expect("the settings button");
         assert!(
             right < settings,
-            "the right panel's toggle must sit immediately left of Settings"
+            "Settings is the last application command before native window controls"
         );
-
-        // Each is in the bar only while its panel is closed. The guard is
-        // checked against the toggle that follows it, so swapping the two
-        // conditions cannot pass.
-        for (guard, toggle) in [
-            ("when(!self.left_panel_open", "render_left_toggle"),
-            ("when(!self.right_panel_open", "render_right_toggle"),
-        ] {
-            let at = body.find(guard).unwrap_or_else(|| {
-                panic!("`{guard}` must gate the bar's copy, or the toggle is drawn twice")
-            });
-            let after = &body[at..];
-            let next = after
-                .find("render_left_toggle")
-                .into_iter()
-                .chain(after.find("render_right_toggle"))
-                .min()
-                .expect("a toggle after its guard");
-            assert!(
-                after[next..].starts_with(toggle),
-                "`{guard}` must gate `{toggle}`, not the other side's"
-            );
-        }
-
-        // And each open panel carries its own copy, or opening a panel hides
-        // the only control that closes it again.
         for (renderer, toggle) in [
             ("fn render_side_panel", "render_left_toggle"),
             ("fn render_right_panel", "render_right_toggle"),
@@ -2578,10 +3144,75 @@ mod tests {
             let body = &source[start..];
             let end = body.find("\n    /// ").unwrap_or(body.len());
             assert!(
-                body[..end].contains(toggle),
-                "{renderer} must carry `{toggle}` in its header"
+                !body[..end].contains(toggle),
+                "{renderer} must not duplicate the global `{toggle}` control"
             );
         }
+    }
+
+    #[test]
+    fn the_left_panel_uses_vertical_sidebar_navigation() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let start = source
+            .find("fn render_side_panel")
+            .expect("render_side_panel");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Document outline")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(body.contains("Button::new(panel.id())"));
+        assert!(body.contains(".label(i18n::t(panel.label(), cx))"));
+        assert!(body.contains(".justify_start()"));
+        assert!(body.contains(".selected(panel == self.side_panel)"));
+        assert!(body.contains(".icon(panel.icon())"));
+        assert!(
+            body.contains(".py_2()") && !body.contains(".p_2()"),
+            "the navigation button's own 8px inset must align with root file \
+             rows instead of being shifted by a second outer horizontal inset"
+        );
+        assert!(!body.contains("TabBar::new(\"side-panel\")"));
+    }
+
+    #[test]
+    fn harness_updates_rebuild_the_details_panel_and_web_bounds() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let start = source.find("pub fn open_folder").expect("open_folder");
+        let body = &source[start..];
+        let end = body
+            .find("\n    /// Open `path` as a document")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let observer = body.find("cx.observe(&harness").expect("Harness observer");
+        let observer = &body[observer..];
+        assert!(observer.contains("this.web_dirty(cx)"));
+        assert!(observer.contains("cx.notify()"));
+    }
+
+    #[test]
+    fn unavailable_details_do_not_hide_the_global_switcher() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let start = source
+            .find("fn render_right_panel")
+            .expect("render_right_panel");
+        let body = &source[start..];
+        let end = body.find("\n    /// The left panel").unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(body.contains("!self.right_panel_available(cx)"));
+
+        let toggle = source
+            .split_once("fn render_right_toggle")
+            .expect("render_right_toggle")
+            .1;
+        let toggle = toggle
+            .split("\n    fn render_tabs")
+            .next()
+            .unwrap_or(toggle);
+        assert!(toggle.contains(".disabled(!available)"));
+        assert!(toggle.contains(".pressed(self.right_panel_open && available)"));
     }
 
     /// Nothing in this file may reach the App through the infallible windowed

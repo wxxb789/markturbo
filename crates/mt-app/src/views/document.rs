@@ -788,6 +788,7 @@ impl DocumentView {
                 let available = available_layouts(doc_type);
                 TabBar::new("layout-modes")
                     .segmented()
+                    .small()
                     .selected_index(
                         available
                             .iter()
@@ -1767,6 +1768,16 @@ mod tests {
         assert!(
             !body.contains(".dropdown_menu(") && !body.contains(".tooltip("),
             "the document toolbar must not create an overlay above the Web preview"
+        );
+        assert_eq!(
+            body.matches(".border_b_1()").count(),
+            1,
+            "the document toolbar owns one boundary to the work surface; the \
+             window title bar must not contribute a second crossing rule"
+        );
+        assert!(
+            body.contains(".small()"),
+            "the secondary layout selector should stay compact beneath the tabs"
         );
     }
 

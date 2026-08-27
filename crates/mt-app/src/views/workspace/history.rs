@@ -11,14 +11,11 @@
 
 use std::path::{Path, PathBuf};
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{
-    Disableable as _, IconName, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    h_flex,
-};
+use gpui_component::{IconName, h_flex};
 
-use super::{NavigateBack, NavigateForward, Workspace};
+use super::{ChromeIconButton, NavigateBack, NavigateForward, Workspace};
 use crate::i18n;
 
 /// Where the user has been, so Back and Forward mean something.
@@ -166,7 +163,7 @@ impl Workspace {
     /// that the tabs start after, and one that appears and disappears would
     /// shift every tab sideways as the user navigates. Disabled says "there is
     /// nowhere to go" — which is the actual state — where absent says nothing.
-    pub(super) fn render_navigator(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn render_navigator(&self, tooltips: bool, cx: &Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
             .items_center()
@@ -175,26 +172,32 @@ impl Workspace {
             // becomes a window drag unless it is claimed back.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
-                Button::new("nav-back")
-                    .icon(IconName::ArrowLeft)
-                    .xsmall()
-                    .ghost()
-                    .disabled(!self.history.can_go_back())
-                    .tooltip(i18n::t(i18n::Key::NavigateBack, cx))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_navigate_back(&NavigateBack, window, cx)
-                    })),
+                ChromeIconButton::new(
+                    "nav-back",
+                    IconName::ArrowLeft,
+                    i18n::t(i18n::Key::NavigateBack, cx),
+                )
+                .disabled(!self.history.can_go_back())
+                .when(tooltips, |button| {
+                    button.tooltip(i18n::t(i18n::Key::NavigateBack, cx))
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.on_navigate_back(&NavigateBack, window, cx)
+                })),
             )
             .child(
-                Button::new("nav-forward")
-                    .icon(IconName::ArrowRight)
-                    .xsmall()
-                    .ghost()
-                    .disabled(!self.history.can_go_forward())
-                    .tooltip(i18n::t(i18n::Key::NavigateForward, cx))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_navigate_forward(&NavigateForward, window, cx)
-                    })),
+                ChromeIconButton::new(
+                    "nav-forward",
+                    IconName::ArrowRight,
+                    i18n::t(i18n::Key::NavigateForward, cx),
+                )
+                .disabled(!self.history.can_go_forward())
+                .when(tooltips, |button| {
+                    button.tooltip(i18n::t(i18n::Key::NavigateForward, cx))
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.on_navigate_forward(&NavigateForward, window, cx)
+                })),
             )
     }
 }
@@ -301,7 +304,7 @@ mod tests {
     }
 
     /// The navigator leads the tab strip, and its buttons disable rather than
-    /// disappear.
+    /// disappear in every document layout.
     ///
     /// A hidden button would shift every tab sideways as the user navigates,
     /// which is exactly the kind of motion that makes a strip hard to aim at.
@@ -324,9 +327,15 @@ mod tests {
             2,
             "both buttons must disable rather than be conditionally rendered"
         );
-        assert!(
-            !nav.contains(".when(") || !nav.contains("Button::new(\"nav-"),
-            "a conditionally-present button shifts the tabs as the user navigates"
+        assert_eq!(
+            nav.matches(".when(tooltips, |button|").count(),
+            2,
+            "Web mode keeps the fixed buttons but suppresses popup tooltips"
+        );
+        assert_eq!(
+            nav.matches("ChromeIconButton::new(").count(),
+            2,
+            "both fixed navigation buttons must remain in the element tree"
         );
 
         // And it is childed before the tab strip, which is a fact about the
@@ -336,6 +345,37 @@ mod tests {
             .find("fn render_title_bar")
             .expect("render_title_bar");
         let bar = &workspace[bar_start..];
+        let chrome = workspace
+            .split_once("impl RenderOnce for ChromeIconButton")
+            .expect("the shared icon-button behavior")
+            .1;
+        let chrome = chrome.split("impl Workspace").next().unwrap_or(chrome);
+        assert_eq!(
+            chrome.matches(".accessibility_label(self.label)").count(),
+            2,
+            "both push and toggle variants need names even when WebView \
+             suppresses popup tooltips"
+        );
+        assert_eq!(
+            chrome.matches(".size_6()").count(),
+            2,
+            "both variants must keep the repository's 24px pointer target"
+        );
+        assert_eq!(
+            chrome.matches("window.prevent_default()").count(),
+            2,
+            "pointer activation must preserve editor focus for both variants"
+        );
+        assert!(
+            chrome.contains("let inert = disabled || loading")
+                && chrome.matches(".disabled(inert)").count() == 2,
+            "loading and disabled chrome commands must be inert to keyboard \
+             and accessibility clients, not only missing a click handler"
+        );
+        assert!(
+            bar.contains("self.render_navigator(!web_active, cx)"),
+            "Web layouts must render the fixed navigator without tooltips"
+        );
         let navigator = bar.find(".child(navigator)").expect("the navigator");
         let tabs = bar.find("self.render_tabs(cx)").expect("the tab strip");
         assert!(navigator < tabs, "Back/Forward come before the tabs");
