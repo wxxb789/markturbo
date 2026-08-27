@@ -35,6 +35,7 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         cls.config = tomllib.loads((ROOT / "release.toml").read_text(encoding="utf-8"))
         cls.bump = load_workflow(ROOT / ".github" / "workflows" / "version-bump.yml")
         cls.release = load_workflow(ROOT / ".github" / "workflows" / "release.yml")
+        cls.pull_request = load_workflow(ROOT / ".github" / "workflows" / "pull-request.yml")
 
     def test_cargo_release_only_owns_workspace_versioning(self) -> None:
         self.assertEqual(
@@ -121,6 +122,76 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertEqual(
             step_named(build_steps, "Package")["run"],
             "bash ./scripts/package-release.sh",
+        )
+
+    def test_pull_request_validation_preserves_the_release_build_contract(self) -> None:
+        self.assertEqual(self.pull_request["on"], {"pull_request": {}})
+        self.assertEqual(
+            self.pull_request["concurrency"],
+            {
+                "group": "pull-request-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+                "cancel-in-progress": True,
+            },
+        )
+        self.assertEqual(self.pull_request["permissions"], {"contents": "read"})
+
+        validation = self.pull_request["jobs"]["validate"]
+        release_build = self.release["jobs"]["build"]
+        self.assertEqual(
+            validation["strategy"],
+            {
+                "fail-fast": False,
+                "matrix": {
+                    "include": [
+                        {"runner": "ubuntu-latest"},
+                        {"runner": "macos-latest"},
+                        {"runner": "windows-latest"},
+                    ],
+                },
+            },
+        )
+        self.assertEqual(
+            [entry["runner"] for entry in validation["strategy"]["matrix"]["include"]],
+            [entry["runner"] for entry in release_build["strategy"]["matrix"]["include"]],
+        )
+        self.assertEqual(validation["runs-on"], "${{ matrix.runner }}")
+        self.assertEqual(validation["defaults"]["run"]["shell"], "bash")
+        self.assertNotIn("permissions", validation)
+
+        validation_steps = validation["steps"]
+        release_steps = release_build["steps"]
+        checkout = validation_steps[0]
+        self.assertEqual(checkout["uses"], "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        self.assertEqual(checkout["with"], {"persist-credentials": False})
+
+        setup_uv = validation_steps[1]
+        self.assertEqual(setup_uv["uses"], "astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d")
+        self.assertEqual(setup_uv["with"], {"enable-cache": False})
+
+        for step_name in ["Install Linux build dependencies", "Install Rust", "Lint", "Test", "Package"]:
+            self.assertEqual(
+                step_named(validation_steps, step_name),
+                step_named(release_steps, step_name),
+            )
+
+        self.assertEqual(
+            step_named(validation_steps, "Install Rust")["run"],
+            "rustup toolchain install stable --profile minimal --no-self-update\n"
+            "rustup default stable\n"
+            "rustup component add clippy\n",
+        )
+        self.assertEqual(step_named(validation_steps, "Format")["run"], "cargo fmt --all -- --check")
+        self.assertEqual(
+            step_named(validation_steps, "Verify release automation")["run"],
+            "uv run scripts/test_release_automation.py",
+        )
+        self.assertEqual(
+            step_named(validation_steps, "Test generated app icons")["run"],
+            "uv run scripts/test_generate_app_icons.py",
+        )
+        self.assertEqual(
+            step_named(validation_steps, "Test platform packaging")["run"],
+            "uv run scripts/test_platform_packaging.py",
         )
 
     def test_semver_prereleases_become_github_prereleases(self) -> None:

@@ -31,6 +31,22 @@ crates declare, not results.
 `gpui_linux` defaults to both `wayland` and `x11`; this workspace enables both
 explicitly, along with `font-kit` and `runtime_shaders`.
 
+## Application identity and icon
+
+The stable platform identifier is `io.github.wxxb789.markturbo`.
+
+- Windows embeds the multi-resolution `.ico` in `markturbo.exe` at build time.
+- macOS release packaging creates `markturbo.app` with `markturbo.icns` in its
+  `Contents/Resources` directory. The top-level `markturbo` command remains a
+  relative symlink to the bundle executable.
+- Linux/X11 receives a 256 px icon through GPUI's `WindowOptions`. The Linux
+  release includes an installer which registers the matching freedesktop
+  `.desktop` file and hicolor PNG for desktop shells.
+
+All three are derived from
+`crates/mt-app/resources/icons/markturbo.png`; run
+`./scripts/generate-app-icons.py` after replacing that 1024 px master.
+
 **gpui-wry** (the WebView) states in its own README:
 
 > Only supports macOS and Windows currently.
@@ -92,6 +108,23 @@ No TLS development package is listed, and that is deliberate: the translation
 client is built on `rustls` with the `ring` provider, so nothing links OpenSSL.
 The only match for "openssl" in the graph is `openssl-probe`, which reads the
 system certificate *paths* and links nothing.
+
+### Linux release archive
+
+After extracting a Linux release archive, run:
+
+```sh
+./scripts/install-linux.sh
+```
+
+The installer keeps the executable, `fonts/`, `sample/`, and `docs/` together
+under `$XDG_DATA_HOME/markturbo/app` (or `~/.local/share/markturbo/app` when
+`XDG_DATA_HOME` is unset). Reinstalling replaces only that `app/` payload and
+preserves other application data under `$XDG_DATA_HOME/markturbo/`. It installs the desktop entry to
+`$XDG_DATA_HOME/applications/` and the hicolor icon to
+`$XDG_DATA_HOME/icons/hicolor/512x512/apps/`. The generated desktop entry uses
+the installed binary's absolute path, so launching from a desktop shell does
+not depend on `PATH`.
 
 ## Where settings live
 

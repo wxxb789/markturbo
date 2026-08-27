@@ -12,6 +12,39 @@
 # embeds no font it can ship instead.
 set -euo pipefail
 
+macos_version_fields() {
+  local version="$1"
+  local numeric='0|[1-9][0-9]*'
+  local core stage sequence suffix
+
+  if [[ "$version" =~ ^($numeric)\.($numeric)\.($numeric)$ ]]; then
+    core="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+    printf '%s\t%s\n' "$core" "$core"
+    return
+  fi
+
+  if [[ "$version" =~ ^($numeric)\.($numeric)\.($numeric)-(alpha|beta|rc)\.($numeric)$ ]]; then
+    core="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+    stage="${BASH_REMATCH[4]}"
+    sequence="${BASH_REMATCH[5]}"
+    if (( 10#$sequence < 1 || 10#$sequence > 255 )); then
+      echo "error: unsupported macOS bundle version: prerelease number must be 1 through 255: $version" >&2
+      return 1
+    fi
+    case "$stage" in
+      alpha) suffix="a" ;;
+      beta)  suffix="b" ;;
+      rc)    suffix="fc" ;;
+    esac
+    printf '%s\t%s%s%s\n' "$core" "$core" "$suffix" "$sequence"
+    return
+  fi
+
+  echo "error: unsupported macOS bundle version: $version (expected X.Y.Z, X.Y.Z-alpha.N, X.Y.Z-beta.N, or X.Y.Z-rc.N)" >&2
+  return 1
+}
+
+main() {
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
@@ -19,6 +52,11 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 NAME="markturbo-${VERSION}-${TARGET}"
 OUT="$ROOT/dist/$NAME"
+
+if [[ "$TARGET" == *apple-darwin* ]]; then
+  MACOS_VERSION_FIELDS="$(macos_version_fields "$VERSION")" || exit $?
+  IFS=$'\t' read -r MACOS_SHORT_VERSION MACOS_BUNDLE_VERSION <<< "$MACOS_VERSION_FIELDS"
+fi
 
 case "$TARGET" in
   *windows*) BIN="markturbo.exe" ;;
@@ -44,7 +82,36 @@ echo "==> Verifying the binary runs"
 echo "==> Staging $OUT"
 rm -rf "$OUT"
 mkdir -p "$OUT"
-cp "$BUILT" "$OUT/"
+
+FONT_OUT="$OUT/fonts"
+case "$TARGET" in
+  *apple-darwin*)
+    # Finder reads the icon from an application bundle; a bare Mach-O binary
+    # can only show the generic executable icon. Keep the command-line entry
+    # point as a relative symlink so existing `./markturbo PATH` usage remains.
+    APP="$OUT/markturbo.app"
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+    cp "$BUILT" "$APP/Contents/MacOS/markturbo"
+    cp crates/mt-app/resources/icons/markturbo.icns \
+      "$APP/Contents/Resources/markturbo.icns"
+    sed -e "s/@SHORT_VERSION@/$MACOS_SHORT_VERSION/g" \
+      -e "s/@BUNDLE_VERSION@/$MACOS_BUNDLE_VERSION/g" \
+      crates/mt-app/resources/macos/Info.plist.in > "$APP/Contents/Info.plist"
+    plutil -lint "$APP/Contents/Info.plist" >/dev/null
+    ln -s "markturbo.app/Contents/MacOS/markturbo" "$OUT/markturbo"
+
+    # The renderer searches beside the executable. Store the faces once in the
+    # conventional Resources directory and expose them there through a relative
+    # symlink, so the .app remains self-contained when moved.
+    FONT_OUT="$APP/Contents/Resources/fonts"
+    ln -s "../Resources/fonts" "$APP/Contents/MacOS/fonts"
+    ln -s "markturbo.app/Contents/Resources/fonts" "$OUT/fonts"
+    ;;
+  *)
+    cp "$BUILT" "$OUT/"
+    ;;
+esac
+
 cp README.md LICENSE "$OUT/" 2>/dev/null || cp README.md "$OUT/"
 mkdir -p "$OUT/docs"
 cp docs/architecture.md docs/platforms.md "$OUT/docs/"
@@ -59,13 +126,29 @@ cp docs/architecture.md docs/platforms.md "$OUT/docs/"
 # search and every formula becomes an install hint. Checking here turns that
 # into a build failure rather than a bug report.
 echo "==> Staging the math fonts"
-mkdir -p "$OUT/fonts"
-cp fonts/katex/*.ttf fonts/katex/LICENSE.md "$OUT/fonts/"
-FONT_COUNT="$(find "$OUT/fonts" -name 'KaTeX_*.ttf' | wc -l)"
+mkdir -p "$FONT_OUT"
+cp fonts/katex/*.ttf fonts/katex/LICENSE.md "$FONT_OUT/"
+FONT_COUNT="$(find "$FONT_OUT" -name 'KaTeX_*.ttf' | wc -l)"
 [ "$FONT_COUNT" -ge 19 ] || {
   echo "error: staged $FONT_COUNT KaTeX faces, expected at least 19" >&2
   exit 1
 }
+
+case "$TARGET" in
+  *linux*)
+    # X11 receives the icon directly from GPUI. Wayland groups the window by
+    # app_id, and the installer puts this layout in the user's XDG data home.
+    mkdir -p "$OUT/share/applications" \
+      "$OUT/share/icons/hicolor/512x512/apps" \
+      "$OUT/scripts"
+    cp crates/mt-app/resources/linux/io.github.wxxb789.markturbo.desktop.in \
+      "$OUT/share/applications/"
+    cp crates/mt-app/resources/icons/markturbo-512.png \
+      "$OUT/share/icons/hicolor/512x512/apps/io.github.wxxb789.markturbo.png"
+    cp scripts/install-linux.sh "$OUT/scripts/"
+    chmod 755 "$OUT/scripts/install-linux.sh"
+    ;;
+esac
 
 # The sample workspace is what a new user opens first, so it ships too.
 cp -r sample "$OUT/sample"
@@ -356,3 +439,8 @@ echo "==> Done"
 echo "    directory: dist/$NAME"
 echo "    archive:   dist/$ARCHIVE"
 du -h "$ARCHIVE" | awk '{print "    size:      " $1}'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

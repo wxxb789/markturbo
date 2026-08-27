@@ -552,10 +552,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_separators_do_not_defeat_root_matching() {
-        // Project roots are stored joined onto the workspace, so on Windows the
-        // path uses backslashes while the table uses forward slashes.
-        let root = PathBuf::from(r"Q:\repos\demo\.factory\skills");
+    fn native_separators_do_not_defeat_root_matching() {
+        // Runtime roots are joined with `PathBuf`, so exercise the host's path
+        // semantics rather than treating a Windows literal as one name on Unix.
+        let root = PathBuf::from("workspace").join(rel(".factory/skills"));
         assert_eq!(label_for_root(&root, false), "droid");
     }
 

@@ -10,11 +10,27 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 use gpui::*;
 use gpui_component::Root;
 use mt_app::assets::Assets;
 use mt_app::views::workspace::Workspace;
+
+const APP_ID: &str = "io.github.wxxb789.markturbo";
+
+#[cfg(target_os = "linux")]
+fn linux_window_icon() -> Arc<image::RgbaImage> {
+    Arc::new(
+        image::load_from_memory_with_format(
+            include_bytes!("../resources/icons/markturbo-256.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("the checked-in markturbo icon must be a valid PNG")
+        .into_rgba8(),
+    )
+}
 
 const USAGE: &str = "\
 markturbo — a native workspace for Markdown as the human-agent interface
@@ -140,6 +156,9 @@ fn main() {
     let app = gpui_platform::application().with_assets(Assets);
 
     app.run(move |cx| {
+        // Set the process identity before opening a window. Windows uses this
+        // as its AppUserModelID; Linux matches it to the staged desktop file.
+        cx.set_app_identity(APP_ID, "markturbo");
         // Must come before any component is constructed.
         gpui_component::init(cx);
         // Before the first window: `Workspace::new` reads the saved theme to
@@ -158,6 +177,7 @@ fn main() {
         cx.spawn(async move |cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds)),
+                app_id: Some(APP_ID.to_owned()),
                 window_min_size: Some(gpui::Size {
                     width: px(720.),
                     height: px(480.),
@@ -166,6 +186,8 @@ fn main() {
                 window_background: gpui::WindowBackgroundAppearance::Transparent,
                 #[cfg(target_os = "linux")]
                 window_decorations: Some(gpui::WindowDecorations::Client),
+                #[cfg(target_os = "linux")]
+                icon: Some(linux_window_icon()),
                 kind: WindowKind::Normal,
                 ..gpui_component::TitleBar::window_options()
             };
@@ -285,6 +307,22 @@ mod tests {
     fn no_argument_opens_the_current_directory() {
         let target = resolve_target(&[]).expect("should not exit");
         assert_eq!(target, std::env::current_dir().ok());
+    }
+
+    #[test]
+    fn app_identity_matches_the_desktop_integration() {
+        assert_eq!(super::APP_ID, "io.github.wxxb789.markturbo");
+        let icon = image::load_from_memory_with_format(
+            include_bytes!("../resources/icons/markturbo-256.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("the runtime icon must decode")
+        .into_rgba8();
+        assert_eq!(
+            (icon.width(), icon.height()),
+            (256, 256),
+            "the runtime icon must stay at the X11 integration size"
+        );
     }
 
     #[test]

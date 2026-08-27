@@ -63,5 +63,14 @@ wry.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+image.workspace = true
+
+[build-dependencies]
+# Embeds the multi-resolution icon in the Windows PE. The crate is already in
+# the GPUI graph; naming it here makes the resource part of this binary.
+embed-resource = "3"
+
 [dev-dependencies]
+image.workspace = true
 tempfile.workspace = true

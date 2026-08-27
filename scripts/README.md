@@ -8,6 +8,10 @@ nothing here is compiled into it.
 | `probe.py` | Measures markturbo startup, memory, idle CPU, child windows, and hit testing |
 | `gen-perf-fixtures.py` | Regenerates the committed fixtures under `fixtures/perf/` |
 | `test_release_automation.py` | Locks the `cargo-release` configuration and GitHub Actions release contract |
+| `generate-app-icons.py` | Derives the Windows, macOS, and Linux icons from the 1024 px master PNG |
+| `test_generate_app_icons.py` | Exercises icon command discovery and transactional publication failures |
+| `test_platform_packaging.py` | Exercises Linux installation and macOS bundle version mapping |
+| `install-linux.sh` | Installs an extracted Linux release into the user's XDG data home |
 | `package-release.sh` | Builds and stages a distributable archive under `dist/` |
 
 ## The rules
@@ -25,6 +29,12 @@ single-file script with inline dependencies:
 
 Run it as `uv run scripts/<name>.py`. There is no virtualenv to create and no
 requirements file to keep in sync; `uv` reads the header and does it.
+
+`generate-app-icons.py` has no Python dependencies. On Windows it requires
+ImageMagick's `magick`, because `convert.exe` is a filesystem utility; on other
+platforms it accepts `magick` or `convert`. It validates every generated
+artifact before publishing, and restores the prior icon set if publication
+fails partway.
 
 For the WebView single-window acceptance and paired startup comparison:
 

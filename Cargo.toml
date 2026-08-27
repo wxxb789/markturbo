@@ -90,6 +90,9 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
 gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
 gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
+# GPUI's X11 window icon is an `image::RgbaImage`. Keep only PNG decoding: the
+# icon is the one place markturbo names this already-transitive crate directly.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 anyhow = "1"
 env_logger = "0.11"
