@@ -84,6 +84,10 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
     # `Language::Make`, and the variant only exists with this feature on.
     "tree-sitter-make",
 ] }
+# Already in the graph through gpui-component. The styled Button has no
+# independent accessible-name API for icon-only commands at this revision, so
+# the workspace chrome composes the Base behavior with the same theme tokens.
+gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
 gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
 

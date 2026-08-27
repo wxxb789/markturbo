@@ -35,11 +35,23 @@ use gpui::{Pixels, px};
 /// window title above it.
 pub const INSET: f32 = 12.;
 
+/// Space reserved by `gpui-component::TitleBar` before application chrome.
+///
+/// This mirrors the pinned component's platform constants: 80px clears the
+/// macOS traffic lights, while the other client-decorated platforms use the
+/// regular 12px window inset. The title row subtracts it from the measured
+/// left-panel width so both rows meet at the same divider.
+#[cfg(target_os = "macos")]
+pub const TITLE_BAR_LEADING_INSET: f32 = 80.;
+#[cfg(not(target_os = "macos"))]
+pub const TITLE_BAR_LEADING_INSET: f32 = INSET;
+
 /// Height of the title bar's content row.
 ///
-/// Tall enough for a 24px hit target plus breathing room. Windows' own caption
-/// buttons are 32px tall, so anything shorter leaves them poking out.
-pub const TITLE_BAR: f32 = 40.;
+/// Matches the large document tabs while leaving room for Windows' 32px caption
+/// buttons. One shared height is what lets the active tab meet the document
+/// surface instead of floating inside a taller strip.
+pub const TITLE_BAR: f32 = 36.;
 
 /// The smallest square a pointer target may be.
 ///
@@ -171,6 +183,10 @@ pub fn inset() -> Pixels {
 
 pub fn title_bar() -> Pixels {
     px(TITLE_BAR)
+}
+
+pub fn title_bar_leading_inset() -> Pixels {
+    px(TITLE_BAR_LEADING_INSET)
 }
 
 pub fn row() -> Pixels {
