@@ -340,16 +340,23 @@ mod tests {
 
         // And it is childed before the tab strip, which is a fact about the
         // title bar rather than about this file.
-        let workspace = include_str!("../workspace.rs");
+        let workspace = crate::views::production_source(include_str!("../workspace.rs"));
         let bar_start = workspace
-            .find("fn render_title_bar")
-            .expect("render_title_bar");
+            .find("fn render_document_title_controls")
+            .expect("render_document_title_controls");
         let bar = &workspace[bar_start..];
+        let bar = bar
+            .split("\n    fn render_right_title_bar")
+            .next()
+            .unwrap_or(bar);
         let chrome = workspace
             .split_once("impl RenderOnce for ChromeIconButton")
             .expect("the shared icon-button behavior")
             .1;
-        let chrome = chrome.split("impl Workspace").next().unwrap_or(chrome);
+        let chrome = chrome
+            .split("/// Full-width sidebar navigation")
+            .next()
+            .unwrap_or(chrome);
         assert_eq!(
             chrome.matches(".accessibility_label(self.label)").count(),
             2,
@@ -357,7 +364,7 @@ mod tests {
              suppresses popup tooltips"
         );
         assert_eq!(
-            chrome.matches(".size_6()").count(),
+            chrome.matches(".size(metrics::target())").count(),
             2,
             "both variants must keep the repository's 24px pointer target"
         );

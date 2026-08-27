@@ -73,4 +73,5 @@ embed-resource = "3"
 
 [dev-dependencies]
 image.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

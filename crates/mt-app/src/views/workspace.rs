@@ -19,13 +19,12 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::{Button as BaseButton, GlobalState, Toggle as BaseToggle};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, StyledExt as _,
     TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
     menu::ContextMenuExt as _,
-    resizable::{ResizableState, h_resizable, resizable_panel},
     spinner::Spinner,
     tab::{Tab, TabBar},
     tooltip::Tooltip,
@@ -156,31 +155,15 @@ struct WorkspacePanelWidths {
 }
 
 fn resolved_workspace_panel_widths(
-    workspace_sizes: &[Pixels],
-    details_sizes: &[Pixels],
-    saved_left: Option<Pixels>,
-    saved_right: Option<Pixels>,
+    preferred_left: Pixels,
+    preferred_right: Pixels,
     left_visible: bool,
     right_visible: bool,
     viewport: Pixels,
 ) -> WorkspacePanelWidths {
-    let requested_left = if left_visible {
-        workspace_sizes
-            .first()
-            .copied()
-            .filter(|_| workspace_sizes.len() == 2)
-            .or(saved_left)
-            .unwrap_or_else(|| metrics::SIDE_PANEL.resolve(viewport))
-    } else {
-        px(0.)
-    };
+    let requested_left = if left_visible { preferred_left } else { px(0.) };
     let requested_right = if right_visible {
-        details_sizes
-            .last()
-            .copied()
-            .filter(|_| details_sizes.len() == 2)
-            .or(saved_right)
-            .unwrap_or_else(|| metrics::RIGHT_PANEL.resolve(viewport))
+        preferred_right
     } else {
         px(0.)
     };
@@ -194,7 +177,7 @@ fn resolved_workspace_panel_widths(
     // the side panel's established useful-width floor for the center column;
     // when both panels are visible, distribute the remaining budget in the
     // same proportion as the user's requested extra width above each minimum.
-    let side_budget = (viewport - px(metrics::SIDE_PANEL_MIN)).max(px(0.));
+    let side_budget = (viewport - px(metrics::DOCUMENT_MIN)).max(px(0.));
     match (left_visible, right_visible) {
         (true, true) => {
             let minimum = left_range.start + right_range.start;
@@ -240,15 +223,103 @@ fn resolved_workspace_panel_widths(
     WorkspacePanelWidths { left, right }
 }
 
-fn restored_panel_range(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceResizeEdge {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceResizeGrab {
+    edge: WorkspaceResizeEdge,
+    pointer_offset: Pixels,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceResizeGeometry {
+    boundary: Pixels,
     width: Pixels,
-    configured: std::ops::Range<Pixels>,
-) -> std::ops::Range<Pixels> {
-    if width < configured.start {
-        px(0.)..width
-    } else {
-        configured
+    minimum: Pixels,
+    maximum: Pixels,
+}
+
+struct WorkspaceResizePreview;
+
+impl Render for WorkspaceResizePreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
     }
+}
+
+fn clamped_dragged_panel_width(
+    edge: WorkspaceResizeEdge,
+    requested: Pixels,
+    opposite_width: Pixels,
+    opposite_visible: bool,
+    viewport: Pixels,
+) -> Pixels {
+    let (minimum, maximum) = panel_width_limits(edge, opposite_width, opposite_visible, viewport);
+    requested.clamp(minimum, maximum)
+}
+
+fn panel_width_limits(
+    edge: WorkspaceResizeEdge,
+    opposite_width: Pixels,
+    opposite_visible: bool,
+    viewport: Pixels,
+) -> (Pixels, Pixels) {
+    let configured = match edge {
+        WorkspaceResizeEdge::Left => metrics::SIDE_PANEL.drag_range(),
+        WorkspaceResizeEdge::Right => metrics::RIGHT_PANEL.drag_range(),
+    };
+    let opposite_width = if opposite_visible {
+        opposite_width
+    } else {
+        px(0.)
+    };
+    let available = (viewport - px(metrics::DOCUMENT_MIN) - opposite_width).max(px(0.));
+    let maximum = configured.end.min(available);
+    let minimum = configured.start.min(maximum);
+    (minimum, maximum)
+}
+
+fn workspace_resize_geometry(
+    edge: WorkspaceResizeEdge,
+    widths: WorkspacePanelWidths,
+    left_visible: bool,
+    right_visible: bool,
+    viewport: Pixels,
+) -> WorkspaceResizeGeometry {
+    let (boundary, width, opposite_width, opposite_visible) = match edge {
+        WorkspaceResizeEdge::Left => (widths.left, widths.left, widths.right, right_visible),
+        WorkspaceResizeEdge::Right => (
+            viewport - widths.right,
+            widths.right,
+            widths.left,
+            left_visible,
+        ),
+    };
+    let (minimum, maximum) = panel_width_limits(edge, opposite_width, opposite_visible, viewport);
+    WorkspaceResizeGeometry {
+        boundary,
+        width,
+        minimum,
+        maximum,
+    }
+}
+
+fn workspace_region(id: &'static str, width: Option<Pixels>, content: AnyElement) -> AnyElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .relative()
+        .h_full()
+        .min_w_0()
+        .min_h_0()
+        .when_some(width, |this, width| this.w(width).flex_none())
+        .when(width.is_none(), |this| this.flex_1())
+        .child(content)
+        .into_any_element()
 }
 
 fn native_window_controls_width(window: &Window) -> Pixels {
@@ -372,7 +443,7 @@ impl RenderOnce for ChromeIconButton {
                 })
                 .flex()
                 .flex_shrink_0()
-                .size_6()
+                .size(metrics::target())
                 .items_center()
                 .justify_center()
                 .rounded(cx.theme().radius)
@@ -409,7 +480,7 @@ impl RenderOnce for ChromeIconButton {
                 })
                 .flex()
                 .flex_shrink_0()
-                .size_6()
+                .size(metrics::target())
                 .items_center()
                 .justify_center()
                 .rounded(cx.theme().radius)
@@ -447,6 +518,104 @@ impl RenderOnce for ChromeIconButton {
         } else {
             button
         }
+    }
+}
+
+/// Full-width sidebar navigation with application-owned content alignment.
+///
+/// The styled component centers its private label row after caller styles are
+/// applied, so `w_full().justify_start()` still rendered these four entries in
+/// the middle of the panel. Base keeps the semantic button behavior while the
+/// visible row shares the file tree's 8px content spine.
+#[derive(IntoElement)]
+struct SidebarNavigationButton {
+    id: &'static str,
+    icon: IconName,
+    label: SharedString,
+    selected: bool,
+    on_click: Option<ChromeClickHandler>,
+}
+
+impl SidebarNavigationButton {
+    fn new(id: &'static str, icon: IconName, label: impl Into<SharedString>) -> Self {
+        Self {
+            id,
+            icon,
+            label: label.into(),
+            selected: false,
+            on_click: None,
+        }
+    }
+
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_click = Some(Box::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for SidebarNavigationButton {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus_handle = window
+            .use_keyed_state(self.id, cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        let is_focused = focus_handle.is_focused(window);
+        let label = self.label.clone();
+        let selected = self.selected;
+        let on_click = self.on_click;
+        let foreground = cx.theme().sidebar_foreground;
+        let selected_background = cx.theme().sidebar_accent;
+        let hover_background = cx.theme().tokens.secondary_hover.background;
+        let active_background = cx.theme().tokens.secondary_active.background;
+
+        BaseToggle::new(self.id)
+            .pressed(selected)
+            .accessibility_label(self.label)
+            .track_focus(&focus_handle)
+            .styles(|styles| {
+                styles.pressed(|style| {
+                    style
+                        .bg(selected_background)
+                        .text_color(cx.theme().sidebar_accent_foreground)
+                })
+            })
+            .flex()
+            .w_full()
+            .h(metrics::row())
+            .flex_shrink_0()
+            .items_center()
+            .justify_start()
+            .px(metrics::row_pad())
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().transparent)
+            .text_color(foreground)
+            .when(!selected, |this| {
+                this.hover(|style| style.bg(hover_background))
+                    .active(|style| style.bg(active_background))
+            })
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                GlobalState::suppress_text_selection(cx);
+            })
+            .when_some(on_click, |this, on_click| {
+                this.on_change(move |_, event, window, cx| on_click(event, window, cx))
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_start()
+                    .gap(metrics::gap())
+                    .child(Icon::new(self.icon).small())
+                    .child(div().min_w_0().truncate().text_sm().child(label)),
+            )
+            .when(is_focused, |this| this.focus_ring_style(window, cx))
     }
 }
 
@@ -571,19 +740,15 @@ pub struct Workspace {
     web: WebSurface,
     /// True while the settings page is showing.
     settings_open: bool,
-    /// Measured geometry for the left-panel/document boundary.
-    workspace_split_state: Entity<ResizableState>,
-    /// Measured geometry for the document/details boundary.
-    details_split_state: Entity<ResizableState>,
-    /// Last observed sizes, kept here so repeated prepaint notifications do
-    /// not turn into a permanent Workspace redraw loop.
-    workspace_split_sizes: Vec<Pixels>,
-    details_split_sizes: Vec<Pixels>,
-    /// User-chosen widths survive collapsing a panel or temporarily replacing
-    /// the document with Settings; `ResizableState` itself cannot preserve the
-    /// first panel when the outer split drops from two children to one.
-    saved_left_panel_width: Option<Pixels>,
-    saved_right_panel_width: Option<Pixels>,
+    /// User-owned panel widths. Window resize only clamps the rendered result;
+    /// it never rewrites these preferences, so maximize/restore is reversible.
+    preferred_left_panel_width: Pixels,
+    preferred_right_panel_width: Pixels,
+    /// Actual width assigned by `Root`, which excludes Linux CSD shadow insets.
+    /// `None` is used only for the first frame before prepaint measures it.
+    layout_width: Option<Pixels>,
+    /// Pointer-to-divider offset captured when a resize gesture begins.
+    panel_resize_grab: Option<WorkspaceResizeGrab>,
     /// True while the file/harness/outline panel is showing on the left.
     left_panel_open: bool,
     /// True while the details panel is showing on the right.
@@ -650,8 +815,7 @@ impl Workspace {
                 crate::views::try_update(&this, cx, |this, cx| this.drain_watcher(cx));
             }
         });
-        let workspace_split_state = cx.new(|_| ResizableState::default());
-        let details_split_state = cx.new(|_| ResizableState::default());
+        let viewport = window.viewport_size().width;
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -670,12 +834,10 @@ impl Workspace {
             status_generation: 0,
             _status_timer: None,
             settings_open: false,
-            workspace_split_state: workspace_split_state.clone(),
-            details_split_state: details_split_state.clone(),
-            workspace_split_sizes: Vec::new(),
-            details_split_sizes: Vec::new(),
-            saved_left_panel_width: None,
-            saved_right_panel_width: None,
+            preferred_left_panel_width: metrics::SIDE_PANEL.resolve(viewport),
+            preferred_right_panel_width: metrics::RIGHT_PANEL.resolve(viewport),
+            layout_width: None,
+            panel_resize_grab: None,
             left_panel_open: true,
             right_panel_open: true,
             translating: false,
@@ -684,45 +846,6 @@ impl Workspace {
             _subscriptions: Vec::new(),
             _panel_subscriptions: Vec::new(),
         };
-
-        this._subscriptions
-            .push(cx.observe(&workspace_split_state, |this, state, cx| {
-                let sizes = state.read(cx).sizes().clone();
-                if sizes != this.workspace_split_sizes {
-                    if this.left_panel_open
-                        && sizes.len() == 2
-                        && let Some(width) = sizes.first().copied()
-                    {
-                        let range = metrics::SIDE_PANEL.drag_range();
-                        if width >= range.start && width <= range.end {
-                            this.saved_left_panel_width = Some(width);
-                        }
-                    }
-                    this.workspace_split_sizes = sizes;
-                    this.web_dirty(cx);
-                    cx.notify();
-                }
-            }));
-        this._subscriptions
-            .push(cx.observe(&details_split_state, |this, state, cx| {
-                let sizes = state.read(cx).sizes().clone();
-                if sizes != this.details_split_sizes {
-                    if this.right_panel_open
-                        && !this.settings_open
-                        && this.right_panel_available(cx)
-                        && sizes.len() == 2
-                        && let Some(width) = sizes.last().copied()
-                    {
-                        let range = metrics::RIGHT_PANEL.drag_range();
-                        if width >= range.start && width <= range.end {
-                            this.saved_right_panel_width = Some(width);
-                        }
-                    }
-                    this.details_split_sizes = sizes;
-                    this.web_dirty(cx);
-                    cx.notify();
-                }
-            }));
 
         // The saved preference, applied before the first frame so the window
         // never flashes the wrong theme.
@@ -1089,32 +1212,108 @@ impl Workspace {
             .is_some_and(|harness| harness.read(cx).has_selection())
     }
 
-    fn reset_workspace_split(&mut self, cx: &mut Context<Self>) {
-        self.workspace_split_sizes.clear();
-        self.workspace_split_state
-            .update(cx, |state, _| state.clear());
-    }
-
-    fn reset_details_split(&mut self, cx: &mut Context<Self>) {
-        self.details_split_sizes.clear();
-        self.details_split_state
-            .update(cx, |state, _| state.clear());
-    }
-
     fn workspace_panel_widths(
         &self,
         viewport: Pixels,
         right_visible: bool,
     ) -> WorkspacePanelWidths {
         resolved_workspace_panel_widths(
-            &self.workspace_split_sizes,
-            &self.details_split_sizes,
-            self.saved_left_panel_width,
-            self.saved_right_panel_width,
+            self.preferred_left_panel_width,
+            self.preferred_right_panel_width,
             self.left_panel_open,
             right_visible,
             viewport,
         )
+    }
+
+    fn on_panel_resize_drag(
+        &mut self,
+        event: &DragMoveEvent<WorkspaceResizeEdge>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let edge = *event.drag(cx);
+        let Some(grab) = self.panel_resize_grab.filter(|grab| grab.edge == edge) else {
+            return;
+        };
+        let viewport = self.layout_width.unwrap_or(window.viewport_size().width);
+        let boundary = (event.event.position.x - grab.pointer_offset).clamp(px(0.), viewport);
+        let requested = match edge {
+            WorkspaceResizeEdge::Left => boundary,
+            WorkspaceResizeEdge::Right => viewport - boundary,
+        };
+        self.set_panel_width(edge, requested, window, cx);
+    }
+
+    fn resize_panel_by_delta(
+        &mut self,
+        edge: WorkspaceResizeEdge,
+        delta: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = self.layout_width.unwrap_or(window.viewport_size().width);
+        let right_visible =
+            self.right_panel_open && !self.settings_open && self.right_panel_available(cx);
+        let widths = self.workspace_panel_widths(viewport, right_visible);
+        let current = match edge {
+            WorkspaceResizeEdge::Left => widths.left,
+            WorkspaceResizeEdge::Right => widths.right,
+        };
+        self.set_panel_width(edge, current + delta, window, cx);
+    }
+
+    fn set_panel_width(
+        &mut self,
+        edge: WorkspaceResizeEdge,
+        requested: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = self.layout_width.unwrap_or(window.viewport_size().width);
+        let right_visible =
+            self.right_panel_open && !self.settings_open && self.right_panel_available(cx);
+        let widths = self.workspace_panel_widths(viewport, right_visible);
+        let width = match edge {
+            WorkspaceResizeEdge::Left => {
+                clamped_dragged_panel_width(edge, requested, widths.right, right_visible, viewport)
+            }
+            WorkspaceResizeEdge::Right => clamped_dragged_panel_width(
+                edge,
+                requested,
+                widths.left,
+                self.left_panel_open,
+                viewport,
+            ),
+        };
+        let preferred = match edge {
+            WorkspaceResizeEdge::Left => &mut self.preferred_left_panel_width,
+            WorkspaceResizeEdge::Right => &mut self.preferred_right_panel_width,
+        };
+        if *preferred == width {
+            return;
+        }
+        *preferred = width;
+        self.web_dirty(cx);
+        cx.notify();
+    }
+
+    fn on_panel_resize_key_down(
+        &mut self,
+        edge: WorkspaceResizeEdge,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let step = metrics::gap_group();
+        let delta = match (edge, event.keystroke.key.as_str()) {
+            (WorkspaceResizeEdge::Left, "left") | (WorkspaceResizeEdge::Right, "right") => -step,
+            (WorkspaceResizeEdge::Left, "right") | (WorkspaceResizeEdge::Right, "left") => step,
+            _ => return,
+        };
+        window.prevent_default();
+        cx.stop_propagation();
+        self.resize_panel_by_delta(edge, delta, window, cx);
     }
 
     fn set_status(&mut self, message: String, cx: &mut Context<Self>) {
@@ -1234,7 +1433,6 @@ impl Workspace {
 
     fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
-        self.reset_details_split(cx);
         // The WebView's visibility depends on this flag, and it is an OS child
         // window that will not notice a re-render on its own.
         self.web_dirty(cx);
@@ -1248,7 +1446,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.left_panel_open = !self.left_panel_open;
-        self.reset_workspace_split(cx);
         // The WebView is an OS child window; it does not notice the document
         // pane resizing under it.
         self.web_dirty(cx);
@@ -1265,7 +1462,6 @@ impl Workspace {
             return;
         }
         self.right_panel_open = !self.right_panel_open;
-        self.reset_details_split(cx);
         self.web_dirty(cx);
         cx.notify();
     }
@@ -1516,8 +1712,6 @@ impl Workspace {
             v_flex()
                 .size_full()
                 .bg(cx.theme().sidebar)
-                .border_l_1()
-                .border_color(cx.theme().border)
                 .child(
                     h_flex()
                         .h(metrics::row())
@@ -1551,26 +1745,22 @@ impl Workspace {
         v_flex()
             .size_full()
             .bg(cx.theme().sidebar)
-            .border_r_1()
-            .border_color(cx.theme().border)
             .child(
                 v_flex()
                     .flex_shrink_0()
                     .gap_0p5()
                     .py_2()
                     .children(SidePanel::ALL.map(|panel| {
-                        Button::new(panel.id())
-                            .icon(panel.icon())
-                            .label(i18n::t(panel.label(), cx))
-                            .small()
-                            .ghost()
-                            .w_full()
-                            .justify_start()
-                            .selected(panel == self.side_panel)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.side_panel = panel;
-                                cx.notify();
-                            }))
+                        SidebarNavigationButton::new(
+                            panel.id(),
+                            panel.icon(),
+                            i18n::t(panel.label(), cx),
+                        )
+                        .selected(panel == self.side_panel)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.side_panel = panel;
+                            cx.notify();
+                        }))
                     })),
             )
             .child(div().flex_1().min_h_0().map(|this| match self.side_panel {
@@ -1702,7 +1892,6 @@ impl Workspace {
         // user click into it first.
         if !self.left_panel_open {
             self.left_panel_open = true;
-            self.reset_workspace_split(cx);
         }
         // Cloned first: leasing the entity through `update` takes its own
         // borrow of `cx`, which cannot overlap one held through `self`.
@@ -1980,220 +2169,362 @@ impl Workspace {
         )
     }
 
-    /// The one bar across the top of the document column.
-    ///
-    /// Window title row and document tab strip merged: stacked, they spent 80
-    /// vertical pixels on chrome and read as two competing headers, and every
-    /// modern editor puts the tabs in the title bar. The app name yields to
-    /// them — the window title already says what this is.
-    ///
-    /// It spans the whole workspace. `TitleBar` appends the native window
-    /// controls after the application chrome, keeping the physical top-right
-    /// edge stable while either side panel resizes.
-    fn render_title_bar(
+    fn render_panel_resize_handle(
         &self,
-        panel_widths: WorkspacePanelWidths,
-        window: &Window,
+        edge: WorkspaceResizeEdge,
+        geometry: WorkspaceResizeGeometry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = match edge {
+            WorkspaceResizeEdge::Left => "left-panel-resize-handle",
+            WorkspaceResizeEdge::Right => "right-panel-resize-handle",
+        };
+        let group = match edge {
+            WorkspaceResizeEdge::Left => "left-panel-resize-group",
+            WorkspaceResizeEdge::Right => "right-panel-resize-group",
+        };
+        let label = i18n::t(
+            match edge {
+                WorkspaceResizeEdge::Left => i18n::Key::SidePanelWidth,
+                WorkspaceResizeEdge::Right => i18n::Key::DetailsPanelWidth,
+            },
+            cx,
+        );
+        let focus_handle = window
+            .use_keyed_state(id, cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone()
+            .tab_index(0)
+            .tab_stop(true);
+        let focus_on_press = focus_handle.clone();
+        let is_focused = focus_handle.is_focused(window);
+        let increment = cx.entity().downgrade();
+        let decrement = increment.clone();
+        let set_value = increment.clone();
+        let line = cx.theme().border;
+        let hover = cx.theme().primary;
+        // accesskit_consumer 0.37 exposes a Splitter's RangeValue provider as
+        // read-only on Windows even when SetValue is handled. Keep the same
+        // interaction contract under Slider until the consumer is fixed.
+        let (role, orientation) = if cfg!(target_os = "windows") {
+            (gpui::Role::Slider, gpui::accesskit::Orientation::Horizontal)
+        } else {
+            (gpui::Role::Splitter, gpui::accesskit::Orientation::Vertical)
+        };
+
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .role(role)
+            .aria_label(label)
+            .aria_orientation(orientation)
+            .aria_numeric_value(f32::from(geometry.width) as f64)
+            .aria_min_numeric_value(f32::from(geometry.minimum) as f64)
+            .aria_max_numeric_value(f32::from(geometry.maximum) as f64)
+            .aria_numeric_value_step(f32::from(metrics::gap_group()) as f64)
+            .track_focus(&focus_handle)
+            .group(group)
+            .occlude()
+            .absolute()
+            .top_0()
+            .left(geometry.boundary - px(4.))
+            .h_full()
+            .w(px(9.))
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    focus_on_press.focus(window, cx);
+                    this.panel_resize_grab = Some(WorkspaceResizeGrab {
+                        edge,
+                        pointer_offset: event.position.x - geometry.boundary,
+                    });
+                    cx.stop_propagation();
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                this.on_panel_resize_key_down(edge, event, window, cx)
+            }))
+            .on_a11y_action(gpui::accesskit::Action::Increment, move |_, window, cx| {
+                if let Some(this) = increment.upgrade() {
+                    this.update(cx, |this, cx| {
+                        this.resize_panel_by_delta(edge, metrics::gap_group(), window, cx);
+                    });
+                }
+            })
+            .on_a11y_action(gpui::accesskit::Action::Decrement, move |_, window, cx| {
+                if let Some(this) = decrement.upgrade() {
+                    this.update(cx, |this, cx| {
+                        this.resize_panel_by_delta(edge, -metrics::gap_group(), window, cx);
+                    });
+                }
+            })
+            .on_a11y_action(
+                gpui::accesskit::Action::SetValue,
+                move |data, window, cx| {
+                    let Some(gpui::accesskit::ActionData::NumericValue(value)) = data else {
+                        return;
+                    };
+                    if !value.is_finite() {
+                        return;
+                    }
+                    if let Some(this) = set_value.upgrade() {
+                        this.update(cx, |this, cx| {
+                            this.set_panel_width(edge, px(*value as f32), window, cx);
+                        });
+                    }
+                },
+            )
+            .on_drag(edge, |_, _, _, cx| cx.new(|_| WorkspaceResizePreview))
+            .on_drag_move::<WorkspaceResizeEdge>(cx.listener(Self::on_panel_resize_drag))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.panel_resize_grab = None),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.panel_resize_grab = None),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(4.))
+                    .h_full()
+                    .w(px(1.))
+                    .bg(if is_focused { hover } else { line })
+                    .group_hover(group, |this| this.bg(hover)),
+            )
+            .into_any_element()
+    }
+
+    fn render_title_commands(&self, tooltips: bool, cx: &Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_shrink_0()
+            .gap(metrics::gap())
+            .items_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                ChromeIconButton::new(
+                    "open-folder",
+                    IconName::FolderOpen,
+                    i18n::t(i18n::Key::OpenFolder, cx),
+                )
+                .when(tooltips, |button| {
+                    button.tooltip(i18n::t(i18n::Key::OpenFolder, cx))
+                })
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.on_open_folder(&OpenFolder, window, cx)),
+                ),
+            )
+            .child(
+                ChromeIconButton::new(
+                    "translate",
+                    IconName::Globe,
+                    i18n::t(i18n::Key::Translate, cx),
+                )
+                .loading(self.translating)
+                .when(tooltips, |button| {
+                    button.tooltip(i18n::t(i18n::Key::Translate, cx))
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let has_selection = this
+                        .active_document()
+                        .is_some_and(|document| !document.read(cx).selection(cx).is_empty());
+                    if has_selection {
+                        this.on_translate_selection(&TranslateSelection, window, cx)
+                    } else {
+                        this.on_translate_document(&TranslateDocument, window, cx)
+                    }
+                })),
+            )
+            .child(self.render_right_toggle(tooltips, cx))
+            .child(
+                ChromeIconButton::new(
+                    "settings",
+                    IconName::Settings,
+                    i18n::t(i18n::Key::Settings, cx),
+                )
+                .pressed(self.settings_open)
+                .when(tooltips, |button| {
+                    button.tooltip(i18n::t(i18n::Key::Settings, cx))
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.on_open_settings(&OpenSettings, window, cx)
+                })),
+            )
+    }
+
+    fn render_left_toggle_overlay(&self, tooltips: bool, cx: &Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("workspace-left-toggle")
+            .absolute()
+            .top_0()
+            .left_0()
+            .h(metrics::title_bar())
+            .items_center()
+            .pl(metrics::title_bar_leading_inset())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.render_left_toggle(tooltips, cx))
+    }
+
+    fn render_title_commands_overlay(
+        &self,
+        tooltips: bool,
+        native_controls_width: Pixels,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id("workspace-title-commands")
+            .absolute()
+            .top_0()
+            .right(native_controls_width)
+            .h(metrics::title_bar())
+            .w(metrics::title_commands())
+            .items_center()
+            .justify_end()
+            .px(metrics::gap())
+            .child(self.render_title_commands(tooltips, cx))
+    }
+
+    /// Platform title-bar behavior and native controls, underneath the
+    /// application-owned workspace columns.
+    fn render_title_bar_backdrop(&self, cx: &Context<Self>) -> impl IntoElement {
+        TitleBar::new()
+            .h(metrics::title_bar())
+            .border_b_0()
+            .bg(cx.theme().title_bar)
+    }
+
+    fn render_left_title_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+        h_flex()
+            .h(metrics::title_bar())
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+    }
+
+    fn render_document_title_bar(
+        &self,
+        native_controls_width: Pixels,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .h(metrics::title_bar())
+            .w_full()
+            .flex_none()
+            .child(
+                h_flex()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().title_bar),
+            )
+            .when(native_controls_width > px(0.), |this| {
+                this.child(
+                    div()
+                        .h_full()
+                        .w(native_controls_width)
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(cx.theme().border),
+                )
+            })
+    }
+
+    /// The title controls are one stable semantic row above the workspace
+    /// body. Their horizontal track uses the same owned panel widths as the
+    /// background and body rows, so focus identity and AccessKit order do not
+    /// depend on which panels are open.
+    fn render_document_title_controls(
+        &self,
+        left: Pixels,
+        right: Pixels,
+        reserve_left_toggle: bool,
+        reserve_commands: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let web_active = self.web_active(cx);
         let navigator = self.render_navigator(!web_active, cx).into_any_element();
         let web_path_controls = self.render_web_path_controls(cx);
-        let left_panel_visible = panel_widths.left > px(0.);
-        let right_panel_visible = panel_widths.right > px(0.);
-        // `TitleBar` owns the platform leading inset and native controls. The
-        // application-owned pieces reserve only what remains, so the two panel
-        // dividers land on the exact same x coordinates in both rows.
-        let title_bar_leading_inset = metrics::title_bar_leading_inset()
-            + if window.is_fullscreen() {
-                // Pinned TitleBar adds `.pl_3()` to its inner drag bar in
-                // fullscreen. Subtract the same token or the divider shifts
-                // 12px away from the content split only in that state.
-                metrics::inset()
-            } else {
-                px(0.)
-            };
-        let left_chrome_width = (panel_widths.left - title_bar_leading_inset).max(px(0.));
-        let right_chrome_width =
-            (panel_widths.right - native_window_controls_width(window)).max(px(0.));
-
-        TitleBar::new()
+        h_flex()
+            .absolute()
+            .top_0()
+            .left(left)
+            .right(right)
             .h(metrics::title_bar())
-            // `TabBar` already owns the document-strip hairline. Letting the
-            // outer title bar add another one draws straight through the active
-            // tab instead of connecting that tab to the document surface.
-            .border_b_0()
-            .bg(cx.theme().title_bar)
+            .min_w_0()
+            .items_center()
+            .gap(metrics::gap())
+            .when(reserve_left_toggle, |this| {
+                this.pl(metrics::title_bar_leading_inset() + metrics::target() + metrics::gap())
+            })
+            .when(!reserve_left_toggle, |this| this.pl(metrics::gap()))
+            // Back and Forward first, then the tabs — the arrangement Zed and
+            // every browser use, because navigation is about the strip that
+            // follows it.
+            .child(navigator)
+            // The tabs claim the press; the slack beside them does not. A
+            // handler on the flex filler would cover the title bar's drag area.
+            .when(!self.tabs.is_empty(), |this| {
+                this.child(
+                    div()
+                        .min_w_0()
+                        .max_w_full()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.render_tabs(cx)),
+                )
+            })
+            .when(self.tabs.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("markturbo"),
+                )
+            })
+            .child(div().flex_1().min_w_0().h_full())
+            .when_some(web_path_controls, |this, controls| this.child(controls))
+            .when(reserve_commands, |this| {
+                this.child(div().h_full().w(metrics::title_commands()).flex_none())
+            })
+            .when(!reserve_commands, |this| this.pr(metrics::gap()))
+    }
+
+    fn render_right_title_bar(
+        &self,
+        native_controls_width: Pixels,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .h(metrics::title_bar())
+            .w_full()
+            .flex_none()
             .child(
                 h_flex()
+                    .h_full()
                     .flex_1()
                     .min_w_0()
-                    .h_full()
-                    .items_center()
-                    .child(
-                        h_flex()
-                            .h_full()
-                            .flex_shrink_0()
-                            .items_center()
-                            .when(left_panel_visible, |this| {
-                                this.w(left_chrome_width)
-                                    .justify_start()
-                                    .pr(metrics::gap())
-                                    .border_r_1()
-                                    .border_color(cx.theme().border)
-                                    .bg(cx.theme().sidebar)
-                            })
-                            .when(!left_panel_visible, |this| this.pr(metrics::gap()))
-                            .child(
-                                h_flex()
-                                    .flex_shrink_0()
-                                    .items_center()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .child(self.render_left_toggle(!web_active, cx)),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap(metrics::gap())
-                            // Back and Forward first, then the tabs — the
-                            // arrangement Zed and every browser use, because
-                            // navigation is about the strip that follows it.
-                            .child(navigator)
-                            // The tabs claim the press; the slack beside them does
-                            // not. `stop_propagation` on a `flex_1` wrapper covered
-                            // the whole bar and killed **both** ways the window
-                            // moves: GPUI's, because `TitleBar`'s own
-                            // `on_mouse_down` -> `start_window_move` never sees a
-                            // stopped event, and Windows', because
-                            // `handle_nc_mouse_down_msg` returns `Some(0)` for a
-                            // handled press and `DefWindowProc` never gets the
-                            // `HTCAPTION`. So the handler goes on a box sized to
-                            // the tabs, and what is left over stays a drag handle.
-                            .when(!self.tabs.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .min_w_0()
-                                        .max_w_full()
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation()
-                                        })
-                                        .child(self.render_tabs(cx)),
-                                )
-                            })
-                            // With nothing open the name stands in for the tabs,
-                            // and is itself part of the drag handle.
-                            .when(self.tabs.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("markturbo"),
-                                )
-                            })
-                            // Whatever is left of the bar. No handler, so a press
-                            // here reaches the title bar and moves the window.
-                            .child(div().flex_1().min_w_0().h_full())
-                            .when_some(web_path_controls, |this, controls| this.child(controls)),
-                    )
-                    .child(
-                        h_flex()
-                            .h_full()
-                            .flex_shrink_0()
-                            .items_center()
-                            .justify_end()
-                            .px(metrics::gap())
-                            .when(right_panel_visible, |this| {
-                                this.w(right_chrome_width)
-                                    .border_l_1()
-                                    .border_color(cx.theme().border)
-                                    .bg(cx.theme().sidebar)
-                            })
-                            .child(
-                                // `TitleBar` appends the native controls after
-                                // this content-sized claim, so application
-                                // commands stay at the physical top-right edge
-                                // without stealing the surrounding drag area.
-                                h_flex()
-                                    .flex_shrink_0()
-                                    .gap_0p5()
-                                    .items_center()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .child(
-                                        ChromeIconButton::new(
-                                            "open-folder",
-                                            IconName::FolderOpen,
-                                            i18n::t(i18n::Key::OpenFolder, cx),
-                                        )
-                                        .when(!web_active, |button| {
-                                            button.tooltip(i18n::t(i18n::Key::OpenFolder, cx))
-                                        })
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.on_open_folder(&OpenFolder, window, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        ChromeIconButton::new(
-                                            "translate",
-                                            IconName::Globe,
-                                            i18n::t(i18n::Key::Translate, cx),
-                                        )
-                                        .loading(self.translating)
-                                        .when(!web_active, |button| {
-                                            button.tooltip(i18n::t(i18n::Key::Translate, cx))
-                                        })
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                let has_selection =
-                                                    this.active_document().is_some_and(|d| {
-                                                        !d.read(cx).selection(cx).is_empty()
-                                                    });
-                                                if has_selection {
-                                                    this.on_translate_selection(
-                                                        &TranslateSelection,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                } else {
-                                                    this.on_translate_document(
-                                                        &TranslateDocument,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                }
-                                            }),
-                                        ),
-                                    )
-                                    .child(self.render_right_toggle(!web_active, cx))
-                                    .child(
-                                        ChromeIconButton::new(
-                                            "settings",
-                                            IconName::Settings,
-                                            i18n::t(i18n::Key::Settings, cx),
-                                        )
-                                        .pressed(self.settings_open)
-                                        .when(!web_active, |button| {
-                                            button.tooltip(i18n::t(i18n::Key::Settings, cx))
-                                        })
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.on_open_settings(&OpenSettings, window, cx)
-                                            }),
-                                        ),
-                                    ),
-                            ),
-                    ),
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().sidebar),
             )
+            .when(native_controls_width > px(0.), |this| {
+                this.child(
+                    div()
+                        .h_full()
+                        .w(native_controls_width)
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(cx.theme().border),
+                )
+            })
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -2294,11 +2625,10 @@ impl Render for Workspace {
         // with the App already borrowed. `WebSurface::mark_dirty` runs it after
         // the effect cycle instead.
 
-        // Panel widths are a share of the window rather than a fixed column, so
-        // the same layout reads the same on a laptop and on a 4K display. The
-        // viewport is only available here, which is why the widths are resolved
-        // in `render` rather than baked into a constant.
-        let viewport = window.viewport_size().width;
+        // Preferences are initialized from the first viewport, then remain
+        // stable through maximize/restore. This pass only clamps them when the
+        // current window is too narrow to preserve the document column.
+        let viewport = self.layout_width.unwrap_or(window.viewport_size().width);
         let content: AnyElement = if self.settings_open {
             self.settings.clone().into_any_element()
         } else {
@@ -2330,38 +2660,144 @@ impl Render for Workspace {
             .left_panel_open
             .then(|| self.render_side_panel(cx).into_any_element());
         let panel_widths = self.workspace_panel_widths(viewport, right_panel_visible);
-        let left_panel_range =
-            restored_panel_range(panel_widths.left, metrics::SIDE_PANEL.drag_range());
-        let right_panel_range =
-            restored_panel_range(panel_widths.right, metrics::RIGHT_PANEL.drag_range());
-        let title_bar = self
-            .render_title_bar(panel_widths, window, cx)
+        let web_active = self.web_active(cx);
+        let controls_width = native_window_controls_width(window);
+        let left_toggle_overlay = self
+            .render_left_toggle_overlay(!web_active, cx)
             .into_any_element();
-        let details_split = h_resizable("details-split")
-            .with_state(&self.details_split_state)
-            .child(resizable_panel().child(div().size_full().child(content)))
-            .when_some(right_panel, |group, panel| {
-                group.child(
-                    resizable_panel()
-                        .size(panel_widths.right)
-                        .size_range(right_panel_range)
-                        .flex_none()
-                        .child(panel),
-                )
-            });
-        let workspace_split = h_resizable("workspace-split")
-            .with_state(&self.workspace_split_state)
-            .when_some(side_panel, |group, panel| {
-                group.child(
-                    resizable_panel()
-                        .size(panel_widths.left)
-                        .size_range(left_panel_range)
-                        .flex_none()
-                        .child(panel),
-                )
-            })
-            .child(resizable_panel().child(details_split));
+        let title_commands_overlay = self
+            .render_title_commands_overlay(!web_active, controls_width, cx)
+            .into_any_element();
+        let document_controls_right = if right_panel_visible {
+            panel_widths.right
+        } else {
+            controls_width
+        };
+        let document_title_controls = self
+            .render_document_title_controls(
+                panel_widths.left,
+                document_controls_right,
+                !self.left_panel_open,
+                !right_panel_visible,
+                cx,
+            )
+            .into_any_element();
+        let left_title_region = self.left_panel_open.then(|| {
+            workspace_region(
+                "left-title-region",
+                Some(panel_widths.left),
+                self.render_left_title_bar(cx).into_any_element(),
+            )
+        });
+        let document_title_region = workspace_region(
+            "document-title-region",
+            None,
+            self.render_document_title_bar(
+                if right_panel_visible {
+                    px(0.)
+                } else {
+                    controls_width
+                },
+                cx,
+            )
+            .into_any_element(),
+        );
+        let right_title_region = right_panel_visible.then(|| {
+            workspace_region(
+                "right-title-region",
+                Some(panel_widths.right),
+                self.render_right_title_bar(controls_width, cx)
+                    .into_any_element(),
+            )
+        });
+        let left_column = side_panel
+            .map(|panel| workspace_region("left-workspace-column", Some(panel_widths.left), panel));
+        let left_resize_handle = left_column.as_ref().map(|_| {
+            self.render_panel_resize_handle(
+                WorkspaceResizeEdge::Left,
+                workspace_resize_geometry(
+                    WorkspaceResizeEdge::Left,
+                    panel_widths,
+                    self.left_panel_open,
+                    right_panel_visible,
+                    viewport,
+                ),
+                window,
+                cx,
+            )
+        });
+        let document_column = workspace_region("document-workspace-column", None, content);
+        let right_column = right_panel.map(|panel| {
+            workspace_region("right-workspace-column", Some(panel_widths.right), panel)
+        });
+        let right_resize_handle = right_column.as_ref().map(|_| {
+            self.render_panel_resize_handle(
+                WorkspaceResizeEdge::Right,
+                workspace_resize_geometry(
+                    WorkspaceResizeEdge::Right,
+                    panel_widths,
+                    self.left_panel_open,
+                    right_panel_visible,
+                    viewport,
+                ),
+                window,
+                cx,
+            )
+        });
+        let title_bar_backdrop = self.render_title_bar_backdrop(cx).into_any_element();
+        let title_regions = h_flex()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .when_some(left_title_region, |this, region| this.child(region))
+            .child(document_title_region)
+            .when_some(right_title_region, |this, region| this.child(region));
+        let workspace_title = div()
+            .relative()
+            .w_full()
+            .h(metrics::title_bar())
+            .flex_none()
+            .min_w_0()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(metrics::title_bar())
+                    .child(title_bar_backdrop),
+            )
+            .child(title_regions)
+            .child(left_toggle_overlay)
+            .child(document_title_controls)
+            .child(title_commands_overlay);
+        let body_regions = h_flex()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .when_some(left_column, |this, column| this.child(column))
+            .child(document_column)
+            .when_some(right_column, |this, column| this.child(column));
+        let workspace_body = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(body_regions)
+            .when_some(left_resize_handle, |this, handle| this.child(handle))
+            .when_some(right_resize_handle, |this, handle| this.child(handle));
+        let workspace_frame = v_flex()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            // Title controls precede body content in the actual element tree,
+            // so paint, Tab traversal, and AccessKit browse order all describe
+            // the same interface. Both rows receive the same owned widths.
+            .child(workspace_title)
+            .child(workspace_body);
 
+        let this = cx.entity().downgrade();
         v_flex()
             .id("workspace")
             // Without a role the whole window is announced instead of the
@@ -2392,9 +2828,19 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_translate_document))
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
+            .on_prepaint(move |bounds, _, cx| {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |this, cx| {
+                        let width = bounds.size.width;
+                        if this.layout_width != Some(width) {
+                            this.layout_width = Some(width);
+                            cx.notify();
+                        }
+                    });
+                }
+            })
             .size_full()
-            .child(title_bar)
-            .child(div().flex_1().min_h_0().child(workspace_split))
+            .child(workspace_frame)
             .child(self.render_status_bar(cx))
     }
 }
@@ -2442,21 +2888,22 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, path::Path, rc::Rc};
+
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::{
-        TAB_LABEL_MAX, elide_tab_label, path_affects_harness, resolved_workspace_panel_widths,
-        restored_panel_range,
+        TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge, clamped_dragged_panel_width,
+        elide_tab_label, path_affects_harness, resolved_workspace_panel_widths,
     };
+    use gpui::{AppContext as _, Modifiers, MouseButton, TestAppContext, point, px};
 
     #[test]
-    fn title_chrome_uses_the_measured_panel_widths() {
+    fn workspace_panel_widths_preserve_preferences_and_the_document_floor() {
         let widths = resolved_workspace_panel_widths(
-            &[gpui::px(224.), gpui::px(976.)],
-            &[gpui::px(912.), gpui::px(288.)],
-            None,
-            None,
+            gpui::px(224.),
+            gpui::px(288.),
             true,
             true,
             gpui::px(1200.),
@@ -2466,10 +2913,8 @@ mod tests {
         assert_eq!(widths.right, gpui::px(288.));
 
         let collapsed = resolved_workspace_panel_widths(
-            &[gpui::px(1200.)],
-            &[gpui::px(1200.)],
-            None,
-            None,
+            gpui::px(224.),
+            gpui::px(288.),
             false,
             false,
             gpui::px(1200.),
@@ -2478,10 +2923,8 @@ mod tests {
         assert_eq!(collapsed.right, gpui::px(0.));
 
         let restored = resolved_workspace_panel_widths(
-            &[],
-            &[],
-            Some(gpui::px(224.)),
-            Some(gpui::px(288.)),
+            gpui::px(224.),
+            gpui::px(288.),
             true,
             true,
             gpui::px(1200.),
@@ -2490,40 +2933,34 @@ mod tests {
         assert_eq!(restored.right, gpui::px(288.));
 
         let narrowed = resolved_workspace_panel_widths(
-            &[],
-            &[],
-            Some(gpui::px(640.)),
-            Some(gpui::px(720.)),
+            gpui::px(640.),
+            gpui::px(720.),
             true,
             true,
             gpui::px(720.),
         );
         assert_eq!(
             narrowed.left + narrowed.right,
-            gpui::px(540.),
-            "restoring both panels must leave the document its existing 180px \
+            gpui::px(440.),
+            "restoring both panels must leave the document its 280px \
              useful-width floor"
         );
-        assert!(narrowed.left >= gpui::px(crate::metrics::SIDE_PANEL.min));
-        assert!(narrowed.right >= gpui::px(crate::metrics::RIGHT_PANEL.min));
+        assert_eq!(narrowed.left, gpui::px(crate::metrics::SIDE_PANEL.min));
+        assert_eq!(narrowed.right, gpui::px(crate::metrics::RIGHT_PANEL.min));
 
         let left_only = resolved_workspace_panel_widths(
-            &[],
-            &[],
-            Some(gpui::px(640.)),
-            None,
+            gpui::px(640.),
+            gpui::px(288.),
             true,
             false,
             gpui::px(720.),
         );
-        assert_eq!(left_only.left, gpui::px(540.));
+        assert_eq!(left_only.left, gpui::px(440.));
 
-        for (viewport, expected_side_budget) in [(600., 420.), (300., 120.)] {
+        for (viewport, expected_side_budget) in [(600., 320.), (300., 20.)] {
             let forced = resolved_workspace_panel_widths(
-                &[],
-                &[],
-                Some(gpui::px(640.)),
-                Some(gpui::px(720.)),
+                gpui::px(640.),
+                gpui::px(720.),
                 true,
                 true,
                 gpui::px(viewport),
@@ -2536,22 +2973,180 @@ mod tests {
         }
 
         let tiny_right = resolved_workspace_panel_widths(
-            &[],
-            &[],
-            None,
-            Some(gpui::px(720.)),
+            gpui::px(224.),
+            gpui::px(720.),
             false,
             true,
             gpui::px(300.),
         );
-        assert_eq!(tiny_right.right, gpui::px(120.));
+        assert_eq!(tiny_right.right, gpui::px(20.));
+    }
+
+    #[test]
+    fn panel_drag_clamps_only_the_dragged_preference() {
         assert_eq!(
-            restored_panel_range(tiny_right.right, crate::metrics::RIGHT_PANEL.drag_range()),
-            gpui::px(0.)..gpui::px(120.),
-            "the runtime range must permit the budgeted width below the normal minimum"
+            clamped_dragged_panel_width(
+                WorkspaceResizeEdge::Left,
+                gpui::px(900.),
+                gpui::px(288.),
+                true,
+                gpui::px(1200.),
+            ),
+            gpui::px(632.),
+            "the opposite panel and document floor bound the dragged side"
+        );
+        assert_eq!(
+            clamped_dragged_panel_width(
+                WorkspaceResizeEdge::Right,
+                gpui::px(40.),
+                gpui::px(224.),
+                true,
+                gpui::px(1200.),
+            ),
+            gpui::px(crate::metrics::RIGHT_PANEL.min),
+            "normal viewports retain the panel's useful minimum"
+        );
+        assert_eq!(
+            clamped_dragged_panel_width(
+                WorkspaceResizeEdge::Right,
+                gpui::px(720.),
+                gpui::px(180.),
+                true,
+                gpui::px(300.),
+            ),
+            gpui::px(0.),
+            "a forced tiny viewport yields to the document rather than panicking"
         );
     }
-    use std::path::Path;
+
+    #[gpui::test]
+    fn dragging_the_workspace_divider_updates_the_owned_column(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::settings::AppSettings::init(cx);
+        });
+        let captured = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let captured = captured.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(None, window, cx));
+                *captured.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let workspace = captured.borrow().clone().expect("the Workspace entity");
+        let before = workspace.read_with(cx, |workspace, _| workspace.preferred_left_panel_width);
+        let handle = cx
+            .debug_bounds("left-panel-resize-handle")
+            .expect("the left resize handle");
+        assert_eq!(
+            handle.origin.x + px(4.),
+            before,
+            "the splitter line must sit on the owned panel boundary"
+        );
+        let start = point(
+            handle.origin.x + handle.size.width / 2.,
+            handle.origin.y + handle.size.height / 2.,
+        );
+
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            point(start.x + px(10.), start.y),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(start.x + px(60.), start.y),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(start.x + px(60.), start.y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let (after, grab_cleared) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.preferred_left_panel_width,
+                workspace.panel_resize_grab.is_none(),
+            )
+        });
+        assert!(after > before, "dragging right must widen the owned column");
+        assert!(
+            grab_cleared,
+            "the resize gesture must release retained state"
+        );
+        let column = cx
+            .debug_bounds("left-workspace-column")
+            .expect("the resolved left workspace column");
+        assert_eq!(column.size.width, after);
+    }
+
+    #[gpui::test]
+    fn keyboard_resizes_the_focused_workspace_divider(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::settings::AppSettings::init(cx);
+        });
+        let captured = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let captured = captured.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(None, window, cx));
+                *captured.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let workspace = captured.borrow().clone().expect("the Workspace entity");
+        let handle = cx
+            .debug_bounds("left-panel-resize-handle")
+            .expect("the left resize handle");
+        let position = point(
+            handle.origin.x + handle.size.width / 2.,
+            handle.origin.y + handle.size.height / 2.,
+        );
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
+        let before = workspace.read_with(cx, |workspace, _| workspace.preferred_left_panel_width);
+
+        cx.simulate_keystrokes("right");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let after = workspace.read_with(cx, |workspace, _| workspace.preferred_left_panel_width);
+        assert_eq!(after, before + crate::metrics::gap_group());
+    }
+
+    /// Windows UI Automation maps Splitter to a read-only RangeValue provider
+    /// in the pinned accesskit_consumer, so the equivalent Slider role is a
+    /// compatibility contract rather than a presentational choice.
+    #[test]
+    fn windows_exposes_panel_resize_as_a_writable_range_control() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let resize = source
+            .split_once("fn render_panel_resize_handle")
+            .expect("render_panel_resize_handle")
+            .1;
+        let resize = resize
+            .split("\n    fn render_title_commands")
+            .next()
+            .unwrap_or(resize);
+
+        assert!(resize.contains("if cfg!(target_os = \"windows\")"));
+        assert!(resize.contains("gpui::Role::Slider"));
+        assert!(resize.contains("gpui::accesskit::Orientation::Horizontal"));
+        assert!(resize.contains("gpui::Role::Splitter"));
+        assert!(resize.contains("gpui::accesskit::Orientation::Vertical"));
+        assert!(resize.contains("gpui::accesskit::Action::SetValue"));
+        assert!(resize.contains("gpui::accesskit::ActionData::NumericValue(value)"));
+    }
 
     #[test]
     fn short_names_are_left_alone() {
@@ -2594,8 +3189,8 @@ mod tests {
     fn web_mode_keeps_fixed_chrome_and_side_panels() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let title = source
-            .find("fn render_title_bar")
-            .expect("render_title_bar");
+            .find("fn render_title_commands")
+            .expect("title chrome renderers");
         let title_body = &source[title..];
         let title_end = title_body
             .find("\n    fn render_status_bar")
@@ -2604,7 +3199,11 @@ mod tests {
         let path = source
             .find("fn render_web_path_controls")
             .expect("fixed Web commands");
-        let path_body = &source[path..title];
+        let path_end = source[path..]
+            .find("\n    fn render_panel_resize_handle")
+            .map(|end| path + end)
+            .unwrap_or(title);
+        let path_body = &source[path..path_end];
         let status = source
             .find("fn render_status_bar")
             .expect("render_status_bar");
@@ -2621,8 +3220,8 @@ mod tests {
         assert!(!title_body.contains("let navigator = if web_active"));
         assert!(title_body.contains("self.render_navigator(!web_active, cx).into_any_element()"));
         assert!(!path_body.contains(".tooltip(") && !path_body.contains(".context_menu("));
-        assert!(title_body.contains("render_left_toggle(!web_active, cx)"));
-        assert!(title_body.contains("render_right_toggle(!web_active, cx)"));
+        assert!(title_body.contains("render_left_toggle(tooltips, cx)"));
+        assert!(title_body.contains("render_right_toggle(tooltips, cx)"));
         assert!(!title_body.contains(".when(!self.left_panel_open"));
         assert!(!title_body.contains(".when(!self.right_panel_open"));
         assert!(!title_body.contains("web_active && !self.right_panel_open"));
@@ -2646,7 +3245,9 @@ mod tests {
         assert!(status_body.contains(".when(!web_active, |button| button.tooltip("));
         assert!(render.contains("let right_panel = self.render_right_panel(cx)"));
         let side_panel = &render[render.find("let side_panel").expect("side panel")..];
-        let side_panel = &side_panel[..side_panel.find("v_flex()").unwrap_or(side_panel.len())];
+        let side_panel = &side_panel[..side_panel
+            .find("let panel_widths")
+            .unwrap_or(side_panel.len())];
         assert!(side_panel.contains(".left_panel_open") && side_panel.contains(".then("));
         assert!(!side_panel.contains("web_active"));
         assert!(
@@ -2923,8 +3524,8 @@ mod tests {
     fn the_title_bar_keeps_a_drag_handle() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
-            .find("fn render_title_bar")
-            .expect("render_title_bar must exist");
+            .find("fn render_title_commands")
+            .expect("title chrome renderers must exist");
         let body = &source[start..];
         let end = body
             .find("\n    fn render_status_bar")
@@ -2978,7 +3579,9 @@ mod tests {
         // claiming the width.
         let start = source.find("fn render_tabs").expect("render_tabs");
         let tabs = &source[start..];
-        let end = tabs.find("\n    /// The one bar").unwrap_or(tabs.len());
+        let end = tabs
+            .find("\n    fn render_web_path_controls")
+            .unwrap_or(tabs.len());
         let tabs = &tabs[..end];
         assert!(
             !tabs.contains(".w_full()"),
@@ -2986,15 +3589,66 @@ mod tests {
         );
     }
 
-    /// The title bar spans every panel so global actions and window controls
-    /// remain at the physical top-right edge.
+    /// The title and body rows resolve their tracks from one owned width model,
+    /// not from a previous frame's measured layout.
+    ///
+    /// Source-level because the regression is architectural: two sibling trees
+    /// can agree in a static window and still diverge after maximize/restore.
+    /// The Windows reproduction measured both edges at x=371 on launch; after
+    /// one restore the title edge stayed at x=371 while the body edge moved to
+    /// x=409. Explicitly assigning the same width to both rows makes that state
+    /// impossible while preserving row-major accessibility order.
+    #[test]
+    fn workspace_rows_share_one_owned_width_model() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let region = source
+            .split_once("fn workspace_region")
+            .map(|(_, body)| body)
+            .expect("workspace_region must own shared row geometry");
+        let region = region.split("\nfn ").next().unwrap_or(region);
+        assert!(region.contains(".child(content)"));
+        assert!(region.contains("this.w(width).flex_none()"));
+
+        let render = source
+            .split_once("impl Render for Workspace")
+            .map(|(_, body)| body)
+            .expect("the Workspace Render impl");
+        let render = render.split("\n/// Keybindings").next().unwrap_or(render);
+        for (id, width) in [
+            ("left-title-region", "Some(panel_widths.left)"),
+            ("document-title-region", "None"),
+            ("right-title-region", "Some(panel_widths.right)"),
+            ("left-workspace-column", "Some(panel_widths.left)"),
+            ("document-workspace-column", "None"),
+            ("right-workspace-column", "Some(panel_widths.right)"),
+        ] {
+            let id_at = render
+                .find(&format!("\"{id}\""))
+                .unwrap_or_else(|| panic!("missing {id}"));
+            let call_at = render[..id_at]
+                .rfind("workspace_region(")
+                .unwrap_or_else(|| panic!("{id} is not built by workspace_region"));
+            let call = &render[call_at..(id_at + 100).min(render.len())];
+            assert!(
+                id_at - call_at < 80 && call.contains(width),
+                "{id} must use the shared {width} track"
+            );
+        }
+        assert!(
+            !render.contains("h_resizable(\"workspace-split\")"),
+            "the outer Workspace split cannot remain a second geometry owner"
+        );
+    }
+
+    /// Platform title-bar behavior sits behind a title row whose tracks share
+    /// the body row's resolved widths.
     ///
     /// Source-level: this is pure layout, invisible to any runtime assertion.
     /// What it guards is the arrangement itself — a title bar drawn across the
     /// panels makes them read as content parked underneath it, where this reads
     /// as the main view extending sideways, which is the whole point.
     #[test]
-    fn the_title_bar_spans_the_workspace_split() {
+    fn platform_title_bar_sits_behind_the_owned_title_row() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let render = source
             .split_once("impl Render for Workspace")
@@ -3002,93 +3656,84 @@ mod tests {
             .1;
         let body = render.split("\n/// Keybindings").next().unwrap_or(render);
 
-        assert!(body.contains("let workspace_split = h_resizable("));
         assert!(
-            body.contains(".with_state(&self.workspace_split_state)"),
-            "the content split needs an explicit state so the title row can use \
-             the same measured panel widths instead of drifting after a resize"
+            body.contains("let title_regions = h_flex()")
+                && body.contains("let body_regions = h_flex()"),
+            "title and body need explicit rows over the same three tracks"
         );
         assert!(
-            body.contains(".with_state(&self.details_split_state)"),
-            "the document/details split needs the same persistent geometry \
-             contract as the left side"
+            body.contains("let title_bar_backdrop = self.render_title_bar_backdrop(cx)"),
+            "the platform TitleBar must remain present for native controls and dragging"
         );
         assert!(
-            body.contains(".size(panel_widths.left)") && body.contains(".size(panel_widths.right)"),
-            "reopened panels must use their last measured widths rather than \
-             reverting to the fraction defaults"
+            body.contains("Some(panel_widths.left)") && body.contains("Some(panel_widths.right)"),
+            "the user-owned widths must size the complete left and right columns"
         );
         assert!(
-            body.contains("self.workspace_panel_widths(")
-                && body.contains(".render_title_bar(panel_widths, window, cx)"),
-            "the tab strip must begin at the measured document-column edge, \
-             including after the left panel is dragged wider"
+            body.contains("left_resize_handle")
+                && body.contains("WorkspaceResizeEdge::Left")
+                && body.contains("WorkspaceResizeEdge::Right"),
+            "both panel boundaries need one visible, draggable owner"
         );
-        let title = body.find(".child(title_bar)").expect("the title bar");
-        let split = body
-            .find(".child(div().flex_1().min_h_0().child(workspace_split))")
-            .expect("the workspace split child");
-        assert!(
-            title < split,
-            "the title bar must be above the resizable split, or expanding the \
-             details panel moves Settings and the native window controls inward"
-        );
-        assert!(
-            body.contains(".child(title_bar)") && body.contains(".child(workspace_split)"),
-            "the full-width title bar and the three-pane workspace need explicit \
-             sibling ownership"
-        );
-        let title_renderer = source
-            .split_once("fn render_title_bar")
-            .expect("render_title_bar")
+        let title = body
+            .split_once("let workspace_title = div()")
+            .expect("the workspace title row")
             .1;
-        let title_renderer = title_renderer
-            .split("\n    fn render_status_bar")
+        let title = title.split("let body_regions").next().unwrap_or(title);
+        let backdrop = title
+            .find(".child(title_bar_backdrop)")
+            .expect("the platform title-bar backdrop");
+        let regions = title
+            .find(".child(title_regions)")
+            .expect("the owned title regions");
+        assert!(
+            backdrop < regions,
+            "application chrome must paint over the platform backdrop while leaving \
+             its native controls and drag regions active"
+        );
+        let backdrop_renderer = source
+            .split_once("fn render_title_bar_backdrop")
+            .expect("render_title_bar_backdrop")
+            .1;
+        let backdrop_renderer = backdrop_renderer
+            .split("\n    fn render_left_title_bar")
             .next()
-            .unwrap_or(title_renderer);
+            .unwrap_or(backdrop_renderer);
         assert!(
-            title_renderer.contains(".border_b_0()"),
+            backdrop_renderer.contains("TitleBar::new()")
+                && backdrop_renderer.contains(".border_b_0()"),
             "the active document tab cannot connect to its content while the \
-             outer TitleBar paints another full-width bottom rule"
+             platform backdrop paints another full-width bottom rule"
         );
         assert!(
-            title_renderer.contains("metrics::title_bar_leading_inset()")
-                && title_renderer.contains("window.is_fullscreen()")
-                && title_renderer.contains(".w(left_chrome_width)"),
-            "the title row must subtract TitleBar's platform inset before \
-             reserving the measured left-panel width, including its fullscreen inset"
+            !source.contains("workspace_split_state")
+                && !source.contains("details_split_state")
+                && !source.contains("left_chrome_width"),
+            "no second geometry cache may reconstruct the shared column boundaries"
         );
         assert!(
-            title_renderer.contains("native_window_controls_width(window)")
-                && title_renderer.contains(".w(right_chrome_width)"),
-            "the details chrome must reserve its measured width without \
-             counting the native controls that TitleBar appends separately"
+            body.contains("native_window_controls_width(window)")
+                && body.contains("render_right_title_bar(controls_width, cx)"),
+            "application commands must stay immediately before native controls"
         );
         assert!(
-            !title_renderer.contains(".pl(metrics::inset())"),
-            "TitleBar already owns platform chrome spacing; a second fixed inset \
-             breaks the shared alignment spine"
-        );
-        assert!(
-            !title_renderer.contains(".w_full()"),
-            "a full-width child competes with TitleBar's native controls and \
-             pushes the application actions plus min/max/close off the window"
+            body.contains("self.layout_width.unwrap_or(window.viewport_size().width)")
+                && body.contains("this.layout_width = Some(width)"),
+            "panel budgeting must use the width Root actually assigned, including Linux CSD"
         );
 
-        // Both panels are collapsible, and the split is what makes them
-        // resizable rather than fixed.
         assert!(
-            body.contains("when_some(side_panel"),
+            body.contains("self.left_panel_open.then(||") && body.contains("left-title-region"),
             "the left panel must be omittable, not merely narrow"
         );
         assert!(
-            body.contains("when_some(right_panel"),
+            body.contains("right_panel_visible.then(||") && body.contains("right-title-region"),
             "the right panel must be omittable"
         );
     }
 
-    /// Panel toggles stay in the global title bar instead of moving between two
-    /// homes as panels open and close.
+    /// Panel toggles stay in one global overlay instead of moving between
+    /// columns as panels open and close.
     ///
     /// Source-level: pure layout, invisible to any runtime assertion. Two things
     /// are guarded. The sides — put together, a control's position contradicts
@@ -3099,41 +3744,58 @@ mod tests {
     #[test]
     fn panel_toggles_and_global_commands_stay_in_the_title_bar() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn render_title_bar")
-            .expect("render_title_bar must exist");
-        let body = &source[start..];
-        let end = body
-            .find("\n    fn render_status_bar")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert_eq!(body.matches("render_left_toggle").count(), 1);
-        assert_eq!(body.matches("render_right_toggle").count(), 1);
-        let left = body
-            .find("render_left_toggle")
-            .expect("the left panel toggle");
-        let open = body
+        let commands = source
+            .split_once("fn render_title_commands")
+            .expect("render_title_commands")
+            .1;
+        let commands = commands
+            .split("\n    /// Platform title-bar behavior")
+            .next()
+            .unwrap_or(commands);
+        let open = commands
             .find("\"open-folder\",")
             .expect("the open-folder command");
-        let translate = body.find("\"translate\",").expect("the translate command");
-        let right = body
+        let translate = commands
+            .find("\"translate\",")
+            .expect("the translate command");
+        let right = commands
             .find("render_right_toggle")
             .expect("the right panel toggle");
-        let tabs = body.find("self.render_tabs(cx)").expect("the tab strip");
+        let settings = commands.find("\"settings\",").expect("the settings button");
         assert!(
-            left < tabs,
-            "the panel switchers should lead the document tabs"
+            open < translate && translate < right && right < settings,
+            "global commands need one stable order before native window controls"
         );
-        assert!(
-            tabs < open && open < translate && translate < right,
-            "global commands need one stable order between the tabs and Settings"
-        );
-        let settings = body.find("\"settings\",").expect("the settings button");
-        assert!(
-            right < settings,
-            "Settings is the last application command before native window controls"
-        );
+
+        let document = source
+            .split_once("fn render_document_title_controls")
+            .expect("render_document_title_controls")
+            .1;
+        let document = document
+            .split("\n    fn render_right_title_bar")
+            .next()
+            .unwrap_or(document);
+        let left_reservation = document
+            .find("metrics::title_bar_leading_inset()")
+            .expect("space reserved for the fixed left toggle");
+        let navigator = document
+            .find(".child(navigator)")
+            .expect("the document navigator");
+        let tabs = document
+            .find("self.render_tabs(cx)")
+            .expect("the tab strip");
+        assert!(left_reservation < navigator && navigator < tabs);
+
+        let render = source
+            .split_once("impl Render for Workspace")
+            .expect("the Workspace Render impl")
+            .1;
+        assert!(render.contains("!self.left_panel_open"));
+        assert!(render.contains("side_panel") && render.contains("left_title_bar"));
+        assert!(render.contains("render_left_toggle_overlay(!web_active, cx)"));
+        assert!(render.contains("render_title_commands_overlay("));
+        assert_eq!(source.matches("self.render_left_toggle(").count(), 1);
+        assert_eq!(source.matches("self.render_title_commands(").count(), 1);
         for (renderer, toggle) in [
             ("fn render_side_panel", "render_left_toggle"),
             ("fn render_right_panel", "render_right_toggle"),
@@ -3151,6 +3813,86 @@ mod tests {
     }
 
     #[test]
+    fn workspace_structure_follows_the_visual_and_accessibility_order() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        assert!(
+            !source.contains("TAB_GROUP_") && !source.contains(".tab_group()"),
+            "visual structure should establish keyboard order without a second ordering model"
+        );
+
+        let region = source
+            .split_once("fn workspace_region")
+            .expect("workspace_region must own row geometry")
+            .1;
+        let region = region.split("\nfn ").next().unwrap_or(region);
+        assert!(
+            region.contains(".when_some(width, |this, width| this.w(width).flex_none())")
+                && region.contains(".when(width.is_none(), |this| this.flex_1())"),
+            "both workspace rows must resolve their tracks through one helper"
+        );
+
+        let render = source
+            .split_once("impl Render for Workspace")
+            .expect("the Workspace Render impl")
+            .1;
+        let render = render.split("\n/// Keybindings").next().unwrap_or(render);
+        for region in [
+            "left-title-region",
+            "document-title-region",
+            "right-title-region",
+            "left-workspace-column",
+            "document-workspace-column",
+            "right-workspace-column",
+        ] {
+            assert!(
+                render.contains(&format!("\"{region}\"")),
+                "missing shared workspace region {region}"
+            );
+        }
+
+        let frame = render
+            .split_once("let workspace_frame = v_flex()")
+            .expect("a row-major workspace frame")
+            .1;
+        let title = frame
+            .find(".child(workspace_title)")
+            .expect("the title row");
+        let body = frame.find(".child(workspace_body)").expect("the body row");
+        assert!(
+            title < body,
+            "title controls must precede body content in paint, Tab, and AccessKit order"
+        );
+
+        let title = render
+            .split_once("let workspace_title = div()")
+            .expect("the stable title layer")
+            .1;
+        let title = title.split("let workspace_body").next().unwrap_or(title);
+        let backdrop = title
+            .find(".child(title_bar_backdrop)")
+            .expect("the platform title bar");
+        let backgrounds = title
+            .find(".child(title_regions)")
+            .expect("the title backgrounds");
+        let leading = title
+            .find(".child(left_toggle_overlay)")
+            .expect("the leading title control");
+        let document = title
+            .find(".child(document_title_controls)")
+            .expect("the document title controls");
+        let trailing = title
+            .find(".child(title_commands_overlay)")
+            .expect("the trailing title controls");
+        assert!(
+            backdrop < backgrounds
+                && backgrounds < leading
+                && leading < document
+                && document < trailing,
+            "title controls need one stable left-to-right semantic and paint order"
+        );
+    }
+
+    #[test]
     fn the_left_panel_uses_vertical_sidebar_navigation() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
@@ -3162,17 +3904,28 @@ mod tests {
             .unwrap_or(body.len());
         let body = &body[..end];
 
-        assert!(body.contains("Button::new(panel.id())"));
-        assert!(body.contains(".label(i18n::t(panel.label(), cx))"));
-        assert!(body.contains(".justify_start()"));
+        assert!(body.contains("SidebarNavigationButton::new("));
+        assert!(body.contains("i18n::t(panel.label(), cx)"));
         assert!(body.contains(".selected(panel == self.side_panel)"));
-        assert!(body.contains(".icon(panel.icon())"));
+        assert!(body.contains("panel.icon()"));
         assert!(
             body.contains(".py_2()") && !body.contains(".p_2()"),
-            "the navigation button's own 8px inset must align with root file \
-             rows instead of being shifted by a second outer horizontal inset"
+            "the navigation row owns the same horizontal inset as root file rows"
         );
         assert!(!body.contains("TabBar::new(\"side-panel\")"));
+
+        let component = source
+            .split_once("impl RenderOnce for SidebarNavigationButton")
+            .expect("SidebarNavigationButton renderer")
+            .1;
+        let component = component
+            .split("\nfn path_affects_harness")
+            .next()
+            .unwrap_or(component);
+        assert!(component.contains("BaseToggle::new(self.id)"));
+        assert!(component.contains(".accessibility_label(self.label)"));
+        assert!(component.contains(".justify_start()"));
+        assert!(component.contains(".px(metrics::row_pad())"));
     }
 
     #[test]
