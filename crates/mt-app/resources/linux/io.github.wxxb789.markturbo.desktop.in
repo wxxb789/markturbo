@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=markturbo
+Comment=Native workspace for Markdown human-agent artifacts
+Exec=@MARKTURBO_EXECUTABLE@ %F
+Icon=io.github.wxxb789.markturbo
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/markdown;text/plain;
+StartupWMClass=io.github.wxxb789.markturbo
