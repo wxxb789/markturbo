@@ -311,8 +311,12 @@ owns the workspace they consume.
 
 Also not built, and why:
 
-- **A dock/panel system.** `h_resizable` covers the required layout. `DockArea`
-  is available upstream if freeform panels are ever wanted.
+- **A dock/panel system.** The workspace owns one two-row, three-track frame:
+  title and body resolve the same retained, user-owned panel widths, while the current
+  window width only clamps that render. Boundary handles update those owned
+  widths directly. A nested `h_resizable` would introduce a second, previous-
+  frame geometry source and can let title and body diverge after a window-state
+  transition. `DockArea` remains available if freeform panels are ever wanted.
 - **A generic plugin platform.** The renderer registry is the extension point
   that was actually needed.
 
