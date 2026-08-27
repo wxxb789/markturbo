@@ -36,6 +36,40 @@ Code, Cursor, OpenCode, git, and shell tools consume them unchanged.
 ./scripts/package-release.sh     # builds, verifies, and archives into dist/
 ```
 
+The **Bump version** GitHub Actions workflow publishes releases from the
+default branch. Its default operation is `patch`; it updates the workspace and
+lockfile together, commits the change, creates `v<version>`, then calls the
+release workflow directly. The direct call matters because a tag pushed with a
+workflow's `GITHUB_TOKEN` does not start another workflow run.
+
+The same control also supports `major`, `minor`, `alpha`, `beta`, `rc`, and
+`release`. Version changes are delegated to `cargo-release`, and prerelease
+steps move forward on one core version:
+
+```text
+0.1.1 -> 0.1.2-alpha.1 -> 0.1.2-beta.1 -> 0.1.2-rc.1 -> 0.1.2
+```
+
+Repeating a channel increments its sequence. `release` removes the prerelease
+suffix, while `patch` on a prerelease promotes that core version to stable,
+matching `cargo-release` semantics. The **Release** workflow can also be run for
+an existing tag, and a manually pushed `v*` tag triggers it.
+
+Every release runs Clippy and the release-profile workspace tests on native
+Linux, macOS, and Windows runners before using `package-release.sh`. Versions
+with a prerelease suffix become GitHub prereleases; stable versions become
+normal releases. The resulting assets are host-native archives, not signed
+installers or a notarized macOS application bundle.
+
+Install the pinned release tool to use the same version logic locally:
+
+```sh
+cargo binstall cargo-release@1.1.5 --no-confirm --disable-telemetry
+cargo release version patch --workspace        # dry run
+cargo release version patch --workspace --execute --no-confirm
+cargo release version alpha --workspace --execute --no-confirm
+```
+
 Or build and run directly:
 
 ```sh
@@ -186,6 +220,7 @@ implicit, and no trust level lets a document markturbo renders reach the network
 ## Tests
 
 ```sh
+uv run scripts/test_release_automation.py
 cargo test --release
 ```
 
