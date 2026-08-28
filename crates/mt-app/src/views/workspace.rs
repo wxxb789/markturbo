@@ -719,6 +719,16 @@ fn path_affects_harness(root: &Path, path: &Path) -> bool {
 /// that the bar is not still claiming "Saved" when the user comes back.
 const STATUS_LINGER: Duration = Duration::from_secs(6);
 
+fn document_details_status_key(is_externally_changed: bool, is_dirty: bool) -> i18n::Key {
+    if is_externally_changed {
+        i18n::Key::ChangedOnDisk
+    } else if is_dirty {
+        i18n::Key::UnsavedChanges
+    } else {
+        i18n::Key::Saved
+    }
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     root: Option<PathBuf>,
@@ -1722,11 +1732,7 @@ impl Workspace {
                 .map(|root| crate::workspace::display_relative(root, document.path()))
                 .unwrap_or_else(|| document.path().to_string_lossy().replace('\\', "/"));
             let status = i18n::t(
-                if document.is_dirty() {
-                    i18n::Key::UnsavedChanges
-                } else {
-                    i18n::Key::Saved
-                },
+                document_details_status_key(document.is_externally_changed(), document.is_dirty()),
                 cx,
             )
             .to_string();
@@ -3004,9 +3010,10 @@ mod tests {
     // limit.
     use super::{
         DetailsContent, SidePanel, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge,
-        clamped_dragged_panel_width, details_content, elide_tab_label, path_affects_harness,
-        resolved_workspace_panel_widths,
+        clamped_dragged_panel_width, details_content, document_details_status_key, elide_tab_label,
+        path_affects_harness, resolved_workspace_panel_widths,
     };
+    use crate::i18n;
     use gpui::{AppContext as _, Modifiers, MouseButton, TestAppContext, point, px};
 
     #[test]
@@ -4115,6 +4122,30 @@ mod tests {
             .next()
             .unwrap_or(action);
         assert!(!action.contains("right_panel_available"));
+    }
+
+    #[test]
+    fn document_details_status_prioritizes_external_changes() {
+        assert_eq!(
+            document_details_status_key(false, false),
+            i18n::Key::Saved,
+            "a clean document whose file matches disk is saved"
+        );
+        assert_eq!(
+            document_details_status_key(false, true),
+            i18n::Key::UnsavedChanges,
+            "local edits are unsaved when no external change exists"
+        );
+        assert_eq!(
+            document_details_status_key(true, false),
+            i18n::Key::ChangedOnDisk,
+            "an external change is not saved even without local edits"
+        );
+        assert_eq!(
+            document_details_status_key(true, true),
+            i18n::Key::ChangedOnDisk,
+            "an external conflict takes precedence over local unsaved edits"
+        );
     }
 
     /// Nothing in this file may reach the App through the infallible windowed
