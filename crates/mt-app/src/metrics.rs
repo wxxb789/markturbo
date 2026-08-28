@@ -75,6 +75,9 @@ pub const ROW_GAP: f32 = 2.;
 /// Horizontal padding inside a list row.
 pub const ROW_PAD: f32 = 8.;
 
+/// Width of the label lane in key/value rows inside the details panel.
+pub const DETAILS_LABEL: f32 = 96.;
+
 /// Indentation per level in a tree.
 pub const INDENT: f32 = 14.;
 
@@ -211,6 +214,10 @@ pub fn row_gap() -> Pixels {
     px(ROW_GAP)
 }
 
+pub fn details_label() -> Pixels {
+    px(DETAILS_LABEL)
+}
+
 pub fn row_pad() -> Pixels {
     px(ROW_PAD)
 }
@@ -262,6 +269,7 @@ mod tests {
             ("TARGET", TARGET),
             ("ROW", ROW),
             ("ROW_PAD", ROW_PAD),
+            ("DETAILS_LABEL", DETAILS_LABEL),
             ("DOCUMENT_MIN", DOCUMENT_MIN),
             ("GAP_GROUP", GAP_GROUP),
             ("HEADER_PAD_Y", HEADER_PAD_Y),
@@ -283,8 +291,9 @@ mod tests {
         // The side panel can be narrowed, but not to uselessness — below about
         // 160px a file name is all ellipsis.
         assert!(SIDE_PANEL_MIN >= 160.);
-        // The details panel holds a 96px label column plus its value, so it
+        // The details panel holds a fixed label column plus its value, so it
         // needs to be the wider of the two or every field wraps.
+        assert!(DETAILS_LABEL < RIGHT_PANEL.min / 2.);
         assert!(RIGHT_PANEL.fraction > SIDE_PANEL.fraction);
         assert!(RIGHT_PANEL.min > SIDE_PANEL.min);
         assert!(DOCUMENT_MIN >= RIGHT_PANEL.min);

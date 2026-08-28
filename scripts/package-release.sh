@@ -184,9 +184,10 @@ open yet.
 
 The side panels run the full height of the window; the bar across the top spans
 only the document beside them. Left panel: Files, Search, Harness, Outline.
-Right panel: the details of whatever is selected on the left. Each toggle sits
-above the panel it governs — left button at the left edge, right at the right —
-or use a key:
+Right panel: details for the active document, or specialized details for the
+selected Harness artifact. It stays available with no document open and simply
+shows no content then. Each toggle sits above the panel it governs — left button
+at the left edge, right at the right — or use a key:
 
 | Key | Panel |
 |---|---|

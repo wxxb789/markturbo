@@ -14,6 +14,8 @@ Built with Rust, [GPUI](https://github.com/zed-industries/zed), and
 
 - Open a directory as a workspace; browse it in a native file tree.
 - Open Markdown, MDX, and agent artifacts in tabs.
+- Inspect the active document in the always-available Details panel; selecting
+  a Harness artifact shows its specialized details there instead.
 - Read in **Source / Native / Web / Split·Native / Split·Web** layouts, each
   offered only where it makes sense: a `.rs` file gets Source alone, an `.html`
   gets the WebView.
