@@ -11,10 +11,15 @@ license = "Apache-2.0"
 [workspace.dependencies]
 mt-doc = { path = "crates/mt-doc" }
 
-# gpui must be specified EXACTLY as gpui-component specifies it (same URL, no
-# rev), or Cargo treats them as distinct sources and the graph ends up with two
+# gpui must use EXACTLY the same source as gpui-component (same URL, no rev),
+# or Cargo treats them as distinct sources and the graph ends up with two
 # incompatible gpui crates. Cargo.lock is what actually pins the revision.
-gpui = { git = "https://github.com/zed-industries/zed" }
+#
+# `stacker` became opt-in upstream after this workspace first adopted GPUI.
+# Keep it explicit: deeply nested Markdown can produce equally deep element
+# trees, and silently dropping the previous layout/prepaint stack protection is
+# not an acceptable dependency-upgrade behavior change.
+gpui = { git = "https://github.com/zed-industries/zed", features = ["stacker"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",
     "x11",
@@ -64,10 +69,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
 # and never a panic (`SyntaxHighlighter::new` logs and builds an inert
 # highlighter). `tree-sitter-tsx` is the one addition that costs 0 bytes: it
 # reuses the `tree-sitter-typescript` parse table already compiled in.
-# This is the first upstream revision that limits `gpui/profiler` to gpui-fps.
-# Older revisions enabled it workspace-wide, so downstream release builds could
-# not disable the profiler even with `default-features = false`.
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0", features = [
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b", features = [
     # Markdown itself, plus the inline grammar it needs. One feature, two variants.
     "tree-sitter-markdown",
     # The rest are fence languages, ordered by how often they appear in one.
@@ -84,12 +86,12 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
     # `Language::Make`, and the variant only exists with this feature on.
     "tree-sitter-make",
 ] }
-# Already in the graph through gpui-component. The styled Button has no
-# independent accessible-name API for icon-only commands at this revision, so
-# the workspace chrome composes the Base behavior with the same theme tokens.
-gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
-gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "7885c41663c7a6cc68ad0c99b1ba33550f807ff0" }
+# Already in the graph through gpui-component. The workspace chrome uses the
+# Base behavior directly for its compact custom buttons and toggles while
+# retaining the same theme tokens and accessibility semantics.
+gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b" }
+gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b" }
 # GPUI's X11 window icon is an `image::RgbaImage`. Keep only PNG decoding: the
 # icon is the one place markturbo names this already-transitive crate directly.
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -127,7 +129,7 @@ ratex-font = "=0.1.14"
 ab_glyph = "0.2"
 mermaid-svg = "0.7"
 notify = "8"
-notify-debouncer-full = "0.6"
+notify-debouncer-full = "0.7"
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -137,7 +139,7 @@ serde_yaml = "0.9"
 # be hand-edited: it takes comments, which JSON cannot, and it does not punish a
 # trailing comma. Already in the native tree via gpui-component, so naming it
 # costs no extra compilation.
-toml = "0.8"
+toml = "1.1"
 # The platform's own configuration directory. Replaces four hand-rolled
 # branches, one of which was wrong: macOS is not an XDG platform, and a file in
 # ~/.config there is invisible to every macOS convention for finding it.
