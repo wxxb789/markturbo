@@ -54,6 +54,18 @@ impl Section {
     }
 }
 
+/// Keep the current section when it still has rows, otherwise expose the other
+/// artifact kind instead of leaving the details switch permanently disabled.
+fn populated_section(preferred: Section, skills: usize, instructions: usize) -> Option<Section> {
+    match preferred {
+        Section::Skills if skills > 0 => Some(Section::Skills),
+        Section::Instructions if instructions > 0 => Some(Section::Instructions),
+        _ if skills > 0 => Some(Section::Skills),
+        _ if instructions > 0 => Some(Section::Instructions),
+        _ => None,
+    }
+}
+
 pub struct HarnessView {
     focus_handle: FocusHandle,
     root: PathBuf,
@@ -165,9 +177,13 @@ impl HarnessView {
         let previous = self.selected_path();
         self.skills = skills;
         self.instructions = instructions;
-        self.selected = previous
-            .and_then(|path| self.position_of(&path))
-            .or_else(|| (!self.is_empty()).then_some(0));
+        self.selected = previous.and_then(|path| self.position_of(&path));
+        if self.selected.is_none() {
+            self.section =
+                populated_section(self.section, self.skills.len(), self.instructions.len())
+                    .unwrap_or(self.section);
+            self.selected = (!self.is_empty()).then_some(0);
+        }
         cx.notify();
     }
 
@@ -769,7 +785,7 @@ fn field(cx: &App, name: &str, value: &str) -> Option<AnyElement> {
             .text_xs()
             .child(
                 div()
-                    .w(px(96.))
+                    .w(metrics::details_label())
                     .flex_shrink_0()
                     .text_color(cx.theme().muted_foreground)
                     .child(name.to_string()),
@@ -946,7 +962,7 @@ mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{Row, Section, artifacts_under, group};
+    use super::{Row, Section, artifacts_under, group, populated_section};
     use crate::settings::GroupBy;
     use mt_doc::skill::{Skill, SkillMeta};
     use mt_doc::{Diagnostic, DocType, Instruction, Origin};
@@ -973,6 +989,29 @@ mod tests {
                 language.label()
             );
         }
+    }
+
+    #[test]
+    fn discovery_keeps_a_populated_section_and_falls_back_from_an_empty_one() {
+        assert_eq!(
+            populated_section(Section::Skills, 1, 1),
+            Some(Section::Skills)
+        );
+        assert_eq!(
+            populated_section(Section::Instructions, 1, 1),
+            Some(Section::Instructions)
+        );
+        assert_eq!(
+            populated_section(Section::Skills, 0, 1),
+            Some(Section::Instructions),
+            "an instructions-only workspace must make its details reachable"
+        );
+        assert_eq!(
+            populated_section(Section::Instructions, 1, 0),
+            Some(Section::Skills),
+            "a skills-only workspace must make its details reachable"
+        );
+        assert_eq!(populated_section(Section::Skills, 0, 0), None);
     }
 
     fn skill(name: &str, origin: Origin, root: &str, valid: bool) -> Skill {

@@ -91,6 +91,8 @@ pub enum Key {
     Files,
     Validation,
     Kind,
+    Status,
+    Saved,
     Open,
     OpenSkillMd,
 
@@ -224,6 +226,8 @@ fn english(key: Key) -> &'static str {
         Key::Files => "Files",
         Key::Validation => "Validation",
         Key::Kind => "Kind",
+        Key::Status => "Status",
+        Key::Saved => "Saved",
         Key::Open => "Open",
         Key::OpenSkillMd => "Open SKILL.md",
 
@@ -372,6 +376,8 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::Files => "文件",
         Key::Validation => "校验",
         Key::Kind => "类型",
+        Key::Status => "状态",
+        Key::Saved => "已保存",
         Key::Open => "打开",
         Key::OpenSkillMd => "打开 SKILL.md",
 
@@ -498,6 +504,8 @@ mod tests {
         Key::Files,
         Key::Validation,
         Key::Kind,
+        Key::Status,
+        Key::Saved,
         Key::Open,
         Key::OpenSkillMd,
         Key::Appearance,
