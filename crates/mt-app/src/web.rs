@@ -461,7 +461,7 @@ code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-siz
 pre code { background: none; padding: 0; }
 table { border-collapse: collapse; margin: 1.2em 0; }
 th, td { border: 1px solid var(--border-color, rgba(127,127,127,.35)); padding: 7px 12px; }
-th { background: var(--table-header-bg, rgba(127,127,127,.12)); }
+th { background: var(--table-header-bg, rgba(127,127,127,.12)); color: var(--text-secondary, inherit); }
 mark { background: var(--highlight-bg, rgba(240,200,60,.35)); color: inherit; }
 blockquote { border-left: 3px solid var(--blockquote-border, rgba(127,127,127,.4));
              color: var(--text-secondary, inherit); margin-left: 0; padding-left: 1.1em; }
@@ -639,6 +639,12 @@ mod tests {
         let html = build_html(&md(src), &registry(), Trust::Restricted);
         assert!(html.contains("标题"));
         assert!(html.contains("<table>"), "got {html}");
+        assert!(
+            html.contains(
+                "th { background: var(--table-header-bg, rgba(127,127,127,.12)); color: var(--text-secondary, inherit); }"
+            ),
+            "Web table headers must consume the same secondary foreground token as Native"
+        );
     }
 
     #[test]
@@ -675,6 +681,10 @@ mod tests {
             html.contains(&format!("--bg-color: #{:06x}", preset.tokens.bg)),
             "got {html}"
         );
+        assert!(html.contains(&format!(
+            "--text-secondary: #{:06x}",
+            preset.tokens.text_secondary
+        )));
         assert!(html.contains(&format!("--link-color: #{:06x}", preset.tokens.link)));
         // The stylesheet has to actually consume them, or the variables are
         // decoration.

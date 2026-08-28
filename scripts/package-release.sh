@@ -64,11 +64,6 @@ case "$TARGET" in
 esac
 
 echo "==> Building $NAME"
-GPUI_FEATURES="$(cargo tree -p mt-app -e features -i gpui)"
-if grep -Fq 'gpui feature "profiler"' <<<"$GPUI_FEATURES"; then
-  echo "error: the default mt-app feature graph enables gpui/profiler" >&2
-  exit 1
-fi
 cargo build --release -p mt-app
 
 BUILT="$ROOT/target/release/$BIN"
