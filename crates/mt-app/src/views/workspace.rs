@@ -148,6 +148,30 @@ impl SidePanel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailsContent {
+    Empty,
+    Document,
+    Harness,
+}
+
+fn details_content(
+    side_panel: SidePanel,
+    settings_open: bool,
+    document_open: bool,
+    harness_selected: bool,
+) -> DetailsContent {
+    if settings_open {
+        DetailsContent::Empty
+    } else if side_panel == SidePanel::Harness && harness_selected {
+        DetailsContent::Harness
+    } else if document_open {
+        DetailsContent::Document
+    } else {
+        DetailsContent::Empty
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WorkspacePanelWidths {
     left: Pixels,
@@ -695,6 +719,16 @@ fn path_affects_harness(root: &Path, path: &Path) -> bool {
 /// that the bar is not still claiming "Saved" when the user comes back.
 const STATUS_LINGER: Duration = Duration::from_secs(6);
 
+fn document_details_status_key(is_externally_changed: bool, is_dirty: bool) -> i18n::Key {
+    if is_externally_changed {
+        i18n::Key::ChangedOnDisk
+    } else if is_dirty {
+        i18n::Key::UnsavedChanges
+    } else {
+        i18n::Key::Saved
+    }
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     root: Option<PathBuf>,
@@ -1206,12 +1240,6 @@ impl Workspace {
                 .is_some_and(|document| document.read(cx).layout().uses_webview())
     }
 
-    fn right_panel_available(&self, cx: &App) -> bool {
-        self.harness
-            .as_ref()
-            .is_some_and(|harness| harness.read(cx).has_selection())
-    }
-
     fn workspace_panel_widths(
         &self,
         viewport: Pixels,
@@ -1253,8 +1281,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let viewport = self.layout_width.unwrap_or(window.viewport_size().width);
-        let right_visible =
-            self.right_panel_open && !self.settings_open && self.right_panel_available(cx);
+        let right_visible = self.right_panel_open;
         let widths = self.workspace_panel_widths(viewport, right_visible);
         let current = match edge {
             WorkspaceResizeEdge::Left => widths.left,
@@ -1271,8 +1298,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let viewport = self.layout_width.unwrap_or(window.viewport_size().width);
-        let right_visible =
-            self.right_panel_open && !self.settings_open && self.right_panel_available(cx);
+        let right_visible = self.right_panel_open;
         let widths = self.workspace_panel_widths(viewport, right_visible);
         let width = match edge {
             WorkspaceResizeEdge::Left => {
@@ -1458,9 +1484,6 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.right_panel_available(cx) {
-            return;
-        }
         self.right_panel_open = !self.right_panel_open;
         self.web_dirty(cx);
         cx.notify();
@@ -1699,15 +1722,84 @@ impl Workspace {
 
     // --- Rendering --------------------------------------------------------
 
-    /// The selected Harness artifact's details, when one is available.
+    fn render_document_details(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (title, kind, location, status) = {
+            let document = self.active_document()?.read(cx);
+            let location = self
+                .root
+                .as_deref()
+                .filter(|root| document.path().starts_with(root))
+                .map(|root| crate::workspace::display_relative(root, document.path()))
+                .unwrap_or_else(|| document.path().to_string_lossy().replace('\\', "/"));
+            let status = i18n::t(
+                document_details_status_key(document.is_externally_changed(), document.is_dirty()),
+                cx,
+            )
+            .to_string();
+            (
+                document.title(cx),
+                document.document().doc_type().label().to_string(),
+                location,
+                status,
+            )
+        };
+        let accessibility_label = format!("{}: {title}", i18n::t(i18n::Key::Details, cx));
+
+        Some(
+            v_flex()
+                .id("document-details")
+                .role(gpui::Role::DescriptionList)
+                .aria_label(accessibility_label)
+                .p(metrics::inset())
+                .gap(metrics::gap())
+                .child(div().text_sm().font_semibold().child(title))
+                .child(detail_field(
+                    "document-detail-kind",
+                    cx,
+                    i18n::t(i18n::Key::Kind, cx),
+                    kind,
+                ))
+                .child(detail_field(
+                    "document-detail-location",
+                    cx,
+                    i18n::t(i18n::Key::Location, cx),
+                    location,
+                ))
+                .child(detail_field(
+                    "document-detail-status",
+                    cx,
+                    i18n::t(i18n::Key::Status, cx),
+                    status,
+                ))
+                .into_any_element(),
+        )
+    }
+
+    /// Contextual details for the active document or selected Harness artifact.
     fn render_right_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.right_panel_open || self.settings_open || !self.right_panel_available(cx) {
+        if !self.right_panel_open {
             return None;
         }
-        let harness = self.harness.clone()?;
-        // The details carry an Open button whose click handler emits a
-        // `HarnessEvent`, so rendering leases the entity context.
-        let details = harness.update(cx, |harness, cx| harness.render_details(cx));
+        let harness_selected = self
+            .harness
+            .as_ref()
+            .is_some_and(|harness| harness.read(cx).has_selection());
+        let details = match details_content(
+            self.side_panel,
+            self.settings_open,
+            self.active_document().is_some(),
+            harness_selected,
+        ) {
+            DetailsContent::Harness => self
+                .harness
+                .clone()
+                .map(|harness| harness.update(cx, |harness, cx| harness.render_details(cx)))
+                .unwrap_or_else(|| div().into_any_element()),
+            DetailsContent::Document => self
+                .render_document_details(cx)
+                .unwrap_or_else(|| div().into_any_element()),
+            DetailsContent::Empty => div().into_any_element(),
+        };
         Some(
             v_flex()
                 .size_full()
@@ -1985,14 +2077,12 @@ impl Workspace {
 
     /// The right panel's fixed toggle in the global title bar.
     fn render_right_toggle(&self, tooltip: bool, cx: &Context<Self>) -> impl IntoElement {
-        let available = self.right_panel_available(cx);
         ChromeIconButton::new(
             "toggle-right-panel",
             IconName::PanelRight,
             i18n::t(i18n::Key::ToggleRightPanel, cx),
         )
-        .pressed(self.right_panel_open && available)
-        .disabled(!available)
+        .pressed(self.right_panel_open)
         .when(tooltip, |button| {
             button.tooltip(i18n::t(i18n::Key::ToggleRightPanel, cx))
         })
@@ -2612,6 +2702,31 @@ fn empty_hint(cx: &App, text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
+fn detail_field(
+    id: &'static str,
+    cx: &App,
+    name: &str,
+    value: impl Into<SharedString>,
+) -> AnyElement {
+    let value = value.into();
+    h_flex()
+        .id(id)
+        .role(gpui::Role::Group)
+        .aria_label(format!("{name}: {value}"))
+        .gap_2()
+        .items_start()
+        .text_xs()
+        .child(
+            div()
+                .w(metrics::details_label())
+                .flex_shrink_0()
+                .text_color(cx.theme().muted_foreground)
+                .child(name.to_string()),
+        )
+        .child(div().flex_1().min_w_0().child(value))
+        .into_any_element()
+}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2894,9 +3009,11 @@ mod tests {
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::{
-        TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge, clamped_dragged_panel_width,
-        elide_tab_label, path_affects_harness, resolved_workspace_panel_widths,
+        DetailsContent, SidePanel, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge,
+        clamped_dragged_panel_width, details_content, document_details_status_key, elide_tab_label,
+        path_affects_harness, resolved_workspace_panel_widths,
     };
+    use crate::i18n;
     use gpui::{AppContext as _, Modifiers, MouseButton, TestAppContext, point, px};
 
     #[test]
@@ -2980,6 +3097,34 @@ mod tests {
             gpui::px(300.),
         );
         assert_eq!(tiny_right.right, gpui::px(20.));
+    }
+
+    #[test]
+    fn details_content_follows_the_visible_context() {
+        assert_eq!(
+            details_content(SidePanel::Files, false, false, false),
+            DetailsContent::Empty
+        );
+        assert_eq!(
+            details_content(SidePanel::Files, false, true, false),
+            DetailsContent::Document
+        );
+        assert_eq!(
+            details_content(SidePanel::Harness, false, true, true),
+            DetailsContent::Harness
+        );
+        assert_eq!(
+            details_content(SidePanel::Files, false, true, true),
+            DetailsContent::Document
+        );
+        assert_eq!(
+            details_content(SidePanel::Harness, false, false, true),
+            DetailsContent::Harness
+        );
+        assert_eq!(
+            details_content(SidePanel::Harness, true, true, true),
+            DetailsContent::Empty
+        );
     }
 
     #[test]
@@ -3945,7 +4090,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_details_do_not_hide_the_global_switcher() {
+    fn details_panel_is_always_available_and_includes_document_details() {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source
             .find("fn render_right_panel")
@@ -3954,7 +4099,8 @@ mod tests {
         let end = body.find("\n    /// The left panel").unwrap_or(body.len());
         let body = &body[..end];
 
-        assert!(body.contains("!self.right_panel_available(cx)"));
+        assert!(!source.contains("fn right_panel_available"));
+        assert!(body.contains("render_document_details(cx)"));
 
         let toggle = source
             .split_once("fn render_right_toggle")
@@ -3964,8 +4110,42 @@ mod tests {
             .split("\n    fn render_tabs")
             .next()
             .unwrap_or(toggle);
-        assert!(toggle.contains(".disabled(!available)"));
-        assert!(toggle.contains(".pressed(self.right_panel_open && available)"));
+        assert!(!toggle.contains(".disabled("));
+        assert!(toggle.contains(".pressed(self.right_panel_open)"));
+
+        let action = source
+            .split_once("fn on_toggle_right_panel")
+            .expect("right panel action")
+            .1;
+        let action = action
+            .split("\n    /// Open files dropped")
+            .next()
+            .unwrap_or(action);
+        assert!(!action.contains("right_panel_available"));
+    }
+
+    #[test]
+    fn document_details_status_prioritizes_external_changes() {
+        assert_eq!(
+            document_details_status_key(false, false),
+            i18n::Key::Saved,
+            "a clean document whose file matches disk is saved"
+        );
+        assert_eq!(
+            document_details_status_key(false, true),
+            i18n::Key::UnsavedChanges,
+            "local edits are unsaved when no external change exists"
+        );
+        assert_eq!(
+            document_details_status_key(true, false),
+            i18n::Key::ChangedOnDisk,
+            "an external change is not saved even without local edits"
+        );
+        assert_eq!(
+            document_details_status_key(true, true),
+            i18n::Key::ChangedOnDisk,
+            "an external conflict takes precedence over local unsaved edits"
+        );
     }
 
     /// Nothing in this file may reach the App through the infallible windowed
