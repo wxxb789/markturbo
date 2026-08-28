@@ -4858,7 +4858,7 @@ dependencies = [
 
 [[package]]
 name = "mt-app"
-version = "0.1.3"
+version = "0.1.4-alpha.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -4902,7 +4902,7 @@ dependencies = [
 
 [[package]]
 name = "mt-doc"
-version = "0.1.3"
+version = "0.1.4-alpha.1"
 dependencies = [
  "anyhow",
  "log",
