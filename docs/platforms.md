@@ -1,8 +1,9 @@
 # Platform support
 
-GOAL §22 asks that build paths be *investigated and documented*, and that
-platforms be implemented where the upstream stack supports them reliably —
-rather than claiming portability that does not exist.
+The [historical v0.1 product direction](history/v0.1-product-direction.md)
+required build paths to be investigated and documented rather than claiming
+portability that did not exist. The current [Product Contract](../PRODUCT.md)
+names Windows 11 x64 as the only first public-quality platform.
 
 ## Summary
 
@@ -196,6 +197,6 @@ rest of the document renders normally.
 
 - **WebAssembly.** `gpui_web` exists upstream and `gpui-component` ships a WASM
   gallery, but this application's premise is that the filesystem is the source
-  of truth. A browser build would need a different storage model, which GOAL
-  §1.2 rules out for v0.1.
+  of truth. A browser build would need a different storage model, which the
+  historical local-first brief and current Product Contract both reject.
 - **iOS / Android.** No upstream gpui backend.

@@ -9,11 +9,46 @@ reject individual hunks, and copy or save only the approved result; prove with
 keyless tests that rejection is byte-identical, stale proposals cannot apply,
 and one undo operation restores the pre-apply editor state.
 
+## Product contract alignment
+
+**Disposition:** Retained and revised on 2026-08-29.
+
+Goal 07 is a document-only intermediate capability. It does not by itself
+fulfill the public-quality context-aware promise: Goal 10 requires the
+integrated Goal 07 revision workflow and Goal 08's explicitly selected,
+disclosed Effective Agent Context in Review before release.
+
 ## Product invariant
 
 The model may propose; only the user edits. No generated response is authority to
 mutate a file, and no answer that materially affects the agent should remain
 trapped in hidden Review state.
+
+## Revision evaluation standard
+
+Revision evaluation is deterministic and local to this goal. It does not use an
+acceptance-rate target or reuse the Review usefulness threshold in `PRODUCT.md`.
+For every revision-eligible case in immutable corpus version `goal-01-v1`, the
+evaluation record must identify the corpus version and manifest digest, the
+reviewed source snapshot, answered material questions, the displayed proposed
+diff, each owner accept/reject decision, and an owner intent-preservation
+judgment for the accepted output.
+
+The revision workflow passes only when all of the following hold:
+
+1. Every revision-eligible `goal-01-v1` case has the complete owner decision and
+   intent-preservation record above.
+2. Every accepted output is judged by the owner to preserve the artifact's
+   intent.
+3. No accepted output contains an intent-violating change defined by that
+   case's annotation in `OWNER-ANNOTATIONS.md`.
+4. Every answered material question is represented in the proposed artifact or
+   visibly marked as intentionally omitted.
+5. In every reject-all evaluation, the resulting editor bytes are identical to
+   the reviewed source snapshot.
+
+The report may describe the number of accepted hunks, but that number is not a
+success measure.
 
 ## In scope
 
@@ -49,16 +84,16 @@ trapped in hidden Review state.
 - Treat user-authored answers as recoverable dirty state under Goal 02 until they
   are incorporated, explicitly discarded, or exported; closing or interruption
   must not silently lose a clarification the user has typed.
-- Evaluation against every Goal 01 artifact for which its annotation calls for a
-  revision.
+- Evaluation against every artifact in `evaluation/goal-01/CORPUS.md` whose
+  annotation calls for a revision.
 
 ## Out of scope
 
 - Automatically running the revised prompt or judging downstream model output.
 - Autonomous multi-step editing, background agents, batch rewrite of a folder,
   or applying changes without the active user's confirmation.
-- Effective Agent Context resolution or choosing a different instruction file to
-  edit; Goal 08 owns that context.
+- Effective Agent Context resolution, source selection, or context inclusion in
+  Review; Goal 08 owns those capabilities and their disclosed integration.
 - Git staging, commits, version-control history, collaborative review, or cloud
   document history.
 - Rich-text editing, a generic chat conversation, prompt scores, or templates.
@@ -91,9 +126,9 @@ Automated tests must cover at least:
 
 ## Completion evidence
 
-- Every revision-eligible Goal 01 corpus artifact has a recorded proposed diff,
-  human accept/reject decisions, and an intent-preservation judgment meeting the
-  threshold defined in Goal 01.
+- Every revision-eligible artifact in `evaluation/goal-01/CORPUS.md` has a
+  recorded proposed diff, human accept/reject decisions, and an
+  intent-preservation judgment that passes the Revision evaluation standard.
 - Project-owner review confirms that at least one real artifact became clearer
   because a question changed or exposed a decision, not merely because prose was
   expanded.
@@ -107,12 +142,13 @@ Automated tests must cover at least:
 
 Stop if the editor cannot represent a multi-hunk Apply as one reliable undo
 transaction, if the provider cannot return a proposal that can be validated
-without trusting opaque model instructions, or if Goal 06 failed its usefulness
-threshold. Do not substitute unreviewed whole-document replacement or multiple
-uncoordinated writes for the approved-diff contract.
+without trusting opaque model instructions, or if Goal 06 did not meet its
+evaluation gate. Do not substitute unreviewed whole-document replacement or
+multiple uncoordinated writes for the approved-diff contract.
 
 ## Boundary for the next goal
 
 This goal owns revision review and application for the active artifact only.
-Goal 08 determines the broader instruction context an agent receives and may
-supply that context to this already-complete workflow.
+Goal 08 next makes selected Effective Agent Context visible, disclosed, and
+available to Review. Goal 10 cannot ship the public-quality context-aware promise
+until both workflows operate together.

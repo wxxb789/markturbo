@@ -138,6 +138,22 @@ local HTML file it is instead the filesystem: the file is loaded from disk rathe
 from an opaque origin, so its own relative images and stylesheets resolve, which is the
 only reason to trust one. That also places it outside the policy above.
 
+## Review
+
+### Review
+A non-mutating inspection of an Agent Artifact that reports what the configured reviewer
+understood, separates source statements from inference, and raises only questions that could
+materially change the outcome. A Review is neither a chat nor authorization to edit.
+
+### Effective Agent Context
+The ordered instruction sources that a supported, versioned harness profile would apply
+automatically to a chosen target, together with their provenance, scope, and precedence.
+Available Skills remain separate unless the profile establishes that they were invoked.
+
+### Approved Revision
+The exact subset of a proposed change that the user accepts after inspecting its local diff.
+Only an Approved Revision may become document source; an unapplied proposal remains inert.
+
 ## View
 
 ### Layout
