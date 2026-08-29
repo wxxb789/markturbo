@@ -10,6 +10,15 @@ loading/result/stale/error, context, conflict, and settings states at
 minimum/default/wide window widths in both effective color modes, with no new
 product capability or regression in keyboard and accessibility behavior.
 
+## Product contract alignment
+
+**Disposition:** Retained and revised on 2026-08-29.
+
+The hierarchy is defined by the [Capability roles](../PRODUCT.md#capability-roles).
+Visual acceptance must satisfy the [First-Time-User
+Evidence](../PRODUCT.md#first-time-user-evidence); this goal adds only the UI and
+state evidence needed to show that hierarchy works in the product.
+
 ## Design standard
 
 Taste is expressed through defaults, hierarchy, absence, reversibility, and
@@ -19,16 +28,15 @@ users who need them.
 
 ## In scope
 
-- Derive one explicit action hierarchy from Goal 01. The expected order is:
-  Review as the primary outcome, editing and Agent Context as supporting work,
-  and Translation/Web compatibility as secondary capabilities.
+- Derive one explicit action hierarchy from the
+  [Capability roles](../PRODUCT.md#capability-roles).
 - Replace implementation vocabulary with user-task vocabulary where owner review
   confirms it improves comprehension. Candidates to test include:
   - `Source` → `Edit`;
   - `Native` → `Preview`;
   - `Web` → `Compatibility Preview`;
   - `Harness` → `Agent Context` or `Skills & Instructions`.
-- Keep every layout the Goal 01 contract still requires, but progressively
+- Keep every layout `PRODUCT.md` still requires, but progressively
   disclose uncommon variants instead of making every technical mode compete for
   first attention. Do not preserve a mode merely because it existed before the
   product decision, and do not remove one the contract retained.
@@ -37,8 +45,7 @@ users who need them.
   toggle.
 - Make Review discoverable from the welcome state and active document without
   turning it into a chat sidebar.
-- Move Translation to a secondary document/selection action if Goal 01 does not
-  identify it as primary.
+- Keep Translation as a secondary document/selection action.
 - Select and tune one signature light preset and one signature dark preset as
   defaults. Existing alternatives may remain preferences, but do not expand the
   theme catalog.
@@ -89,12 +96,12 @@ be automated; platform-specific WebView states require their real runtime.
 
 - The project owner approves one state matrix produced from a release build and
   records any intentional exceptions.
-- The Goal 01-approved number of representative first-time users completes its
-  approved comprehension tasks and threshold without coaching: identify the
-  primary action, open/paste path, active artifact, and current safety state
-  without being taught internal terms.
+- The [First-Time-User Evidence](../PRODUCT.md#first-time-user-evidence) passes.
+  In those sessions, participants also identify the primary action, open/paste
+  path, active artifact, and current safety state without being taught internal
+  terms.
 - All controls remain reachable by keyboard with visible focus; automated
-  accessibility assertions and a primary-platform screen-reader smoke test cover
+  accessibility assertions and a Windows 11 x64 screen-reader smoke test cover
   changed surfaces.
 - Changed strings are complete in English and Chinese, or the product contract
   explicitly narrows language support before implementation.
@@ -108,9 +115,9 @@ be automated; platform-specific WebView states require their real runtime.
 
 ## Stop and ask
 
-Stop if Goal 01 does not establish the primary action and terminology audience,
-if owner review cannot choose a signature default, or if a proposed simplification
-would remove a required capability rather than progressively disclose it.
+Stop if owner review cannot choose a signature default, or if a proposed
+simplification would remove a required capability rather than progressively
+disclose it.
 
 ## Boundary for the next goal
 

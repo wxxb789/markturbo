@@ -1,7 +1,9 @@
 # Architecture
 
-The boundaries chosen for v0.1, and why. This is the note GOAL §19.7 asks for,
-written after inspecting the upstream source rather than from assumptions.
+The boundaries chosen for v0.1, and why. This records the architecture work
+requested by the [historical v0.1 product direction](history/v0.1-product-direction.md),
+after inspecting upstream source rather than relying on assumptions. Current
+product scope is governed by the [Product Contract](../PRODUCT.md).
 
 ## The one hard boundary
 
@@ -101,11 +103,12 @@ a diagnostic, not a lost session.
 
 ### gpui-component provides more than expected
 
-Inspecting the upstream source first (GOAL §19) changed the plan substantially.
+Inspecting upstream source first, as the historical v0.1 brief required, changed
+the plan substantially.
 `gpui-component` already ships:
 
 - `MarkdownExtensions` — a block parser/renderer registry with an MDX parse
-  mode. The "renderer registry" GOAL §5 asks for at the *view* layer already
+  mode. The renderer registry requested by the historical brief at the *view* layer already
   exists upstream; this codebase supplies the block *backends* and lets
   `TextView` dispatch.
 - `EditorState` / `Editor` — a rope-backed code editor with tree-sitter
@@ -303,7 +306,7 @@ even a provider returning unrelated text cannot damage document structure.
 
 ## What was deliberately not built
 
-Per GOAL §18: no knowledge graph, backlinks, canvas, PKM system, proprietary
+Per the historical v0.1 non-goals: no knowledge graph, backlinks, canvas, PKM system, proprietary
 format, WYSIWYG, collaboration, sync, accounts, plugin marketplace, extension
 runtime, terminal, debugger, LSP IDE, git client, vector DB, RAG, or AI chat
 sidebar. Agents live in Codex, Claude Code, Cursor, and the terminal; this app

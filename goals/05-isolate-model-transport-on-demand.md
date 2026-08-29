@@ -24,11 +24,23 @@ markturbo model worker
 
 The worker is a capability boundary, not a generic plugin platform.
 
+## Product contract alignment
+
+**Disposition:** Retained and revised on 2026-08-29.
+
+This goal preserves the configured endpoint and Translation behavior promised by
+`PRODUCT.md` while making a worker conditional on Goal 04's Windows 11 x64
+evidence. It neither expands the provider catalog nor changes the explicit,
+user-initiated model-data boundary established by Goal 05A.
+
 ## In scope
 
 - One bundled worker executable for model-backed operations.
-- A narrow, versioned protocol with an explicit startup handshake and bounded
-  request/response sizes.
+- A narrow, versioned protocol with an explicit startup handshake, an encoded
+  request-frame limit of 8 MiB, and an encoded response-frame limit of 1 MiB.
+  These limits bound protocol frames only. `PRODUCT.md`'s per-request outbound
+  disclosure and consent requirements, and Review's structured-response
+  validation, still apply.
 - On-demand process creation from the first explicit model-backed action; an
   ordinary launch, edit, preview, search, or context inspection starts no worker.
 - Parent-owned lifecycle: the worker exits when its parent exits and does not
@@ -39,14 +51,16 @@ The worker is a capability boundary, not a generic plugin platform.
   never command-line arguments, process titles, or logs.
 - The core sends only content required by the invoked operation and retains
   authority over whether returned changes may be applied.
-- Preserve all existing provider routing, custom base URL, local
-  OpenAI-compatible endpoint, and Translation behavior; establish and document
-  timeout and cancellation semantics rather than assuming the current transport
-  already provides them.
+- Preserve the existing configured endpoint behavior, including custom base URL,
+  local OpenAI-compatible endpoint, and Translation behavior; establish and
+  document timeout and cancellation semantics rather than assuming the current
+  transport already provides them. Do not add a provider, wire format, or new
+  provider-routing capability.
 - Actionable behavior for a missing, mismatched, crashed, timed-out, or malformed
   worker; the editor and local workflows remain usable.
-- Stage the worker in development and release archives so one extracted product
-  is complete. Goal 10 owns production signing and installer policy.
+- Stage the worker in development and the Windows 11 x64 release archive so one
+  extracted product is complete. Goal 10 owns production signing and installer
+  policy.
 - Keep protocol types small and independent of GPUI, `genai`, and renderer
   dependencies.
 
@@ -57,7 +71,7 @@ The worker is a capability boundary, not a generic plugin platform.
 - Third-party plugins, arbitrary worker discovery, a marketplace, or optional
   first-run downloads.
 - Running a bundled local language model or managing model weights.
-- Implementing Intent Review semantics or UI; Goal 06 owns that consumer.
+- Implementing Review semantics or UI; Goal 06 owns that consumer.
 - Exposing a localhost server or remotely callable API.
 
 ## Completion evidence for the go path
@@ -96,11 +110,11 @@ The worker is a capability boundary, not a generic plugin platform.
 If Goal 04 is absent, inconclusive, below threshold, or does not specifically
 select a worker, take the no-go path and continue without architectural work.
 Stop and ask only when an authorized worker cannot preserve one-step packaging or
-a secure private protocol on the primary platform. Do not reinterpret “dynamic”
-as permission to expose unstable Rust trait objects across a library ABI.
+a secure private protocol on Windows 11 x64. Do not reinterpret “dynamic” as
+permission to expose unstable Rust trait objects across a library ABI.
 
 ## Boundary for the next goal
 
 This goal changes where model transport executes, not what a Review means. Goal
 05A next secures credentials and outbound requests for either architecture; Goal
-06 then defines the read-only Intent Review product behavior.
+06 then defines the read-only Review product behavior.
