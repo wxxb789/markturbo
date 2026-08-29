@@ -7,6 +7,9 @@ prompts, specs, plans, and MDX.
 > This is not a Markdown editor with AI features. It is a native workspace for
 > Markdown as the interface between humans and AI agents.
 
+The current user, product promise, capability roles, data policy, and success
+thresholds are defined in the owner-approved [Product Contract](PRODUCT.md).
+
 Built with Rust, [GPUI](https://github.com/zed-industries/zed), and
 [`longbridge/gpui-component`](https://github.com/longbridge/gpui-component).
 
@@ -22,7 +25,11 @@ Built with Rust, [GPUI](https://github.com/zed-industries/zed), and
 - Render Mermaid, D2, PlantUML, and LaTeX from document source.
 - Discover Agent Skills and agent instruction files across the conventional
   roots of 80+ harnesses, project-local and global, parse and validate
-  `SKILL.md` frontmatter, and inspect them in the Harness panel.
+  `SKILL.md` frontmatter, and inspect them in the Harness panel. Discovery is
+  an inventory, not a claim that every discovered instruction applies. Goal 08
+  will implement and verify the first Effective Agent Context profile,
+  `codex-agents-md-2026-08-29`; other instruction files remain individually
+  reviewable without claiming verified inheritance semantics.
 - Search the open tabs, the whole project, or every discovered skill and
   instruction file — including the directories outside the open folder.
 - Translate a selection, a block, or a whole document while preserving code,

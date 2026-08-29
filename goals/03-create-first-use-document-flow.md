@@ -2,22 +2,31 @@
 
 ## Objective
 
-On a clean profile and a no-argument desktop launch, let a new user reach an
-editable Markdown buffer by pasting text, opening a file or workspace, or opening
-the bundled sample, then save it through Save As as an ordinary `.md` file and
-reopen it from a bounded recent-target list; verify the complete flow on the
-primary platform without depending on Intent Review.
+On a clean Windows 11 x64 profile and a no-argument desktop launch, let a new
+user reach an editable Markdown buffer by pasting text, opening a file or
+workspace, or opening the bundled sample, then save it through Save As as an
+ordinary `.md` file and reopen it from a recent-target list capped at 10 entries;
+verify the complete flow without depending on Review.
 
 ## User outcome
 
 A person with a rough prompt must not need another editor, a pre-existing file,
 or terminal knowledge before markturbo becomes useful.
 
+## Product contract alignment
+
+**Disposition:** Retained and revised on 2026-08-29.
+
+This goal retains ordinary local Markdown as the first-use artifact and serves
+the `PRODUCT.md` promise that a developer can prepare agent-ready work without a
+pre-existing file or account. It does not add semantic Review, model traffic, or
+a proprietary workspace format.
+
 ## In scope
 
 - Replace an accidental installation/current-directory first screen with a
   deliberate welcome state for a no-argument desktop launch.
-- Offer these explicit entry points, using terminology settled by Goal 01:
+- Offer these explicit entry points, using terminology settled by `PRODUCT.md`:
   - create or paste into a new Markdown artifact;
   - open a file;
   - open a workspace folder;
@@ -33,9 +42,9 @@ or terminal knowledge before markturbo becomes useful.
   already open.
 - Make cancellation of Open, overwrite confirmation, and Save As a no-op that
   preserves the current workspace, buffer, and focus.
-- Persist only a numerically bounded, owner-approved number of recent paths and
-  presentation metadata in application settings; do not copy document contents
-  or create workspace metadata.
+- Persist at most 10 recent file or workspace paths and presentation metadata in
+  application settings; do not copy document contents or create workspace
+  metadata. Evict the least recently used entry when the list is full.
 - Remove or clearly disable stale recent entries without preventing startup.
 - Keep path arguments working: opening `markturbo PATH` still opens the requested
   file or directory directly.
@@ -68,8 +77,8 @@ A clean-profile acceptance run must demonstrate all of the following:
    recovery behavior with its exact text preserved.
 8. Reopening the saved file displays the same text, including CJK and emoji.
 9. The bundled sample opens from the welcome state without a terminal.
-10. The Goal 01-approved recent-path bound survives restart; a missing recent
-    entry degrades visibly and safely.
+10. The at-most-10 recent-path bound survives restart; a missing recent entry
+    degrades visibly and safely.
 11. A direct command-line path still bypasses the welcome state and opens the
     requested target.
 
@@ -81,9 +90,9 @@ Automated tests cover state transitions and path persistence. In addition:
 
 ## Stop and ask
 
-Stop and ask if Goal 01 does not identify the primary platform or if preserving
-no-argument terminal behavior conflicts with the chosen desktop first-run
-contract. Do not implement platform detection based on an unverified heuristic.
+Stop and ask if preserving no-argument terminal behavior conflicts with the
+approved Windows 11 x64 desktop first-run contract. Do not implement platform
+detection based on an unverified heuristic.
 
 ## Boundary for the next goal
 

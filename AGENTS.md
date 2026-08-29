@@ -2,10 +2,13 @@
 
 Read the relevant source before working:
 
-- `GOAL.md`: product direction.
+- `PRODUCT.md`: current owner-approved product contract and success thresholds.
 - `goals/`: ordered delivery goals and acceptance evidence.
 - `docs/architecture.md`: architecture and decisions.
 - `CONCEPTS.md`: project vocabulary.
+
+Read `docs/history/v0.1-product-direction.md` only when tracing the original
+implementation brief. Its feature list is historical, not current product scope.
 
 `CLAUDE.md` links to this file. On Windows without symlink support it may contain
 only `AGENTS.md`; read this file instead.

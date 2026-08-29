@@ -6,7 +6,7 @@ For every destructive lifecycle path owned by markturbo, prevent a normal UI
 action, asynchronous operation, or external file change from silently discarding
 newer user-authored text, and recover the latest successfully persisted checkpoint
 after interruption; verify the enumerated paths with automated tests and a
-primary-platform acceptance run while preserving ordinary files as the source of
+Windows 11 x64 acceptance run while preserving ordinary files as the source of
 truth.
 
 ## Product invariant
@@ -14,6 +14,15 @@ truth.
 When markturbo must choose between convenience and preserving text, it preserves
 the text or asks the user. A model result, watcher event, close action, or crash
 must never become implicit permission to replace a newer buffer.
+
+## Product contract alignment
+
+**Disposition:** Retained and revised on 2026-08-29.
+
+This goal preserves the local-first Markdown source-of-truth promise in
+`PRODUCT.md` on the first public-quality platform, Windows 11 x64. It retains
+recovery only as optional local protection for a dirty buffer, never as a
+workspace format or a replacement for explicit Save and Discard decisions.
 
 ## In scope
 
@@ -41,10 +50,17 @@ must never become implicit permission to replace a newer buffer.
 - Preserve a symbolic link or other explicitly supported shared-file identity on
   Save, or refuse with an actionable choice; atomic replacement must not silently
   turn `CLAUDE.md -> AGENTS.md` into two divergent regular files.
-- Maintain a local recovery checkpoint for dirty buffers in application data at
-  the cadence and count/byte/age bounds approved in Goal 01; remove it after an
-  intentional save or discard, and restore or offer the latest completed
-  checkpoint after an interrupted session.
+- On Windows 11 x64, maintain optional local recovery checkpoints for dirty
+  buffers under application data, protected for the current user with DPAPI and
+  written atomically. Checkpoint after two seconds without an edit and at least
+  every ten seconds while dirty; acknowledge a maximum ten-second loss window;
+  retain at most 50 records, 32 MiB per record, and 128 MiB in total; and expire
+  records after seven days. Delete a record after intentional Save or Discard,
+  prune expired records at startup and after a completed checkpoint, evict the
+  oldest inactive record first when a bound is reached, and never discard the
+  newest checkpoint for an open dirty buffer without a visible warning. Report
+  unavailable, failed, or oversized recovery without blocking editing or
+  damaging the source file.
 - Retain enough load metadata to preserve encoding, BOM, line endings, source
   path, and the original conflict stamp. If the disk file changed while the app
   was not running, restore the buffer as conflicted rather than authorizing an
@@ -55,7 +71,7 @@ must never become implicit permission to replace a newer buffer.
 
 ## Out of scope
 
-- The Intent Review workflow, clarification questions, generated revisions, or
+- The Review workflow, clarification questions, generated revisions, or
   per-hunk diff acceptance.
 - General cloud sync, collaborative editing, version history, or continuous
   autosave to the source file.
@@ -88,7 +104,7 @@ Automated coverage must prove at least these cases:
     become replacement text or numeric character references; explicit conversion
     or Save As preserves the editor's exact source.
 13. Recovery restores the latest completed checkpoint after simulated interruption
-    within Goal 01's stated loss window, including CJK and emoji.
+    within the approved ten-second maximum loss window, including CJK and emoji.
 14. Recovery of legacy-encoded, BOM-bearing, or CRLF content retains the original
     save metadata; if its disk file changed while closed, the recovered buffer is
     conflicted and cannot overwrite implicitly.
@@ -99,7 +115,7 @@ Automated coverage must prove at least these cases:
 ## Completion evidence
 
 - Focused lifecycle, stale-result, filesystem-conflict, and recovery tests pass.
-- A primary-platform run exercises tab close, keyboard close, window close,
+- A Windows 11 x64 run exercises tab close, keyboard close, window close,
   external modification, and interrupted-session recovery with the expected
   decisions and exact text retained.
 - `cargo fmt --all -- --check` passes.
@@ -111,10 +127,10 @@ Automated coverage must prove at least these cases:
 
 ## Stop and ask
 
-Stop and ask before persisting recovery content if the product contract does not
-settle whether sensitive document text may be stored locally in plaintext, or
-if the chosen platform cannot provide an acceptable recovery policy. Do not
-silently omit recovery or invent cloud storage.
+Stop and ask if Windows 11 x64 cannot provide current-user DPAPI protection and
+atomic application-data writes that satisfy the approved recovery contract. Do
+not silently weaken the bounds, omit recovery, persist plaintext, or invent
+cloud storage.
 
 ## Boundary for the next goal
 

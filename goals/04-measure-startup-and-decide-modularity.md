@@ -1,21 +1,30 @@
-# Goal 04 — Measure startup and decide capability modularity
+# Goal 04 — Measure startup and decide model-transport modularity
 
 ## Objective
 
-Produce a reproducible go/no-go decision on extracting optional capabilities by
-measuring the full application, a bare GPUI shell, and applicable compile-time
-ablations of the model/network stack, diagram/math backends, WebView integration,
-and non-core tree-sitter grammars on the primary platform; collect at least 10
-quiet-gated A-B-B-A rounds for each shipping candidate, include first-visible,
-first-painted, first-input, idle-memory, baseline first-use, executable, and
-archive-size evidence, and adopt no runtime module architecture without a
-pre-registered numeric materiality threshold.
+Produce a reproducible, gating go/no-go decision only for isolating the
+model/network stack on Windows 11 x64. Measure the full application, a bare GPUI
+shell, and a compile-time ablation of that stack; collect at least 10
+quiet-gated A-B-B-A rounds, include first-visible, first-painted, first-input,
+idle-memory, baseline first-use, executable, and archive-size evidence, and
+adopt no model runtime architecture without a pre-registered numeric materiality
+threshold. Renderer, WebView, and grammar ablations are optional diagnostics and
+cannot delay later product goals.
 
 ## Question this goal must answer
 
-Would removing a capability from the initial process materially improve the
-user-observed launch path, or would dynamic loading add complexity around a
-startup cost dominated by GPUI/platform initialization?
+Would removing the model/network dependency closure from the initial process
+materially improve the user-observed launch path, or would a worker add
+complexity around a startup cost dominated by GPUI/platform initialization?
+
+## Product contract alignment
+
+**Disposition:** Retained and revised on 2026-08-29.
+
+`PRODUCT.md` makes only model transport a possible startup-driven architecture
+decision. Renderer, WebView, and grammar measurements may be retained as
+diagnostics when already available, but cannot authorize extraction or removal
+and are not a completion condition.
 
 ## In scope
 
@@ -25,26 +34,24 @@ startup cost dominated by GPUI/platform initialization?
   - first application frame painted;
   - first input successfully handled;
   - initial workspace or welcome state ready.
-- Record cold and warm behavior separately where the platform permits an honest
-  distinction. If the selected platform cannot use the Windows-only
-  `scripts/probe.py` quiet/startup mechanisms, build and validate an equivalent
-  platform-native harness rather than translating its claims by assumption.
+- Record cold and warm behavior separately where Windows 11 x64 permits an
+  honest distinction, using the Windows-only `scripts/probe.py` quiet/startup
+  mechanisms as the primary evidence. Other platform measurements are
+  non-release diagnostics and cannot replace this gate.
 - Quantify or symmetrically include the overhead of any instrumentation added to
   observe first paint or first input, so the probe does not decide its own result.
 - Measure, from the same source revision and release configuration:
   1. the full application;
   2. a bare GPUI window using the same platform setup;
-  3. the application without the model/network dependency closure;
-  4. the application without Mermaid, D2, and RaTeX;
-  5. the application without WebView integration, when that capability exists on
-     the selected platform;
-  6. the application with only the minimum Markdown/editor grammar set, retaining
-     any temporary source adjustments solely to make the ablation compile.
+  3. the application without the model/network dependency closure.
+- Renderer, WebView, or grammar ablations may be recorded as explicitly
+  non-gating diagnostics when the measurement apparatus already exists. They may
+  be skipped without blocking Goal 05A or Goal 06 and cannot become a product
+  feature matrix.
 - Use compile-time removal as the upper bound on what later explicit loading can
-  save. For each ablation, record the exact user behavior lost—especially fenced
-  code highlighting—so an upper-bound number is not mistaken for a shippable
-  product. Temporary feature gates are acceptable measurement apparatus but must
-  not become an accidental product configuration matrix.
+  save. Record the exact model-backed behavior lost so an upper-bound number is
+  not mistaken for a shippable product. Temporary feature gates are acceptable
+  measurement apparatus but must not become a product configuration matrix.
 - Treat a dynamic library as lazy only when runtime module inspection proves it
   is absent before first use; ordinary loader-time dynamic linkage does not meet
   the goal merely because code moved into another file.
@@ -52,13 +59,15 @@ startup cost dominated by GPUI/platform initialization?
   the repository quiet gate and matching fresh builds.
 - Record executable size, complete distributable archive size, idle working set
   and private bytes, page faults or image-load evidence where available, and the
-  full build's baseline first-use latency for each candidate capability. An
-  ablated build has no first-use result and must not be assigned an estimate.
-- Use current `cargo bloat`/section evidence rather than stale historical sizes.
-- Before examining A/B results, record a numeric threshold for a material launch
-  or idle-memory improvement and have the project owner approve it.
-- End with one explicit decision for each candidate: keep static, explicitly load,
-  isolate in a worker, investigate upstream, or reject.
+  full build's baseline model first-use latency. The ablated build has no
+  first-use result and must not be assigned an estimate.
+- Use current `cargo bloat`/section evidence for the model/network closure rather
+  than stale historical sizes.
+- Before examining the model/network A/B results, record a numeric threshold for
+  a material launch or idle-memory improvement and have the project owner
+  approve it.
+- End with one explicit, owner-approved decision for model transport: keep
+  in-process, isolate in a worker, investigate upstream, or reject.
 
 ## Out of scope
 
@@ -90,13 +99,13 @@ warm-up, matching `scripts/probe.py` ordering. A single launch is not evidence.
 
 - The enhanced harness can reproduce every startup milestone it claims to
   measure and fails visibly when it cannot.
-- The bare shell, full build, and each of the four ablation rows have recorded
-  results or an explicit platform-not-applicable result; a platform-inapplicable
-  WebView case is labeled rather than fabricated.
+- The bare shell, full build, and model/network ablation have recorded results;
+  the model/network row is the only paired shipping decision.
 - The `opt-level = "s"` deferred decision is resolved or explicitly remains
   blocked by a failed quiet gate; no noisy result is promoted to evidence.
-- One owner-approved go/no-go table records the materiality threshold and the
-  decision for model transport, renderers, WebView, and grammar work.
+- One owner-approved go/no-go table records the materiality threshold and
+  decision for model transport. Any compatibility observation is separately
+  labeled optional diagnostic evidence.
 - Measurement-only code and retained harness changes are clearly separated.
 - `cargo fmt --all -- --check`, relevant harness tests, and
   `cargo test --release --workspace` pass; the pass count is recorded.
@@ -104,11 +113,11 @@ warm-up, matching `scripts/probe.py` ordering. A single launch is not evidence.
 ## Stop and ask
 
 Use the existing bounded quiet-machine wait, or another duration approved before
-the run. If no machine passes, a startup milestone cannot be observed honestly,
-or no numeric threshold is approved, preserve the result as inconclusive and
-authorize no extraction; Goal 05 then takes its no-go path and product work may
-continue at Goal 05A/06. Ask only if the owner wants to delay product work for a
-new measurement environment rather than accept that conservative outcome.
+the run. If no machine passes, a model/network startup milestone cannot be
+observed honestly, or no model materiality threshold is approved, preserve that
+decision as inconclusive and authorize no extraction; Goal 05 then takes its
+no-go path and product work may continue at Goal 05A/06. Ask only if the owner
+wants to delay the model-transport decision for a new measurement environment.
 
 ## Boundary for the next goal
 
