@@ -12,5 +12,6 @@ The evaluation artifacts AS-01 and AS-02 are vendored from the
 - copyright: Copyright 2024-2026 Longbridge
 - license: Apache License 2.0
 
-The repository `LICENSE` contains the Apache License 2.0 terms. Redistribution
-must preserve this attribution and any applicable upstream notices.
+`snapshots/licenses/Apache-2.0.txt` fixes the Apache License 2.0 terms for this
+corpus version. Redistribution must preserve this attribution and any applicable
+upstream notices.

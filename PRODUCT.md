@@ -176,21 +176,38 @@ The initial reference configuration is:
 - one request per artifact, with the exact artifact bytes, configuration, and
   result retained in owner-local evaluation records when permitted.
 
-The checked-in evaluation set is immutable corpus version `goal-01-v1`. It is
-defined by
+The checked-in evaluation set is corpus version `goal-01-v1`. It is defined by
 `evaluation/goal-01/CORPUS.md` and fixed by
-`evaluation/goal-01/MANIFEST.sha256`. The final manifest hashes `CORPUS.md`,
-`OWNER-ANNOTATIONS.md`, `THIRD-PARTY-NOTICES.md`, the four task prompts, the
-four listed specification/plan artifacts, the two listed instruction documents,
-and every regular file below each of the two listed Agent Skill directories.
-Any hash-covered artifact, annotation, notice, provenance, or other corpus
-metadata change requires a new owner-approved corpus version; `goal-01-v1` is
-never updated in place. Exact wording is never compared. Goal 06 passes only when:
+`evaluation/goal-01/MANIFEST.sha256`. On 2026-08-29, the owner approved the
+single in-place migration exception recorded in
+`evaluation/goal-01/MIGRATION-EXCEPTION.md`: it replaced canonical-file
+references with a self-contained snapshot corpus and added the fixed scoring
+registry. That record retains original manifest-file SHA-256
+`c3deed707528c84107c55061ac069830b489e481811aac86afa9c10490bc6a8c`
+and original approved commit `03d5b9e3ae99e10db28bf8ce93c572d19b492ece`.
+
+The migrated manifest hashes `CORPUS.md`, `.gitattributes`,
+`OWNER-ANNOTATIONS.md`, `THIRD-PARTY-NOTICES.md`, `MIGRATION-EXCEPTION.md`,
+`SCORING.md`, the Apache-2.0 license snapshot, the four task prompts, four
+version-local goal snapshots, two version-local instruction snapshots, and
+every regular file in both complete Agent Skill snapshots. Its paths are all
+inside `evaluation/goal-01/`; later edits or moves of canonical sources cannot
+invalidate this corpus. The version-local Git attributes preserve the snapshot
+bytes without line-ending conversion or diff-time whitespace normalization.
+Immutability resumed after the migration: any later hash-covered artifact,
+annotation, notice, provenance, scoring item, or other corpus metadata change
+requires a new owner-approved corpus version, and `goal-01-v1` is never updated
+in place again.
+
+`evaluation/goal-01/SCORING.md` fixes 60 independently scorable high-impact
+items and requires at least 45 hits (`ceil(0.75 * 60)`). A hit requires
+equivalent grounded meaning; exact wording is never compared. Item boundaries
+and the denominator cannot change after results are seen. Goal 06 passes only when:
 
 1. all 12 results decode completely against the structured schema;
 2. at least 10 of 12 are judged useful by the project owner;
-3. at least 75% of the pre-annotated high-impact findings or questions are
-   surfaced with equivalent grounded meaning;
+3. at least 45 of the 60 pre-annotated high-impact findings or questions are
+   surfaced with equivalent grounded meaning under the fixed scoring registry;
 4. no result invents a source anchor;
 5. no more than one artifact contains a materially misleading finding;
 6. no result contains more than five clarification questions.
@@ -270,3 +287,9 @@ event summaries are deleted within 90 days after the `continue`, `revise`, or
   approved 2026-08-29 under the terms recorded in the corpus
 - Project-owner annotation set adopted and complete: 2026-08-29 in
   `evaluation/goal-01/OWNER-ANNOTATIONS.md`
+- One-time `goal-01-v1` in-place migration exception approved by the project
+  owner: 2026-08-29; original approved commit
+  `03d5b9e3ae99e10db28bf8ce93c572d19b492ece` and original manifest-file
+  SHA-256 `c3deed707528c84107c55061ac069830b489e481811aac86afa9c10490bc6a8c`
+  retained in `evaluation/goal-01/MIGRATION-EXCEPTION.md`; immutability resumed
+  after the migrated corpus and scoring registry were fixed.
