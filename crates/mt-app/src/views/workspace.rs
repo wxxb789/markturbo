@@ -11,9 +11,13 @@
 //! their methods to `Workspace` from there, so `self.web_dirty(cx)` reads the
 //! same here as it did before the split.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -34,16 +38,26 @@ use mt_doc::translate::Scope;
 
 use crate::fs;
 use crate::i18n;
+use crate::lifecycle::{
+    DestructiveAction, DestructiveRequest, DestructiveResolution, DirtyDecision, DocumentId,
+    DocumentLifecycle,
+};
 use crate::metrics;
+use crate::recovery::{
+    CancellableRecoveryCheckpointAttempt, CheckpointAttemptTiming, CheckpointBatchOutcome,
+    CheckpointSchedule, RecoveredRecord, RecoveryError, RecoveryKey, RecoveryMaintenance,
+    RecoveryRetirement, RecoveryRetirementBatch, RecoveryStore, RecoveryToken,
+    RetirementCompletion,
+};
 use crate::renderer::RendererRegistry;
 use crate::translate::Provider;
-use crate::views::document::{DocumentEvent, DocumentView};
+use crate::views::document::{DocumentEvent, DocumentView, PreparedRecovery, SaveMode};
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::harness::{HarnessEvent, HarnessView};
 use crate::views::search::{Corpus, SearchEvent, SearchView};
 use crate::views::settings_page::{SettingsEvent, SettingsView};
 use crate::views::tabs::Tabs;
-use crate::watcher::Watcher;
+use crate::watcher::{Change, Watcher};
 
 mod history;
 pub(crate) mod web_surface;
@@ -78,6 +92,7 @@ actions!(
 /// grows to its file name pushes every other tab off the bar, which is the
 /// failure this bounds — the full path is a hover away.
 const TAB_LABEL_MAX: usize = 22;
+const TAB_CLOSE_ACCESSIBILITY_ID: &str = "markturbo-document-tab-close";
 
 /// Shorten `name` to [`TAB_LABEL_MAX`], keeping the extension.
 ///
@@ -757,6 +772,23 @@ pub struct Workspace {
     history: History,
     registry: Arc<RendererRegistry>,
     watcher: Option<Watcher>,
+    recovery: Option<RecoveryStore>,
+    /// True until the startup recovery scan either completes or fails.
+    startup_recovery_pending: bool,
+    /// Original keys for documents opened before startup recovery is ready.
+    /// Save As observes the new path even though an older checkpoint still
+    /// belongs to the path that was open when startup began.
+    startup_recovery_keys: HashMap<crate::lifecycle::DocumentId, RecoveryKey>,
+    /// Explicit Save or Discard decisions that still need a durable marker.
+    /// `None` keeps unknown-origin work fail-closed for every destructive action.
+    pending_recovery_retirements: HashMap<RecoveryKey, Option<DocumentId>>,
+    recovery_retirements: HashMap<RecoveryKey, RecoveryRetirement>,
+    recovery_retirement_batches: HashMap<RecoveryKey, RecoveryRetirementBatch>,
+    recovery_retirement_retries: HashSet<RecoveryKey>,
+    recovery_schedules: HashMap<crate::lifecycle::DocumentId, DocumentRecoveryState>,
+    /// True while the one physical checkpoint batch owned by this workspace is running.
+    recovery_checkpoint_worker_active: bool,
+    recovery_warning: Option<String>,
     status: Option<String>,
     /// Bumped by every [`Workspace::set_status`], so a timer can tell whether
     /// the message it was started for is still the one on screen.
@@ -766,6 +798,12 @@ pub struct Workspace {
     /// One slot rather than a detached task per message: replacing it cancels
     /// the previous timer, which is the other half of the generation check.
     _status_timer: Option<Task<()>>,
+    /// One wake-up for the earliest dirty-buffer checkpoint deadline.
+    _recovery_timer: Option<Task<()>>,
+    /// Bumped whenever the single recovery wake-up is replaced or cancelled.
+    /// A task can wake while it is being dropped, so its generation is also
+    /// checked before it is allowed to dispatch background checkpoint work.
+    recovery_timer_generation: u64,
     /// The window's single WebView and what it is showing.
     ///
     /// One field rather than three, and no `#[cfg]` here: the platform split
@@ -797,7 +835,18 @@ pub struct Workspace {
     /// second request would overwrite the editor twice with two different
     /// answers to the same text.
     translating: bool,
+    /// Present while Save / Discard / Cancel is resolving a destructive action.
+    pending_destructive: Option<DestructiveRequest>,
+    /// A fully resolved action waiting only for startup recovery to expose the
+    /// guarded store needed to publish its durable retirement marker.
+    pending_startup_destructive: Option<PendingStartupDestructive>,
+    /// Recovery records handled by Save or Discard are retired only if the
+    /// destructive walk reaches a safe lifecycle boundary. A later Cancel
+    /// leaves every still-dirty buffer and its last checkpoint intact.
+    pending_destructive_recovery: Vec<(RecoveryKey, Option<DocumentId>)>,
     _tasks: Vec<Task<()>>,
+    #[cfg(test)]
+    _test_recovery_root: Option<tempfile::TempDir>,
     /// Subscriptions that live as long as the workspace does.
     ///
     /// Per-document subscriptions are *not* here — they ride in
@@ -818,6 +867,171 @@ struct DocumentTab {
     _subscriptions: [Subscription; 2],
 }
 
+struct DocumentRecoveryState {
+    key: RecoveryKey,
+    revision: u64,
+    suppressed_oversized_revision: Option<u64>,
+    token: Option<RecoveryToken>,
+    schedule: CheckpointSchedule,
+    in_flight: Option<RecoveryAttempt>,
+    /// The current due boundary has already cancelled or warned while the
+    /// physical workspace worker remains occupied.
+    deadline_reported: bool,
+    protection_warning: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryAttempt {
+    token: RecoveryToken,
+    revision: u64,
+    timing: CheckpointAttemptTiming,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RecoveryAttempt {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl PartialEq for RecoveryAttempt {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token
+            && self.revision == other.revision
+            && self.timing == other.timing
+            && Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+}
+
+impl Eq for RecoveryAttempt {}
+
+fn current_checkpoint_write_completed(
+    attempt_is_current: bool,
+    state_revision: u64,
+    attempt_revision: u64,
+    outcome: &CheckpointBatchOutcome,
+) -> bool {
+    attempt_is_current
+        && state_revision == attempt_revision
+        && matches!(outcome, CheckpointBatchOutcome::Written)
+}
+
+#[derive(Default)]
+struct StartupRecovery {
+    recovery: Option<RecoveryStore>,
+    documents: Vec<PreparedRecovery>,
+    recovery_issue_count: usize,
+    recovery_error: Option<String>,
+}
+
+struct PendingStartupDestructive {
+    request: DestructiveRequest,
+    keys: Vec<(RecoveryKey, Option<DocumentId>)>,
+}
+
+fn insert_scoped_recovery_key(
+    keys: &mut HashMap<RecoveryKey, Option<DocumentId>>,
+    key: RecoveryKey,
+    document_id: Option<DocumentId>,
+) -> Option<DocumentId> {
+    *keys
+        .entry(key)
+        .and_modify(|current| {
+            if *current != document_id {
+                *current = None;
+            }
+        })
+        .or_insert(document_id)
+}
+
+fn prepare_recovery_records(records: Vec<RecoveredRecord>) -> (Vec<PreparedRecovery>, usize) {
+    let mut documents = Vec::with_capacity(records.len());
+    let mut skipped = 0;
+    for recovered in records {
+        match DocumentView::prepare_recovery(recovered) {
+            Ok(document) => documents.push(document),
+            Err(_) => skipped += 1,
+        }
+    }
+    (documents, skipped)
+}
+
+/// Open, verify, and parse recovery data without making it a prerequisite for editing.
+fn startup_recovery() -> StartupRecovery {
+    #[cfg(not(test))]
+    {
+        match RecoveryStore::open() {
+            Ok((store, maintenance)) => match store.recover() {
+                Ok(scan) => {
+                    let scan_issues = scan.issues.len();
+                    let (documents, preparation_issues) = prepare_recovery_records(scan.records);
+                    StartupRecovery {
+                        recovery: Some(store),
+                        documents,
+                        recovery_issue_count: maintenance.issues.len()
+                            + scan_issues
+                            + preparation_issues,
+                        recovery_error: None,
+                    }
+                }
+                Err(error) => StartupRecovery {
+                    recovery: Some(store),
+                    recovery_issue_count: maintenance.issues.len(),
+                    recovery_error: Some(error.to_string()),
+                    ..StartupRecovery::default()
+                },
+            },
+            Err(error) => StartupRecovery {
+                recovery_error: Some(error.to_string()),
+                ..StartupRecovery::default()
+            },
+        }
+    }
+    #[cfg(test)]
+    {
+        // Tests install an explicit reversible protector when they need durable
+        // records; opening production DPAPI storage would make test state leak
+        // across runs and hide which records a test owns.
+        StartupRecovery::default()
+    }
+}
+
+fn startup_recovery_status(
+    restored: usize,
+    skipped: usize,
+    recovery_error: Option<&str>,
+) -> Option<String> {
+    let summary = (restored > 0 || skipped > 0).then(|| {
+        format!(
+            "Restored {restored} recovery checkpoint(s); skipped {skipped} unavailable or invalid record(s)."
+        )
+    });
+    match (recovery_error, summary) {
+        (Some(error), Some(summary)) => {
+            Some(format!("{error}. Editing remains available. {summary}"))
+        }
+        (Some(error), None) => Some(format!("{error}. Editing remains available.")),
+        (None, Some(summary)) => Some(summary),
+        (None, None) => None,
+    }
+}
+
+fn checkpoint_batch_status(maintenance_issues: usize, last_error: Option<&str>) -> Option<String> {
+    let maintenance = (maintenance_issues > 0).then(|| {
+        format!(
+            "Recovery skipped {maintenance_issues} malformed, oversized, expired, or unreadable record(s)."
+        )
+    });
+    match (last_error, maintenance) {
+        (Some(error), Some(maintenance)) => Some(format!(
+            "{error}. Editing and source files are unchanged. {maintenance}"
+        )),
+        (Some(error), None) => Some(format!("{error}. Editing and source files are unchanged.")),
+        (None, Some(maintenance)) => Some(maintenance),
+        (None, None) => None,
+    }
+}
+
 impl Workspace {
     /// Every open document, cloned.
     ///
@@ -836,6 +1050,18 @@ impl Workspace {
 impl Workspace {
     /// Create the workspace, opening `initial` if given.
     pub fn new(initial: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_startup_recovery(initial, startup_recovery, window, cx)
+    }
+
+    fn new_with_startup_recovery<F>(
+        initial: Option<PathBuf>,
+        load_startup_recovery: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self
+    where
+        F: FnOnce() -> StartupRecovery + Send + 'static,
+    {
         // Poll the watcher on a timer rather than blocking a thread on it: the
         // receiver is non-blocking and a UI tick is the natural cadence.
         let poll = cx.spawn(async move |this, cx| {
@@ -864,9 +1090,21 @@ impl Workspace {
             history: History::default(),
             registry: Arc::new(RendererRegistry::with_defaults()),
             watcher: None,
+            recovery: None,
+            startup_recovery_pending: true,
+            startup_recovery_keys: HashMap::new(),
+            pending_recovery_retirements: HashMap::new(),
+            recovery_retirements: HashMap::new(),
+            recovery_retirement_batches: HashMap::new(),
+            recovery_retirement_retries: HashSet::new(),
+            recovery_schedules: HashMap::new(),
+            recovery_checkpoint_worker_active: false,
+            recovery_warning: None,
             status: None,
             status_generation: 0,
             _status_timer: None,
+            _recovery_timer: None,
+            recovery_timer_generation: 0,
             settings_open: false,
             preferred_left_panel_width: metrics::SIDE_PANEL.resolve(viewport),
             preferred_right_panel_width: metrics::RIGHT_PANEL.resolve(viewport),
@@ -875,8 +1113,13 @@ impl Workspace {
             left_panel_open: true,
             right_panel_open: true,
             translating: false,
+            pending_destructive: None,
+            pending_startup_destructive: None,
+            pending_destructive_recovery: Vec::new(),
             web: WebSurface::default(),
             _tasks: vec![poll],
+            #[cfg(test)]
+            _test_recovery_root: None,
             _subscriptions: Vec::new(),
             _panel_subscriptions: Vec::new(),
         };
@@ -938,6 +1181,18 @@ impl Workspace {
                 cx.notify();
             }),
         );
+
+        // The OS close button is only a request. Returning false keeps the
+        // window alive while dirty documents walk the same decision boundary
+        // as Ctrl/Cmd-W and the tab control.
+        let workspace = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.request_window_close(window, cx)
+                })
+                .unwrap_or(true)
+        });
         // Following the system means following it *while running*, not only at
         // startup — someone whose OS flips at sunset expects the app to flip
         // with it. An explicit preference ignores the event.
@@ -969,6 +1224,7 @@ impl Workspace {
         // A path argument may name a file: open its parent as the workspace and
         // the file as the first tab, which is what "open this file with
         // markturbo" should do.
+        let mut initial_file = None;
         if let Some(path) = initial {
             let (root, file) = if path.is_dir() {
                 (Some(path), None)
@@ -978,10 +1234,15 @@ impl Workspace {
             if let Some(root) = root {
                 this.open_folder(root, window, cx);
             }
-            if let Some(file) = file.filter(|f| f.is_file()) {
-                this.open_file(file, window, cx);
-            }
+            initial_file = file.filter(|file| file.is_file());
         }
+        if let Some(file) = initial_file {
+            this.open_file(file, window, cx);
+        }
+        let startup_targets = this.startup_recovery_targets(cx);
+        cx.defer_in(window, move |this, window, cx| {
+            this.start_startup_recovery(load_startup_recovery, startup_targets, window, cx);
+        });
         this
     }
 
@@ -1081,14 +1342,19 @@ impl Workspace {
             && let Some(current) = self.tabs.take_preview()
             && let Some(ix) = self.tabs.index_of(&current)
         {
-            if self
-                .tabs
-                .get(ix)
-                .is_some_and(|t| t.payload.view.read(cx).is_dirty())
-            {
+            let preserve = self.tabs.get(ix).is_some_and(|tab| {
+                let document = tab.payload.view.read(cx);
+                let key = self
+                    .startup_recovery_keys
+                    .get(&document.id())
+                    .cloned()
+                    .unwrap_or_else(|| document.recovery_key());
+                document.is_dirty() || self.is_undurable_recovery_retirement(&key)
+            });
+            if preserve {
                 // Keep it: promoting beats losing unsaved work.
             } else {
-                self.close_tab(ix, cx);
+                self.close_tab_unchecked(ix, cx);
             }
         }
 
@@ -1128,19 +1394,65 @@ impl Workspace {
 
         let registry = self.registry.clone();
         let view = cx.new(|cx| DocumentView::new(file, registry, window, cx));
+        self.insert_document(path, view, window, cx);
+    }
 
+    fn insert_document(
+        &mut self,
+        path: PathBuf,
+        view: Entity<DocumentView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_document_with_recovery(path, view, true, window, cx);
+    }
+
+    fn insert_document_with_recovery(
+        &mut self,
+        path: PathBuf,
+        view: Entity<DocumentView>,
+        arm_dirty_recovery: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.startup_recovery_pending {
+            let document = view.read(cx);
+            self.startup_recovery_keys
+                .entry(document.id())
+                .or_insert_with(|| document.recovery_key());
+        }
         // Both subscriptions ride with the tab, so closing it drops them.
         let subscriptions = [
             cx.subscribe_in(
                 &view,
                 window,
-                |this: &mut Self, _, event: &DocumentEvent, _, cx| match event {
+                |this: &mut Self, document, event: &DocumentEvent, window, cx| match event {
                     DocumentEvent::Status(message) => this.set_status(message.clone(), cx),
                     DocumentEvent::Conflict => this.set_status(
                         "This file changed on disk. Reload or overwrite from the banner.".into(),
                         cx,
                     ),
-                    DocumentEvent::DirtyChanged => cx.notify(),
+                    DocumentEvent::SaveAsRequested => {
+                        let id = document.read(cx).id();
+                        this.prompt_save_as(id, window, cx);
+                    }
+                    DocumentEvent::Edited => {
+                        let key = document.read(cx).recovery_key();
+                        this.pending_recovery_retirements.remove(&key);
+                        this.arm_document_recovery(document, cx);
+                    }
+                    DocumentEvent::DirtyChanged => {
+                        if !document.read(cx).is_dirty() {
+                            let id = document.read(cx).id();
+                            let current_key = document.read(cx).recovery_key();
+                            let key = this
+                                .startup_recovery_keys
+                                .remove(&id)
+                                .unwrap_or(current_key);
+                            this.retire_document_recovery(id, Some(key), cx);
+                        }
+                        cx.notify();
+                    }
                     DocumentEvent::ScrollWebPreview(fraction) => {
                         this.queue_web_scroll(*fraction, cx)
                     }
@@ -1154,6 +1466,8 @@ impl Workspace {
             }),
         ];
 
+        let needs_recovery = view.read(cx).is_dirty();
+        let recovery_document = view.clone();
         self.tabs.push(
             path.clone(),
             DocumentTab {
@@ -1161,17 +1475,835 @@ impl Workspace {
                 _subscriptions: subscriptions,
             },
         );
+        // Recovered buffers are already dirty when their tab is inserted, so
+        // they have no subsequent editor event that could arm recovery.
+        if arm_dirty_recovery && needs_recovery {
+            self.arm_document_recovery(&recovery_document, cx);
+        }
         self.record_visit(path, 0);
         self.web_dirty(cx);
         cx.notify();
     }
 
-    fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
-        // ponytail: closing a dirty tab drops its edits. A confirm dialog is
-        // the obvious next step; the file on disk is never touched either way.
-        //
-        // `Tabs::close` also shifts the active index, empties the preview slot
-        // if it named this tab, and drops the tab's two subscriptions with it.
+    fn restore_prepared_recovery(
+        &mut self,
+        documents: Vec<PreparedRecovery>,
+        startup_targets: Option<&HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (usize, usize) {
+        let mut restored = 0;
+        let mut skipped = 0;
+        for prepared in documents {
+            let path = prepared.path().to_path_buf();
+            if let Some(ix) = self.tabs.index_of(&path) {
+                let Some(startup_targets) = startup_targets else {
+                    skipped += 1;
+                    continue;
+                };
+                let expected = startup_targets.get(&path).copied();
+
+                let document = self
+                    .document_at(ix)
+                    .cloned()
+                    .expect("an indexed recovery path must have a document");
+                let applied = document.update(cx, |document, cx| {
+                    if !document.can_accept_startup_recovery(expected) {
+                        return false;
+                    }
+                    document.apply_startup_recovery(prepared, window, cx);
+                    true
+                });
+                if applied {
+                    self.register_restored_recovery(&document, cx);
+                    restored += 1;
+                } else {
+                    skipped += 1;
+                }
+                continue;
+            }
+
+            let registry = self.registry.clone();
+            let view = cx.new(|cx| DocumentView::from_recovery(prepared, registry, window, cx));
+            self.insert_document_with_recovery(path, view.clone(), false, window, cx);
+            self.register_restored_recovery(&view, cx);
+            restored += 1;
+        }
+        (restored, skipped)
+    }
+
+    fn register_restored_recovery(
+        &mut self,
+        document: &Entity<DocumentView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self.recovery.clone() else {
+            return;
+        };
+        let (id, key, revision) = {
+            let document = document.read(cx);
+            (document.id(), document.recovery_key(), document.revision())
+        };
+        let (token, protection_warning) = store.activate_and_current_token(&key);
+        let mut schedule = CheckpointSchedule::default();
+        schedule.mark_durable_baseline(cx.background_executor().now());
+        self.recovery_schedules.insert(
+            id,
+            DocumentRecoveryState {
+                key,
+                revision,
+                suppressed_oversized_revision: None,
+                token: Some(token),
+                schedule,
+                in_flight: None,
+                deadline_reported: false,
+                protection_warning,
+            },
+        );
+        self.schedule_recovery_timer(cx);
+        self.refresh_recovery_warning(cx);
+    }
+
+    fn start_startup_recovery<F>(
+        &mut self,
+        load_startup_recovery: F,
+        startup_targets: HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce() -> StartupRecovery + Send + 'static,
+    {
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let startup = cx
+                .background_spawn(async move { load_startup_recovery() })
+                .await;
+            let startup = Arc::new(Mutex::new(Some((startup, startup_targets))));
+            loop {
+                let startup = startup.clone();
+                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
+                    let startup = startup
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some((startup, startup_targets)) = startup {
+                        this.restore_startup_recovery(startup, startup_targets, window, cx);
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        });
+        self._tasks.push(task);
+    }
+
+    fn startup_recovery_targets(
+        &self,
+        cx: &App,
+    ) -> HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let document = tab.payload.view.read(cx);
+                (tab.path.clone(), (document.id(), document.revision()))
+            })
+            .collect()
+    }
+
+    fn resume_recovery_destructive(
+        &mut self,
+        mut pending: PendingStartupDestructive,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match pending.request.revalidate(&self.lifecycle_documents(cx)) {
+            DestructiveResolution::Prompt(_) => {
+                self.rearm_dirty_recovery(cx);
+                self.pending_destructive_recovery.extend(pending.keys);
+                self.pending_destructive = Some(pending.request);
+                self.prompt_destructive(window, cx);
+            }
+            DestructiveResolution::Proceed(action) => self.perform_after_discard_retirement(
+                pending.request,
+                action,
+                pending.keys,
+                window,
+                cx,
+            ),
+            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
+                self.rearm_dirty_recovery(cx);
+            }
+        }
+    }
+
+    fn restore_startup_recovery(
+        &mut self,
+        mut startup: StartupRecovery,
+        startup_targets: HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        startup.documents.retain(|document| {
+            !self
+                .pending_recovery_retirements
+                .contains_key(&RecoveryKey::for_path(document.path()))
+        });
+        self.recovery = startup.recovery.take();
+        self.startup_recovery_pending = false;
+        self.startup_recovery_keys.clear();
+        let pending_startup_destructive = self.pending_startup_destructive.take();
+        let (restored, restore_skipped) =
+            self.restore_prepared_recovery(startup.documents, Some(&startup_targets), window, cx);
+        if let Some(status) = startup_recovery_status(
+            restored,
+            startup.recovery_issue_count + restore_skipped,
+            startup.recovery_error.as_deref(),
+        ) {
+            self.set_status(status, cx);
+        }
+        debug_assert!(!self.startup_recovery_pending);
+        log::debug!("recovery startup finished");
+        if self.recovery.is_none() {
+            if pending_startup_destructive.is_some()
+                || !self.pending_recovery_retirements.is_empty()
+            {
+                self.set_status(
+                    "Recovery storage is unavailable, so its checkpoint could not be cleared. The document remains open."
+                        .into(),
+                    cx,
+                );
+            }
+            return;
+        }
+
+        if let Some(pending) = pending_startup_destructive {
+            self.resume_recovery_destructive(pending, window, cx);
+        } else {
+            self.flush_pending_recovery_retirements(cx);
+        }
+        let dirty_documents: Vec<_> = self
+            .document_views()
+            .into_iter()
+            .filter(|document| {
+                let document = document.read(cx);
+                let key = document.recovery_key();
+                document.is_dirty()
+                    && !self.pending_recovery_retirements.contains_key(&key)
+                    && !self.recovery_retirements.contains_key(&key)
+                    && !self.recovery_retirement_batches.contains_key(&key)
+                    && self
+                        .recovery_schedules
+                        .get(&document.id())
+                        .is_none_or(|state| state.token.is_none())
+            })
+            .collect();
+        for document in dirty_documents {
+            self.arm_document_recovery(&document, cx);
+        }
+    }
+
+    fn flush_pending_recovery_retirements(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<_> = self
+            .pending_recovery_retirements
+            .iter()
+            .map(|(key, document_id)| (key.clone(), *document_id))
+            .collect();
+        for (key, document_id) in pending {
+            self.invalidate_recovery(&key, document_id, cx);
+        }
+    }
+
+    fn pending_recovery_keys(
+        &self,
+        action: &DestructiveAction,
+    ) -> Vec<(RecoveryKey, Option<DocumentId>)> {
+        self.pending_recovery_retirements
+            .iter()
+            .filter_map(|(key, document_id)| match action {
+                DestructiveAction::CloseTab(id) => (document_id.is_none()
+                    || *document_id == Some(*id))
+                .then(|| (key.clone(), *document_id)),
+                DestructiveAction::CloseWindow | DestructiveAction::ReplaceWorkspace(_) => {
+                    Some((key.clone(), *document_id))
+                }
+            })
+            .collect()
+    }
+
+    fn is_undurable_recovery_retirement(&self, key: &RecoveryKey) -> bool {
+        self.pending_recovery_retirements.contains_key(key)
+    }
+
+    fn lifecycle_documents(&self, cx: &App) -> Vec<DocumentLifecycle> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let document = tab.payload.view.read(cx);
+                DocumentLifecycle {
+                    id: document.id(),
+                    dirty: document.is_dirty(),
+                    snapshot: document.source_snapshot(cx),
+                }
+            })
+            .collect()
+    }
+
+    fn document_index(&self, id: crate::lifecycle::DocumentId, cx: &App) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.payload.view.read(cx).id() == id)
+    }
+
+    fn document_by_id(
+        &self,
+        id: crate::lifecycle::DocumentId,
+        cx: &App,
+    ) -> Option<Entity<DocumentView>> {
+        self.document_index(id, cx)
+            .and_then(|ix| self.document_at(ix).cloned())
+    }
+
+    fn request_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.document_at(ix).map(|document| document.read(cx).id()) else {
+            return;
+        };
+        let action = DestructiveAction::CloseTab(id);
+        if self.request_destructive(action.clone(), window, cx) {
+            self.perform_destructive(action, window, cx);
+        }
+    }
+
+    /// Return true only when the platform may close immediately.
+    fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.request_destructive(DestructiveAction::CloseWindow, window, cx)
+    }
+
+    fn request_workspace_replace(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let action = DestructiveAction::ReplaceWorkspace(path);
+        if self.request_destructive(action.clone(), window, cx) {
+            self.perform_destructive(action, window, cx);
+        }
+    }
+
+    /// Start one Save / Discard / Cancel walk. The return value means the
+    /// action has no dirty documents and can proceed synchronously.
+    fn request_destructive(
+        &mut self,
+        action: DestructiveAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.pending_destructive.is_some() || self.pending_startup_destructive.is_some() {
+            return false;
+        }
+        self.pending_destructive_recovery.clear();
+        let keys = self.pending_recovery_keys(&action);
+        let request = DestructiveRequest::new(action, &self.lifecycle_documents(cx));
+        match request.initial_resolution() {
+            DestructiveResolution::Proceed(action) => {
+                if keys.is_empty() {
+                    true
+                } else {
+                    self.perform_after_discard_retirement(request, action, keys, window, cx);
+                    false
+                }
+            }
+            DestructiveResolution::Prompt(_) => {
+                self.pending_destructive = Some(request);
+                self.prompt_destructive(window, cx);
+                false
+            }
+            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => false,
+        }
+    }
+
+    fn prompt_destructive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .pending_destructive
+            .as_ref()
+            .and_then(DestructiveRequest::current)
+        else {
+            return;
+        };
+        let Some(document) = self.document_by_id(id, cx) else {
+            self.resolve_destructive(DirtyDecision::Discard, window, cx);
+            return;
+        };
+        let title = document.read(cx).title(cx);
+        let message = format!("Save changes to {title}?");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some("Your changes will be lost if you discard them."),
+            &[
+                PromptButton::ok("Save"),
+                PromptButton::new("Discard"),
+                PromptButton::cancel("Cancel"),
+            ],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await.unwrap_or(2);
+            let decision = match answer {
+                0 => DirtyDecision::Save,
+                1 => DirtyDecision::Discard,
+                _ => DirtyDecision::Cancel,
+            };
+            loop {
+                if crate::views::try_update_in(&this, cx, |this, window, cx| {
+                    this.resolve_destructive(decision, window, cx);
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn resolve_destructive(
+        &mut self,
+        decision: DirtyDecision,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut request) = self.pending_destructive.take() else {
+            return;
+        };
+        let documents = self.lifecycle_documents(cx);
+        if !request.current_prompt_matches(&documents) {
+            match request.revalidate(&documents) {
+                DestructiveResolution::Prompt(_) => {
+                    self.pending_destructive = Some(request);
+                    self.prompt_destructive(window, cx);
+                }
+                DestructiveResolution::Proceed(action) => {
+                    let keys = std::mem::take(&mut self.pending_destructive_recovery);
+                    self.perform_after_discard_retirement(request, action, keys, window, cx);
+                }
+                DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {}
+            }
+            return;
+        }
+        let current = request.current();
+        let current_document = current.and_then(|id| self.document_by_id(id, cx));
+        let recovery_key = current_document
+            .as_ref()
+            .map(|document| document.read(cx).recovery_key());
+        let snapshot_before_save = current_document
+            .as_ref()
+            .map(|document| document.read(cx).source_snapshot(cx));
+        let save_succeeded = current_document.is_some_and(|document| {
+            decision == DirtyDecision::Save
+                && document.update(cx, |document, cx| document.save(SaveMode::Normal, cx))
+        });
+        let saved_snapshot = save_succeeded.then_some(snapshot_before_save).flatten();
+        let resolution = request.decide(decision, saved_snapshot, &self.lifecycle_documents(cx));
+        if let (Some(id), Some(key)) = (current, recovery_key)
+            && matches!(decision, DirtyDecision::Save | DirtyDecision::Discard)
+            && !matches!(
+                resolution,
+                DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_)
+            )
+        {
+            self.pending_destructive_recovery.push((key, Some(id)));
+        }
+        match resolution {
+            DestructiveResolution::Prompt(_) => {
+                self.pending_destructive = Some(request);
+                self.prompt_destructive(window, cx);
+            }
+            DestructiveResolution::Proceed(_action) => {
+                // The final scan is immediately before destruction. This is
+                // needed because another document can become dirty while a
+                // previous document's modal prompt is open.
+                match request.revalidate(&self.lifecycle_documents(cx)) {
+                    DestructiveResolution::Prompt(_) => {
+                        self.pending_destructive = Some(request);
+                        self.prompt_destructive(window, cx);
+                    }
+                    DestructiveResolution::Proceed(action) => {
+                        let keys = std::mem::take(&mut self.pending_destructive_recovery);
+                        self.perform_after_discard_retirement(request, action, keys, window, cx);
+                    }
+                    DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {}
+                }
+            }
+            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
+                self.pending_destructive_recovery.clear();
+            }
+        }
+    }
+
+    fn perform_after_discard_retirement(
+        &mut self,
+        request: DestructiveRequest,
+        action: DestructiveAction,
+        mut scoped_keys: Vec<(RecoveryKey, Option<DocumentId>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        scoped_keys.extend(self.pending_recovery_keys(&action));
+        let mut merged = HashMap::new();
+        for (key, document_id) in scoped_keys {
+            insert_scoped_recovery_key(&mut merged, key, document_id);
+        }
+        let scoped_keys: Vec<_> = merged.into_iter().collect();
+        let keys: Vec<_> = scoped_keys.iter().map(|(key, _)| key.clone()).collect();
+        if keys.iter().any(|key| {
+            self.pending_recovery_retirements.contains_key(key)
+                && (self.recovery_retirements.contains_key(key)
+                    || self.recovery_retirement_batches.contains_key(key))
+        }) {
+            self.schedule_destructive_retirement_continuation(
+                PendingStartupDestructive {
+                    request,
+                    keys: scoped_keys,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        let dirty_keys: HashSet<_> = self
+            .document_views()
+            .into_iter()
+            .filter_map(|document| {
+                let document = document.read(cx);
+                document.is_dirty().then(|| document.recovery_key())
+            })
+            .collect();
+        if keys.iter().any(|key| {
+            dirty_keys.contains(key)
+                && (self.recovery_retirements.contains_key(key)
+                    || self.recovery_retirement_batches.contains_key(key))
+        }) {
+            self.schedule_destructive_retirement_continuation(
+                PendingStartupDestructive {
+                    request,
+                    keys: scoped_keys,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        let scoped_keys: Vec<_> = scoped_keys
+            .into_iter()
+            .filter(|(key, _)| {
+                !self.recovery_retirements.contains_key(key)
+                    && !self.recovery_retirement_batches.contains_key(key)
+            })
+            .collect();
+        let keys: Vec<_> = scoped_keys.iter().map(|(key, _)| key.clone()).collect();
+        if keys
+            .iter()
+            .any(|key| self.recovery_retirement_retries.contains(key))
+        {
+            self.schedule_destructive_retirement_continuation(
+                PendingStartupDestructive {
+                    request,
+                    keys: scoped_keys,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        if keys.is_empty() {
+            self.perform_destructive(action, window, cx);
+            return;
+        }
+        let Some(store) = self.recovery.clone() else {
+            for (key, document_id) in &scoped_keys {
+                insert_scoped_recovery_key(
+                    &mut self.pending_recovery_retirements,
+                    key.clone(),
+                    *document_id,
+                );
+                self.remove_recovery_state_for_key(key, cx);
+            }
+            if self.startup_recovery_pending {
+                self.pending_startup_destructive = Some(PendingStartupDestructive {
+                    request,
+                    keys: scoped_keys,
+                });
+                self.set_status(
+                    "Waiting for recovery storage to clear its checkpoint. The document remains open."
+                        .into(),
+                    cx,
+                );
+            } else {
+                self.set_status(
+                    "Recovery storage is unavailable, so its checkpoint could not be cleared. The document remains open."
+                        .into(),
+                    cx,
+                );
+            }
+            return;
+        };
+
+        for (key, document_id) in &scoped_keys {
+            insert_scoped_recovery_key(
+                &mut self.pending_recovery_retirements,
+                key.clone(),
+                *document_id,
+            );
+        }
+        let now = cx.background_executor().now();
+        for key in &keys {
+            self.cancel_recovery_attempts_for_key(key, now);
+        }
+        let batch = match store.begin_retirements(keys.iter().cloned()) {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.rearm_dirty_recovery(cx);
+                self.set_status(
+                    format!(
+                        "Could not clear the recovery checkpoint: {error}. The document remains open."
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+        for key in &keys {
+            self.pending_recovery_retirements.remove(key);
+            self.recovery_retirement_batches
+                .insert(key.clone(), batch.clone());
+        }
+        self.pending_destructive = Some(request);
+        self.schedule_recovery_timer(cx);
+        self.refresh_recovery_warning(cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let completed_batch = batch.clone();
+            let completed = cx
+                .background_spawn(async move {
+                    let result = store.complete_retirements(batch.clone());
+                    if result.is_err() {
+                        store.abandon_retirements(&batch);
+                    }
+                    result
+                })
+                .await;
+            let completed = Arc::new(Mutex::new(Some((scoped_keys, completed_batch, completed))));
+            loop {
+                let completed_for_update = completed.clone();
+                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
+                    let completed = completed_for_update
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(completed) = completed {
+                        let (scoped_keys, batch, result) = completed;
+                        this.finish_discard_retirements(scoped_keys, batch, result, window, cx);
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn schedule_destructive_retirement_continuation(
+        &mut self,
+        pending: PendingStartupDestructive,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_startup_destructive = Some(pending);
+        self.set_status(
+            "Waiting for recovery checkpoint cleanup before continuing. The document remains open."
+                .into(),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            loop {
+                if crate::views::try_update_in(&this, cx, |this, window, cx| {
+                    if let Some(pending) = this.pending_startup_destructive.take() {
+                        this.resume_recovery_destructive(pending, window, cx);
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn finish_discard_retirements(
+        &mut self,
+        scoped_keys: Vec<(RecoveryKey, Option<DocumentId>)>,
+        batch: RecoveryRetirementBatch,
+        result: Result<RetirementCompletion, RecoveryError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keys: Vec<_> = scoped_keys.iter().map(|(key, _)| key.clone()).collect();
+        if keys
+            .iter()
+            .any(|key| self.recovery_retirement_batches.get(key) != Some(&batch))
+        {
+            if let Some(request) = self.pending_destructive.take() {
+                self.resume_recovery_destructive(
+                    PendingStartupDestructive {
+                        request,
+                        keys: scoped_keys,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
+        let Some(mut request) = self.pending_destructive.take() else {
+            return;
+        };
+
+        let mut wait_for_replayed_retirement = false;
+        let cleanup_error = match result {
+            Ok(RetirementCompletion::Retired { .. }) => {
+                self.finish_recovery_retirement_batch(&keys, &batch, cx);
+                wait_for_replayed_retirement = keys
+                    .iter()
+                    .any(|key| self.pending_recovery_retirements.contains_key(key));
+                None
+            }
+            Ok(RetirementCompletion::CleanupPending { error }) => {
+                self.schedule_recovery_retirement_batch_retry(keys.clone(), batch.clone(), cx);
+                Some(format!(
+                    "Recovery checkpoint was cleared, but cleanup remains pending: {error}"
+                ))
+            }
+            Err(error) => {
+                self.finish_recovery_retirement_batch(&keys, &batch, cx);
+                self.rearm_dirty_recovery(cx);
+                self.set_status(
+                    format!(
+                        "Could not clear the recovery checkpoint: {error}. The document remains open."
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+        if wait_for_replayed_retirement {
+            self.schedule_destructive_retirement_continuation(
+                PendingStartupDestructive {
+                    request,
+                    keys: scoped_keys,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+
+        match request.revalidate(&self.lifecycle_documents(cx)) {
+            DestructiveResolution::Prompt(_) => {
+                self.rearm_dirty_recovery(cx);
+                self.pending_destructive_recovery.extend(scoped_keys);
+                self.pending_destructive = Some(request);
+                self.prompt_destructive(window, cx);
+            }
+            DestructiveResolution::Proceed(action) => {
+                for (key, _) in scoped_keys {
+                    self.remove_recovery_state_for_key(&key, cx);
+                }
+                if let Some(error) = cleanup_error {
+                    self.set_status(error, cx);
+                }
+                self.perform_destructive(action, window, cx);
+            }
+            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
+                self.rearm_dirty_recovery(cx);
+            }
+        }
+    }
+
+    fn rearm_dirty_recovery(&mut self, cx: &mut Context<Self>) {
+        let dirty: Vec<_> = self
+            .document_views()
+            .into_iter()
+            .filter(|document| document.read(cx).is_dirty())
+            .collect();
+        for document in dirty {
+            self.arm_document_recovery(&document, cx);
+        }
+    }
+
+    fn perform_destructive(
+        &mut self,
+        action: DestructiveAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            DestructiveAction::CloseTab(id) => {
+                if let Some(ix) = self.document_index(id, cx) {
+                    self.close_tab_unchecked(ix, cx);
+                }
+            }
+            DestructiveAction::CloseWindow => window.remove_window(),
+            DestructiveAction::ReplaceWorkspace(path) => {
+                while !self.tabs.is_empty() {
+                    self.close_tab_unchecked(self.tabs.len() - 1, cx);
+                }
+                self.open_folder(path, window, cx);
+            }
+        }
+    }
+
+    fn close_tab_unchecked(&mut self, ix: usize, cx: &mut Context<Self>) {
+        // `Tabs::close` shifts the active index, empties the preview slot if it
+        // named this tab, and drops the tab's subscriptions with it. Callers
+        // reach this only after the destructive interlock has granted access.
+        let recovery_id = self.document_at(ix).map(|document| document.read(cx).id());
+        if let Some(id) = recovery_id {
+            // A close is the last intentional lifecycle decision for this
+            // buffer. Cancel its deadline before invalidating any checkpoint
+            // capability held by an already-running worker.
+            self.retire_document_recovery(id, None, cx);
+        }
         let Some((closed, _dropped)) = self.tabs.close(ix) else {
             return;
         };
@@ -1364,10 +2496,915 @@ impl Workspace {
         }));
     }
 
+    fn refresh_recovery_warning(&mut self, cx: &mut Context<Self>) {
+        let warning = self
+            .recovery_schedules
+            .values()
+            .any(|state| state.protection_warning)
+            .then(|| {
+                "Recovery protection is unavailable for at least one dirty document. Editing and source files are unchanged."
+                    .to_string()
+            });
+        if self.recovery_warning != warning {
+            self.recovery_warning = warning;
+            cx.notify();
+        }
+    }
+
+    /// Remove one document's deadline before invalidating checkpoint work.
+    fn remove_recovery_schedule(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        cx: &mut Context<Self>,
+    ) -> Option<RecoveryKey> {
+        let key = self.recovery_schedules.remove(&id).map(|state| {
+            if let Some(attempt) = &state.in_flight {
+                attempt.cancel();
+            }
+            state.key
+        });
+        self.schedule_recovery_timer(cx);
+        self.refresh_recovery_warning(cx);
+        key
+    }
+
+    /// Invalidate in-flight checkpoint capabilities before deleting durable data.
+    fn invalidate_recovery(
+        &mut self,
+        key: &RecoveryKey,
+        document_id: Option<DocumentId>,
+        cx: &mut Context<Self>,
+    ) {
+        let document_id = insert_scoped_recovery_key(
+            &mut self.pending_recovery_retirements,
+            key.clone(),
+            document_id,
+        );
+        let had_owner = self.recovery_retirements.contains_key(key)
+            || self.recovery_retirement_batches.contains_key(key);
+        let Some(store) = self.recovery.clone() else {
+            return;
+        };
+        let ticket = match store.begin_retirement(key) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.set_status(
+                    format!("Could not clear the recovery checkpoint: {error}"),
+                    cx,
+                );
+                if !had_owner {
+                    self.schedule_recovery_retirement_retry(key.clone(), cx);
+                }
+                return;
+            }
+        };
+        self.pending_recovery_retirements.remove(key);
+        let stale_batch = self.recovery_retirement_batches.get(key).cloned();
+        let stale_batch_keys: Vec<_> = stale_batch
+            .as_ref()
+            .map(|batch| {
+                self.recovery_retirement_batches
+                    .iter()
+                    .filter(|(_, current)| *current == batch)
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for stale_key in &stale_batch_keys {
+            self.recovery_retirement_batches.remove(stale_key);
+            self.recovery_retirement_retries.remove(stale_key);
+        }
+        self.recovery_retirements
+            .insert(key.clone(), ticket.clone());
+        self.spawn_recovery_retirement_completion(
+            key.clone(),
+            ticket,
+            document_id,
+            Duration::ZERO,
+            cx,
+        );
+        for stale_key in stale_batch_keys {
+            if stale_key != *key
+                && let Some(&document_id) = self.pending_recovery_retirements.get(&stale_key)
+            {
+                self.invalidate_recovery(&stale_key, document_id, cx);
+            }
+        }
+    }
+
+    fn spawn_recovery_retirement_completion(
+        &mut self,
+        key: RecoveryKey,
+        ticket: RecoveryRetirement,
+        document_id: Option<DocumentId>,
+        delay: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self.recovery.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let completed_ticket = ticket.clone();
+            let result = cx
+                .background_spawn(async move {
+                    let result = store.complete_retirement(ticket.clone());
+                    if result.is_err() {
+                        store.abandon_retirement(&ticket);
+                    }
+                    result
+                })
+                .await;
+            let result = Arc::new(Mutex::new(Some(result)));
+            loop {
+                let key = key.clone();
+                let ticket = completed_ticket.clone();
+                let result_for_update = result.clone();
+                if crate::views::try_update(&this, cx, move |this, cx| {
+                    if this.recovery_retirements.get(&key) != Some(&ticket) {
+                        return;
+                    }
+                    let result = result_for_update
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(result) = result {
+                        this.finish_recovery_retirement(key, ticket, document_id, result, cx);
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn finish_recovery_retirement(
+        &mut self,
+        key: RecoveryKey,
+        ticket: RecoveryRetirement,
+        document_id: Option<DocumentId>,
+        result: Result<RetirementCompletion, RecoveryError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.recovery_retirements.get(&key) != Some(&ticket) {
+            return;
+        }
+        self.recovery_retirement_retries.remove(&key);
+        match result {
+            Ok(RetirementCompletion::Retired { .. }) => {
+                self.recovery_retirements.remove(&key);
+                if let Some(&document_id) = self.pending_recovery_retirements.get(&key) {
+                    self.invalidate_recovery(&key, document_id, cx);
+                }
+            }
+            Ok(RetirementCompletion::CleanupPending { error }) => {
+                self.set_status(
+                    format!(
+                        "Recovery checkpoint was cleared, but cleanup remains pending: {error}"
+                    ),
+                    cx,
+                );
+                self.schedule_recovery_retirement_completion_retry(key, ticket, document_id, cx);
+            }
+            Err(error) => {
+                self.recovery_retirements.remove(&key);
+                insert_scoped_recovery_key(
+                    &mut self.pending_recovery_retirements,
+                    key.clone(),
+                    document_id,
+                );
+                self.set_status(
+                    format!("Could not clear the recovery checkpoint: {error}"),
+                    cx,
+                );
+                self.schedule_recovery_retirement_retry(key, cx);
+            }
+        }
+    }
+
+    fn schedule_recovery_retirement_completion_retry(
+        &mut self,
+        key: RecoveryKey,
+        ticket: RecoveryRetirement,
+        document_id: Option<DocumentId>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.recovery_retirement_retries.insert(key.clone()) {
+            return;
+        }
+        self.spawn_recovery_retirement_completion(
+            key,
+            ticket,
+            document_id,
+            Duration::from_secs(1),
+            cx,
+        );
+    }
+
+    fn finish_recovery_retirement_batch(
+        &mut self,
+        keys: &[RecoveryKey],
+        batch: &RecoveryRetirementBatch,
+        cx: &mut Context<Self>,
+    ) {
+        if keys
+            .iter()
+            .any(|key| self.recovery_retirement_batches.get(key) != Some(batch))
+        {
+            return;
+        }
+        for key in keys {
+            self.recovery_retirement_batches.remove(key);
+            self.recovery_retirement_retries.remove(key);
+        }
+        let queued: Vec<_> = keys
+            .iter()
+            .filter_map(|key| {
+                self.pending_recovery_retirements
+                    .get(key)
+                    .map(|document_id| (key.clone(), *document_id))
+            })
+            .collect();
+        for (key, document_id) in queued {
+            self.invalidate_recovery(&key, document_id, cx);
+        }
+    }
+
+    fn schedule_recovery_retirement_batch_retry(
+        &mut self,
+        keys: Vec<RecoveryKey>,
+        batch: RecoveryRetirementBatch,
+        cx: &mut Context<Self>,
+    ) {
+        if keys.is_empty()
+            || keys
+                .iter()
+                .any(|key| self.recovery_retirement_retries.contains(key))
+        {
+            return;
+        }
+        let Some(store) = self.recovery.clone() else {
+            return;
+        };
+        self.recovery_retirement_retries
+            .extend(keys.iter().cloned());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(1))
+                .await;
+            let completed_batch = batch.clone();
+            let result = cx
+                .background_spawn(async move {
+                    let result = store.complete_retirements(batch.clone());
+                    if result.is_err() {
+                        store.abandon_retirements(&batch);
+                    }
+                    result
+                })
+                .await;
+            let completed = Arc::new(Mutex::new(Some((keys, completed_batch, result))));
+            loop {
+                let completed_for_update = completed.clone();
+                if crate::views::try_update(&this, cx, move |this, cx| {
+                    let completed = completed_for_update
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some((keys, batch, result)) = completed {
+                        if keys.iter().any(|key| {
+                            this.recovery_retirement_batches.get(key) != Some(&batch)
+                        }) {
+                            return;
+                        }
+                        for key in &keys {
+                            this.recovery_retirement_retries.remove(key);
+                        }
+                        match result {
+                            Ok(RetirementCompletion::Retired { .. }) => {
+                                this.finish_recovery_retirement_batch(&keys, &batch, cx);
+                            }
+                            Ok(RetirementCompletion::CleanupPending { error }) => {
+                                this.set_status(
+                                    format!(
+                                        "Recovery checkpoint was cleared, but cleanup remains pending: {error}"
+                                    ),
+                                    cx,
+                                );
+                                this.schedule_recovery_retirement_batch_retry(keys, batch, cx);
+                            }
+                            Err(error) => {
+                                this.finish_recovery_retirement_batch(&keys, &batch, cx);
+                                this.rearm_dirty_recovery(cx);
+                                this.set_status(
+                                    format!(
+                                        "Could not finish recovery checkpoint cleanup: {error}"
+                                    ),
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn schedule_recovery_retirement_retry(&mut self, key: RecoveryKey, cx: &mut Context<Self>) {
+        if !self.recovery_retirement_retries.insert(key.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            loop {
+                let key = key.clone();
+                if crate::views::try_update(&this, cx, move |this, cx| {
+                    let pending = this.pending_recovery_retirements.get(&key).copied();
+                    let owned = this.recovery_retirements.contains_key(&key)
+                        || this.recovery_retirement_batches.contains_key(&key);
+                    if owned {
+                        return;
+                    }
+                    this.recovery_retirement_retries.remove(&key);
+                    if let Some(document_id) = pending {
+                        this.invalidate_recovery(&key, document_id, cx);
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn retire_document_recovery(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        fallback_key: Option<RecoveryKey>,
+        cx: &mut Context<Self>,
+    ) -> Option<RecoveryKey> {
+        let key = self.remove_recovery_schedule(id, cx).or(fallback_key);
+        if let Some(key) = &key {
+            self.invalidate_recovery(key, Some(id), cx);
+        }
+        key
+    }
+
+    fn cancel_recovery_attempts_for_key(&mut self, key: &RecoveryKey, now: Instant) {
+        for state in self
+            .recovery_schedules
+            .values_mut()
+            .filter(|state| state.key == *key)
+        {
+            if let Some(attempt) = state.in_flight.take() {
+                attempt.cancel();
+                if now >= attempt.timing.durable_complete_by {
+                    state
+                        .schedule
+                        .checkpoint_deadline_missed(attempt.timing, now);
+                    state.protection_warning = true;
+                } else {
+                    state.schedule.checkpoint_cancelled(attempt.timing, now);
+                }
+            }
+            state.token = None;
+        }
+    }
+
+    fn remove_recovery_state_for_key(&mut self, key: &RecoveryKey, cx: &mut Context<Self>) {
+        self.recovery_schedules.retain(|_, state| {
+            if state.key == *key {
+                if let Some(attempt) = &state.in_flight {
+                    attempt.cancel();
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.schedule_recovery_timer(cx);
+        self.refresh_recovery_warning(cx);
+    }
+
+    fn arm_document_recovery(&mut self, document: &Entity<DocumentView>, cx: &mut Context<Self>) {
+        self.arm_document_recovery_at(document, cx.background_executor().now(), cx);
+    }
+
+    fn arm_document_recovery_at(
+        &mut self,
+        document: &Entity<DocumentView>,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.recovery.clone();
+        let (id, revision, key) = {
+            let document = document.read(cx);
+            (document.id(), document.revision(), document.recovery_key())
+        };
+        let replaced_key = self.recovery_schedules.get_mut(&id).and_then(|state| {
+            (state.key != key).then(|| {
+                if let Some(attempt) = &state.in_flight {
+                    attempt.cancel();
+                }
+                state.key.clone()
+            })
+        });
+        if let Some(previous_key) = replaced_key {
+            self.invalidate_recovery(&previous_key, Some(id), cx);
+        }
+        match self.recovery_schedules.entry(id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut schedule = CheckpointSchedule::default();
+                schedule.mark_dirty(now);
+                let (token, protection_warning) = store.as_ref().map_or((None, false), |store| {
+                    let (token, deferred) = store.activate_and_current_token(&key);
+                    (Some(token), deferred)
+                });
+                entry.insert(DocumentRecoveryState {
+                    key,
+                    revision,
+                    suppressed_oversized_revision: None,
+                    token,
+                    schedule,
+                    in_flight: None,
+                    deadline_reported: false,
+                    protection_warning,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                if state.key != key {
+                    if let Some(attempt) = &state.in_flight {
+                        attempt.cancel();
+                    }
+                    state.key = key.clone();
+                    let (token, protection_warning) =
+                        store.as_ref().map_or((None, false), |store| {
+                            let (token, deferred) = store.activate_and_current_token(&key);
+                            (Some(token), deferred)
+                        });
+                    state.token = token;
+                    state.schedule = CheckpointSchedule::default();
+                    state.in_flight = None;
+                    state.deadline_reported = false;
+                    state.suppressed_oversized_revision = None;
+                    state.protection_warning = protection_warning;
+                } else if state.revision != revision {
+                    if let Some(attempt) = &state.in_flight {
+                        attempt.cancel();
+                    }
+                    if state.suppressed_oversized_revision.take().is_some() {
+                        state.schedule = CheckpointSchedule::default();
+                    }
+                }
+                if state.token.is_none()
+                    && let Some(store) = &store
+                {
+                    let (token, protection_deferred) = store.activate_and_current_token(&key);
+                    state.token = Some(token);
+                    state.protection_warning |= protection_deferred;
+                }
+                state.revision = revision;
+                state.schedule.mark_dirty(now);
+            }
+        }
+        self.schedule_recovery_timer(cx);
+        self.refresh_recovery_warning(cx);
+    }
+
+    fn schedule_recovery_timer(&mut self, cx: &mut Context<Self>) {
+        self.recovery_timer_generation = self.recovery_timer_generation.wrapping_add(1);
+        let generation = self.recovery_timer_generation;
+        // Dropping the previous task is the primary cancellation mechanism;
+        // `generation` also protects the narrow race where it wakes first.
+        self._recovery_timer = None;
+        let recovery_available = self.recovery.is_some();
+        let worker_active = self.recovery_checkpoint_worker_active;
+        let now = cx.background_executor().now();
+        let Some(deadline) = self
+            .recovery_schedules
+            .values()
+            .filter_map(|state| match &state.in_flight {
+                _ if state.suppressed_oversized_revision == Some(state.revision) => None,
+                Some(attempt) if !state.deadline_reported => {
+                    Some(attempt.timing.durable_complete_by)
+                }
+                Some(_) => None,
+                None if worker_active && state.deadline_reported => None,
+                None if recovery_available || !state.protection_warning => {
+                    state.schedule.next_deadline()
+                }
+                None => None,
+            })
+            .min()
+        else {
+            return;
+        };
+        let delay = deadline.saturating_duration_since(now);
+        self._recovery_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            loop {
+                if crate::views::try_update(&this, cx, |this, cx| {
+                    if this.recovery_timer_generation != generation {
+                        return;
+                    }
+                    this._recovery_timer = None;
+                    this.checkpoint_recovery(cx);
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        }));
+    }
+
+    fn checkpoint_recovery(&mut self, cx: &mut Context<Self>) {
+        self.checkpoint_recovery_at(cx.background_executor().now(), cx);
+    }
+
+    fn checkpoint_recovery_at(&mut self, now: Instant, cx: &mut Context<Self>) {
+        let Some(store) = self.recovery.clone() else {
+            for state in self.recovery_schedules.values_mut() {
+                if state.in_flight.is_none() && state.schedule.is_due(now) {
+                    state.protection_warning = true;
+                }
+            }
+            self.refresh_recovery_warning(cx);
+            self.schedule_recovery_timer(cx);
+            return;
+        };
+        let documents = self.document_views();
+        let worker_active = self.recovery_checkpoint_worker_active;
+        let mut open_ids = HashSet::new();
+        let mut active_keys = HashSet::new();
+        let mut due = Vec::new();
+        let mut preflight_error = None;
+
+        for document in documents {
+            let (id, dirty, revision, key, text_byte_len) = {
+                let document = document.read(cx);
+                (
+                    document.id(),
+                    document.is_dirty(),
+                    document.revision(),
+                    document.recovery_key(),
+                    document.text_byte_len(cx),
+                )
+            };
+            open_ids.insert(id);
+            if !dirty {
+                if let Some(state) = self.recovery_schedules.remove(&id) {
+                    self.invalidate_recovery(&state.key, Some(id), cx);
+                }
+                continue;
+            }
+            active_keys.insert(key.clone());
+
+            let replaced_key = self.recovery_schedules.get_mut(&id).and_then(|state| {
+                (state.key != key).then(|| {
+                    if let Some(attempt) = &state.in_flight {
+                        attempt.cancel();
+                    }
+                    state.key.clone()
+                })
+            });
+            if let Some(previous_key) = replaced_key {
+                self.invalidate_recovery(&previous_key, Some(id), cx);
+            }
+            let state = self.recovery_schedules.entry(id).or_insert_with(|| {
+                let mut schedule = CheckpointSchedule::default();
+                schedule.mark_dirty(now);
+                let (token, protection_warning) = store.activate_and_current_token(&key);
+                DocumentRecoveryState {
+                    key: key.clone(),
+                    revision,
+                    suppressed_oversized_revision: None,
+                    token: Some(token),
+                    schedule,
+                    in_flight: None,
+                    deadline_reported: false,
+                    protection_warning,
+                }
+            });
+            if state.key != key {
+                if let Some(attempt) = &state.in_flight {
+                    attempt.cancel();
+                }
+                state.key = key.clone();
+                state.revision = revision;
+                let (token, protection_warning) = store.activate_and_current_token(&key);
+                state.token = Some(token);
+                state.schedule = CheckpointSchedule::default();
+                state.schedule.mark_dirty(now);
+                state.in_flight = None;
+                state.deadline_reported = false;
+                state.suppressed_oversized_revision = None;
+                state.protection_warning = protection_warning;
+            } else if state.revision != revision {
+                if let Some(attempt) = &state.in_flight {
+                    attempt.cancel();
+                }
+                state.revision = revision;
+                if state.suppressed_oversized_revision.take().is_some() {
+                    state.schedule = CheckpointSchedule::default();
+                }
+                state.schedule.mark_dirty(now);
+            }
+            if let Some(attempt) = state.in_flight.as_ref()
+                && now >= attempt.timing.durable_complete_by
+                && !state.deadline_reported
+            {
+                let timing = attempt.timing;
+                attempt.cancel();
+                state.schedule.checkpoint_deadline_missed(timing, now);
+                state.deadline_reported = true;
+                state.protection_warning = true;
+            }
+            if state.in_flight.is_none() && state.schedule.is_due(now) {
+                if state.suppressed_oversized_revision == Some(revision) {
+                    continue;
+                }
+                if worker_active {
+                    state.deadline_reported = true;
+                    state.protection_warning = true;
+                    continue;
+                }
+                let plaintext_ceiling = store.plaintext_admission_ceiling();
+                if text_byte_len as u64 > plaintext_ceiling {
+                    state.suppressed_oversized_revision = Some(revision);
+                    state.protection_warning = true;
+                    preflight_error = Some(
+                        RecoveryError::OversizedCheckpoint {
+                            bytes: text_byte_len as u64,
+                            limit: plaintext_ceiling,
+                        }
+                        .to_string(),
+                    );
+                    continue;
+                }
+                // Capture the generation immediately before dispatch. A later
+                // Save or Discard invalidates it before deleting the record.
+                state.token = Some(store.current_token(&state.key));
+                let timing = state
+                    .schedule
+                    .checkpoint_dispatched(now)
+                    .expect("a due dirty recovery schedule must produce attempt timing");
+                let attempt = RecoveryAttempt {
+                    token: state
+                        .token
+                        .clone()
+                        .expect("a ready recovery store must provide a checkpoint token"),
+                    revision,
+                    timing,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                };
+                state.in_flight = Some(attempt.clone());
+                state.deadline_reported = false;
+                due.push((id, attempt, document.read(cx).recovery_checkpoint(cx)));
+            }
+        }
+        self.recovery_schedules
+            .retain(|id, _| open_ids.contains(id));
+        self.refresh_recovery_warning(cx);
+        if let Some(error) = preflight_error {
+            self.set_status(
+                checkpoint_batch_status(0, Some(&error))
+                    .expect("a checkpoint error must produce visible status"),
+                cx,
+            );
+        }
+        if due.is_empty() {
+            self.schedule_recovery_timer(cx);
+            return;
+        }
+
+        debug_assert!(!self.recovery_checkpoint_worker_active);
+        self.recovery_checkpoint_worker_active = true;
+        self.schedule_recovery_timer(cx);
+
+        cx.spawn(async move |this, cx| {
+            let background_executor = cx.background_executor().clone();
+            let batch = cx
+                .background_spawn(async move {
+                    let batch = store.checkpoint_batch_if_current_cancellable(
+                        due.iter().map(|(_, attempt, checkpoint)| {
+                            CancellableRecoveryCheckpointAttempt {
+                                checkpoint,
+                                token: &attempt.token,
+                                cancelled: attempt.cancelled.as_ref(),
+                            }
+                        }),
+                        &active_keys,
+                    );
+                    let store_returned_at = background_executor.now();
+                    let results = due
+                        .into_iter()
+                        .zip(batch.outcomes)
+                        .map(|((id, attempt, _), outcome)| (id, attempt, outcome))
+                        .collect::<Vec<_>>();
+                    (results, batch.maintenance, store_returned_at)
+                })
+                .await;
+
+            let batch = Arc::new(Mutex::new(Some(batch)));
+            loop {
+                let batch = batch.clone();
+                if crate::views::try_update(&this, cx, move |this, cx| {
+                    let batch = batch
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some((results, maintenance, store_returned_at)) = batch {
+                        this.finish_recovery_checkpoints(
+                            results,
+                            maintenance,
+                            store_returned_at,
+                            cx,
+                        );
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn finish_recovery_checkpoints(
+        &mut self,
+        results: Vec<(
+            crate::lifecycle::DocumentId,
+            RecoveryAttempt,
+            CheckpointBatchOutcome,
+        )>,
+        maintenance: RecoveryMaintenance,
+        store_returned_at: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let now = cx.background_executor().now();
+        let worker_released = std::mem::take(&mut self.recovery_checkpoint_worker_active);
+        let maintenance_issues = maintenance.issues.len();
+        let mut last_error = None;
+        for (id, attempt, outcome) in results {
+            let attempt_is_current = self
+                .recovery_schedules
+                .get(&id)
+                .is_some_and(|state| state.in_flight.as_ref() == Some(&attempt));
+            let written_revision_is_current =
+                self.recovery_schedules.get(&id).is_some_and(|state| {
+                    current_checkpoint_write_completed(
+                        attempt_is_current,
+                        state.revision,
+                        attempt.revision,
+                        &outcome,
+                    )
+                });
+            if let Some(state) = self.recovery_schedules.get_mut(&id)
+                && attempt_is_current
+            {
+                let current = state
+                    .in_flight
+                    .take()
+                    .expect("the current recovery attempt must still be in flight");
+                let deadline_reported = std::mem::take(&mut state.deadline_reported);
+                let oversized_revision_is_current = state.revision == current.revision
+                    && matches!(
+                        &outcome,
+                        CheckpointBatchOutcome::Failed(RecoveryError::OversizedCheckpoint { .. })
+                    );
+                if oversized_revision_is_current {
+                    state.suppressed_oversized_revision = Some(current.revision);
+                    state.protection_warning = true;
+                } else if store_returned_at > current.timing.durable_complete_by {
+                    if !deadline_reported {
+                        state
+                            .schedule
+                            .checkpoint_deadline_missed(current.timing, store_returned_at);
+                    }
+                    state.protection_warning = true;
+                } else {
+                    match &outcome {
+                        CheckpointBatchOutcome::Written => {
+                            if deadline_reported && state.revision == current.revision {
+                                state
+                                    .schedule
+                                    .mark_durable_baseline(current.timing.snapshot_at);
+                            } else if !deadline_reported {
+                                state.schedule.checkpoint_written(current.timing);
+                            }
+                            if state.revision == current.revision {
+                                state.protection_warning = false;
+                            }
+                        }
+                        CheckpointBatchOutcome::Superseded if !deadline_reported => {
+                            if current.cancelled.load(Ordering::Acquire) {
+                                state
+                                    .schedule
+                                    .checkpoint_cancelled(current.timing, store_returned_at);
+                            } else {
+                                state.schedule.checkpoint_superseded(current.timing);
+                            }
+                        }
+                        CheckpointBatchOutcome::Failed(_) | CheckpointBatchOutcome::Deferred
+                            if !deadline_reported =>
+                        {
+                            state
+                                .schedule
+                                .checkpoint_failed(current.timing, store_returned_at);
+                            state.protection_warning = true;
+                        }
+                        CheckpointBatchOutcome::Superseded
+                        | CheckpointBatchOutcome::Failed(_)
+                        | CheckpointBatchOutcome::Deferred => {}
+                    }
+                }
+            }
+            match outcome {
+                CheckpointBatchOutcome::Written if written_revision_is_current => {
+                    log::debug!("recovery checkpoint written")
+                }
+                CheckpointBatchOutcome::Failed(error) if attempt_is_current => {
+                    last_error = Some(error.to_string())
+                }
+                CheckpointBatchOutcome::Written
+                | CheckpointBatchOutcome::Superseded
+                | CheckpointBatchOutcome::Deferred
+                | CheckpointBatchOutcome::Failed(_) => {}
+            }
+        }
+
+        if let Some(status) = checkpoint_batch_status(maintenance_issues, last_error.as_deref()) {
+            self.set_status(status, cx);
+        }
+        self.refresh_recovery_warning(cx);
+        if worker_released {
+            self.checkpoint_recovery_at(now, cx);
+        } else {
+            self.schedule_recovery_timer(cx);
+        }
+    }
+
     /// Apply pending filesystem changes.
     fn drain_watcher(&mut self, cx: &mut Context<Self>) {
         let Some(watcher) = &self.watcher else { return };
+        let root = watcher.root().to_path_buf();
         let changes = watcher.poll();
+        self.apply_watcher_changes(&root, &changes, cx);
+    }
+
+    /// Apply already-classified filesystem events. Keeping this separate from
+    /// polling makes the document safety decision deterministic: the watcher
+    /// owns OS delivery timing, while the workspace owns what a change means.
+    fn apply_watcher_changes(
+        &mut self,
+        watcher_root: &Path,
+        changes: &[Change],
+        cx: &mut Context<Self>,
+    ) {
         if changes.is_empty() {
             return;
         }
@@ -1382,7 +3419,7 @@ impl Workspace {
         let harness_changed = removed_artifact
             || changes
                 .iter()
-                .any(|change| path_affects_harness(watcher.root(), change.path()));
+                .any(|change| path_affects_harness(watcher_root, change.path()));
 
         // Every open document whose file changed. With auto-reload off, the
         // flag and its banner are the whole response — the user's unsaved edits
@@ -1395,19 +3432,26 @@ impl Workspace {
         // run on a background task, because markdown-rs is superlinear and this
         // fires on every external write. A document that goes dirty while that
         // parse runs is flagged by the task itself when the result lands.
-        let auto_reload = crate::settings::AppSettings::global(cx).watch_auto_reload;
-        for change in &changes {
-            let path = change.path();
-            // Cloned: `self.documents` cannot stay borrowed across the `&mut cx`
-            // that leasing each entity takes.
-            for doc in self.document_views() {
-                if doc.read(cx).path() != path {
-                    continue;
-                }
-                let reloaded = auto_reload && doc.update(cx, |doc, cx| doc.reload_if_clean(cx));
-                if !reloaded {
-                    doc.update(cx, |doc, cx| doc.mark_externally_changed(cx));
-                }
+        let auto_reload = !self.startup_recovery_pending
+            && crate::settings::AppSettings::global(cx).watch_auto_reload;
+        // Cloned: `self.documents` cannot stay borrowed across the `&mut cx`
+        // that leasing each entity takes. Coalescing matching events avoids
+        // duplicate reloads in one poll; writes delivered later remain queued
+        // for the next poll.
+        let documents = self.document_views();
+        for doc in documents {
+            let affected = {
+                let document = doc.read(cx);
+                changes
+                    .iter()
+                    .any(|change| document.watches_path(change.path()))
+            };
+            if !affected {
+                continue;
+            }
+            let reloaded = auto_reload && doc.update(cx, |doc, cx| doc.reload_if_clean(cx));
+            if !reloaded {
+                doc.update(cx, |doc, cx| doc.mark_externally_changed(cx));
             }
         }
 
@@ -1441,7 +3485,7 @@ impl Workspace {
                 return;
             };
             crate::views::try_update_in(&this, cx, |this, window, cx| {
-                this.open_folder(path, window, cx);
+                this.request_workspace_replace(path, window, cx);
             });
         })
         .detach();
@@ -1449,12 +3493,90 @@ impl Workspace {
 
     fn on_save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(doc) = self.active_document().cloned() {
-            doc.update(cx, |doc, cx| doc.save(false, cx));
+            doc.update(cx, |doc, cx| {
+                doc.save(SaveMode::Normal, cx);
+            });
         }
     }
 
-    fn on_close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_tab(self.tabs.active_index(), cx);
+    fn prompt_save_as(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(document) = self.document_by_id(id, cx) else {
+            return;
+        };
+        let source = document.read(cx).path().to_path_buf();
+        let directory = source
+            .parent()
+            .map(Path::to_path_buf)
+            .or_else(|| self.root.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let suggested = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled.md")
+            .to_string();
+        let path = cx.prompt_for_new_path(&directory, Some(&suggested));
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(path) = path.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            loop {
+                if crate::views::try_update_in(&this, cx, |this, _window, cx| {
+                    this.finish_save_as(id, path.clone(), cx);
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn finish_save_as(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.document_index(id, cx) else {
+            return;
+        };
+        if self
+            .tabs
+            .index_of(&path)
+            .is_some_and(|existing| existing != ix)
+        {
+            self.set_status(
+                "That path is already open. Choose another Save As path.".into(),
+                cx,
+            );
+            return;
+        }
+        let document = self.document_at(ix).cloned().expect("index was found");
+        let old_path = document.read(cx).path().to_path_buf();
+        if document.update(cx, |document, cx| document.save_as(&path, cx)) {
+            self.tabs.replace_path(ix, path.clone());
+            self.history.forget(&old_path);
+            self.record_visit(path, 0);
+            self.web_dirty(cx);
+            cx.notify();
+        }
+    }
+
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_close_tab(self.tabs.active_index(), window, cx);
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
@@ -1501,8 +3623,9 @@ impl Workspace {
 
         for path in paths {
             if path.is_dir() {
-                self.open_folder(path.clone(), window, cx);
+                self.request_workspace_replace(path.clone(), window, cx);
                 opened += 1;
+                break;
             } else if crate::workspace::is_openable(path) {
                 // With no folder open, adopt the file's parent as the
                 // workspace — the same thing a path argument does, and it is
@@ -1672,8 +3795,10 @@ impl Workspace {
         // `doc.document()`: that parse is debounced by 180ms, so translating
         // right after a keystroke would translate the previous text and then
         // overwrite the editor with it — silently discarding the edit.
-        let text = doc.read(cx).text(cx);
+        let source_snapshot = doc.read(cx).async_snapshot(cx);
+        let text = source_snapshot.text().to_owned();
         let doc_type = doc.read(cx).document().doc_type();
+        let doc = doc.downgrade();
 
         self.set_status(format!("Translating via {}…", provider.label()), cx);
         // Set before the spawn, not inside it: the button has to go inert on
@@ -1688,34 +3813,70 @@ impl Workspace {
                 })
                 .await;
 
-            // `try_update_in` rather than `update_in`: this lands after an
-            // await and can arrive mid-draw, where the infallible borrow
-            // panics. Skipping costs one frame; panicking costs the session.
-            crate::views::try_update_in(&this, cx, |this, window, cx| {
-                // Cleared in both arms — a flag left set by the error path is a
-                // permanently dead button.
-                this.translating = false;
-                match result {
-                    Ok(translation) => {
-                        doc.update(cx, |doc, cx| {
-                            doc.replace_text(translation.text, window, cx);
-                        });
-                        this.set_status(
-                            format!(
-                                "Translated {} segment(s) via {}",
-                                translation
-                                    .segments
-                                    .iter()
-                                    .filter(|s| s.translatable)
-                                    .count(),
-                                provider.label()
-                            ),
-                            cx,
-                        );
+            // A fallible window borrow may skip one draw frame. Retain the
+            // result and retry so the loading flag always clears and a stale
+            // result is still reported instead of disappearing silently.
+            let result = Arc::new(Mutex::new(Some(result)));
+            loop {
+                let result = result.clone();
+                let doc = doc.clone();
+                let source_snapshot = source_snapshot.clone();
+                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
+                    let result = result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    let Some(result) = result else { return };
+                    // Cleared in both arms — a flag left set by the error path
+                    // is a permanently dead button.
+                    this.translating = false;
+                    match result {
+                        Ok(translation) => {
+                            let applied = doc.upgrade().is_some_and(|doc| {
+                                doc.update(cx, |doc, cx| {
+                                    doc.replace_text_if_current(
+                                        &source_snapshot,
+                                        translation.text,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                            });
+                            if applied {
+                                this.set_status(
+                                    format!(
+                                        "Translated {} segment(s) via {}",
+                                        translation
+                                            .segments
+                                            .iter()
+                                            .filter(|s| s.translatable)
+                                            .count(),
+                                        provider.label()
+                                    ),
+                                    cx,
+                                );
+                            } else {
+                                this.set_status(
+                                    "The document changed while translation was running. The result was not applied; run Translate again to use the latest text."
+                                        .into(),
+                                    cx,
+                                );
+                            }
+                        }
+                        Err(err) => this.set_status(format!("Translation failed: {err}"), cx),
                     }
-                    Err(err) => this.set_status(format!("Translation failed: {err}"), cx),
+                })
+                .is_some()
+                {
+                    break;
                 }
-            });
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
         })
         .detach();
     }
@@ -2113,6 +4274,7 @@ impl Workspace {
                     .map(|rest| rest.to_string_lossy().replace('\\', "/"));
                 let is_preview = self.tabs.is_preview(&path);
                 let dirty = doc.is_dirty();
+                let active_single_document = self.tabs.len() == 1 && self.tabs.active_index() == ix;
                 let label = elide_tab_label(&doc.title(cx));
                 let aria_label = if dirty {
                     format!("{label}, {}", i18n::t(i18n::Key::UnsavedChanges, cx))
@@ -2174,6 +4336,11 @@ impl Workspace {
                         if dirty {
                             div()
                                 .id(SharedString::from(format!("dirty-{ix}")))
+                                .role(gpui::Role::Button)
+                                .aria_label("Close document")
+                                .when(active_single_document, |this| {
+                                    this.accessibility_id(TAB_CLOSE_ACCESSIBILITY_ID)
+                                })
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -2184,6 +4351,9 @@ impl Workspace {
                                             .build(window, cx)
                                     })
                                 })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.request_close_tab(ix, window, cx);
+                                }))
                                 .child(
                                     div()
                                         .size(metrics::dirty_dot())
@@ -2194,9 +4364,15 @@ impl Workspace {
                         } else {
                             Button::new(SharedString::from(format!("close-{ix}")))
                                 .icon(IconName::Close)
+                                .accessibility_label("Close document")
+                                .when(active_single_document, |button| {
+                                    button.accessibility_id(TAB_CLOSE_ACCESSIBILITY_ID)
+                                })
                                 .small()
                                 .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| this.close_tab(ix, cx)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.request_close_tab(ix, window, cx);
+                                }))
                                 .into_any_element()
                         },
                     )
@@ -2481,7 +4657,18 @@ impl Workspace {
     /// Platform title-bar behavior and native controls, underneath the
     /// application-owned workspace columns.
     fn render_title_bar_backdrop(&self, cx: &Context<Self>) -> impl IntoElement {
+        let workspace = cx.entity().downgrade();
         TitleBar::new()
+            .on_close_window(move |_, window, cx| {
+                let should_close = workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.request_window_close(window, cx)
+                    })
+                    .unwrap_or(true);
+                if should_close {
+                    window.remove_window();
+                }
+            })
             .h(metrics::title_bar())
             .border_b_0()
             .bg(cx.theme().title_bar)
@@ -2635,6 +4822,10 @@ impl Workspace {
             },
             cx,
         );
+        let status = self
+            .recovery_warning
+            .clone()
+            .or_else(|| self.status.clone());
 
         h_flex()
             .w_full()
@@ -2647,8 +4838,8 @@ impl Workspace {
             .bg(cx.theme().status_bar)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
-            .children(self.status.clone().map(|s| div().flex_1().child(s)))
-            .when(self.status.is_none(), |this| {
+            .children(status.clone().map(|s| div().flex_1().child(s)))
+            .when(status.is_none(), |this| {
                 this.child(
                     div().flex_1().children(
                         self.root
@@ -3003,18 +5194,4835 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, path::Path, rc::Rc};
+    use std::{
+        cell::RefCell,
+        collections::{HashMap, HashSet},
+        fs,
+        path::Path,
+        path::PathBuf,
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
 
     // Import selectively: the `gpui::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::{
-        DetailsContent, SidePanel, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge,
-        clamped_dragged_panel_width, details_content, document_details_status_key, elide_tab_label,
-        path_affects_harness, resolved_workspace_panel_widths,
+        DestructiveAction, DestructiveRequest, DestructiveResolution, DetailsContent,
+        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RetirementCompletion, SaveMode,
+        SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge,
+        checkpoint_batch_status, clamped_dragged_panel_width, current_checkpoint_write_completed,
+        details_content, document_details_status_key, elide_tab_label, path_affects_harness,
+        prepare_recovery_records, resolved_workspace_panel_widths, startup_recovery_status,
     };
     use crate::i18n;
-    use gpui::{AppContext as _, Modifiers, MouseButton, TestAppContext, point, px};
+    use crate::recovery::{
+        CheckpointBatchOutcome, CheckpointOutcome, CheckpointSchedule, RecoveredRecord,
+        RecoveryCheckpoint, RecoveryError, RecoveryIssue, RecoveryKey, RecoveryLimits,
+        RecoveryMaintenance, RecoveryMetadata, RecoveryProtector, RecoveryRecord, RecoveryScan,
+        RecoveryStore, RecoveryToken,
+    };
+    use crate::views::Layout;
+    use crate::watcher::Change;
+    use crate::web::{self, Trust};
+    use gpui::{
+        AppContext as _, Context, Entity, Focusable as _, Modifiers, MouseButton, TestAppContext,
+        VisualTestContext, Window, point, px,
+    };
+
+    fn open_test_workspace(
+        cx: &mut TestAppContext,
+        initial: PathBuf,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        open_test_workspace_with(cx, Some(initial))
+    }
+
+    fn open_test_workspace_with(
+        cx: &mut TestAppContext,
+        initial: Option<PathBuf>,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let (workspace, cx) =
+            open_test_workspace_with_startup_recovery(cx, initial, StartupRecovery::default);
+        cx.run_until_parked();
+        let recovery_root = tempfile::tempdir().unwrap();
+        let recovery = RecoveryStore::new_at(
+            recovery_root.path().join("store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace.startup_recovery_pending = false;
+            workspace.recovery = Some(recovery);
+            workspace._test_recovery_root = Some(recovery_root);
+        });
+        (workspace, cx)
+    }
+
+    fn open_test_workspace_with_startup_recovery<F>(
+        cx: &mut TestAppContext,
+        initial: Option<PathBuf>,
+        load_startup_recovery: F,
+    ) -> (Entity<Workspace>, &mut VisualTestContext)
+    where
+        F: FnOnce() -> StartupRecovery + Send + 'static,
+    {
+        open_test_workspace_with_startup_recovery_inspection(
+            cx,
+            initial,
+            load_startup_recovery,
+            |_, _, _| {},
+        )
+    }
+
+    fn open_test_workspace_with_startup_recovery_inspection<F, G>(
+        cx: &mut TestAppContext,
+        initial: Option<PathBuf>,
+        load_startup_recovery: F,
+        inspect_before_startup: G,
+    ) -> (Entity<Workspace>, &mut VisualTestContext)
+    where
+        F: FnOnce() -> StartupRecovery + Send + 'static,
+        G: FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::settings::AppSettings::init(cx);
+            super::init(cx);
+        });
+        let captured = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let captured = captured.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| {
+                    let mut workspace = Workspace::new_with_startup_recovery(
+                        initial,
+                        load_startup_recovery,
+                        window,
+                        cx,
+                    );
+                    inspect_before_startup(&mut workspace, window, cx);
+                    workspace
+                });
+                *captured.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            }
+        });
+        let workspace = captured.borrow().clone().expect("the Workspace entity");
+        cx.update(|window, app| {
+            let handle = workspace.read(app).focus_handle(app);
+            window.focus(&handle, app);
+            window.draw(app).clear(app);
+        });
+        cx.update(|window, app| window.draw(app).clear(app));
+        (workspace, cx)
+    }
+
+    fn populated_startup_recovery(store: RecoveryStore) -> StartupRecovery {
+        let scan = store.recover().unwrap();
+        let scan_issues = scan.issues.len();
+        let (documents, preparation_issues) = prepare_recovery_records(scan.records);
+        StartupRecovery {
+            recovery: Some(store),
+            documents,
+            recovery_issue_count: scan_issues + preparation_issues,
+            recovery_error: None,
+        }
+    }
+
+    fn write_recovery_checkpoint(store: &RecoveryStore, path: &Path, text: &str) {
+        let loaded = crate::fs::load(path).unwrap();
+        let checkpoint = RecoveryCheckpoint {
+            key: RecoveryKey::for_path(path),
+            text: text.to_string(),
+            metadata: RecoveryMetadata::from_loaded_file(&loaded),
+        };
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+    }
+
+    fn restore_recovery_for_test(
+        workspace: &mut Workspace,
+        scan: RecoveryScan,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> (usize, usize) {
+        let scan_issues = scan.issues.len();
+        let (documents, preparation_issues) = prepare_recovery_records(scan.records);
+        let (restored, restore_skipped) =
+            workspace.restore_prepared_recovery(documents, None, window, cx);
+        (restored, scan_issues + preparation_issues + restore_skipped)
+    }
+
+    fn restore_startup_recovery_for_test(
+        workspace: &mut Workspace,
+        scan: RecoveryScan,
+        recovery_issue_count: usize,
+        recovery_error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let (documents, preparation_issues) = prepare_recovery_records(scan.records);
+        let startup_targets = workspace.startup_recovery_targets(cx);
+        workspace.restore_startup_recovery(
+            StartupRecovery {
+                recovery: workspace.recovery.clone(),
+                documents,
+                recovery_issue_count: recovery_issue_count + preparation_issues,
+                recovery_error,
+            },
+            startup_targets,
+            window,
+            cx,
+        );
+    }
+
+    fn complete_startup_with_store(
+        workspace: &Entity<Workspace>,
+        store: RecoveryStore,
+        cx: &mut VisualTestContext,
+    ) {
+        let startup_targets =
+            workspace.read_with(cx, |workspace, app| workspace.startup_recovery_targets(app));
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(
+                    StartupRecovery {
+                        recovery: Some(store),
+                        ..StartupRecovery::default()
+                    },
+                    startup_targets,
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
+    fn replace_document(
+        workspace: &Entity<Workspace>,
+        ix: usize,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(ix).cloned())
+            .expect("the document tab");
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text(text.to_string(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    fn document_text(workspace: &Entity<Workspace>, ix: usize, cx: &VisualTestContext) -> String {
+        workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_at(ix)
+                .expect("the document tab")
+                .read(app)
+                .text(app)
+        })
+    }
+
+    fn assert_failed_save_preserves_document(
+        workspace: &Entity<Workspace>,
+        text: &str,
+        externally_changed: bool,
+        status: &str,
+        cx: &VisualTestContext,
+    ) {
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .expect("the document tab");
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert_eq!(document.is_externally_changed(), externally_changed);
+            assert_eq!(document.text(app), text);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.status.as_deref(), Some(status));
+        });
+    }
+
+    struct TestRecoveryProtector;
+
+    impl RecoveryProtector for TestRecoveryProtector {
+        fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
+            Ok(plaintext.iter().rev().copied().collect())
+        }
+
+        fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
+            Ok(ciphertext.iter().rev().copied().collect())
+        }
+    }
+
+    enum CountingProtection {
+        Reversible,
+        Expand(usize),
+        FailOnce,
+    }
+
+    struct CountingRecoveryProtector {
+        calls: AtomicUsize,
+        behavior: CountingProtection,
+    }
+
+    impl CountingRecoveryProtector {
+        fn new(behavior: CountingProtection) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                behavior,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RecoveryProtector for CountingRecoveryProtector {
+        fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.behavior, CountingProtection::FailOnce) && call == 0 {
+                return Err(RecoveryError::Protection);
+            }
+            let mut ciphertext: Vec<_> = plaintext.iter().rev().copied().collect();
+            if let CountingProtection::Expand(bytes) = self.behavior {
+                ciphertext.resize(ciphertext.len() + bytes, 0);
+            }
+            Ok(ciphertext)
+        }
+
+        fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
+            Ok(ciphertext.iter().rev().copied().collect())
+        }
+    }
+
+    fn recovery_limits(max_record_bytes: u64) -> RecoveryLimits {
+        RecoveryLimits {
+            max_record_bytes,
+            ..RecoveryLimits::default()
+        }
+    }
+
+    fn test_recovery_attempt(
+        token: RecoveryToken,
+        revision: u64,
+        now: Instant,
+        cancelled: Arc<AtomicBool>,
+    ) -> RecoveryAttempt {
+        let mut schedule = CheckpointSchedule::default();
+        schedule.mark_dirty(now);
+        let timing = schedule
+            .checkpoint_dispatched(now + Duration::from_secs(2))
+            .unwrap();
+        RecoveryAttempt {
+            token,
+            revision,
+            timing,
+            cancelled,
+        }
+    }
+
+    #[gpui::test]
+    fn a_clean_tab_closes_immediately(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clean.md");
+        fs::write(&path, "clean\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+
+        cx.simulate_keystrokes("ctrl-w");
+
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    fn dirty_close_saves_exact_text_before_closing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.md");
+        fs::write(&path, "before\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "中文 draft \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        cx.simulate_keystrokes("ctrl-w");
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            0
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), edited);
+    }
+
+    #[gpui::test]
+    fn dirty_close_discard_never_writes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        replace_document(&workspace, 0, "editor only\n", cx);
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            0
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
+    }
+
+    #[gpui::test]
+    fn discard_waits_for_startup_store_before_closing_and_retiring(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard-before-startup.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, "checkpoint before discard\n");
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+        });
+        replace_document(&workspace, 0, "discarded editor text\n", cx);
+        let id = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).id()
+        });
+        let key = RecoveryKey::for_path(&path);
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.pending_startup_destructive.is_some());
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "Waiting for recovery storage to clear its checkpoint. The document remains open."
+                )
+            );
+        });
+        assert_eq!(store.recover().unwrap().records.len(), 1);
+
+        complete_startup_with_store(&workspace, store.clone(), cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_retirement_batches.contains_key(&key));
+            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
+            assert!(
+                !workspace.recovery_schedules.contains_key(&id),
+                "startup repair must not re-arm a document being durably discarded"
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            0
+        );
+        assert!(store.recover().unwrap().records.is_empty());
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
+    }
+
+    #[gpui::test]
+    fn cancelling_a_new_dirty_prompt_rearms_a_startup_discarded_document(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("startup-discard-first.md");
+        let second = dir.path().join("startup-discard-second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+                workspace.recovery = None;
+                workspace.startup_recovery_pending = true;
+            });
+        });
+
+        let latest_first = "first text kept after cancelled close\n";
+        replace_document(&workspace, 0, latest_first, cx);
+        let (first_id, first_checkpoint) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (document.id(), document.recovery_checkpoint(app))
+        });
+        let first_key = first_checkpoint.key.clone();
+        store
+            .checkpoint(&first_checkpoint, &HashSet::from([first_key.clone()]))
+            .unwrap();
+
+        assert!(!cx.simulate_close());
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        complete_startup_with_store(&workspace, store.clone(), cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .recovery_retirement_batches
+                    .contains_key(&first_key)
+            );
+        });
+
+        let second_document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(1).cloned())
+            .unwrap();
+        cx.update(|window, app| {
+            second_document.update(app, |document, cx| {
+                document.replace_text("second became dirty\n".into(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.has_pending_prompt(),
+            "the newly dirty second document must be decided before window close"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .pending_destructive_recovery
+                    .iter()
+                    .any(|(key, _)| key == &first_key)
+            );
+        });
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+        assert_eq!(document_text(&workspace, 0, cx), latest_first);
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.document_at(0).unwrap().read(app).is_dirty());
+            let state = workspace
+                .recovery_schedules
+                .get(&first_id)
+                .expect("the still-dirty first document must be re-armed after revalidation");
+            assert!(state.token.is_some());
+            assert!(state.schedule.next_deadline().is_some());
+        });
+
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let recovered: HashMap<_, _> = store
+            .recover()
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| (record.record.key, record.record.text))
+            .collect();
+        assert_eq!(
+            recovered.get(&first_key).map(String::as_str),
+            Some(latest_first)
+        );
+    }
+
+    #[gpui::test]
+    fn save_waits_for_startup_store_before_closing_and_retiring(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save-before-startup.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, "checkpoint before save\n");
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+        });
+        let edited = "saved while recovery starts\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.pending_startup_destructive.is_some());
+        });
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(store.recover().unwrap().records.len(), 1);
+
+        complete_startup_with_store(&workspace, store.clone(), cx);
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            0
+        );
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn saved_preview_is_kept_until_startup_retirement_is_durable(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first-preview.md");
+        let second = dir.path().join("second-preview.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &first, "first checkpoint\n");
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file_as(first.clone(), true, window, cx);
+                workspace.recovery = None;
+                workspace.startup_recovery_pending = true;
+            });
+        });
+        replace_document(&workspace, 0, "saved preview text\n", cx);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file_as(second.clone(), true, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert!(workspace.tabs.index_of(&first).is_some());
+            assert!(workspace.tabs.index_of(&second).is_some());
+        });
+        complete_startup_with_store(&workspace, store.clone(), cx);
+        cx.run_until_parked();
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn preview_remains_while_retirement_is_queued_behind_an_old_owner(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("queued-preview-first.md");
+        let second = dir.path().join("queued-preview-second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.recovery = Some(store.clone());
+                workspace.open_file_as(first.clone(), true, window, cx);
+            });
+        });
+        let key = RecoveryKey::for_path(&first);
+        let old = store.begin_retirement(&key).unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery_retirements.insert(key.clone(), old);
+            workspace.pending_recovery_retirements.insert(key, None);
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file_as(second.clone(), true, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert!(
+                workspace.tabs.index_of(&first).is_some(),
+                "a queued retirement must keep its preview even while an older owner exists"
+            );
+            assert!(workspace.tabs.index_of(&second).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn unavailable_startup_store_keeps_waiting_discard_open(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard-without-store.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+        });
+        replace_document(&workspace, 0, "must remain open\n", cx);
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        let startup_targets =
+            workspace.read_with(cx, |workspace, app| workspace.startup_recovery_targets(app));
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(
+                    StartupRecovery {
+                        recovery: None,
+                        recovery_error: Some("recovery unavailable".into()),
+                        ..StartupRecovery::default()
+                    },
+                    startup_targets,
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(!workspace.startup_recovery_pending);
+            assert!(workspace.pending_startup_destructive.is_none());
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "Recovery storage is unavailable, so its checkpoint could not be cleared. The document remains open."
+                )
+            );
+        });
+        assert_eq!(document_text(&workspace, 0, cx), "must remain open\n");
+    }
+
+    #[gpui::test]
+    fn dirty_close_cancel_preserves_the_tab_and_exact_text(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "keep 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            1
+        );
+        assert_eq!(document_text(&workspace, 0, cx), edited);
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
+    }
+
+    #[gpui::test]
+    fn failed_save_during_close_keeps_the_tab_and_exact_text(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflict.md");
+        fs::write(&path, "disk one\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "my exact edit\n";
+        replace_document(&workspace, 0, edited, cx);
+        fs::write(&path, "disk two\n").unwrap();
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            1
+        );
+        assert_eq!(document_text(&workspace, 0, cx), edited);
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk two\n");
+    }
+
+    #[gpui::test]
+    fn save_action_refuses_missing_source_and_preserves_exact_editor_text(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "keep this exact text 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        fs::remove_file(&path).unwrap();
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        assert!(!path.exists(), "Ctrl-S must not recreate a missing source");
+        assert_failed_save_preserves_document(
+            &workspace,
+            edited,
+            true,
+            "The source path no longer exists. Recreate it or Save As.",
+            cx,
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    fn save_action_refuses_retargeted_symlink_without_overwriting_either_target(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target-a.md");
+        let alternate = dir.path().join("target-b.md");
+        let link = dir.path().join("shared.md");
+        fs::write(&target, "target A\n").unwrap();
+        fs::write(&alternate, "target B\n").unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!("skipping workspace save symlink test: {error}");
+            return;
+        }
+        let (workspace, cx) = open_test_workspace(cx, link.clone());
+        let edited = "keep symlink editor text 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        fs::remove_file(&link).unwrap();
+        std::os::windows::fs::symlink_file(&alternate, &link).unwrap();
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target A\n");
+        assert_eq!(fs::read_to_string(&alternate).unwrap(), "target B\n");
+        assert_failed_save_preserves_document(
+            &workspace,
+            edited,
+            true,
+            "The source path or symbolic-link target changed. Save As to preserve both versions.",
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn save_action_refuses_decode_loss_without_changing_original_bytes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.md");
+        let original = b"\xEF\xBB\xBFvalid \xFF byte\n";
+        fs::write(&path, original).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "keep decoded editor text 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_failed_save_preserves_document(
+            &workspace,
+            edited,
+            false,
+            "The original bytes could not be decoded exactly. Convert to UTF-8 or Save As.",
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn save_action_refuses_unrepresentable_text_without_changing_gbk_bytes(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-gbk.txt");
+        let original = b"\xD6\xD0\xCE\xC4\r\n";
+        fs::write(&path, original).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "中文 with emoji \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_failed_save_preserves_document(
+            &workspace,
+            edited,
+            false,
+            "The editor text cannot be represented as GBK. Convert to UTF-8 or Save As.",
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn document_save_actions_compose_overwrite_and_utf8_conversion(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.md");
+        fs::write(&path, b"\xEF\xBB\xBFvalid \xFF byte\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "exact editor text \u{4e2d}\u{6587} \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        fs::write(&path, "external version\n").unwrap();
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+
+        document.update(cx, |document, cx| {
+            assert!(!document.save(SaveMode::Normal, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some("This file changed on disk. Reload or overwrite from the banner.")
+            );
+        });
+
+        document.update(cx, |document, cx| {
+            assert!(!document.save(SaveMode::Overwrite, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "The original bytes could not be decoded exactly. Convert to UTF-8 or Save As."
+                )
+            );
+        });
+
+        document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::ConvertToUtf8, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        document.read_with(cx, |document, app| {
+            assert!(!document.is_dirty());
+            assert_eq!(document.text(app), edited);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.status.as_deref(), Some("Saved"));
+        });
+    }
+
+    #[gpui::test]
+    fn editing_after_overwrite_authorization_requires_a_new_overwrite_decision(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.md");
+        fs::write(&path, b"\xEF\xBB\xBFvalid \xFF byte\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let first_edit = "first editor text \u{4e2d}\u{6587} \u{1f680}\n";
+        replace_document(&workspace, 0, first_edit, cx);
+        let external = "external version\n";
+        fs::write(&path, external).unwrap();
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+
+        document.update(cx, |document, cx| {
+            assert!(!document.save(SaveMode::Normal, cx));
+            assert!(!document.save(SaveMode::Overwrite, cx));
+        });
+        let second_edit = "newer editor text \u{4e2d}\u{6587} \u{1f680}\n";
+        replace_document(&workspace, 0, second_edit, cx);
+
+        document.update(cx, |document, cx| {
+            assert!(!document.save(SaveMode::ConvertToUtf8, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), second_edit);
+        });
+    }
+
+    #[gpui::test]
+    fn auto_reload_cannot_replace_a_dirty_editor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("external.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "editor 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        fs::write(path, "external rewrite\n").unwrap();
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+
+        let started = document.update(cx, |document, cx| document.reload_if_clean(cx));
+
+        assert!(!started);
+        assert_eq!(
+            document.read_with(cx, |document, app| document.text(app)),
+            edited
+        );
+    }
+
+    #[gpui::test]
+    fn watcher_auto_reload_waits_for_startup_recovery_and_preserves_conflict(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup-watcher.md");
+        fs::write(&path, "disk before startup\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, "unseen recovered text\n");
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let startup_targets =
+            workspace.read_with(cx, |workspace, app| workspace.startup_recovery_targets(app));
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+        });
+        cx.update(|_, app| {
+            crate::settings::AppSettings::update(app, |settings| {
+                settings.watch_auto_reload = true;
+            });
+        });
+
+        fs::write(&path, "external rewrite during startup\n").unwrap();
+        let startup = populated_startup_recovery(store);
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(dir.path(), &[Change::Modified(path.clone())], cx);
+        });
+        cx.run_until_parked();
+
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), "disk before startup\n");
+            assert!(document.is_externally_changed());
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(startup, startup_targets, window, cx);
+            });
+        });
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), "unseen recovered text\n");
+            assert!(document.is_dirty());
+            assert!(
+                document.is_externally_changed(),
+                "the startup recovery must retain the watcher conflict"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn clean_auto_reload_deletion_enters_the_missing_source_state(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed-clean.md");
+        let text = "disk text stays visible\n";
+        fs::write(&path, text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        cx.update(|_, app| {
+            crate::settings::AppSettings::update(app, |settings| {
+                settings.watch_auto_reload = true;
+            });
+        });
+        fs::remove_file(&path).unwrap();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(dir.path(), &[Change::Removed(path)], cx);
+        });
+        cx.run_until_parked();
+
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.read_with(cx, |document, app| {
+            assert!(!document.is_dirty());
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), text);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some("The source path no longer exists. Recreate it or Save As.")
+            );
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    fn resolved_symlink_target_change_marks_dirty_document_without_replacing_text(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared-target.md");
+        let link = dir.path().join("shared-link.md");
+        fs::write(&target, "disk\n").unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!("skipping symlink watcher test: {error}");
+            return;
+        }
+
+        let (workspace, cx) = open_test_workspace(cx, link);
+        let edited = "editor 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(dir.path(), &[Change::Modified(target.clone())], cx);
+        });
+
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.read_with(cx, |document, app| {
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), edited);
+        });
+    }
+
+    #[gpui::test]
+    fn stale_transformation_result_keeps_the_newer_editor_revision_and_text(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("translation.md");
+        fs::write(&path, "revision N\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let snapshot = document.read_with(cx, |document, app| document.async_snapshot(app));
+
+        replace_document(&workspace, 0, "revision N+1 中文 \u{1f680}\n", cx);
+        let revision_after_edit = document.read_with(cx, |document, _| document.revision());
+
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text_if_current(
+                    &snapshot,
+                    "stale translation\n".into(),
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        assert!(!applied);
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.revision(), revision_after_edit);
+            assert_eq!(document.text(app), "revision N+1 中文 \u{1f680}\n");
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_rejects_a_transformation_from_the_previous_source_identity(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("translation.md");
+        let saved_as = dir.path().join("translation.html");
+        let text = "same revision and text\n";
+        fs::write(&original, text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, original);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let snapshot = document.read_with(cx, |document, app| document.async_snapshot(app));
+
+        document.update(cx, |document, cx| {
+            assert!(document.save_as(&saved_as, cx));
+        });
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text_if_current(
+                    &snapshot,
+                    "stale translation\n".into(),
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        assert!(!applied);
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
+            assert_eq!(document.text(app), text);
+        });
+        assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
+    }
+
+    #[gpui::test]
+    fn trusted_mdx_save_as_html_is_restricted_before_the_new_web_payload(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("trusted.mdx");
+        let saved_as = dir.path().join("restricted.html");
+        let text = "<!doctype html><html><body><script>window.ran = true</script></body></html>";
+        fs::write(&original, text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, original);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| {
+            document.set_layout(Layout::Web, cx);
+            document.set_trust(Trust::Trusted, cx);
+        });
+        let id = document.read_with(cx, |document, _| document.id());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_save_as(id, saved_as.clone(), cx);
+        });
+
+        document.read_with(cx, |document, _| {
+            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
+            assert_eq!(document.trust(), Trust::Restricted);
+            let payload = document.web_html().expect("the rebuilt HTML payload");
+            assert!(!payload.starts_with("file://"));
+            assert!(web::to_data_url(payload).starts_with("data:text/html;charset=utf-8,"));
+        });
+        assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
+    }
+
+    #[gpui::test]
+    fn trusted_html_path_only_save_as_rebuilds_as_restricted_data_url(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("trusted-before.html");
+        let saved_as = dir.path().join("restricted-after.html");
+        let text = "<!doctype html><html><body><img src=local.png></body></html>";
+        fs::write(&original, text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, original);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| {
+            document.set_trust(Trust::Trusted, cx);
+        });
+        document.read_with(cx, |document, _| {
+            assert_eq!(document.trust(), Trust::Trusted);
+            assert!(document.web_html().unwrap().starts_with("file://"));
+        });
+        let id = document.read_with(cx, |document, _| document.id());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_save_as(id, saved_as.clone(), cx);
+        });
+
+        document.read_with(cx, |document, _| {
+            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
+            assert_eq!(document.trust(), Trust::Restricted);
+            let payload = document.web_html().expect("the rebuilt HTML payload");
+            assert!(!payload.starts_with("file://"));
+            assert!(web::to_data_url(payload).starts_with("data:text/html;charset=utf-8,"));
+        });
+        assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
+    }
+
+    #[gpui::test]
+    fn failed_save_as_preserves_trust_and_the_existing_web_payload(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("trusted.html");
+        let failed_path = dir.path().join("missing-parent").join("failed.html");
+        fs::write(&original, "<!doctype html><p>trusted</p>").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, original.clone());
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| {
+            document.set_trust(Trust::Trusted, cx);
+        });
+        let id = document.read_with(cx, |document, _| document.id());
+        let before = document.read_with(cx, |document, _| document.web_html().unwrap().to_string());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_save_as(id, failed_path.clone(), cx);
+        });
+
+        document.read_with(cx, |document, _| {
+            assert_eq!(document.path(), original.as_path());
+            assert_eq!(document.trust(), Trust::Trusted);
+            assert_eq!(document.web_html(), Some(before.as_str()));
+        });
+        assert!(!failed_path.exists());
+    }
+
+    #[gpui::test]
+    fn markdown_save_as_preserves_content_layout_and_restricted_payload(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("before.md");
+        let saved_as = dir.path().join("after.md");
+        let text = "# Exact Markdown\n\nbody\n";
+        fs::write(&original, text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, original);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| {
+            document.set_layout(Layout::Web, cx);
+        });
+        let id = document.read_with(cx, |document, _| document.id());
+        let before = document.read_with(cx, |document, _| document.web_html().unwrap().to_string());
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_save_as(id, saved_as.clone(), cx);
+        });
+
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.document().doc_type(), mt_doc::DocType::Markdown);
+            assert_eq!(document.layout(), Layout::Web);
+            assert_eq!(document.trust(), Trust::Restricted);
+            assert_eq!(document.text(app), text);
+            assert_eq!(document.web_html(), Some(before.as_str()));
+            assert!(
+                web::to_data_url(document.web_html().unwrap())
+                    .starts_with("data:text/html;charset=utf-8,")
+            );
+        });
+        assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
+    }
+
+    #[gpui::test]
+    fn discard_keeps_the_tab_open_when_recovery_retirement_fails(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard-retirement-failure.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let edited = "discard only after durable retirement\n";
+        replace_document(&workspace, 0, edited, cx);
+        write_recovery_checkpoint(&store, &path, "older checkpoint\n");
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace
+                .recovery_schedules
+                .get_mut(&document.id())
+                .unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(now);
+            let attempt = RecoveryAttempt {
+                token: state
+                    .token
+                    .clone()
+                    .expect("a ready test store must provide a recovery token"),
+                revision: document.revision(),
+                timing: schedule.checkpoint_dispatched(now).unwrap(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            state.schedule = schedule;
+            state.in_flight = Some(attempt);
+        });
+        store.fail_next_persist_for_test();
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), edited);
+            assert!(
+                workspace
+                    .recovery_schedules
+                    .get(&document.id())
+                    .is_some_and(|state| state.in_flight.is_none())
+            );
+            assert!(
+                workspace.status.as_deref().is_some_and(
+                    |status| status.contains("Could not clear the recovery checkpoint")
+                )
+            );
+        });
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
+        assert_eq!(
+            store.recover().unwrap().records[0].record.text,
+            "older checkpoint\n"
+        );
+
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(recovered.records[0].record.text, edited);
+    }
+
+    #[gpui::test]
+    fn discard_proceeds_after_the_record_is_retired_even_if_cleanup_fails(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discard-cleanup-failure.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "discarded after rename\n", cx);
+        let checkpoint = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_at(0)
+                .unwrap()
+                .read(app)
+                .recovery_checkpoint(app)
+        });
+        store
+            .checkpoint(&checkpoint, &HashSet::from([checkpoint.key.clone()]))
+            .unwrap();
+        store.fail_next_delete_for_test();
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.tabs.is_empty());
+            assert!(workspace.status.as_deref().is_some_and(|status| {
+                status.contains("checkpoint was cleared, but cleanup remains pending")
+            }));
+        });
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn save_retries_a_failed_durable_recovery_retirement(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save-retirement-retry.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let edited = "saved before retirement retry\n";
+        replace_document(&workspace, 0, edited, cx);
+        let checkpoint = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_at(0)
+                .unwrap()
+                .read(app)
+                .recovery_checkpoint(app)
+        });
+        store
+            .checkpoint(&checkpoint, &HashSet::from([checkpoint.key.clone()]))
+            .unwrap();
+        store.fail_next_persist_for_test();
+
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .pending_recovery_retirements
+                    .contains_key(&checkpoint.key)
+            );
+            assert!(
+                workspace
+                    .recovery_retirement_retries
+                    .contains(&checkpoint.key)
+            );
+        });
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(store.recover().unwrap().records.len(), 1);
+
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert!(store.recover().unwrap().records.is_empty());
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace
+                    .pending_recovery_retirements
+                    .contains_key(&checkpoint.key)
+            );
+            assert!(
+                !workspace
+                    .recovery_retirement_retries
+                    .contains(&checkpoint.key)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn unrelated_failed_retirement_does_not_block_clean_close_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("failed-retirement.md");
+        let second = dir.path().join("clean-close.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second.clone(), window, cx);
+            });
+        });
+
+        replace_document(&workspace, 0, "saved first text\n", cx);
+        let first_document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let (first_id, checkpoint) = first_document.read_with(cx, |document, app| {
+            (document.id(), document.recovery_checkpoint(app))
+        });
+        store
+            .checkpoint(&checkpoint, &HashSet::from([checkpoint.key.clone()]))
+            .unwrap();
+        store.fail_next_persist_for_test();
+        first_document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.pending_recovery_retirements.get(&checkpoint.key),
+                Some(&Some(first_id))
+            );
+            assert!(
+                workspace
+                    .recovery_retirement_retries
+                    .contains(&checkpoint.key)
+            );
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_close_tab(1, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.tabs.index_of(&first).is_some());
+            assert!(workspace.tabs.index_of(&second).is_none());
+            assert!(
+                workspace
+                    .pending_recovery_retirements
+                    .contains_key(&checkpoint.key)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn close_tab_waits_for_its_pre_save_as_startup_key(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("before-save-as.md");
+        let saved_as = dir.path().join("after-save-as.md");
+        fs::write(&original, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, original.clone());
+        let id = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).id()
+        });
+        let original_key = RecoveryKey::for_path(&original);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+            workspace
+                .startup_recovery_keys
+                .insert(id, original_key.clone());
+        });
+        replace_document(&workspace, 0, "saved elsewhere\n", cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_save_as(id, saved_as.clone(), cx);
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.pending_recovery_retirements.get(&original_key),
+                Some(&Some(id))
+            );
+            assert!(workspace.tabs.index_of(&saved_as).is_some());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_close_tab(0, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            let pending = workspace
+                .pending_startup_destructive
+                .as_ref()
+                .expect("the original startup key must delay the target tab close");
+            assert!(pending.keys.contains(&(original_key, Some(id))));
+        });
+        assert_eq!(fs::read_to_string(saved_as).unwrap(), "saved elsewhere\n");
+    }
+
+    #[gpui::test]
+    fn clean_document_opened_during_startup_retires_its_old_key_after_save_as(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("late-open-before-save-as.md");
+        let saved_as = dir.path().join("late-open-after-save-as.md");
+        fs::write(&original, "disk before startup\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &original, "old-path checkpoint\n");
+        let startup = populated_startup_recovery(store.clone());
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(original.clone(), window, cx);
+            });
+        });
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let id = document.read_with(cx, |document, _| document.id());
+        let original_key = RecoveryKey::for_path(&original);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.startup_recovery_keys.get(&id),
+                Some(&original_key),
+                "a clean tab opened during startup must retain its original key"
+            );
+        });
+
+        cx.update(|_, app| {
+            crate::settings::AppSettings::update(app, |settings| {
+                settings.watch_auto_reload = true;
+            });
+        });
+        fs::write(&original, "external rewrite during startup\n").unwrap();
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(dir.path(), &[Change::Modified(original.clone())], cx);
+        });
+        document.read_with(cx, |document, app| {
+            assert!(!document.is_dirty());
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), "disk before startup\n");
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_save_as(id, saved_as.clone(), cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.pending_recovery_retirements.get(&original_key),
+                Some(&Some(id))
+            );
+            assert!(workspace.tabs.index_of(&original).is_none());
+            assert!(workspace.tabs.index_of(&saved_as).is_some());
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(startup, HashMap::new(), window, cx);
+                assert_eq!(workspace.tabs.len(), 1);
+                assert!(workspace.tabs.index_of(&original).is_none());
+                assert!(workspace.tabs.index_of(&saved_as).is_some());
+                assert!(workspace.recovery_retirements.contains_key(&original_key));
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(store.recover().unwrap().records.is_empty());
+        assert_eq!(
+            fs::read_to_string(saved_as).unwrap(),
+            "disk before startup\n"
+        );
+    }
+
+    #[gpui::test]
+    fn full_workspace_actions_include_all_pending_keys_in_one_batch(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("full-action-first.md");
+        let second = dir.path().join("full-action-second.md");
+        let unknown = dir.path().join("unknown-origin.md");
+        let replacement = dir.path().join("replacement");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second.clone(), window, cx);
+            });
+        });
+        let (first_id, second_id) = workspace.read_with(cx, |workspace, app| {
+            (
+                workspace.document_at(0).unwrap().read(app).id(),
+                workspace.document_at(1).unwrap().read(app).id(),
+            )
+        });
+        let first_key = RecoveryKey::for_path(&first);
+        let second_key = RecoveryKey::for_path(&second);
+        let unknown_key = RecoveryKey::for_path(&unknown);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace
+                    .pending_recovery_retirements
+                    .insert(first_key.clone(), Some(first_id));
+                workspace
+                    .pending_recovery_retirements
+                    .insert(second_key.clone(), Some(second_id));
+                workspace
+                    .pending_recovery_retirements
+                    .insert(unknown_key.clone(), None);
+
+                let all =
+                    HashSet::from([first_key.clone(), second_key.clone(), unknown_key.clone()]);
+                for action in [
+                    DestructiveAction::CloseWindow,
+                    DestructiveAction::ReplaceWorkspace(replacement.clone()),
+                ] {
+                    let selected = workspace
+                        .pending_recovery_keys(&action)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect::<HashSet<_>>();
+                    assert_eq!(selected, all);
+                }
+                let close_tab_keys = workspace
+                    .pending_recovery_keys(&DestructiveAction::CloseTab(first_id))
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect::<HashSet<_>>();
+                assert_eq!(
+                    close_tab_keys,
+                    HashSet::from([first_key.clone(), unknown_key.clone()]),
+                    "unknown-origin work must remain fail-closed"
+                );
+
+                let request = DestructiveRequest::new(
+                    DestructiveAction::ReplaceWorkspace(replacement.clone()),
+                    &workspace.lifecycle_documents(cx),
+                );
+                let DestructiveResolution::Proceed(action) = request.initial_resolution() else {
+                    panic!("clean documents must not prompt before workspace replacement");
+                };
+                workspace.perform_after_discard_retirement(request, action, Vec::new(), window, cx);
+
+                let batch = workspace
+                    .recovery_retirement_batches
+                    .get(&first_key)
+                    .cloned()
+                    .expect("the first pending key must enter the batch");
+                assert_eq!(
+                    workspace.recovery_retirement_batches.get(&second_key),
+                    Some(&batch)
+                );
+                assert_eq!(
+                    workspace.recovery_retirement_batches.get(&unknown_key),
+                    Some(&batch)
+                );
+                assert_eq!(workspace.recovery_retirement_batches.len(), 3);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn second_save_replaces_a_stale_ui_retirement_owner(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("second-save-stale-owner.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        write_recovery_checkpoint(&store, &path, "first saved checkpoint\n");
+        let key = RecoveryKey::for_path(&path);
+        let old = store.begin_retirement(&key).unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .recovery_retirements
+                .insert(key.clone(), old.clone());
+        });
+        let old_completion = store.complete_retirement(old.clone()).unwrap();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.invalidate_recovery(&key, None, cx);
+        });
+        let fresh = workspace.read_with(cx, |workspace, _| {
+            let fresh = workspace
+                .recovery_retirements
+                .get(&key)
+                .cloned()
+                .expect("the second Save must install a fresh retirement owner");
+            assert_ne!(fresh, old);
+            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
+            fresh
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_retirement(key.clone(), old, None, Ok(old_completion), cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.recovery_retirements.get(&key), Some(&fresh));
+            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
+        });
+    }
+
+    #[gpui::test]
+    fn matched_old_completion_replays_a_queued_save_retirement(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued-save-replay.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        write_recovery_checkpoint(&store, &path, "queued checkpoint\n");
+        let key = RecoveryKey::for_path(&path);
+        let old = store.begin_retirement(&key).unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .recovery_retirements
+                .insert(key.clone(), old.clone());
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.invalidate_recovery(&key, None, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.recovery_retirements.get(&key), Some(&old));
+            assert!(workspace.pending_recovery_retirements.contains_key(&key));
+        });
+        let old_completion = store.complete_retirement(old.clone()).unwrap();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_retirement(
+                key.clone(),
+                old.clone(),
+                None,
+                Ok(old_completion),
+                cx,
+            );
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let fresh = workspace
+                .recovery_retirements
+                .get(&key)
+                .expect("the matched old completion must replay the queued Save");
+            assert_ne!(fresh, &old);
+            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
+        });
+    }
+
+    #[gpui::test]
+    fn edit_cancels_only_the_queued_retirement_intent(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit-cancels-queued-retirement.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let key = document.read_with(cx, |document, _| document.recovery_key());
+        let old = store.begin_retirement(&key).unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .recovery_retirements
+                .insert(key.clone(), old.clone());
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.invalidate_recovery(&key, None, cx);
+        });
+
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text("new edit cancels only the queue\n".into(), window, cx);
+            });
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
+            assert_eq!(workspace.recovery_retirements.get(&key), Some(&old));
+        });
+    }
+
+    #[gpui::test]
+    fn stale_batch_takeover_resumes_the_destructive_action(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-batch-takeover.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "discard after takeover\n", cx);
+        let (id, checkpoint) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (document.id(), document.recovery_checkpoint(app))
+        });
+        let key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([key.clone()]))
+            .unwrap();
+        let old_batch = store.begin_retirements([key.clone()]).unwrap();
+        let old_completion = store.complete_retirements(old_batch.clone()).unwrap();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let documents = workspace.lifecycle_documents(cx);
+                let mut request =
+                    DestructiveRequest::new(DestructiveAction::CloseTab(id), &documents);
+                assert!(matches!(
+                    request.decide(DirtyDecision::Discard, None, &documents),
+                    DestructiveResolution::Proceed(_)
+                ));
+                workspace.pending_destructive = Some(request);
+                workspace
+                    .recovery_retirement_batches
+                    .insert(key.clone(), old_batch.clone());
+                workspace.invalidate_recovery(&key, Some(id), cx);
+                workspace.finish_discard_retirements(
+                    vec![(key.clone(), Some(id))],
+                    old_batch.clone(),
+                    Ok(old_completion),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.is_empty()),
+            "a stale batch callback must resume the action through the fresh owner"
+        );
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn replay_persist_failure_keeps_destructive_action_open_until_retry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay-persist-failure.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "keep open through replay retry\n", cx);
+        let (id, checkpoint) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (document.id(), document.recovery_checkpoint(app))
+        });
+        let key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([key.clone()]))
+            .unwrap();
+        let old_batch = store.begin_retirements([key.clone()]).unwrap();
+        let old_completion = store.complete_retirements(old_batch.clone()).unwrap();
+        store.fail_next_persist_for_test();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let documents = workspace.lifecycle_documents(cx);
+                let mut request =
+                    DestructiveRequest::new(DestructiveAction::CloseTab(id), &documents);
+                assert!(matches!(
+                    request.decide(DirtyDecision::Discard, None, &documents),
+                    DestructiveResolution::Proceed(_)
+                ));
+                workspace.pending_destructive = Some(request);
+                workspace
+                    .recovery_retirement_batches
+                    .insert(key.clone(), old_batch.clone());
+                workspace
+                    .pending_recovery_retirements
+                    .insert(key.clone(), Some(id));
+                workspace.finish_discard_retirements(
+                    vec![(key.clone(), Some(id))],
+                    old_batch.clone(),
+                    Ok(old_completion),
+                    window,
+                    cx,
+                );
+            });
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.pending_recovery_retirements.contains_key(&key));
+            assert!(workspace.pending_startup_destructive.is_some());
+        });
+
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert!(workspace.read_with(cx, |workspace, _| workspace.tabs.is_empty()));
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn marker_write_retry_does_not_suppress_later_batch_cleanup_retry(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("marker-retry-first.md");
+        let second = dir.path().join("marker-retry-second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+            });
+        });
+
+        replace_document(&workspace, 0, "saved first text\n", cx);
+        let first_document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let first_checkpoint =
+            first_document.read_with(cx, |document, app| document.recovery_checkpoint(app));
+        let first_key = first_checkpoint.key.clone();
+        store
+            .checkpoint(&first_checkpoint, &HashSet::from([first_key.clone()]))
+            .unwrap();
+        store.fail_next_persist_for_test();
+        first_document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_retirement_retries.contains(&first_key));
+            assert!(
+                workspace
+                    .pending_recovery_retirements
+                    .contains_key(&first_key)
+            );
+        });
+
+        let second_document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(1).cloned())
+            .unwrap();
+        cx.update(|window, app| {
+            second_document.update(app, |document, cx| {
+                document.replace_text("discarded second text\n".into(), window, cx);
+            });
+        });
+        let (second_id, second_checkpoint) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(1).unwrap().read(app);
+            (document.id(), document.recovery_checkpoint(app))
+        });
+        let second_key = second_checkpoint.key.clone();
+        store
+            .checkpoint(
+                &second_checkpoint,
+                &HashSet::from([first_key.clone(), second_key.clone()]),
+            )
+            .unwrap();
+        store.fail_next_delete_for_test();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let documents = workspace.lifecycle_documents(cx);
+                let mut request =
+                    DestructiveRequest::new(DestructiveAction::CloseTab(second_id), &documents);
+                let DestructiveResolution::Proceed(action) =
+                    request.decide(DirtyDecision::Discard, None, &documents)
+                else {
+                    panic!("the dirty second document must be authorized for discard");
+                };
+                workspace.perform_after_discard_retirement(
+                    request,
+                    action,
+                    vec![(second_key.clone(), Some(second_id))],
+                    window,
+                    cx,
+                );
+                workspace.pending_recovery_retirements.remove(&first_key);
+            });
+        });
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.recovery_retirement_batches.is_empty(),
+                "the old marker retry must not strand a later batch cleanup"
+            );
+            assert!(workspace.pending_recovery_retirements.is_empty());
+            assert!(workspace.recovery_retirement_retries.is_empty());
+        });
+
+        replace_document(&workspace, 0, "dirty after cleanup\n", cx);
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |workspace, _| workspace.tabs.is_empty()));
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn save_and_discard_clear_the_recovery_record(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+
+        replace_document(&workspace, 0, "saved text\n", cx);
+        let saved_checkpoint = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_at(0)
+                .unwrap()
+                .read(app)
+                .recovery_checkpoint(app)
+        });
+        store
+            .checkpoint(
+                &saved_checkpoint,
+                &HashSet::from([saved_checkpoint.key.clone()]),
+            )
+            .unwrap();
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        assert!(store.recover().unwrap().records.is_empty());
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(path.clone(), window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "discarded text\n", cx);
+        let discarded_checkpoint = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_at(0)
+                .unwrap()
+                .read(app)
+                .recovery_checkpoint(app)
+        });
+        store
+            .checkpoint(
+                &discarded_checkpoint,
+                &HashSet::from([discarded_checkpoint.key.clone()]),
+            )
+            .unwrap();
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn save_and_discard_supersede_an_in_flight_checkpoint(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in-flight.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+
+        for decision in ["Save", "Discard"] {
+            if workspace.read_with(cx, |workspace, _| workspace.tabs.is_empty()) {
+                cx.update(|window, app| {
+                    workspace.update(app, |workspace, cx| {
+                        workspace.open_file(path.clone(), window, cx);
+                    });
+                });
+            }
+            replace_document(&workspace, 0, &format!("{decision} text\n"), cx);
+            let (id, checkpoint, attempt) = workspace.read_with(cx, |workspace, app| {
+                let document = workspace.document_at(0).unwrap().read(app);
+                let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+                let attempt = test_recovery_attempt(
+                    state
+                        .token
+                        .clone()
+                        .expect("a ready test store must provide a recovery token"),
+                    state.revision,
+                    Instant::now(),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                (document.id(), document.recovery_checkpoint(app), attempt)
+            });
+            store
+                .checkpoint(&checkpoint, &HashSet::from([checkpoint.key.clone()]))
+                .unwrap();
+            workspace.update(cx, |workspace, _| {
+                workspace.recovery_schedules.get_mut(&id).unwrap().in_flight =
+                    Some(attempt.clone());
+            });
+
+            cx.simulate_keystrokes("ctrl-w");
+            cx.simulate_prompt_answer(decision);
+            cx.run_until_parked();
+
+            let outcome = store
+                .checkpoint_if_current(
+                    &checkpoint,
+                    &HashSet::from([checkpoint.key.clone()]),
+                    attempt.token.clone(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, CheckpointOutcome::Superseded));
+            workspace.update(cx, |workspace, cx| {
+                workspace.finish_recovery_checkpoints(
+                    vec![(id, attempt, CheckpointBatchOutcome::Superseded)],
+                    RecoveryMaintenance::default(),
+                    cx.background_executor().now(),
+                    cx,
+                );
+            });
+            assert!(store.recover().unwrap().records.is_empty());
+        }
+    }
+
+    #[gpui::test]
+    fn clean_and_closed_documents_retire_recovery_deadlines(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deadline.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store);
+        });
+
+        replace_document(&workspace, 0, "save me\n", cx);
+        let generation_before_save = workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.recovery_schedules.len(), 1);
+            assert!(workspace._recovery_timer.is_some());
+            workspace.recovery_timer_generation
+        });
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_schedules.is_empty());
+            assert!(workspace._recovery_timer.is_none());
+            assert!(workspace.recovery_timer_generation > generation_before_save);
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(path, window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "discard me\n", cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.recovery_schedules.len(), 1);
+            assert!(workspace._recovery_timer.is_some());
+        });
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_schedules.is_empty());
+            assert!(workspace._recovery_timer.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn stale_recovery_completion_cannot_clear_a_newer_attempt(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-completion.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        let (id, key) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (document.id(), document.recovery_key())
+        });
+        let old_token = store.current_token(&key);
+        store.invalidate_and_delete(&key).unwrap();
+        let new_token = store.current_token(&key);
+        let now = Instant::now();
+        let mut schedule = super::CheckpointSchedule::default();
+        schedule.mark_dirty(now);
+        let timing = schedule
+            .checkpoint_dispatched(now + Duration::from_secs(2))
+            .unwrap();
+        let attempt = super::RecoveryAttempt {
+            token: new_token.clone(),
+            revision: 7,
+            timing,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let deadline = schedule.next_deadline();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.recovery = Some(store);
+            workspace.recovery_schedules.insert(
+                id,
+                super::DocumentRecoveryState {
+                    key,
+                    revision: 7,
+                    suppressed_oversized_revision: None,
+                    token: Some(new_token),
+                    schedule,
+                    in_flight: Some(attempt.clone()),
+                    deadline_reported: false,
+                    protection_warning: false,
+                },
+            );
+            workspace.finish_recovery_checkpoints(
+                vec![(
+                    id,
+                    test_recovery_attempt(old_token, 7, now, Arc::new(AtomicBool::new(false))),
+                    CheckpointBatchOutcome::Written,
+                )],
+                RecoveryMaintenance::default(),
+                cx.background_executor().now(),
+                cx,
+            );
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert_eq!(state.in_flight.as_ref(), Some(&attempt));
+            assert_eq!(state.schedule.next_deadline(), deadline);
+        });
+    }
+
+    #[gpui::test]
+    fn editing_one_document_does_not_cancel_other_recovery_attempts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first-cancelled.md");
+        let second_path = dir.path().join("second-cancelled.md");
+        fs::write(&first_path, "first\n").unwrap();
+        fs::write(&second_path, "second\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first_path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second_path, window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "first dirty\n", cx);
+        replace_document(&workspace, 1, "second dirty\n", cx);
+
+        let now = cx.background_executor.now();
+        let first_cancelled = Arc::new(AtomicBool::new(false));
+        let second_cancelled = Arc::new(AtomicBool::new(false));
+        let (first_id, second_id) = workspace.read_with(cx, |workspace, app| {
+            (
+                workspace.document_at(0).unwrap().read(app).id(),
+                workspace.document_at(1).unwrap().read(app).id(),
+            )
+        });
+        workspace.update(cx, |workspace, app| {
+            for id in [first_id, second_id] {
+                let document = workspace.document_by_id(id, app).unwrap();
+                let document = document.read(app);
+                let mut schedule = CheckpointSchedule::default();
+                schedule.mark_dirty(now);
+                let attempt = RecoveryAttempt {
+                    token: store.activate_and_current_token(&document.recovery_key()).0,
+                    revision: document.revision(),
+                    timing: schedule.checkpoint_dispatched(now).unwrap(),
+                    cancelled: if id == first_id {
+                        first_cancelled.clone()
+                    } else {
+                        second_cancelled.clone()
+                    },
+                };
+                workspace.recovery_schedules.insert(
+                    id,
+                    DocumentRecoveryState {
+                        key: document.recovery_key(),
+                        revision: document.revision(),
+                        suppressed_oversized_revision: None,
+                        token: Some(attempt.token.clone()),
+                        schedule,
+                        in_flight: Some(attempt),
+                        deadline_reported: false,
+                        protection_warning: false,
+                    },
+                );
+            }
+        });
+
+        replace_document(&workspace, 0, "newer first text\n", cx);
+
+        assert!(first_cancelled.load(Ordering::Acquire));
+        assert!(!second_cancelled.load(Ordering::Acquire));
+        workspace.read_with(cx, |workspace, _| {
+            let first = workspace.recovery_schedules.get(&first_id).unwrap();
+            let second = workspace.recovery_schedules.get(&second_id).unwrap();
+            assert!(first.in_flight.is_some());
+            assert!(second.in_flight.is_some());
+            assert!(!Arc::ptr_eq(
+                &first.in_flight.as_ref().unwrap().cancelled,
+                &second.in_flight.as_ref().unwrap().cancelled,
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn cancelled_checkpoint_catches_up_after_the_retry_throttle(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled-catch-up.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "first snapshot\n", cx);
+
+        let now = cx.background_executor.now();
+        let (id, attempt) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(now);
+            (
+                document.id(),
+                RecoveryAttempt {
+                    token: state
+                        .token
+                        .clone()
+                        .expect("a ready test store must provide a recovery token"),
+                    revision: document.revision(),
+                    timing: schedule.checkpoint_dispatched(now).unwrap(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            )
+        });
+        workspace.update(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(now);
+            let timing = schedule.checkpoint_dispatched(now).unwrap();
+            state.schedule = schedule;
+            state.in_flight = Some(RecoveryAttempt {
+                timing,
+                ..attempt.clone()
+            });
+        });
+
+        cx.background_executor.advance_clock(Duration::from_secs(3));
+        let latest = "latest exact text 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, latest, cx);
+        assert!(attempt.cancelled.load(Ordering::Acquire));
+
+        let cancelled_attempt = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .recovery_schedules
+                .get(&id)
+                .unwrap()
+                .in_flight
+                .clone()
+                .unwrap()
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_checkpoints(
+                vec![(id, cancelled_attempt, CheckpointBatchOutcome::Superseded)],
+                RecoveryMaintenance::default(),
+                cx.background_executor().now(),
+                cx,
+            );
+        });
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(recovered.records[0].record.text, latest);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_warning.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn active_checkpoint_worker_coalesces_repeated_edits_into_one_latest_follow_up(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coalesced-worker.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let batches_before = store.checkpoint_batch_count_for_test();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text("first snapshot\n".into(), window, cx);
+            });
+        });
+        let edited_at = cx.background_executor.now();
+        let (id, checkpoint, attempt) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(edited_at);
+            (
+                document.id(),
+                document.recovery_checkpoint(app),
+                RecoveryAttempt {
+                    token: state.token.clone().unwrap(),
+                    revision: document.revision(),
+                    timing: schedule
+                        .checkpoint_dispatched(edited_at + Duration::from_secs(2))
+                        .unwrap(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            )
+        });
+        workspace.update(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(edited_at);
+            let timing = schedule
+                .checkpoint_dispatched(edited_at + Duration::from_secs(2))
+                .unwrap();
+            state.schedule = schedule;
+            state.in_flight = Some(RecoveryAttempt {
+                timing,
+                ..attempt.clone()
+            });
+            state.deadline_reported = false;
+            workspace.recovery_checkpoint_worker_active = true;
+            workspace._recovery_timer = None;
+        });
+
+        let (worker_paused, release_worker) = store.pause_after_checkpoint_final_check_for_test();
+        let worker_store = store.clone();
+        let worker_checkpoint = checkpoint.clone();
+        let worker_attempt = attempt.clone();
+        let worker_key = checkpoint.key.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store.checkpoint_batch_if_current_cancellable(
+                [crate::recovery::CancellableRecoveryCheckpointAttempt {
+                    checkpoint: &worker_checkpoint,
+                    token: &worker_attempt.token,
+                    cancelled: worker_attempt.cancelled.as_ref(),
+                }],
+                &HashSet::from([worker_key]),
+            )
+        });
+        worker_paused
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the first physical checkpoint batch must reach the publish boundary");
+
+        cx.background_executor.advance_clock(
+            attempt
+                .timing
+                .durable_complete_by
+                .saturating_duration_since(cx.background_executor.now()),
+        );
+        workspace.update(cx, |workspace, cx| workspace.checkpoint_recovery(cx));
+        let mut latest = String::new();
+        for revision in 1..=4 {
+            latest = format!("latest revision {revision} 中文 \u{1f680}\n");
+            cx.update(|window, app| {
+                document.update(app, |document, cx| {
+                    document.replace_text(latest.clone(), window, cx);
+                });
+            });
+        }
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery(cx);
+        });
+        let same_attempt_while_paused = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .recovery_schedules
+                .get(&id)
+                .and_then(|state| state.in_flight.as_ref())
+                .is_some_and(|current| current == &attempt)
+        });
+        let batches_while_paused = store.checkpoint_batch_count_for_test();
+
+        release_worker.send(()).unwrap();
+        let batch = worker.join().unwrap();
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_checkpoints(
+                vec![(id, attempt, batch.outcomes.into_iter().next().unwrap())],
+                batch.maintenance,
+                cx.background_executor().now(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let recovered = store.recover().unwrap();
+
+        assert!(
+            same_attempt_while_paused,
+            "an occupied worker slot must retain the cancelled logical attempt instead of snapshotting again"
+        );
+        assert_eq!(
+            batches_while_paused,
+            batches_before + 1,
+            "deadline handling must not start a second physical batch"
+        );
+        assert_eq!(
+            store.checkpoint_batch_count_for_test(),
+            batches_before + 2,
+            "the released slot must dispatch exactly one coalesced follow-up"
+        );
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(recovered.records[0].record.text, latest);
+    }
+
+    #[gpui::test]
+    fn checkpoint_returning_after_its_durable_deadline_keeps_the_warning(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store-late.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        replace_document(&workspace, 0, "late checkpoint\n", cx);
+        let dispatched_at = cx.background_executor.now();
+        let (id, attempt) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(dispatched_at);
+            (
+                document.id(),
+                RecoveryAttempt {
+                    token: state.token.clone().unwrap(),
+                    revision: document.revision(),
+                    timing: schedule.checkpoint_dispatched(dispatched_at).unwrap(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            )
+        });
+        workspace.update(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(dispatched_at);
+            let _ = schedule.checkpoint_dispatched(dispatched_at).unwrap();
+            state.schedule = schedule;
+            state.in_flight = Some(attempt.clone());
+            state.protection_warning = false;
+        });
+        cx.background_executor.advance_clock(Duration::from_secs(9));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_checkpoints(
+                vec![(id, attempt, CheckpointBatchOutcome::Written)],
+                RecoveryMaintenance::default(),
+                cx.background_executor().now(),
+                cx,
+            );
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert!(state.protection_warning);
+            assert!(state.schedule.next_deadline().is_some());
+            assert!(workspace.recovery_warning.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn checkpoint_returning_on_time_clears_a_warning_even_when_ui_delivery_is_late(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui-late.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        replace_document(&workspace, 0, "durable on time\n", cx);
+        let dispatched_at = cx.background_executor.now();
+        let (id, attempt) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(dispatched_at);
+            (
+                document.id(),
+                RecoveryAttempt {
+                    token: state.token.clone().unwrap(),
+                    revision: document.revision(),
+                    timing: schedule.checkpoint_dispatched(dispatched_at).unwrap(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            )
+        });
+        workspace.update(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let mut schedule = CheckpointSchedule::default();
+            schedule.mark_dirty(dispatched_at);
+            let _ = schedule.checkpoint_dispatched(dispatched_at).unwrap();
+            state.schedule = schedule;
+            state.in_flight = Some(attempt.clone());
+            state.protection_warning = false;
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(attempt.timing.durable_complete_by, cx);
+        });
+        let store_returned_at = attempt
+            .timing
+            .durable_complete_by
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_checkpoints(
+                vec![(id, attempt, CheckpointBatchOutcome::Written)],
+                RecoveryMaintenance::default(),
+                store_returned_at,
+                cx,
+            );
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert!(!state.protection_warning);
+            assert!(workspace.recovery_warning.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn overdue_checkpoint_waits_for_the_physical_worker_before_retrying(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overdue-stuck.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let latest = "latest while stale worker is stuck\n";
+        replace_document(&workspace, 0, latest, cx);
+
+        let now = cx.background_executor.now();
+        let (id, token, revision) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            (
+                document.id(),
+                state
+                    .token
+                    .clone()
+                    .expect("a ready test store must provide a recovery token"),
+                document.revision(),
+            )
+        });
+        let mut schedule = CheckpointSchedule::default();
+        schedule.mark_dirty(now);
+        let attempt = RecoveryAttempt {
+            token,
+            revision,
+            timing: schedule.checkpoint_dispatched(now).unwrap(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        workspace.update(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            state.schedule = schedule;
+            state.in_flight = Some(attempt.clone());
+            state.deadline_reported = false;
+            workspace.recovery_checkpoint_worker_active = true;
+        });
+
+        cx.background_executor.advance_clock(
+            attempt
+                .timing
+                .durable_complete_by
+                .saturating_duration_since(now),
+        );
+        let deadline = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(deadline, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert_eq!(state.in_flight.as_ref(), Some(&attempt));
+            assert!(state.deadline_reported);
+            assert!(state.protection_warning);
+            assert!(workspace._recovery_timer.is_none());
+        });
+        assert!(attempt.cancelled.load(Ordering::Acquire));
+
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert_eq!(state.in_flight.as_ref(), Some(&attempt));
+            assert!(workspace.recovery_warning.is_some());
+        });
+        assert!(store.recover().unwrap().records.is_empty());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery_checkpoint_worker_active = false;
+            workspace.recovery_schedules.remove(&id);
+            workspace._recovery_timer = None;
+        });
+    }
+
+    #[gpui::test]
+    fn overdue_checkpoint_retries_and_clears_warning_after_becoming_durable(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overdue.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "protected late\n", cx);
+
+        let now = cx.background_executor.now();
+        let (id, key, revision, token) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            (
+                document.id(),
+                document.recovery_key(),
+                document.revision(),
+                state
+                    .token
+                    .clone()
+                    .expect("a ready test store must provide a recovery token"),
+            )
+        });
+        let mut schedule = CheckpointSchedule::default();
+        schedule.mark_dirty(now);
+        let timing = schedule.checkpoint_dispatched(now).unwrap();
+        let attempt = RecoveryAttempt {
+            token: token.clone(),
+            revision,
+            timing,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery_schedules.insert(
+                id,
+                DocumentRecoveryState {
+                    key,
+                    revision,
+                    suppressed_oversized_revision: None,
+                    token: Some(token),
+                    schedule,
+                    in_flight: Some(attempt.clone()),
+                    deadline_reported: false,
+                    protection_warning: false,
+                },
+            );
+            workspace.recovery_checkpoint_worker_active = true;
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(timing.durable_complete_by, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert_eq!(state.in_flight.as_ref(), Some(&attempt));
+            assert!(state.deadline_reported);
+            assert!(state.protection_warning);
+            assert!(workspace.recovery_warning.is_some());
+            assert!(workspace._recovery_timer.is_none());
+        });
+        assert!(attempt.cancelled.load(Ordering::Acquire));
+
+        let overdue_attempt = attempt;
+        cx.background_executor
+            .advance_clock(timing.durable_complete_by.saturating_duration_since(now));
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_checkpoints(
+                vec![(
+                    id,
+                    overdue_attempt,
+                    CheckpointBatchOutcome::Failed(RecoveryError::Protection),
+                )],
+                RecoveryMaintenance::default(),
+                cx.background_executor().now(),
+                cx,
+            );
+            workspace._recovery_timer = None;
+        });
+
+        let latest = "latest after overdue 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, latest, cx);
+        workspace.update(cx, |workspace, _| {
+            workspace._recovery_timer = None;
+        });
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        let retry_at = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace._recovery_timer = None;
+            workspace.checkpoint_recovery_at(retry_at, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let retry = workspace
+                .recovery_schedules
+                .get(&id)
+                .unwrap()
+                .in_flight
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                retry.timing.durable_complete_by,
+                retry_at + Duration::from_secs(8)
+            );
+            assert!(workspace.recovery_warning.is_some());
+        });
+        cx.run_until_parked();
+
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(recovered.records[0].record.text, latest);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_warning.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn obvious_oversized_revision_does_no_physical_work_until_a_smaller_edit(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("obvious-oversized.md");
+        fs::write(&path, "disk\n").unwrap();
+        let protector = Arc::new(CountingRecoveryProtector::new(
+            CountingProtection::Reversible,
+        ));
+        let max_record_bytes = 4 * 1024;
+        let store = RecoveryStore::new_at_with_limits(
+            dir.path().join("recovery-store"),
+            protector.clone(),
+            recovery_limits(max_record_bytes),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+
+        replace_document(
+            &workspace,
+            0,
+            &"x".repeat(max_record_bytes as usize + 1),
+            cx,
+        );
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        for elapsed in [Duration::from_secs(1), Duration::from_secs(30)] {
+            cx.background_executor.advance_clock(elapsed);
+            cx.run_until_parked();
+        }
+
+        assert_eq!(store.checkpoint_batch_count_for_test(), 0);
+        assert_eq!(protector.calls(), 0);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.recovery_checkpoint_worker_active);
+            assert!(workspace.recovery_warning.is_some());
+            assert!(workspace._recovery_timer.is_none());
+        });
+
+        let smaller = "small recoverable edit 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, smaller, cx);
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        assert_eq!(store.checkpoint_batch_count_for_test(), 1);
+        assert_eq!(protector.calls(), 1);
+        assert_eq!(store.recover().unwrap().records[0].record.text, smaller);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_warning.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn ciphertext_oversize_is_not_retried_until_the_document_is_edited(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ciphertext-oversized.md");
+        fs::write(&path, "disk\n").unwrap();
+        let max_record_bytes = 4 * 1024;
+        let protector = Arc::new(CountingRecoveryProtector::new(CountingProtection::Expand(
+            max_record_bytes as usize,
+        )));
+        let store = RecoveryStore::new_at_with_limits(
+            dir.path().join("recovery-store"),
+            protector.clone(),
+            recovery_limits(max_record_bytes),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+
+        replace_document(&workspace, 0, "below the plaintext ceiling\n", cx);
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(protector.calls(), 1);
+        assert_eq!(store.checkpoint_batch_count_for_test(), 1);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.recovery_warning.is_some()));
+
+        cx.background_executor
+            .advance_clock(Duration::from_secs(30));
+        cx.run_until_parked();
+        assert_eq!(protector.calls(), 1);
+        assert_eq!(store.checkpoint_batch_count_for_test(), 1);
+
+        replace_document(&workspace, 0, "a different below-ceiling revision\n", cx);
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(protector.calls(), 2);
+        assert_eq!(store.checkpoint_batch_count_for_test(), 2);
+    }
+
+    #[gpui::test]
+    fn transient_protection_failure_retries_the_same_revision_and_succeeds(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transient-protection.md");
+        fs::write(&path, "disk\n").unwrap();
+        let protector = Arc::new(CountingRecoveryProtector::new(CountingProtection::FailOnce));
+        let store =
+            RecoveryStore::new_at(dir.path().join("recovery-store"), protector.clone()).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+
+        let text = "retry this exact revision 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, text, cx);
+        let revision = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).revision()
+        });
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(protector.calls(), 1);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.recovery_warning.is_some()));
+
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert_eq!(protector.calls(), 2);
+        assert_eq!(store.checkpoint_batch_count_for_test(), 2);
+        assert_eq!(store.recover().unwrap().records[0].record.text, text);
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(
+                workspace.document_at(0).unwrap().read(app).revision(),
+                revision
+            );
+            assert!(workspace.recovery_warning.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn stale_written_checkpoint_does_not_clear_an_existing_recovery_warning(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-written-warning.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "current revision\n", cx);
+
+        let now = cx.background_executor.now();
+        let (id, key, revision, token) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            (
+                document.id(),
+                document.recovery_key(),
+                document.revision(),
+                state
+                    .token
+                    .clone()
+                    .expect("a ready test store must provide a recovery token"),
+            )
+        });
+        let mut schedule = CheckpointSchedule::default();
+        schedule.mark_dirty(now);
+        let timing = schedule.checkpoint_dispatched(now).unwrap();
+        schedule.mark_dirty(now + Duration::from_secs(1));
+        let attempt = RecoveryAttempt {
+            token: token.clone(),
+            revision: revision.saturating_sub(1),
+            timing,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.recovery = Some(store);
+            workspace.recovery_schedules.insert(
+                id,
+                DocumentRecoveryState {
+                    key,
+                    revision,
+                    suppressed_oversized_revision: None,
+                    token: Some(token),
+                    schedule,
+                    in_flight: Some(attempt.clone()),
+                    deadline_reported: false,
+                    protection_warning: true,
+                },
+            );
+            workspace.finish_recovery_checkpoints(
+                vec![(id, attempt, CheckpointBatchOutcome::Written)],
+                RecoveryMaintenance::default(),
+                cx.background_executor().now(),
+                cx,
+            );
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert!(state.protection_warning);
+            assert!(workspace.recovery_warning.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn eviction_reservation_warns_until_a_later_checkpoint_is_written(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reserved-document.md");
+        let incoming_path = dir.path().join("incoming-document.md");
+        fs::write(&path, "disk\n").unwrap();
+        fs::write(&incoming_path, "incoming disk\n").unwrap();
+        let store = RecoveryStore::new_at_with_limits(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+            RecoveryLimits {
+                max_records: 1,
+                max_record_bytes: 10_000,
+                max_total_bytes: 20_000,
+                max_age: Duration::from_secs(7 * 24 * 60 * 60),
+            },
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, "older recovery text\n");
+        let incoming = RecoveryCheckpoint {
+            key: RecoveryKey::for_path(&incoming_path),
+            text: "incoming recovery text\n".into(),
+            metadata: RecoveryMetadata::from_loaded_file(&crate::fs::load(&incoming_path).unwrap()),
+        };
+        let token = store.current_token(&incoming.key);
+        let (reserved, release) = store.pause_after_eviction_reservation_for_test();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store
+                .checkpoint_if_current(&incoming, &HashSet::new(), token)
+                .unwrap()
+        });
+        reserved
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the transaction must reserve its eviction victim");
+
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let edited = "edited during eviction reservation\n";
+        replace_document(&workspace, 0, edited, cx);
+        let immediate_warning =
+            workspace.read_with(cx, |workspace, _| workspace.recovery_warning.clone());
+
+        release.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            CheckpointOutcome::Written(_)
+        ));
+        let warning = "Recovery protection is unavailable for at least one dirty document. Editing and source files are unchanged.";
+        assert_eq!(immediate_warning.as_deref(), Some(warning));
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.recovery_warning.as_deref(), Some(warning));
+        });
+
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_warning.is_none());
+            assert!(
+                workspace
+                    .recovery_schedules
+                    .values()
+                    .all(|state| !state.protection_warning)
+            );
+        });
+        let records = store.recover().unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.text, edited);
+    }
+
+    #[gpui::test]
+    fn continued_edits_checkpoint_without_postponing_the_oldest_uncovered_text(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continuous-checkpoint.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+
+        let first = "first checkpoint\n";
+        replace_document(&workspace, 0, first, cx);
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let first_scan = store.recover().unwrap();
+        assert_eq!(first_scan.records.len(), 1);
+        assert_eq!(first_scan.records[0].record.text, first);
+
+        let mut latest = first.to_string();
+        let mut latest_before_last_edit = first.to_string();
+        for second in 1..=9 {
+            cx.background_executor.advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            latest_before_last_edit.clone_from(&latest);
+            latest = format!("latest revision {second} 中文 \\u{{1f680}}\n");
+            replace_document(&workspace, 0, &latest, cx);
+        }
+
+        let before_deadline = store.recover().unwrap();
+        assert_eq!(before_deadline.records.len(), 1);
+        assert_eq!(
+            before_deadline.records[0].record.text,
+            latest_before_last_edit
+        );
+
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let after_deadline = store.recover().unwrap();
+        assert_eq!(after_deadline.records.len(), 1);
+        assert_eq!(after_deadline.records[0].record.text, latest);
+    }
+
+    #[gpui::test]
+    fn simultaneously_due_documents_share_one_recovery_scan(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.md");
+        let second = dir.path().join("second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+            });
+        });
+
+        replace_document(&workspace, 0, "first exact 中文 \u{1f680}\n", cx);
+        replace_document(&workspace, 1, "second exact 中文 \u{1f680}\n", cx);
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        assert_eq!(
+            store.retention_scan_count_for_test(),
+            1,
+            "one scheduler wake-up must scan retention once for the whole due batch"
+        );
+        let recovered: std::collections::HashMap<_, _> = store
+            .recover()
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| (record.record.key, record.record.text))
+            .collect();
+        assert_eq!(recovered.len(), 2);
+        assert!(
+            recovered
+                .values()
+                .any(|text| text == "first exact 中文 \u{1f680}\n")
+        );
+        assert!(
+            recovered
+                .values()
+                .any(|text| text == "second exact 中文 \u{1f680}\n")
+        );
+    }
+
+    #[gpui::test]
+    fn recovery_idle_deadline_restores_exact_cjk_and_emoji_text(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+
+        let edited = "checkpoint 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        let started = Instant::now();
+        workspace.update(cx, |workspace, cx| {
+            let document = workspace.document_at(0).cloned().unwrap();
+            workspace.arm_document_recovery_at(&document, started, cx);
+            workspace.checkpoint_recovery_at(started + Duration::from_secs(1), cx);
+        });
+        assert!(
+            store.recover().unwrap().records.is_empty(),
+            "the idle checkpoint must not fire before two seconds"
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(started + Duration::from_secs(2), cx);
+        });
+        cx.run_until_parked();
+        let scan = store.recover().unwrap();
+        assert_eq!(scan.records.len(), 1, "the two-second deadline dispatched");
+        assert_eq!(scan.records[0].record.text, edited);
+
+        let (restored_workspace, cx) = open_test_workspace_with(cx, None);
+        restored_workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let restored = cx.update(|window, app| {
+            restored_workspace.update(app, |workspace, cx| {
+                restore_recovery_for_test(workspace, scan, window, cx)
+            })
+        });
+        assert_eq!(restored, (1, 0));
+        let restored_document = restored_workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        restored_document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), edited);
+        });
+    }
+
+    #[gpui::test]
+    fn no_record_startup_recovery_clears_pending_state(cx: &mut TestAppContext) {
+        let (workspace, cx) =
+            open_test_workspace_with_startup_recovery(cx, None, StartupRecovery::default);
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.startup_recovery_pending);
+            assert!(workspace.recovery.is_none());
+            assert!(workspace.tabs.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn early_edit_keeps_its_deadline_until_startup_recovery_is_available(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup-pending.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+        });
+
+        let edited_at = cx.background_executor.now();
+        replace_document(&workspace, 0, "typed while recovery opens\n", cx);
+        let id = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace
+                .recovery_schedules
+                .get(&document.id())
+                .expect("an early edit must create recovery timing state");
+            assert_eq!(
+                state.schedule.next_deadline(),
+                Some(edited_at + Duration::from_secs(2))
+            );
+            document.id()
+        });
+
+        let unavailable_at = edited_at + Duration::from_secs(2);
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(unavailable_at, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert!(state.protection_warning);
+            assert!(workspace.recovery_warning.is_some());
+        });
+
+        let store_ready_at = edited_at + Duration::from_secs(3);
+        complete_startup_with_store(&workspace, store, cx);
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert!(
+                state.token.is_some(),
+                "the startup result must activate an existing unprotected schedule"
+            );
+            assert_eq!(
+                state.schedule.next_deadline(),
+                Some(edited_at + Duration::from_secs(2)),
+                "activating recovery must preserve the first edit's deadline"
+            );
+            assert!(
+                workspace._recovery_timer.is_some(),
+                "the overdue schedule must be re-armed when recovery becomes available"
+            );
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(store_ready_at, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let attempt = workspace
+                .recovery_schedules
+                .get(&id)
+                .and_then(|state| state.in_flight.as_ref())
+                .expect("the overdue early edit must dispatch when recovery becomes available");
+            assert_eq!(
+                attempt.timing.durable_complete_by,
+                edited_at + Duration::from_secs(10)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn populated_startup_recovery_does_not_block_initial_file_or_early_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("initial.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, "older recovered text\n");
+        let store_for_startup = store.clone();
+        let initial_was_interactive = Arc::new(AtomicBool::new(false));
+        let loader_observation = initial_was_interactive.clone();
+        let inspection_observation = initial_was_interactive.clone();
+        let latest = "typed before recovery 中文 \u{1f680}\n";
+
+        let (workspace, cx) = open_test_workspace_with_startup_recovery_inspection(
+            cx,
+            Some(path.clone()),
+            move || {
+                assert!(
+                    loader_observation.load(Ordering::Acquire),
+                    "the initial file must be open and editable before recovery loading begins"
+                );
+                populated_startup_recovery(store_for_startup)
+            },
+            move |workspace, window, cx| {
+                assert_eq!(workspace.tabs.len(), 1);
+                let document = workspace.document_at(0).cloned().unwrap();
+                assert_eq!(document.read(cx).text(cx), "disk\n");
+                document.update(cx, |document, cx| {
+                    document.replace_text(latest.to_string(), window, cx);
+                });
+                assert_eq!(document.read(cx).text(cx), latest);
+                inspection_observation.store(true, Ordering::Release);
+            },
+        );
+
+        cx.run_until_parked();
+
+        let id = workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), latest);
+            document.id()
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery.is_some());
+            assert!(workspace.recovery_schedules.contains_key(&id));
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "Restored 0 recovery checkpoint(s); skipped 1 unavailable or invalid record(s)."
+                )
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn clean_initial_file_accepts_recovery_without_recheckpointing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-path.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let recovered = "recovered exact 中文 \u{1f680}\n";
+        write_recovery_checkpoint(&store, &path, recovered);
+        let scans_after_seed = store.retention_scan_count_for_test();
+        let store_for_startup = store.clone();
+
+        let (workspace, cx) =
+            open_test_workspace_with_startup_recovery(cx, Some(path), move || {
+                populated_startup_recovery(store_for_startup)
+            });
+        cx.run_until_parked();
+
+        let id = workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), recovered);
+            document.id()
+        });
+        let restored_at = cx.background_executor.now();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.startup_recovery_pending);
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert_eq!(
+                state.schedule.next_deadline(),
+                Some(restored_at + Duration::from_secs(10))
+            );
+            assert!(state.in_flight.is_none());
+            assert!(workspace._recovery_timer.is_some());
+        });
+
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(
+            store.retention_scan_count_for_test(),
+            scans_after_seed,
+            "a restored checkpoint is already durable and must not be rewritten"
+        );
+
+        let latest = "edited after recovery 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, latest, cx);
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(store.recover().unwrap().records[0].record.text, latest);
+    }
+
+    #[gpui::test]
+    fn restored_dirty_checkpoint_refreshes_at_ten_seconds_from_its_durable_baseline(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restored-refresh.md");
+        fs::write(&path, "disk\n").unwrap();
+        let loaded = crate::fs::load(&path).unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let recovered_text = "restored durable 中文 \u{1f680}\n";
+        write_recovery_checkpoint(&store, &path, recovered_text);
+        let scans_after_seed = store.retention_scan_count_for_test();
+        let baseline_checkpointed_at = UNIX_EPOCH + Duration::from_secs(1);
+        let scan = RecoveryScan {
+            records: vec![RecoveredRecord {
+                record: RecoveryRecord {
+                    key: RecoveryKey::for_path(&path),
+                    text: recovered_text.into(),
+                    metadata: RecoveryMetadata::from_loaded_file(&loaded),
+                    checkpointed_at: baseline_checkpointed_at,
+                },
+                source_conflicted: false,
+            }],
+            issues: Vec::new(),
+        };
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let restored_at = cx.background_executor.now();
+
+        let restored = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                restore_recovery_for_test(workspace, scan, window, cx)
+            })
+        });
+        assert_eq!(restored, (1, 0));
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            assert_eq!(
+                state.schedule.next_deadline(),
+                Some(restored_at + Duration::from_secs(10))
+            );
+            assert!(workspace._recovery_timer.is_some());
+        });
+
+        cx.background_executor.advance_clock(Duration::from_secs(9));
+        cx.run_until_parked();
+        assert_eq!(store.retention_scan_count_for_test(), scans_after_seed);
+        assert_eq!(
+            store.recover().unwrap().records[0].record.text,
+            recovered_text
+        );
+
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(store.retention_scan_count_for_test(), scans_after_seed + 1);
+        let refreshed = store.recover().unwrap();
+        assert_eq!(refreshed.records[0].record.text, recovered_text);
+        assert!(refreshed.records[0].record.checkpointed_at > baseline_checkpointed_at);
+    }
+
+    #[gpui::test]
+    fn changed_initial_source_restores_recovery_as_conflicted(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed-source.md");
+        fs::write(&path, "original disk\n").unwrap();
+        let loaded = crate::fs::load(&path).unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let recovered = "recovered before interruption 中文 \u{1f680}\n";
+        store
+            .checkpoint(
+                &RecoveryCheckpoint {
+                    key: RecoveryKey::for_path(&path),
+                    text: recovered.to_string(),
+                    metadata: RecoveryMetadata::from_loaded_file(&loaded),
+                },
+                &HashSet::new(),
+            )
+            .unwrap();
+        fs::write(&path, "external disk rewrite\n").unwrap();
+        let store_for_startup = store.clone();
+
+        let (workspace, cx) =
+            open_test_workspace_with_startup_recovery(cx, Some(path.clone()), move || {
+                populated_startup_recovery(store_for_startup)
+            });
+        cx.run_until_parked();
+
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), recovered);
+        });
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        assert_eq!(fs::read_to_string(path).unwrap(), "external disk rewrite\n");
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), recovered);
+        });
+    }
+
+    #[gpui::test]
+    fn file_opened_during_startup_accepts_matching_recovery(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened-during-startup.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let recovered = "recovered after manual open\n";
+        write_recovery_checkpoint(&store, &path, recovered);
+        let startup = populated_startup_recovery(store);
+        let (workspace, cx) = open_test_workspace(cx, path);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(startup, HashMap::new(), window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), recovered);
+        });
+    }
+
+    #[gpui::test]
+    fn watcher_conflict_survives_startup_recovery_application(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watcher-before-recovery.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let recovered = "recovered while watcher pending\n";
+        write_recovery_checkpoint(&store, &path, recovered);
+        let startup = populated_startup_recovery(store);
+        let (workspace, cx) = open_test_workspace(cx, path);
+        let startup_targets =
+            workspace.read_with(cx, |workspace, app| workspace.startup_recovery_targets(app));
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.update(cx, |document, cx| document.mark_externally_changed(cx));
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(startup, startup_targets, window, cx);
+            });
+        });
+
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), recovered);
+        });
+    }
+
+    #[gpui::test]
+    fn queued_retirement_filters_a_startup_record_before_restore(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved-before-recovery.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, "obsolete recovery\n");
+        let startup = populated_startup_recovery(store.clone());
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let startup_targets =
+            workspace.read_with(cx, |workspace, app| workspace.startup_recovery_targets(app));
+        let key = RecoveryKey::for_path(&path);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+            workspace.invalidate_recovery(&key, None, cx);
+            assert!(workspace.pending_recovery_retirements.contains_key(&key));
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(startup, startup_targets, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(store.recover().unwrap().records.is_empty());
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert_eq!(
+                workspace.document_at(0).unwrap().read(app).text(app),
+                "disk\n"
+            );
+            assert!(workspace.pending_recovery_retirements.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn startup_recovery_counts_each_scan_issue_once(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let scan = RecoveryScan {
+            records: Vec::new(),
+            issues: vec![RecoveryIssue::Malformed {
+                path: dir.path().join("malformed.mtrecovery"),
+            }],
+        };
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                // `startup_recovery` aggregates scan issues with maintenance
+                // issues before this layer restores the records.
+                restore_startup_recovery_for_test(workspace, scan, 1, None, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "Restored 0 recovery checkpoint(s); skipped 1 unavailable or invalid record(s)."
+                )
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn malformed_startup_recovery_is_reported_without_blocking_editing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("editing-remains-available.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        let scan = RecoveryScan {
+            records: Vec::new(),
+            issues: vec![RecoveryIssue::Malformed {
+                path: dir.path().join("malformed.mtrecovery"),
+            }],
+        };
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                restore_startup_recovery_for_test(workspace, scan, 1, None, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "Restored 0 recovery checkpoint(s); skipped 1 unavailable or invalid record(s)."
+                )
+            );
+        });
+        replace_document(&workspace, 0, "still editable 中文 \u{1f680}\n", cx);
+        assert_eq!(
+            document_text(&workspace, 0, cx),
+            "still editable 中文 \u{1f680}\n"
+        );
+    }
+
+    #[test]
+    fn startup_recovery_status_keeps_single_signal_messages_and_combines_mixed_outcomes() {
+        assert_eq!(startup_recovery_status(0, 0, None), None);
+        assert_eq!(
+            startup_recovery_status(0, 0, Some("recovery decryption failed")).as_deref(),
+            Some("recovery decryption failed. Editing remains available.")
+        );
+        assert_eq!(
+            startup_recovery_status(1, 0, None).as_deref(),
+            Some("Restored 1 recovery checkpoint(s); skipped 0 unavailable or invalid record(s).")
+        );
+        assert_eq!(
+            startup_recovery_status(0, 2, None).as_deref(),
+            Some("Restored 0 recovery checkpoint(s); skipped 2 unavailable or invalid record(s).")
+        );
+        assert_eq!(
+            startup_recovery_status(0, 1, Some("recovery decryption failed")).as_deref(),
+            Some(
+                "recovery decryption failed. Editing remains available. Restored 0 recovery checkpoint(s); skipped 1 unavailable or invalid record(s)."
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn startup_recovery_reports_error_beside_restored_or_skipped_summary(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup-mixed.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        let scan = RecoveryScan {
+            records: Vec::new(),
+            issues: vec![RecoveryIssue::Malformed {
+                path: dir.path().join("malformed.mtrecovery"),
+            }],
+        };
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                restore_startup_recovery_for_test(
+                    workspace,
+                    scan,
+                    1,
+                    Some("recovery decryption failed".into()),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "recovery decryption failed. Editing remains available. Restored 0 recovery checkpoint(s); skipped 1 unavailable or invalid record(s)."
+                )
+            );
+        });
+        replace_document(
+            &workspace,
+            0,
+            "still editable after mixed startup 中文 \u{1f680}\n",
+            cx,
+        );
+        assert_eq!(
+            document_text(&workspace, 0, cx),
+            "still editable after mixed startup 中文 \u{1f680}\n"
+        );
+    }
+    #[test]
+    fn stale_written_checkpoint_does_not_signal_current_durability() {
+        let written = CheckpointBatchOutcome::Written;
+        assert!(current_checkpoint_write_completed(true, 7, 7, &written));
+        assert!(!current_checkpoint_write_completed(true, 8, 7, &written));
+        assert!(!current_checkpoint_write_completed(false, 7, 7, &written));
+        assert!(!current_checkpoint_write_completed(
+            true,
+            7,
+            7,
+            &CheckpointBatchOutcome::Deferred,
+        ));
+    }
+
+    #[test]
+    fn checkpoint_batch_status_keeps_single_signal_messages_and_combines_both() {
+        assert_eq!(checkpoint_batch_status(0, None), None);
+        assert_eq!(
+            checkpoint_batch_status(2, None).as_deref(),
+            Some("Recovery skipped 2 malformed, oversized, expired, or unreadable record(s).")
+        );
+        assert_eq!(
+            checkpoint_batch_status(0, Some("recovery encryption failed")).as_deref(),
+            Some("recovery encryption failed. Editing and source files are unchanged.")
+        );
+        assert_eq!(
+            checkpoint_batch_status(1, Some("recovery encryption failed")).as_deref(),
+            Some(
+                "recovery encryption failed. Editing and source files are unchanged. Recovery skipped 1 malformed, oversized, expired, or unreadable record(s)."
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn checkpoint_batch_failure_stays_visible_beside_maintenance_issues(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("checkpoint-first.md");
+        let second = dir.path().join("checkpoint-second.md");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second.clone(), window, cx);
+            });
+        });
+
+        let now = cx.background_executor.now();
+        let issue_path = dir.path().join("malformed.mtrecovery");
+        let (first_id, first_key, first_revision, second_id, second_key, second_revision) =
+            workspace.read_with(cx, |workspace, app| {
+                let first = workspace.document_at(0).unwrap().read(app);
+                let second = workspace.document_at(1).unwrap().read(app);
+                (
+                    first.id(),
+                    first.recovery_key(),
+                    first.revision(),
+                    second.id(),
+                    second.recovery_key(),
+                    second.revision(),
+                )
+            });
+        let first_token = store.activate_and_current_token(&first_key).0;
+        let second_token = store.activate_and_current_token(&second_key).0;
+        workspace.update(cx, |workspace, cx| {
+            let mut first_schedule = CheckpointSchedule::default();
+            first_schedule.mark_dirty(now);
+            let mut second_schedule = CheckpointSchedule::default();
+            second_schedule.mark_dirty(now);
+            let first_attempt = RecoveryAttempt {
+                token: first_token.clone(),
+                revision: first_revision,
+                timing: first_schedule.checkpoint_dispatched(now).unwrap(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            let second_attempt = RecoveryAttempt {
+                token: second_token.clone(),
+                revision: second_revision,
+                timing: second_schedule.checkpoint_dispatched(now).unwrap(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            workspace.recovery_schedules.insert(
+                first_id,
+                DocumentRecoveryState {
+                    key: first_key,
+                    revision: first_revision,
+                    suppressed_oversized_revision: None,
+                    token: Some(first_token),
+                    schedule: first_schedule,
+                    in_flight: Some(first_attempt.clone()),
+                    deadline_reported: false,
+                    protection_warning: false,
+                },
+            );
+            workspace.recovery_schedules.insert(
+                second_id,
+                DocumentRecoveryState {
+                    key: second_key,
+                    revision: second_revision,
+                    suppressed_oversized_revision: None,
+                    token: Some(second_token),
+                    schedule: second_schedule,
+                    in_flight: Some(second_attempt.clone()),
+                    deadline_reported: false,
+                    protection_warning: false,
+                },
+            );
+            workspace.finish_recovery_checkpoints(
+                vec![
+                    (first_id, first_attempt, CheckpointBatchOutcome::Written),
+                    (
+                        second_id,
+                        second_attempt,
+                        CheckpointBatchOutcome::Failed(RecoveryError::QuotaExceeded {
+                            required_records: 51,
+                            max_records: 50,
+                            required_bytes: 129,
+                            max_total_bytes: 128,
+                        }),
+                    ),
+                ],
+                RecoveryMaintenance {
+                    removed_expired: 0,
+                    issues: vec![RecoveryIssue::Malformed { path: issue_path }],
+                },
+                cx.background_executor().now(),
+                cx,
+            );
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "recovery retention quota would require 51 records / 129 bytes; limits are 50 records / 128 bytes. Editing and source files are unchanged. Recovery skipped 1 malformed, oversized, expired, or unreadable record(s)."
+                )
+            );
+        });
+        assert_eq!(document_text(&workspace, 0, cx), "first\n");
+        assert_eq!(document_text(&workspace, 1, cx), "second\n");
+        assert_eq!(fs::read_to_string(first).unwrap(), "first\n");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second\n");
+    }
+    #[gpui::test]
+    fn multi_document_discard_keeps_every_record_when_batch_retirement_fails(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("batch-retirement-first.md");
+        let second = dir.path().join("batch-retirement-second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second.clone(), window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "first discarded snapshot\n", cx);
+        replace_document(&workspace, 1, "second discarded snapshot\n", cx);
+        let checkpoints = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_views()
+                .into_iter()
+                .map(|document| document.read(app).recovery_checkpoint(app))
+                .collect::<Vec<_>>()
+        });
+        for checkpoint in &checkpoints {
+            store
+                .checkpoint(
+                    checkpoint,
+                    &checkpoints
+                        .iter()
+                        .map(|checkpoint| checkpoint.key.clone())
+                        .collect(),
+                )
+                .unwrap();
+        }
+        store.fail_next_persist_for_test();
+
+        assert!(!cx.simulate_close());
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert_eq!(
+                workspace.document_at(0).unwrap().read(app).text(app),
+                "first discarded snapshot\n"
+            );
+            assert_eq!(
+                workspace.document_at(1).unwrap().read(app).text(app),
+                "second discarded snapshot\n"
+            );
+            for checkpoint in &checkpoints {
+                assert!(
+                    workspace
+                        .pending_recovery_retirements
+                        .contains_key(&checkpoint.key),
+                    "a failed batch marker write must keep every retirement queued"
+                );
+            }
+        });
+        let recovered: HashMap<_, _> = store
+            .recover()
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| (record.record.key, record.record.text))
+            .collect();
+        assert_eq!(recovered.len(), 2);
+        for checkpoint in checkpoints {
+            assert_eq!(recovered.get(&checkpoint.key), Some(&checkpoint.text));
+        }
+    }
+
+    #[gpui::test]
+    fn dirty_owned_old_retirement_delays_the_full_discard_batch(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("old-retirement-first.md");
+        let second = dir.path().join("old-retirement-second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "latest first text\n", cx);
+        replace_document(&workspace, 1, "latest second text\n", cx);
+
+        let (first_id, checkpoints) = workspace.read_with(cx, |workspace, app| {
+            let documents = workspace.document_views();
+            let first_id = documents[0].read(app).id();
+            let checkpoints = documents
+                .into_iter()
+                .map(|document| document.read(app).recovery_checkpoint(app))
+                .collect::<Vec<_>>();
+            (first_id, checkpoints)
+        });
+        let first_key = checkpoints[0].key.clone();
+        let second_key = checkpoints[1].key.clone();
+        let active = checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.key.clone())
+            .collect::<HashSet<_>>();
+        for checkpoint in &checkpoints {
+            store.checkpoint(checkpoint, &active).unwrap();
+        }
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.cancel_recovery_attempts_for_key(&first_key, cx.background_executor().now());
+        });
+        let old_batch = store
+            .begin_retirements([first_key.clone()])
+            .expect("the old retirement batch");
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .recovery_retirement_batches
+                .insert(first_key.clone(), old_batch.clone());
+        });
+        assert!(matches!(
+            store.complete_retirements(old_batch.clone()).unwrap(),
+            RetirementCompletion::Retired { .. }
+        ));
+
+        let (latest_first, token) = workspace.update(cx, |workspace, cx| {
+            let document = workspace.document_by_id(first_id, cx).unwrap();
+            workspace.arm_document_recovery(&document, cx);
+            let checkpoint = document.read(cx).recovery_checkpoint(cx);
+            let token = workspace
+                .recovery_schedules
+                .get(&first_id)
+                .and_then(|state| state.token.clone())
+                .expect("the first document must have a rearmed token");
+            (checkpoint, token)
+        });
+        assert!(matches!(
+            store
+                .checkpoint_if_current(&latest_first, &active, token)
+                .unwrap(),
+            CheckpointOutcome::Written(_)
+        ));
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let documents = workspace.lifecycle_documents(cx);
+                let mut request =
+                    DestructiveRequest::new(DestructiveAction::CloseWindow, &documents);
+                assert!(matches!(
+                    request.decide(DirtyDecision::Discard, None, &documents),
+                    DestructiveResolution::Prompt(_)
+                ));
+                let DestructiveResolution::Proceed(action) =
+                    request.decide(DirtyDecision::Discard, None, &documents)
+                else {
+                    panic!("both dirty documents must be authorized for discard");
+                };
+                workspace.perform_after_discard_retirement(
+                    request,
+                    action,
+                    vec![(first_key.clone(), None), (second_key.clone(), None)],
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.recovery_retirement_batches.get(&first_key),
+                Some(&old_batch)
+            );
+            assert!(
+                !workspace
+                    .recovery_retirement_batches
+                    .contains_key(&second_key),
+                "a dirty-owned old retirement must block a partial B-only batch"
+            );
+        });
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_retirement_batch(
+                std::slice::from_ref(&first_key),
+                &old_batch,
+                cx,
+            );
+        });
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 0);
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn saved_document_retirement_does_not_block_later_discard_batch(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("save-then-discard-first.md");
+        let second = dir.path().join("save-then-discard-second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second.clone(), window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "first saved text\n", cx);
+        replace_document(&workspace, 1, "second discarded text\n", cx);
+        let checkpoints = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_views()
+                .into_iter()
+                .map(|document| document.read(app).recovery_checkpoint(app))
+                .collect::<Vec<_>>()
+        });
+        let active = checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.key.clone())
+            .collect::<HashSet<_>>();
+        for checkpoint in &checkpoints {
+            store.checkpoint(checkpoint, &active).unwrap();
+        }
+        store.fail_next_delete_for_test();
+
+        assert!(!cx.simulate_close());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .recovery_retirements
+                    .contains_key(&RecoveryKey::for_path(&first)),
+                "the saved document must retain its durable single-key retirement while cleanup retries"
+            );
+        });
+
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 0);
+        assert_eq!(fs::read_to_string(first).unwrap(), "first saved text\n");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second disk\n");
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui::test]
+    fn window_close_walks_multiple_dirty_documents(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.md");
+        let second = dir.path().join("second.md");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "dirty one\n", cx);
+        replace_document(&workspace, 1, "dirty two\n", cx);
+
+        assert!(!cx.simulate_close());
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        assert!(
+            cx.has_pending_prompt(),
+            "the second dirty document must prompt"
+        );
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 0);
+    }
+
+    #[gpui::test]
+    fn cancelling_a_multi_document_close_keeps_all_recovery_records(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first-recovery.md");
+        let second = dir.path().join("second-recovery.md");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "dirty one\n", cx);
+        replace_document(&workspace, 1, "dirty two\n", cx);
+        let checkpoints = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .document_views()
+                .into_iter()
+                .map(|document| document.read(app).recovery_checkpoint(app))
+                .collect::<Vec<_>>()
+        });
+        let active = checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.key.clone())
+            .collect::<HashSet<_>>();
+        for checkpoint in &checkpoints {
+            store.checkpoint(checkpoint, &active).unwrap();
+        }
+
+        assert!(!cx.simulate_close());
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+        assert_eq!(
+            store.recover().unwrap().records.len(),
+            2,
+            "a cancelled action has not intentionally discarded either open dirty buffer"
+        );
+    }
+
+    #[gpui::test]
+    fn window_close_rechecks_documents_that_become_dirty_during_a_prompt(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first-dirty.md");
+        let second = dir.path().join("becomes-dirty.md");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "dirty one\n", cx);
+
+        assert!(!cx.simulate_close());
+        assert!(cx.has_pending_prompt());
+        replace_document(&workspace, 1, "new async text\n", cx);
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        assert!(
+            cx.has_pending_prompt(),
+            "the newly dirty document must be checked before the window can close"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+        assert_eq!(document_text(&workspace, 1, cx), "new async text\n");
+    }
+
+    #[gpui::test]
+    fn dirty_close_reprompts_when_the_prompted_document_changes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompted-document.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        replace_document(&workspace, 0, "first draft\n", cx);
+
+        cx.simulate_keystrokes("ctrl-w");
+        assert!(cx.has_pending_prompt());
+        replace_document(&workspace, 0, "newer draft\n", cx);
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        assert!(
+            cx.has_pending_prompt(),
+            "an answer for the first revision cannot discard a newer revision"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            1
+        );
+        assert_eq!(document_text(&workspace, 0, cx), "newer draft\n");
+    }
+
+    #[gpui::test]
+    fn workspace_replace_rechecks_documents_that_become_dirty_during_a_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first-dirty.md");
+        let second = dir.path().join("becomes-dirty.md");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second, window, cx);
+            });
+        });
+        replace_document(&workspace, 0, "dirty one\n", cx);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_workspace_replace(replacement.path().to_path_buf(), window, cx);
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        replace_document(&workspace, 1, "new async text\n", cx);
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        assert!(
+            cx.has_pending_prompt(),
+            "the newly dirty document must be checked before replacing the workspace"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            2
+        );
+        assert_eq!(document_text(&workspace, 1, cx), "new async text\n");
+    }
+
+    #[gpui::test]
+    fn workspace_replace_save_persists_text_before_switching_roots(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace-save.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "saved before replace 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_workspace_replace(replacement.path().to_path_buf(), window, cx);
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.root.as_deref(), Some(replacement.path()));
+            assert!(workspace.tabs.is_empty());
+        });
+        assert_eq!(fs::read_to_string(path).unwrap(), edited);
+    }
+
+    #[gpui::test]
+    fn workspace_replace_discard_switches_roots_without_writing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace-discard.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        replace_document(&workspace, 0, "editor only\n", cx);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_workspace_replace(replacement.path().to_path_buf(), window, cx);
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.root.as_deref(), Some(replacement.path()));
+            assert!(workspace.tabs.is_empty());
+        });
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
+    }
+
+    #[gpui::test]
+    fn workspace_replace_cancel_preserves_root_tab_and_text(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace-cancel.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "keep current workspace 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_workspace_replace(replacement.path().to_path_buf(), window, cx);
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.root.as_deref(), Some(dir.path()));
+            assert_eq!(workspace.tabs.len(), 1);
+        });
+        assert_eq!(document_text(&workspace, 0, cx), edited);
+        assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
+    }
+
+    #[gpui::test]
+    fn removed_watcher_event_preserves_dirty_text_until_recreate_or_save_as(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "editor survives remove 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        fs::remove_file(&path).unwrap();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(dir.path(), &[Change::Removed(path.clone())], cx);
+        });
+
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), edited);
+        });
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        assert!(!path.exists(), "Ctrl-S must not recreate a removed source");
+        assert_failed_save_preserves_document(
+            &workspace,
+            edited,
+            true,
+            "The source path no longer exists. Recreate it or Save As.",
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn rename_shaped_watcher_events_preserve_dirty_text_until_recreate_or_save_as(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rename-source.md");
+        let renamed = dir.path().join("rename-destination.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let edited = "editor survives rename 中文 \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        fs::rename(&path, &renamed).unwrap();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(
+                dir.path(),
+                &[
+                    Change::Removed(path.clone()),
+                    Change::Created(renamed.clone()),
+                ],
+                cx,
+            );
+        });
+
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), edited);
+        });
+
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+
+        assert!(
+            !path.exists(),
+            "Ctrl-S must not recreate the old renamed path"
+        );
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "disk\n");
+        assert_failed_save_preserves_document(
+            &workspace,
+            edited,
+            true,
+            "The source path no longer exists. Recreate it or Save As.",
+            cx,
+        );
+    }
+    #[gpui::test]
+    fn recovered_document_retains_text_metadata_and_conflict_state(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.txt");
+        fs::write(&path, b"\xFF\xFEh\x00i\x00\r\x00\n\x00").unwrap();
+        let loaded = crate::fs::load(&path).unwrap();
+        let metadata = RecoveryMetadata::from_loaded_file(&loaded);
+        let original_stamp = metadata.original_stamp.clone();
+        let recovered_text = "recovered 中文 \u{1f680}\n";
+        let scan = RecoveryScan {
+            records: vec![RecoveredRecord {
+                record: RecoveryRecord {
+                    key: RecoveryKey::for_path(&path),
+                    text: recovered_text.into(),
+                    metadata,
+                    checkpointed_at: SystemTime::now(),
+                },
+                source_conflicted: true,
+            }],
+            issues: Vec::new(),
+        };
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store);
+        });
+
+        let restored = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                restore_recovery_for_test(workspace, scan, window, cx)
+            })
+        });
+
+        assert_eq!(restored, (1, 0));
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let id = document.read_with(cx, |document, _| document.id());
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.recovery_schedules.contains_key(&id));
+            assert!(workspace._recovery_timer.is_some());
+        });
+        document.read_with(cx, |document, app| {
+            assert!(document.is_dirty());
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), recovered_text);
+            let checkpoint = document.recovery_checkpoint(app);
+            assert_eq!(checkpoint.metadata.encoding_name, "UTF-16LE");
+            assert!(checkpoint.metadata.had_bom);
+            assert_eq!(checkpoint.metadata.newline, crate::fs::Newline::Crlf);
+            assert_eq!(checkpoint.metadata.original_stamp, original_stamp);
+        });
+    }
 
     #[test]
     fn workspace_panel_widths_preserve_preferences_and_the_document_floor() {
@@ -3328,6 +10336,18 @@ mod tests {
             body.contains(".when(!web_active, |this|") && body.contains("UnsavedChanges"),
             "the dirty marker tooltip needs its own Web-active gate"
         );
+        assert_eq!(
+            super::TAB_CLOSE_ACCESSIBILITY_ID,
+            "markturbo-document-tab-close"
+        );
+        assert!(body.contains("self.tabs.len() == 1 && self.tabs.active_index() == ix"));
+        assert_eq!(
+            body.matches("accessibility_id(TAB_CLOSE_ACCESSIBILITY_ID)")
+                .count(),
+            2,
+            "both the dirty marker and clean close button need the same active-document UIA id"
+        );
+        assert!(body.contains(".role(gpui::Role::Button)"));
     }
 
     #[test]
@@ -3600,7 +10620,9 @@ mod tests {
         let source = crate::views::production_source(include_str!("workspace.rs"));
         let start = source.find("fn set_status").expect("set_status must exist");
         let body = &source[start..];
-        let end = body.find("\n    /// Apply pending").unwrap_or(body.len());
+        let end = body
+            .find("\n    fn remove_recovery_schedule")
+            .unwrap_or(body.len());
         let body = &body[..end];
 
         assert!(
@@ -4174,9 +11196,10 @@ mod tests {
         );
         assert_eq!(
             code.matches("try_update_in(&this").count(),
-            2,
-            "the folder prompt and the translation both land after an await and \
-             both need the fallible path"
+            7,
+            "the folder picker, destructive prompt, Save As picker, and \
+             translation, startup recovery, retirement completion, and cleanup \
+             continuation all land after an await and need the fallible path"
         );
         assert!(
             code.contains("try_update(&this, cx, |this, cx| this.drain_watcher(cx))"),
@@ -4215,6 +11238,26 @@ mod tests {
             body.contains("if !reloaded") && body.contains("mark_externally_changed"),
             "a document that refused to reload must still be flagged, or the \
              conflict banner never appears and the change goes unnoticed"
+        );
+        assert!(
+            body.contains("let documents = self.document_views()"),
+            "one watcher batch must capture the open document set once"
+        );
+        assert!(
+            body.contains(".any(|change| document.watches_path(change.path()))"),
+            "each document must inspect the whole batch before one reload or conflict update"
+        );
+        assert_eq!(
+            body.matches("doc.update(cx, |doc, cx| doc.reload_if_clean(cx))")
+                .count(),
+            1,
+            "one watcher batch must start at most one reload per affected document"
+        );
+        assert_eq!(
+            body.matches("doc.update(cx, |doc, cx| doc.mark_externally_changed(cx))")
+                .count(),
+            1,
+            "one watcher batch must mark each affected document at most once"
         );
     }
 
@@ -4282,6 +11325,183 @@ mod tests {
             actions += 1;
         }
         assert!(actions >= 3, "and the loop above must not be vacuous");
+        assert!(
+            body.contains("async_snapshot") && body.contains("replace_text_if_current"),
+            "a translation result must carry and re-check the exact editor and source identity it read"
+        );
+        assert!(
+            !body.contains("doc.replace_text(translation.text"),
+            "the async result must not bypass the source-snapshot gate"
+        );
+    }
+
+    #[test]
+    fn every_close_surface_uses_the_destructive_interlock() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        assert!(source.contains("fn request_destructive("));
+        assert!(source.contains("window.on_window_should_close"));
+
+        let action = source
+            .split_once("fn on_close_tab")
+            .expect("the keyboard action")
+            .1
+            .split_once("fn on_open_settings")
+            .unwrap()
+            .0;
+        assert!(action.contains("request_close_tab"));
+
+        let tabs = source
+            .split_once("fn render_tabs")
+            .expect("the tab bar")
+            .1
+            .split_once("fn render_web_path_controls")
+            .unwrap()
+            .0;
+        assert!(
+            tabs.matches("request_close_tab").count() >= 2,
+            "both the dirty dot and clean close button must use the same interlock"
+        );
+
+        let title_bar = source
+            .split_once("fn render_title_bar_backdrop")
+            .expect("the Linux title bar")
+            .1
+            .split_once("fn render_left_title_bar")
+            .unwrap()
+            .0;
+        assert!(title_bar.contains("on_close_window"));
+        assert!(title_bar.contains("request_window_close"));
+    }
+
+    #[test]
+    fn recovery_is_restored_checkpointed_off_thread_and_cleared_intentionally() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        assert!(source.contains("RecoveryStore::open()"));
+        assert!(source.contains("store.recover()"));
+        assert!(source.contains("restore_startup_recovery("));
+
+        let constructor = source
+            .split_once("pub fn new(")
+            .expect("the workspace constructor")
+            .1
+            .split_once("pub fn open_folder")
+            .unwrap()
+            .0;
+        assert!(constructor.contains("start_startup_recovery("));
+        assert!(!constructor.contains("let (recovery, recovery_scan"));
+        assert!(
+            constructor.find("this.open_file(").unwrap()
+                < constructor.find("start_startup_recovery(").unwrap(),
+            "the requested file must open before startup recovery begins"
+        );
+
+        let startup_completion = source
+            .split_once("fn restore_startup_recovery")
+            .expect("the startup recovery completion path")
+            .1
+            .split_once("fn flush_pending_recovery_retirements")
+            .unwrap()
+            .0;
+        let pending_cleared = startup_completion
+            .find("self.startup_recovery_pending = false")
+            .expect("startup pending must clear");
+        let applied = startup_completion
+            .find("self.restore_prepared_recovery")
+            .expect("startup records must be applied");
+        let finished = startup_completion
+            .find("log::debug!(\"recovery startup finished\")")
+            .expect("the content-free startup completion signal");
+        let first_return = startup_completion
+            .find("return;")
+            .expect("the unavailable-store branch");
+        assert!(pending_cleared < applied && applied < finished && finished < first_return);
+        assert_eq!(
+            startup_completion
+                .matches("log::debug!(\"recovery startup finished\")")
+                .count(),
+            1,
+            "success, no-record, and error results share one completion signal"
+        );
+
+        let checkpoint = source
+            .split_once("fn checkpoint_recovery")
+            .expect("the recovery scheduler")
+            .1
+            .split_once("fn finish_recovery_checkpoints")
+            .unwrap()
+            .0;
+        assert!(checkpoint.contains("background_spawn"));
+        assert!(checkpoint.contains("recovery_checkpoint(cx)"));
+        assert!(checkpoint.contains("checkpoint_batch_if_current"));
+        assert!(checkpoint.contains("CancellableRecoveryCheckpointAttempt"));
+        assert!(checkpoint.contains("recovery_checkpoint_worker_active"));
+        assert!(checkpoint.contains("store_returned_at = background_executor.now()"));
+        assert!(
+            checkpoint.contains("checkpoint_dispatched(now)"),
+            "the durable deadline must be anchored when the editor snapshot is dispatched"
+        );
+        assert!(
+            checkpoint.contains("durable_complete_by"),
+            "an in-flight checkpoint must keep its absolute durable deadline observable"
+        );
+
+        let completion = source
+            .split_once("fn finish_recovery_checkpoints")
+            .expect("the recovery completion path")
+            .1
+            .split_once("fn drain_watcher")
+            .unwrap()
+            .0;
+        assert!(completion.contains("checkpoint_written"));
+        assert!(completion.contains("checkpoint_superseded"));
+        assert!(completion.contains("checkpoint_failed"));
+        assert!(completion.contains("current_checkpoint_write_completed("));
+        assert!(completion.contains("state.revision"));
+        assert!(completion.contains("attempt.revision"));
+        assert!(
+            completion.contains("CheckpointBatchOutcome::Written if written_revision_is_current")
+        );
+        assert!(completion.contains("log::debug!(\"recovery checkpoint written\")"));
+
+        assert!(source.contains("this.retire_document_recovery(id, Some(key), cx);"));
+        assert!(
+            source.contains("matches!(decision, DirtyDecision::Save | DirtyDecision::Discard)")
+        );
+        assert!(source.contains("begin_retirement"));
+        assert!(source.contains("complete_retirement"));
+    }
+
+    #[test]
+    fn recovery_activation_registers_created_and_repaired_dirty_schedules() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let arm = source
+            .split_once("fn arm_document_recovery_at")
+            .expect("the document recovery armer")
+            .1
+            .split_once("fn schedule_recovery_timer")
+            .unwrap()
+            .0;
+        assert!(arm.contains("Entry::Vacant"));
+        assert!(
+            arm.matches("activate_and_current_token(&key)").count() >= 2,
+            "both an initial schedule and a repaired key must register as active"
+        );
+
+        let checkpoint = source
+            .split_once("fn checkpoint_recovery_at")
+            .expect("the recovery scheduler")
+            .1
+            .split_once("fn finish_recovery_checkpoints")
+            .unwrap()
+            .0;
+        assert!(checkpoint.contains(".or_insert_with(||"));
+        assert!(
+            checkpoint
+                .matches("activate_and_current_token(&key)")
+                .count()
+                >= 2,
+            "a missing schedule and a repaired key in the fallback must register as active"
+        );
     }
 
     /// Search must never search a stale copy of an open document, and must

@@ -232,10 +232,38 @@ document, and for HTML, trusting is exactly the act of handing it the disk.
 ### Save safety
 
 The filesystem is the source of truth, and agents write to it concurrently. A
-save records the file's mtime and size at load; if disk no longer matches, the
-save is refused and the user chooses reload or overwrite. Writes go to a
-randomly-named sibling temp file and are renamed, so a crash cannot truncate a
-document and two concurrent saves of one file cannot collide on one temp path.
+loaded file has a `FileStamp`; before a normal Save, the current named object
+is opened and its metadata, bytes, and SHA-256 are collected from that same
+handle. This detects a changed document even when its mtime and length happen
+to match the loaded version. Windows also records the file object ID, so a
+delete-and-recreate at the same path is a conflict even if the replacement has
+the same bytes and timestamps. A mismatch refuses the normal Save and the user
+chooses reload, overwrite, recreation, conversion, or Save As as the case
+requires.
+
+Those choices are explicit capabilities, not independent `bool` flags. A
+`SaveAuthorization` begins as a normal Save; an overwrite captures the exact
+current `FileStamp` of the resolved destination, and a missing-file decision
+records permission to recreate only a currently absent regular file. UTF-8
+conversion composes with either source decision without replacing it. Before
+commit the save rechecks that exact expected stamp, or that the approved path
+is still absent. Therefore a later external writer, or a path that reappears
+after a recreation decision, becomes a new conflict rather than inheriting an
+earlier answer. The document keeps that authorization only until an edit,
+successful save, source-identity change, or new conflict resets it.
+
+The replacement output is staged in a randomly named sibling file, synced, and
+then installed with guarded `ReplaceFileW` handling on Windows. The backup is
+verified against the expected outgoing object before the replacement is
+accepted. If a race cannot be proved safe, the editor remains dirty and reports
+the preserved artifacts rather than silently treating the Save as successful.
+Win32 is not compare-and-swap and the filesystem is not universal version
+history; the implementation detects and contains the races it can establish,
+rather than claiming an impossible guarantee for every concurrent actor.
+
+Saving through a supported symbolic link preserves the link itself and updates
+its resolved target. The watcher maps changes observed on that resolved target
+back to documents opened through the link.
 
 Three properties of the bytes survive a round trip: **line endings**, **BOM**,
 and **encoding**. The third was the expensive one to get wrong. Reading every
@@ -249,6 +277,201 @@ file so the save re-encodes in it.
 `encoding_rs` has no UTF-16 *encoder* — `Encoding::encode` silently emits UTF-8
 for those two, which would write a UTF-8 body under a UTF-16 BOM and produce a
 file nothing can read. They encode their own code units instead.
+
+### Destructive lifecycle and recovery
+
+Closing a dirty tab, closing the window, and replacing the workspace all pass
+through one lifecycle decision. The decision walks every affected dirty buffer
+and requires **Save**, **Discard**, or **Cancel** before the destructive action
+can proceed. A Save must succeed before its buffer is released. The lifecycle
+model also represents memory-origin documents, so a future new-document flow
+uses the same boundary rather than a separate close path.
+
+The destructive coordinator revalidates the affected documents immediately
+before destruction. If another document becomes dirty, or a prompted document's
+revision changes while a prompt is open, it is returned to the decision queue
+and prompted for its current revision before the destructive action proceeds.
+
+Asynchronous text changes have a different boundary. A `BufferSnapshot`
+captures the editor revision and exact text used by destructive lifecycle
+decisions. An `AsyncSnapshot` adds a source generation that advances after a
+successful Save As. Translation and background reparsing use this stronger
+identity: a result may land only when the revision, text, and source generation
+still match. An edit or Save As while work is in flight therefore leaves the
+current document untouched and asks the user to run the operation again.
+
+Recovery is optional application state, not a workspace format and not an
+autosave of the source file. On Windows, encrypted checkpoint records live by
+default in `%LOCALAPPDATA%\markturbo\recovery`; `MARKTURBO_DATA_DIR` redirects
+the application-data root, making the candidate recovery location
+`%MARKTURBO_DATA_DIR%\recovery`. The override must be absolute. Recovery storage
+accepts only local fixed, removable, or RAM volumes: UNC paths, mapped/remote
+drives, and every unsupported drive type are rejected before storage creation.
+It revalidates the nearest existing ancestor before creation and the canonical
+volume after creation. WebView and log paths may still use the absolute data
+override; an unavailable recovery store is reported while editing and
+source-file Save continue. DPAPI protects each record for the current user, and
+a sibling temporary file plus sync and rename makes each completed checkpoint
+atomic. Non-Windows builds deliberately have no plaintext fallback.
+
+Workspace construction opens the requested folder and file before it starts
+recovery. A deferred task opens the store, decrypts and verifies records, and
+parses recovered Markdown on the background executor; the result returns
+through the same fallible window-update path used by other async UI work. A
+document edited while that work runs still creates checkpoint timing state
+immediately. If its two-second dispatch deadline arrives before the store is
+ready, the workspace keeps a persistent protection warning. When the store
+arrives, it attaches the generation token without moving the original edit or
+ten-second durable deadline. A matching tab accepts recovery only if it is still
+clean and has not advanced
+from the identity captured when startup began. A clean file opened while the
+scan is running may also accept its matching record, while any edit or reload
+keeps the current tab untouched. Existing watcher conflict state is preserved.
+Watcher events still mark affected documents during this interval, but startup
+recovery is also an auto-reload barrier: automatic reload remains off until the
+scan has completed, even when the setting is enabled.
+Successful Save and confirmed Discard decisions made before the store is ready
+queue their recovery keys. The startup result filters those keys before it
+restores records. Once it has attached an available store, it durably retires
+the queued keys and only then resumes a waiting destructive action. If the
+store remains unavailable, the document stays open and the failure is reported;
+editing and source-file Save remain available. Restored dirty records are
+already durable, so they do not immediately rewrite their checkpoint; they are
+instead scheduled for a ten-second refresh from their restored durable baseline.
+
+The Windows production store validates the local-volume policy before it
+creates the root, then takes lifetime ownership before it opens any record. It
+holds a directory handle opened on the canonical root itself, rejects a final
+reparse point, verifies the root's stable file-object ID after canonicalization
+and before each operation, and retains an exclusive `.markturbo-recovery.lock`
+handle. The lock deliberately rejects another markturbo instance instead of
+letting two processes coordinate the same recovery directory. That instance
+starts with recovery unavailable, reports why, and continues with editing and
+source files intact. This is a recovery-storage interlock, not a lock on a
+workspace or source document.
+
+After an edit, a single earliest-deadline scheduler tracks the oldest edit not
+covered by a durable checkpoint. It dispatches after two seconds without an
+edit, but continuous edits cannot postpone that oldest uncovered edit beyond
+the same two-second dispatch budget. Each attempt retains the exact snapshot
+time and an absolute durable deadline: at most eight seconds after dispatch and
+never later than ten seconds after the oldest edit it covers. Periodic refresh
+is anchored to the durable baseline rather than completion, so a slow worker
+cannot add a second ten-second delay. The background batch records
+`store_returned_at` as soon as the store returns; deadline success or failure is
+judged against that timestamp, rather than a later UI callback.
+
+All documents due on one wake-up enter one ordered physical batch, while each
+attempt owns its cancellation flag. A later edit, Save, Discard, or
+source-identity change cancels only that stale snapshot without taking the
+recovery mutation lock; other due documents continue to a durable checkpoint
+instead of being starved by activity elsewhere. Protection and retention work
+observe cancellation between bounded waves and before publication. A retention
+scan stops early only when every current attempt is cancelled. A transaction
+journal is the durable linearization boundary: cancellation before it prevents
+publication, while a transaction that has crossed it finishes under the normal
+transaction rules. There is only one physical checkpoint worker per workspace.
+If it remains occupied past a logical attempt's deadline, the editor reports
+the protection warning and retains the latest due schedule rather than spawning
+an independent retry. Once that batch returns, the worker slot is released and
+the scheduler immediately coalesces repeated edits into one follow-up batch for
+the latest snapshot. A late or stale completion cannot clear a warning for a
+newer revision; only a current successful checkpoint can do so.
+
+The store verifies the recovery root, takes the mutation lock, and performs one
+retention scan for each successful batch. DPAPI decode and checkpoint protection
+use bounded parallel waves of at most four workers per stage; when those stages
+overlap, their combined active work is capped at eight calls. Each wave is also
+limited by the store byte bound. Quota decisions and durable writes remain
+serial and preserve dispatch order.
+
+Each request carries a generation token, so a checkpoint already in flight
+cannot recreate a record after Save or Discard retires it. Capability state
+(generations, active keys, and pending retirements) uses a short lock independent
+from the recovery-root I/O lock. After a successful Save or confirmed Discard,
+the destructive action writes and syncs a durable retirement marker before it
+destroys the document or window. That marker is the non-restorable linearization
+point: recovery hides every marked canonical record across interruption, while
+background cleanup serializes with checkpoint I/O and retries after failure. A
+post-persist marker-sync failure is retried by opening, decoding, and syncing
+the exact existing marker; a different marker is rejected rather than replaced.
+A multi-document destructive action writes one versioned batch marker, so all
+confirmed Discard decisions become durable together or none do. Startup
+reconciliation removes marked canonical records before deleting the marker;
+cleanup failure leaves the marker in place and reports the condition instead of
+exposing retired text. An unreadable, unsupported, or path/key-misbound marker
+fails recovery closed rather than exposing a possibly retired record; that
+recovery failure does not make editing or source-file Save unavailable.
+
+The workspace keeps action-scoped queued intent separate from durable cleanup
+ownership. `pending_recovery_retirements` records the originating document when
+known, so a tab-close action waits only for its own pending key; an unknown
+origin remains fail-closed for every destructive action. A pending entry means a
+newer Save or Discard still needs its own durable marker; it is not an owner.
+`recovery_retirements` and
+`recovery_retirement_batches` hold the exact single-key or batch ticket that
+owns cleanup already made durable. An owner and queued intent for the same key
+therefore mean that a later decision is waiting behind the current owner. When
+that exact owner finishes, the workspace replays the queued intent to publish a
+fresh marker. An edit cancels only the queued intent, while the durable owner
+continues cleanup. Completion callbacks compare the complete ticket identity,
+so a stale callback cannot remove or replace a newer owner.
+
+A destructive action remains open while any relevant queued intent lacks a
+durable marker. If an existing owner or retry must finish first, the action
+resumes through the retirement continuation and rechecks the full key set; it
+proceeds only after every relevant queued intent has acquired a durable owner.
+
+The store registers active recovery keys under the capability lock. When it
+chooses an eviction candidate it combines those live keys with the checkpoint
+dispatch snapshot. A document that becomes dirty after work was queued is
+therefore not treated as inactive merely because the worker has an older view of
+the tab set. Before an eviction transaction performs recovery-root I/O, it
+reserves every victim under that capability lock and then releases the lock. A
+document activated while its record is reserved immediately receives a visible
+protection warning and waits for a later checkpoint; it is never evicted as
+inactive. An active or already-reserved candidate defers the transaction.
+
+Retention is capped at 50 records, 32 MiB per record, and 128 MiB total;
+records expire after seven days. Startup and completed checkpoint batches prune
+expired records. Retention scans keep only the key, timestamp, path, and byte
+size after validating a record; full recovered text and save metadata remain in
+memory only for an actual recovery scan. A current same-key replacement first
+accounts for the old file's metadata, count, and bytes, then treats it as
+non-evictable without decrypting stale ciphertext that the new atomic write will
+replace. Any real preparation or persistence failure falls back to a full scan,
+so malformed and expired data is still reported and pruned; normal cancellation
+does not pay that fallback cost before the latest text can catch up. A same-key
+replacement that needs no eviction uses one atomic prepared-file replacement.
+A write that evicts another record keeps the recovery transaction. Active
+records are never eviction candidates, and a quota failure is visible to the
+user. Retention scans do not read source documents; the recovery scan still
+reads the source as needed to compute restore conflicts.
+
+Replacing a checkpoint or evicting records is a small recovery-store
+transaction. The store writes a validated journal, stages the affected old
+records, publishes the new record, then writes a commit marker before cleanup.
+On startup and before maintenance, it reconciles any journal: a published
+transaction is finished (including the case inferred from its on-disk state),
+while an uncommitted one is rolled back. If a fault leaves ambiguous or
+conflicting artifacts, recovery reports the condition rather than presenting
+them as ordinary records. The journal protects recovery retention only; it does
+not promise a multi-file transaction for user documents.
+
+After a successful Save or confirmed Discard, the matching recovery record is
+durably retired before long physical cleanup. Recovery
+stores the source path, encoding, BOM, line endings, conflict stamp, source
+identity, and decode-error state with the text. On restore, a changed,
+unreadable, or missing source remains a conflicted dirty buffer and cannot
+overwrite implicitly. Malformed, oversized, expired, unreadable, unavailable,
+or failed recovery data is reported without blocking the editor or modifying a
+workspace file. At startup, valid file-backed records from the process-global
+per-user store are restored into the startup window without filtering their
+source paths against `self.root`. Tab deduplication compares the stored paths
+lexically, so equivalent canonical, relative, or link spellings can still be
+distinct. A record from another workspace can therefore appear in that startup
+window; matching-workspace recovery scoping does not exist yet. In-memory record
+restoration is reserved for the Goal 03 new-document flow.
 
 ### Settings: a file a person opens
 
@@ -415,8 +638,6 @@ Ordered by how cheap they are:
 - MDX components render as placeholders in both trust levels. The trust boundary
   and CSP are in place for when a runtime ships.
 - Live web preview pauses above 512KB; the editor and native preview stay live.
-- Closing a tab with unsaved edits discards them without a prompt. The file on
-  disk is never touched.
 - Translation is the one feature that leaves the machine *on its own*, and only
   when the user invokes it with a key configured. What crosses the wire is prose
   the user asked to have translated. Document content is separate: it cannot
