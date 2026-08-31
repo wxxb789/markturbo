@@ -119,6 +119,19 @@ impl<T> Tabs<T> {
         self.active
     }
 
+    /// Update a tab's cached path after Save As.
+    pub fn replace_path(&mut self, ix: usize, path: PathBuf) -> bool {
+        let Some(tab) = self.tabs.get_mut(ix) else {
+            return false;
+        };
+        if self.preview.as_deref() == Some(tab.path.as_path()) {
+            self.preview = Some(path.clone());
+        }
+        tab.path = path;
+        self.menu = None;
+        true
+    }
+
     /// Close the tab at `ix`, returning its path and payload.
     ///
     /// The active index *shifts* rather than clamping. Clamping was the bug:
@@ -356,5 +369,17 @@ mod tests {
         assert!(tabs.focus_path(&p("c.md")));
         assert_eq!(tabs.active().unwrap().path, p("c.md"));
         assert!(!tabs.focus_path(&p("nope.md")));
+    }
+
+    #[test]
+    fn save_as_updates_the_tab_and_preview_identity() {
+        let mut tabs = Tabs::default();
+        tabs.push(p("old.md"), ());
+        tabs.set_preview(Some(p("old.md")));
+
+        assert!(tabs.replace_path(0, p("new.md")));
+        assert_eq!(tabs.active().unwrap().path, p("new.md"));
+        assert_eq!(tabs.preview(), Some(Path::new("new.md")));
+        assert!(!tabs.replace_path(1, p("missing.md")));
     }
 }

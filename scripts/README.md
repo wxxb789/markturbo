@@ -6,6 +6,10 @@ nothing here is compiled into it.
 | Script | What it does |
 |---|---|
 | `probe.py` | Measures markturbo startup, memory, idle CPU, child windows, and hit testing |
+| `goal-02-native-acceptance.py` | Exercises Goal 02's five destructive lifecycle workflows through a real Windows UI and writes hash-bound JSON evidence |
+| `test_goal_02_native_acceptance.py` | Exercises the native harness's schema and fail-closed behavior without launching a UI |
+| `recovery-capacity.py` | Measures the ignored near-capacity Windows DPAPI checkpoint test in fresh cargo processes |
+| `test_recovery_capacity.py` | Exercises recovery-capacity.py parsing without Cargo or DPAPI |
 | `gen-perf-fixtures.py` | Regenerates the committed fixtures under `fixtures/perf/` |
 | `test_release_automation.py` | Locks the `cargo-release` configuration and GitHub Actions release contract |
 | `generate-app-icons.py` | Derives the Windows, macOS, and Linux icons from the 1024 px master PNG |
@@ -60,6 +64,71 @@ do not weaken the thresholds after seeing the result. `--wait-seconds 3600`
 waits for the first passing 60-second rolling window instead of accepting a
 noisy sample. `formula` runs the ignored first-formula test in fresh processes
 and uses the same A-B-B-A order as `startup`.
+
+For the recovery capacity evidence required by Goal 02 on Windows, run:
+
+```bash
+uv run scripts/recovery-capacity.py
+```
+
+It launches three fresh `cargo test` processes by default. Each process runs the
+ignored near-capacity DPAPI test's three internal rounds. The harness rejects
+missing or inconsistent Rust duration, ciphertext, median, or maximum output,
+then prints every round and a nine-sample aggregate summary. It fails when the
+global maximum exceeds the 8-second post-dispatch checkpoint budget. Use
+`uv run scripts/test_recovery_capacity.py` to exercise only that parser; it
+does not invoke Cargo or DPAPI.
+
+## Goal 02 Native Destructive Acceptance
+
+`goal-02-native-acceptance.py` is the Goal 02 Windows 11 x64 acceptance gate.
+It is deliberately separate from `probe.py`: `probe.py windows` verifies a
+clean application's window and WebView lifecycle, not dirty-text safety.
+
+Prerequisites: a current x64 `target/release/markturbo.exe`, an **active,
+unlocked** Windows 11 desktop session, foreground/input-desktop access, and
+`uv`. The script declares `pywinauto==0.6.9`; `uv` resolves it and its
+`comtypes` dependency. Do not run it from a disconnected WTS session.
+
+The executable hash is a required evidence binding. Build the executable, measure
+its current SHA-256, then pass that measured value to the native harness:
+
+```bash
+cargo build --release --locked -p mt-app --bin markturbo
+sha256sum target/release/markturbo.exe
+uv run scripts/goal-02-native-acceptance.py \
+  --exe target/release/markturbo.exe \
+  --expect-exe-sha256 <measured-sha256> \
+  --evidence .scratch/goal-02-native-acceptance-v1.json
+```
+
+The evidence file is `.scratch/goal-02-native-acceptance-v1.json`. A new build
+requires a new measured SHA-256 argument; never reuse an old hash or evidence
+file as proof for a different executable.
+
+The harness may use an absolute `MARKTURBO_DATA_DIR` for isolated WebView and
+log paths. Production recovery storage is separately local-only: UNC,
+mapped/remote, and unsupported-volume roots are rejected before creation, and
+an unavailable recovery store does not prevent editing or source-file Save.
+
+The five required workflows are:
+
+- Pointer tab close -> Cancel -> `Ctrl+S`.
+- `Ctrl+W` -> Discard.
+- `WM_CLOSE` -> Save with exact source bytes.
+- Same-length, same-mtime external change -> detected conflict -> explicit Overwrite.
+- CJK/emoji edit -> checkpoint -> `TerminateProcess` -> restart -> Discard -> restart without recovery.
+
+Exit status is evidence-bearing: `0` means `PASS` only when all five workflows
+pass; `1` means `FAIL`; `2` means `BLOCKED`, including an unavailable active
+desktop or UI dependency. `BLOCKED` is not a passing result and must be rerun in
+an eligible session.
+
+The harness is privacy-preserving and fail-closed. It records hashes, byte
+counts, status codes, and content-free logs rather than document text; it scans
+runtime artifacts for the test sentinel and rejects leaked text, missing
+preconditions, stale hash bindings, incomplete case sets, and ambiguous UI
+locators. An incomplete or failed evidence file is never acceptance evidence.
 
 The single-window count ignores only Windows' hidden zero-sized `IME` and
 `MSCTFIME UI` helpers. Hidden product windows and every non-zero top-level HWND
