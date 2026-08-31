@@ -905,7 +905,7 @@ impl RecoveryStore {
         limits: RecoveryLimits,
     ) -> Result<Self, RecoveryError> {
         fs::create_dir_all(&root)?;
-        Ok(Self::from_parts(root, protector, limits, None))
+        Ok(Self::from_parts(root, protector, limits))
     }
 
     #[cfg(windows)]
@@ -916,19 +916,19 @@ impl RecoveryStore {
         ensure_local_production_root(&root)?;
         fs::create_dir_all(&root)?;
         let root_guard = Arc::new(ProductionRootGuard::acquire(&root)?);
-        Ok(Self::from_parts(
+        let mut store = Self::from_parts(
             root_guard.canonical_root.clone(),
             protector,
             RecoveryLimits::default(),
-            Some(root_guard),
-        ))
+        );
+        store.root_guard = Some(root_guard);
+        Ok(store)
     }
 
     fn from_parts(
         root: PathBuf,
         protector: Arc<dyn RecoveryProtector>,
         limits: RecoveryLimits,
-        #[cfg(windows)] root_guard: Option<Arc<ProductionRootGuard>>,
     ) -> Self {
         Self {
             root,
@@ -938,7 +938,7 @@ impl RecoveryStore {
             mutation_lock: Arc::new(Mutex::new(MutationState::default())),
             retirement_marker_lock: Arc::new(Mutex::new(())),
             #[cfg(windows)]
-            root_guard,
+            root_guard: None,
             #[cfg(test)]
             failures: Arc::new(TestFailurePoints::default()),
         }
@@ -3840,6 +3840,18 @@ mod tests {
         fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
             Ok(ciphertext.iter().rev().copied().collect())
         }
+    }
+
+    #[test]
+    fn test_store_constructor_has_no_platform_specific_arguments() {
+        let source = include_str!("recovery.rs");
+        let constructor = source
+            .split("pub fn new_at_with_limits(")
+            .nth(1)
+            .and_then(|source| source.split("#[cfg(windows)]").next())
+            .unwrap();
+
+        assert!(constructor.contains("Ok(Self::from_parts(root, protector, limits))"));
     }
 
     struct UnreadableProtector;
