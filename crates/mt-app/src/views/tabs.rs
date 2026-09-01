@@ -15,13 +15,47 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::lifecycle::DocumentId;
+
+/// Stable identity of a tab's document source.
+///
+/// Memory buffers intentionally have no path. Assigning a placeholder path
+/// makes file-only operations such as watcher matching, history and copy-path
+/// controls act on a file that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TabIdentity {
+    File(PathBuf),
+    Memory(DocumentId),
+}
+
+impl From<PathBuf> for TabIdentity {
+    fn from(path: PathBuf) -> Self {
+        Self::File(path)
+    }
+}
+
+impl TabIdentity {
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::File(path) => Some(path),
+            Self::Memory(_) => None,
+        }
+    }
+}
+
 /// One open tab.
 #[derive(Debug)]
 pub struct Tab<T> {
-    /// The document's path, cached here so index arithmetic never needs an
-    /// `App` to answer "which tab is this file in?".
-    pub path: PathBuf,
+    /// The document's source identity, cached here so index arithmetic never
+    /// needs an `App` to answer which file, if any, this tab owns.
+    pub identity: TabIdentity,
     pub payload: T,
+}
+
+impl<T> Tab<T> {
+    pub fn path(&self) -> Option<&Path> {
+        self.identity.path()
+    }
 }
 
 /// The open tabs and the cursor into them.
@@ -88,11 +122,13 @@ impl<T> Tabs<T> {
     }
 
     pub fn index_of(&self, path: &Path) -> Option<usize> {
-        self.tabs.iter().position(|t| t.path == path)
+        self.tabs
+            .iter()
+            .position(|tab| tab.path().is_some_and(|candidate| candidate == path))
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
-        self.tabs.iter().map(|t| t.path.as_path())
+        self.tabs.iter().filter_map(Tab::path)
     }
 
     /// Focus an existing tab. Returns false when the index is out of range.
@@ -113,21 +149,32 @@ impl<T> Tabs<T> {
     }
 
     /// Append a tab and make it active. Returns its index.
-    pub fn push(&mut self, path: PathBuf, payload: T) -> usize {
-        self.tabs.push(Tab { path, payload });
+    pub fn push(&mut self, identity: impl Into<TabIdentity>, payload: T) -> usize {
+        self.tabs.push(Tab {
+            identity: identity.into(),
+            payload,
+        });
         self.active = self.tabs.len() - 1;
         self.active
     }
 
     /// Update a tab's cached path after Save As.
     pub fn replace_path(&mut self, ix: usize, path: PathBuf) -> bool {
+        self.replace_identity(ix, TabIdentity::File(path))
+    }
+
+    /// Update a tab's cached source identity after Save As.
+    pub fn replace_identity(&mut self, ix: usize, identity: TabIdentity) -> bool {
         let Some(tab) = self.tabs.get_mut(ix) else {
             return false;
         };
-        if self.preview.as_deref() == Some(tab.path.as_path()) {
-            self.preview = Some(path.clone());
+        if tab
+            .path()
+            .is_some_and(|path| self.preview.as_deref() == Some(path))
+        {
+            self.preview = identity.path().map(Path::to_path_buf);
         }
-        tab.path = path;
+        tab.identity = identity;
         self.menu = None;
         true
     }
@@ -140,11 +187,11 @@ impl<T> Tabs<T> {
     /// a different document. The rule is the one every editor uses: a tab
     /// closing to the left of the active one pulls it along, and closing the
     /// active one lands on its right-hand neighbour (or the new last tab).
-    pub fn close(&mut self, ix: usize) -> Option<(PathBuf, T)> {
+    pub fn close(&mut self, ix: usize) -> Option<(TabIdentity, T)> {
         if ix >= self.tabs.len() {
             return None;
         }
-        let Tab { path, payload } = self.tabs.remove(ix);
+        let Tab { identity, payload } = self.tabs.remove(ix);
 
         if self.tabs.is_empty() {
             self.active = 0;
@@ -157,14 +204,14 @@ impl<T> Tabs<T> {
         // A preview slot naming the tab that just closed would be handed to the
         // next preview open, which would then fail to find it and leave the
         // slot pointing at nothing.
-        if self.preview.as_deref() == Some(path.as_path()) {
+        if self.preview.as_deref() == identity.path() {
             self.preview = None;
         }
         // Indices after `ix` all moved down by one, so a menu index recorded
         // before this close now names a different tab.
         self.menu = None;
 
-        Some((path, payload))
+        Some((identity, payload))
     }
 
     /// The path of the tab opened as a preview, if any.
@@ -230,12 +277,12 @@ mod tests {
         // after the removal is c. Clicking a close button switched documents.
         let mut tabs = abc();
         tabs.focus(1);
-        assert_eq!(tabs.active().unwrap().path, p("b.md"));
+        assert_eq!(tabs.active().unwrap().path(), Some(Path::new("b.md")));
 
         tabs.close(0);
         assert_eq!(
-            tabs.active().unwrap().path,
-            p("b.md"),
+            tabs.active().unwrap().path(),
+            Some(Path::new("b.md")),
             "closing a.md must leave b.md active, not jump to c.md"
         );
     }
@@ -246,8 +293,8 @@ mod tests {
         tabs.focus(1);
         tabs.close(1);
         assert_eq!(
-            tabs.active().unwrap().path,
-            p("c.md"),
+            tabs.active().unwrap().path(),
+            Some(Path::new("c.md")),
             "the tab that slid into the closed slot"
         );
 
@@ -255,7 +302,7 @@ mod tests {
         let mut tabs = abc();
         tabs.focus(2);
         tabs.close(2);
-        assert_eq!(tabs.active().unwrap().path, p("b.md"));
+        assert_eq!(tabs.active().unwrap().path(), Some(Path::new("b.md")));
     }
 
     #[test]
@@ -263,7 +310,7 @@ mod tests {
         let mut tabs = abc();
         tabs.focus(0);
         tabs.close(2);
-        assert_eq!(tabs.active().unwrap().path, p("a.md"));
+        assert_eq!(tabs.active().unwrap().path(), Some(Path::new("a.md")));
     }
 
     #[test]
@@ -313,13 +360,13 @@ mod tests {
         // to the active tab stopped happening after the first right-click.
         let mut tabs = abc();
         tabs.set_menu(2);
-        assert_eq!(tabs.menu_target().unwrap().path, p("c.md"));
+        assert_eq!(tabs.menu_target().unwrap().path(), Some(Path::new("c.md")));
 
         tabs.close(0);
         tabs.focus(0);
         assert_eq!(
-            tabs.menu_target().unwrap().path,
-            p("b.md"),
+            tabs.menu_target().unwrap().path(),
+            Some(Path::new("b.md")),
             "after a close the menu index is dropped and the active tab answers"
         );
 
@@ -328,14 +375,14 @@ mod tests {
         tabs.focus(0);
         tabs.set_menu(2);
         tabs.clear_menu();
-        assert_eq!(tabs.menu_target().unwrap().path, p("a.md"));
+        assert_eq!(tabs.menu_target().unwrap().path(), Some(Path::new("a.md")));
     }
 
     #[test]
     fn the_menu_target_falls_back_to_the_active_tab() {
         let mut tabs = abc();
         tabs.focus(1);
-        assert_eq!(tabs.menu_target().unwrap().path, p("b.md"));
+        assert_eq!(tabs.menu_target().unwrap().path(), Some(Path::new("b.md")));
         assert!(Tabs::<()>::default().menu_target().is_none());
     }
 
@@ -347,8 +394,8 @@ mod tests {
         // them in the payload means `close` is the only place they can go.
         let mut tabs: Tabs<&'static str> = Tabs::default();
         tabs.push(p("a.md"), "subscriptions");
-        let (path, payload) = tabs.close(0).expect("the tab exists");
-        assert_eq!(path, p("a.md"));
+        let (identity, payload) = tabs.close(0).expect("the tab exists");
+        assert_eq!(identity, TabIdentity::File(p("a.md")));
         assert_eq!(payload, "subscriptions");
         assert!(tabs.is_empty());
     }
@@ -367,7 +414,7 @@ mod tests {
         assert!(!tabs.focus(9));
         assert_eq!(tabs.active_index(), 0, "the cursor did not move");
         assert!(tabs.focus_path(&p("c.md")));
-        assert_eq!(tabs.active().unwrap().path, p("c.md"));
+        assert_eq!(tabs.active().unwrap().path(), Some(Path::new("c.md")));
         assert!(!tabs.focus_path(&p("nope.md")));
     }
 
@@ -378,8 +425,28 @@ mod tests {
         tabs.set_preview(Some(p("old.md")));
 
         assert!(tabs.replace_path(0, p("new.md")));
-        assert_eq!(tabs.active().unwrap().path, p("new.md"));
+        assert_eq!(tabs.active().unwrap().path(), Some(Path::new("new.md")));
         assert_eq!(tabs.preview(), Some(Path::new("new.md")));
         assert!(!tabs.replace_path(1, p("missing.md")));
+    }
+
+    #[test]
+    fn a_memory_tab_has_no_path_until_save_as_migrates_its_identity() {
+        let mut tabs = Tabs::default();
+        let memory = TabIdentity::Memory(DocumentId::next());
+        tabs.push(memory, ());
+
+        assert!(tabs.active().unwrap().path().is_none());
+        assert!(tabs.index_of(&p("draft.md")).is_none());
+        assert!(tabs.preview().is_none());
+
+        assert!(tabs.replace_identity(0, TabIdentity::File(p("draft.md"))));
+        assert_eq!(tabs.active().unwrap().path(), Some(Path::new("draft.md")));
+        assert_eq!(tabs.index_of(&p("draft.md")), Some(0));
+        assert_eq!(
+            tabs.preview(),
+            None,
+            "Save As must not turn a memory tab into the preview slot"
+        );
     }
 }

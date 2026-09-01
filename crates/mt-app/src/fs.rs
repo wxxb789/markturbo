@@ -395,6 +395,9 @@ pub enum SaveError {
     /// The file changed on disk since it was loaded. The caller must resolve
     /// this with the user before overwriting.
     Conflict,
+    /// Save As names an existing filesystem entry. Replacing it requires a
+    /// separate, explicit overwrite decision.
+    DestinationExists,
     /// The path no longer exists. Recreating it is a separate user decision.
     Missing,
     /// The path changed between regular-file and symbolic-link identity, or a
@@ -432,6 +435,9 @@ impl std::fmt::Display for SaveError {
         match self {
             SaveError::Conflict => {
                 f.write_str("the file changed on disk since it was opened; reload or save a copy")
+            }
+            SaveError::DestinationExists => {
+                f.write_str("the save destination already exists; choose whether to replace it")
             }
             SaveError::Missing => {
                 f.write_str("the source path no longer exists; recreate it or save a copy")
@@ -688,40 +694,155 @@ fn source_identity(path: &Path) -> std::io::Result<SourceIdentity> {
 }
 
 /// Write to a new path (Save As) and return the verified file identity.
+///
+/// Save As creates a new entry only. The caller must obtain a separate user
+/// decision and call [`overwrite_as`] before replacing an existing entry.
 pub fn save_as(
     path: &Path,
     text: &str,
     newline: Newline,
     had_bom: bool,
 ) -> Result<LoadedFile, SaveError> {
-    let (source_identity, destination, recreated_missing) = match source_identity(path) {
-        Ok(identity) => {
-            let destination = match &identity {
-                SourceIdentity::Regular => path.to_path_buf(),
-                SourceIdentity::SymbolicLink {
-                    resolved_target, ..
-                } => resolved_target.clone(),
-            };
-            (identity, destination, false)
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(SaveError::DestinationExists),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => save_as_with_snapshot(
+            path,
+            text,
+            newline,
+            had_bom,
+            SaveAsTarget {
+                source_identity: SourceIdentity::Regular,
+                destination: path.to_path_buf(),
+                expected: None,
+                recreates_missing: true,
+            },
+        ),
+        Err(error) => Err(SaveError::Io(error)),
+    }
+}
+
+/// Immutable permission to replace a Save As destination.
+///
+/// This is captured while the confirmation is shown, not when its Replace
+/// button is later pressed. Reusing it keeps a changed, removed, or retargeted
+/// destination outside the user's original destructive decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveAsOverwriteAuthorization {
+    source_path: PathBuf,
+    source_identity: SourceIdentity,
+    destination: PathBuf,
+    expected: FileStamp,
+}
+
+impl SaveAsOverwriteAuthorization {
+    /// Capture the exact existing entry the user may choose to replace.
+    pub fn capture(path: &Path) -> Result<Self, SaveError> {
+        let source_identity = match source_identity(path) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SaveError::Missing);
+            }
+            Err(error) => return Err(SaveError::Io(error)),
+        };
+        let destination = match &source_identity {
+            SourceIdentity::Regular => path.to_path_buf(),
+            SourceIdentity::SymbolicLink {
+                resolved_target, ..
+            } => resolved_target.clone(),
+        };
+        let expected = FileStamp::of(&destination).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SaveError::Missing
+            } else {
+                SaveError::Io(error)
+            }
+        })?;
+
+        Ok(Self {
+            source_path: path.to_path_buf(),
+            source_identity,
+            destination,
+            expected,
+        })
+    }
+
+    /// Refuse a later change before the document layer starts its write.
+    pub fn verify(&self) -> Result<(), SaveError> {
+        match source_identity(&self.source_path) {
+            Ok(identity) if identity == self.source_identity => {}
+            Ok(_) => return Err(SaveError::Conflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SaveError::Conflict);
+            }
+            Err(error) => return Err(SaveError::Io(error)),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (SourceIdentity::Regular, path.to_path_buf(), true)
+        match FileStamp::of(&self.destination) {
+            Ok(stamp) if stamp == self.expected => Ok(()),
+            Ok(_) => Err(SaveError::Conflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(SaveError::Conflict),
+            Err(error) => Err(SaveError::Io(error)),
         }
-        Err(error) => return Err(SaveError::Io(error)),
-    };
-    let expected = if recreated_missing {
-        None
-    } else {
-        Some(FileStamp::of(&destination).map_err(SaveError::Io)?)
-    };
+    }
+}
+
+/// Replace an existing Save As destination after an explicit user decision.
+///
+/// Prefer [`overwrite_as_authorized`] when the confirmation was asynchronous,
+/// so the final commit uses the snapshot observed before the prompt appeared.
+pub fn overwrite_as(
+    path: &Path,
+    text: &str,
+    newline: Newline,
+    had_bom: bool,
+) -> Result<LoadedFile, SaveError> {
+    let authorization = SaveAsOverwriteAuthorization::capture(path)?;
+    overwrite_as_authorized(&authorization, text, newline, had_bom)
+}
+
+/// Replace a Save As destination using an earlier explicit authorization.
+pub fn overwrite_as_authorized(
+    authorization: &SaveAsOverwriteAuthorization,
+    text: &str,
+    newline: Newline,
+    had_bom: bool,
+) -> Result<LoadedFile, SaveError> {
+    authorization.verify()?;
+    save_as_with_snapshot(
+        &authorization.source_path,
+        text,
+        newline,
+        had_bom,
+        SaveAsTarget {
+            source_identity: authorization.source_identity.clone(),
+            destination: authorization.destination.clone(),
+            expected: Some(authorization.expected.clone()),
+            recreates_missing: false,
+        },
+    )
+}
+
+struct SaveAsTarget {
+    source_identity: SourceIdentity,
+    destination: PathBuf,
+    expected: Option<FileStamp>,
+    recreates_missing: bool,
+}
+
+fn save_as_with_snapshot(
+    path: &Path,
+    text: &str,
+    newline: Newline,
+    had_bom: bool,
+    target: SaveAsTarget,
+) -> Result<LoadedFile, SaveError> {
     let bytes = encode(text, newline, had_bom, UTF_8)?;
-    let temp = stage(&destination, &bytes)?;
+    let temp = stage(&target.destination, &bytes)?;
     let (stamp, source_identity) = CommitPlan {
         source_path: path,
-        expected_source_identity: &source_identity,
-        destination: &destination,
-        expected_destination_stamp: expected.as_ref(),
-        recreates_missing: recreated_missing,
+        expected_source_identity: &target.source_identity,
+        destination: &target.destination,
+        expected_destination_stamp: target.expected.as_ref(),
+        recreates_missing: target.recreates_missing,
         prepared_bytes: &bytes,
     }
     .commit_staged(temp)?;
@@ -1857,6 +1978,159 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "content\n");
     }
 
+    #[test]
+    fn save_as_refuses_an_existing_destination_without_modifying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "existing.md", b"external bytes\xFF\n");
+
+        let error = save_as(&path, "editor text\n", Newline::Lf, false).unwrap_err();
+
+        assert!(matches!(error, SaveError::DestinationExists));
+        assert_eq!(std::fs::read(&path).unwrap(), b"external bytes\xFF\n");
+    }
+
+    #[cfg(any(target_os = "windows", unix))]
+    #[test]
+    fn save_as_refuses_an_existing_symbolic_link_without_modifying_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = write_file(dir.path(), "target.md", b"external version\n");
+        let link = dir.path().join("existing.md");
+
+        #[cfg(target_os = "windows")]
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!("skipping file-symlink test: {error}");
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = save_as(&link, "editor text\n", Newline::Lf, false).unwrap_err();
+
+        assert!(matches!(error, SaveError::DestinationExists));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"external version\n");
+    }
+
+    #[test]
+    fn save_as_confirmation_can_be_cancelled_without_mutating_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "existing.md", b"external version\n");
+
+        let error = save_as(&path, "editor text\n", Newline::Lf, false).unwrap_err();
+
+        assert!(matches!(error, SaveError::DestinationExists));
+        // A cancelled confirmation deliberately does not call `overwrite_as`.
+        assert_eq!(std::fs::read(&path).unwrap(), b"external version\n");
+    }
+
+    #[test]
+    fn overwrite_as_replaces_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "existing.md", b"external version\n");
+
+        let saved = overwrite_as(&path, "editor text\n", Newline::Lf, false).unwrap();
+
+        assert_eq!(saved.path, path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"editor text\n");
+    }
+
+    #[test]
+    fn overwrite_as_authorization_refuses_a_destination_changed_while_confirming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "existing.md", b"version shown in the prompt\n");
+        let authorization = SaveAsOverwriteAuthorization::capture(&path).unwrap();
+        std::fs::write(&path, b"later external version\n").unwrap();
+
+        let error = overwrite_as_authorized(&authorization, "editor text\n", Newline::Lf, false)
+            .unwrap_err();
+
+        assert!(matches!(error, SaveError::Conflict));
+        assert_eq!(std::fs::read(&path).unwrap(), b"later external version\n");
+    }
+
+    #[test]
+    fn overwrite_as_authorization_refuses_a_destination_removed_while_confirming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "existing.md", b"version shown in the prompt\n");
+        let authorization = SaveAsOverwriteAuthorization::capture(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let error = overwrite_as_authorized(&authorization, "editor text\n", Newline::Lf, false)
+            .unwrap_err();
+
+        assert!(matches!(error, SaveError::Conflict));
+        assert!(!path.exists());
+    }
+
+    #[cfg(any(target_os = "windows", unix))]
+    #[test]
+    fn overwrite_as_authorization_refuses_a_symlink_retargeted_while_confirming() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = write_file(dir.path(), "target-a.md", b"version shown in the prompt\n");
+        let alternate = write_file(dir.path(), "target-b.md", b"other version\n");
+        let link = dir.path().join("existing.md");
+
+        #[cfg(target_os = "windows")]
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!("skipping file-symlink test: {error}");
+            return;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let authorization = SaveAsOverwriteAuthorization::capture(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        #[cfg(target_os = "windows")]
+        std::os::windows::fs::symlink_file(&alternate, &link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&alternate, &link).unwrap();
+
+        let error = overwrite_as_authorized(&authorization, "editor text\n", Newline::Lf, false)
+            .unwrap_err();
+
+        assert!(matches!(error, SaveError::Conflict));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"version shown in the prompt\n"
+        );
+        assert_eq!(std::fs::read(&alternate).unwrap(), b"other version\n");
+    }
+
+    #[test]
+    fn overwrite_as_refuses_a_destination_changed_after_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "existing.md", b"confirmed version\n");
+        let external_path = path.clone();
+        install_save_commit_hook(move || {
+            std::fs::write(external_path, b"later external version\n").unwrap();
+        });
+
+        let error = overwrite_as(&path, "editor text\n", Newline::Lf, false).unwrap_err();
+
+        assert!(matches!(error, SaveError::Conflict));
+        assert_eq!(std::fs::read(&path).unwrap(), b"later external version\n");
+    }
+
+    #[test]
+    fn save_as_refuses_a_destination_created_after_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.md");
+        let external_path = path.clone();
+        install_save_commit_hook(move || {
+            std::fs::write(external_path, b"external version\n").unwrap();
+        });
+
+        let error = save_as(&path, "editor text\n", Newline::Lf, false).unwrap_err();
+
+        assert!(matches!(error, SaveError::Conflict));
+        assert_eq!(std::fs::read(&path).unwrap(), b"external version\n");
+    }
+
     #[cfg(any(target_os = "windows", unix))]
     #[test]
     fn save_as_refuses_a_post_commit_symlink_retarget() {
@@ -1894,7 +2168,7 @@ mod tests {
 
         #[cfg(windows)]
         {
-            save_as(&link, "editor text\n", Newline::Lf, false).unwrap();
+            overwrite_as(&link, "editor text\n", Newline::Lf, false).unwrap();
             assert!(
                 retarget_failure.borrow().is_some(),
                 "the guarded link must reject the retarget attempt"
@@ -1911,7 +2185,7 @@ mod tests {
         }
 
         #[cfg(unix)]
-        let error = save_as(&link, "editor text\n", Newline::Lf, false).unwrap_err();
+        let error = overwrite_as(&link, "editor text\n", Newline::Lf, false).unwrap_err();
         #[cfg(unix)]
         assert!(matches!(error, SaveError::ConcurrentCommit { .. }));
         #[cfg(unix)]

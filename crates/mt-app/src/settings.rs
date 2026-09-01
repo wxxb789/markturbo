@@ -7,9 +7,9 @@
 //! TOML rather than JSON because a settings file is something a person opens.
 //! It takes comments, which JSON cannot, and it does not fail on a trailing
 //! comma. The format has one rule that constrains this file: every scalar must
-//! be written before any table, so [`AppSettings`] must stay flat — a nested
-//! struct or map would serialize to a document `toml` refuses to read back.
-//! `the_settings_document_is_flat_enough_for_toml_to_read_back` holds that.
+//! be written before any table. [`AppSettings`] therefore keeps scalar fields
+//! first and its sole array table, `recent_targets`, last.
+//! `the_settings_document_serializes_recent_targets_last_and_reads_back` holds that.
 //!
 //! Persistence is best-effort by design: a corrupt or unreadable settings file
 //! must never stop the app opening. A bad file falls back to defaults, and the
@@ -157,6 +157,54 @@ impl GroupBy {
     }
 }
 
+/// A target the user can reopen from the welcome state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RecentTargetKind {
+    #[default]
+    File,
+    Workspace,
+}
+
+/// Presentation data for an entry in the recently opened target list.
+///
+/// `path` is the source of truth; the kind and display name are persisted only
+/// so the welcome screen can describe the target without opening it first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RecentTarget {
+    pub path: PathBuf,
+    pub kind: RecentTargetKind,
+    pub display_name: String,
+}
+
+impl RecentTarget {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        kind: RecentTargetKind,
+        display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            kind,
+            display_name: display_name.into(),
+        }
+    }
+}
+
+impl Default for RecentTarget {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            kind: RecentTargetKind::default(),
+            display_name: String::new(),
+        }
+    }
+}
+
+/// The welcome screen keeps its history short enough to scan.
+pub const MAX_RECENT_TARGETS: usize = 10;
+
 /// Everything the user can configure.
 ///
 /// `#[serde(default)]` on every field is what makes a settings file written by
@@ -217,6 +265,13 @@ pub struct AppSettings {
     /// Show skills marked `metadata.internal: true`.
     pub skills_include_internal: bool,
     pub skills_group_by: GroupBy,
+    /// Whether a no-argument launch begins in the welcome state.
+    pub show_welcome_on_startup: bool,
+    /// Most-recently used paths shown by the welcome state.
+    ///
+    /// This must remain last so TOML writes all scalar fields before its array
+    /// tables and can read its own output back.
+    pub recent_targets: Vec<RecentTarget>,
 }
 
 impl Default for AppSettings {
@@ -238,6 +293,8 @@ impl Default for AppSettings {
             skills_include_global: true,
             skills_include_internal: false,
             skills_group_by: GroupBy::default(),
+            show_welcome_on_startup: true,
+            recent_targets: Vec::new(),
         }
     }
 }
@@ -255,6 +312,9 @@ impl AppSettings {
 
     /// Load from disk (or defaults) and install as the global.
     pub fn init(cx: &mut App) {
+        #[cfg(test)]
+        cx.set_global(Self::default());
+        #[cfg(not(test))]
         cx.set_global(Self::load());
     }
 
@@ -268,8 +328,54 @@ impl AppSettings {
     /// for eight of the fourteen settings.
     pub fn update(cx: &mut App, edit: impl FnOnce(&mut AppSettings)) {
         edit(Self::global_mut(cx));
-        let settings = Self::global(cx).clone();
-        settings.save();
+        #[cfg(not(test))]
+        {
+            let settings = Self::global(cx).clone();
+            settings.save();
+        }
+    }
+
+    /// Place `target` first in the recent list, replacing an older entry for
+    /// the same path and evicting the least recently used target when needed.
+    pub fn record_recent_target(&mut self, target: RecentTarget) {
+        if target.path.as_os_str().is_empty() {
+            return;
+        }
+
+        self.recent_targets
+            .retain(|existing| existing.path != target.path);
+        self.recent_targets.insert(0, target);
+        self.recent_targets.truncate(MAX_RECENT_TARGETS);
+    }
+
+    /// Restore the MRU invariants when a settings file was edited outside the
+    /// application or written by an older build without a list bound.
+    fn normalize_recent_targets(&mut self) {
+        let mut normalized = Vec::with_capacity(self.recent_targets.len().min(MAX_RECENT_TARGETS));
+
+        for target in std::mem::take(&mut self.recent_targets) {
+            if target.path.as_os_str().is_empty()
+                || normalized
+                    .iter()
+                    .any(|existing: &RecentTarget| existing.path == target.path)
+            {
+                continue;
+            }
+
+            normalized.push(target);
+            if normalized.len() == MAX_RECENT_TARGETS {
+                break;
+            }
+        }
+
+        self.recent_targets = normalized;
+    }
+
+    /// Remove a stale or user-dismissed recent target by path.
+    pub fn remove_recent_target(&mut self, path: &std::path::Path) -> bool {
+        let len = self.recent_targets.len();
+        self.recent_targets.retain(|target| target.path != path);
+        self.recent_targets.len() != len
     }
 
     /// Read the settings file, falling back to defaults.
@@ -285,8 +391,11 @@ impl AppSettings {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
         };
-        match toml::from_str(&text) {
-            Ok(settings) => settings,
+        match toml::from_str::<Self>(&text) {
+            Ok(mut settings) => {
+                settings.normalize_recent_targets();
+                settings
+            }
             Err(err) => {
                 // Do not delete or rewrite it: the user may have hand-edited it
                 // and a diagnostic they can act on beats silent data loss.
@@ -448,6 +557,12 @@ mod tests {
             theme: ThemePreference::Dark,
             translate_to: "ja".into(),
             skills_group_by: GroupBy::Harness,
+            show_welcome_on_startup: false,
+            recent_targets: vec![RecentTarget::new(
+                PathBuf::from("C:/work/notes.md"),
+                RecentTargetKind::File,
+                "notes.md",
+            )],
             ..AppSettings::default()
         };
 
@@ -456,22 +571,33 @@ mod tests {
         assert_eq!(back, settings);
     }
 
-    /// TOML cannot represent this struct if it ever gains a nested one.
+    /// TOML cannot represent a scalar after an array table.
     ///
     /// The rule that bites: every scalar must be emitted before any table, so a
     /// struct mixing scalars with a nested struct or map serializes to a
     /// document `toml` itself refuses to re-parse — or errors outright on the
-    /// way out. Today every field is a scalar, and this fails the moment one is
-    /// not, which is the point.
+    /// way out. Recent targets deliberately use an array table, so it must stay
+    /// last after every scalar setting.
     #[test]
-    fn the_settings_document_is_flat_enough_for_toml_to_read_back() {
-        let text = toml::to_string_pretty(&AppSettings::default()).unwrap();
+    fn the_settings_document_serializes_recent_targets_last_and_reads_back() {
+        let settings = AppSettings {
+            recent_targets: vec![RecentTarget::new(
+                PathBuf::from("C:/work"),
+                RecentTargetKind::Workspace,
+                "work",
+            )],
+            ..AppSettings::default()
+        };
+        let text = toml::to_string_pretty(&settings).unwrap();
+        let recent_start = text
+            .find("[[recent-targets]]")
+            .expect("recent targets must be TOML array tables");
         assert!(
-            !text.contains('['),
-            "a table appeared; TOML needs every scalar above it:
+            !text[..recent_start].contains('['),
+            "a table appeared before the recent list; TOML needs every scalar above it:
 {text}"
         );
-        toml::from_str::<AppSettings>(&text).expect("its own output must parse");
+        assert_eq!(toml::from_str::<AppSettings>(&text).unwrap(), settings);
     }
 
     /// The unit enums must land as plain strings, under kebab-case names.
@@ -511,6 +637,8 @@ mod tests {
         // still resolve to a real one rather than an empty id.
         assert_eq!(back.theme_light, crate::theme::DEFAULT_LIGHT);
         assert_eq!(back.theme_dark, crate::theme::DEFAULT_DARK);
+        assert!(back.show_welcome_on_startup);
+        assert!(back.recent_targets.is_empty());
     }
 
     #[test]
@@ -584,11 +712,183 @@ mod tests {
             skills_include_global: false,
             skills_group_by: GroupBy::Status,
             translate_to: "de".into(),
+            show_welcome_on_startup: false,
+            recent_targets: vec![RecentTarget::new(
+                PathBuf::from("C:/work/notes.md"),
+                RecentTargetKind::File,
+                "notes.md",
+            )],
         };
         // The parent does not exist yet: saving must create it.
         settings.save_to(&path);
 
         assert_eq!(AppSettings::load_from(&path), settings);
+    }
+
+    #[test]
+    fn recent_targets_are_mru_deduplicated_and_capped() {
+        let mut settings = AppSettings::default();
+        for number in 0..=10 {
+            settings.record_recent_target(RecentTarget::new(
+                PathBuf::from(format!("workspace-{number}")),
+                RecentTargetKind::Workspace,
+                format!("Workspace {number}"),
+            ));
+        }
+
+        assert_eq!(settings.recent_targets.len(), MAX_RECENT_TARGETS);
+        assert_eq!(
+            settings.recent_targets[0].path,
+            PathBuf::from("workspace-10")
+        );
+        assert_eq!(
+            settings.recent_targets.last().unwrap().path,
+            PathBuf::from("workspace-1")
+        );
+
+        settings.record_recent_target(RecentTarget::new(
+            PathBuf::from("workspace-5"),
+            RecentTargetKind::File,
+            "renamed.md",
+        ));
+        assert_eq!(settings.recent_targets.len(), MAX_RECENT_TARGETS);
+        assert_eq!(
+            settings.recent_targets[0].path,
+            PathBuf::from("workspace-5")
+        );
+        assert_eq!(settings.recent_targets[0].kind, RecentTargetKind::File);
+        assert_eq!(settings.recent_targets[0].display_name, "renamed.md");
+        assert_eq!(
+            settings
+                .recent_targets
+                .iter()
+                .filter(|target| target.path.as_path() == std::path::Path::new("workspace-5"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn load_normalizes_hand_edited_recent_targets_in_mru_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[recent-targets]]
+path = "workspace-0"
+display-name = "Workspace 0"
+
+[[recent-targets]]
+path = ""
+display-name = "Empty"
+
+[[recent-targets]]
+path = "workspace-1"
+display-name = "Workspace 1"
+
+[[recent-targets]]
+path = "workspace-2"
+display-name = "Workspace 2"
+
+[[recent-targets]]
+path = "workspace-1"
+display-name = "Duplicate"
+
+[[recent-targets]]
+path = "workspace-3"
+display-name = "Workspace 3"
+
+[[recent-targets]]
+path = "workspace-4"
+display-name = "Workspace 4"
+
+[[recent-targets]]
+path = "workspace-5"
+display-name = "Workspace 5"
+
+[[recent-targets]]
+path = "workspace-6"
+display-name = "Workspace 6"
+
+[[recent-targets]]
+path = "workspace-7"
+display-name = "Workspace 7"
+
+[[recent-targets]]
+path = "workspace-8"
+display-name = "Workspace 8"
+
+[[recent-targets]]
+path = "workspace-9"
+display-name = "Workspace 9"
+
+[[recent-targets]]
+path = "workspace-10"
+display-name = "Workspace 10"
+
+[[recent-targets]]
+path = "workspace-11"
+display-name = "Workspace 11"
+"#,
+        )
+        .unwrap();
+
+        let settings = AppSettings::load_from(&path);
+        assert_eq!(settings.recent_targets.len(), MAX_RECENT_TARGETS);
+        let paths = settings
+            .recent_targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            (0..MAX_RECENT_TARGETS)
+                .map(|number| PathBuf::from(format!("workspace-{number}")))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(settings.recent_targets[1].display_name, "Workspace 1");
+    }
+
+    #[test]
+    fn recent_targets_can_be_removed_and_partial_entries_still_load() {
+        let mut settings = AppSettings::default();
+        let path = PathBuf::from("workspace");
+        settings.record_recent_target(RecentTarget::new(
+            path.clone(),
+            RecentTargetKind::Workspace,
+            "workspace",
+        ));
+
+        assert!(settings.remove_recent_target(&path));
+        assert!(settings.recent_targets.is_empty());
+        assert!(!settings.remove_recent_target(&path));
+
+        let back: AppSettings = toml::from_str(
+            r#"
+[[recent-targets]]
+path = "old-file.md"
+"#,
+        )
+        .unwrap();
+        assert_eq!(back.recent_targets.len(), 1);
+        assert_eq!(back.recent_targets[0].path, PathBuf::from("old-file.md"));
+        assert_eq!(back.recent_targets[0].kind, RecentTargetKind::File);
+        assert!(back.recent_targets[0].display_name.is_empty());
+    }
+
+    #[test]
+    fn test_app_settings_updates_never_write_the_developer_configuration() {
+        let source = include_str!("settings.rs");
+        let update = source
+            .split_once("pub fn update")
+            .expect("AppSettings::update")
+            .1
+            .split_once("/// Place `target`")
+            .expect("end of update")
+            .0;
+        assert!(update.contains("#[cfg(not(test))]"));
+        assert!(update.contains("settings.save()"));
     }
 
     #[test]

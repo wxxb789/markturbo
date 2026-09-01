@@ -40,7 +40,8 @@ USAGE:
 
 ARGS:
     PATH    A directory to open as a workspace, or a file to open (its parent
-            becomes the workspace). Defaults to the current directory.
+            becomes the workspace). Omit for the welcome screen; use `.` to
+            open the current directory.
 
 OPTIONS:
     -h, --help       Print this help
@@ -114,9 +115,10 @@ fn resolve_target(args: &[String]) -> Result<Option<PathBuf>, (String, i32)> {
             // and so a relative argument survives any later cwd change.
             Ok(Some(path.canonicalize().unwrap_or(path)))
         }
-        // No argument: open the current directory. Launching from a terminal in
-        // a repo is the common case, and it makes the app immediately useful.
-        None => Ok(std::env::current_dir().ok()),
+        // No target is an intentional first-use state. Terminal callers that
+        // want cwd pass `.` explicitly, which keeps desktop and CLI behavior
+        // deterministic without platform heuristics.
+        None => Ok(None),
     }
 }
 
@@ -304,9 +306,17 @@ mod tests {
     }
 
     #[test]
-    fn no_argument_opens_the_current_directory() {
+    fn no_argument_leaves_target_for_the_welcome_flow() {
         let target = resolve_target(&[]).expect("should not exit");
-        assert_eq!(target, std::env::current_dir().ok());
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn a_dot_argument_keeps_the_explicit_current_directory_launch() {
+        let target = resolve_target(&args(&["."]))
+            .expect("should open")
+            .expect("explicit target");
+        assert!(target.is_dir());
     }
 
     #[test]
@@ -331,6 +341,8 @@ mod tests {
             let (message, code) = resolve_target(&args(&[flag])).unwrap_err();
             assert_eq!(code, 0, "help is not an error");
             assert!(message.contains("USAGE"));
+            assert!(message.contains("welcome screen"));
+            assert!(message.contains("use `.`"));
         }
         for flag in ["-V", "--version"] {
             let (message, code) = resolve_target(&args(&[flag])).unwrap_err();

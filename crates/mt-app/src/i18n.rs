@@ -20,9 +20,20 @@ use crate::settings::{AppSettings, Language};
 pub enum Key {
     // Title bar and commands
     OpenFolder,
+    OpenFile,
+    OpenFolderPicker,
+    OpenFilePicker,
+    NewDocument,
+    Paste,
+    ClipboardTextUnavailable,
+    OpenBundledSample,
     Translate,
     Settings,
     Save,
+    SaveAsPicker,
+    SaveAsSnapshotChanged,
+    Replace,
+    Cancel,
 
     // Side panels
     PanelFiles,
@@ -64,6 +75,12 @@ pub enum Key {
     NoHeadings,
     OpenAMarkdownFile,
     Scanning,
+    WelcomeTitle,
+    WelcomeSubtitle,
+    Recent,
+    RecentMissing,
+    RecentUnavailable,
+    DontShowWelcomeAgain,
 
     // Document view
     ModeSource,
@@ -145,6 +162,76 @@ pub fn t(key: Key, cx: &gpui::App) -> &'static str {
     text(key, AppSettings::global(cx).language)
 }
 
+fn quoted_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| quoted_path(path))
+}
+
+pub fn replace_file_title(path: &std::path::Path, cx: &gpui::App) -> String {
+    replace_file_title_in(path, AppSettings::global(cx).language)
+}
+
+fn replace_file_title_in(path: &std::path::Path, language: Language) -> String {
+    let name = file_name(path);
+    match language {
+        Language::English => format!("Replace \u{201c}{name}\u{201d}?"),
+        Language::Chinese => format!("替换\u{201c}{name}\u{201d}？"),
+    }
+}
+
+pub fn replace_file_description(path: &std::path::Path, cx: &gpui::App) -> String {
+    replace_file_description_in(path, AppSettings::global(cx).language)
+}
+
+fn replace_file_description_in(path: &std::path::Path, language: Language) -> String {
+    let path = quoted_path(path);
+    match language {
+        Language::English => {
+            format!("This will replace \u{201c}{path}\u{201d} with the current editor text.")
+        }
+        Language::Chinese => format!("当前编辑器文本将替换\u{201c}{path}\u{201d}。"),
+    }
+}
+
+pub fn open_recent_target_label(path: &std::path::Path, cx: &gpui::App) -> String {
+    recent_target_label_in(path, AppSettings::global(cx).language, true)
+}
+
+pub fn remove_recent_target_label(path: &std::path::Path, cx: &gpui::App) -> String {
+    recent_target_label_in(path, AppSettings::global(cx).language, false)
+}
+
+pub fn save_as_snapshot_changed_message(cx: &gpui::App) -> &'static str {
+    t(Key::SaveAsSnapshotChanged, cx)
+}
+
+pub fn save_as_path_already_open_message(path: &std::path::Path, cx: &gpui::App) -> String {
+    let path = quoted_path(path);
+    match AppSettings::global(cx).language {
+        Language::English => {
+            format!("\u{201c}{path}\u{201d} is already open. Choose another Save As path.")
+        }
+        Language::Chinese => format!("\u{201c}{path}\u{201d}已打开。请选择其他另存为路径。"),
+    }
+}
+
+fn recent_target_label_in(path: &std::path::Path, language: Language, open: bool) -> String {
+    let path = quoted_path(path);
+    match (language, open) {
+        (Language::English, true) => format!("Open \u{201c}{path}\u{201d}"),
+        (Language::English, false) => format!("Remove \u{201c}{path}\u{201d} from Recent"),
+        (Language::Chinese, true) => format!("打开\u{201c}{path}\u{201d}"),
+        (Language::Chinese, false) => format!("从最近打开中移除\u{201c}{path}\u{201d}"),
+    }
+}
+
 /// The string for `key` in an explicit language.
 ///
 /// Exposed separately so the table can be tested without an `App`.
@@ -160,9 +247,22 @@ pub fn text(key: Key, language: Language) -> &'static str {
 fn english(key: Key) -> &'static str {
     match key {
         Key::OpenFolder => "Open Folder",
+        Key::OpenFile => "Open File",
+        Key::OpenFolderPicker => "Open Folder\u{2026}",
+        Key::OpenFilePicker => "Open File\u{2026}",
+        Key::NewDocument => "New",
+        Key::Paste => "Paste",
+        Key::ClipboardTextUnavailable => "Clipboard does not contain text or is unavailable.",
+        Key::OpenBundledSample => "Open Bundled Sample",
         Key::Translate => "Translate",
         Key::Settings => "Settings",
         Key::Save => "Save",
+        Key::SaveAsPicker => "Save As\u{2026}",
+        Key::SaveAsSnapshotChanged => {
+            "The document changed while Save As was open. The pending close was cancelled."
+        }
+        Key::Replace => "Replace",
+        Key::Cancel => "Cancel",
 
         Key::PanelFiles => "Files",
         Key::PanelSearch => "Search",
@@ -200,6 +300,12 @@ fn english(key: Key) -> &'static str {
         Key::NoHeadings => "This document has no headings.",
         Key::OpenAMarkdownFile => "Open a Markdown file to begin.",
         Key::Scanning => "Scanning…",
+        Key::WelcomeTitle => "Start a Markdown document",
+        Key::WelcomeSubtitle => "Create a new document or open one from your computer.",
+        Key::Recent => "Recent",
+        Key::RecentMissing => "Missing",
+        Key::RecentUnavailable => "Unavailable",
+        Key::DontShowWelcomeAgain => "Don't show this again",
 
         Key::ModeSource => "Source",
         Key::ModeNative => "Native",
@@ -312,9 +418,20 @@ fn english(key: Key) -> &'static str {
 fn chinese(key: Key) -> Option<&'static str> {
     Some(match key {
         Key::OpenFolder => "打开文件夹",
+        Key::OpenFile => "打开文件",
+        Key::OpenFolderPicker => "打开文件夹\u{2026}",
+        Key::OpenFilePicker => "打开文件\u{2026}",
+        Key::NewDocument => "新建",
+        Key::Paste => "粘贴",
+        Key::ClipboardTextUnavailable => "剪贴板中没有文本，或剪贴板当前不可用。",
+        Key::OpenBundledSample => "打开内置示例",
         Key::Translate => "翻译",
         Key::Settings => "设置",
         Key::Save => "保存",
+        Key::SaveAsPicker => "另存为\u{2026}",
+        Key::SaveAsSnapshotChanged => "另存为对话框打开期间文档已更改，待处理的关闭操作已取消。",
+        Key::Replace => "替换",
+        Key::Cancel => "取消",
 
         Key::PanelFiles => "文件",
         Key::PanelSearch => "搜索",
@@ -352,6 +469,12 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::NoHeadings => "此文档没有标题。",
         Key::OpenAMarkdownFile => "打开一个 Markdown 文件以开始。",
         Key::Scanning => "扫描中…",
+        Key::WelcomeTitle => "开始编写 Markdown 文档",
+        Key::WelcomeSubtitle => "新建文档，或从电脑中打开已有文档。",
+        Key::Recent => "最近打开",
+        Key::RecentMissing => "文件不存在",
+        Key::RecentUnavailable => "不可用",
+        Key::DontShowWelcomeAgain => "不再显示",
 
         Key::ModeSource => "源码",
         Key::ModeNative => "原生",
@@ -450,9 +573,20 @@ mod tests {
     /// one that was added later.
     const EVERY_KEY: &[Key] = &[
         Key::OpenFolder,
+        Key::OpenFile,
+        Key::OpenFolderPicker,
+        Key::OpenFilePicker,
+        Key::NewDocument,
+        Key::Paste,
+        Key::ClipboardTextUnavailable,
+        Key::OpenBundledSample,
         Key::Translate,
         Key::Settings,
         Key::Save,
+        Key::SaveAsPicker,
+        Key::SaveAsSnapshotChanged,
+        Key::Replace,
+        Key::Cancel,
         Key::PanelFiles,
         Key::PanelSearch,
         Key::PanelHarness,
@@ -486,6 +620,12 @@ mod tests {
         Key::NoHeadings,
         Key::OpenAMarkdownFile,
         Key::Scanning,
+        Key::WelcomeTitle,
+        Key::WelcomeSubtitle,
+        Key::Recent,
+        Key::RecentMissing,
+        Key::RecentUnavailable,
+        Key::DontShowWelcomeAgain,
         Key::ModeSource,
         Key::ModeNative,
         Key::ModeWeb,
@@ -612,6 +752,32 @@ mod tests {
     }
 
     #[test]
+    fn picker_commands_use_the_platform_ellipsis_convention() {
+        for key in [
+            Key::OpenFilePicker,
+            Key::OpenFolderPicker,
+            Key::SaveAsPicker,
+        ] {
+            for language in Language::ALL {
+                let label = text(key, language);
+                assert!(label.ends_with('\u{2026}'), "{key:?}: {label}");
+                assert!(!label.ends_with("..."), "{key:?}: {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn destructive_and_recent_labels_name_the_exact_path() {
+        let path = std::path::Path::new("C:/work/notes.md");
+        for language in Language::ALL {
+            assert!(replace_file_title_in(path, language).contains("notes.md"));
+            assert!(replace_file_description_in(path, language).contains("C:/work/notes.md"));
+            assert!(recent_target_label_in(path, language, true).contains("C:/work/notes.md"));
+            assert!(recent_target_label_in(path, language, false).contains("C:/work/notes.md"));
+        }
+    }
+
+    #[test]
     fn english_is_the_default() {
         // Not because it is the better language, but because it is the one this
         // app's own strings are authored in, so it is the only one guaranteed
@@ -626,5 +792,23 @@ mod tests {
         assert!(text(Key::OpenSkillMd, Language::Chinese).contains("SKILL.md"));
         assert_eq!(text(Key::PanelHarness, Language::Chinese), "Harness");
         assert!(text(Key::OpenFolderToDiscover, Language::Chinese).contains("skills"));
+    }
+
+    #[test]
+    fn welcome_strings_are_translated_in_both_languages() {
+        for language in Language::ALL {
+            for key in [
+                Key::WelcomeTitle,
+                Key::NewDocument,
+                Key::Paste,
+                Key::ClipboardTextUnavailable,
+                Key::OpenFile,
+                Key::OpenBundledSample,
+                Key::Recent,
+                Key::DontShowWelcomeAgain,
+            ] {
+                assert!(!text(key, language).is_empty(), "{key:?} in {language:?}");
+            }
+        }
     }
 }

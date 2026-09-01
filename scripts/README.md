@@ -202,3 +202,50 @@ The machine is also noisy. A concurrent release build has been observed to
 change the same measurement by 2x, which is why `probe.py cpu` takes a series
 rather than one sample — a single reading lands on startup transients and cannot
 tell "busy while starting" from "never converges".
+
+## Goal 03 Native First-Use Acceptance
+
+`goal-03-native-acceptance.py` is the Goal 03 Windows 11 x64 first-use gate.
+It requires the same active, unlocked desktop session and current release
+binary as Goal 02, plus `uv` for `pywinauto`. The harness copies the executable
+and gives every scenario isolated absolute `MARKTURBO_DATA_DIR` and
+`MARKTURBO_CONFIG_DIR` roots; it never uses the developer's production
+settings, recovery, or WebView data.
+
+Run it from a terminal that received real user input. Windows may deny
+foreground-window activation to a background agent or service even while the
+desktop session is active; the harness reports that condition as `BLOCKED`.
+
+Build, measure, and run it against the exact release executable:
+
+```bash
+cargo build --release --locked -p mt-app --bin markturbo
+sha256sum target/release/markturbo.exe
+uv run scripts/goal-03-native-acceptance.py \
+  --exe target/release/markturbo.exe \
+  --expect-exe-sha256 <measured-sha256> \
+  --evidence .scratch/goal-03-native-acceptance-v1.json
+```
+
+It demonstrates no-argument Welcome, the persisted `Don't show this again`
+choice, New and Unicode Paste buffers, Save As creation/cancellation/explicit
+Replace, exact direct reopen, bundled sample workspace, ten-entry recent persistence with
+a disabled stale target, and explicit file and directory CLI launches. It
+records only SHA-256 fingerprints, counts, and booleans. `PASS` is impossible
+without matching source and copied executable hashes, a Windows 11 x64 active
+desktop, every required scenario, and a scan proving the test sentinel did not
+reach isolated runtime/configuration artifacts.
+
+Before running, copy disposable plain text to the clipboard. The text-entry
+scenarios replace it temporarily and restore its Unicode text value; additional
+HTML, OLE, or application-private clipboard formats are not preserved. This
+keeps non-BMP input such as emoji exact across the native editor path. A
+clipboard without Unicode text, or an inaccessible clipboard, makes the run
+`BLOCKED`, not `PASS`.
+Drag-and-drop is intentionally not claimed as native acceptance evidence:
+desktop drag injection is not reliable enough for a fail-closed harness. Its
+shared target-routing behavior remains covered by the Rust state tests.
+
+Run `py -3 scripts/test_goal_03_native_acceptance.py` for parser, evidence
+schema, privacy scan, isolation, and Rust UIA/source-contract checks without
+launching a desktop application.

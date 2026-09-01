@@ -79,6 +79,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 
 FONT_OUT="$OUT/fonts"
+SAMPLE_OUT="$OUT/sample"
 case "$TARGET" in
   *apple-darwin*)
     # Finder reads the icon from an application bundle; a bare Mach-O binary
@@ -101,6 +102,12 @@ case "$TARGET" in
     FONT_OUT="$APP/Contents/Resources/fonts"
     ln -s "../Resources/fonts" "$APP/Contents/MacOS/fonts"
     ln -s "markturbo.app/Contents/Resources/fonts" "$OUT/fonts"
+
+    # Locate the sample inside macOS app bundles, then expose it beside the
+    # executable and at the distribution root without duplicating its files.
+    SAMPLE_OUT="$APP/Contents/Resources/sample"
+    ln -s "../Resources/sample" "$APP/Contents/MacOS/sample"
+    ln -s "markturbo.app/Contents/Resources/sample" "$OUT/sample"
     ;;
   *)
     cp "$BUILT" "$OUT/"
@@ -146,7 +153,7 @@ case "$TARGET" in
 esac
 
 # The sample workspace is what a new user opens first, so it ships too.
-cp -r sample "$OUT/sample"
+cp -r sample "$SAMPLE_OUT"
 
 cat > "$OUT/RUNNING.md" <<'EOF'
 # Running markturbo
@@ -166,7 +173,8 @@ diagrams, skills, and translation.
 ```sh
 markturbo /path/to/your/repo     # a directory becomes the workspace
 markturbo /path/to/NOTES.md      # a file opens with its folder as the workspace
-markturbo                        # no argument: the current directory
+markturbo                        # no argument: the welcome screen
+markturbo .                      # open the current directory
 ```
 
 Or drag a file or folder onto the window. A folder becomes the workspace; a

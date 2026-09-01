@@ -1212,7 +1212,7 @@ def main() -> None:
         p.add_argument("--exe", type=Path, default=DEFAULT_EXE,
                        help="binary under test (default: target/release)")
         p.add_argument("--open", metavar="PATH",
-                       help="file or folder to open; omit for the current directory")
+                       help="file or folder to open; omit for the welcome screen (use . for cwd)")
         p.add_argument("--settle", type=float, default=18.0,
                        help="seconds to wait before measuring (default: 18)")
         p.add_argument("--log", type=Path,

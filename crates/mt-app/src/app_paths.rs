@@ -55,6 +55,32 @@ pub fn log_path() -> Option<PathBuf> {
     Some(log_path_in(&log_dir()?, std::process::id()))
 }
 
+/// The sample workspace shipped beside the executable.
+///
+/// Packaged releases keep `sample/` next to `markturbo`. Debug builds and test
+/// binaries fall back to the repository copy so the welcome flow works under
+/// `cargo run` and `cargo test` without teaching production release builds
+/// about a developer checkout.
+pub fn bundled_sample_dir() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    #[cfg(any(debug_assertions, test))]
+    let source_sample = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample"));
+    #[cfg(not(any(debug_assertions, test)))]
+    let source_sample: Option<PathBuf> = None;
+
+    sample_dir_from(&executable, source_sample.as_deref())
+}
+
+fn sample_dir_from(executable: &Path, source_sample: Option<&Path>) -> Option<PathBuf> {
+    let packaged = executable.parent()?.join("sample");
+    if packaged.is_dir() {
+        return Some(packaged);
+    }
+    source_sample
+        .filter(|path| path.is_dir())
+        .map(Path::to_path_buf)
+}
+
 fn webview_data_dir_in(root: &Path) -> PathBuf {
     root.join("webview2")
 }
@@ -78,6 +104,38 @@ fn path_from_env_value(value: Option<&str>) -> Result<Option<PathBuf>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_sample_is_resolved_beside_the_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("markturbo.exe");
+        let sample = dir.path().join("sample");
+        std::fs::create_dir(&sample).unwrap();
+
+        assert_eq!(sample_dir_from(&executable, None), Some(sample));
+    }
+
+    #[test]
+    fn development_sample_is_only_a_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("bin/markturbo.exe");
+        let packaged = executable.parent().unwrap().join("sample");
+        let source = dir.path().join("source-sample");
+        std::fs::create_dir_all(&packaged).unwrap();
+        std::fs::create_dir(&source).unwrap();
+
+        assert_eq!(sample_dir_from(&executable, Some(&source)), Some(packaged));
+        std::fs::remove_dir_all(executable.parent().unwrap()).unwrap();
+        assert_eq!(sample_dir_from(&executable, Some(&source)), Some(source));
+    }
+
+    #[test]
+    fn missing_sample_is_reported_without_inventing_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("markturbo.exe");
+
+        assert_eq!(sample_dir_from(&executable, None), None);
+    }
 
     #[test]
     fn runtime_paths_share_one_user_data_root() {
