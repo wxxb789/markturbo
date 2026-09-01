@@ -506,6 +506,7 @@ struct TestFailurePoints {
     checkpoint_batches: AtomicUsize,
     after_checkpoint_prepare: Mutex<Option<TestPause>>,
     after_checkpoint_final_check: Mutex<Option<TestPause>>,
+    after_retirement_marker: Mutex<Option<TestPause>>,
     before_transaction_journal: Mutex<Option<TestPause>>,
     after_transaction_journal: Mutex<Option<TestPause>>,
     after_eviction_reservation: Mutex<Option<TestPause>>,
@@ -1390,6 +1391,9 @@ impl RecoveryStore {
             return Err(error);
         }
 
+        #[cfg(test)]
+        self.pause_once_for_test(&self.failures.after_retirement_marker);
+
         let mut state = self.lock_capabilities();
         if !batch
             .keys
@@ -1716,7 +1720,7 @@ impl RecoveryStore {
                 return Ok(CheckpointWriteResult::Superseded);
             }
             #[cfg(test)]
-            self.pause_checkpoint_write_once_for_test(&self.failures.after_checkpoint_final_check);
+            self.pause_once_for_test(&self.failures.after_checkpoint_final_check);
             self.persist_prepared_write(prepared, &target_path)
                 .map_err(CheckpointWriteError::Uncertain)?;
         } else {
@@ -1928,7 +1932,7 @@ impl RecoveryStore {
             return Ok(CheckpointWriteResult::Deferred);
         }
         #[cfg(test)]
-        self.pause_checkpoint_write_once_for_test(&self.failures.after_eviction_reservation);
+        self.pause_once_for_test(&self.failures.after_eviction_reservation);
 
         for entry in &transaction.staged {
             if let Err(error) = self.rename_path(
@@ -2729,6 +2733,13 @@ impl RecoveryStore {
     }
 
     #[cfg(test)]
+    fn pause_after_retirement_marker_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.install_test_pause(&self.failures.after_retirement_marker)
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_before_transaction_journal_for_test(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -2776,7 +2787,7 @@ impl RecoveryStore {
     }
 
     #[cfg(test)]
-    fn pause_checkpoint_write_once_for_test(&self, slot: &Mutex<Option<TestPause>>) {
+    fn pause_once_for_test(&self, slot: &Mutex<Option<TestPause>>) {
         let Some(pause) = slot.lock().unwrap().take() else {
             return;
         };
@@ -6267,6 +6278,8 @@ mod tests {
         let token = store.current_token(&item.key);
         let (checkpoint_paused, release_checkpoint) =
             store.pause_after_checkpoint_final_check_for_test();
+        let (retirement_marker_persisted, release_retirement) =
+            store.pause_after_retirement_marker_for_test();
         let store_ref = &store;
         let item_ref = &item;
 
@@ -6286,9 +6299,13 @@ mod tests {
                     .send(store_ref.begin_retirement(&item_ref.key).unwrap())
                     .unwrap();
             });
-            let ticket = ticket_receiver
-                .recv_timeout(Duration::from_millis(250))
-                .ok();
+            let marker_persisted = retirement_marker_persisted
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+            let _ = release_retirement.send(());
+            let ticket = marker_persisted
+                .then(|| ticket_receiver.recv_timeout(Duration::from_secs(5)).ok())
+                .flatten();
 
             release_checkpoint.send(()).unwrap();
             assert!(matches!(
@@ -6296,6 +6313,10 @@ mod tests {
                 CheckpointOutcome::Written(_)
             ));
             retirement.join().unwrap();
+            assert!(
+                marker_persisted,
+                "retirement marker persistence must not wait for recovery I/O"
+            );
             ticket.expect("begin_retirement must not wait for recovery I/O")
         });
 

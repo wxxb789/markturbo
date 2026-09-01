@@ -1702,11 +1702,9 @@ impl Workspace {
                         if !document.read(cx).is_dirty() {
                             let id = document.read(cx).id();
                             let current_key = document.read(cx).recovery_key();
-                            let key = this
-                                .startup_recovery_keys
-                                .remove(&id)
-                                .or_else(|| this.save_as_recovery_keys.remove(&id))
-                                .unwrap_or(current_key);
+                            let startup_key = this.startup_recovery_keys.remove(&id);
+                            let save_as_key = this.save_as_recovery_keys.remove(&id);
+                            let key = save_as_key.or(startup_key).unwrap_or(current_key);
                             this.retire_document_recovery(id, Some(key), cx);
                         }
                         cx.notify();
@@ -9148,6 +9146,61 @@ mod tests {
             assert!(pending.keys.contains(&(original_key, Some(id))));
         });
         assert_eq!(fs::read_to_string(saved_as).unwrap(), "saved elsewhere\n");
+    }
+
+    #[gpui::test]
+    fn saving_during_startup_clears_the_save_as_recovery_key(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.md");
+        fs::write(&path, "disk\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let id = document.read_with(cx, |document, _| document.id());
+        let startup_key = RecoveryKey::for_path(&dir.path().join("startup.md"));
+        let save_as_key = RecoveryKey::for_path(&dir.path().join("save-as.md"));
+
+        replace_document(&workspace, 0, "saved\n", cx);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = None;
+            workspace.startup_recovery_pending = true;
+            workspace
+                .startup_recovery_keys
+                .insert(id, startup_key.clone());
+            workspace
+                .save_as_recovery_keys
+                .insert(id, save_as_key.clone());
+            // Exercise the fallback selection directly; an active schedule
+            // normally takes precedence in retire_document_recovery.
+            workspace.recovery_schedules.remove(&id);
+        });
+
+        document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.startup_recovery_keys.contains_key(&id),
+                "saving must clear the startup recovery key"
+            );
+            assert!(
+                !workspace.save_as_recovery_keys.contains_key(&id),
+                "saving must clear the stale Save As recovery key"
+            );
+            assert_eq!(
+                workspace.pending_recovery_retirements.get(&save_as_key),
+                Some(&Some(id)),
+                "a Save As key identifies the dirty source and takes precedence"
+            );
+            assert!(
+                !workspace
+                    .pending_recovery_retirements
+                    .contains_key(&startup_key),
+                "the superseded startup key must not replace the Save As key"
+            );
+        });
     }
 
     #[gpui::test]

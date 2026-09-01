@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-01
 **Goal:** [Goal 03 - Create a complete first-use document flow](../goals/archive/03-create-first-use-document-flow.md)
-**Status:** COMPLETE
+**Status:** NOT COMPLETE / POST-REVIEW CODE GATES PASS; FINAL NATIVE ACCEPTANCE IS BLOCKED BY THE CURRENT WINDOWS SESSION.
 
 ## Delivered first-use contract
 
@@ -24,11 +24,12 @@
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets` | PASS; no warnings |
 | `git diff --check` | PASS |
-| `cargo test --release --workspace --locked -- --format terse` | 851 passed, 0 failed, 8 ignored |
+| `cargo test --release --workspace --locked -- --format terse` | 852 passed, 0 failed, 8 ignored |
 | `py -3 -m py_compile scripts/goal-03-native-acceptance.py scripts/test_goal_03_native_acceptance.py` | PASS |
 | `py -3 scripts/test_goal_03_native_acceptance.py` | 33 passed |
-| `.scratch/goal-03-native-acceptance-v1.json` | 7 passed, 0 failed, 0 blocked; evidence bound to the listed executable hash |
-| `target/release/markturbo.exe` | AMD64; 48,616,448 bytes; SHA-256 `e50cecefdf312da61b25041d515591d82eb3a20eeac0d40211ebf2c22d555f54` |
+| `py -3 scripts/test_platform_packaging.py` | 5 passed |
+| `.scratch/goal-03-native-acceptance-v1.json` | BLOCKED: `FOREGROUND_PERMISSION_DENIED`; no case ran against the listed executable hash |
+| `target/release/markturbo.exe` | AMD64; 48,616,448 bytes; SHA-256 `7fa8e66808cd9e59561fd088dd153ec9e9634e331e534ff4bf0b964279e45524` |
 
 ## Post-review corrections
 
@@ -41,11 +42,19 @@
 - Window close now drains focused input, reposts `WM_CLOSE`, and completes through
   `WM_DESTROY`; the native harness keeps UI Automation active while verifying
   clean process exit.
+- Save As now removes startup and Save As recovery-key bookkeeping independently,
+  preventing a later normal Save from consuming a stale source key.
+- macOS archives keep one bundled sample under application resources and expose
+  it through relative links beside the executable and at the archive root.
+- The recovery lock test now pauses after the durable retirement marker write,
+  so Windows file-system latency is not mistaken for waiting on the checkpoint
+  mutation lock.
 
-## Native acceptance status
+## Prior native acceptance
 
-The final Windows 11 x64 run completed all seven required cases against a copied
-and hash-verified instance of the final executable:
+The last complete Windows 11 x64 run completed all seven required cases against
+the pre-review executable with SHA-256
+`e50cecefdf312da61b25041d515591d82eb3a20eeac0d40211ebf2c22d555f54`:
 
 1. no-argument Welcome, persistent **Don't show this again**, and restart into a
    pathless memory buffer;
@@ -60,12 +69,19 @@ and hash-verified instance of the final executable:
 
 Every case verified a foreground target, medium-integrity process context, clean
 process exit, and absence of the case sentinel from application logs and
-settings. The evidence records Windows 11 build 26200, x86-64 Python and PE32+,
-and the exact executable hash listed above.
+settings. That evidence does not cover the post-review recovery fix.
+
+## Current native acceptance status
+
+The first post-review run reached the desktop but stopped in the New/Paste case
+with `WELCOME_DID_NOT_CLOSE`. A fresh run against the final hash listed above was
+then blocked before any case by `FOREGROUND_PERMISSION_DENIED`. Computer Use
+reported the same session boundary as `GetCursorPos failed: Access is denied.
+(0x80070005)`. No final-hash native PASS is claimed.
 
 ## Completion boundary
 
-All Goal 03 code gates and the hash-bound native acceptance run pass. The flow
-creates, saves, and reopens ordinary Markdown without Review or a pre-existing
-file. The final read-only review found no actionable defect. Semantic Review
-remains outside this goal and begins at Goal 06.
+All post-review code gates pass, including the deterministic Windows CI
+regression and macOS packaging coverage. Goal 03 remains incomplete until the
+current executable completes all seven native cases from an interactive Windows
+session. Semantic Review remains outside this goal and begins at Goal 06.
