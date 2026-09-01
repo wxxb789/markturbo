@@ -23,8 +23,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_base::{Button as BaseButton, GlobalState, Toggle as BaseToggle};
 use gpui_component::{
-    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, StyledExt as _,
-    TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
+    StyledExt as _, TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
@@ -51,12 +51,14 @@ use crate::recovery::{
 };
 use crate::renderer::RendererRegistry;
 use crate::translate::Provider;
-use crate::views::document::{DocumentEvent, DocumentView, PreparedRecovery, SaveMode};
+use crate::views::document::{
+    DocumentEvent, DocumentView, PreparedRecovery, SaveAsMode, SaveAsOutcome, SaveMode, paths_match,
+};
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::harness::{HarnessEvent, HarnessView};
 use crate::views::search::{Corpus, SearchEvent, SearchView};
 use crate::views::settings_page::{SettingsEvent, SettingsView};
-use crate::views::tabs::Tabs;
+use crate::views::tabs::{TabIdentity, Tabs};
 use crate::watcher::{Change, Watcher};
 
 mod history;
@@ -68,8 +70,12 @@ use self::web_surface::WebSurface;
 actions!(
     markturbo,
     [
+        NewDocument,
+        PasteIntoNew,
+        OpenFile,
         OpenFolder,
         Save,
+        SaveAs,
         CloseTab,
         OpenSettings,
         TranslateDocument,
@@ -93,6 +99,32 @@ actions!(
 /// failure this bounds — the full path is a hover away.
 const TAB_LABEL_MAX: usize = 22;
 const TAB_CLOSE_ACCESSIBILITY_ID: &str = "markturbo-document-tab-close";
+const WELCOME_NEW_ACCESSIBILITY_ID: &str = "markturbo-welcome-new";
+const WELCOME_PASTE_ACCESSIBILITY_ID: &str = "markturbo-welcome-paste";
+const WELCOME_OPEN_FILE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-file";
+const WELCOME_OPEN_FOLDER_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-folder";
+const WELCOME_OPEN_SAMPLE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-sample";
+const WELCOME_DONT_SHOW_ACCESSIBILITY_ID: &str = "markturbo-welcome-dont-show-again";
+const WELCOME_KEY_CONTEXT: &str = "Welcome";
+
+fn should_show_welcome(initial: Option<&Path>, show_welcome_on_startup: bool) -> bool {
+    initial.is_none() && show_welcome_on_startup
+}
+
+fn recent_target_issue(target: &crate::settings::RecentTarget) -> Option<i18n::Key> {
+    if !target.path.exists() {
+        return Some(i18n::Key::RecentMissing);
+    }
+    match target.kind {
+        crate::settings::RecentTargetKind::File
+            if target.path.is_file() && crate::workspace::is_openable(&target.path) =>
+        {
+            None
+        }
+        crate::settings::RecentTargetKind::Workspace if target.path.is_dir() => None,
+        _ => Some(i18n::Key::RecentUnavailable),
+    }
+}
 
 /// Shorten `name` to [`TAB_LABEL_MAX`], keeping the extension.
 ///
@@ -746,6 +778,16 @@ fn document_details_status_key(is_externally_changed: bool, is_dirty: bool) -> i
 
 pub struct Workspace {
     focus_handle: FocusHandle,
+    welcome_scroll: ScrollHandle,
+    /// The deliberate first-run surface, available only for a no-argument start.
+    show_welcome: bool,
+    /// Filesystem availability captured when the Welcome surface is entered.
+    ///
+    /// Rendering may occur many times while a window is resized or animated.
+    /// Recent-target and sample probes belong at that state boundary instead of
+    /// synchronously touching the filesystem from `render_welcome`.
+    welcome_recent_issues: HashMap<PathBuf, Option<i18n::Key>>,
+    welcome_sample_available: bool,
     root: Option<PathBuf>,
     explorer: Option<Entity<Explorer>>,
     harness: Option<Entity<HarnessView>>,
@@ -779,6 +821,9 @@ pub struct Workspace {
     /// Save As observes the new path even though an older checkpoint still
     /// belongs to the path that was open when startup began.
     startup_recovery_keys: HashMap<crate::lifecycle::DocumentId, RecoveryKey>,
+    /// The dirty source key that a successful Save As must retire. The document
+    /// has its new file identity by the time it emits `DirtyChanged`.
+    save_as_recovery_keys: HashMap<crate::lifecycle::DocumentId, RecoveryKey>,
     /// Explicit Save or Discard decisions that still need a durable marker.
     /// `None` keeps unknown-origin work fail-closed for every destructive action.
     pending_recovery_retirements: HashMap<RecoveryKey, Option<DocumentId>>,
@@ -837,6 +882,11 @@ pub struct Workspace {
     translating: bool,
     /// Present while Save / Discard / Cancel is resolving a destructive action.
     pending_destructive: Option<DestructiveRequest>,
+    /// True after close is authorized and while the focused platform input
+    /// handler drains across the final rendered frame.
+    window_close_pending: bool,
+    /// True only after input drain, authorizing the reposted native close.
+    window_close_ready: bool,
     /// A fully resolved action waiting only for startup recovery to expose the
     /// guarded store needed to publish its durable retirement marker.
     pending_startup_destructive: Option<PendingStartupDestructive>,
@@ -1079,6 +1129,13 @@ impl Workspace {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
+            welcome_scroll: ScrollHandle::new(),
+            show_welcome: should_show_welcome(
+                initial.as_deref(),
+                crate::settings::AppSettings::global(cx).show_welcome_on_startup,
+            ),
+            welcome_recent_issues: HashMap::new(),
+            welcome_sample_available: false,
             root: None,
             explorer: None,
             harness: None,
@@ -1093,6 +1150,7 @@ impl Workspace {
             recovery: None,
             startup_recovery_pending: true,
             startup_recovery_keys: HashMap::new(),
+            save_as_recovery_keys: HashMap::new(),
             pending_recovery_retirements: HashMap::new(),
             recovery_retirements: HashMap::new(),
             recovery_retirement_batches: HashMap::new(),
@@ -1114,6 +1172,8 @@ impl Workspace {
             right_panel_open: true,
             translating: false,
             pending_destructive: None,
+            window_close_pending: false,
+            window_close_ready: false,
             pending_startup_destructive: None,
             pending_destructive_recovery: Vec::new(),
             web: WebSurface::default(),
@@ -1123,6 +1183,10 @@ impl Workspace {
             _subscriptions: Vec::new(),
             _panel_subscriptions: Vec::new(),
         };
+
+        if this.show_welcome {
+            this.refresh_welcome_availability(cx);
+        }
 
         // The saved preference, applied before the first frame so the window
         // never flashes the wrong theme.
@@ -1221,23 +1285,12 @@ impl Workspace {
                 }
             }));
 
-        // A path argument may name a file: open its parent as the workspace and
-        // the file as the first tab, which is what "open this file with
-        // markturbo" should do.
-        let mut initial_file = None;
+        // Explicit targets are deliberately different from a no-argument
+        // launch. `markturbo .` remains the terminal form for opening cwd.
         if let Some(path) = initial {
-            let (root, file) = if path.is_dir() {
-                (Some(path), None)
-            } else {
-                (path.parent().map(Path::to_path_buf), Some(path))
-            };
-            if let Some(root) = root {
-                this.open_folder(root, window, cx);
-            }
-            initial_file = file.filter(|file| file.is_file());
-        }
-        if let Some(file) = initial_file {
-            this.open_file(file, window, cx);
+            this.open_target(path, false, window, cx);
+        } else if !this.show_welcome {
+            this.new_memory(String::new(), window, cx);
         }
         let startup_targets = this.startup_recovery_targets(cx);
         cx.defer_in(window, move |this, window, cx| {
@@ -1295,6 +1348,8 @@ impl Workspace {
         self.explorer = Some(explorer);
         self.harness = Some(harness);
         self.root = Some(path);
+        self.show_welcome = false;
+        self.sync_document_watches(cx);
         // Any results on screen came from the folder that was open a moment
         // ago. Leaving them would present another project's matches as this
         // one's, which is worse than an empty list.
@@ -1303,11 +1358,40 @@ impl Workspace {
         cx.notify();
     }
 
+    fn sync_document_watches(&mut self, cx: &App) {
+        let mut directories = HashSet::new();
+        for document in self.document_views() {
+            let document = document.read(cx);
+            let Some(path) = document.source_path() else {
+                continue;
+            };
+            if let Some(parent) = path.parent() {
+                directories.insert(parent.to_path_buf());
+            }
+            if let Ok(resolved) = std::fs::canonicalize(path)
+                && let Some(parent) = resolved.parent()
+            {
+                directories.insert(parent.to_path_buf());
+            }
+        }
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        if let Err(err) = watcher.sync_document_directories(directories) {
+            log::warn!("filesystem document watching could not be synchronized: {err}");
+        }
+    }
+
     /// Open a file in a tab, focusing an existing tab if it is already open.
     ///
     /// A pinned open: the tab stays until the user closes it.
-    pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_file_as(path, false, window, cx);
+    pub fn open_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.open_file_as(path, false, window, cx)
     }
 
     /// Open a file, optionally as a preview.
@@ -1321,18 +1405,18 @@ impl Workspace {
         preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         // Opening the file that is already the preview, by double click, is how
         // it gets promoted — the tab is already right, only its status changes.
         if preview {
             if self.tabs.is_preview(&path) {
                 self.focus_path(&path, cx);
-                return;
+                return true;
             }
         } else if self.tabs.is_preview(&path) {
             self.tabs.set_preview(None);
             self.focus_path(&path, cx);
-            return;
+            return true;
         }
 
         // Replace the outgoing preview rather than accumulating tabs. Its edits
@@ -1358,9 +1442,10 @@ impl Workspace {
             }
         }
 
-        self.open_file_inner(path.clone(), window, cx);
-        self.tabs.set_preview(preview.then_some(path));
+        let opened = self.open_file_inner(path.clone(), window, cx);
+        self.tabs.set_preview((preview && opened).then_some(path));
         cx.notify();
+        opened
     }
 
     /// Focus the tab showing `path`, if it is open.
@@ -1372,29 +1457,183 @@ impl Workspace {
         }
     }
 
-    fn open_file_inner(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        // Opening a document while settings are showing has to show the
-        // document, or the click in the explorer looks like it did nothing.
-        self.settings_open = false;
-
+    fn open_file_inner(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.tabs.focus_path(&path) {
+            // Opening a document while settings are showing has to show the
+            // document, or the click in the explorer looks like it did nothing.
+            self.settings_open = false;
             self.record_visit(path, 0);
             self.web_dirty(cx);
             cx.notify();
-            return;
+            return true;
         }
 
         let file = match fs::load(&path) {
             Ok(file) => file,
             Err(err) => {
                 self.set_status(format!("Cannot open {}: {err}", path.display()), cx);
-                return;
+                return false;
             }
         };
 
+        self.settings_open = false;
         let registry = self.registry.clone();
         let view = cx.new(|cx| DocumentView::new(file, registry, window, cx));
-        self.insert_document(path, view, window, cx);
+        self.insert_document(path.clone(), view, window, cx);
+        true
+    }
+
+    /// Create a Markdown buffer before it has a filesystem path.
+    pub fn new_memory(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.show_welcome = false;
+        let registry = self.registry.clone();
+        let view = cx.new(|cx| DocumentView::new_memory(text, registry, window, cx));
+        self.insert_memory_document(view, true, window, cx);
+    }
+
+    /// Open either supported file or workspace target. User-driven folder
+    /// changes retain the existing dirty-document interlock.
+    fn open_target(
+        &mut self,
+        path: PathBuf,
+        replace_workspace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if path.is_dir() {
+            if replace_workspace {
+                self.request_workspace_replace(path, window, cx);
+            } else {
+                self.open_folder(path.clone(), window, cx);
+                self.record_recent_workspace(path, cx);
+            }
+            return true;
+        }
+        self.open_file_target(path, window, cx)
+    }
+
+    /// Files opened outside a workspace acquire a root for normal explorer,
+    /// watcher, and relative-path behavior, but that parent is not itself a
+    /// recently opened workspace.
+    fn open_file_target(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !path.is_file() || !crate::workspace::is_openable(&path) {
+            self.set_status(format!("Cannot open {}", path.display()), cx);
+            return false;
+        }
+        let opened = self.open_file(path.clone(), window, cx);
+        if opened {
+            if self.root.is_none()
+                && let Some(parent) = path.parent()
+            {
+                self.open_folder(parent.to_path_buf(), window, cx);
+            }
+            self.record_recent_file(path, cx);
+        }
+        opened
+    }
+
+    fn record_recent_file(&self, path: PathBuf, cx: &mut Context<Self>) {
+        self.record_recent_target(path, crate::settings::RecentTargetKind::File, cx);
+    }
+
+    fn record_recent_workspace(&self, path: PathBuf, cx: &mut Context<Self>) {
+        self.record_recent_target(path, crate::settings::RecentTargetKind::Workspace, cx);
+    }
+
+    fn record_recent_target(
+        &self,
+        path: PathBuf,
+        kind: crate::settings::RecentTargetKind,
+        cx: &mut Context<Self>,
+    ) {
+        let display_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let target = crate::settings::RecentTarget::new(path, kind, display_name);
+        if crate::settings::AppSettings::global(cx)
+            .recent_targets
+            .first()
+            == Some(&target)
+        {
+            return;
+        }
+        crate::settings::AppSettings::update(cx, move |settings| {
+            settings.record_recent_target(target);
+        });
+    }
+
+    fn open_recent_target(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let target = crate::settings::AppSettings::global(cx)
+            .recent_targets
+            .iter()
+            .find(|target| target.path == path)
+            .cloned();
+        let Some(target) = target else { return false };
+        if recent_target_issue(&target).is_some() {
+            return false;
+        }
+        self.open_target(target.path, true, window, cx)
+    }
+
+    /// Refresh Welcome-only filesystem state once when the surface is entered.
+    ///
+    /// Opening an item always repeats this check, because the cache is only a
+    /// presentation hint and must never authorize an operation on stale data.
+    fn refresh_welcome_availability(&mut self, cx: &App) {
+        self.welcome_recent_issues = crate::settings::AppSettings::global(cx)
+            .recent_targets
+            .iter()
+            .map(|target| (target.path.clone(), recent_target_issue(target)))
+            .collect();
+        self.welcome_sample_available = crate::app_paths::bundled_sample_dir().is_some();
+    }
+
+    fn welcome_recent_target_issue(
+        &self,
+        target: &crate::settings::RecentTarget,
+    ) -> Option<i18n::Key> {
+        self.welcome_recent_issues
+            .get(&target.path)
+            .copied()
+            .flatten()
+    }
+
+    fn remove_recent_target(&mut self, path: &Path, cx: &mut Context<Self>) {
+        crate::settings::AppSettings::update(cx, |settings| {
+            settings.remove_recent_target(path);
+        });
+    }
+
+    fn open_bundled_sample(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = crate::app_paths::bundled_sample_dir() {
+            self.open_target(path, true, window, cx);
+        }
+    }
+
+    fn dont_show_welcome_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::settings::AppSettings::update(cx, |settings| {
+            settings.show_welcome_on_startup = false;
+        });
+        self.new_memory(String::new(), window, cx);
     }
 
     fn insert_document(
@@ -1404,17 +1643,35 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.insert_document_with_recovery(path, view, true, window, cx);
+        self.insert_document_with_recovery(TabIdentity::File(path), view, true, window, cx);
     }
 
-    fn insert_document_with_recovery(
+    fn insert_memory_document(
         &mut self,
-        path: PathBuf,
         view: Entity<DocumentView>,
         arm_dirty_recovery: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let id = view.read(cx).id();
+        self.insert_document_with_recovery(
+            TabIdentity::Memory(id),
+            view,
+            arm_dirty_recovery,
+            window,
+            cx,
+        );
+    }
+
+    fn insert_document_with_recovery(
+        &mut self,
+        identity: TabIdentity,
+        view: Entity<DocumentView>,
+        arm_dirty_recovery: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_welcome = false;
         if self.startup_recovery_pending {
             let document = view.read(cx);
             self.startup_recovery_keys
@@ -1448,6 +1705,7 @@ impl Workspace {
                             let key = this
                                 .startup_recovery_keys
                                 .remove(&id)
+                                .or_else(|| this.save_as_recovery_keys.remove(&id))
                                 .unwrap_or(current_key);
                             this.retire_document_recovery(id, Some(key), cx);
                         }
@@ -1469,7 +1727,7 @@ impl Workspace {
         let needs_recovery = view.read(cx).is_dirty();
         let recovery_document = view.clone();
         self.tabs.push(
-            path.clone(),
+            identity.clone(),
             DocumentTab {
                 view,
                 _subscriptions: subscriptions,
@@ -1480,7 +1738,10 @@ impl Workspace {
         if arm_dirty_recovery && needs_recovery {
             self.arm_document_recovery(&recovery_document, cx);
         }
-        self.record_visit(path, 0);
+        if let Some(path) = identity.path() {
+            self.record_visit(path.to_path_buf(), 0);
+        }
+        self.sync_document_watches(cx);
         self.web_dirty(cx);
         cx.notify();
     }
@@ -1495,13 +1756,15 @@ impl Workspace {
         let mut restored = 0;
         let mut skipped = 0;
         for prepared in documents {
-            let path = prepared.path().to_path_buf();
-            if let Some(ix) = self.tabs.index_of(&path) {
+            let source_path = prepared.source_path().map(Path::to_path_buf);
+            if let Some(ref path) = source_path
+                && let Some(ix) = self.tabs.index_of(path)
+            {
                 let Some(startup_targets) = startup_targets else {
                     skipped += 1;
                     continue;
                 };
-                let expected = startup_targets.get(&path).copied();
+                let expected = startup_targets.get(path).copied();
 
                 let document = self
                     .document_at(ix)
@@ -1525,7 +1788,17 @@ impl Workspace {
 
             let registry = self.registry.clone();
             let view = cx.new(|cx| DocumentView::from_recovery(prepared, registry, window, cx));
-            self.insert_document_with_recovery(path, view.clone(), false, window, cx);
+            if let Some(path) = source_path {
+                self.insert_document_with_recovery(
+                    TabIdentity::File(path),
+                    view.clone(),
+                    false,
+                    window,
+                    cx,
+                );
+            } else {
+                self.insert_memory_document(view.clone(), false, window, cx);
+            }
             self.register_restored_recovery(&view, cx);
             restored += 1;
         }
@@ -1610,9 +1883,10 @@ impl Workspace {
     ) -> HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)> {
         self.tabs
             .iter()
-            .map(|tab| {
+            .filter_map(|tab| {
                 let document = tab.payload.view.read(cx);
-                (tab.path.clone(), (document.id(), document.revision()))
+                tab.path()
+                    .map(|path| (path.to_path_buf(), (document.id(), document.revision())))
             })
             .collect()
     }
@@ -1653,7 +1927,7 @@ impl Workspace {
         startup.documents.retain(|document| {
             !self
                 .pending_recovery_retirements
-                .contains_key(&RecoveryKey::for_path(document.path()))
+                .contains_key(&document.recovery_key())
         });
         self.recovery = startup.recovery.take();
         self.startup_recovery_pending = false;
@@ -1780,9 +2054,66 @@ impl Workspace {
         }
     }
 
-    /// Return true only when the platform may close immediately.
+    /// Keep the platform window alive long enough to release a focused input
+    /// handler before the application exits.
     fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.request_destructive(DestructiveAction::CloseWindow, window, cx)
+        if self.window_close_ready {
+            return true;
+        }
+        if self.window_close_pending {
+            return false;
+        }
+        if self.request_destructive(DestructiveAction::CloseWindow, window, cx) {
+            self.close_window_after_input_drain(window, cx);
+        }
+        false
+    }
+
+    fn close_window_after_input_drain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.window_close_pending {
+            return;
+        }
+        self.window_close_pending = true;
+        window.disable_focus(cx);
+        let workspace = cx.entity().downgrade();
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| {
+                let ready = workspace
+                    .update(cx, |workspace, _| workspace.window_close_ready = true)
+                    .is_ok();
+                if ready {
+                    Self::post_native_window_close(window);
+                } else {
+                    window.remove_window();
+                }
+            });
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn post_native_window_close(window: &mut Window) {
+        use raw_window_handle::RawWindowHandle;
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+
+        let hwnd = raw_window_handle::HasWindowHandle::window_handle(window)
+            .ok()
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut _)),
+                _ => None,
+            });
+        let Some(hwnd) = hwnd else {
+            window.remove_window();
+            return;
+        };
+        if unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_err() {
+            window.remove_window();
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn post_native_window_close(window: &mut Window) {
+        window.remove_window();
     }
 
     fn request_workspace_replace(
@@ -1913,6 +2244,16 @@ impl Workspace {
         let snapshot_before_save = current_document
             .as_ref()
             .map(|document| document.read(cx).source_snapshot(cx));
+        if decision == DirtyDecision::Save
+            && let Some(document) = current_document.as_ref()
+            && !document.read(cx).is_on_disk()
+        {
+            // A memory buffer has no normal Save destination. Keep the exact
+            // request alive until Save As writes the snapshot the user chose.
+            self.pending_destructive = Some(request);
+            self.prompt_save_as(document.read(cx).id(), window, cx);
+            return;
+        }
         let save_succeeded = current_document.is_some_and(|document| {
             decision == DirtyDecision::Save
                 && document.update(cx, |document, cx| document.save(SaveMode::Normal, cx))
@@ -1947,6 +2288,80 @@ impl Workspace {
                         self.perform_after_discard_retirement(request, action, keys, window, cx);
                     }
                     DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {}
+                }
+            }
+            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
+                self.pending_destructive_recovery.clear();
+            }
+        }
+    }
+
+    fn save_as_snapshot_is_current(&self, id: crate::lifecycle::DocumentId, cx: &App) -> bool {
+        match self.pending_destructive.as_ref() {
+            None => true,
+            Some(request) => {
+                request.current() == Some(id)
+                    && request.current_prompt_matches(&self.lifecycle_documents(cx))
+            }
+        }
+    }
+
+    fn cancel_pending_destructive_save_as(&mut self, id: crate::lifecycle::DocumentId) {
+        if self
+            .pending_destructive
+            .as_ref()
+            .is_some_and(|request| request.current() == Some(id))
+        {
+            self.pending_destructive = None;
+            self.pending_destructive_recovery.clear();
+        }
+    }
+
+    fn complete_pending_destructive_save_as(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        saved_snapshot: crate::lifecycle::BufferSnapshot,
+        recovery_key: RecoveryKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut request) = self.pending_destructive.take() else {
+            return;
+        };
+        if request.current() != Some(id) {
+            self.pending_destructive = Some(request);
+            return;
+        }
+        let resolution = request.decide(
+            DirtyDecision::Save,
+            Some(saved_snapshot),
+            &self.lifecycle_documents(cx),
+        );
+        if !matches!(
+            resolution,
+            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_)
+        ) {
+            self.pending_destructive_recovery
+                .push((recovery_key, Some(id)));
+        }
+        match resolution {
+            DestructiveResolution::Prompt(_) => {
+                self.pending_destructive = Some(request);
+                self.prompt_destructive(window, cx);
+            }
+            DestructiveResolution::Proceed(_action) => {
+                match request.revalidate(&self.lifecycle_documents(cx)) {
+                    DestructiveResolution::Prompt(_) => {
+                        self.pending_destructive = Some(request);
+                        self.prompt_destructive(window, cx);
+                    }
+                    DestructiveResolution::Proceed(action) => {
+                        let keys = std::mem::take(&mut self.pending_destructive_recovery);
+                        self.perform_after_discard_retirement(request, action, keys, window, cx);
+                    }
+                    DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
+                        self.pending_destructive_recovery.clear();
+                    }
                 }
             }
             DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
@@ -2283,12 +2698,15 @@ impl Workspace {
                     self.close_tab_unchecked(ix, cx);
                 }
             }
-            DestructiveAction::CloseWindow => window.remove_window(),
+            DestructiveAction::CloseWindow => self.close_window_after_input_drain(window, cx),
             DestructiveAction::ReplaceWorkspace(path) => {
                 while !self.tabs.is_empty() {
                     self.close_tab_unchecked(self.tabs.len() - 1, cx);
                 }
-                self.open_folder(path, window, cx);
+                self.open_folder(path.clone(), window, cx);
+                if self.root.as_deref() == Some(path.as_path()) {
+                    self.record_recent_workspace(path, cx);
+                }
             }
         }
     }
@@ -2309,7 +2727,10 @@ impl Workspace {
         };
         // Otherwise Back reopens the tab that was just closed, which reads as
         // the close button not working.
-        self.history.forget(&closed);
+        if let Some(path) = closed.path() {
+            self.history.forget(path);
+        }
+        self.sync_document_watches(cx);
         self.web_dirty(cx);
         cx.notify();
     }
@@ -3409,7 +3830,9 @@ impl Workspace {
             return;
         }
 
-        let tree_changed = changes.iter().any(|c| c.affects_tree());
+        let tree_changed = changes
+            .iter()
+            .any(|change| change.affects_tree() && change.path().starts_with(watcher_root));
         let removed_artifact = self.harness.as_ref().is_some_and(|harness| {
             let harness = harness.read(cx);
             changes
@@ -3466,12 +3889,48 @@ impl Workspace {
 
     // --- Actions ----------------------------------------------------------
 
+    fn on_new_document(&mut self, _: &NewDocument, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_memory(String::new(), window, cx);
+    }
+
+    fn on_paste_into_new(&mut self, _: &PasteIntoNew, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.set_status(i18n::t(i18n::Key::ClipboardTextUnavailable, cx).into(), cx);
+            return;
+        };
+        self.new_memory(text, window, cx);
+    }
+
+    fn on_open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(i18n::t(i18n::Key::OpenFile, cx).into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(path) = paths
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .and_then(|paths| paths.first().cloned())
+            else {
+                return;
+            };
+            crate::views::try_update_in(&this, cx, |this, window, cx| {
+                this.open_target(path, true, window, cx);
+            });
+        })
+        .detach();
+    }
+
     fn on_open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open workspace folder".into()),
+            prompt: Some(i18n::t(i18n::Key::OpenFolder, cx).into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             // The prompt future nests: cancelled -> failed -> no selection.
@@ -3485,7 +3944,7 @@ impl Workspace {
                 return;
             };
             crate::views::try_update_in(&this, cx, |this, window, cx| {
-                this.request_workspace_replace(path, window, cx);
+                this.open_target(path, true, window, cx);
             });
         })
         .detach();
@@ -3499,6 +3958,12 @@ impl Workspace {
         }
     }
 
+    fn on_save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(document) = self.active_document() {
+            self.prompt_save_as(document.read(cx).id(), window, cx);
+        }
+    }
+
     fn prompt_save_as(
         &mut self,
         id: crate::lifecycle::DocumentId,
@@ -3508,26 +3973,97 @@ impl Workspace {
         let Some(document) = self.document_by_id(id, cx) else {
             return;
         };
-        let source = document.read(cx).path().to_path_buf();
+        let source = document.read(cx).source_path().map(Path::to_path_buf);
         let directory = source
-            .parent()
+            .as_deref()
+            .and_then(Path::parent)
             .map(Path::to_path_buf)
             .or_else(|| self.root.clone())
             .unwrap_or_else(|| PathBuf::from("."));
         let suggested = source
-            .file_name()
+            .as_deref()
+            .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap_or("Untitled.md")
             .to_string();
         let path = cx.prompt_for_new_path(&directory, Some(&suggested));
 
         cx.spawn_in(window, async move |this, cx| {
-            let Some(path) = path.await.ok().and_then(Result::ok).flatten() else {
-                return;
-            };
+            let path = path.await.ok().and_then(Result::ok).flatten();
             loop {
-                if crate::views::try_update_in(&this, cx, |this, _window, cx| {
-                    this.finish_save_as(id, path.clone(), cx);
+                if crate::views::try_update_in(&this, cx, |this, window, cx| {
+                    this.finish_save_as_selection(id, path.clone(), window, cx);
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn finish_save_as_selection(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match path {
+            Some(path) => self.finish_save_as(id, path, SaveAsMode::CreateOnly, window, cx),
+            None => self.cancel_pending_destructive_save_as(id),
+        }
+    }
+
+    fn prompt_save_as_overwrite(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let authorization = match fs::SaveAsOverwriteAuthorization::capture(&path) {
+            Ok(authorization) => Arc::new(authorization),
+            Err(error) => {
+                self.cancel_pending_destructive_save_as(id);
+                self.set_status(format!("Save As failed: {error}"), cx);
+                return;
+            }
+        };
+        let title = i18n::replace_file_title(&path, cx);
+        let description = i18n::replace_file_description(&path, cx);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&description),
+            &[
+                PromptButton::ok(i18n::t(i18n::Key::Replace, cx)),
+                PromptButton::cancel(i18n::t(i18n::Key::Cancel, cx)),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let replace = answer.await.unwrap_or(1) == 0;
+            loop {
+                if crate::views::try_update_in(&this, cx, |this, window, cx| {
+                    if replace {
+                        this.finish_save_as(
+                            id,
+                            path.clone(),
+                            SaveAsMode::Overwrite(authorization.clone()),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        this.cancel_pending_destructive_save_as(id);
+                    }
                 })
                 .is_some()
                 {
@@ -3548,30 +4084,76 @@ impl Workspace {
         &mut self,
         id: crate::lifecycle::DocumentId,
         path: PathBuf,
+        mode: SaveAsMode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.document_index(id, cx) else {
+            self.cancel_pending_destructive_save_as(id);
             return;
         };
-        if self
-            .tabs
-            .index_of(&path)
-            .is_some_and(|existing| existing != ix)
-        {
-            self.set_status(
-                "That path is already open. Choose another Save As path.".into(),
-                cx,
-            );
+        if !self.save_as_snapshot_is_current(id, cx) {
+            self.cancel_pending_destructive_save_as(id);
+            self.set_status(i18n::save_as_snapshot_changed_message(cx).into(), cx);
+            return;
+        }
+        if self.tabs.iter().enumerate().any(|(existing, tab)| {
+            existing != ix
+                && tab
+                    .path()
+                    .is_some_and(|candidate| paths_match(candidate, &path))
+        }) {
+            self.cancel_pending_destructive_save_as(id);
+            self.set_status(i18n::save_as_path_already_open_message(&path, cx), cx);
             return;
         }
         let document = self.document_at(ix).cloned().expect("index was found");
-        let old_path = document.read(cx).path().to_path_buf();
-        if document.update(cx, |document, cx| document.save_as(&path, cx)) {
-            self.tabs.replace_path(ix, path.clone());
-            self.history.forget(&old_path);
-            self.record_visit(path, 0);
-            self.web_dirty(cx);
-            cx.notify();
+        let (old_path, old_recovery_key, saved_snapshot) = {
+            let document = document.read(cx);
+            (
+                document.source_path().map(Path::to_path_buf),
+                document.recovery_key(),
+                document.source_snapshot(cx),
+            )
+        };
+        let create_only = mode == SaveAsMode::CreateOnly;
+        self.save_as_recovery_keys
+            .insert(id, old_recovery_key.clone());
+        match document.update(cx, |document, cx| document.save_as(&path, mode, cx)) {
+            SaveAsOutcome::Saved => {
+                self.tabs
+                    .replace_identity(ix, TabIdentity::File(path.clone()));
+                if let Some(old_path) = old_path {
+                    self.history.forget(&old_path);
+                } else if self.root.is_none()
+                    && let Some(parent) = path.parent()
+                {
+                    // A first Save As gives a memory buffer its ordinary
+                    // workspace identity without adding the parent as a
+                    // separately opened recent workspace.
+                    self.open_folder(parent.to_path_buf(), window, cx);
+                }
+                self.sync_document_watches(cx);
+                self.record_recent_file(path.clone(), cx);
+                self.record_visit(path, 0);
+                self.web_dirty(cx);
+                self.complete_pending_destructive_save_as(
+                    id,
+                    saved_snapshot,
+                    old_recovery_key,
+                    window,
+                    cx,
+                );
+                cx.notify();
+            }
+            SaveAsOutcome::DestinationExists if create_only => {
+                self.save_as_recovery_keys.remove(&id);
+                self.prompt_save_as_overwrite(id, path, window, cx);
+            }
+            SaveAsOutcome::DestinationExists | SaveAsOutcome::Failed => {
+                self.save_as_recovery_keys.remove(&id);
+                self.cancel_pending_destructive_save_as(id);
+            }
         }
     }
 
@@ -3593,6 +4175,9 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.show_welcome {
+            return;
+        }
         self.left_panel_open = !self.left_panel_open;
         // The WebView is an OS child window; it does not notice the document
         // pane resizing under it.
@@ -3606,6 +4191,9 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.show_welcome {
+            return;
+        }
         self.right_panel_open = !self.right_panel_open;
         self.web_dirty(cx);
         cx.notify();
@@ -3623,20 +4211,11 @@ impl Workspace {
 
         for path in paths {
             if path.is_dir() {
-                self.request_workspace_replace(path.clone(), window, cx);
+                self.open_target(path.clone(), true, window, cx);
                 opened += 1;
                 break;
             } else if crate::workspace::is_openable(path) {
-                // With no folder open, adopt the file's parent as the
-                // workspace — the same thing a path argument does, and it is
-                // what makes the tree useful after a bare drop.
-                if self.root.is_none()
-                    && let Some(parent) = path.parent()
-                {
-                    self.open_folder(parent.to_path_buf(), window, cx);
-                }
-                self.open_file(path.clone(), window, cx);
-                opened += 1;
+                opened += usize::from(self.open_target(path.clone(), true, window, cx));
             } else {
                 skipped.push(
                     path.file_name()
@@ -3660,7 +4239,9 @@ impl Workspace {
     /// list changes, so a stale index can never answer here.
     fn menu_target(&self, cx: &App) -> Option<PathBuf> {
         let _ = cx;
-        self.tabs.menu_target().map(|t| t.path.clone())
+        self.tabs
+            .menu_target()
+            .and_then(|tab| tab.path().map(Path::to_path_buf))
     }
 
     fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
@@ -3886,12 +4467,16 @@ impl Workspace {
     fn render_document_details(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let (title, kind, location, status) = {
             let document = self.active_document()?.read(cx);
-            let location = self
-                .root
-                .as_deref()
-                .filter(|root| document.path().starts_with(root))
-                .map(|root| crate::workspace::display_relative(root, document.path()))
-                .unwrap_or_else(|| document.path().to_string_lossy().replace('\\', "/"));
+            let location = document.source_path().map_or_else(
+                || "Unsaved document".to_string(),
+                |path| {
+                    self.root
+                        .as_deref()
+                        .filter(|root| path.starts_with(root))
+                        .map(|root| crate::workspace::display_relative(root, path))
+                        .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"))
+                },
+            );
             let status = i18n::t(
                 document_details_status_key(document.is_externally_changed(), document.is_dirty()),
                 cx,
@@ -4108,7 +4693,9 @@ impl Workspace {
         };
         // The outline and the search results both land here, and both are the
         // kind of jump a user expects Back to undo.
-        self.record_visit(doc.read(cx).path().to_path_buf(), offset);
+        if let Some(path) = doc.read(cx).source_path() {
+            self.record_visit(path.to_path_buf(), offset);
+        }
         doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
     }
 
@@ -4130,7 +4717,7 @@ impl Workspace {
         };
         // Guard against the open having failed — landing the cursor in whatever
         // tab happened to be active would be worse than doing nothing.
-        if doc.read(cx).path() != path {
+        if doc.read(cx).source_path() != Some(path.as_path()) {
             return;
         }
         self.record_visit(path, offset);
@@ -4172,7 +4759,9 @@ impl Workspace {
         let add_open_tabs = |corpus: &mut Corpus| {
             for tab in self.tabs.iter() {
                 let doc = tab.payload.view.read(cx);
-                corpus.open.push((tab.path.clone(), doc.text(cx)));
+                if let Some(path) = tab.path() {
+                    corpus.open.push((path.to_path_buf(), doc.text(cx)));
+                }
             }
         };
 
@@ -4180,7 +4769,9 @@ impl Workspace {
             Scope::Document => {
                 if let Some(doc) = self.active_document() {
                     let doc = doc.read(cx);
-                    corpus.open.push((doc.path().to_path_buf(), doc.text(cx)));
+                    if let Some(path) = doc.source_path() {
+                        corpus.open.push((path.to_path_buf(), doc.text(cx)));
+                    }
                 }
             }
             Scope::OpenTabs => add_open_tabs(&mut corpus),
@@ -4264,15 +4855,21 @@ impl Workspace {
             .selected_index(self.tabs.active_index())
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let doc = tab.payload.view.read(cx);
-                let path = tab.path.clone();
-                let full = path.to_string_lossy().replace('\\', "/");
+                let path = tab.path().map(Path::to_path_buf);
+                let full = path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|| "Unsaved document".to_string());
                 // Relative only makes sense with a folder open, and only for a
                 // file actually under it — a globally-discovered skill is not.
-                let relative = root
-                    .as_ref()
-                    .and_then(|root| path.strip_prefix(root).ok())
+                let relative = path
+                    .as_deref()
+                    .zip(root.as_deref())
+                    .and_then(|(path, root)| path.strip_prefix(root).ok())
                     .map(|rest| rest.to_string_lossy().replace('\\', "/"));
-                let is_preview = self.tabs.is_preview(&path);
+                let is_preview = path
+                    .as_deref()
+                    .is_some_and(|path| self.tabs.is_preview(path));
                 let dirty = doc.is_dirty();
                 let active_single_document = self.tabs.len() == 1 && self.tabs.active_index() == ix;
                 let label = elide_tab_label(&doc.title(cx));
@@ -4288,7 +4885,7 @@ impl Workspace {
                     .when(doc.is_externally_changed(), |tab| {
                         tab.icon(IconName::TriangleAlert)
                     })
-                    .when(!web_active, |tab| {
+                    .when(!web_active && path.is_some(), |tab| {
                         tab.child(
                             div()
                                 .id(SharedString::from(format!("tab-affordances-{ix}")))
@@ -4380,20 +4977,286 @@ impl Workspace {
             .on_click(cx.listener(|this, ix: &usize, _, cx| {
                 if this.tabs.focus(*ix)
                     && let Some(tab) = this.tabs.get(*ix)
+                    && let Some(path) = tab.path()
                 {
-                    let path = tab.path.clone();
-                    this.record_visit(path, 0);
+                    this.record_visit(path.to_path_buf(), 0);
                 }
                 this.web_dirty(cx);
                 cx.notify();
             }))
     }
 
+    fn render_welcome(&self, cx: &Context<Self>) -> AnyElement {
+        let recents = crate::settings::AppSettings::global(cx)
+            .recent_targets
+            .clone();
+        let sample_available = self.welcome_sample_available;
+
+        v_flex()
+            .id("welcome")
+            .role(gpui::Role::Group)
+            .aria_label(i18n::t(i18n::Key::WelcomeTitle, cx))
+            .size_full()
+            .min_h_0()
+            .items_center()
+            .overflow_y_scroll()
+            .track_scroll(&self.welcome_scroll)
+            .px_6()
+            .py_8()
+            .child(
+                v_flex()
+                    .w(px(560.))
+                    .max_w_full()
+                    .flex_shrink_0()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(Icon::new(IconName::BookOpen).large())
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(i18n::t(i18n::Key::WelcomeTitle, cx)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(i18n::t(i18n::Key::WelcomeSubtitle, cx)),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("welcome-new")
+                                    .icon(IconName::Plus)
+                                    .label(i18n::t(i18n::Key::NewDocument, cx))
+                                    .accessibility_id(WELCOME_NEW_ACCESSIBILITY_ID)
+                                    .primary()
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_new_document(&NewDocument, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("welcome-paste")
+                                    .icon(IconName::Copy)
+                                    .label(i18n::t(i18n::Key::Paste, cx))
+                                    .accessibility_id(WELCOME_PASTE_ACCESSIBILITY_ID)
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_paste_into_new(&PasteIntoNew, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("welcome-open-file")
+                                    .icon(IconName::File)
+                                    .label(i18n::t(i18n::Key::OpenFilePicker, cx))
+                                    .accessibility_id(WELCOME_OPEN_FILE_ACCESSIBILITY_ID)
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_open_file(&OpenFile, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("welcome-open-folder")
+                                    .icon(IconName::FolderOpen)
+                                    .label(i18n::t(i18n::Key::OpenFolderPicker, cx))
+                                    .accessibility_id(WELCOME_OPEN_FOLDER_ACCESSIBILITY_ID)
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_open_folder(&OpenFolder, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("welcome-open-sample")
+                                    .icon(IconName::BookOpen)
+                                    .label(i18n::t(i18n::Key::OpenBundledSample, cx))
+                                    .accessibility_id(WELCOME_OPEN_SAMPLE_ACCESSIBILITY_ID)
+                                    .disabled(!sample_available)
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_bundled_sample(window, cx);
+                                    })),
+                            ),
+                    )
+                    .when(!recents.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .mt_4()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(i18n::t(i18n::Key::Recent, cx)),
+                                )
+                                .children(recents.into_iter().map(|target| {
+                                    let issue = self.welcome_recent_target_issue(&target);
+                                    let path_text = target.path.to_string_lossy().into_owned();
+                                    let label = if target.display_name.is_empty() {
+                                        path_text.clone()
+                                    } else {
+                                        target
+                                            .path
+                                            .parent()
+                                            .map(|parent| {
+                                                format!(
+                                                    "{}  {}",
+                                                    target.display_name,
+                                                    parent.display()
+                                                )
+                                            })
+                                            .unwrap_or_else(|| target.display_name.clone())
+                                    };
+                                    let open_label =
+                                        i18n::open_recent_target_label(&target.path, cx);
+                                    let remove_label =
+                                        i18n::remove_recent_target_label(&target.path, cx);
+                                    let identity =
+                                        RecoveryKey::for_path(&target.path).as_str().to_owned();
+                                    let path = target.path.clone();
+                                    let remove_path = path.clone();
+                                    let open_id =
+                                        SharedString::from(format!("welcome-recent-{identity}"));
+                                    let open_accessibility_id = SharedString::from(format!(
+                                        "markturbo-welcome-recent-{identity}"
+                                    ));
+                                    let remove_id = SharedString::from(format!(
+                                        "welcome-recent-remove-{identity}"
+                                    ));
+                                    let status_id = SharedString::from(format!(
+                                        "markturbo-welcome-recent-status-{identity}"
+                                    ));
+                                    let icon = match target.kind {
+                                        crate::settings::RecentTargetKind::File => IconName::File,
+                                        crate::settings::RecentTargetKind::Workspace => {
+                                            IconName::Folder
+                                        }
+                                    };
+                                    let open_button = if issue.is_some() {
+                                        BaseButton::new(open_id)
+                                            .role(gpui::Role::Button)
+                                            .disabled(true)
+                                            .accessibility_label(open_label)
+                                            .accessibility_id(open_accessibility_id)
+                                            .a11y_synthetic_children(|builder| {
+                                                builder.parent_node().set_disabled();
+                                            })
+                                            .styles(|styles| {
+                                                styles.disabled(|style| {
+                                                    style
+                                                        .bg(cx
+                                                            .theme()
+                                                            .input_background()
+                                                            .opacity(0.5))
+                                                        .border_color(cx.theme().input.opacity(0.5))
+                                                        .text_color(
+                                                            cx.theme()
+                                                                .muted_foreground
+                                                                .opacity(0.5),
+                                                        )
+                                                        .shadow_none()
+                                                })
+                                            })
+                                            .flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h_8()
+                                            .px_2p5()
+                                            .gap_2()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(cx.theme().radius)
+                                            .border_1()
+                                            .child(Icon::new(icon).small())
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .truncate()
+                                                    .child(label.clone()),
+                                            )
+                                            .into_any_element()
+                                    } else {
+                                        Button::new(open_id)
+                                            .icon(icon)
+                                            .label(label.clone())
+                                            .accessibility_label(open_label)
+                                            .tooltip(path_text.clone())
+                                            .accessibility_id(open_accessibility_id)
+                                            .flex_1()
+                                            .min_w_0()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_recent_target(&path, window, cx);
+                                            }))
+                                            .into_any_element()
+                                    };
+                                    h_flex()
+                                        .w_full()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(open_button)
+                                        .when_some(issue, move |this, issue| {
+                                            let label = i18n::t(issue, cx);
+                                            this.child(
+                                                div()
+                                                    .id(status_id.clone())
+                                                    .role(gpui::Role::Label)
+                                                    .aria_value(label)
+                                                    .accessibility_id(status_id)
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(label),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new(remove_id)
+                                                .icon(IconName::Close)
+                                                .accessibility_label(remove_label)
+                                                .accessibility_id(SharedString::from(format!(
+                                                    "markturbo-welcome-recent-remove-{identity}"
+                                                )))
+                                                .small()
+                                                .ghost()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.remove_recent_target(&remove_path, cx);
+                                                })),
+                                        )
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("welcome-dont-show-again")
+                            .label(i18n::t(i18n::Key::DontShowWelcomeAgain, cx))
+                            .accessibility_id(WELCOME_DONT_SHOW_ACCESSIBILITY_ID)
+                            .text()
+                            .w_full()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dont_show_welcome_again(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_web_path_controls(&self, cx: &Context<Self>) -> Option<AnyElement> {
         if !self.web_active(cx) {
             return None;
         }
-        let path = self.active_document()?.read(cx).path().to_path_buf();
+        let path = self
+            .active_document()?
+            .read(cx)
+            .source_path()
+            .map(Path::to_path_buf)?;
         let has_relative = self
             .root
             .as_ref()
@@ -4571,41 +5434,43 @@ impl Workspace {
             .gap(metrics::gap())
             .items_center()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                ChromeIconButton::new(
-                    "open-folder",
-                    IconName::FolderOpen,
-                    i18n::t(i18n::Key::OpenFolder, cx),
+            .when(!self.show_welcome, |this| {
+                this.child(
+                    ChromeIconButton::new(
+                        "open-folder",
+                        IconName::FolderOpen,
+                        i18n::t(i18n::Key::OpenFolderPicker, cx),
+                    )
+                    .when(tooltips, |button| {
+                        button.tooltip(i18n::t(i18n::Key::OpenFolderPicker, cx))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_open_folder(&OpenFolder, window, cx)
+                    })),
                 )
-                .when(tooltips, |button| {
-                    button.tooltip(i18n::t(i18n::Key::OpenFolder, cx))
-                })
-                .on_click(
-                    cx.listener(|this, _, window, cx| this.on_open_folder(&OpenFolder, window, cx)),
-                ),
-            )
-            .child(
-                ChromeIconButton::new(
-                    "translate",
-                    IconName::Globe,
-                    i18n::t(i18n::Key::Translate, cx),
+                .child(
+                    ChromeIconButton::new(
+                        "translate",
+                        IconName::Globe,
+                        i18n::t(i18n::Key::Translate, cx),
+                    )
+                    .loading(self.translating)
+                    .when(tooltips, |button| {
+                        button.tooltip(i18n::t(i18n::Key::Translate, cx))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let has_selection = this
+                            .active_document()
+                            .is_some_and(|document| !document.read(cx).selection(cx).is_empty());
+                        if has_selection {
+                            this.on_translate_selection(&TranslateSelection, window, cx)
+                        } else {
+                            this.on_translate_document(&TranslateDocument, window, cx)
+                        }
+                    })),
                 )
-                .loading(self.translating)
-                .when(tooltips, |button| {
-                    button.tooltip(i18n::t(i18n::Key::Translate, cx))
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    let has_selection = this
-                        .active_document()
-                        .is_some_and(|document| !document.read(cx).selection(cx).is_empty());
-                    if has_selection {
-                        this.on_translate_selection(&TranslateSelection, window, cx)
-                    } else {
-                        this.on_translate_document(&TranslateDocument, window, cx)
-                    }
-                })),
-            )
-            .child(self.render_right_toggle(tooltips, cx))
+                .child(self.render_right_toggle(tooltips, cx))
+            })
             .child(
                 ChromeIconButton::new(
                     "settings",
@@ -4632,7 +5497,9 @@ impl Workspace {
             .items_center()
             .pl(metrics::title_bar_leading_inset())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(self.render_left_toggle(tooltips, cx))
+            .when(!self.show_welcome, |this| {
+                this.child(self.render_left_toggle(tooltips, cx))
+            })
     }
 
     fn render_title_commands_overlay(
@@ -4666,7 +5533,7 @@ impl Workspace {
                     })
                     .unwrap_or(true);
                 if should_close {
-                    window.remove_window();
+                    Self::post_native_window_close(window);
                 }
             })
             .h(metrics::title_bar())
@@ -4879,7 +5746,6 @@ impl Workspace {
                         crate::settings::AppSettings::update(cx, |settings| {
                             settings.watch_auto_reload = !settings.watch_auto_reload
                         });
-                        cx.notify();
                     })),
             )
     }
@@ -4937,6 +5803,8 @@ impl Render for Workspace {
         let viewport = self.layout_width.unwrap_or(window.viewport_size().width);
         let content: AnyElement = if self.settings_open {
             self.settings.clone().into_any_element()
+        } else if self.show_welcome {
+            self.render_welcome(cx)
         } else {
             match self.active_document() {
                 Some(doc) => doc.clone().into_any_element(),
@@ -4960,12 +5828,19 @@ impl Render for Workspace {
         // side panel read the active document through it. Building them inline
         // would overlap those borrows with the `&mut Context` the element chain
         // already holds.
-        let right_panel = self.render_right_panel(cx);
+        let left_panel_visible = !self.show_welcome && self.left_panel_open;
+        let right_panel = (!self.show_welcome)
+            .then(|| self.render_right_panel(cx))
+            .flatten();
         let right_panel_visible = right_panel.is_some();
-        let side_panel = self
-            .left_panel_open
-            .then(|| self.render_side_panel(cx).into_any_element());
-        let panel_widths = self.workspace_panel_widths(viewport, right_panel_visible);
+        let side_panel = left_panel_visible.then(|| self.render_side_panel(cx).into_any_element());
+        let panel_widths = resolved_workspace_panel_widths(
+            self.preferred_left_panel_width,
+            self.preferred_right_panel_width,
+            left_panel_visible,
+            right_panel_visible,
+            viewport,
+        );
         let web_active = self.web_active(cx);
         let controls_width = native_window_controls_width(window);
         let left_toggle_overlay = self
@@ -4983,12 +5858,12 @@ impl Render for Workspace {
             .render_document_title_controls(
                 panel_widths.left,
                 document_controls_right,
-                !self.left_panel_open,
+                !left_panel_visible,
                 !right_panel_visible,
                 cx,
             )
             .into_any_element();
-        let left_title_region = self.left_panel_open.then(|| {
+        let left_title_region = left_panel_visible.then(|| {
             workspace_region(
                 "left-title-region",
                 Some(panel_widths.left),
@@ -5024,7 +5899,7 @@ impl Render for Workspace {
                 workspace_resize_geometry(
                     WorkspaceResizeEdge::Left,
                     panel_widths,
-                    self.left_panel_open,
+                    left_panel_visible,
                     right_panel_visible,
                     viewport,
                 ),
@@ -5112,9 +5987,17 @@ impl Render for Workspace {
             .role(gpui::Role::Application)
             .aria_label("markturbo workspace")
             .track_focus(&self.focus_handle)
-            .key_context("Workspace")
+            .key_context(if self.show_welcome && !self.settings_open {
+                WELCOME_KEY_CONTEXT
+            } else {
+                "Workspace"
+            })
+            .on_action(cx.listener(Self::on_new_document))
+            .on_action(cx.listener(Self::on_paste_into_new))
+            .on_action(cx.listener(Self::on_open_file))
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_save_as))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_copy_path))
@@ -5154,10 +6037,18 @@ impl Render for Workspace {
 /// Keybindings for the workspace's actions.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("cmd-o", OpenFolder, None),
-        KeyBinding::new("ctrl-o", OpenFolder, None),
+        KeyBinding::new("cmd-n", NewDocument, None),
+        KeyBinding::new("ctrl-n", NewDocument, None),
+        KeyBinding::new("cmd-v", PasteIntoNew, Some(WELCOME_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteIntoNew, Some(WELCOME_KEY_CONTEXT)),
+        KeyBinding::new("cmd-o", OpenFile, None),
+        KeyBinding::new("ctrl-o", OpenFile, None),
+        KeyBinding::new("cmd-shift-o", OpenFolder, None),
+        KeyBinding::new("ctrl-alt-o", OpenFolder, None),
         KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("ctrl-s", Save, None),
+        KeyBinding::new("cmd-shift-s", SaveAs, None),
+        KeyBinding::new("ctrl-shift-s", SaveAs, None),
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("ctrl-w", CloseTab, None),
         // The platform convention for preferences on each host.
@@ -5213,12 +6104,14 @@ mod tests {
     // limit.
     use super::{
         DestructiveAction, DestructiveRequest, DestructiveResolution, DetailsContent,
-        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RetirementCompletion, SaveMode,
-        SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge,
-        checkpoint_batch_status, clamped_dragged_panel_width, current_checkpoint_write_completed,
-        details_content, document_details_status_key, elide_tab_label, path_affects_harness,
-        prepare_recovery_records, resolved_workspace_panel_widths, startup_recovery_status,
+        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RetirementCompletion, SaveAsMode,
+        SaveAsOutcome, SaveMode, SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace,
+        WorkspaceResizeEdge, checkpoint_batch_status, clamped_dragged_panel_width,
+        current_checkpoint_write_completed, details_content, document_details_status_key,
+        elide_tab_label, path_affects_harness, prepare_recovery_records,
+        resolved_workspace_panel_widths, startup_recovery_status,
     };
+    use crate::fs::{FileStamp, Newline, SourceIdentity};
     use crate::i18n;
     use crate::recovery::{
         CheckpointBatchOutcome, CheckpointOutcome, CheckpointSchedule, RecoveredRecord,
@@ -5230,8 +6123,8 @@ mod tests {
     use crate::watcher::Change;
     use crate::web::{self, Trust};
     use gpui::{
-        AppContext as _, Context, Entity, Focusable as _, Modifiers, MouseButton, TestAppContext,
-        VisualTestContext, Window, point, px,
+        AppContext as _, ClipboardItem, Context, Entity, Focusable as _, Modifiers, MouseButton,
+        TestAppContext, VisualTestContext, Window, point, px,
     };
 
     fn open_test_workspace(
@@ -5288,9 +6181,15 @@ mod tests {
         F: FnOnce() -> StartupRecovery + Send + 'static,
         G: FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     {
+        let initial_is_none = initial.is_none();
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::settings::AppSettings::init(cx);
+            // Most workspace tests use an empty state as a fixture for
+            // document and panel behavior. First-use tests opt in below.
+            crate::settings::AppSettings::update(cx, |settings| {
+                settings.show_welcome_on_startup = false;
+            });
             super::init(cx);
         });
         let captured = Rc::new(RefCell::new(None));
@@ -5312,12 +6211,51 @@ mod tests {
             }
         });
         let workspace = captured.borrow().clone().expect("the Workspace entity");
+        if initial_is_none {
+            workspace.update(cx, |workspace, _| {
+                // This helper is the legacy empty-workspace fixture. Product
+                // startup behavior is covered by the explicit welcome helpers.
+                let _ = workspace.tabs.close(0);
+            });
+        }
         cx.update(|window, app| {
             let handle = workspace.read(app).focus_handle(app);
             window.focus(&handle, app);
             window.draw(app).clear(app);
         });
         cx.update(|window, app| window.draw(app).clear(app));
+        (workspace, cx)
+    }
+
+    fn open_test_workspace_with_welcome_preference(
+        cx: &mut TestAppContext,
+        show_welcome_on_startup: bool,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::settings::AppSettings::init(cx);
+            crate::settings::AppSettings::update(cx, |settings| {
+                settings.show_welcome_on_startup = show_welcome_on_startup;
+            });
+            super::init(cx);
+        });
+        let captured = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let captured = captured.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| {
+                    Workspace::new_with_startup_recovery(None, StartupRecovery::default, window, cx)
+                });
+                *captured.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            }
+        });
+        let workspace = captured.borrow().clone().expect("the Workspace entity");
+        cx.update(|window, app| {
+            let handle = workspace.read(app).focus_handle(app);
+            window.focus(&handle, app);
+            window.draw(app).clear(app);
+        });
         (workspace, cx)
     }
 
@@ -5341,6 +6279,34 @@ mod tests {
             metadata: RecoveryMetadata::from_loaded_file(&loaded),
         };
         store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+    }
+
+    fn write_memory_recovery_checkpoint(store: &RecoveryStore, text: &str) -> RecoveryKey {
+        let key = RecoveryKey::new_memory();
+        store
+            .checkpoint(
+                &RecoveryCheckpoint {
+                    key: key.clone(),
+                    text: text.to_string(),
+                    metadata: RecoveryMetadata {
+                        source_path: None,
+                        encoding_name: "UTF-8".to_string(),
+                        had_bom: false,
+                        newline: Newline::Lf,
+                        original_stamp: FileStamp {
+                            modified: None,
+                            len: 0,
+                            digest: [0; 32],
+                            object_id: None,
+                        },
+                        source_identity: SourceIdentity::Regular,
+                        decode_had_errors: false,
+                    },
+                },
+                &HashSet::new(),
+            )
+            .unwrap();
+        key
     }
 
     fn restore_recovery_for_test(
@@ -5542,6 +6508,1380 @@ mod tests {
             workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
             0
         );
+    }
+
+    #[gpui::test]
+    fn memory_documents_are_pathless_dirty_when_pasted_and_excluded_from_path_only_surfaces(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory("# Pasted prompt\nbody\n".to_string(), window, cx);
+            });
+        });
+
+        let document = workspace
+            .read_with(cx, |workspace, app| {
+                assert!(matches!(
+                    workspace.tabs.active().map(|tab| &tab.identity),
+                    Some(super::TabIdentity::Memory(_))
+                ));
+                assert!(workspace.tabs.active().and_then(|tab| tab.path()).is_none());
+                assert!(workspace.search_corpus(app).open.is_empty());
+                workspace.document_at(0).cloned()
+            })
+            .expect("the memory document");
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.source_path(), None);
+            assert_eq!(document.title(app), "Pasted prompt");
+            assert!(document.is_dirty());
+            assert_eq!(document.layout(), Layout::Source);
+            assert!(!document.watches_path(Path::new("C:/not-a-document.md")));
+            assert_eq!(document.recovery_checkpoint(app).metadata.source_path, None);
+        });
+
+        cx.update(|_window, app| {
+            document.update(app, |document, cx| document.set_layout(Layout::Web, cx));
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.render_web_path_controls(cx).is_none());
+            });
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(String::new(), window, cx);
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(1).unwrap().read(app);
+            assert_eq!(document.source_path(), None);
+            assert_eq!(document.title(app), "Untitled");
+            assert!(!document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_migrates_a_memory_document_to_a_file_identity(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved-from-memory.md");
+        let text = "# Saved prompt\nexact text\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let source_generation = Rc::new(RefCell::new(None));
+        cx.update(|window, app| {
+            let source_generation = source_generation.clone();
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.to_string(), window, cx);
+                let id = workspace.document_at(0).unwrap().read(cx).id();
+                *source_generation.borrow_mut() = Some(
+                    workspace
+                        .document_at(0)
+                        .unwrap()
+                        .read(cx)
+                        .async_snapshot(cx)
+                        .source_generation(),
+                );
+                workspace.finish_save_as(id, path.clone(), SaveAsMode::CreateOnly, window, cx);
+            });
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        workspace.read_with(cx, |workspace, app| {
+            assert!(matches!(
+                workspace.tabs.active().map(|tab| &tab.identity),
+                Some(super::TabIdentity::File(candidate)) if candidate == &path
+            ));
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(path.as_path()));
+            assert!(!document.is_dirty());
+            assert_eq!(
+                document.async_snapshot(app).source_generation(),
+                source_generation
+                    .borrow()
+                    .expect("the initial source generation")
+                    + 1
+            );
+            assert_eq!(workspace.root.as_deref(), path.parent());
+            assert_eq!(
+                crate::settings::AppSettings::global(app)
+                    .recent_targets
+                    .first()
+                    .map(|target| target.path.as_path()),
+                Some(path.as_path())
+            );
+        });
+
+        let edited = "# Saved prompt\nsubsequent save \u{4fdd}\u{7559} \u{1f680}\n";
+        replace_document(&workspace, 0, edited, cx);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_save(&super::Save, window, cx);
+            });
+        });
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+
+        fs::write(&path, "external version\n").unwrap();
+        cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.apply_watcher_changes(dir.path(), &[Change::Modified(path.clone())], cx);
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(path.as_path()));
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), edited);
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_outside_the_workspace_keeps_real_watcher_conflict_detection(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let external_dir = tempfile::tempdir().unwrap();
+        let original = workspace_dir.path().join("original.md");
+        let destination = external_dir.path().join("saved-as.md");
+        let text = "editor text stays visible\n";
+        fs::write(&original, text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, original);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let id = workspace.document_at(0).unwrap().read(cx).id();
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        fs::write(&destination, "external rewrite\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            workspace.update(cx, |workspace, cx| workspace.drain_watcher(cx));
+            let conflicted = workspace.read_with(cx, |workspace, app| {
+                workspace
+                    .document_at(0)
+                    .unwrap()
+                    .read(app)
+                    .is_externally_changed()
+            });
+            if conflicted {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(destination.as_path()));
+            assert!(document.is_externally_changed());
+            assert_eq!(document.text(app), text);
+        });
+    }
+
+    #[test]
+    fn welcome_visibility_requires_a_no_argument_launch_and_the_saved_preference() {
+        assert!(super::should_show_welcome(None, true));
+        assert!(!super::should_show_welcome(
+            Some(Path::new("workspace")),
+            true
+        ));
+        assert!(!super::should_show_welcome(None, false));
+    }
+
+    #[gpui::test]
+    fn no_argument_workspace_starts_on_the_welcome_state(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.show_welcome);
+            assert!(workspace.tabs.is_empty());
+            assert!(workspace.root.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn explicit_path_bypasses_welcome_and_records_its_file_target(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opened.md");
+        fs::write(&path, "# Opened\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            assert_eq!(workspace.root.as_deref(), path.parent());
+            assert_eq!(
+                crate::settings::AppSettings::global(app)
+                    .recent_targets
+                    .first()
+                    .map(|target| target.path.as_path()),
+                Some(path.as_path())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn paste_creates_an_exact_dirty_memory_document(cx: &mut TestAppContext) {
+        let text = "# \u{7cbe}\u{8d34} \u{1f680}\nexact clipboard text\n";
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.update(|window, app| {
+            app.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            workspace.update(app, |workspace, cx| {
+                workspace.on_paste_into_new(&super::PasteIntoNew, window, cx);
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+            assert_eq!(document.layout(), Layout::Source);
+        });
+    }
+
+    #[gpui::test]
+    fn unavailable_welcome_clipboard_preserves_the_surface_and_reports_the_reason(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_paste_into_new(&super::PasteIntoNew, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.show_welcome);
+            assert!(workspace.root.is_none());
+            assert!(workspace.tabs.is_empty());
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(i18n::t(i18n::Key::ClipboardTextUnavailable, app))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn welcome_ctrl_v_pastes_into_a_new_document(cx: &mut TestAppContext) {
+        let text = "# Clipboard shortcut\nexact \u{4e2d}\u{6587} \u{1f680}\n";
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+
+        cx.simulate_keystrokes("ctrl-v");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn welcome_paste_shortcut_is_inactive_while_settings_is_visible(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.update(|window, app| {
+            app.write_to_clipboard(ClipboardItem::new_string("settings input".to_string()));
+            workspace.update(app, |workspace, cx| {
+                workspace.on_open_settings(&super::OpenSettings, window, cx);
+            });
+        });
+
+        cx.simulate_keystrokes("ctrl-v");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.settings_open);
+            assert!(workspace.show_welcome);
+            assert!(workspace.tabs.is_empty());
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    fn failed_file_open_keeps_welcome_root_tabs_and_focus_unchanged(cx: &mut TestAppContext) {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.md");
+        fs::write(&path, "locked\n").unwrap();
+        let _lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+
+        let opened = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file_target(path.clone(), window, cx)
+            })
+        });
+
+        assert!(!opened);
+        cx.update(|window, app| {
+            let workspace = workspace.read(app);
+            assert!(workspace.show_welcome);
+            assert!(workspace.root.is_none());
+            assert!(workspace.tabs.is_empty());
+            assert!(workspace.focus_handle.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn cancelling_file_and_folder_pickers_preserves_the_welcome_state_and_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_open_file(&super::OpenFile, window, cx);
+            });
+        });
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.files);
+            assert!(!options.directories);
+            None
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_open_folder(&super::OpenFolder, window, cx);
+            });
+        });
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(!options.files);
+            assert!(options.directories);
+            None
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            let workspace = workspace.read(app);
+            assert!(workspace.show_welcome);
+            assert!(workspace.root.is_none());
+            assert!(workspace.tabs.is_empty());
+            assert!(workspace.status.is_none());
+            assert!(workspace.focus_handle.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn bundled_sample_opens_from_welcome_and_becomes_the_recent_workspace(cx: &mut TestAppContext) {
+        let sample = crate::app_paths::bundled_sample_dir().expect("the debug sample");
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_bundled_sample(window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            assert_eq!(workspace.root.as_deref(), Some(sample.as_path()));
+            let recent = crate::settings::AppSettings::global(app)
+                .recent_targets
+                .first()
+                .expect("the sample recent target");
+            assert_eq!(recent.path, sample);
+            assert_eq!(recent.kind, crate::settings::RecentTargetKind::Workspace);
+        });
+    }
+
+    #[gpui::test]
+    fn missing_recent_target_is_disabled_and_removable_without_opening_anything(
+        cx: &mut TestAppContext,
+    ) {
+        let missing = PathBuf::from("Q:/definitely/not/here/markturbo-missing.md");
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.update(|window, app| {
+            crate::settings::AppSettings::update(app, |settings| {
+                settings.record_recent_target(crate::settings::RecentTarget::new(
+                    missing.clone(),
+                    crate::settings::RecentTargetKind::File,
+                    "missing.md",
+                ));
+            });
+            workspace.update(app, |workspace, cx| {
+                assert!(!workspace.open_recent_target(&missing, window, cx));
+                workspace.remove_recent_target(&missing, cx);
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.tabs.is_empty());
+            assert!(
+                crate::settings::AppSettings::global(app)
+                    .recent_targets
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn recent_target_validation_distinguishes_missing_and_mismatched_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = crate::settings::RecentTarget::new(
+            dir.path(),
+            crate::settings::RecentTargetKind::File,
+            "directory",
+        );
+        assert_eq!(
+            super::recent_target_issue(&directory),
+            Some(i18n::Key::RecentUnavailable)
+        );
+        let missing = crate::settings::RecentTarget::new(
+            dir.path().join("missing.md"),
+            crate::settings::RecentTargetKind::File,
+            "missing.md",
+        );
+        assert_eq!(
+            super::recent_target_issue(&missing),
+            Some(i18n::Key::RecentMissing)
+        );
+    }
+
+    #[test]
+    fn stale_recent_button_reports_the_accesskit_disabled_state() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let welcome = source
+            .split_once("fn render_welcome")
+            .expect("Welcome renderer")
+            .1
+            .split_once("fn render_status_bar")
+            .expect("end of Welcome renderer")
+            .0;
+
+        assert!(welcome.contains("BaseButton::new(open_id)"));
+        assert!(welcome.contains(".disabled(true)"));
+        assert!(welcome.contains(".a11y_synthetic_children("));
+        assert!(welcome.contains("builder.parent_node().set_disabled()"));
+    }
+
+    #[gpui::test]
+    fn valid_recent_file_reopens_through_the_shared_target_path(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recent.md");
+        let text = "# Recent \u{4e2d}\u{6587} \u{1f680}\nexact text\n";
+        fs::write(&path, text).unwrap();
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.update(|window, app| {
+            crate::settings::AppSettings::update(app, |settings| {
+                settings.record_recent_target(crate::settings::RecentTarget::new(
+                    path.clone(),
+                    crate::settings::RecentTargetKind::File,
+                    "recent.md",
+                ));
+            });
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.open_recent_target(&path, window, cx));
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.root.as_deref(), path.parent());
+            assert_eq!(workspace.tabs.len(), 1);
+            assert_eq!(workspace.document_at(0).unwrap().read(app).text(app), text);
+            assert_eq!(
+                crate::settings::AppSettings::global(app)
+                    .recent_targets
+                    .first()
+                    .map(|target| target.path.as_path()),
+                Some(path.as_path())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dont_show_welcome_again_persists_and_starts_an_empty_memory_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.dont_show_welcome_again(window, cx);
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            assert!(!crate::settings::AppSettings::global(app).show_welcome_on_startup);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), None);
+            assert_eq!(document.text(app), "");
+            assert!(!document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn clean_window_close_defers_teardown_until_the_focused_input_handler_can_drain(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.dont_show_welcome_again(window, cx);
+            });
+        });
+
+        cx.update(|window, app| {
+            assert!(window.focused(app).is_some());
+            let should_close = workspace.update(app, |workspace, cx| {
+                workspace.request_window_close(window, cx)
+            });
+            assert!(!should_close);
+            assert!(window.focused(app).is_none());
+            assert!(workspace.read(app).window_close_pending);
+            assert!(!workspace.read(app).window_close_ready);
+
+            workspace.update(app, |workspace, cx| {
+                workspace.window_close_ready = true;
+                assert!(workspace.request_window_close(window, cx));
+            });
+        });
+    }
+
+    #[test]
+    fn window_close_drains_input_then_reenters_the_native_close_path() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let request = source
+            .split_once("fn request_window_close")
+            .expect("window close request")
+            .1
+            .split_once("fn close_window_after_input_drain")
+            .expect("end of window close request")
+            .0;
+        assert!(request.contains("if self.window_close_ready"));
+        assert!(request.contains("return true;"));
+
+        let close = source
+            .split_once("fn close_window_after_input_drain")
+            .expect("window close helper")
+            .1
+            .split_once("fn request_workspace_replace")
+            .expect("end of window close helper")
+            .0;
+        assert!(close.contains("window.disable_focus(cx)"));
+        assert_eq!(close.matches("window.on_next_frame").count(), 2);
+        assert!(close.contains("workspace.window_close_ready = true"));
+        assert!(close.contains("Self::post_native_window_close(window)"));
+
+        let native = source
+            .split_once("fn post_native_window_close")
+            .expect("native close helper")
+            .1
+            .split_once("fn request_workspace_replace")
+            .expect("end of native close helper")
+            .0;
+        assert!(native.contains("PostMessageW"));
+        assert!(native.contains("WM_CLOSE"));
+    }
+
+    #[gpui::test]
+    fn disabled_welcome_starts_future_no_argument_workspaces_with_a_new_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, false);
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), None);
+            assert_eq!(document.text(app), "");
+            assert!(!document.is_dirty());
+        });
+    }
+
+    #[test]
+    fn welcome_openers_keep_picker_cancel_and_drag_drop_on_one_target_path() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let file = source
+            .split_once("fn on_open_file")
+            .expect("file picker")
+            .1
+            .split_once("fn on_open_folder")
+            .unwrap()
+            .0;
+        assert!(file.contains("files: true"));
+        assert!(file.contains("directories: false"));
+        assert!(file.contains("else {\n                return;"));
+        assert!(file.contains("this.open_target(path, true, window, cx);"));
+        let folder = source
+            .split_once("fn on_open_folder")
+            .expect("folder picker")
+            .1
+            .split_once("fn on_save")
+            .unwrap()
+            .0;
+        assert!(folder.contains("files: false"));
+        assert!(folder.contains("directories: true"));
+        assert!(folder.contains("else {\n                return;"));
+        assert!(folder.contains("this.open_target(path, true, window, cx);"));
+        let drop = source
+            .split_once("fn on_drop_paths")
+            .expect("drop handler")
+            .1
+            .split_once("/// The path of whichever")
+            .unwrap()
+            .0;
+        assert!(drop.contains("self.open_target(path.clone(), true, window, cx)"));
+        assert!(source.contains("fn open_bundled_sample"));
+        assert!(source.contains("crate::app_paths::bundled_sample_dir()"));
+    }
+
+    #[test]
+    fn welcome_controls_have_stable_windows_uia_ids() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        for id in [
+            "markturbo-welcome-new",
+            "markturbo-welcome-paste",
+            "markturbo-welcome-open-file",
+            "markturbo-welcome-open-folder",
+            "markturbo-welcome-open-sample",
+            "markturbo-welcome-dont-show-again",
+        ] {
+            assert!(source.contains(id), "missing {id}");
+        }
+        assert!(source.contains(".accessibility_id("));
+        assert!(source.contains("markturbo-welcome-recent-status-"));
+        assert!(source.contains(".role(gpui::Role::Label)"));
+        assert!(source.contains(".aria_value(label)"));
+        let welcome = source
+            .split_once("fn render_welcome")
+            .expect("welcome renderer")
+            .1
+            .split_once("fn render_web_path_controls")
+            .unwrap()
+            .0;
+        assert!(welcome.contains("RecoveryKey::for_path(&target.path)"));
+        assert!(
+            welcome.contains(".overflow_y_scroll()"),
+            "ten recent entries must remain reachable at the minimum window height"
+        );
+        assert!(
+            !welcome.contains("recents.into_iter().enumerate()"),
+            "recent control identity must follow the path, not its MRU index"
+        );
+    }
+
+    #[test]
+    fn welcome_render_uses_cached_filesystem_availability() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let welcome = source
+            .split_once("fn render_welcome")
+            .expect("welcome renderer")
+            .1
+            .split_once("fn render_web_path_controls")
+            .unwrap()
+            .0;
+
+        assert!(welcome.contains("self.welcome_sample_available"));
+        assert!(welcome.contains("self.welcome_recent_target_issue(&target)"));
+        assert!(
+            !welcome.contains("crate::app_paths::bundled_sample_dir()")
+                && !welcome.contains("let issue = recent_target_issue(&target);"),
+            "Welcome rendering must not synchronously probe the filesystem"
+        );
+    }
+
+    #[test]
+    fn welcome_and_save_as_copy_names_the_target_and_follow_up_choice() {
+        let workspace = crate::views::production_source(include_str!("workspace.rs"));
+        let welcome = workspace
+            .split_once("fn render_welcome")
+            .expect("welcome renderer")
+            .1
+            .split_once("fn render_web_path_controls")
+            .unwrap()
+            .0;
+        assert!(welcome.contains("Key::OpenFilePicker"));
+        assert!(welcome.contains("Key::OpenFolderPicker"));
+        assert!(welcome.contains("i18n::open_recent_target_label"));
+        assert!(welcome.contains("i18n::remove_recent_target_label"));
+        assert!(welcome.contains(".tooltip(path_text.clone())"));
+
+        let overwrite = workspace
+            .split_once("fn prompt_save_as_overwrite")
+            .expect("overwrite prompt")
+            .1
+            .split_once("fn finish_save_as")
+            .unwrap()
+            .0;
+        assert!(overwrite.contains("i18n::replace_file_title"));
+        assert!(overwrite.contains("i18n::replace_file_description"));
+        assert!(!overwrite.contains("\"Replace existing file?\""));
+
+        let finish = workspace
+            .split_once("fn finish_save_as")
+            .expect("Save As completion")
+            .1
+            .split_once("fn on_close_tab")
+            .unwrap()
+            .0;
+        assert!(finish.contains("i18n::save_as_snapshot_changed_message"));
+        assert!(finish.contains("i18n::save_as_path_already_open_message"));
+
+        let document = crate::views::production_source(include_str!("document.rs"));
+        assert!(document.contains("Key::SaveAsPicker"));
+    }
+
+    #[test]
+    fn welcome_hides_document_only_title_commands() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let left = source
+            .split_once("fn render_left_toggle_overlay")
+            .expect("left title control")
+            .1
+            .split_once("fn render_title_commands_overlay")
+            .unwrap()
+            .0;
+        assert!(left.contains(".when(!self.show_welcome"));
+
+        let commands = source
+            .split_once("fn render_title_commands")
+            .expect("title commands")
+            .1
+            .split_once("fn render_left_toggle_overlay")
+            .unwrap()
+            .0;
+        assert!(commands.contains(".when(!self.show_welcome"));
+        assert!(commands.contains("i18n::Key::Settings"));
+    }
+
+    #[gpui::test]
+    fn ten_recent_targets_scroll_into_view_at_the_minimum_window_size(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut targets = Vec::new();
+        for ix in 0..10 {
+            let path = dir.path().join(format!(
+                "{ix:02}-a-very-long-recent-document-name-for-layout-\u{4e2d}\u{6587}.md"
+            ));
+            if ix < 8 {
+                fs::write(&path, format!("# Recent {ix}\n")).unwrap();
+            }
+            targets.push(path);
+        }
+
+        cx.update(|app| {
+            gpui_component::init(app);
+            crate::settings::AppSettings::init(app);
+            super::init(app);
+        });
+        let captured = Rc::new(RefCell::new(None));
+        let window = cx.open_window(gpui::size(px(720.), px(480.)), {
+            let captured = captured.clone();
+            move |window, app| {
+                let workspace = app.new(|cx| {
+                    Workspace::new_with_startup_recovery(None, StartupRecovery::default, window, cx)
+                });
+                *captured.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, app)
+            }
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let workspace = captured.borrow().clone().expect("the Workspace entity");
+        cx.update(|window, app| {
+            crate::settings::AppSettings::update(app, |settings| {
+                for path in &targets {
+                    settings.record_recent_target(crate::settings::RecentTarget::new(
+                        path.clone(),
+                        crate::settings::RecentTargetKind::File,
+                        path.file_name().unwrap().to_string_lossy(),
+                    ));
+                }
+            });
+            let handle = workspace.read(app).focus_handle(app);
+            window.focus(&handle, app);
+            window.draw(app).clear(app);
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| window.draw(app).clear(app));
+
+        let (before, max, bounds) = workspace.read_with(&cx, |workspace, _| {
+            (
+                workspace.welcome_scroll.offset(),
+                workspace.welcome_scroll.max_offset(),
+                workspace.welcome_scroll.bounds(),
+            )
+        });
+        assert!(
+            max.y > px(0.),
+            "ten recent targets must overflow vertically"
+        );
+        assert!(bounds.top() >= crate::metrics::title_bar());
+        assert!(bounds.bottom() <= px(480.) - crate::metrics::status_bar());
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(360.), px(240.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-2_000.))),
+            ..Default::default()
+        });
+        cx.update(|window, app| window.draw(app).clear(app));
+
+        let after = workspace.read_with(&cx, |workspace, _| workspace.welcome_scroll.offset());
+        assert!(
+            after.y < before.y,
+            "the welcome page must respond to scrolling"
+        );
+        assert_eq!(after.y, -max.y, "the full recent list must be reachable");
+    }
+
+    #[gpui::test]
+    fn cancelling_save_as_overwrite_keeps_destination_and_buffer_byte_identical(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("existing.md");
+        let original_bytes = b"external bytes\xFF\n";
+        fs::write(&destination, original_bytes).unwrap();
+        let text = "editor text\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                let id = workspace.document_at(0).unwrap().read(cx).id();
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.has_pending_prompt(),
+            "an existing Save As destination must require a separate Replace decision"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(fs::read(&destination).unwrap(), original_bytes);
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+            assert!(matches!(
+                workspace.tabs.active().map(|tab| &tab.identity),
+                Some(super::TabIdentity::Memory(_))
+            ));
+            assert!(workspace.pending_destructive.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn confirmed_save_as_overwrite_replaces_only_the_selected_destination(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("existing.md");
+        let untouched = dir.path().join("untouched.md");
+        fs::write(&destination, "external version\n").unwrap();
+        fs::write(&untouched, "do not replace\n").unwrap();
+        let text = "editor text \u{4fdd}\u{7559} \u{1f680}\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                let id = workspace.document_at(0).unwrap().read(cx).id();
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), text);
+        assert_eq!(fs::read_to_string(&untouched).unwrap(), "do not replace\n");
+        workspace.read_with(cx, |workspace, app| {
+            assert!(matches!(
+                workspace.tabs.active().map(|tab| &tab.identity),
+                Some(super::TabIdentity::File(path)) if path == &destination
+            ));
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(destination.as_path()));
+            assert!(!document.is_dirty());
+            assert_eq!(document.text(app), text);
+        });
+    }
+
+    #[gpui::test]
+    fn replace_confirmation_refuses_a_destination_changed_while_the_prompt_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("existing.md");
+        fs::write(&destination, "version shown in the prompt\n").unwrap();
+        let text = "editor text\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                let id = workspace.document_at(0).unwrap().read(cx).id();
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        fs::write(&destination, "later external version\n").unwrap();
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "later external version\n"
+        );
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.pending_destructive.is_none());
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+            assert_eq!(document.source_path(), None);
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some("Save As failed: the file changed on disk since it was opened; reload or save a copy")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_picker_cancellation_is_a_total_no_op(cx: &mut TestAppContext) {
+        let text = "unsaved \u{4fdd}\u{7559} \u{1f680}\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                let id = workspace.document_at(0).unwrap().read(cx).id();
+                workspace.finish_save_as_selection(id, None, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.pending_destructive.is_none());
+            assert!(workspace.status.is_none());
+            assert!(matches!(
+                workspace.tabs.active().map(|tab| &tab.identity),
+                Some(super::TabIdentity::Memory(_))
+            ));
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_rejects_an_equivalent_path_already_open_in_another_tab(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let open_path = dir.path().join("open.md");
+        let equivalent_path = dir.path().join(".").join("open.md");
+        fs::write(&open_path, "open document\n").unwrap();
+        let text = "second editor\n";
+        let (workspace, cx) = open_test_workspace(cx, open_path.clone());
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                let id = workspace.document_at(1).unwrap().read(cx).id();
+                workspace.finish_save_as(
+                    id,
+                    equivalent_path.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        assert_eq!(fs::read_to_string(&open_path).unwrap(), "open document\n");
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let expected = i18n::save_as_path_already_open_message(&equivalent_path, app);
+            assert_eq!(workspace.status.as_deref(), Some(expected.as_str()));
+            let document = workspace.document_at(1).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+            assert!(matches!(
+                workspace.tabs.active().map(|tab| &tab.identity),
+                Some(super::TabIdentity::Memory(_))
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn memory_dirty_close_save_keeps_the_destructive_request_open_for_save_as(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "CJK \u{4fdd}\u{7559} \u{1f680}\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let id = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                workspace.document_at(0).unwrap().read(cx).id()
+            })
+        });
+
+        cx.simulate_keystrokes("ctrl-w");
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(
+                workspace
+                    .pending_destructive
+                    .as_ref()
+                    .and_then(DestructiveRequest::current),
+                Some(id),
+                "Save As must retain the exact destructive request until its write succeeds"
+            );
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("saved-after-close.md");
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(fs::read_to_string(destination).unwrap(), text);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.tabs.len()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    fn cancelling_memory_dirty_close_save_as_keeps_the_buffer_open_and_recoverable(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "CJK \u{4fdd}\u{7559} \u{1f680}\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let id = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                workspace.document_at(0).unwrap().read(cx).id()
+            })
+        });
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as_selection(id, None, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.pending_destructive.is_none());
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+            assert!(workspace.recovery_schedules.contains_key(&id));
+        });
+    }
+
+    #[gpui::test]
+    fn cancelling_an_existing_save_as_destination_keeps_a_dirty_close_buffer_open(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "CJK close save \u{4fdd}\u{7559} \u{1f680}\n";
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("existing.md");
+        let original = b"destination remains unchanged\n";
+        fs::write(&destination, original).unwrap();
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let id = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                workspace.document_at(0).unwrap().read(cx).id()
+            })
+        });
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.pending_destructive.is_none());
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.recovery_schedules.contains_key(&id));
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+            assert!(document.is_dirty());
+            assert_eq!(document.source_path(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn replacing_an_existing_save_as_destination_completes_the_dirty_close(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "CJK close replace \u{4fdd}\u{7559} \u{1f680}\n";
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("existing.md");
+        fs::write(&destination, "old destination\n").unwrap();
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let id = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(text.into(), window, cx);
+                workspace.document_at(0).unwrap().read(cx).id()
+            })
+        });
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), text);
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.pending_destructive.is_none());
+            assert!(workspace.tabs.is_empty());
+            assert!(!workspace.recovery_schedules.contains_key(&id));
+            assert_eq!(
+                crate::settings::AppSettings::global(app)
+                    .recent_targets
+                    .first()
+                    .map(|target| target.path.as_path()),
+                Some(destination.as_path())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dropping_a_folder_then_file_uses_the_shared_target_lifecycle(cx: &mut TestAppContext) {
+        let folder = tempfile::tempdir().unwrap();
+        let document_path = folder.path().join("dropped.md");
+        let text = "# Dropped \u{4fdd}\u{7559} \u{1f680}\n";
+        fs::write(&document_path, text).unwrap();
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_drop_paths(&[folder.path().to_path_buf()], window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            assert_eq!(workspace.root.as_deref(), Some(folder.path()));
+            assert!(workspace.tabs.is_empty());
+            let recent = crate::settings::AppSettings::global(app)
+                .recent_targets
+                .first()
+                .expect("dropped folder is recent");
+            assert_eq!(recent.path.as_path(), folder.path());
+            assert_eq!(recent.kind, crate::settings::RecentTargetKind::Workspace);
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_drop_paths(std::slice::from_ref(&document_path), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.root.as_deref(), Some(folder.path()));
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(document_path.as_path()));
+            assert_eq!(document.text(app), text);
+            assert!(!document.is_dirty());
+            assert!(
+                !workspace.recovery_schedules.contains_key(&document.id()),
+                "a clean dropped file must not enter dirty-buffer recovery"
+            );
+            let recents = &crate::settings::AppSettings::global(app).recent_targets;
+            assert_eq!(recents[0].path, document_path);
+            assert_eq!(recents[0].kind, crate::settings::RecentTargetKind::File);
+            assert_eq!(recents[1].path, folder.path());
+            assert_eq!(
+                recents[1].kind,
+                crate::settings::RecentTargetKind::Workspace
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_snapshot_drift_cancels_the_pending_close_without_writing(cx: &mut TestAppContext) {
+        let initial = "initial \u{4fdd}\u{7559} \u{1f680}\n";
+        let revised = "revised \u{4fdd}\u{7559} \u{1f680}\n";
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let id = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory(initial.into(), window, cx);
+                workspace.document_at(0).unwrap().read(cx).id()
+            })
+        });
+
+        cx.simulate_keystrokes("ctrl-w");
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        replace_document(&workspace, 0, revised, cx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("must-not-write.md");
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(
+                    id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        assert!(!destination.exists());
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.pending_destructive.is_none());
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.recovery_schedules.contains_key(&id));
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), revised);
+            assert!(document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn pathless_recovery_restores_as_a_memory_document_with_its_original_key(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let key = write_memory_recovery_checkpoint(&store, "# Recovered prompt\n");
+        let scan = store.recover().unwrap();
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        workspace.update(cx, |workspace, _| workspace.recovery = Some(store));
+
+        let restored = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                restore_recovery_for_test(workspace, scan, window, cx)
+            })
+        });
+        assert_eq!(restored, (1, 0));
+        workspace.read_with(cx, |workspace, app| {
+            assert!(matches!(
+                workspace.tabs.active().map(|tab| &tab.identity),
+                Some(super::TabIdentity::Memory(_))
+            ));
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), None);
+            assert_eq!(document.recovery_key(), key);
+            assert!(document.is_dirty());
+            assert_eq!(document.text(app), "# Recovered prompt\n");
+        });
+    }
+
+    #[gpui::test]
+    fn failed_history_navigation_keeps_the_active_memory_document_and_no_preview(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.md");
+        let second = dir.path().join("second.md");
+        fs::write(&second, "second\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, second.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory("unsaved\n".to_string(), window, cx);
+                workspace.record_visit(missing.clone(), 0);
+                workspace.record_visit(second, 0);
+            });
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_navigate_back(&super::NavigateBack, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert!(matches!(
+                workspace.tabs.active().map(|tab| &tab.identity),
+                Some(super::TabIdentity::Memory(_))
+            ));
+            assert!(workspace.tabs.preview().is_none());
+            assert_eq!(
+                workspace
+                    .document_at(workspace.tabs.active_index())
+                    .unwrap()
+                    .read(app)
+                    .text(app),
+                "unsaved\n"
+            );
+        });
     }
 
     #[gpui::test]
@@ -6343,7 +8683,10 @@ mod tests {
         let snapshot = document.read_with(cx, |document, app| document.async_snapshot(app));
 
         document.update(cx, |document, cx| {
-            assert!(document.save_as(&saved_as, cx));
+            assert_eq!(
+                document.save_as(&saved_as, SaveAsMode::CreateOnly, cx),
+                SaveAsOutcome::Saved
+            );
         });
         let applied = cx.update(|window, app| {
             document.update(app, |document, cx| {
@@ -6358,7 +8701,7 @@ mod tests {
 
         assert!(!applied);
         document.read_with(cx, |document, app| {
-            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.source_path(), Some(saved_as.as_path()));
             assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
             assert_eq!(document.text(app), text);
         });
@@ -6382,12 +8725,14 @@ mod tests {
         });
         let id = document.read_with(cx, |document, _| document.id());
 
-        workspace.update(cx, |workspace, cx| {
-            workspace.finish_save_as(id, saved_as.clone(), cx);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(id, saved_as.clone(), SaveAsMode::CreateOnly, window, cx);
+            });
         });
 
         document.read_with(cx, |document, _| {
-            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.source_path(), Some(saved_as.as_path()));
             assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
             assert_eq!(document.trust(), Trust::Restricted);
             let payload = document.web_html().expect("the rebuilt HTML payload");
@@ -6417,12 +8762,14 @@ mod tests {
         });
         let id = document.read_with(cx, |document, _| document.id());
 
-        workspace.update(cx, |workspace, cx| {
-            workspace.finish_save_as(id, saved_as.clone(), cx);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(id, saved_as.clone(), SaveAsMode::CreateOnly, window, cx);
+            });
         });
 
         document.read_with(cx, |document, _| {
-            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.source_path(), Some(saved_as.as_path()));
             assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
             assert_eq!(document.trust(), Trust::Restricted);
             let payload = document.web_html().expect("the rebuilt HTML payload");
@@ -6448,12 +8795,20 @@ mod tests {
         let id = document.read_with(cx, |document, _| document.id());
         let before = document.read_with(cx, |document, _| document.web_html().unwrap().to_string());
 
-        workspace.update(cx, |workspace, cx| {
-            workspace.finish_save_as(id, failed_path.clone(), cx);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(
+                    id,
+                    failed_path.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
         });
 
         document.read_with(cx, |document, _| {
-            assert_eq!(document.path(), original.as_path());
+            assert_eq!(document.source_path(), Some(original.as_path()));
             assert_eq!(document.trust(), Trust::Trusted);
             assert_eq!(document.web_html(), Some(before.as_str()));
         });
@@ -6477,12 +8832,14 @@ mod tests {
         let id = document.read_with(cx, |document, _| document.id());
         let before = document.read_with(cx, |document, _| document.web_html().unwrap().to_string());
 
-        workspace.update(cx, |workspace, cx| {
-            workspace.finish_save_as(id, saved_as.clone(), cx);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(id, saved_as.clone(), SaveAsMode::CreateOnly, window, cx);
+            });
         });
 
         document.read_with(cx, |document, app| {
-            assert_eq!(document.path(), saved_as.as_path());
+            assert_eq!(document.source_path(), Some(saved_as.as_path()));
             assert_eq!(document.document().doc_type(), mt_doc::DocType::Markdown);
             assert_eq!(document.layout(), Layout::Web);
             assert_eq!(document.trust(), Trust::Restricted);
@@ -6763,8 +9120,10 @@ mod tests {
                 .insert(id, original_key.clone());
         });
         replace_document(&workspace, 0, "saved elsewhere\n", cx);
-        workspace.update(cx, |workspace, cx| {
-            workspace.finish_save_as(id, saved_as.clone(), cx);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(id, saved_as.clone(), SaveAsMode::CreateOnly, window, cx);
+            });
         });
 
         workspace.read_with(cx, |workspace, _| {
@@ -6845,8 +9204,10 @@ mod tests {
             assert_eq!(document.text(app), "disk before startup\n");
         });
 
-        workspace.update(cx, |workspace, cx| {
-            workspace.finish_save_as(id, saved_as.clone(), cx);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(id, saved_as.clone(), SaveAsMode::CreateOnly, window, cx);
+            });
         });
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
@@ -9555,7 +11916,8 @@ mod tests {
         cx.background_executor.advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
 
-        assert_eq!(cx.cx.update(|app| app.windows().len()), 0);
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.window_close_pending));
         assert!(store.recover().unwrap().records.is_empty());
     }
 
@@ -9614,7 +11976,8 @@ mod tests {
         cx.simulate_prompt_answer("Discard");
         cx.run_until_parked();
 
-        assert_eq!(cx.cx.update(|app| app.windows().len()), 0);
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.window_close_pending));
         assert_eq!(fs::read_to_string(first).unwrap(), "first saved text\n");
         assert_eq!(fs::read_to_string(second).unwrap(), "second disk\n");
         assert!(store.recover().unwrap().records.is_empty());
@@ -9647,7 +12010,8 @@ mod tests {
         cx.simulate_prompt_answer("Discard");
         cx.run_until_parked();
 
-        assert_eq!(cx.cx.update(|app| app.windows().len()), 0);
+        assert_eq!(cx.cx.update(|app| app.windows().len()), 1);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.window_close_pending));
     }
 
     #[gpui::test]
@@ -10177,6 +12541,9 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::settings::AppSettings::init(cx);
+            crate::settings::AppSettings::update(cx, |settings| {
+                settings.show_welcome_on_startup = false;
+            });
         });
         let captured = Rc::new(RefCell::new(None));
         let (_, cx) = cx.add_window_view({
@@ -10245,6 +12612,9 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::settings::AppSettings::init(cx);
+            crate::settings::AppSettings::update(cx, |settings| {
+                settings.show_welcome_on_startup = false;
+            });
         });
         let captured = Rc::new(RefCell::new(None));
         let (_, cx) = cx.add_window_view({
@@ -10319,8 +12689,8 @@ mod tests {
             .unwrap_or(body.len());
         let body = &body[..end];
         let gate = body
-            .find(".when(!web_active, |tab|")
-            .expect("the Web-active overlay gate");
+            .find(".when(!web_active && path.is_some(), |tab|")
+            .expect("the file-only Web-active overlay gate");
         let end = body[gate..]
             .find("// A preview tab")
             .map(|end| gate + end)
@@ -10328,6 +12698,10 @@ mod tests {
         let affordance = &body[gate..end];
 
         assert!(affordance.contains(".tooltip(") && affordance.contains(".context_menu("));
+        assert!(
+            affordance.contains("path.is_some()"),
+            "memory documents have no filesystem path, so they must not offer file-path controls"
+        );
         assert!(affordance.contains("tab.child("));
         assert!(affordance.contains(".absolute()") && affordance.contains(".inset_0()"));
         assert!(!body.contains(".prefix("));
@@ -10394,7 +12768,7 @@ mod tests {
         assert!(title_body.contains("IconName::Globe"));
         assert!(!title_body.contains(".label(i18n::t(i18n::Key::OpenFolder"));
         assert!(!title_body.contains(".label(i18n::t(i18n::Key::Translate"));
-        for key in ["OpenFolder", "Translate", "Settings"] {
+        for key in ["OpenFolderPicker", "Translate", "Settings"] {
             assert!(
                 title_body.contains(&format!("i18n::t(i18n::Key::{key}, cx)")),
                 "the {key} icon-only command must pass its localized name to \
@@ -10408,12 +12782,12 @@ mod tests {
         assert!(status_body.contains(".when(web_active, |button|"));
         assert!(status_body.contains("button.label(auto_refresh_label)"));
         assert!(status_body.contains(".when(!web_active, |button| button.tooltip("));
-        assert!(render.contains("let right_panel = self.render_right_panel(cx)"));
+        assert!(render.contains("let right_panel = (!self.show_welcome)"));
         let side_panel = &render[render.find("let side_panel").expect("side panel")..];
         let side_panel = &side_panel[..side_panel
             .find("let panel_widths")
             .unwrap_or(side_panel.len())];
-        assert!(side_panel.contains(".left_panel_open") && side_panel.contains(".then("));
+        assert!(side_panel.contains("left_panel_visible") && side_panel.contains(".then("));
         assert!(!side_panel.contains("web_active"));
         assert!(
             render.contains(".child(self.render_status_bar(cx))"),
@@ -10448,6 +12822,7 @@ mod tests {
         let body = &body[..end];
 
         assert!(!body.contains("tree_changed || harness_changed"));
+        assert!(body.contains("change.path().starts_with(watcher_root)"));
         assert!(body.contains("harness.has_artifact_under(change.path())"));
     }
 
@@ -10672,7 +13047,7 @@ mod tests {
             "an unopenable drop must say so rather than doing nothing visible"
         );
         assert!(
-            body.contains("self.root.is_none()"),
+            source.contains("fn open_file_target") && source.contains("self.root.is_none()"),
             "a bare file drop should adopt its parent as the workspace"
         );
     }
@@ -10746,9 +13121,7 @@ mod tests {
         // claiming the width.
         let start = source.find("fn render_tabs").expect("render_tabs");
         let tabs = &source[start..];
-        let end = tabs
-            .find("\n    fn render_web_path_controls")
-            .unwrap_or(tabs.len());
+        let end = tabs.find("\n    fn render_welcome").unwrap_or(tabs.len());
         let tabs = &tabs[..end];
         assert!(
             !tabs.contains(".w_full()"),
@@ -10890,7 +13263,7 @@ mod tests {
         );
 
         assert!(
-            body.contains("self.left_panel_open.then(||") && body.contains("left-title-region"),
+            body.contains("left_panel_visible.then(||") && body.contains("left-title-region"),
             "the left panel must be omittable, not merely narrow"
         );
         assert!(
@@ -11194,18 +13567,42 @@ mod tests {
             "an update goes through the infallible windowed borrow, which \
              panics when it lands mid-draw. Use `crate::views::try_update_in`."
         );
-        assert_eq!(
-            code.matches("try_update_in(&this").count(),
-            7,
-            "the folder picker, destructive prompt, Save As picker, and \
-             translation, startup recovery, retirement completion, and cleanup \
-             continuation all land after an await and need the fallible path"
+        assert!(
+            code.matches("try_update_in(&this").count() >= 8
+                && code.contains("fn prompt_save_as_overwrite"),
+            "the folder picker, destructive prompt, Save As picker and Replace \
+             confirmation, translation, startup recovery, retirement completion, \
+             and cleanup continuation all land after an await and need the \
+             fallible path"
         );
         assert!(
             code.contains("try_update(&this, cx, |this, cx| this.drain_watcher(cx))"),
             "the watcher poll lands after an await too; it needs no `Window`, \
              so it takes the windowless fallible path"
         );
+    }
+
+    #[test]
+    fn save_as_has_an_explicit_workspace_action_and_keybinding() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
+        for action in ["NewDocument", "OpenFile", "OpenFolder"] {
+            assert!(
+                code.contains(&format!("{action},")),
+                "missing {action} action"
+            );
+        }
+        assert!(code.contains("KeyBinding::new(\"ctrl-n\", NewDocument, None)"));
+        assert!(code.contains("KeyBinding::new(\"ctrl-o\", OpenFile, None)"));
+        assert!(code.contains("KeyBinding::new(\"ctrl-alt-o\", OpenFolder, None)"));
+        assert!(
+            !code.contains("KeyBinding::new(\"ctrl-o\", OpenFolder, None)"),
+            "Ctrl+O must open a file, not only a workspace folder"
+        );
+        assert!(code.contains("SaveAs,"));
+        assert!(code.contains(".on_action(cx.listener(Self::on_save_as))"));
+        assert!(code.contains("KeyBinding::new(\"cmd-shift-s\", SaveAs, None)"));
+        assert!(code.contains("KeyBinding::new(\"ctrl-shift-s\", SaveAs, None)"));
     }
 
     /// Auto-refresh must never discard typed text.
@@ -11390,7 +13787,7 @@ mod tests {
         assert!(constructor.contains("start_startup_recovery("));
         assert!(!constructor.contains("let (recovery, recovery_scan"));
         assert!(
-            constructor.find("this.open_file(").unwrap()
+            constructor.find("this.open_target(").unwrap()
                 < constructor.find("start_startup_recovery(").unwrap(),
             "the requested file must open before startup recovery begins"
         );

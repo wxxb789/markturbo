@@ -23,7 +23,7 @@ use gpui_component::{
 };
 use mt_doc::{DocType, Document, Severity};
 
-use crate::fs::{self, LoadedFile, SaveError, SourceIdentity};
+use crate::fs::{self, FileStamp, LoadedFile, Newline, SaveError, SourceIdentity};
 use crate::i18n;
 use crate::lifecycle::{AsyncSnapshot, BufferSnapshot, DocumentId};
 use crate::metrics;
@@ -76,6 +76,7 @@ const LIVE_PREVIEW_LIMIT: usize = 512 * 1024;
 const SOURCE_LAYOUT_ACCESSIBILITY_ID: &str = "markturbo-layout-source";
 const SOURCE_EDITOR_ACCESSIBILITY_ID: &str = "markturbo-document-source-editor";
 const CONFLICT_OVERWRITE_ACCESSIBILITY_ID: &str = "markturbo-conflict-overwrite";
+const DOCUMENT_SAVE_AS_ACCESSIBILITY_ID: &str = "markturbo-document-save-as";
 
 /// Events a document view emits to the workspace.
 #[derive(Debug, Clone)]
@@ -101,6 +102,77 @@ pub enum SaveMode {
     Overwrite,
     Recreate,
     ConvertToUtf8,
+}
+
+/// A Save As write is either create-only or an overwrite that the workspace
+/// has already confirmed with the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SaveAsMode {
+    CreateOnly,
+    Overwrite(Arc<fs::SaveAsOverwriteAuthorization>),
+}
+
+/// The narrow result the workspace needs to decide whether an existing target
+/// warrants a separate destructive confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveAsOutcome {
+    Saved,
+    DestinationExists,
+    Failed,
+}
+
+/// Where this document's authoritative text came from.
+///
+/// A memory buffer is not a file waiting to be named. Keeping that distinction
+/// explicit prevents source-only operations from inventing a filesystem path
+/// before Save As establishes one.
+#[derive(Debug, Clone)]
+enum DocumentOrigin {
+    File(LoadedFile),
+    Memory { recovery_key: RecoveryKey },
+}
+
+impl DocumentOrigin {
+    fn source_path(&self) -> Option<&Path> {
+        match self {
+            Self::File(file) => Some(&file.path),
+            Self::Memory { .. } => None,
+        }
+    }
+
+    fn is_file_backed(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+
+    /// Whether normal Save can still write to this document's original path.
+    ///
+    /// Keep the file origin after a rename or deletion: recovery, conflict
+    /// handling, and the tab label still need that original identity. The
+    /// destructive-close flow, however, must use Save As when it is gone.
+    fn has_current_save_target(&self) -> bool {
+        self.source_path().is_some_and(Path::is_file)
+    }
+
+    fn file(&self) -> Option<&LoadedFile> {
+        match self {
+            Self::File(file) => Some(file),
+            Self::Memory { .. } => None,
+        }
+    }
+
+    fn file_mut(&mut self) -> Option<&mut LoadedFile> {
+        match self {
+            Self::File(file) => Some(file),
+            Self::Memory { .. } => None,
+        }
+    }
+
+    fn recovery_key(&self) -> RecoveryKey {
+        match self {
+            Self::File(file) => RecoveryKey::for_path(&file.path),
+            Self::Memory { recovery_key } => recovery_key.clone(),
+        }
+    }
 }
 
 impl SaveMode {
@@ -132,14 +204,18 @@ enum SaveIssue {
 }
 
 pub(crate) struct PreparedRecovery {
-    file: LoadedFile,
+    origin: DocumentOrigin,
     document: Document,
     source_conflicted: bool,
 }
 
 impl PreparedRecovery {
-    pub(crate) fn path(&self) -> &Path {
-        &self.file.path
+    pub(crate) fn source_path(&self) -> Option<&Path> {
+        self.origin.source_path()
+    }
+
+    pub(crate) fn recovery_key(&self) -> RecoveryKey {
+        self.origin.recovery_key()
     }
 }
 
@@ -194,8 +270,8 @@ fn reload_failure_issue(kind: std::io::ErrorKind) -> SaveIssue {
 pub struct DocumentView {
     id: DocumentId,
     focus_handle: FocusHandle,
-    /// The file as loaded, including the stamp used for conflict detection.
-    file: LoadedFile,
+    /// Explicitly either a file-backed source or a pathless memory buffer.
+    origin: DocumentOrigin,
     /// Parsed view of the editor's current text.
     document: Document,
     editor: Entity<EditorState>,
@@ -289,20 +365,54 @@ impl DocumentView {
         cx: &mut Context<Self>,
     ) -> Self {
         let document = Document::new(Some(file.path.clone()), file.text.clone());
-        Self::new_with_document(file, document, registry, window, cx)
+        Self::new_with_document(DocumentOrigin::File(file), document, registry, window, cx)
+    }
+
+    /// Create a Markdown buffer before it has any filesystem identity.
+    ///
+    /// An initial paste is unsaved work immediately; an empty New buffer starts
+    /// clean and only joins recovery after its first edit.
+    pub fn new_memory(
+        text: String,
+        registry: Arc<RendererRegistry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let dirty = !text.is_empty();
+        let document = Document::new(None, text);
+        let mut view = Self::new_with_document(
+            DocumentOrigin::Memory {
+                recovery_key: RecoveryKey::new_memory(),
+            },
+            document,
+            registry,
+            window,
+            cx,
+        );
+        view.dirty = dirty;
+        view.revision = u64::from(dirty);
+        view.layout = Layout::Source;
+        view.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
+        view
     }
 
     fn new_with_document(
-        file: LoadedFile,
+        origin: DocumentOrigin,
         document: Document,
         registry: Arc<RendererRegistry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let doc_type = document.doc_type();
+        let text = document.source().to_owned();
+        let language = origin
+            .source_path()
+            .map(editor_language)
+            .unwrap_or(Language::Markdown);
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
-                .language(editor_language(&file.path))
+                .language(language)
                 .line_number(true)
                 .soft_wrap(true)
                 .tab_size(TabSize {
@@ -310,10 +420,10 @@ impl DocumentView {
                     ..Default::default()
                 })
                 .searchable(true)
-                .default_value(file.text.clone())
+                .default_value(text.clone())
         });
 
-        let preview = cx.new(|cx| TextViewState::markdown(&file.text, cx).selectable(true));
+        let preview = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
 
         let subscriptions = vec![cx.subscribe_in(
             &editor,
@@ -333,7 +443,7 @@ impl DocumentView {
         let mut this = Self {
             id: DocumentId::next(),
             focus_handle: cx.focus_handle(),
-            file,
+            origin,
             document,
             editor,
             preview,
@@ -360,15 +470,16 @@ impl DocumentView {
         this
     }
 
-    fn recovery_file(recovered: &RecoveredRecord) -> Result<LoadedFile, String> {
+    fn recovery_origin(recovered: &RecoveredRecord) -> Result<DocumentOrigin, String> {
         let metadata = &recovered.record.metadata;
-        let path = metadata
-            .source_path
-            .clone()
-            .ok_or_else(|| "in-memory recovery requires the new-document flow".to_string())?;
+        let Some(path) = metadata.source_path.clone() else {
+            return Ok(DocumentOrigin::Memory {
+                recovery_key: recovered.record.key.clone(),
+            });
+        };
         let encoding = encoding_rs::Encoding::for_label(metadata.encoding_name.as_bytes())
             .ok_or_else(|| "recovery record names an unsupported encoding".to_string())?;
-        Ok(LoadedFile {
+        Ok(DocumentOrigin::File(LoadedFile {
             path,
             text: recovered.record.text.clone(),
             stamp: metadata.original_stamp.clone(),
@@ -377,14 +488,17 @@ impl DocumentView {
             encoding,
             decode_had_errors: metadata.decode_had_errors,
             source_identity: metadata.source_identity.clone(),
-        })
+        }))
     }
 
     pub(crate) fn prepare_recovery(recovered: RecoveredRecord) -> Result<PreparedRecovery, String> {
-        let file = Self::recovery_file(&recovered)?;
-        let document = Document::new(Some(file.path.clone()), file.text.clone());
+        let origin = Self::recovery_origin(&recovered)?;
+        let document = Document::new(
+            origin.source_path().map(Path::to_path_buf),
+            recovered.record.text.clone(),
+        );
         Ok(PreparedRecovery {
-            file,
+            origin,
             document,
             source_conflicted: recovered.source_conflicted,
         })
@@ -397,11 +511,11 @@ impl DocumentView {
         cx: &mut Context<Self>,
     ) -> Self {
         let PreparedRecovery {
-            file,
+            origin,
             document,
             source_conflicted,
         } = prepared;
-        let mut document = Self::new_with_document(file, document, registry, window, cx);
+        let mut document = Self::new_with_document(origin, document, registry, window, cx);
         document.dirty = true;
         document.revision = 1;
         document.externally_changed = source_conflicted;
@@ -425,15 +539,15 @@ impl DocumentView {
         cx: &mut Context<Self>,
     ) {
         let PreparedRecovery {
-            file,
+            origin,
             document,
             source_conflicted,
         } = prepared;
         let source_conflicted = source_conflicted || self.externally_changed;
-        let text = file.text.clone();
+        let text = document.source().to_owned();
         self._reparse = None;
         self._reload = None;
-        self.file = file;
+        self.origin = origin;
         self.editor.update(cx, |state, cx| {
             state.set_value(text.clone(), window, cx);
         });
@@ -451,8 +565,8 @@ impl DocumentView {
         cx.notify();
     }
 
-    pub fn path(&self) -> &std::path::Path {
-        &self.file.path
+    pub fn source_path(&self) -> Option<&Path> {
+        self.origin.source_path()
     }
 
     /// Whether a filesystem event can affect this document's source.
@@ -462,9 +576,12 @@ impl DocumentView {
     /// Treating only the opened spelling as relevant leaves an unsaved editor
     /// unaware of an external rewrite to the shared target.
     pub fn watches_path(&self, path: &Path) -> bool {
-        paths_match(&self.file.path, path)
+        let Some(file) = self.origin.file() else {
+            return false;
+        };
+        paths_match(&file.path, path)
             || matches!(
-                &self.file.source_identity,
+                &file.source_identity,
                 SourceIdentity::SymbolicLink {
                     resolved_target,
                     ..
@@ -481,23 +598,41 @@ impl DocumentView {
     }
 
     pub fn recovery_key(&self) -> RecoveryKey {
-        RecoveryKey::for_path(&self.file.path)
+        self.origin.recovery_key()
     }
 
     pub fn recovery_checkpoint(&self, cx: &App) -> RecoveryCheckpoint {
+        let metadata = self.origin.file().map_or_else(
+            || RecoveryMetadata {
+                source_path: None,
+                encoding_name: "UTF-8".to_owned(),
+                had_bom: false,
+                newline: Newline::Lf,
+                original_stamp: FileStamp {
+                    modified: None,
+                    len: 0,
+                    digest: [0; 32],
+                    object_id: None,
+                },
+                source_identity: SourceIdentity::Regular,
+                decode_had_errors: false,
+            },
+            RecoveryMetadata::from_loaded_file,
+        );
         RecoveryCheckpoint {
             key: self.recovery_key(),
             text: self.text(cx),
-            metadata: RecoveryMetadata::from_loaded_file(&self.file),
+            metadata,
         }
     }
 
-    /// Whether this document exists on disk.
+    /// Whether normal Save has an existing file destination.
     ///
-    /// A tab for a file that was never saved has no name to show, so the label
-    /// falls back to the first line — see [`Self::title`].
+    /// A file-backed document whose source was renamed or deleted still keeps
+    /// its origin for recovery and conflict handling, but dirty-close Save
+    /// must prompt for Save As instead of attempting a normal Save.
     pub fn is_on_disk(&self) -> bool {
-        self.file.path.is_file()
+        self.origin.has_current_save_target()
     }
 
     /// The tab label.
@@ -514,10 +649,11 @@ impl DocumentView {
     /// warning was the one that lost it. The tab draws it as its own element
     /// now; see `workspace::render_tabs`.
     pub fn title(&self, cx: &App) -> String {
-        if self.is_on_disk() {
+        if self.origin.is_file_backed() {
             return self
-                .file
-                .path
+                .origin
+                .source_path()
+                .expect("file origin has a source path")
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("untitled")
@@ -751,7 +887,10 @@ impl DocumentView {
     /// [`Self::reload_if_clean`], which is involuntary and repeats on every
     /// external write — that one must not block the window.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match fs::load(&self.file.path) {
+        let Some(path) = self.source_path().map(Path::to_path_buf) else {
+            return;
+        };
+        match fs::load(&path) {
             Ok(file) => {
                 let document = Document::with_type(self.document.doc_type(), file.text.clone());
                 self.apply_reload(file, document, window, cx);
@@ -776,7 +915,7 @@ impl DocumentView {
         cx: &mut Context<Self>,
     ) {
         let text = file.text.clone();
-        self.file = file;
+        self.origin = DocumentOrigin::File(file);
         // `set_value` suppresses the `Change` event, so this does not re-enter
         // `on_edit` and mark the document dirty again.
         self.editor.update(cx, |state, cx| {
@@ -820,7 +959,9 @@ impl DocumentView {
         if self.dirty {
             return false;
         }
-        let source_path = self.file.path.clone();
+        let Some(source_path) = self.source_path().map(Path::to_path_buf) else {
+            return false;
+        };
         let source_snapshot = self.async_snapshot(cx);
         let path = source_path.clone();
         let doc_type = self.document.doc_type();
@@ -865,15 +1006,18 @@ impl DocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(current_path) = self.source_path() else {
+            return;
+        };
         if !reload_snapshot_matches(
             source_path,
             source_snapshot,
-            &self.file.path,
+            current_path,
             self.revision,
             &self.text(cx),
             self.source_generation,
         ) {
-            if self.file.path.as_path() == source_path && self.dirty {
+            if current_path == source_path && self.dirty {
                 self.mark_externally_changed(cx);
             }
             return;
@@ -896,12 +1040,15 @@ impl DocumentView {
         error: std::io::Error,
         cx: &mut Context<Self>,
     ) {
-        let same_source = self.file.path.as_path() == source_path
+        let Some(current_path) = self.source_path() else {
+            return;
+        };
+        let same_source = current_path == source_path
             && self.source_generation == source_snapshot.source_generation();
         let snapshot_matches = reload_snapshot_matches(
             source_path,
             source_snapshot,
-            &self.file.path,
+            current_path,
             self.revision,
             &self.text(cx),
             self.source_generation,
@@ -929,19 +1076,27 @@ impl DocumentView {
     /// lifecycle actions use that result as their permission to continue.
     pub fn save(&mut self, mode: SaveMode, cx: &mut Context<Self>) -> bool {
         let text = self.text(cx);
-        let authorization = match mode.authorize(&self.file, &self.save_authorization) {
+        let Some(file) = self.origin.file().cloned() else {
+            cx.emit(DocumentEvent::SaveAsRequested);
+            return false;
+        };
+        let authorization = match mode.authorize(&file, &self.save_authorization) {
             Ok(authorization) => authorization,
             Err(error) => return self.handle_save_error(error, cx),
         };
         self.save_authorization = authorization.clone();
-        match fs::save_with(&self.file, &text, &authorization) {
+        match fs::save_with(&file, &text, &authorization) {
             Ok(saved) => {
-                self.file.stamp = saved.stamp;
-                self.file.text = text;
-                self.file.encoding = saved.encoding;
-                self.file.had_bom = saved.had_bom;
-                self.file.decode_had_errors = false;
-                self.file.source_identity = saved.source_identity;
+                let file = self
+                    .origin
+                    .file_mut()
+                    .expect("a successful file save keeps a file origin");
+                file.stamp = saved.stamp;
+                file.text = text;
+                file.encoding = saved.encoding;
+                file.had_bom = saved.had_bom;
+                file.decode_had_errors = false;
+                file.source_identity = saved.source_identity;
                 self.dirty = false;
                 self.externally_changed = false;
                 self.save_issue = None;
@@ -1012,9 +1167,21 @@ impl DocumentView {
         false
     }
 
-    pub fn save_as(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn save_as(
+        &mut self,
+        path: &std::path::Path,
+        mode: SaveAsMode,
+        cx: &mut Context<Self>,
+    ) -> SaveAsOutcome {
         let text = self.text(cx);
-        match fs::save_as(path, &text, self.file.newline, false) {
+        let newline = self.origin.file().map_or(Newline::Lf, |file| file.newline);
+        let saved = match mode {
+            SaveAsMode::CreateOnly => fs::save_as(path, &text, newline, false),
+            SaveAsMode::Overwrite(authorization) => {
+                fs::overwrite_as_authorized(&authorization, &text, newline, false)
+            }
+        };
+        match saved {
             Ok(file) => {
                 // Dropping the task cancels the common case. `finish_reload`
                 // still checks the captured identity for a result that was
@@ -1022,8 +1189,15 @@ impl DocumentView {
                 self._reload = None;
                 self._reparse = None;
                 self.source_generation = self.source_generation.wrapping_add(1);
-                self.file = file;
+                self.origin = DocumentOrigin::File(file);
                 self.document = Document::new(Some(path.to_path_buf()), text);
+                let doc_type = self.document.doc_type();
+                if !available_layouts(doc_type).contains(&self.layout) {
+                    self.layout = Layout::default_for(doc_type);
+                }
+                self.editor.update(cx, |state, cx| {
+                    state.set_highlighter(editor_language(path), cx);
+                });
                 self.trust = Trust::Restricted;
                 self.dirty = false;
                 self.externally_changed = false;
@@ -1033,8 +1207,9 @@ impl DocumentView {
                 cx.emit(DocumentEvent::Status("Saved".into()));
                 self.rebuild_derived(cx);
                 cx.notify();
-                true
+                SaveAsOutcome::Saved
             }
+            Err(SaveError::DestinationExists) => SaveAsOutcome::DestinationExists,
             Err(SaveError::ConcurrentCommit {
                 preserved_paths,
                 outcome,
@@ -1047,12 +1222,12 @@ impl DocumentView {
                 });
                 cx.emit(DocumentEvent::Status(status));
                 cx.notify();
-                false
+                SaveAsOutcome::Failed
             }
             Err(err) => {
                 cx.emit(DocumentEvent::Status(format!("Save As failed: {err}")));
                 cx.notify();
-                false
+                SaveAsOutcome::Failed
             }
         }
     }
@@ -1166,7 +1341,10 @@ impl DocumentView {
             // truly live trusted preview would need a temporary-file protocol,
             // not a different cache key.
             self.web_html = Some(match self.trust {
-                Trust::Trusted => web::to_file_url(&self.file.path),
+                Trust::Trusted => self
+                    .source_path()
+                    .map(web::to_file_url)
+                    .unwrap_or_else(|| web::build_html_raw(&self.document, Trust::Restricted)),
                 Trust::Restricted => web::build_html_raw(&self.document, self.trust),
             });
             return;
@@ -1325,6 +1503,15 @@ impl DocumentView {
                 )
             })
             .child(
+                Button::new("save-as-document")
+                    .label(i18n::t(i18n::Key::SaveAsPicker, cx))
+                    .accessibility_id(DOCUMENT_SAVE_AS_ACCESSIBILITY_ID)
+                    .xsmall()
+                    .on_click(cx.listener(|_this, _, _, cx| {
+                        cx.emit(DocumentEvent::SaveAsRequested);
+                    })),
+            )
+            .child(
                 Button::new("save")
                     .label(i18n::t(i18n::Key::Save, cx))
                     .xsmall()
@@ -1422,7 +1609,7 @@ impl DocumentView {
                 )
                 .child(
                     Button::new("save-as")
-                        .label("Save As")
+                        .label(i18n::t(i18n::Key::SaveAsPicker, cx))
                         .xsmall()
                         .on_click(cx.listener(|_this, _, _, cx| {
                             cx.emit(DocumentEvent::SaveAsRequested);
@@ -1816,7 +2003,7 @@ fn editor_language(path: &std::path::Path) -> Language {
 /// Compare literal paths first so delete/rename notifications remain useful;
 /// fall back to canonical paths while both ends still exist so equivalent link
 /// spellings identify the same on-disk source.
-fn paths_match(left: &Path, right: &Path) -> bool {
+pub(crate) fn paths_match(left: &Path, right: &Path) -> bool {
     left == right
         || std::fs::canonicalize(left)
             .ok()
@@ -1890,12 +2077,15 @@ mod tests {
     // Import selectively: the `gpui::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
     use super::{
-        AsyncSnapshot, Layout, SaveIssue, available_layouts, editor_language, first_line_title,
-        reload_snapshot_matches,
+        AsyncSnapshot, DocumentView, Layout, SaveIssue, available_layouts, editor_language,
+        first_line_title, reload_snapshot_matches,
     };
+    use crate::fs::{FileStamp, Newline, SourceIdentity};
+    use crate::recovery::{RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord};
     use gpui_component::highlighter::Language;
     use mt_doc::DocType;
     use std::path::Path;
+    use std::time::SystemTime;
 
     /// This file's source between `signature` and the next `end` marker.
     ///
@@ -1913,6 +2103,101 @@ mod tests {
     #[test]
     fn a_buffer_is_named_by_its_first_line() {
         assert_eq!(first_line_title("Design notes\nbody\n"), "Design notes");
+    }
+
+    #[test]
+    fn a_renamed_file_source_is_not_a_normal_save_destination() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let source = dir.path().join("draft.md");
+        std::fs::write(&source, "# Draft\n").expect("source file");
+        let origin = super::DocumentOrigin::File(crate::fs::load(&source).expect("loaded source"));
+
+        assert!(origin.has_current_save_target());
+
+        let renamed = dir.path().join("renamed.md");
+        std::fs::rename(&source, &renamed).expect("rename source");
+
+        assert!(
+            !origin.has_current_save_target(),
+            "the stale source path must route dirty-close Save through Save As"
+        );
+        assert_eq!(
+            origin.source_path(),
+            Some(source.as_path()),
+            "renaming must not erase the file origin needed by recovery and conflict handling"
+        );
+
+        let is_on_disk = fn_body("pub fn is_on_disk", "\n    /// The tab label.");
+        assert!(is_on_disk.contains("self.origin.has_current_save_target()"));
+        let title = fn_body("pub fn title", "\n    pub fn is_dirty");
+        assert!(
+            title.contains("self.origin.is_file_backed()"),
+            "a missing file source must retain its filename tab label"
+        );
+    }
+
+    #[test]
+    fn the_document_toolbar_exposes_an_explicit_save_as_command() {
+        let toolbar = fn_body("fn render_toolbar", "\n    /// The banner shown");
+        assert!(toolbar.contains("Button::new(\"save-as-document\")"));
+        assert!(toolbar.contains("Key::SaveAsPicker"));
+        assert!(toolbar.contains("DOCUMENT_SAVE_AS_ACCESSIBILITY_ID"));
+        assert!(toolbar.contains("DocumentEvent::SaveAsRequested"));
+    }
+
+    #[test]
+    fn memory_recovery_preparation_preserves_the_stored_key_without_a_path() {
+        let key = RecoveryKey::new_memory();
+        let recovered = RecoveredRecord {
+            record: RecoveryRecord {
+                key: key.clone(),
+                text: "# Pasted prompt\n".to_string(),
+                metadata: RecoveryMetadata {
+                    source_path: None,
+                    encoding_name: "UTF-8".to_string(),
+                    had_bom: false,
+                    newline: Newline::Lf,
+                    original_stamp: FileStamp {
+                        modified: None,
+                        len: 0,
+                        digest: [0; 32],
+                        object_id: None,
+                    },
+                    source_identity: SourceIdentity::Regular,
+                    decode_had_errors: false,
+                },
+                checkpointed_at: SystemTime::now(),
+            },
+            source_conflicted: false,
+        };
+
+        let prepared = DocumentView::prepare_recovery(recovered).expect("memory recovery prepares");
+        assert_eq!(prepared.source_path(), None);
+        assert_eq!(prepared.recovery_key(), key);
+        assert_eq!(prepared.document.source(), "# Pasted prompt\n");
+    }
+
+    #[test]
+    fn memory_documents_start_as_markdown_and_checkpoint_without_a_source_path() {
+        let source = crate::views::production_source(include_str!("document.rs"));
+        let constructor = source
+            .split_once("pub fn new_memory")
+            .expect("memory constructor")
+            .1
+            .split_once("fn new_with_document")
+            .unwrap()
+            .0;
+        assert!(constructor.contains("Document::new(None, text)"));
+        assert!(constructor.contains("RecoveryKey::new_memory()"));
+        assert!(constructor.contains("view.dirty = dirty"));
+        assert!(constructor.contains("view.revision = u64::from(dirty)"));
+
+        let checkpoint = fn_body(
+            "pub fn recovery_checkpoint",
+            "\n    /// Whether this document",
+        );
+        assert!(checkpoint.contains("source_path: None"));
+        assert!(checkpoint.contains("RecoveryMetadata::from_loaded_file"));
     }
 
     #[test]
@@ -1981,10 +2266,22 @@ mod tests {
     #[test]
     fn save_as_consumes_the_single_verified_filesystem_result() {
         let body = fn_body(
-            "pub fn save_as(&mut self",
+            "pub(crate) fn save_as(",
             "\n    /// Called on every keystroke",
         );
-        assert!(body.contains("match fs::save_as(path, &text, self.file.newline, false)"));
+        assert!(body.contains(
+            "let newline = self.origin.file().map_or(Newline::Lf, |file| file.newline);"
+        ));
+        assert!(
+            body.contains("SaveAsMode::CreateOnly => fs::save_as(path, &text, newline, false)")
+        );
+        assert!(body.contains("SaveAsMode::Overwrite(authorization)"));
+        assert!(
+            body.contains("fs::overwrite_as_authorized(&authorization, &text, newline, false)")
+        );
+        assert!(
+            body.contains("Err(SaveError::DestinationExists) => SaveAsOutcome::DestinationExists")
+        );
         assert!(
             !body.contains("fs::load(path)") && !body.contains("file.text = text"),
             "Save As must not load a separately observed path or overwrite the verified text"
@@ -2008,7 +2305,7 @@ mod tests {
     #[test]
     fn successful_save_as_restricts_the_new_source_before_web_rebuild() {
         let body = fn_body(
-            "pub fn save_as(&mut self",
+            "pub(crate) fn save_as(",
             "\n    /// Called on every keystroke",
         );
         let success = &body[body.find("Ok(file) => {").expect("the success branch")
@@ -2020,7 +2317,7 @@ mod tests {
             .find("self.source_generation = self.source_generation.wrapping_add(1);")
             .expect("Save As must change the source generation");
         let file = success
-            .find("self.file = file;")
+            .find("self.origin = DocumentOrigin::File(file);")
             .expect("Save As must install the verified file");
         let document = success
             .find("self.document = Document::new")
@@ -2041,6 +2338,52 @@ mod tests {
             !success.contains("set_trust("),
             "set_trust would rebuild the old source before Save As installs the new identity"
         );
+    }
+
+    #[test]
+    fn successful_save_as_reconciles_layout_and_editor_language_with_the_new_path() {
+        let body = fn_body(
+            "pub(crate) fn save_as(",
+            "\n    /// Called on every keystroke",
+        );
+        let success = &body[body.find("Ok(file) => {").expect("the success branch")
+            ..body
+                .find("Err(SaveError::ConcurrentCommit")
+                .expect("the first failure branch")];
+
+        let document = success
+            .find("self.document = Document::new")
+            .expect("Save As must parse the new path's document type");
+        let doc_type = success
+            .find("let doc_type = self.document.doc_type();")
+            .expect("Save As must use the new document type");
+        let layout_check = success
+            .find("!available_layouts(doc_type).contains(&self.layout)")
+            .expect("Save As must reject a layout the new type cannot render");
+        let layout_fallback = success
+            .find("self.layout = Layout::default_for(doc_type);")
+            .expect("Save As must choose a usable layout for the new type");
+        let highlighter = success
+            .find("state.set_highlighter(editor_language(path), cx)")
+            .expect("Save As must refresh syntax highlighting from the new path");
+        let rebuild = success
+            .find("self.rebuild_derived(cx);")
+            .expect("Save As must rebuild the new source");
+
+        assert!(
+            document < doc_type
+                && doc_type < layout_check
+                && layout_check < layout_fallback
+                && layout_fallback < highlighter
+                && highlighter < rebuild,
+            "the new type, usable layout, and language must be installed before rebuilding"
+        );
+
+        assert!(!available_layouts(DocType::Html).contains(&Layout::Native));
+        assert_eq!(Layout::default_for(DocType::Html), Layout::Web);
+        assert!(!available_layouts(DocType::Text).contains(&Layout::Native));
+        assert_eq!(Layout::default_for(DocType::Text), Layout::Source);
+        assert_eq!(editor_language(Path::new("after.rs")), Language::Rust);
     }
 
     #[test]
@@ -2077,7 +2420,7 @@ mod tests {
         );
 
         let save_as = fn_body(
-            "pub fn save_as(&mut self",
+            "pub(crate) fn save_as(",
             "\n    /// Called on every keystroke",
         );
         assert!(
@@ -2525,7 +2868,7 @@ mod tests {
         let source = crate::views::production_source(include_str!("document.rs"));
         let start = source.find("pub fn new(").expect("DocumentView::new");
         let body = &source[start..];
-        let end = body.find("\n    pub fn path(").unwrap_or(body.len());
+        let end = body.find("\n    pub fn source_path(").unwrap_or(body.len());
         let body = &body[..end];
 
         assert!(

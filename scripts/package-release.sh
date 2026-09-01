@@ -166,7 +166,8 @@ diagrams, skills, and translation.
 ```sh
 markturbo /path/to/your/repo     # a directory becomes the workspace
 markturbo /path/to/NOTES.md      # a file opens with its folder as the workspace
-markturbo                        # no argument: the current directory
+markturbo                        # no argument: the welcome screen
+markturbo .                      # open the current directory
 ```
 
 Or drag a file or folder onto the window. A folder becomes the workspace; a

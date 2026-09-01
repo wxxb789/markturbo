@@ -9,9 +9,10 @@ use std::{
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    process,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -42,6 +43,7 @@ const RETIREMENT_MARKER_PREFIX: &str = ".markturbo-recovery-retiring-";
 const RETIREMENT_MARKER_VERSION: u8 = 1;
 const MAX_PARALLEL_RECOVERY_WORKERS: usize = 4;
 const CHECKPOINT_WAVE_METADATA_OVERHEAD_BYTES: u64 = 4 * 1024;
+static NEXT_MEMORY_RECOVERY_KEY: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 const LOCAL_RECOVERY_ROOT_REQUIRED: &str = "recovery root must be on a local volume";
 #[cfg(windows)]
@@ -97,6 +99,24 @@ impl RecoveryKey {
         let mut hasher = Sha256::new();
         hasher.update(b"markturbo-recovery-document-v1\0");
         hasher.update(document_id.as_bytes());
+        Self(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Generate a process-crossing opaque key for a buffer with no source
+    /// path. The sequence makes calls unique inside one process; process ID and
+    /// wall-clock nanoseconds distinguish separately started application
+    /// processes without introducing a random-number dependency.
+    pub fn new_memory() -> Self {
+        let sequence = NEXT_MEMORY_RECOVERY_KEY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(b"markturbo-recovery-memory-v1\0");
+        hasher.update(process::id().to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        hasher.update(sequence.to_le_bytes());
         Self(format!("{:x}", hasher.finalize()))
     }
 
@@ -4108,6 +4128,16 @@ mod tests {
             text: text.to_owned(),
             metadata: metadata(),
         }
+    }
+
+    #[test]
+    fn new_memory_keys_are_unique_and_valid_recovery_identifiers() {
+        let first = RecoveryKey::new_memory();
+        let second = RecoveryKey::new_memory();
+
+        assert_ne!(first, second);
+        assert!(first.is_valid());
+        assert!(second.is_valid());
     }
 
     #[test]
