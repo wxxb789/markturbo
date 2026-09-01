@@ -241,6 +241,15 @@ the same bytes and timestamps. A mismatch refuses the normal Save and the user
 chooses reload, overwrite, recreation, conversion, or Save As as the case
 requires.
 
+Save As has a separate two-step authorization. The first filesystem operation
+is create-only and refuses every existing directory entry, including a symbolic
+link. Only an explicit **Replace** decision calls the overwrite path, which
+captures and rechecks the selected destination before commit. Cancelling either
+the picker or Replace leaves the editor and destination byte-identical. A
+successful Save As consumes the single verified `LoadedFile` returned by the
+filesystem layer, migrates tab and recovery identity to the new path, and
+invalidates asynchronous results that still belong to the old source.
+
 Those choices are explicit capabilities, not independent `bool` flags. A
 `SaveAuthorization` begins as a normal Save; an overwrite captures the exact
 current `FileStamp` of the resolved destination, and a missing-file decision
@@ -263,7 +272,11 @@ rather than claiming an impossible guarantee for every concurrent actor.
 
 Saving through a supported symbolic link preserves the link itself and updates
 its resolved target. The watcher maps changes observed on that resolved target
-back to documents opened through the link.
+back to documents opened through the link. The workspace root remains the
+primary recursive watch, but Open File and Save As register an additional
+parent when a document lives outside that root. Explorer and Harness refreshes
+remain scoped to the primary root; document conflict detection receives events
+from every registered document parent.
 
 Three properties of the bytes survive a round trip: **line endings**, **BOM**,
 and **encoding**. The third was the expensive one to get wrong. Reading every
@@ -284,8 +297,11 @@ Closing a dirty tab, closing the window, and replacing the workspace all pass
 through one lifecycle decision. The decision walks every affected dirty buffer
 and requires **Save**, **Discard**, or **Cancel** before the destructive action
 can proceed. A Save must succeed before its buffer is released. The lifecycle
-model also represents memory-origin documents, so a future new-document flow
-uses the same boundary rather than a separate close path.
+model also represents memory-origin documents. Saving one during a destructive
+decision suspends that exact request while Save As runs; only a successful write
+resumes the close or workspace replacement. Picker cancellation, Replace
+cancellation, write failure, or a changed editor snapshot keeps the document
+open on the same recovery path.
 
 The destructive coordinator revalidates the affected documents immediately
 before destruction. If another document becomes dirty, or a prompted document's
@@ -471,7 +487,8 @@ source paths against `self.root`. Tab deduplication compares the stored paths
 lexically, so equivalent canonical, relative, or link spellings can still be
 distinct. A record from another workspace can therefore appear in that startup
 window; matching-workspace recovery scoping does not exist yet. In-memory record
-restoration is reserved for the Goal 03 new-document flow.
+restoration creates an independent pathless Markdown tab and preserves the
+record's process-independent recovery key until Save As retires it.
 
 ### Settings: a file a person opens
 
@@ -482,9 +499,10 @@ reason — the file is a user-facing artifact, not an internal cache.
 TOML over JSON because a settings file is something people edit: it takes
 comments, and it does not fail on a trailing comma. The format imposes one
 constraint on the code, which is worth knowing before adding a field: every
-scalar must be written before any table, so `AppSettings` must stay flat. A
-nested struct or map would serialize to a document `toml` itself refuses to read
-back. `the_settings_document_is_flat_enough_for_toml_to_read_back` holds that.
+scalar must be written before any table. `AppSettings` therefore keeps its
+ordinary scalar preferences first and the sole `[[recent-targets]]` array table
+last. `the_settings_document_serializes_recent_targets_last_and_reads_back`
+holds that ordering and round trip.
 
 The directory comes from `dirs` rather than four `cfg` branches. Windows and
 Linux land where they did; macOS moved from `~/.config/markturbo` to
@@ -501,6 +519,21 @@ it.
 `NotifyGlobalObservers` effect — so the notification was always being sent and
 nobody was listening. A single `observe_global` subscription is the backstop for
 the writers that are not the settings page.
+
+A no-argument launch deliberately shows the Welcome state; `markturbo .` is the
+explicit terminal form for opening the current directory, and any other path
+argument still bypasses Welcome. **Don't show this again** persists one scalar
+preference and immediately opens a pathless Markdown buffer; later no-argument
+launches do the same. Welcome stores at most ten MRU file or workspace paths,
+their kind, and a display name. It stores no document content. Missing or
+mismatched entries remain visible and removable, while valid entries re-enter
+the same file/workspace open paths used by pickers and drag-and-drop.
+The ten-target bound is covered in settings state by
+`settings::tests::recent_targets_are_mru_deduplicated_and_capped` and across a
+restart by the native acceptance harness scenario `recent_bound_restart_stale`
+in `scripts/goal-03-native-acceptance.py`, which loads eleven isolated persisted
+targets, requires exactly ten Welcome recent controls, restarts, and proves a
+missing entry remains visibly marked and inert.
 
 ### Background parsing
 

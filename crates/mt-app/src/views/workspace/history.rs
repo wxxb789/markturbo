@@ -127,7 +127,7 @@ impl Workspace {
         self.history.navigating = true;
         self.open_file_as(visit.path.clone(), true, window, cx);
         if let Some(doc) = self.active_document().cloned()
-            && doc.read(cx).path() == visit.path
+            && doc.read(cx).source_path() == Some(visit.path.as_path())
         {
             doc.update(cx, |doc, cx| doc.reveal_offset(visit.offset, window, cx));
         }

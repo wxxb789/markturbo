@@ -9,9 +9,10 @@ use std::{
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    process,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -42,6 +43,7 @@ const RETIREMENT_MARKER_PREFIX: &str = ".markturbo-recovery-retiring-";
 const RETIREMENT_MARKER_VERSION: u8 = 1;
 const MAX_PARALLEL_RECOVERY_WORKERS: usize = 4;
 const CHECKPOINT_WAVE_METADATA_OVERHEAD_BYTES: u64 = 4 * 1024;
+static NEXT_MEMORY_RECOVERY_KEY: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 const LOCAL_RECOVERY_ROOT_REQUIRED: &str = "recovery root must be on a local volume";
 #[cfg(windows)]
@@ -97,6 +99,24 @@ impl RecoveryKey {
         let mut hasher = Sha256::new();
         hasher.update(b"markturbo-recovery-document-v1\0");
         hasher.update(document_id.as_bytes());
+        Self(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Generate a process-crossing opaque key for a buffer with no source
+    /// path. The sequence makes calls unique inside one process; process ID and
+    /// wall-clock nanoseconds distinguish separately started application
+    /// processes without introducing a random-number dependency.
+    pub fn new_memory() -> Self {
+        let sequence = NEXT_MEMORY_RECOVERY_KEY.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(b"markturbo-recovery-memory-v1\0");
+        hasher.update(process::id().to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        hasher.update(sequence.to_le_bytes());
         Self(format!("{:x}", hasher.finalize()))
     }
 
@@ -486,6 +506,7 @@ struct TestFailurePoints {
     checkpoint_batches: AtomicUsize,
     after_checkpoint_prepare: Mutex<Option<TestPause>>,
     after_checkpoint_final_check: Mutex<Option<TestPause>>,
+    after_retirement_marker: Mutex<Option<TestPause>>,
     before_transaction_journal: Mutex<Option<TestPause>>,
     after_transaction_journal: Mutex<Option<TestPause>>,
     after_eviction_reservation: Mutex<Option<TestPause>>,
@@ -1370,6 +1391,9 @@ impl RecoveryStore {
             return Err(error);
         }
 
+        #[cfg(test)]
+        self.pause_once_for_test(&self.failures.after_retirement_marker);
+
         let mut state = self.lock_capabilities();
         if !batch
             .keys
@@ -1696,7 +1720,7 @@ impl RecoveryStore {
                 return Ok(CheckpointWriteResult::Superseded);
             }
             #[cfg(test)]
-            self.pause_checkpoint_write_once_for_test(&self.failures.after_checkpoint_final_check);
+            self.pause_once_for_test(&self.failures.after_checkpoint_final_check);
             self.persist_prepared_write(prepared, &target_path)
                 .map_err(CheckpointWriteError::Uncertain)?;
         } else {
@@ -1908,7 +1932,7 @@ impl RecoveryStore {
             return Ok(CheckpointWriteResult::Deferred);
         }
         #[cfg(test)]
-        self.pause_checkpoint_write_once_for_test(&self.failures.after_eviction_reservation);
+        self.pause_once_for_test(&self.failures.after_eviction_reservation);
 
         for entry in &transaction.staged {
             if let Err(error) = self.rename_path(
@@ -2709,6 +2733,13 @@ impl RecoveryStore {
     }
 
     #[cfg(test)]
+    fn pause_after_retirement_marker_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.install_test_pause(&self.failures.after_retirement_marker)
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_before_transaction_journal_for_test(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -2756,7 +2787,7 @@ impl RecoveryStore {
     }
 
     #[cfg(test)]
-    fn pause_checkpoint_write_once_for_test(&self, slot: &Mutex<Option<TestPause>>) {
+    fn pause_once_for_test(&self, slot: &Mutex<Option<TestPause>>) {
         let Some(pause) = slot.lock().unwrap().take() else {
             return;
         };
@@ -4108,6 +4139,16 @@ mod tests {
             text: text.to_owned(),
             metadata: metadata(),
         }
+    }
+
+    #[test]
+    fn new_memory_keys_are_unique_and_valid_recovery_identifiers() {
+        let first = RecoveryKey::new_memory();
+        let second = RecoveryKey::new_memory();
+
+        assert_ne!(first, second);
+        assert!(first.is_valid());
+        assert!(second.is_valid());
     }
 
     #[test]
@@ -6237,6 +6278,8 @@ mod tests {
         let token = store.current_token(&item.key);
         let (checkpoint_paused, release_checkpoint) =
             store.pause_after_checkpoint_final_check_for_test();
+        let (retirement_marker_persisted, release_retirement) =
+            store.pause_after_retirement_marker_for_test();
         let store_ref = &store;
         let item_ref = &item;
 
@@ -6256,9 +6299,13 @@ mod tests {
                     .send(store_ref.begin_retirement(&item_ref.key).unwrap())
                     .unwrap();
             });
-            let ticket = ticket_receiver
-                .recv_timeout(Duration::from_millis(250))
-                .ok();
+            let marker_persisted = retirement_marker_persisted
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+            let _ = release_retirement.send(());
+            let ticket = marker_persisted
+                .then(|| ticket_receiver.recv_timeout(Duration::from_secs(5)).ok())
+                .flatten();
 
             release_checkpoint.send(()).unwrap();
             assert!(matches!(
@@ -6266,6 +6313,10 @@ mod tests {
                 CheckpointOutcome::Written(_)
             ));
             retirement.join().unwrap();
+            assert!(
+                marker_persisted,
+                "retirement marker persistence must not wait for recovery I/O"
+            );
             ticket.expect("begin_retirement must not wait for recovery I/O")
         });
 

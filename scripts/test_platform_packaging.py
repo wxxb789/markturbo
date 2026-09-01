@@ -126,6 +126,42 @@ def create_linux_release(root: Path, binary_prefix: str = "") -> Path:
     return release
 
 
+def create_macos_packaging_fixture(root: Path) -> Path:
+    script = root / "scripts" / "package-release.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(PACKAGE_SCRIPT, script)
+
+    (root / "Cargo.toml").write_text('version = "1.2.3"\n', encoding="utf-8")
+    (root / "README.md").write_text("readme\n", encoding="utf-8")
+    (root / "LICENSE").write_text("license\n", encoding="utf-8")
+    (root / "docs").mkdir()
+    (root / "docs" / "architecture.md").write_text("architecture\n", encoding="utf-8")
+    (root / "docs" / "platforms.md").write_text("platforms\n", encoding="utf-8")
+    (root / "sample").mkdir()
+    (root / "sample" / "README.md").write_text("sample\n", encoding="utf-8")
+
+    icons = root / "crates" / "mt-app" / "resources" / "icons"
+    macos = root / "crates" / "mt-app" / "resources" / "macos"
+    icons.mkdir(parents=True)
+    macos.mkdir(parents=True)
+    (icons / "markturbo.icns").write_text("icon\n", encoding="utf-8")
+    (macos / "Info.plist.in").write_text(
+        "<plist><dict><string>@SHORT_VERSION@</string><string>@BUNDLE_VERSION@</string></dict></plist>\n",
+        encoding="utf-8",
+    )
+
+    fonts = root / "fonts" / "katex"
+    fonts.mkdir(parents=True)
+    for index in range(19):
+        (fonts / f"KaTeX_{index}.ttf").write_text("font\n", encoding="utf-8")
+    (fonts / "LICENSE.md").write_text("font license\n", encoding="utf-8")
+
+    binary = root / "target" / "release" / "markturbo"
+    binary.parent.mkdir(parents=True)
+    write_release_binary(binary, "markturbo ")
+    return script
+
+
 class PlatformPackagingTests(unittest.TestCase):
     def test_linux_installer_installs_a_discoverable_user_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -310,6 +346,59 @@ class PlatformPackagingTests(unittest.TestCase):
                 )
                 self.assertNotEqual(invalid.returncode, 0)
                 self.assertIn("unsupported macOS bundle version", invalid.stderr)
+
+    def test_macos_bundle_locates_the_sample_beside_the_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = create_macos_packaging_fixture(root)
+            tools = root / "tools"
+            tools.mkdir()
+            (tools / "cargo").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (tools / "rustc").write_text(
+                "#!/usr/bin/env bash\nprintf 'host: aarch64-apple-darwin\\n'\n",
+                encoding="utf-8",
+            )
+            (tools / "plutil").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (tools / "ln").write_text(
+                "#!/usr/bin/env bash\nprintf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$3\" >> \"${MARKTURBO_TEST_LN_LOG:?}\"\n",
+                encoding="utf-8",
+            )
+            for tool in tools.iterdir():
+                tool.chmod(0o755)
+
+            link_log = root / "link-log"
+            environment = os.environ.copy()
+            environment["MARKTURBO_TEST_LN_LOG"] = shell_path(link_log)
+            result = run_bash(
+                "-c",
+                'PATH="$1:$PATH"; export PATH; exec bash "$2"',
+                "--",
+                shell_path(tools),
+                shell_path(script),
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            release = root / "dist" / "markturbo-1.2.3-aarch64-apple-darwin"
+            bundled_sample = release / "markturbo.app" / "Contents" / "Resources" / "sample"
+            executable_sample = release / "markturbo.app" / "Contents" / "MacOS" / "sample"
+            cli_sample = release / "sample"
+            link_calls = {
+                tuple(line.split("\t")) for line in link_log.read_text(encoding="utf-8").splitlines()
+            }
+
+            with self.subTest("stores one sample copy in the app bundle"):
+                self.assertEqual((bundled_sample / "README.md").read_text(encoding="utf-8"), "sample\n")
+            with self.subTest("runtime lookup follows a relative link beside the executable"):
+                self.assertIn(
+                    ("-s", "../Resources/sample", shell_path(executable_sample)),
+                    link_calls,
+                )
+            with self.subTest("CLI and documentation retain a relative root sample path"):
+                self.assertIn(
+                    ("-s", "markturbo.app/Contents/Resources/sample", shell_path(cli_sample)),
+                    link_calls,
+                )
 
 
 if __name__ == "__main__":

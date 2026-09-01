@@ -4,6 +4,7 @@
 //! silently working from stale text. Debounced: an agent rewriting a tree
 //! produces bursts of events, and re-reading per event would thrash.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
@@ -42,6 +43,7 @@ pub struct Watcher {
     _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<Vec<DebouncedEvent>>,
     root: PathBuf,
+    document_directories: HashSet<PathBuf>,
 }
 
 /// Debounce window. Long enough to coalesce an agent's multi-file write, short
@@ -83,7 +85,44 @@ impl Watcher {
             _debouncer: debouncer,
             rx,
             root: root.to_path_buf(),
+            document_directories: HashSet::new(),
         })
+    }
+
+    /// Match the non-recursive watches to the parents of open documents.
+    ///
+    /// Save As and Open File can give a document a path outside the workspace
+    /// tree. Those parents remain bounded by the open tab set and disappear
+    /// when the last document using them closes or moves.
+    pub fn sync_document_directories(
+        &mut self,
+        directories: impl IntoIterator<Item = PathBuf>,
+    ) -> anyhow::Result<()> {
+        let desired: HashSet<_> = directories
+            .into_iter()
+            .filter(|directory| !directory.starts_with(&self.root))
+            .collect();
+
+        let removed: Vec<_> = self
+            .document_directories
+            .difference(&desired)
+            .cloned()
+            .collect();
+        for directory in removed {
+            self._debouncer.unwatch(&directory)?;
+            self.document_directories.remove(&directory);
+        }
+
+        let added: Vec<_> = desired
+            .difference(&self.document_directories)
+            .cloned()
+            .collect();
+        for directory in added {
+            self._debouncer
+                .watch(&directory, RecursiveMode::NonRecursive)?;
+            self.document_directories.insert(directory);
+        }
+        Ok(())
     }
 
     /// Drain pending changes without blocking.
@@ -94,7 +133,7 @@ impl Watcher {
         let mut changes = Vec::new();
         while let Ok(events) = self.rx.try_recv() {
             for event in events {
-                changes.extend(classify(&event, &self.root));
+                changes.extend(classify(&event, &self.root, &self.document_directories));
             }
         }
         dedup(changes)
@@ -115,13 +154,24 @@ impl Watcher {
 /// tree that would have displayed it did not.
 use mt_doc::walk::is_noise_path as is_noise;
 
-fn classify(event: &DebouncedEvent, root: &Path) -> Vec<Change> {
+fn classify(
+    event: &DebouncedEvent,
+    root: &Path,
+    document_directories: &HashSet<PathBuf>,
+) -> Vec<Change> {
     use notify::EventKind;
 
     event
         .paths
         .iter()
-        .filter(|p| !is_noise(p, root))
+        .filter(|path| {
+            let root = std::iter::once(root)
+                .chain(document_directories.iter().map(PathBuf::as_path))
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .unwrap_or(root);
+            !is_noise(path, root)
+        })
         .filter_map(|path| {
             let path = path.clone();
             Some(match event.kind {
@@ -190,6 +240,46 @@ mod tests {
 
         let change = wait_for(&watcher, |c| c.path().ends_with("a.md"));
         assert!(change.is_some(), "expected a change for a.md");
+    }
+
+    #[test]
+    fn detects_a_change_in_an_added_directory_outside_the_primary_root() {
+        let primary = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let path = external.path().join("saved-as.md");
+        std::fs::write(&path, "one\n").unwrap();
+
+        let mut watcher = Watcher::new(primary.path()).unwrap();
+        watcher
+            .sync_document_directories([external.path().to_path_buf()])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(&path, "two\n").unwrap();
+
+        let change = wait_for(&watcher, |c| c.path().ends_with("saved-as.md"));
+        assert!(
+            change.is_some(),
+            "expected a change outside the primary root"
+        );
+    }
+
+    #[test]
+    fn syncing_document_directories_drops_roots_no_open_document_uses() {
+        let primary = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut watcher = Watcher::new(primary.path()).unwrap();
+
+        watcher
+            .sync_document_directories([first.path().to_path_buf(), second.path().to_path_buf()])
+            .unwrap();
+        assert_eq!(watcher.document_directories.len(), 2);
+
+        watcher
+            .sync_document_directories([second.path().to_path_buf()])
+            .unwrap();
+        assert_eq!(watcher.document_directories.len(), 1);
+        assert!(watcher.document_directories.contains(second.path()));
     }
 
     #[test]
