@@ -1,212 +1,6 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
-"""Unit tests for goal-02-native-acceptance.py without launching a UI."""
+"""Goal 02 native harness tests without launching a UI."""
 
-from __future__ import annotations
-
-import copy
-import hashlib
-import json
-import runpy
-import struct
-import sys
-import tempfile
-import unittest
-from pathlib import Path
-from unittest import mock
-
-
-SCRIPT = Path(__file__).with_name("goal-02-native-acceptance.py")
-PYWINAUTO_WAS_LOADED = "pywinauto" in sys.modules
-HARNESS = runpy.run_path(SCRIPT)
-
-BUILD_CLI_COMMAND = HARNESS["build_cli_command"]
-BUILD_LAUNCH_SPEC = HARNESS["build_launch_spec"]
-CHECKPOINT_SUCCESS_PRESENT = HARNESS["checkpoint_success_present"]
-COMPLETE_EVIDENCE = HARNESS["complete_evidence"]
-DOCUMENT_SENTINEL = HARNESS["DOCUMENT_SENTINEL"]
-EXECUTABLE_HASH_FAILURE = HARNESS["executable_hash_failure"]
-FINGERPRINT_TEXT = HARNESS["fingerprint_text"]
-HARNESS_BLOCKED = HARNESS["HarnessBlocked"]
-HARNESS_FAILURE = HARNESS["HarnessFailure"]
-INSPECT_PE_BYTES = HARNESS["inspect_pe_bytes"]
-LAYOUT_SOURCE_AUTOMATION_ID = HARNESS["LAYOUT_SOURCE_AUTOMATION_ID"]
-NATIVE_HARNESS = HARNESS["NativeHarness"]
-NEW_EVIDENCE = HARNESS["new_evidence"]
-NORMALIZE_EXPECTED_HASH = HARNESS["normalize_expected_hash"]
-PARSE_ARGS = HARNESS["parse_args"]
-PARSE_OUTCOME_LINE = HARNESS["parse_outcome_line"]
-PLATFORM_PREFLIGHT_FAILURE = HARNESS["platform_preflight_failure"]
-REQUIRED_CASE_IDS = HARNESS["REQUIRED_CASE_IDS"]
-RUN = HARNESS["run"]
-RUNTIME_ARTIFACT_SCAN = HARNESS["scan_runtime_artifacts"]
-LIVE_RECOVERY_SCAN = HARNESS["scan_live_recovery_records"]
-RECOVERY_STARTUP_FINISHED_PRESENT = HARNESS["recovery_startup_finished_present"]
-SECURITY_CONTEXT = HARNESS["SecurityContext"]
-SECURITY_CONTEXT_FAILURE = HARNESS["security_context_failure"]
-SAFE_EXCEPTION_NAME = HARNESS["safe_exception_name"]
-SAFE_FAILURE_TYPE = HARNESS["safe_failure_type"]
-VALIDATE_EVIDENCE = HARNESS["validate_evidence"]
-WAIT_UNTIL = HARNESS["wait_until"]
-SOURCE_EDITOR_AUTOMATION_ID = HARNESS["SOURCE_EDITOR_AUTOMATION_ID"]
-TAB_CLOSE_AUTOMATION_ID = HARNESS["TAB_CLOSE_AUTOMATION_ID"]
-CONFLICT_OVERWRITE_AUTOMATION_ID = HARNESS["CONFLICT_OVERWRITE_AUTOMATION_ID"]
-VK_A = HARNESS["VK_A"]
-VK_BACK = HARNESS["VK_BACK"]
-
-HASH = "a" * 64
-SAME_AS_RAW = object()
-
-
-def valid_evidence() -> dict:
-    evidence = NEW_EVIDENCE(HASH)
-    evidence["executable"].update(
-        {
-            "sha256": HASH,
-            "byte_count": 1234,
-            "hash_verified": True,
-            "copied_sha256": HASH,
-            "copy_hash_verified": True,
-            "format": "PE32+",
-            "machine": "x86_64",
-            "machine_code": 0x8664,
-            "optional_magic": 0x20B,
-        }
-    )
-    evidence["environment"] = {
-        "platform": "Windows 11",
-        "windows_major": 10,
-        "windows_build": 22631,
-        "architecture": "x86_64",
-        "native_machine_code": 0x8664,
-        "python_pointer_bits": 64,
-        "wts_state": "WTSActive",
-        "input_desktop": "Default",
-        "thread_desktop": "Default",
-        "harness_process": {
-            "session_id": 1,
-            "integrity_rid": 0x2000,
-            "integrity": "medium",
-        },
-    }
-    process_context = {"session_id": 1, "integrity_rid": 0x2000, "integrity": "medium"}
-    runtime_scan = {
-        "files_scanned": 4,
-        "app_logs_scanned": 1,
-        "recovery_artifacts_scanned": 2,
-        "canonical_recovery_records_scanned": 1,
-        "recovery_leases_scanned": 1,
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-        "panic_absent": True,
-        "refcell_absent": True,
-    }
-
-    def fp(value: bytes) -> dict[str, int | str]:
-        return {"byte_count": len(value), "sha256": hashlib.sha256(value).hexdigest()}
-
-    original = fp(b"orig")
-    edited = fp(b"edit")
-    external = fp(b"swap")
-    canonical_record = fp(b"ciphertext")
-    live_recovery_scan = {
-        "canonical_record_count": 1,
-        "canonical_records": [canonical_record],
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-    }
-    observations = {
-        REQUIRED_CASE_IDS[0]: {
-            "editor": edited,
-            "source_before": original,
-            "source_after_cancel_save": edited,
-            "cancel_kept_tab": True,
-            "flow": "pointer tab-close -> Cancel -> SendInput Ctrl+S",
-            "process_context": process_context,
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan,
-        },
-        REQUIRED_CASE_IDS[1]: {
-            "discarded_editor": edited,
-            "source_before": original,
-            "source_after_discard": original,
-            "discard_closed_tab": True,
-            "flow": "SendInput Ctrl+W -> Discard",
-            "process_context": process_context,
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan,
-        },
-        REQUIRED_CASE_IDS[2]: {
-            "editor": edited,
-            "saved_source": edited,
-            "flow": "WM_CLOSE -> Save",
-            "window_exited": True,
-            "process_context": process_context,
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan,
-        },
-        REQUIRED_CASE_IDS[3]: {
-            "loaded_source": original,
-            "external_source": external,
-            "dirty_editor": edited,
-            "saved_after_explicit_overwrite": edited,
-            "same_length": True,
-            "same_mtime_ns": True,
-            "watcher_conflict_before_save": True,
-            "explicit_overwrite_used": True,
-            "flow": "watcher conflict -> explicit Overwrite",
-            "process_context": process_context,
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan,
-        },
-        REQUIRED_CASE_IDS[4]: {
-            "edited_text": edited,
-            "checkpoint_log_seen": True,
-            "checkpoint_signal": "content-free checkpoint success log",
-            "live_runtime_scan": runtime_scan,
-            "live_recovery_scan": live_recovery_scan,
-            "edit_to_signal_ms": 9999.0,
-            "restored_editor": edited,
-            "recovery_restored_exact": True,
-            "restore_ms": 3.0,
-            "source_after_recovery_discard": original,
-            "restart_editor": original,
-            "discarded_recovery_absent": True,
-            "discard_restart_absent_ms": 4.0,
-            "termination": "TerminateProcess",
-            "restart_count": 2,
-            "startup_finished_log_seen": True,
-            "startup_signal": "content-free recovery startup finished log",
-            "startup_observed_before_restart_editor": True,
-            "flow": (
-                "edit -> checkpoint log -> TerminateProcess -> restart -> Discard -> "
-                "restart after startup log"
-            ),
-            "process_contexts": [process_context, process_context, process_context],
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan,
-        },
-    }
-    for case in evidence["cases"]:
-        case["status"] = "PASS"
-        case["duration_ms"] = 1.25
-        case["observations"] = observations[case["id"]]
-    COMPLETE_EVIDENCE(evidence, "PASS")
-    return evidence
-
-
-def minimal_pe(machine: int = 0x8664, magic: int = 0x20B) -> bytes:
-    data = bytearray(512)
-    data[:2] = b"MZ"
-    struct.pack_into("<I", data, 0x3C, 0x80)
-    data[0x80:0x84] = b"PE\0\0"
-    struct.pack_into("<H", data, 0x84, machine)
-    struct.pack_into("<H", data, 0x94, 0xF0)
-    struct.pack_into("<H", data, 0x98, magic)
-    return bytes(data)
+from ._native_goal02_support import *
 
 
 class FakeControl:
@@ -468,205 +262,6 @@ class FakeLifecycleWin32:
         ]
 
 
-class EvidenceSchemaTests(unittest.TestCase):
-    def test_accepts_complete_versioned_evidence(self) -> None:
-        evidence = valid_evidence()
-
-        VALIDATE_EVIDENCE(evidence)
-
-        self.assertEqual(evidence["schema_version"], 1)
-        self.assertEqual([case["id"] for case in evidence["cases"]], list(REQUIRED_CASE_IDS))
-
-    def test_rejects_missing_required_case(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"].pop()
-        COMPLETE_EVIDENCE(evidence, "PASS")
-
-        with self.assertRaisesRegex(ValueError, "required case set is incomplete"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_rejects_duplicate_required_case(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][-1] = copy.deepcopy(evidence["cases"][0])
-        COMPLETE_EVIDENCE(evidence, "PASS")
-
-        with self.assertRaisesRegex(ValueError, "duplicate required case ids"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_rejects_invalid_observation_hash(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["editor"]["sha256"] = "short"
-
-        with self.assertRaisesRegex(ValueError, "invalid observation SHA-256"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_failed_case_accepts_legacy_missing_or_safe_exception_type(self) -> None:
-        evidence = valid_evidence()
-        failed = evidence["cases"][0]
-        failed["status"] = "FAIL"
-        failed["reason_code"] = "SOURCE_EDITOR_UIA_TIMEOUT"
-        failed.pop("failure_type")
-        COMPLETE_EVIDENCE(evidence, "FAIL")
-
-        VALIDATE_EVIDENCE(evidence)
-
-        failed["failure_type"] = "HarnessFailure"
-        VALIDATE_EVIDENCE(evidence)
-
-        failed["failure_type"] = "UNIQUE_SECRET"
-        with self.assertRaisesRegex(ValueError, "invalid case failure type"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_requires_matching_verified_executable_hash(self) -> None:
-        evidence = valid_evidence()
-        evidence["executable"]["sha256"] = "b" * 64
-
-        with self.assertRaisesRegex(ValueError, "does not match expected"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_requires_environment_and_matching_process_context(self) -> None:
-        evidence = valid_evidence()
-        evidence["environment"].pop("harness_process")
-        with self.assertRaisesRegex(ValueError, "missing process context"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["process_context"]["session_id"] = 2
-        with self.assertRaisesRegex(ValueError, "differs from harness context"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_requires_true_case_facts_and_runtime_scan(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][3]["observations"]["watcher_conflict_before_save"] = False
-        with self.assertRaisesRegex(ValueError, "requires true watcher_conflict_before_save"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["runtime_scan"][
-            "utf8_sentinel_absent"
-        ] = False
-        with self.assertRaisesRegex(ValueError, "requires true utf8_sentinel_absent"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_rejects_signal_over_budget_and_negative_duration(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][4]["observations"]["edit_to_signal_ms"] = 10_000.001
-        with self.assertRaisesRegex(ValueError, "exceeds 10000ms"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][2]["duration_ms"] = -0.1
-        with self.assertRaisesRegex(ValueError, "duration must be nonnegative"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][2]["duration_ms"] = float("nan")
-        with self.assertRaisesRegex(ValueError, "duration must be nonnegative"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_rejects_case_specific_hash_mismatch(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["source_after_cancel_save"] = {
-            "byte_count": 4,
-            "sha256": "b" * 64,
-        }
-
-        with self.assertRaisesRegex(ValueError, "Cancel did not preserve exact"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_rejects_contradictory_windows_and_process_evidence(self) -> None:
-        mutations = (
-            ("windows_build", 21999, "Windows 11 build 22000"),
-            ("native_machine_code", 0xAA64, "x64 OS and Python"),
-            ("python_pointer_bits", 32, "x64 OS and Python"),
-            ("wts_state", "WTSDisconnected", "WTSActive"),
-            ("input_desktop", "Winlogon", "unlocked Default input desktop"),
-        )
-        for key, value, message in mutations:
-            with self.subTest(key=key):
-                evidence = valid_evidence()
-                evidence["environment"][key] = value
-                with self.assertRaisesRegex(ValueError, message):
-                    VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_rejects_contradictory_pe_evidence(self) -> None:
-        evidence = valid_evidence()
-        evidence["executable"]["machine_code"] = 0x14C
-
-        with self.assertRaisesRegex(ValueError, "AMD64 PE32"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_rejects_contradictory_flow_mechanics(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][1]["observations"]["flow"] = "WM_CLOSE -> Save"
-        with self.assertRaisesRegex(ValueError, "flow mechanics"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["restart_count"] = 1
-        with self.assertRaisesRegex(ValueError, "requires two restarts"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_requires_startup_barrier_and_live_canonical_record(self) -> None:
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["startup_observed_before_restart_editor"] = False
-        with self.assertRaisesRegex(ValueError, "startup_observed_before_restart_editor"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        live = evidence["cases"][4]["observations"]["live_recovery_scan"]
-        live["canonical_record_count"] = 0
-        live["canonical_records"] = []
-        with self.assertRaisesRegex(ValueError, "requires a canonical record"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["live_runtime_scan"]["canonical_recovery_records_scanned"] = 0
-        with self.assertRaisesRegex(ValueError, "omitted canonical recovery records"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["live_runtime_scan"]["recovery_leases_scanned"] = 0
-        with self.assertRaisesRegex(ValueError, "omitted recovery lease"):
-            VALIDATE_EVIDENCE(evidence)
-
-
-class PlatformAndExecutableTests(unittest.TestCase):
-    def test_accepts_windows_11_x64_only(self) -> None:
-        self.assertIsNone(PLATFORM_PREFLIGHT_FAILURE("Windows", 10, 22631, "AMD64", 64))
-        self.assertEqual(
-            PLATFORM_PREFLIGHT_FAILURE("Windows", 10, 19045, "AMD64", 64),
-            "WINDOWS_11_REQUIRED",
-        )
-        self.assertEqual(
-            PLATFORM_PREFLIGHT_FAILURE("Linux", 6, 0, "x86_64", 64),
-            "WINDOWS_REQUIRED",
-        )
-        self.assertEqual(
-            PLATFORM_PREFLIGHT_FAILURE("Windows", 10, 22631, "ARM64", 64),
-            "WINDOWS_X64_REQUIRED",
-        )
-
-    def test_parses_amd64_pe32_plus(self) -> None:
-        result = INSPECT_PE_BYTES(minimal_pe())
-
-        self.assertEqual(result["machine"], "x86_64")
-        self.assertEqual(result["format"], "PE32+")
-
-    def test_rejects_non_x64_pe(self) -> None:
-        with self.assertRaisesRegex(ValueError, "not AMD64 PE32"):
-            INSPECT_PE_BYTES(minimal_pe(machine=0x14C, magic=0x10B))
-
-    def test_hash_comparison_fails_closed(self) -> None:
-        self.assertIsNone(EXECUTABLE_HASH_FAILURE(HASH, HASH))
-        self.assertEqual(
-            EXECUTABLE_HASH_FAILURE("b" * 64, HASH), "EXECUTABLE_HASH_MISMATCH"
-        )
-        self.assertEqual(EXECUTABLE_HASH_FAILURE("short", HASH), "EXECUTABLE_HASH_INVALID")
 
 
 class SessionIntegrityAndOutcomeTests(unittest.TestCase):
@@ -718,6 +313,39 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
         self.assertEqual((block_code, block_evidence["status"]), (2, "BLOCKED"))
         VALIDATE_EVIDENCE(fail_evidence)
         VALIDATE_EVIDENCE(block_evidence)
+
+    def test_foreground_failure_exposes_only_content_free_diagnostics(self) -> None:
+        class FakeUser32:
+            def ShowWindow(self, _hwnd, _command):
+                return 1
+
+            def BringWindowToTop(self, _hwnd):
+                return 0
+
+            def SetForegroundWindow(self, _hwnd):
+                return 0
+
+            def GetForegroundWindow(self):
+                return 456
+
+        win32 = object.__new__(runtime.Win32)
+        win32.user32 = FakeUser32()
+
+        with self.assertRaises(HARNESS_BLOCKED) as raised:
+            win32.require_foreground(123, timeout=0.0)
+
+        self.assertEqual(raised.exception.code, "FOREGROUND_PERMISSION_DENIED")
+        self.assertEqual(
+            raised.exception.diagnostics,
+            {
+                "requested_hwnd": 123,
+                "foreground_hwnd": 0,
+                "show_window_return": True,
+                "bring_to_top_return": False,
+                "set_foreground_return": False,
+                "foreground_attempts": 0,
+            },
+        )
 
 
 class SelectorAndOrchestrationTests(unittest.TestCase):
@@ -1230,9 +858,72 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertLess(watcher, explicit)
         self.assertNotIn("VK_S", body[:explicit])
 
+    def test_launch_uses_the_configured_foreground_timeout(self) -> None:
+        events: list[tuple[object, ...]] = []
+        context = runtime.SecurityContext(1, 0x2000, "medium")
+
+        class FakeProcess:
+            pid = 91
+
+            def poll(self):
+                return None
+
+        class FakeWindow:
+            handle = 73
+
+            def wait(self, state, timeout):
+                events.append(("wait", state, timeout))
+
+        class FakeApplication:
+            def __init__(self, backend):
+                events.append(("backend", backend))
+
+            def connect(self, process, timeout):
+                events.append(("connect", process, timeout))
+                return self
+
+            def top_window(self):
+                return FakeWindow()
+
+        class FakeWin32:
+            def security_context(self, pid):
+                events.append(("context", pid))
+                return context
+
+            def require_foreground(self, hwnd, timeout):
+                events.append(("foreground", hwnd, timeout))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            data = root / "data"
+            config = root / "config"
+            workspace = root / "workspace"
+            stderr = root / "stderr.log"
+            for directory in (data, config, workspace):
+                directory.mkdir()
+            process = FakeProcess()
+            harness = runtime.NativeHarness(
+                root / "markturbo.exe",
+                root,
+                3.5,
+                FakeWin32(),
+                FakeApplication,
+                object,
+                object,
+                object,
+                object,
+                context,
+            )
+            with mock.patch.object(runtime.subprocess, "Popen", return_value=process) as popen:
+                app = harness.launch_app(None, data, config, workspace, stderr)
+
+        self.assertEqual(app.spec.args, (str(root / "markturbo.exe"),))
+        self.assertEqual(events[-1], ("foreground", 73, 3.5))
+        self.assertEqual(popen.call_args.args[0], app.spec.args)
+
     def test_recovery_waits_for_success_log_not_record_existence(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("    def scenario_recovery", 1)[1].split("\n\ndef preflight", 1)[0]
+        body = source.split("    def scenario_recovery", 1)[1].split("\n\ndef native_run_plan", 1)[0]
 
         self.assertIn("wait_checkpoint_log", body)
         self.assertNotIn("glob(", body)
@@ -1251,290 +942,3 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         startup = third.index("wait_recovery_startup_finished")
         observe = third.index("wait_editor_fingerprint")
         self.assertLess(startup, observe)
-
-
-class RuntimeEvidenceTests(unittest.TestCase):
-    def test_checkpoint_log_parser_requires_written_marker_after_offset(self) -> None:
-        marker = b"DEBUG recovery checkpoint written\n"
-        self.assertTrue(CHECKPOINT_SUCCESS_PRESENT(marker))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(b"recovery checkpoint failed; durable=false\n"))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(b"recovery checkpoint written but failed\n"))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(marker + b"other\n", len(marker)))
-
-    def test_startup_log_parser_requires_finished_marker_after_offset(self) -> None:
-        marker = b"DEBUG recovery startup finished\n"
-        self.assertTrue(RECOVERY_STARTUP_FINISHED_PRESENT(marker))
-        self.assertFalse(RECOVERY_STARTUP_FINISHED_PRESENT(b"recovery startup began\n"))
-        self.assertFalse(RECOVERY_STARTUP_FINISHED_PRESENT(marker + b"other\n", len(marker)))
-
-    def test_live_recovery_scan_requires_canonical_encrypted_record(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary) / "data"
-            recovery = data / "recovery"
-            recovery.mkdir(parents=True)
-            (recovery / "junk.mtrecovery").write_bytes(b"ignored")
-            with self.assertRaises(HARNESS_FAILURE) as missing:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(missing.exception.code, "CANONICAL_RECOVERY_RECORD_MISSING")
-
-            canonical = recovery / (("a" * 64) + ".mtrecovery")
-            canonical.write_bytes(b"")
-            with self.assertRaises(HARNESS_FAILURE) as empty:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(empty.exception.code, "CANONICAL_RECOVERY_RECORD_EMPTY")
-
-            canonical.write_bytes(b"encrypted-record")
-            result = LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(result["canonical_record_count"], 1)
-            self.assertEqual(len(result["canonical_records"]), 1)
-
-            canonical.write_bytes(DOCUMENT_SENTINEL.encode("utf-8"))
-            with self.assertRaises(HARNESS_FAILURE) as leaked:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(leaked.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
-
-    def test_runtime_scan_covers_stderr_app_logs_and_recovery_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-            (recovery / (("a" * 64) + ".mtrecovery")).write_bytes(b"ciphertext")
-            (recovery / ".markturbo-recovery.lock").write_bytes(b"lease")
-
-            result = RUNTIME_ARTIFACT_SCAN(data, stderr)
-
-            self.assertEqual(result["files_scanned"], 4)
-            self.assertEqual(result["app_logs_scanned"], 1)
-            self.assertEqual(result["recovery_artifacts_scanned"], 2)
-            self.assertEqual(result["canonical_recovery_records_scanned"], 1)
-            self.assertEqual(result["recovery_leases_scanned"], 1)
-
-    def test_runtime_scan_counts_records_and_leases_separately(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-
-            (recovery / ".markturbo-recovery.lock").write_bytes(b"lease")
-            lease_only = RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(lease_only["canonical_recovery_records_scanned"], 0)
-            self.assertEqual(lease_only["recovery_leases_scanned"], 1)
-
-            (recovery / ".markturbo-recovery.lock").unlink()
-            (recovery / (("a" * 64) + ".mtrecovery")).write_bytes(b"ciphertext")
-            record_only = RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(record_only["canonical_recovery_records_scanned"], 1)
-            self.assertEqual(record_only["recovery_leases_scanned"], 0)
-
-    def test_recovery_scans_fail_closed_on_permission_error(self) -> None:
-        secret = "UNIQUE-DOCUMENT-CONTENT"
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-            record = recovery / (("a" * 64) + ".mtrecovery")
-            record.write_bytes(b"ciphertext")
-            original_read_bytes = Path.read_bytes
-
-            def denied(path: Path) -> bytes:
-                if path == record:
-                    raise PermissionError(secret)
-                return original_read_bytes(path)
-
-            with mock.patch.object(Path, "read_bytes", new=denied):
-                with self.assertRaises(HARNESS_FAILURE) as live:
-                    LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(live.exception.code, "LIVE_RECOVERY_RECORD_SCAN_FAILED")
-            self.assertEqual(live.exception.detail, "PermissionError")
-
-            with mock.patch.object(Path, "read_bytes", new=denied):
-                with self.assertRaises(HARNESS_FAILURE) as runtime:
-                    RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(runtime.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
-            self.assertEqual(runtime.exception.detail, "PermissionError")
-            self.assertNotIn(secret, runtime.exception.detail)
-
-    def test_runtime_scan_rejects_utf8_utf16_panic_and_refcell(self) -> None:
-        payloads = (
-            (DOCUMENT_SENTINEL.encode("utf-8"), "UTF8_DOCUMENT_SENTINEL_LEAKED"),
-            (DOCUMENT_SENTINEL.encode("utf-16-le"), "UTF16LE_DOCUMENT_SENTINEL_LEAKED"),
-            (b"thread panicked at source", "PANIC_LOGGED"),
-            (b"RefCell already borrowed", "REFCELL_BORROW_PANIC_LOGGED"),
-        )
-        for payload, code in payloads:
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                data = root / "data"
-                logs = data / "logs"
-                logs.mkdir(parents=True)
-                stderr = root / "stderr.log"
-                stderr.write_bytes(b"")
-                (logs / "markturbo-1.log").write_bytes(payload)
-
-                with self.assertRaises(HARNESS_FAILURE) as raised:
-                    RUNTIME_ARTIFACT_SCAN(data, stderr)
-                self.assertEqual(raised.exception.code, code)
-
-    def test_runtime_scan_requires_app_log_and_scans_recovery_payload(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            with self.assertRaises(HARNESS_FAILURE) as missing:
-                RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(missing.exception.code, "APP_LOG_MISSING")
-
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            (logs / "markturbo-1.log").write_bytes(b"startup ok")
-            (recovery / "record.mtrecovery").write_bytes(
-                DOCUMENT_SENTINEL.encode("utf-16-le")
-            )
-            with self.assertRaises(HARNESS_FAILURE) as leaked:
-                RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(leaked.exception.code, "UTF16LE_DOCUMENT_SENTINEL_LEAKED")
-
-    def test_cleanup_failure_is_a_product_failure(self) -> None:
-        class BadProcess:
-            def poll(self) -> None:
-                return None
-
-            def kill(self) -> None:
-                raise OSError("cannot kill")
-
-        harness = object.__new__(NATIVE_HARNESS)
-        harness.processes = [BadProcess()]
-
-        with self.assertRaises(HARNESS_FAILURE) as raised:
-            harness.cleanup()
-
-        self.assertEqual(raised.exception.code, "CLEANUP_REAP_FAILED")
-
-
-class PrivacyAndCliTests(unittest.TestCase):
-    def test_loading_parser_does_not_import_pywinauto(self) -> None:
-        if not PYWINAUTO_WAS_LOADED:
-            self.assertNotIn("pywinauto", sys.modules)
-
-    def test_editor_readback_does_not_use_clipboard_or_setvalue(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        forbidden_apis = (
-            "Clipboard",
-            "CF_UNICODETEXT",
-            "GMEM_",
-            "Global",
-            "SetValue",
-        )
-        for forbidden in forbidden_apis:
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, source)
-                self.assertIn(forbidden, f"legacy call: {forbidden}")
-
-    def test_document_text_never_appears_in_serialized_observation(self) -> None:
-        secret = "UNIQUE-SECRET-\u4fdd\u5b58-\U0001f680"
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["editor"] = FINGERPRINT_TEXT(
-            secret
-        ).evidence()
-        serialized = json.dumps(evidence, ensure_ascii=False)
-
-        self.assertNotIn(secret, serialized)
-        self.assertNotIn("UNIQUE-SECRET", serialized)
-        self.assertIn(hashlib.sha256(secret.encode("utf-8")).hexdigest(), serialized)
-
-        evidence["cases"][0]["observations"]["raw_text"] = secret
-        with self.assertRaisesRegex(ValueError, "unknown observation field"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_exception_sanitizer_never_returns_exception_text(self) -> None:
-        secret = "UNIQUE-DOCUMENT-CONTENT"
-
-        result = SAFE_EXCEPTION_NAME(RuntimeError(secret))
-
-        self.assertEqual(result, "RuntimeError")
-        self.assertNotIn(secret, result)
-
-    def test_failure_type_prefers_safe_detail_and_rejects_unsafe_detail(self) -> None:
-        for name in ("PermissionError", "TypeError", "COMError"):
-            with self.subTest(name=name):
-                self.assertEqual(
-                    SAFE_FAILURE_TYPE(HARNESS_FAILURE("RUNTIME_ARTIFACT_SCAN_FAILED", name)),
-                    name,
-                )
-        for detail in ("UNIQUE_SECRET", "secret text", "secret-text"):
-            with self.subTest(detail=detail):
-                self.assertEqual(
-                    SAFE_FAILURE_TYPE(HARNESS_FAILURE("RUNTIME_ARTIFACT_SCAN_FAILED", detail)),
-                    "HarnessFailure",
-                )
-
-    def test_constructs_isolated_absolute_launch_without_starting_process(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            exe = root / "bin" / "markturbo.exe"
-            target = root / "workspace" / "case.md"
-            data = root / "data"
-            config = root / "config"
-            workspace = root / "workspace"
-            stderr = root / "stderr.log"
-            with mock.patch("subprocess.Popen") as popen:
-                spec = BUILD_LAUNCH_SPEC(
-                    exe,
-                    target,
-                    data,
-                    config,
-                    workspace,
-                    stderr,
-                    {
-                        "OPENAI_API_KEY": "must-not-propagate",
-                        "ANTHROPIC_API_KEY": "must-not-propagate",
-                        "PATH": "path",
-                    },
-                )
-
-            popen.assert_not_called()
-            self.assertEqual(spec.args, (str(exe), str(target)))
-            self.assertEqual(spec.cwd, str(workspace))
-            self.assertEqual(spec.env["MARKTURBO_DATA_DIR"], str(data))
-            self.assertEqual(spec.env["MARKTURBO_CONFIG_DIR"], str(config))
-            self.assertEqual(spec.env["RUST_LOG"], "debug")
-            self.assertNotIn("OPENAI_API_KEY", spec.env)
-            self.assertNotIn("ANTHROPIC_API_KEY", spec.env)
-
-    def test_constructs_cli_without_starting_process(self) -> None:
-        exe = Path("C:/release/markturbo.exe")
-        evidence = Path("C:/evidence/goal-02.json")
-        with mock.patch("subprocess.Popen") as popen:
-            command = BUILD_CLI_COMMAND(exe, HASH, evidence)
-            args = PARSE_ARGS(command[2:])
-
-        popen.assert_not_called()
-        self.assertEqual(args.exe, exe)
-        self.assertEqual(args.expect_exe_sha256, HASH)
-        self.assertEqual(args.evidence, evidence)
-        self.assertEqual(NORMALIZE_EXPECTED_HASH(HASH.upper()), HASH)
-
-
-if __name__ == "__main__":
-    unittest.main()

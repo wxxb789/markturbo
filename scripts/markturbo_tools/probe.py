@@ -1,24 +1,14 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["pillow>=10"]
-# ///
 """Measure and inspect a running markturbo window.
 
 The harness behind this repository's performance work. Everything it reports is
 read from a real process on a real window — no estimates.
 
-    ./scripts/probe.py memory                 # startup RSS, empty workspace
-    ./scripts/probe.py startup                # time to a titled main window
-    ./scripts/probe.py memory --open doc.md   # with a document open
-    ./scripts/probe.py cpu --open big.md      # idle CPU over time
-    ./scripts/probe.py windows --open x.html  # child windows and hit testing
-    ./scripts/probe.py shot --open x.md -o out.png
+    python -m scripts.markturbo_tools.probe memory
+    python -m scripts.markturbo_tools.probe startup
 
 Why Python rather than PowerShell: this needs Win32 for process counters, child
 window enumeration and hit testing, and `ctypes` reaches all of it without the
-assembly-loading differences between PowerShell 5 and 7. `uv run` makes the one
-dependency (Pillow, for `shot`) implicit.
+assembly-loading differences between PowerShell 5 and 7.
 
 Windows only. Every subcommand except `shot` works headless.
 """
@@ -30,15 +20,17 @@ import ctypes
 import ctypes.wintypes as wt
 import os
 import shutil
-import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from collections import deque
 from pathlib import Path
+from statistics import median
 
-REPO = Path(__file__).resolve().parent.parent
+from .metrics import inclusive_p95, measure_abba, nearest_rank_percentile
+
+REPO = Path(__file__).resolve().parents[2]
 DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
 MAIN_WINDOW_TITLE = "markturbo"
 DEFAULT_FORBIDDEN_LOG_SUBSTRINGS = ("RefCell already borrowed",)
@@ -47,13 +39,14 @@ SW_RESTORE = 9
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 
-if sys.platform != "win32":
-    sys.exit("probe.py needs Win32 process and window APIs; it is Windows-only.")
-
-psapi = ctypes.WinDLL("psapi", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-pdh = ctypes.WinDLL("pdh", use_last_error=True)
+if sys.platform == "win32":
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    pdh = ctypes.WinDLL("pdh", use_last_error=True)
+else:
+    # Keep geometry and parsing helpers importable for cross-platform tests.
+    psapi = kernel32 = user32 = pdh = None
 
 
 class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
@@ -93,40 +86,41 @@ class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
-user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
-user32.GetClientRect.restype = wt.BOOL
-user32.ClientToScreen.argtypes = [wt.HWND, ctypes.POINTER(POINT)]
-user32.ClientToScreen.restype = wt.BOOL
-user32.SetWindowPos.argtypes = [
-    wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, wt.UINT,
-]
-user32.SetWindowPos.restype = wt.BOOL
-kernel32.GetSystemTimes.argtypes = [
-    ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)
-]
-kernel32.GetSystemTimes.restype = wt.BOOL
-pdh.PdhOpenQueryW.argtypes = [wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)]
-pdh.PdhOpenQueryW.restype = ctypes.c_long
-pdh.PdhAddEnglishCounterW.argtypes = [
-    wt.HANDLE, wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)
-]
-pdh.PdhAddEnglishCounterW.restype = ctypes.c_long
-pdh.PdhCollectQueryData.argtypes = [wt.HANDLE]
-pdh.PdhCollectQueryData.restype = ctypes.c_long
-pdh.PdhGetFormattedCounterValue.argtypes = [
-    wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.DWORD),
-    ctypes.POINTER(PDH_FMT_COUNTERVALUE),
-]
-pdh.PdhGetFormattedCounterValue.restype = ctypes.c_long
-pdh.PdhCloseQuery.argtypes = [wt.HANDLE]
-pdh.PdhCloseQuery.restype = ctypes.c_long
+if sys.platform == "win32":
+    user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+    user32.GetClientRect.restype = wt.BOOL
+    user32.ClientToScreen.argtypes = [wt.HWND, ctypes.POINTER(POINT)]
+    user32.ClientToScreen.restype = wt.BOOL
+    user32.SetWindowPos.argtypes = [
+        wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wt.UINT,
+    ]
+    user32.SetWindowPos.restype = wt.BOOL
+    kernel32.GetSystemTimes.argtypes = [
+        ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)
+    ]
+    kernel32.GetSystemTimes.restype = wt.BOOL
+    pdh.PdhOpenQueryW.argtypes = [wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)]
+    pdh.PdhOpenQueryW.restype = ctypes.c_long
+    pdh.PdhAddEnglishCounterW.argtypes = [
+        wt.HANDLE, wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)
+    ]
+    pdh.PdhAddEnglishCounterW.restype = ctypes.c_long
+    pdh.PdhCollectQueryData.argtypes = [wt.HANDLE]
+    pdh.PdhCollectQueryData.restype = ctypes.c_long
+    pdh.PdhGetFormattedCounterValue.argtypes = [
+        wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.DWORD),
+        ctypes.POINTER(PDH_FMT_COUNTERVALUE),
+    ]
+    pdh.PdhGetFormattedCounterValue.restype = ctypes.c_long
+    pdh.PdhCloseQuery.argtypes = [wt.HANDLE]
+    pdh.PdhCloseQuery.restype = ctypes.c_long
+    user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    user32.PostMessageW.restype = wt.BOOL
+    user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wt.BOOL
 
 PDH_FMT_DOUBLE = 0x00000200
-user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
-user32.PostMessageW.restype = wt.BOOL
-user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
-user32.ShowWindow.restype = wt.BOOL
 
 
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -232,13 +226,6 @@ class DiskBusyCounter:
         self.close()
 
 
-def percentile(values: list[float], quantile: float) -> float:
-    """Nearest-rank percentile, matching the measurement ticket."""
-    ordered = sorted(values)
-    index = max(0, int((quantile * len(ordered)) + 0.999999999) - 1)
-    return ordered[index]
-
-
 def quiet_gate_failures(
     cpu: list[float],
     disk: list[float],
@@ -248,10 +235,10 @@ def quiet_gate_failures(
     max_disk_p95: float,
 ) -> list[str]:
     checks = [
-        ("CPU median", statistics.median(cpu), max_cpu_median),
-        ("CPU p95", percentile(cpu, 0.95), max_cpu_p95),
-        ("disk median", statistics.median(disk), max_disk_median),
-        ("disk p95", percentile(disk, 0.95), max_disk_p95),
+        ("CPU median", median(cpu), max_cpu_median),
+        ("CPU p95", nearest_rank_percentile(cpu, 0.95), max_cpu_p95),
+        ("disk median", median(disk), max_disk_median),
+        ("disk p95", nearest_rank_percentile(disk, 0.95), max_disk_p95),
     ]
     return [f"{name} {value:.2f}% > {limit:.2f}%" for name, value, limit in checks
             if value > limit]
@@ -701,33 +688,37 @@ def startup_once(exe: Path, target: str | None, timeout: float) -> float:
 
 
 def summarize_startup(label: str, samples: list[float]) -> None:
-    p95 = statistics.quantiles(samples, n=20, method="inclusive")[-1]
+    p95 = inclusive_p95(samples)
     print(f"{label}: {len(samples)} samples")
     print("  " + "  ".join(f"{sample:7.1f}" for sample in samples))
-    print(f"  median {statistics.median(samples):.1f} ms  p95 {p95:.1f} ms")
+    print(f"  median {median(samples):.1f} ms  p95 {p95:.1f} ms")
 
 
 def summarize_startup_comparison(
     a_label: str,
     b_label: str,
-    paired_a: list[float],
-    paired_b: list[float],
+    comparison: AbbaComparison,
 ) -> None:
     """Report paired round means and B-minus-A deltas."""
-    deltas = [b - a for a, b in zip(paired_a, paired_b, strict=True)]
-    percentages = [delta / a * 100 for a, delta in zip(paired_a, deltas, strict=True)]
-    print(f"paired comparison: B - A ({len(deltas)} A-B-B-A rounds)")
+    print(f"paired comparison: B - A ({len(comparison.deltas)} A-B-B-A rounds)")
     print(f"  A = {a_label}")
     print(f"  B = {b_label}")
     for index, (a, b, delta, percent) in enumerate(
-        zip(paired_a, paired_b, deltas, percentages, strict=True), start=1
+        zip(
+            comparison.paired_a,
+            comparison.paired_b,
+            comparison.deltas,
+            comparison.percentages,
+            strict=True,
+        ),
+        start=1,
     ):
         print(f"  round {index:>2}: A {a:7.1f}  B {b:7.1f}  "
               f"B-A {delta:+7.1f} ms {percent:+6.2f}%")
-    print(f"  median paired A {statistics.median(paired_a):.1f} ms  "
-          f"B {statistics.median(paired_b):.1f} ms")
-    print(f"  median B-A {statistics.median(deltas):+.1f} ms  "
-          f"{statistics.median(percentages):+.2f}%")
+    print(f"  median paired A {median(comparison.paired_a):.1f} ms  "
+          f"B {median(comparison.paired_b):.1f} ms")
+    print(f"  median B-A {median(comparison.deltas):+.1f} ms  "
+          f"{median(comparison.percentages):+.2f}%")
 
 
 def cmd_startup(a: argparse.Namespace) -> None:
@@ -749,25 +740,14 @@ def cmd_startup(a: argparse.Namespace) -> None:
             startup_once(exe, a.open, a.timeout)
 
     if a.compare:
-        # A-B-B-A offsets cache warmth and background drift within every round.
-        samples_a: list[float] = []
-        samples_b: list[float] = []
-        paired_a: list[float] = []
-        paired_b: list[float] = []
-        for _ in range(a.rounds):
-            a_first = startup_once(a.exe, a.open, a.timeout)
-            b_first = startup_once(a.compare, a.open, a.timeout)
-            b_second = startup_once(a.compare, a.open, a.timeout)
-            a_second = startup_once(a.exe, a.open, a.timeout)
-            samples_a.extend((a_first, a_second))
-            samples_b.extend((b_first, b_second))
-            paired_a.append(statistics.fmean((a_first, a_second)))
-            paired_b.append(statistics.fmean((b_first, b_second)))
-        summarize_startup(f"A {a.exe}", samples_a)
-        summarize_startup(f"B {a.compare}", samples_b)
-        summarize_startup_comparison(
-            str(a.exe), str(a.compare), paired_a, paired_b
+        comparison = measure_abba(
+            a.rounds,
+            lambda: startup_once(a.exe, a.open, a.timeout),
+            lambda: startup_once(a.compare, a.open, a.timeout),
         )
+        summarize_startup(f"A {a.exe}", list(comparison.samples_a))
+        summarize_startup(f"B {a.compare}", list(comparison.samples_b))
+        summarize_startup_comparison(str(a.exe), str(a.compare), comparison)
     else:
         samples = []
         for _ in range(a.rounds):
@@ -787,9 +767,11 @@ def duration_us(text: str) -> float:
                     "ms": 1000.0, "s": 1_000_000.0}[match.group(2)]
 
 
-def formula_once(exe: Path, font_dir: Path, timeout: float) -> float:
+def formula_once(exe: Path, font_dir: Path | None, timeout: float) -> float:
     env = os.environ.copy()
-    env["MT_MATH_FONT_DIR"] = str(font_dir)
+    env.pop("MT_MATH_FONT_DIR", None)
+    if font_dir is not None:
+        env["MT_MATH_FONT_DIR"] = str(font_dir)
     result = subprocess.run(
         [
             str(exe),
@@ -818,8 +800,34 @@ def summarize_formula(label: str, samples: list[float]) -> None:
     print(f"{label}: {len(samples)} samples")
     print("  " + "  ".join(f"{sample:7.1f}" for sample in samples))
     print(
-        f"  median {statistics.median(samples):.1f} us  "
-        f"p95 {percentile(samples, 0.95):.1f} us"
+        f"  median {median(samples):.1f} us  "
+        f"p95 {nearest_rank_percentile(samples, 0.95):.1f} us"
+    )
+
+
+def summarize_formula_comparison(comparison: AbbaComparison) -> None:
+    print(f"paired comparison: B - A ({len(comparison.deltas)} A-B-B-A rounds)")
+    for index, (a_value, b_value, delta, percent) in enumerate(
+        zip(
+            comparison.paired_a,
+            comparison.paired_b,
+            comparison.deltas,
+            comparison.percentages,
+            strict=True,
+        ),
+        start=1,
+    ):
+        print(
+            f"  round {index:>2}: A {a_value:7.1f}  B {b_value:7.1f}  "
+            f"B-A {delta:+7.1f} us {percent:+6.2f}%"
+        )
+    print(
+        f"  median paired A {median(comparison.paired_a):.1f} us  "
+        f"B {median(comparison.paired_b):.1f} us"
+    )
+    print(
+        f"  median B-A {median(comparison.deltas):+.1f} us  "
+        f"{median(comparison.percentages):+.2f}%"
     )
 
 
@@ -831,7 +839,7 @@ def cmd_formula(a: argparse.Namespace) -> None:
         sys.exit("--warmup cannot be negative")
     if a.timeout <= 0:
         sys.exit("--timeout must be greater than zero")
-    if not a.font_dir.is_dir():
+    if a.font_dir is not None and not a.font_dir.is_dir():
         sys.exit(f"{a.font_dir} not found")
     exes = [a.exe] + ([a.compare] if a.compare else [])
     for exe in exes:
@@ -849,40 +857,14 @@ def cmd_formula(a: argparse.Namespace) -> None:
         summarize_formula(str(a.exe), samples)
         return
 
-    samples_a: list[float] = []
-    samples_b: list[float] = []
-    paired_a: list[float] = []
-    paired_b: list[float] = []
-    for _ in range(a.rounds):
-        a_first = formula_once(a.exe, a.font_dir, a.timeout)
-        b_first = formula_once(a.compare, a.font_dir, a.timeout)
-        b_second = formula_once(a.compare, a.font_dir, a.timeout)
-        a_second = formula_once(a.exe, a.font_dir, a.timeout)
-        samples_a.extend((a_first, a_second))
-        samples_b.extend((b_first, b_second))
-        paired_a.append(statistics.fmean((a_first, a_second)))
-        paired_b.append(statistics.fmean((b_first, b_second)))
-
-    summarize_formula(f"A {a.exe}", samples_a)
-    summarize_formula(f"B {a.compare}", samples_b)
-    deltas = [b - a for a, b in zip(paired_a, paired_b, strict=True)]
-    percentages = [delta / a * 100 for a, delta in zip(paired_a, deltas, strict=True)]
-    print(f"paired comparison: B - A ({len(deltas)} A-B-B-A rounds)")
-    for index, (a_value, b_value, delta, percent) in enumerate(
-        zip(paired_a, paired_b, deltas, percentages, strict=True), start=1
-    ):
-        print(
-            f"  round {index:>2}: A {a_value:7.1f}  B {b_value:7.1f}  "
-            f"B-A {delta:+7.1f} us {percent:+6.2f}%"
-        )
-    print(
-        f"  median paired A {statistics.median(paired_a):.1f} us  "
-        f"B {statistics.median(paired_b):.1f} us"
+    comparison = measure_abba(
+        a.rounds,
+        lambda: formula_once(a.exe, a.font_dir, a.timeout),
+        lambda: formula_once(a.compare, a.font_dir, a.timeout),
     )
-    print(
-        f"  median B-A {statistics.median(deltas):+.1f} us  "
-        f"{statistics.median(percentages):+.2f}%"
-    )
+    summarize_formula(f"A {a.exe}", list(comparison.samples_a))
+    summarize_formula(f"B {a.compare}", list(comparison.samples_b))
+    summarize_formula_comparison(comparison)
 
 
 def cmd_memory(a: argparse.Namespace) -> None:
@@ -965,10 +947,10 @@ def cmd_quiet(a: argparse.Namespace) -> None:
 
     cpu = list(cpu_samples)
     disk_values = list(disk_samples)
-    cpu_median = statistics.median(cpu)
-    cpu_p95 = percentile(cpu, 0.95)
-    disk_median = statistics.median(disk_values)
-    disk_p95 = percentile(disk_values, 0.95)
+    cpu_median = median(cpu)
+    cpu_p95 = nearest_rank_percentile(cpu, 0.95)
+    disk_median = median(disk_values)
+    disk_p95 = nearest_rank_percentile(disk_values, 0.95)
     print(f"quiet gate: {a.samples} x {a.interval:g}s rolling window")
     print(f"  waited {waited:.0f}s")
     print(f"  CPU   median {cpu_median:.2f}%  p95 {cpu_p95:.2f}%")
@@ -1199,7 +1181,14 @@ def cmd_shot(a: argparse.Namespace) -> None:
         kill_and_wait(p)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    if sys.platform != "win32":
+        print(
+            "probe requires Win32 process and window APIs; it is Windows-only.",
+            file=sys.stderr,
+        )
+        return 2
+
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1238,7 +1227,11 @@ def main() -> None:
                          help="prebuilt open_document_cost test executable")
     formula.add_argument("--compare", type=Path,
                          help="second test executable; measured A-B-B-A")
-    formula.add_argument("--font-dir", type=Path, default=REPO / "fonts" / "katex")
+    formula.add_argument(
+        "--font-dir",
+        type=Path,
+        help="optional complete KaTeX override; omit to measure embedded fonts",
+    )
     formula.add_argument("--rounds", type=int, default=10)
     formula.add_argument("--warmup", type=int, default=2)
     formula.add_argument("--timeout", type=float, default=30.0)
@@ -1299,13 +1292,14 @@ def main() -> None:
     common(shot)
     shot.add_argument("-o", "--out", default="shot.png")
 
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if hasattr(a, "exe") and not a.exe.is_file():
         sys.exit(f"{a.exe} not found — cargo build --release first")
     {"startup": cmd_startup, "formula": cmd_formula, "memory": cmd_memory,
      "cpu": cmd_cpu, "quiet": cmd_quiet, "windows": cmd_windows,
      "shot": cmd_shot}[a.cmd](a)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

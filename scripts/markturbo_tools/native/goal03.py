@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["pywinauto==0.6.9"]
-# ///
 """Exercise Goal 03's first-use document workflow through a real Windows UI.
 
 The harness is fail-closed. A PASS binds every observation to the supplied
@@ -19,62 +14,58 @@ import ctypes.wintypes as wt
 import hashlib
 import json
 import math
-import os
-import runpy
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
+import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+from .runtime import (
+    IMAGE_FILE_MACHINE_AMD64,
+    INTEGRITY_NAMES,
+    PE32_PLUS_MAGIC,
+    REASON_CODE_RE,
+    SAFE_FAILURE_TYPES,
+    SHA256_RE,
+    SOURCE_EDITOR_AUTOMATION_ID,
+    VK_A,
+    VK_CONTROL,
+    VK_S,
+    VK_W,
+    Fingerprint,
+    HarnessBlocked,
+    HarnessFailure,
+    NativeHarness as BaseNativeHarness,
+    NativeRunPlan,
+    complete_evidence as complete_evidence_envelope,
+    finite_nonnegative,
+    fingerprint_text,
+    key_input,
+    load_pywinauto,
+    main_native_acceptance,
+    normalize_expected_hash,
+    preflight,
+    require_true,
+    safe_exception_name,
+    sha256_file,
+    utc_now,
+    validate_fingerprint,
+    validate_environment as validate_runtime_environment,
+    validate_process_context,
+    wait_until,
+    write_durable,
+    run_native_acceptance,
+)
 
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
 DEFAULT_EVIDENCE = REPO / ".scratch" / "goal-03-native-acceptance-v1.json"
-GOAL_02 = Path(__file__).with_name("goal-02-native-acceptance.py")
-BASE = runpy.run_path(GOAL_02)
 
 SCHEMA = "markturbo.goal-03-native-acceptance"
 SCHEMA_VERSION = 1
-SHA256_RE = BASE["SHA256_RE"]
-HarnessBlocked = BASE["HarnessBlocked"]
-HarnessFailure = BASE["HarnessFailure"]
-Fingerprint = BASE["Fingerprint"]
-RunningApp = BASE["RunningApp"]
-LaunchSpec = BASE["LaunchSpec"]
-Win32 = BASE["Win32"]
-BaseNativeHarness = BASE["NativeHarness"]
-fingerprint_text = BASE["fingerprint_text"]
-sha256_file = BASE["sha256_file"]
-normalize_expected_hash = BASE["normalize_expected_hash"]
-executable_hash_failure = BASE["executable_hash_failure"]
-inspect_pe = BASE["inspect_pe"]
-platform_preflight_failure = BASE["platform_preflight_failure"]
-security_context_failure = BASE["security_context_failure"]
-safe_exception_name = BASE["safe_exception_name"]
-safe_failure_type = BASE["safe_failure_type"]
-wait_until = BASE["wait_until"]
-load_pywinauto = BASE["load_pywinauto"]
-preflight_goal_02 = BASE["preflight"]
-utc_now = BASE["utc_now"]
-finite_nonnegative = BASE["finite_nonnegative"]
-validate_fingerprint = BASE["validate_fingerprint"]
-validate_process_context = BASE["validate_process_context"]
-require_true = BASE["require_true"]
-mark_remaining_cases = BASE["mark_remaining_cases"]
-IMAGE_FILE_MACHINE_AMD64 = BASE["IMAGE_FILE_MACHINE_AMD64"]
-PE32_PLUS_MAGIC = BASE["PE32_PLUS_MAGIC"]
-VK_A = BASE["VK_A"]
-VK_CONTROL = BASE["VK_CONTROL"]
 VK_SHIFT = 0x10
-VK_S = BASE["VK_S"]
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_V = 0x56
-VK_W = BASE["VK_W"]
-key_input = BASE["key_input"]
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
@@ -120,7 +111,8 @@ OVERWRITE_TEXT = f"# {DOCUMENT_SENTINEL}: Replace\n\nExact CJK \u4fdd\u5b58 and 
 EXISTING_DESTINATION = b"goal-03 original destination\n"
 CANCELLED_DESTINATION = b"goal-03 cancelled destination\n"
 
-SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | BASE["INTEGRITY_NAMES"]
+SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
+SAMPLE_VERSION_RE = re.compile(r"^[0-9a-f]{24}$")
 ALLOWED_OBSERVATION_KEYS = {
     "app_logs_scanned",
     "byte_count",
@@ -134,6 +126,9 @@ ALLOWED_OBSERVATION_KEYS = {
     "editor_before_cancellation",
     "files_scanned",
     "flow",
+    "foreground_attempts",
+    "foreground_diagnostics",
+    "foreground_hwnd",
     "foreground_verified",
     "integrity",
     "integrity_rid",
@@ -147,9 +142,14 @@ ALLOWED_OBSERVATION_KEYS = {
     "process_contexts",
     "recent_count",
     "recent_restart_visible",
+    "requested_hwnd",
     "reopened_editor",
     "runtime_scan",
     "sample_workspace_opened",
+    "sample_content",
+    "sample_file_count",
+    "sample_manifest",
+    "sample_version",
     "save_as_cancelled",
     "save_as_cancel_destination_after",
     "save_as_cancel_destination_before",
@@ -157,6 +157,9 @@ ALLOWED_OBSERVATION_KEYS = {
     "save_as_created",
     "saved_destination",
     "session_id",
+    "set_foreground_return",
+    "show_window_return",
+    "bring_to_top_return",
     "sha256",
     "source_after_cancel",
     "source_before",
@@ -221,16 +224,7 @@ def new_evidence(expected_hash: str) -> dict[str, Any]:
 
 
 def complete_evidence(evidence: dict[str, Any], status: str) -> None:
-    evidence["status"] = status
-    evidence["completed_at_utc"] = utc_now()
-    cases = evidence["cases"]
-    evidence["summary"] = {
-        "required_case_count": len(REQUIRED_CASE_IDS),
-        "passed_case_count": sum(case["status"] == "PASS" for case in cases),
-        "blocked_case_count": sum(case["status"] == "BLOCKED" for case in cases),
-        "failed_case_count": sum(case["status"] == "FAIL" for case in cases),
-        "not_run_case_count": sum(case["status"] == "NOT_RUN" for case in cases),
-    }
+    complete_evidence_envelope(evidence, status, REQUIRED_CASE_IDS)
 
 
 def validate_observations(value: Any, key: str | None = None) -> None:
@@ -247,6 +241,8 @@ def validate_observations(value: Any, key: str | None = None) -> None:
         for nested in value:
             validate_observations(nested, key)
     elif isinstance(value, str):
+        if key == "sample_version" and SAMPLE_VERSION_RE.fullmatch(value):
+            return
         if key != "sha256" and value not in SAFE_STRINGS:
             raise ValueError("free-form observation strings are forbidden")
     elif value is not None and not isinstance(value, (bool, int, float)):
@@ -271,7 +267,7 @@ def validate_runtime_scan(value: Any) -> None:
 def validate_environment(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("invalid environment evidence")
-    BASE["validate_environment"](value)
+    validate_runtime_environment(value)
     return validate_process_context(value.get("harness_process"))
 
 
@@ -305,7 +301,13 @@ def required_observations(case_id: str) -> set[str]:
             "overwrite_cancel_focus_preserved",
             "overwrite_confirmed",
         },
-        CASE_SAMPLE: {"sample_workspace_opened"},
+        CASE_SAMPLE: {
+            "sample_workspace_opened",
+            "sample_file_count",
+            "sample_manifest",
+            "sample_content",
+            "sample_version",
+        },
         CASE_RECENTS: {
             "recent_restart_visible",
             "recent_count",
@@ -372,6 +374,18 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
             raise ValueError("confirmed overwrite did not replace the destination")
     elif case_id == CASE_SAMPLE:
         require_true(observations, "sample_workspace_opened")
+        file_count = observations.get("sample_file_count")
+        if not isinstance(file_count, int) or isinstance(file_count, bool) or file_count <= 0:
+            raise ValueError("sample file inventory must be nonempty")
+        manifest = validate_fingerprint(observations.get("sample_manifest"))
+        content = validate_fingerprint(observations.get("sample_content"))
+        if manifest["byte_count"] <= 0 or content["byte_count"] <= 0:
+            raise ValueError("sample fingerprints must be nonempty")
+        version = observations.get("sample_version")
+        if not isinstance(version, str) or not SAMPLE_VERSION_RE.fullmatch(version):
+            raise ValueError("sample version must be a 24-character SHA-256 prefix")
+        if content["sha256"][:24] != version:
+            raise ValueError("sample version does not match the materialized content")
     elif case_id == CASE_RECENTS:
         require_true(observations, "recent_restart_visible", "stale_recent_disabled")
         if observations.get("recent_count") != 10:
@@ -432,12 +446,12 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
             raise ValueError("invalid case status")
         reason = case.get("reason_code")
         if reason is not None and (
-            not isinstance(reason, str) or not BASE["REASON_CODE_RE"].fullmatch(reason)
+            not isinstance(reason, str) or not REASON_CODE_RE.fullmatch(reason)
         ):
             raise ValueError("invalid case reason code")
         failure_type = case.get("failure_type")
         if failure_type is not None and (
-            not isinstance(failure_type, str) or failure_type not in BASE["SAFE_FAILURE_TYPES"]
+            not isinstance(failure_type, str) or failure_type not in SAFE_FAILURE_TYPES
         ):
             raise ValueError("invalid case failure type")
         if status != "FAIL" and failure_type is not None:
@@ -470,50 +484,6 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
     }
     if summary != expected_summary:
         raise ValueError("case summary does not match case evidence")
-
-
-def write_evidence(path: Path, evidence: dict[str, Any]) -> None:
-    validate_evidence(evidence)
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            json.dump(evidence, handle, indent=2, sort_keys=True, ensure_ascii=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def build_launch_spec(
-    copied_exe: Path,
-    target: Path | None,
-    data_root: Path,
-    config_root: Path,
-    workspace_root: Path,
-    stderr_path: Path,
-    base_env: dict[str, str] | None = None,
-) -> Any:
-    paths = [copied_exe, data_root, config_root, workspace_root, stderr_path]
-    if target is not None:
-        paths.append(target)
-    if any(not path.is_absolute() for path in paths):
-        raise ValueError("launch paths must be absolute")
-    env = dict(os.environ if base_env is None else base_env)
-    for secret in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "MARKTURBO_TRANSLATE_MODEL"):
-        env.pop(secret, None)
-    env.update(
-        {
-            "MARKTURBO_DATA_DIR": str(data_root),
-            "MARKTURBO_CONFIG_DIR": str(config_root),
-            "RUST_LOG": "debug",
-        }
-    )
-    args = (str(copied_exe),) if target is None else (str(copied_exe), str(target))
-    return LaunchSpec(args=args, cwd=str(workspace_root), env=env, stderr_path=stderr_path)
 
 
 def production_source(path: Path) -> str:
@@ -558,13 +528,79 @@ def source_contract_failure() -> str | None:
     return None
 
 
+def sample_inventory(root: Path) -> tuple[int, Fingerprint, Fingerprint]:
+    """Fingerprint a sample tree without retaining paths or file contents."""
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    manifest = hashlib.sha256()
+    content = hashlib.sha256()
+    content_byte_count = 0
+    for path in files:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        manifest.update(relative)
+        manifest.update(b"\0")
+        content.update(relative)
+        content.update(b"\0")
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                content_byte_count += len(chunk)
+                content.update(chunk)
+        content.update(b"\0")
+    manifest_byte_count = sum(
+        len(path.relative_to(root).as_posix().encode("utf-8")) + 1 for path in files
+    )
+    return (
+        len(files),
+        Fingerprint(manifest_byte_count, manifest.hexdigest()),
+        Fingerprint(content_byte_count, content.hexdigest()),
+    )
+
+
+def materialized_sample_inventory(data_root: Path) -> dict[str, Any]:
+    try:
+        versions = sorted(path for path in (data_root / "sample").iterdir() if path.is_dir())
+    except OSError as error:
+        raise HarnessFailure("SAMPLE_MATERIALIZATION_MISSING", safe_exception_name(error)) from None
+    if len(versions) != 1:
+        raise HarnessFailure("SAMPLE_MATERIALIZATION_INCOMPLETE")
+    try:
+        file_count, manifest, content = sample_inventory(versions[0])
+    except OSError as error:
+        raise HarnessFailure("SAMPLE_MATERIALIZATION_SCAN_FAILED", safe_exception_name(error)) from None
+    if (
+        file_count <= 0
+        or manifest.byte_count <= 0
+        or content.byte_count <= 0
+        or versions[0].name != content.sha256[:24]
+    ):
+        raise HarnessFailure("SAMPLE_MATERIALIZATION_INCOMPLETE")
+    return {
+        "sample_file_count": file_count,
+        "sample_manifest": manifest.evidence(),
+        "sample_content": content.evidence(),
+        "sample_version": versions[0].name,
+    }
+
+
+def artifact_contains(path: Path, patterns: tuple[bytes, ...]) -> bytes | None:
+    """Find a sensitive byte sequence while keeping only a chunk boundary tail."""
+    overlap = max(len(pattern) for pattern in patterns) - 1
+    tail = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            value = tail + chunk
+            for pattern in patterns:
+                if pattern in value:
+                    return pattern
+            tail = value[-overlap:] if overlap else b""
+    return None
+
+
 def scan_case_artifacts(case_root: Path) -> dict[str, Any]:
     try:
         roots = (case_root / "data", case_root / "config")
         paths = [
             path
             for root in roots
-            if root.exists()
             for path in root.rglob("*")
             if path.is_file()
         ]
@@ -584,12 +620,12 @@ def scan_case_artifacts(case_root: Path) -> dict[str, Any]:
         raise HarnessFailure("APP_LOG_MISSING")
     for path in paths:
         try:
-            value = path.read_bytes()
+            leaked = artifact_contains(path, (utf8, utf16))
         except OSError as error:
             raise HarnessFailure("RUNTIME_ARTIFACT_SCAN_FAILED", safe_exception_name(error)) from None
-        if utf8 in value:
+        if leaked == utf8:
             raise HarnessFailure("UTF8_DOCUMENT_SENTINEL_LEAKED")
-        if utf16 in value:
+        if leaked == utf16:
             raise HarnessFailure("UTF16LE_DOCUMENT_SENTINEL_LEAKED")
     config_root = case_root / "config"
     return {
@@ -606,56 +642,6 @@ class Goal03Harness(BaseNativeHarness):
         data_root, config_root, workspace_root, stderr_path = self.case_roots(case_id)
         case_root = data_root.parent
         return case_root, data_root, config_root, workspace_root, stderr_path
-
-    def launch_target(
-        self,
-        target: Path | None,
-        data_root: Path,
-        config_root: Path,
-        workspace_root: Path,
-        stderr_path: Path,
-    ) -> Any:
-        spec = build_launch_spec(
-            self.copied_exe, target, data_root, config_root, workspace_root, stderr_path
-        )
-        try:
-            with stderr_path.open("ab") as stderr:
-                process = subprocess.Popen(
-                    spec.args,
-                    cwd=spec.cwd,
-                    env=spec.env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr,
-                )
-        except OSError as error:
-            raise HarnessFailure("PROCESS_LAUNCH_FAILED", safe_exception_name(error)) from None
-        self.processes.append(process)
-        if process.poll() is not None:
-            raise HarnessFailure("PROCESS_EXITED_BEFORE_UI")
-        child_context = self.win32.security_context(process.pid)
-        if failure := security_context_failure(self.parent_context, child_context):
-            raise HarnessBlocked(failure)
-        try:
-            app = self.application_class(backend="uia").connect(process=process.pid, timeout=self.ui_timeout)
-            window = app.top_window()
-            window.wait("exists visible enabled ready", timeout=self.ui_timeout)
-            hwnd = int(window.handle)
-        except Exception as error:
-            if process.poll() is not None:
-                raise HarnessFailure("PROCESS_EXITED_BEFORE_UI") from None
-            raise HarnessFailure("MAIN_WINDOW_UIA_TIMEOUT", safe_exception_name(error)) from None
-        if not hwnd:
-            raise HarnessBlocked("UIA_MAIN_WINDOW_HANDLE_MISSING")
-        self.win32.require_foreground(hwnd, self.ui_timeout)
-        return RunningApp(
-            process,
-            window,
-            hwnd,
-            spec,
-            child_context,
-            data_root / "logs" / f"markturbo-{process.pid}.log",
-        )
 
     def welcome_control(self, app: Any, automation_id: str) -> Any:
         return self.find_control(
@@ -686,7 +672,7 @@ class Goal03Harness(BaseNativeHarness):
         try:
             editor = self.control_by_id(
                 app.hwnd,
-                BASE["SOURCE_EDITOR_AUTOMATION_ID"],
+                SOURCE_EDITOR_AUTOMATION_ID,
                 "Edit",
                 "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
             )
@@ -898,8 +884,7 @@ class Goal03Harness(BaseNativeHarness):
         self.win32.send_shortcut(hwnd, VK_A)
         self.win32.send_unicode(hwnd, str(path))
         self.win32.send_key(hwnd, VK_RETURN)
-        if path.exists():
-            self.accept_native_overwrite_confirmation(app, hwnd)
+        self.accept_native_overwrite_confirmation(app, hwnd)
         wait_until(
             lambda: hwnd
             not in self.win32.owned_task_dialogs(app.process.pid, app.hwnd),
@@ -1051,7 +1036,7 @@ class Goal03Harness(BaseNativeHarness):
 
     def scenario_welcome(self) -> dict[str, Any]:
         case_root, data, config, workspace, stderr = self.profile(CASE_WELCOME)
-        first = self.launch_target(None, data, config, workspace, stderr)
+        first = self.launch_app(None, data, config, workspace, stderr)
         try:
             self.welcome_control(first, WELCOME_NEW_AUTOMATION_ID)
             self.welcome_control(first, WELCOME_PASTE_AUTOMATION_ID)
@@ -1060,7 +1045,7 @@ class Goal03Harness(BaseNativeHarness):
             self.wait_welcome_absent(first)
             self.source_editor_ready(first)
             self.close_app(first)
-            second = self.launch_target(None, data, config, workspace, stderr)
+            second = self.launch_app(None, data, config, workspace, stderr)
             try:
                 self.wait_welcome_absent(second)
                 self.source_editor_ready(second)
@@ -1082,14 +1067,14 @@ class Goal03Harness(BaseNativeHarness):
 
     def scenario_new_paste(self) -> dict[str, Any]:
         case_root, data, config, workspace, stderr = self.profile(CASE_NEW_PASTE)
-        new = self.launch_target(None, data, config, workspace, stderr)
+        new = self.launch_app(None, data, config, workspace, stderr)
         try:
             self.click_control(self.welcome_control(new, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.wait_welcome_absent(new)
             self.source_editor_ready(new)
             new_text = self.replace_editor(new, NEW_TEXT)
             self.discard_memory_document(new)
-            paste = self.launch_target(None, data, config, workspace, stderr)
+            paste = self.launch_app(None, data, config, workspace, stderr)
             try:
                 clipboard_before = self.read_text_clipboard()
                 try:
@@ -1126,7 +1111,7 @@ class Goal03Harness(BaseNativeHarness):
     def scenario_save_create(self) -> dict[str, Any]:
         case_root, data, config, workspace, stderr = self.profile(CASE_SAVE_CREATE)
         destination = (workspace / "created.md").resolve()
-        first = self.launch_target(None, data, config, workspace, stderr)
+        first = self.launch_app(None, data, config, workspace, stderr)
         try:
             self.click_control(self.welcome_control(first, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(first)
@@ -1135,7 +1120,7 @@ class Goal03Harness(BaseNativeHarness):
             self.select_save_path(first, destination)
             saved = self.wait_file(destination, editor, "SAVE_AS_CREATE_TIMEOUT")
             self.close_app(first)
-            reopened = self.launch_target(destination, data, config, workspace, stderr)
+            reopened = self.launch_app(destination, data, config, workspace, stderr)
             try:
                 self.wait_welcome_absent(reopened)
                 self.source_editor_ready(reopened)
@@ -1162,11 +1147,11 @@ class Goal03Harness(BaseNativeHarness):
         case_root, data, config, workspace, stderr = self.profile(CASE_SAVE_CANCEL_OVERWRITE)
         cancelled_destination = (workspace / "cancelled.md").resolve()
         destination = (workspace / "replace.md").resolve()
-        BASE["write_durable"](cancelled_destination, CANCELLED_DESTINATION)
-        BASE["write_durable"](destination, EXISTING_DESTINATION)
+        write_durable(cancelled_destination, CANCELLED_DESTINATION)
+        write_durable(destination, EXISTING_DESTINATION)
         cancelled_before = sha256_file(cancelled_destination)
         before = sha256_file(destination)
-        app = self.launch_target(None, data, config, workspace, stderr)
+        app = self.launch_app(None, data, config, workspace, stderr)
         try:
             self.click_control(self.welcome_control(app, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(app)
@@ -1220,14 +1205,16 @@ class Goal03Harness(BaseNativeHarness):
 
     def scenario_sample(self) -> dict[str, Any]:
         case_root, data, config, workspace, stderr = self.profile(CASE_SAMPLE)
-        app = self.launch_target(None, data, config, workspace, stderr)
+        app = self.launch_app(None, data, config, workspace, stderr)
         try:
             sample = self.welcome_control(app, WELCOME_OPEN_SAMPLE_AUTOMATION_ID)
             self.click_control(sample, "WELCOME_SAMPLE_CLICK_FAILED")
             self.wait_welcome_absent(app)
+            materialized = materialized_sample_inventory(data)
             self.close_app(app)
             observations = {
                 "sample_workspace_opened": True,
+                **materialized,
                 "flow": CASE_FLOWS[CASE_SAMPLE],
                 "process_context": app.security_context.evidence(),
                 "foreground_verified": True,
@@ -1242,12 +1229,12 @@ class Goal03Harness(BaseNativeHarness):
         documents = []
         for index in range(11):
             path = (workspace / f"recent-{index:02}.md").resolve()
-            BASE["write_durable"](path, f"recent {index}\n".encode("utf-8"))
+            write_durable(path, f"recent {index}\n".encode("utf-8"))
             documents.append(path)
-        BASE["write_durable"](
+        write_durable(
             config / "settings.toml", recent_settings_document(documents)
         )
-        app = self.launch_target(None, data, config, workspace, stderr)
+        app = self.launch_app(None, data, config, workspace, stderr)
         try:
             self.welcome_control(app, WELCOME_NEW_AUTOMATION_ID)
 
@@ -1265,7 +1252,7 @@ class Goal03Harness(BaseNativeHarness):
         finally:
             self.reap(app)
         documents[1].unlink()
-        restarted = self.launch_target(None, data, config, workspace, stderr)
+        restarted = self.launch_app(None, data, config, workspace, stderr)
         try:
             self.welcome_control(restarted, WELCOME_NEW_AUTOMATION_ID)
             def ten_recent_controls() -> list[Any] | None:
@@ -1309,8 +1296,8 @@ class Goal03Harness(BaseNativeHarness):
     def scenario_cli(self) -> dict[str, Any]:
         case_root, data, config, workspace, stderr = self.profile(CASE_CLI)
         document = (workspace / "explicit.md").resolve()
-        BASE["write_durable"](document, SAVE_TEXT.encode("utf-8"))
-        file_app = self.launch_target(document, data, config, workspace, stderr)
+        write_durable(document, SAVE_TEXT.encode("utf-8"))
+        file_app = self.launch_app(document, data, config, workspace, stderr)
         try:
             self.wait_welcome_absent(file_app)
             self.source_editor_ready(file_app)
@@ -1319,8 +1306,8 @@ class Goal03Harness(BaseNativeHarness):
             self.close_app(file_app)
             directory = (workspace / "folder").resolve()
             directory.mkdir()
-            BASE["write_durable"](directory / "readme.md", b"folder\n")
-            directory_app = self.launch_target(directory, data, config, workspace, stderr)
+            write_durable(directory / "readme.md", b"folder\n")
+            directory_app = self.launch_app(directory, data, config, workspace, stderr)
             try:
                 self.wait_welcome_absent(directory_app)
                 self.close_app(directory_app)
@@ -1339,64 +1326,17 @@ class Goal03Harness(BaseNativeHarness):
         return observations
 
 
-def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
-    evidence = new_evidence(args.expect_exe_sha256)
-    if failure := source_contract_failure():
-        mark_remaining_cases(evidence, 0, "NOT_RUN", failure)
-        complete_evidence(evidence, "FAIL")
-        return 1, evidence, failure
-    try:
-        exe = args.exe.resolve(strict=False)
-        win32, parent_context = preflight_goal_02(exe, args.expect_exe_sha256, evidence)
-        application_class, uia_element_info_class, uia_wrapper_class, iuia_class, no_pattern_error_class = load_pywinauto()
-    except HarnessBlocked as error:
-        mark_remaining_cases(evidence, 0, "BLOCKED", error.code)
-        complete_evidence(evidence, "BLOCKED")
-        return 2, evidence, error.code
-    except HarnessFailure as error:
-        mark_remaining_cases(evidence, 0, "NOT_RUN", error.code)
-        complete_evidence(evidence, "FAIL")
-        return 1, evidence, error.code
-    except Exception as error:
-        code = f"PREFLIGHT_{safe_exception_name(error).upper()}"
-        mark_remaining_cases(evidence, 0, "NOT_RUN", code)
-        complete_evidence(evidence, "FAIL")
-        return 1, evidence, code
-
-    with tempfile.TemporaryDirectory(prefix="markturbo-goal-03-native-", ignore_cleanup_errors=True) as temporary:
-        root = Path(temporary).resolve()
-        try:
-            bin_root = root / "bin"
-            bin_root.mkdir()
-            copied_exe = Path(shutil.copy2(exe, bin_root / exe.name)).resolve()
-            copied = sha256_file(copied_exe)
-            evidence["executable"]["copied_sha256"] = copied.sha256
-            evidence["executable"]["copy_hash_verified"] = copied.sha256 == args.expect_exe_sha256
-            if not evidence["executable"]["copy_hash_verified"]:
-                raise HarnessFailure("COPIED_EXECUTABLE_HASH_MISMATCH")
-            source_sample = REPO / "sample"
-            if not source_sample.is_dir():
-                raise HarnessFailure("SAMPLE_FIXTURE_MISSING")
-            shutil.copytree(source_sample, bin_root / "sample")
-        except (HarnessFailure, OSError) as error:
-            code = error.code if isinstance(error, HarnessFailure) else "ISOLATION_COPY_FAILED"
-            mark_remaining_cases(evidence, 0, "NOT_RUN", code)
-            complete_evidence(evidence, "FAIL")
-            return 1, evidence, code
-
-        harness = Goal03Harness(
-            copied_exe,
-            root,
-            args.ui_timeout,
-            win32,
-            application_class,
-            uia_element_info_class,
-            uia_wrapper_class,
-            iuia_class,
-            no_pattern_error_class,
-            parent_context,
-        )
-        scenarios: tuple[Callable[[], dict[str, Any]], ...] = (
+def native_run_plan() -> NativeRunPlan:
+    return NativeRunPlan(
+        required_case_ids=REQUIRED_CASE_IDS,
+        workdir_prefix="markturbo-goal-03-native-",
+        new_evidence=new_evidence,
+        validate_evidence=validate_evidence,
+        source_contract=source_contract_failure,
+        preflight=preflight,
+        ui_types_loader=load_pywinauto,
+        harness_factory=Goal03Harness,
+        scenarios=lambda harness: (
             harness.scenario_welcome,
             harness.scenario_new_paste,
             harness.scenario_save_create,
@@ -1404,42 +1344,12 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
             harness.scenario_sample,
             harness.scenario_recents,
             harness.scenario_cli,
-        )
-        returncode, code = 1, "INTERNAL_NO_RESULT"
-        current = 0
-        try:
-            for current, scenario in enumerate(scenarios):
-                case = evidence["cases"][current]
-                started = time.perf_counter()
-                try:
-                    case["observations"] = scenario()
-                except HarnessBlocked as error:
-                    case.update(status="BLOCKED", reason_code=error.code, duration_ms=round((time.perf_counter() - started) * 1000, 3))
-                    mark_remaining_cases(evidence, current + 1, "BLOCKED", "SKIPPED_AFTER_BLOCKED")
-                    returncode, code = 2, error.code
-                    break
-                except HarnessFailure as error:
-                    case.update(status="FAIL", reason_code=error.code, failure_type=safe_failure_type(error), duration_ms=round((time.perf_counter() - started) * 1000, 3))
-                    mark_remaining_cases(evidence, current + 1, "NOT_RUN", "SKIPPED_AFTER_FAILURE")
-                    returncode, code = 1, error.code
-                    break
-                except Exception as error:
-                    case.update(status="FAIL", reason_code="INTERNAL_FAILURE", failure_type=safe_exception_name(error), duration_ms=round((time.perf_counter() - started) * 1000, 3))
-                    mark_remaining_cases(evidence, current + 1, "NOT_RUN", "SKIPPED_AFTER_FAILURE")
-                    returncode, code = 1, "INTERNAL_FAILURE"
-                    break
-                case.update(status="PASS", duration_ms=round((time.perf_counter() - started) * 1000, 3))
-            else:
-                returncode, code = 0, "ALL_REQUIRED_CASES"
-        finally:
-            try:
-                harness.cleanup()
-            except HarnessFailure as error:
-                returncode, code = 1, error.code
-                case = evidence["cases"][current]
-                case.update(status="FAIL", reason_code=error.code, failure_type=safe_failure_type(error), duration_ms=case["duration_ms"] or 0.0)
-        complete_evidence(evidence, {0: "PASS", 1: "FAIL", 2: "BLOCKED"}[returncode])
-        return returncode, evidence, code
+        ),
+    )
+
+
+def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
+    return run_native_acceptance(args, native_run_plan())
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1448,6 +1358,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expect-exe-sha256", type=normalize_expected_hash, required=True)
     parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE)
     parser.add_argument("--ui-timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--case",
+        choices=REQUIRED_CASE_IDS,
+        help="run one case for debugging; it never produces acceptance PASS",
+    )
+    parser.add_argument(
+        "--keep-workdir-on-failure",
+        action="store_true",
+        help="preserve the isolated data, config, logs, and stderr directory after a non-PASS run",
+    )
     args = parser.parse_args(argv)
     if not math.isfinite(args.ui_timeout) or args.ui_timeout <= 0:
         parser.error("--ui-timeout must be greater than zero")
@@ -1456,17 +1376,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    returncode, evidence, code = run(args)
-    try:
-        write_evidence(args.evidence, evidence)
-    except (OSError, ValueError):
-        print("FAIL: EVIDENCE_WRITE_FAILED", file=sys.stderr)
-        return 1
-    status = {0: "PASS", 1: "FAIL", 2: "BLOCKED"}[returncode]
-    stream = sys.stdout if returncode == 0 else sys.stderr
-    print(f"{status}: {code}", file=stream)
-    print(f"evidence: {args.evidence.resolve()}", file=stream)
-    return returncode
+    return main_native_acceptance(args, native_run_plan())
 
 
 if __name__ == "__main__":

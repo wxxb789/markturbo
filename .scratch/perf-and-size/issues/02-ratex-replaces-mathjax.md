@@ -1,5 +1,9 @@
 # 02 — Replace MathJax with RaTeX, lazily, embedding no fonts
 
+> Superseded on 2026-09-01: the single-file Windows release now embeds the
+> required KaTeX faces. The measurements below remain historical evidence;
+> current runtime and packaging behavior is documented in `docs/architecture.md`.
+
 Type: task
 Status: resolved
 

@@ -34,6 +34,9 @@ jobs:
       contents: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,16 +45,25 @@ jobs:
 
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
-          enable-cache: false
+          enable-cache: true
+          cache-dependency-glob: |
+            scripts/pyproject.toml
+            scripts/uv.lock
 
-      - name: Install cargo-release
+      - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          cargo install cargo-release --version "$CARGO_RELEASE_VERSION" --locked
 
-      - name: Verify release automation
-        run: uv run scripts/test_release_automation.py
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-linux
+
+      - name: Install cargo-release
+        run: cargo install cargo-release --version "$CARGO_RELEASE_VERSION" --locked
+
+      - name: Test tooling
+        run: uv run --project scripts scripts/mt.py check fast
 
       - name: Bump workspace version
         id: version

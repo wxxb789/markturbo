@@ -1,0 +1,13 @@
+[project]
+name = "markturbo-tools"
+version = "0.1.0"
+description = "Development and acceptance tooling for MarkTurbo"
+requires-python = ">=3.11"
+dependencies = [
+    "pillow==12.3.0; sys_platform == 'win32'",
+    "pywinauto==0.6.9; sys_platform == 'win32'",
+    "ruamel.yaml==0.18.17",
+]
+
+[tool.uv]
+package = false
