@@ -15,6 +15,7 @@
 //!   skills.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -499,8 +500,9 @@ impl Discovery {
 /// Workspace roots are deliberately not cached: their watcher events describe
 /// the project the user is actively editing, and their scan is already cheap.
 /// Global roots are the expensive part, so each one is reused only while every
-/// directory visited by the previous walk and every discovered entry document
-/// still has the same filesystem stamp.
+/// directory visited by the previous walk still has the same direct entries
+/// and filesystem stamp, and every discovered entry document still has the
+/// same filesystem stamp.
 #[derive(Debug, Default)]
 pub struct DiscoveryCache {
     global_roots: BTreeMap<PathBuf, CachedRoot>,
@@ -562,6 +564,7 @@ struct PathStamp {
     path: PathBuf,
     modified: SystemTime,
     len: Option<u64>,
+    children: Option<Vec<OsString>>,
 }
 
 impl PathStamp {
@@ -570,10 +573,16 @@ impl PathStamp {
         if !metadata.is_dir() {
             return None;
         }
+        let mut children: Vec<_> = std::fs::read_dir(path)
+            .ok()?
+            .map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect::<Option<_>>()?;
+        children.sort();
         Some(Self {
             path: path.to_path_buf(),
             modified: metadata.modified().ok()?,
             len: None,
+            children: Some(children),
         })
     }
 
@@ -586,6 +595,7 @@ impl PathStamp {
             path: path.to_path_buf(),
             modified: metadata.modified().ok()?,
             len: Some(metadata.len()),
+            children: None,
         })
     }
 
@@ -1625,6 +1635,25 @@ mod tests {
         assert_eq!(
             cache.global_scans, 4,
             "each category entry change must invalidate the cached root"
+        );
+    }
+
+    #[test]
+    fn category_entries_invalidate_when_the_directory_timestamp_does_not_change() {
+        let temp = tempdir().unwrap();
+        let global = temp.path().join("global");
+        let category = global.join("category");
+        write_skill(&category, "alpha", "first");
+        let mut before = PathStamp::directory(&category).unwrap();
+
+        write_skill(&category, "beta", "second");
+        let after = PathStamp::directory(&category).unwrap();
+        before.modified = after.modified;
+
+        assert_ne!(before.children, after.children);
+        assert!(
+            !before.matches_directory(),
+            "the entry inventory must invalidate even when directory timestamps collide"
         );
     }
 
