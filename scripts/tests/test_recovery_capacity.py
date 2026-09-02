@@ -1,24 +1,20 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
-"""Unit tests for recovery-capacity.py output parsing."""
+"""Unit tests for recovery-capacity output parsing."""
 
 from __future__ import annotations
 
-import runpy
+import contextlib
+import io
 import unittest
-from pathlib import Path
+from unittest import mock
 
+from scripts.markturbo_tools import recovery_capacity as harness
 
-HARNESS = runpy.run_path(Path(__file__).with_name("recovery-capacity.py"))
-DURATION_SECONDS = HARNESS["duration_seconds"]
-PARSE_CAPACITY_OUTPUT = HARNESS["parse_capacity_output"]
-CAPACITY_BUDGET_FAILURE = HARNESS["capacity_budget_failure"]
-CAPACITY_MEASUREMENT = HARNESS["CapacityMeasurement"]
-CAPACITY_ROUND = HARNESS["CapacityRound"]
-SUMMARIZE_CAPACITY = HARNESS["summarize_capacity"]
+DURATION_SECONDS = harness.duration_seconds
+PARSE_CAPACITY_OUTPUT = harness.parse_capacity_output
+CAPACITY_BUDGET_FAILURE = harness.capacity_budget_failure
+CAPACITY_MEASUREMENT = harness.CapacityMeasurement
+CAPACITY_ROUND = harness.CapacityRound
+SUMMARIZE_CAPACITY = harness.summarize_capacity
 
 
 VALID_OUTPUT = """\
@@ -105,6 +101,69 @@ class CapacitySummaryTests(unittest.TestCase):
 
         self.assertEqual(summary.round_count, 3)
         self.assertIn("8.010000000s exceeds", CAPACITY_BUDGET_FAILURE(summary))
+
+
+class MainExecutionTests(unittest.TestCase):
+    def test_main_requires_windows_before_parsing_or_launching_cargo(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(harness.sys, "platform", "linux"),
+            mock.patch.object(harness, "parse_args") as parse_args,
+            mock.patch.object(harness, "run_cargo_invocation") as run_cargo,
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(harness.main([]), 2)
+
+        parse_args.assert_not_called()
+        run_cargo.assert_not_called()
+        self.assertIn("requires Windows", stderr.getvalue())
+
+    def test_main_reports_a_cargo_failure(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(harness.sys, "platform", "win32"),
+            mock.patch.object(harness, "run_cargo_invocation", side_effect=RuntimeError("cargo failed")),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(harness.main(["--invocations", "1"]), 1)
+
+        self.assertIn("invocation 1 failed: cargo failed", stderr.getvalue())
+
+    def test_main_fails_when_the_global_capacity_budget_is_exceeded(self) -> None:
+        measurement = CAPACITY_MEASUREMENT(
+            rounds=(
+                CAPACITY_ROUND(0, 8.1, 1),
+                CAPACITY_ROUND(1, 7.9, 2),
+                CAPACITY_ROUND(2, 7.8, 3),
+            ),
+            median_seconds=7.9,
+            max_seconds=8.1,
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(harness.sys, "platform", "win32"),
+            mock.patch.object(harness, "run_cargo_invocation", return_value=measurement),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(harness.main(["--invocations", "1"]), 1)
+
+        self.assertIn("exceeds the 8-second", stderr.getvalue())
+
+    def test_main_reports_pass_after_all_invocations_meet_the_budget(self) -> None:
+        measurement = PARSE_CAPACITY_OUTPUT(VALID_OUTPUT)
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(harness.sys, "platform", "win32"),
+            mock.patch.object(harness, "run_cargo_invocation", return_value=measurement) as run_cargo,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(harness.main(["--invocations", "2"]), 0)
+
+        self.assertEqual(run_cargo.call_count, 2)
+        self.assertIn("PASS: all capacity rounds", stdout.getvalue())
 
 
 if __name__ == "__main__":

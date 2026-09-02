@@ -58,9 +58,10 @@ user-initiated model-data boundary established by Goal 05A.
   provider-routing capability.
 - Actionable behavior for a missing, mismatched, crashed, timed-out, or malformed
   worker; the editor and local workflows remain usable.
-- Stage the worker in development and the Windows 11 x64 release archive so one
-  extracted product is complete. Goal 10 owns production signing and installer
-  policy.
+- Stage the worker in development and embed any required worker payload in the
+  single Windows 11 x64 release executable. Runtime materialization, if needed,
+  uses app-owned data rather than a sibling sidecar. Goal 10 owns production
+  signing and installer policy.
 - Keep protocol types small and independent of GPUI, `genai`, and renderer
   dependencies.
 
@@ -88,10 +89,10 @@ user-initiated model-data boundary established by Goal 05A.
 5. Missing, version-mismatched, crashed, malformed, oversized, and timed-out
    worker cases produce diagnostics and do not change document text.
 6. Logs and process arguments contain neither API keys nor request content.
-7. A release archive contains every required worker artifact and works after
-   moving the extracted folder.
+7. The single release executable contains every required worker artifact and
+   works after moving only that file to a clean machine.
 8. The Goal 04 paired harness confirms the pre-approved improvement and records
-   any first-request regression and total archive-size change.
+   any first-request regression and total executable-size change.
 9. `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`, focused
    protocol/integration tests, and `cargo test --release --workspace` pass; the
    pass count is recorded.
@@ -109,9 +110,10 @@ user-initiated model-data boundary established by Goal 05A.
 
 If Goal 04 is absent, inconclusive, below threshold, or does not specifically
 select a worker, take the no-go path and continue without architectural work.
-Stop and ask only when an authorized worker cannot preserve one-step packaging or
-a secure private protocol on Windows 11 x64. Do not reinterpret “dynamic” as
-permission to expose unstable Rust trait objects across a library ABI.
+Stop and ask only when an authorized worker cannot preserve single-asset
+packaging or a secure private protocol on Windows 11 x64. Do not reinterpret
+“dynamic” as permission to expose unstable Rust trait objects across a library
+ABI.
 
 ## Boundary for the next goal
 

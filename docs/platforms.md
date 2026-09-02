@@ -5,20 +5,21 @@ required build paths to be investigated and documented rather than claiming
 portability that did not exist. The current [Product Contract](../PRODUCT.md)
 names Windows 11 x64 as the only first public-quality platform.
 
-## Summary
+## Release status
 
-| Platform | App | Native rendering | Editor | WebView | Verified |
+| Platform | App | Native rendering | Editor | WebView | Release status |
 |---|---|---|---|---|---|
-| Windows 10/11 (x64) | ✅ | ✅ | ✅ | ✅ | **Built and run** |
-| macOS | ✅ | ✅ | ✅ | ✅ | Upstream-supported, not run here |
-| Linux (X11 + Wayland) | ✅ | ✅ | ✅ | ❌ | Upstream-supported, not run here |
-| FreeBSD | ⚠️ | ✅ | ✅ | ❌ | Compiles per upstream `cfg`; untested |
-| WebAssembly | ❌ | — | — | — | Out of scope for a local-first app |
+| Windows 11 (x64) | Yes | Yes | Yes | Yes | **Only public-quality and CD target** |
+| macOS | Compatibility build | Yes | Yes | Yes | No CD asset |
+| Linux (X11 + Wayland) | Compatibility build | Yes | Yes | No | No CD asset |
+| FreeBSD | Best effort | Yes | Yes | No | Untested |
+| WebAssembly | No | - | - | - | Out of scope |
 
-"Verified" means what was actually exercised while building this. Only Windows
-was: the binary was compiled and launched, a native window opened with a D3D11
-device, and the full test suite ran. The other rows report what the upstream
-crates declare, not results.
+Windows 11 x64 is the only platform with a public release contract. The release
+workflow publishes one raw `markturbo-windows-x64.exe`, with the required fonts and bundled
+sample embedded. Other platforms remain useful compile and compatibility
+coverage, not downloadable product artifacts. Installer, signing, notarization,
+and multi-platform distribution work belong to future Goal 10.
 
 ## Where the support comes from
 
@@ -37,16 +38,12 @@ explicitly, along with `font-kit` and `runtime_shaders`.
 The stable platform identifier is `io.github.wxxb789.markturbo`.
 
 - Windows embeds the multi-resolution `.ico` in `markturbo.exe` at build time.
-- macOS release packaging creates `markturbo.app` with `markturbo.icns` in its
-  `Contents/Resources` directory. The top-level `markturbo` command remains a
-  relative symlink to the bundle executable.
-- Linux/X11 receives a 256 px icon through GPUI's `WindowOptions`. The Linux
-  release includes an installer which registers the matching freedesktop
-  `.desktop` file and hicolor PNG for desktop shells.
+- macOS and Linux retain development/compatibility icon support but have no
+  release package contract.
 
-All three are derived from
+All platform icon forms are derived from
 `crates/mt-app/resources/icons/markturbo.png`; run
-`./scripts/generate-app-icons.py` after replacing that 1024 px master.
+`uv run --project scripts scripts/mt.py icons` after replacing that 1024 px master.
 
 **gpui-wry** (the WebView) states in its own README:
 
@@ -110,22 +107,13 @@ client is built on `rustls` with the `ring` provider, so nothing links OpenSSL.
 The only match for "openssl" in the graph is `openssl-probe`, which reads the
 system certificate *paths* and links nothing.
 
-### Linux release archive
+### Windows CD artifact
 
-After extracting a Linux release archive, run:
-
-```sh
-./scripts/install-linux.sh
-```
-
-The installer keeps the executable, `fonts/`, `sample/`, and `docs/` together
-under `$XDG_DATA_HOME/markturbo/app` (or `~/.local/share/markturbo/app` when
-`XDG_DATA_HOME` is unset). Reinstalling replaces only that `app/` payload and
-preserves other application data under `$XDG_DATA_HOME/markturbo/`. It installs the desktop entry to
-`$XDG_DATA_HOME/applications/` and the hicolor icon to
-`$XDG_DATA_HOME/icons/hicolor/512x512/apps/`. The generated desktop entry uses
-the installed binary's absolute path, so launching from a desktop shell does
-not depend on `PATH`.
+The release workflow produces exactly `markturbo-windows-x64.exe`. It contains its icon,
+KaTeX font resources, and bundled sample; it does not upload archives, docs,
+installers, or auxiliary payloads. This is a portable executable artifact, not
+an installer and not a signed distribution. Installation and OS registration
+are reserved for Goal 10.
 
 ## Where settings live
 

@@ -116,9 +116,10 @@ On a clean Windows 11 x64 machine or equivalent clean Windows 11 x64 VM:
 - `cargo clippy --workspace --all-targets` introduces no new warnings.
 - `cargo test --release --workspace` passes and the pass count is published in
   the release evidence.
-- Existing platform packaging tests and the Goal 04 platform-appropriate startup,
-  memory, CPU, and window harnesses pass against the packaged executable; run
-  and pass `scripts/probe.py` against the Windows 11 x64 packaged executable.
+- The Goal 04 platform-appropriate startup, memory, CPU, and window harnesses
+  pass against the published executable; run and pass
+  `uv run --project scripts scripts/mt.py probe -- ...` against the Windows 11
+  x64 artifact.
 - The measured startup result does not regress beyond the guardrail approved in
   Goal 04, or the release is blocked with the regression documented.
 - The download page names the one verified platform and accurately labels all

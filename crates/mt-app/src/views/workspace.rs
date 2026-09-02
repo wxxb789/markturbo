@@ -1604,7 +1604,7 @@ impl Workspace {
             .iter()
             .map(|target| (target.path.clone(), recent_target_issue(target)))
             .collect();
-        self.welcome_sample_available = crate::app_paths::bundled_sample_dir().is_some();
+        self.welcome_sample_available = crate::app_paths::bundled_sample_available();
     }
 
     fn welcome_recent_target_issue(
@@ -1624,8 +1624,20 @@ impl Workspace {
     }
 
     fn open_bundled_sample(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = crate::app_paths::bundled_sample_dir() {
-            self.open_target(path, true, window, cx);
+        self.open_bundled_sample_result(crate::app_paths::bundled_sample_dir(), window, cx);
+    }
+
+    fn open_bundled_sample_result(
+        &mut self,
+        sample: std::io::Result<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match sample {
+            Ok(path) => {
+                self.open_target(path, true, window, cx);
+            }
+            Err(_) => self.set_status(i18n::t(i18n::Key::BundledSampleUnavailable, cx).into(), cx),
         }
     }
 
@@ -6900,6 +6912,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn unavailable_bundled_sample_keeps_welcome_visible_and_reports_status(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_bundled_sample_result(
+                    Err(std::io::Error::other("test materialization failure")),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.show_welcome);
+            assert!(workspace.root.is_none());
+            assert!(workspace.tabs.is_empty());
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(i18n::t(i18n::Key::BundledSampleUnavailable, app))
+            );
+        });
+    }
+
+    #[gpui::test]
     fn missing_recent_target_is_disabled_and_removable_without_opening_anything(
         cx: &mut TestAppContext,
     ) {
@@ -7190,6 +7229,30 @@ mod tests {
                 && !welcome.contains("let issue = recent_target_issue(&target);"),
             "Welcome rendering must not synchronously probe the filesystem"
         );
+    }
+
+    #[test]
+    fn welcome_refresh_uses_the_nonmaterializing_sample_probe() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let refresh = source
+            .split_once("fn refresh_welcome_availability")
+            .expect("Welcome refresh")
+            .1
+            .split_once("fn welcome_recent_target_issue")
+            .unwrap()
+            .0;
+        let open = source
+            .split_once("fn open_bundled_sample")
+            .expect("sample opener")
+            .1
+            .split_once("fn dont_show_welcome_again")
+            .unwrap()
+            .0;
+
+        assert!(refresh.contains("crate::app_paths::bundled_sample_available()"));
+        assert!(!refresh.contains("bundled_sample_dir()"));
+        assert!(open.contains("self.open_bundled_sample_result("));
+        assert!(open.contains("crate::app_paths::bundled_sample_dir()"));
     }
 
     #[test]

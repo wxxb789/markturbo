@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """Measure Windows DPAPI recovery capacity with fresh Rust test processes.
 
 The ignored Rust test performs three near-capacity checkpoint commits. This
@@ -21,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]
 DEFAULT_INVOCATIONS = 3
 RUST_TEST = "recovery::tests::recovery_capacity_batch_commits_within_budget"
 EXPECTED_ROUNDS = 3
@@ -224,7 +219,7 @@ def print_global_summary(measurements: list[CapacityMeasurement]) -> CapacitySum
     return summary
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--invocations",
@@ -232,18 +227,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_INVOCATIONS,
         help=f"fresh cargo test processes to run (default: {DEFAULT_INVOCATIONS})",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.invocations <= 0:
         parser.error("--invocations must be positive")
     return args
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     if sys.platform != "win32":
         print("recovery capacity harness requires Windows current-user DPAPI", file=sys.stderr)
         return 2
 
-    args = parse_args()
+    args = parse_args(argv)
     print(f"recovery capacity harness: {args.invocations} fresh cargo invocation(s)")
     print("command: " + " ".join(cargo_command()))
     measurements: list[CapacityMeasurement] = []

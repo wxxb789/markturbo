@@ -1,12 +1,8 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """Derive the platform app icons from the checked-in 1024 px master PNG."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import struct
@@ -15,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 ICONS = ROOT / "crates" / "mt-app" / "resources" / "icons"
 MASTER = ICONS / "markturbo.png"
 X11 = ICONS / "markturbo-256.png"
@@ -145,7 +141,9 @@ def publish(generated: dict[Path, Path], temporary: Path) -> None:
         raise
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args(argv)
     if png_size(MASTER) != (1024, 1024):
         raise SystemExit(f"{MASTER} must be exactly 1024x1024")
 
@@ -182,7 +180,8 @@ def main() -> None:
     print(f"wrote {LINUX.relative_to(ROOT)}")
     print(f"wrote {ICO.relative_to(ROOT)}")
     print(f"wrote {ICNS.relative_to(ROOT)}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

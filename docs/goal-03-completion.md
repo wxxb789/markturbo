@@ -4,6 +4,9 @@
 **Goal:** [Goal 03 - Create a complete first-use document flow](../goals/archive/03-create-first-use-document-flow.md)
 **Status:** NOT COMPLETE / POST-REVIEW CODE GATES PASS; FINAL NATIVE ACCEPTANCE IS BLOCKED BY THE CURRENT WINDOWS SESSION.
 
+Commands below preserve the exact historical evidence. Use
+[`scripts/README.md`](../scripts/README.md) for current tooling entry points.
+
 ## Delivered first-use contract
 
 - A no-argument launch opens Welcome. `markturbo .` remains the explicit current-directory launch, and other file or directory arguments bypass Welcome.

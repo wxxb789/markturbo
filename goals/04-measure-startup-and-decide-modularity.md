@@ -6,7 +6,7 @@ Produce a reproducible, gating go/no-go decision only for isolating the
 model/network stack on Windows 11 x64. Measure the full application, a bare GPUI
 shell, and a compile-time ablation of that stack; collect at least 10
 quiet-gated A-B-B-A rounds, include first-visible, first-painted, first-input,
-idle-memory, baseline first-use, executable, and archive-size evidence, and
+idle-memory, baseline first-use, and executable-size evidence, and
 adopt no model runtime architecture without a pre-registered numeric materiality
 threshold. Renderer, WebView, and grammar ablations are optional diagnostics and
 cannot delay later product goals.
@@ -35,7 +35,7 @@ and are not a completion condition.
   - first input successfully handled;
   - initial workspace or welcome state ready.
 - Record cold and warm behavior separately where Windows 11 x64 permits an
-  honest distinction, using the Windows-only `scripts/probe.py` quiet/startup
+  honest distinction, using the Windows-only `mt.py probe` quiet/startup
   mechanisms as the primary evidence. Other platform measurements are
   non-release diagnostics and cannot replace this gate.
 - Quantify or symmetrically include the overhead of any instrumentation added to
@@ -57,7 +57,7 @@ and are not a completion condition.
   the goal merely because code moved into another file.
 - Re-run the existing `opt-level = 3` versus `opt-level = "s"` comparison using
   the repository quiet gate and matching fresh builds.
-- Record executable size, complete distributable archive size, idle working set
+- Record executable size, idle working set
   and private bytes, page faults or image-load evidence where available, and the
   full build's baseline model first-use latency. The ablated build has no
   first-use result and must not be assigned an estimate.
@@ -90,10 +90,11 @@ Every reported number must include:
 - raw samples, median, and p95 where applicable;
 - quiet-gate result;
 - whether the run was cold or warm;
-- the compared executable and archive sizes.
+- the compared executable sizes.
 
 For a paired shipping decision, use at least 10 A-B-B-A rounds after any declared
-warm-up, matching `scripts/probe.py` ordering. A single launch is not evidence.
+warm-up, matching `uv run --project scripts scripts/mt.py probe -- startup`
+ordering. A single launch is not evidence.
 
 ## Completion evidence
 

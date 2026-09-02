@@ -1,32 +1,18 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
-"""Regression tests for generate-app-icons.py publication contracts."""
+"""Regression tests for app-icon publication contracts."""
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import struct
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.markturbo_tools import icons
 
-sys.dont_write_bytecode = True
-
-SCRIPT = Path(__file__).with_name("generate-app-icons.py")
-SPEC = importlib.util.spec_from_file_location("generate_app_icons", SCRIPT)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError(f"could not load {SCRIPT}")
-ICONS = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = ICONS
-SPEC.loader.exec_module(ICONS)
+ICONS = icons
 
 
 def png(size: int) -> bytes:
@@ -72,7 +58,7 @@ class AppIconGenerationTests(unittest.TestCase):
                 mock.patch.object(ICONS.subprocess, "run", side_effect=fail_ico),
             ):
                 with self.assertRaises(subprocess.CalledProcessError):
-                    ICONS.main()
+                    ICONS.main([])
 
             self.assertEqual(self.destination_bytes(destinations), before)
 

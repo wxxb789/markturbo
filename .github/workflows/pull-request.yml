@@ -11,15 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-          - runner: macos-latest
-          - runner: windows-latest
-    runs-on: ${{ matrix.runner }}
+  quality:
+    runs-on: ubuntu-latest
     defaults:
       run:
         shell: bash
@@ -27,13 +20,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
 
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
-          enable-cache: false
+          enable-cache: true
+          cache-dependency-glob: |
+            scripts/pyproject.toml
+            scripts/uv.lock
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-linux
 
       - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -51,29 +57,49 @@ jobs:
             libfontconfig-dev \
             libvulkan-dev
 
+      - name: Prepare check range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git cat-file -e "$BASE_SHA^{commit}"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+
+      - name: Check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: uv run --project scripts scripts/mt.py check ci
+
+  release-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            cache: macos
+          - runner: windows-2022
+            cache: windows
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          rustup component add clippy
 
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Lint
-        run: cargo clippy --workspace --all-targets
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-${{ matrix.cache }}
 
       - name: Test
-        run: cargo test --release --workspace --locked
-
-      - name: Verify release automation
-        run: uv run scripts/test_release_automation.py
-
-      - name: Test generated app icons
-        run: uv run scripts/test_generate_app_icons.py
-
-      - name: Test platform packaging
-        run: uv run scripts/test_platform_packaging.py
-
-      - name: Package
-        run: bash ./scripts/package-release.sh
+        run: cargo test --locked --release --workspace

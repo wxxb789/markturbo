@@ -7,9 +7,8 @@
 //! the view code do not change.
 //!
 //! Mermaid and D2 render in pure Rust with no external dependency, so they are
-//! always available. Math renders in pure Rust too, but its glyph outlines come
-//! from the KaTeX faces shipped beside the executable — this application embeds
-//! no font it can ask the user to install instead. PlantUML has no usable
+//! always available. Math renders in pure Rust too, with its KaTeX glyph faces
+//! embedded in the executable. PlantUML has no usable
 //! pure-Rust implementation and falls back to a locally installed binary. When
 //! either dependency is absent the block gets an install hint, never a crash.
 //!
@@ -201,136 +200,55 @@ fn cache() -> &'static Mutex<HashMap<String, RenderOutcome>> {
 // Pure-Rust renderers
 // ---------------------------------------------------------------------------
 
-/// KaTeX faces RaTeX's layout can ask for, and the file each lives in.
-///
-/// Mirrors `ratex-font-loader`'s own `FONT_MAP`. These are not embedded: see
-/// [`MATH_FONTS_HINT`] for where they come from.
-const FONT_FILES: &[(ratex_font::FontId, &str)] = {
-    use ratex_font::FontId as F;
-    &[
-        (F::MainRegular, "KaTeX_Main-Regular.ttf"),
-        (F::MainBold, "KaTeX_Main-Bold.ttf"),
-        (F::MainItalic, "KaTeX_Main-Italic.ttf"),
-        (F::MainBoldItalic, "KaTeX_Main-BoldItalic.ttf"),
-        (F::MathItalic, "KaTeX_Math-Italic.ttf"),
-        (F::MathBoldItalic, "KaTeX_Math-BoldItalic.ttf"),
-        (F::AmsRegular, "KaTeX_AMS-Regular.ttf"),
-        (F::CaligraphicRegular, "KaTeX_Caligraphic-Regular.ttf"),
-        (F::FrakturRegular, "KaTeX_Fraktur-Regular.ttf"),
-        (F::FrakturBold, "KaTeX_Fraktur-Bold.ttf"),
-        (F::SansSerifRegular, "KaTeX_SansSerif-Regular.ttf"),
-        (F::SansSerifBold, "KaTeX_SansSerif-Bold.ttf"),
-        (F::SansSerifItalic, "KaTeX_SansSerif-Italic.ttf"),
-        (F::ScriptRegular, "KaTeX_Script-Regular.ttf"),
-        (F::TypewriterRegular, "KaTeX_Typewriter-Regular.ttf"),
-        (F::Size1Regular, "KaTeX_Size1-Regular.ttf"),
-        (F::Size2Regular, "KaTeX_Size2-Regular.ttf"),
-        (F::Size3Regular, "KaTeX_Size3-Regular.ttf"),
-        (F::Size4Regular, "KaTeX_Size4-Regular.ttf"),
-    ]
-};
-
-/// What to tell a user who has no math fonts.
-///
-/// This application embeds no fonts it can ask the user to install instead —
-/// the two in `assets.rs` are there because gpui requests them by exact path
-/// and diagram labels come out blank without them, which is a different case.
-/// The release archive ships these beside the executable, so a packaged build
-/// finds them without the user doing anything; this hint is for a build run
-/// from the source tree.
-pub const MATH_FONTS_HINT: &str = "install the KaTeX fonts: download \
-     https://github.com/KaTeX/KaTeX/releases/latest and install the `KaTeX_*.ttf` \
-     files under katex/fonts/, or set MT_MATH_FONT_DIR to the folder holding them";
-
-/// Directories that may hold the KaTeX `.ttf` files, most specific first.
-///
-/// No hardcoded distro paths beyond the conventional per-user and system font
-/// folders: a fixed list is what makes a font loader work on the author's
-/// machine and nowhere else.
-fn font_dir_candidates() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(explicit) = std::env::var_os("MT_MATH_FONT_DIR") {
-        dirs.push(PathBuf::from(explicit));
-    }
-    // Beside the executable: this is where `package-release.sh` puts them.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        dirs.push(parent.join("fonts"));
-        // And where `cargo run` / `cargo test` leave it: the executable is in
-        // `target/<profile>/` or `target/<profile>/deps/`, so the repository's
-        // own `fonts/katex` is two or three levels up. Without this a build
-        // from source finds no font and every formula is a diagnostic, which
-        // reads as "math is broken" rather than "math is not packaged yet".
-        for up in [2, 3] {
-            if let Some(root) = parent.ancestors().nth(up) {
-                dirs.push(root.join("fonts/katex"));
-            }
-        }
-    }
-    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
-    if cfg!(windows) {
-        dirs.extend(env("LOCALAPPDATA").map(|p| p.join("Microsoft/Windows/Fonts")));
-        dirs.extend(env("SYSTEMROOT").map(|p| p.join("Fonts")));
-    } else if cfg!(target_os = "macos") {
-        dirs.extend(env("HOME").map(|p| p.join("Library/Fonts")));
-        dirs.push(PathBuf::from("/Library/Fonts"));
-    } else {
-        dirs.extend(env("HOME").map(|p| p.join(".local/share/fonts")));
-        dirs.extend(env("HOME").map(|p| p.join(".fonts")));
-        dirs.push(PathBuf::from("/usr/share/fonts/truetype/katex"));
-        dirs.push(PathBuf::from("/usr/share/fonts"));
-    }
-    dirs
-}
-
-/// The first candidate directory holding all nineteen faces.
-///
-/// **Stat only.** `availability()` reaches this from `render_status_bar`, which
-/// runs every frame, so reading a single byte here would put half a megabyte of
-/// font on the first frame of a workspace that may never show a formula.
-fn font_dir() -> Option<&'static PathBuf> {
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        font_dir_candidates()
-            .into_iter()
-            .find(|dir| FONT_FILES.iter().all(|(_, f)| dir.join(f).is_file()))
-    })
-    .as_ref()
-}
-
 /// The KaTeX faces, read and parsed once.
 ///
 /// Nothing here runs until the first math block is rendered — there is no
 /// warm-up and an empty workspace pays nothing. Measured: 4.34MB at startup,
 /// 4.55MB after a thousand formulas.
 ///
-/// The bytes are leaked deliberately. They live for the process either way, and
-/// `FontRef` borrows rather than copies, so the alternative is re-parsing every
-/// face on every formula.
 struct Fonts {
-    faces: HashMap<ratex_font::FontId, ab_glyph::FontRef<'static>>,
+    faces: HashMap<ratex_font::FontId, ab_glyph::FontArc>,
 }
 
 fn fonts() -> Option<&'static Fonts> {
     static FONTS: OnceLock<Option<Fonts>> = OnceLock::new();
     FONTS
         .get_or_init(|| {
-            let dir = font_dir()?;
-            let faces: HashMap<_, _> = FONT_FILES
-                .iter()
-                .filter_map(|(id, f)| {
-                    let bytes: &'static [u8] =
-                        Box::leak(std::fs::read(dir.join(f)).ok()?.into_boxed_slice());
-                    Some((*id, ab_glyph::FontRef::try_from_slice(bytes).ok()?))
-                })
-                .collect();
-            // A directory that passed the stat check but holds a truncated or
-            // corrupt face is not usable; reporting it as available would show
-            // half a formula.
-            (faces.len() == FONT_FILES.len()).then_some(Fonts { faces })
+            let override_dir = std::env::var_os("MT_MATH_FONT_DIR").map(PathBuf::from);
+            load_math_fonts_from(override_dir.as_deref())
         })
         .as_ref()
+}
+
+fn load_math_fonts_from(override_dir: Option<&std::path::Path>) -> Option<Fonts> {
+    override_dir
+        .and_then(load_math_font_override)
+        .or_else(load_embedded_math_fonts)
+}
+
+fn load_math_font_override(directory: &std::path::Path) -> Option<Fonts> {
+    load_math_fonts(|name| {
+        let bytes = std::fs::read(directory.join(name)).ok()?;
+        ab_glyph::FontArc::try_from_vec(bytes).ok()
+    })
+}
+
+fn load_embedded_math_fonts() -> Option<Fonts> {
+    load_math_fonts(|name| {
+        let bytes = crate::assets::embedded_math_font(name)?;
+        match bytes {
+            std::borrow::Cow::Borrowed(bytes) => ab_glyph::FontArc::try_from_slice(bytes).ok(),
+            std::borrow::Cow::Owned(bytes) => ab_glyph::FontArc::try_from_vec(bytes).ok(),
+        }
+    })
+}
+
+fn load_math_fonts(mut load: impl FnMut(&str) -> Option<ab_glyph::FontArc>) -> Option<Fonts> {
+    let mut faces = HashMap::with_capacity(crate::assets::MATH_FONT_FILES.len());
+    for (id, name) in crate::assets::MATH_FONT_FILES {
+        faces.insert(*id, load(name)?);
+    }
+    Some(Fonts { faces })
 }
 
 /// The largest math source this will parse.
@@ -372,10 +290,7 @@ impl BlockRenderer for MathRenderer {
         "LaTeX"
     }
     fn availability(&self) -> Availability {
-        match font_dir() {
-            Some(dir) => Availability::External(dir.clone()),
-            None => Availability::Missing(MATH_FONTS_HINT.to_string()),
-        }
+        Availability::Builtin
     }
     fn render(&self, source: &str) -> RenderOutcome {
         let source = source.trim();
@@ -389,12 +304,10 @@ impl BlockRenderer for MathRenderer {
                 ),
             ));
         }
-        // Not reached through `availability()`: that one only stats, and a
-        // directory can pass the stat check and still hold a corrupt face.
         let Some(fonts) = fonts() else {
-            return RenderOutcome::Failed(Diagnostic::warning(
+            return RenderOutcome::Failed(Diagnostic::error(
                 "math",
-                format!("LaTeX fonts not found: {MATH_FONTS_HINT}"),
+                "LaTeX fonts embedded in this build could not be loaded".to_string(),
             ));
         };
         let nodes = match ratex_parser::parse(source) {
@@ -654,7 +567,7 @@ fn outline_d(
     px: f32,
     py: f32,
     em: f32,
-    font: &ab_glyph::FontRef<'_>,
+    font: &ab_glyph::FontArc,
     gid: ab_glyph::GlyphId,
 ) -> Option<String> {
     use ab_glyph::{Font as _, OutlineCurve};
@@ -1019,22 +932,11 @@ mod tests {
         }
     }
 
-    /// The diagram backends need nothing installed; math needs its fonts.
-    ///
-    /// This used to assert all three of LaTeX, Mermaid and D2 were `Builtin`.
-    /// LaTeX no longer is, and the change is deliberate rather than a
-    /// regression: MathJax carried its own glyph outlines inside a 1.6MB
-    /// JavaScript bundle compiled into the binary, and this application now
-    /// embeds no font it could instead ship beside the executable. So math
-    /// reports where its fonts came from, exactly as PlantUML reports where its
-    /// binary came from.
-    ///
-    /// What must stay true is that math is never *silently* unavailable: either
-    /// a directory it found, or a `Missing` carrying an install hint.
+    /// Native diagram and math rendering must not depend on companion files.
     #[test]
     fn the_diagram_backends_need_nothing_installed() {
         let report = registry().availability_report();
-        for name in ["Mermaid", "D2"] {
+        for name in ["Mermaid", "D2", "LaTeX"] {
             let entry = report.iter().find(|(n, _)| *n == name).unwrap();
             assert_eq!(
                 entry.1,
@@ -1042,22 +944,41 @@ mod tests {
                 "{name} must need no external dependency"
             );
         }
+    }
 
-        let math = report.iter().find(|(n, _)| *n == "LaTeX").unwrap();
-        match &math.1 {
-            Availability::External(dir) => assert!(
-                dir.join("KaTeX_Main-Regular.ttf").is_file(),
-                "reported {dir:?} as the font directory, but the faces are not there"
-            ),
-            Availability::Missing(hint) => assert!(
-                hint.contains("KaTeX") && hint.contains("MT_MATH_FONT_DIR"),
-                "the hint must say what to install and how to point at it: {hint}"
-            ),
-            Availability::Builtin => panic!(
-                "math no longer carries its own glyphs; reporting `Builtin` \
-                 would hide a missing font until the first formula"
-            ),
+    #[test]
+    fn a_complete_math_font_override_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        for (_, name) in crate::assets::MATH_FONT_FILES {
+            let bytes = crate::assets::embedded_math_font(name).expect("font must be embedded");
+            std::fs::write(directory.path().join(name), bytes).unwrap();
         }
+        let fonts = load_math_font_override(directory.path()).expect("complete override");
+        assert_eq!(fonts.faces.len(), crate::assets::MATH_FONT_FILES.len());
+    }
+
+    #[test]
+    fn an_incomplete_or_corrupt_math_font_override_uses_the_embedded_set() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(load_math_font_override(directory.path()).is_none());
+        assert!(load_math_fonts_from(Some(directory.path())).is_some());
+
+        for (_, name) in crate::assets::MATH_FONT_FILES {
+            let bytes = crate::assets::embedded_math_font(name).expect("font must be embedded");
+            std::fs::write(directory.path().join(name), bytes).unwrap();
+        }
+        let corrupt = directory.path().join("KaTeX_Main-Regular.ttf");
+        std::fs::write(&corrupt, b"corrupt").unwrap();
+        assert!(load_math_font_override(directory.path()).is_none());
+        assert!(load_math_fonts_from(Some(directory.path())).is_some());
+
+        let regular = crate::assets::embedded_math_font("KaTeX_Main-Regular.ttf")
+            .expect("font must be embedded");
+        std::fs::write(&corrupt, regular).unwrap();
+        std::fs::remove_file(&corrupt).unwrap();
+        std::fs::create_dir(&corrupt).unwrap();
+        assert!(load_math_font_override(directory.path()).is_none());
+        assert!(load_math_fonts_from(Some(directory.path())).is_some());
     }
 
     // --- Valid input ------------------------------------------------------
@@ -1384,45 +1305,21 @@ mod tests {
         );
     }
 
-    /// Math must initialize nothing until a formula is actually rendered.
-    ///
-    /// This replaces `warming_up_returns_immediately_and_leaves_math_working`,
-    /// whose whole premise was a JS engine that cost ~870ms to start and so had
-    /// to be warmed on a thread before the window opened. RaTeX has no engine:
-    /// the renderer is a ZST and the fonts load on first use, so the property
-    /// worth pinning is the opposite one — that constructing the registry
-    /// touches no font and reads no file.
-    ///
-    /// Measured on the release build: 4.34MB at startup, 4.55MB after a
-    /// thousand formulas, against MathJax's 87.5MB paid unconditionally.
+    /// Availability checks must stay cheap; parsing embedded faces is deferred
+    /// until the first math block is rendered.
     #[test]
     fn constructing_the_registry_does_not_load_a_font() {
         let registry = RendererRegistry::with_defaults();
 
-        // The property, observed rather than timed: `availability()` may stat —
-        // it runs from `render_status_bar` on every frame — but must not read.
-        // A wall-clock bound alone would pass just as well if a font *were*
-        // loaded quickly, and would flake on a cold cache.
-        //
-        // `External(dir)` proves the directory was found by stat, and that no
-        // face was parsed: parsing happens in `fonts()`, behind its own
-        // `OnceLock`, which `availability()` never reaches.
-        match registry
-            .availability_report()
-            .iter()
-            .find(|(n, _)| *n == "LaTeX")
-        {
-            Some((_, Availability::External(dir))) => assert!(
-                dir.is_dir(),
-                "reported {dir:?} without stat-ing it into existence"
-            ),
-            Some((_, Availability::Missing(_))) => {}
-            other => panic!("math reported {other:?}, which hides when a font loads"),
-        }
+        assert_eq!(
+            registry
+                .availability_report()
+                .iter()
+                .find(|(n, _)| *n == "LaTeX")
+                .map(|(_, availability)| availability),
+            Some(&Availability::Builtin)
+        );
 
-        // Repeated reports must be free: the `OnceLock` means one directory
-        // search per process, not one per frame. Nineteen `is_file()` calls per
-        // candidate directory, sixty times a second, would be a real cost.
         let start = std::time::Instant::now();
         for _ in 0..1_000 {
             let _ = registry.availability_report();
@@ -1430,8 +1327,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(200),
-            "1000 availability reports took {elapsed:?}; the directory search \
-             is meant to be behind a OnceLock, so this is re-stat-ing per call"
+            "1000 availability reports took {elapsed:?}; they must not parse fonts"
         );
     }
 
@@ -1499,18 +1395,11 @@ mod tests {
     #[test]
     fn glyph_colour_defaults_to_currentcolor_and_textcolor_survives() {
         let registry = registry();
-        let Some(plain) = registry.render("math", "x+y").svg().map(str::to_string) else {
-            // No KaTeX fonts on this machine, so there is no colour to assert
-            // about. Say so rather than passing silently: this repository has
-            // already had thirty-seven source-scanning tests pass against
-            // nothing, and a green test that asserted nothing is the same bug.
-            eprintln!(
-                "SKIPPED glyph_colour_defaults_to_currentcolor_and_textcolor_survives: \
-                 no KaTeX fonts found. Set MT_MATH_FONT_DIR or run from the repository, \
-                 which carries them in fonts/katex."
-            );
-            return;
-        };
+        let plain = registry
+            .render("math", "x+y")
+            .svg()
+            .expect("embedded fonts must render math")
+            .to_string();
         assert!(
             plain.contains("currentColor"),
             "an uncoloured formula must inherit the theme"
