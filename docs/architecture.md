@@ -165,15 +165,12 @@ Every fill is `currentColor` unless `\textcolor` or `\color` said otherwise,
 which is what lets one rendered formula serve twelve themes and follow the OS
 light/dark switch without re-rendering.
 
-**The fonts are not embedded.** This application embeds no font it can instead
-ship beside the executable; `assets.rs` is the one exception, and a different
-case, because gpui requests those two by exact path and diagram labels come out
-blank without them. The nineteen KaTeX faces live in `fonts/katex/`,
-`package-release.sh` stages them next to the binary, and
-`renderer.rs::font_dir_candidates` searches there first. When none of the
-candidate directories holds all nineteen, `availability()` reports `Missing`
-with an install hint and every formula becomes a diagnostic — the same shape
-PlantUML has always used for a missing binary.
+**The release executable embeds its resources.** The nineteen KaTeX faces and
+bundled sample are compiled into `markturbo-windows-x64.exe`, which is the sole
+CD artifact. Source files remain under `fonts/katex/` and `sample/` for
+reproducible builds, licensing, and development. A release runtime must not
+depend on a sibling fonts directory or workspace checkout. PlantUML remains the
+one optional external renderer and reports `Missing` with an install hint.
 
 **`ratex-parser` is vendored under a `[patch.crates-io]`**, carrying one
 25-line clamp. `\begin{alignat}{N}` allocates `N * 2` 64-byte values with no
@@ -512,8 +509,7 @@ convention for finding, backing up, or migrating application data.
 
 There is no migration. An existing `settings.json` is not read and not deleted;
 the user starts from defaults. That is the standing rule for this stage rather
-than an oversight, and the packaged `RUNNING.md` says so where a user will see
-it.
+than an oversight.
 
 `AppSettings::update` is the only writer, and `global_mut` already pushes a
 `NotifyGlobalObservers` effect — so the notification was always being sent and
@@ -531,7 +527,7 @@ the same file/workspace open paths used by pickers and drag-and-drop.
 The ten-target bound is covered in settings state by
 `settings::tests::recent_targets_are_mru_deduplicated_and_capped` and across a
 restart by the native acceptance harness scenario `recent_bound_restart_stale`
-in `scripts/goal-03-native-acceptance.py`, which loads eleven isolated persisted
+in `scripts/mt.py accept goal-03`, which loads eleven isolated persisted
 targets, requires exactly ten Welcome recent controls, restarts, and proves a
 missing entry remains visibly marked and inert.
 

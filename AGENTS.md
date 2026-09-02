@@ -1,74 +1,81 @@
-# Agent instructions
+# MarkTurbo agent instructions
 
-Read the relevant source before working:
+## Authority and scope
 
-- `PRODUCT.md`: current owner-approved product contract and success thresholds.
-- `goals/`: ordered delivery goals and acceptance evidence.
-- `docs/architecture.md`: architecture and decisions.
-- `CONCEPTS.md`: project vocabulary.
+Read `PRODUCT.md`, the relevant ordered goal in `goals/`,
+`docs/architecture.md`, and `CONCEPTS.md` before changing product behavior.
+Goals are canonical: link to them from PRs and commits rather than duplicating
+their requirements. `docs/history/` is historical context, not current scope.
+Update `CONCEPTS.md` only when project vocabulary changes.
 
-Read `docs/history/v0.1-product-direction.md` only when tracing the original
-implementation brief. Its feature list is historical, not current product scope.
+Keep changes scoped. Preserve user work and generated evidence. Do not change
+later goals to bypass an earlier goal's acceptance gate.
 
-`CLAUDE.md` links to this file. On Windows without symlink support it may contain
-only `AGENTS.md`; read this file instead.
+## Platform and release status
 
-## Workflow
+Windows 11 x64 is the only public-quality target. CI tests Linux, macOS, and
+Windows for compatibility, not as a release promise. CD publishes one
+Windows `markturbo-windows-x64.exe` asset. Installers, signing, notarization, and
+multi-platform distributables are future Goal 10 work.
 
-- Inspect relevant code and documentation first. Keep changes scoped and
-  preserve unrelated work.
-- For numbered product work, read the goal and its prerequisites. Its scope,
-  evidence, stop conditions, and next-goal boundary are binding; later goals do
-  not bypass earlier gates.
-- Keep each goal canonical. Link to it from tickets, plans, commits, and PRs
-  instead of duplicating it.
-- Update `CONCEPTS.md` only when project vocabulary changes.
+Use the canonical tooling entry point:
 
-## Evidence and validation
+```sh
+uv run --project scripts scripts/mt.py check fast
+uv run --project scripts scripts/mt.py check ci
+uv run --project scripts scripts/mt.py check full
+```
 
-- Every reported number must come from a cited command or harness. State when it
-  was not measured.
-- Use `scripts/` for measurements; see `scripts/README.md`. Repeat performance
-  runs on this noisy machine and avoid concurrent release builds.
-- Consult `.scratch/perf-and-size/` before revisiting its recorded decisions.
-- Run `cargo fmt --all` once before committing.
-- Run `cargo clippy --workspace --all-targets`; add no warnings.
-- Run `cargo test --release --workspace` on a clean tree before pushing and
-  report the pass count. Let slow release builds finish.
-- Report validation that could not run and why.
+`fast` checks unstaged and staged whitespace changes plus explicit tooling
+tests. With `BASE_SHA` and `HEAD_SHA` (or `--base` and `--head`), it checks only
+that explicit CI revision range without changing the index. `ci` adds formatting,
+Clippy, and locked release-profile workspace tests. `full` adds the safe local
+release binary build. Native UI acceptance is always explicit:
 
-## Tests
+```sh
+uv run --project scripts scripts/mt.py accept goal-02 -- <arguments>
+uv run --project scripts scripts/mt.py accept goal-03 -- <arguments>
+```
 
-- Prove each regression test fails without the fix, then passes with it.
-- Explain every skip on stderr.
-- Source-scanning tests protect behavior requiring a real window, WebView2, or
-  GPU. Preserve equivalent coverage when moving named code.
+Never claim native acceptance from source tests or CI. It requires an active,
+unlocked Windows desktop, a current hash-bound executable, and a PASS evidence
+file. A BLOCKED result is not acceptance evidence.
 
-## Structural invariants
+## Validation and evidence
+
+Run the narrowest relevant tier while iterating. Before opening or merging a PR,
+run `check ci` on the proposed commit from a clean tree. Before a goal completion
+or release, run `check full` and report the actual pass count. Explain any test
+not run.
+
+Every reported measurement must name the command or evidence file. Performance
+work uses `scripts/`; consult `.scratch/perf-and-size/`, repeat measurements, and
+do not run concurrent release builds on this noisy machine. Regression tests
+should demonstrate the failure first when practical; for desktop, WebView, GPU,
+or foreground-gated behavior, state why a safe red proof is unavailable.
+Source-scanning tests are coverage for those boundaries; preserve equivalent
+coverage when moving the code they name.
+
+## Structural and privacy invariants
 
 - `mt-doc` has no GPUI dependency.
-- Keep `panic = "unwind"` so renderer panics become diagnostics. Retain the
-  allocation clamp in `vendor/ratex-parser`.
-- Never mutate the WebView from `render`. Set `web_dirty` and use `cx.defer`; see
-  `crates/mt-app/src/views/workspace/web_surface.rs`.
-- Content problems become diagnostics, not UI-level errors. Preserve the source
-  and keep broken documents editable.
-- Ship installable fonts beside the binary. Only the two GPUI-required fonts in
-  `assets.rs` are embedded; KaTeX fonts remain under `fonts/katex/`.
+- Keep `panic = "unwind"` and the allocation clamp in `vendor/ratex-parser`.
+- Never mutate a WebView from `render`; set `web_dirty` and defer the update.
+- Content failures are diagnostics. Broken documents remain editable and source
+  text remains preserved.
+- Native evidence may record content-free timings, hashes, byte counts, status,
+  and OS/session/integrity metadata needed to validate a run. Test text,
+  filesystem paths, credentials, and user documents must not leak.
+- The shipped executable includes the fonts and bundled sample it needs; do not
+  reintroduce a sidecar release layout.
 
-## Dependencies
+## Dependencies and delivery
 
-- Prefer crates.io and read the workspace `Cargo.toml` comments before changing
-  dependencies or features.
-- `vendor/ratex-parser` is the only local patch; its README defines removal.
-- Dependencies sharing a git source must use the same source selector. This
-  applies to `gpui` and `gpui-component`.
+Read workspace `Cargo.toml` comments before changing dependencies. Prefer
+crates.io; `vendor/ratex-parser` is the sole local patch. Dependencies sharing
+a git source must use the same source selector.
 
-## Code and commits
-
-- Use English for code, comments, documentation, tickets, commits, and PRs.
-- Comments explain evidence, non-obvious behavior, failure prevention, or
-  rejected alternatives; omit code narration.
-- Use one bounded ticket and one commit. Name the user-visible impact in the
-  subject; put mechanism, evidence, and rejected alternatives in the body.
-- Product commits name the exact file under `goals/` they advance.
+Use English in code, comments, docs, commits, and PRs. Make cohesive PRs, not
+an arbitrary one-commit rule. Commit subjects name the user-visible impact and,
+for product work, the goal file advanced. Run the formatter once before the
+commit that contains its intended edits.

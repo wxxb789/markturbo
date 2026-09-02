@@ -51,8 +51,8 @@ ENVIRONMENT:
     ANTHROPIC_API_KEY           Anthropic key, if not set in Settings
     OPENAI_API_KEY              OpenAI key, if not set in Settings
     MARKTURBO_TRANSLATE_MODEL   Model id, if not set in Settings
-    MT_MATH_FONT_DIR            Folder holding the KaTeX fonts, if they are
-                                not beside the executable or installed
+    MT_MATH_FONT_DIR            Optional complete KaTeX font override;
+                                otherwise embedded fonts are used
     MARKTURBO_DATA_DIR          Override the platform runtime-data directory
     RUST_LOG                    Log filter, e.g. RUST_LOG=debug
 ";
@@ -343,6 +343,8 @@ mod tests {
             assert!(message.contains("USAGE"));
             assert!(message.contains("welcome screen"));
             assert!(message.contains("use `.`"));
+            assert!(message.contains("otherwise embedded fonts are used"));
+            assert!(!message.contains("beside the executable"));
         }
         for flag in ["-V", "--version"] {
             let (message, code) = resolve_target(&args(&[flag])).unwrap_err();

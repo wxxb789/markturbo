@@ -1,6 +1,7 @@
 # Build output
 /target
-/dist
+/scripts/.venv/
+*.py[cod]
 # Anchored `/target` above only covers the workspace root. `vendor/ratex-parser`
 # is a crate in its own right, so `cargo` run from inside it leaves ~178MB here.
 vendor/*/target/
@@ -21,3 +22,9 @@ Thumbs.db
 
 # Working notes from an agent session, not project documentation.
 /.plans
+
+# Scratch is disposable by default. Versioned performance evidence is an
+# explicit exception.
+/.scratch/*
+!/.scratch/perf-and-size/
+!/.scratch/perf-and-size/**

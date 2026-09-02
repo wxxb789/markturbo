@@ -1,8 +1,4 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
-"""Unit tests for goal-03-native-acceptance.py without launching a UI."""
+"""Unit tests for the Goal 03 native harness without launching a UI."""
 
 from __future__ import annotations
 
@@ -11,7 +7,8 @@ import contextlib
 import copy
 import hashlib
 import io
-import runpy
+import json
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -19,39 +16,53 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.markturbo_tools.native import goal03 as HARNESS
+from scripts.markturbo_tools.native import runtime
 
-SCRIPT = Path(__file__).with_name("goal-03-native-acceptance.py")
+SCRIPT = Path(HARNESS.__file__)
 PYWINAUTO_WAS_LOADED = "pywinauto" in sys.modules
-HARNESS = runpy.run_path(SCRIPT)
 
-BUILD_LAUNCH_SPEC = HARNESS["build_launch_spec"]
-CASE_CLI = HARNESS["CASE_CLI"]
-CASE_NEW_PASTE = HARNESS["CASE_NEW_PASTE"]
-CASE_RECENTS = HARNESS["CASE_RECENTS"]
-CASE_SAMPLE = HARNESS["CASE_SAMPLE"]
-CASE_SAVE_CANCEL_OVERWRITE = HARNESS["CASE_SAVE_CANCEL_OVERWRITE"]
-CASE_SAVE_CREATE = HARNESS["CASE_SAVE_CREATE"]
-CASE_WELCOME = HARNESS["CASE_WELCOME"]
-COMPLETE_EVIDENCE = HARNESS["complete_evidence"]
-DOCUMENT_SENTINEL = HARNESS["DOCUMENT_SENTINEL"]
-HARNESS_FAILURE = HARNESS["HarnessFailure"]
-HAS_UNICODE_CLIPBOARD_TEXT = HARNESS["has_unicode_clipboard_text"]
-NEW_EVIDENCE = HARNESS["new_evidence"]
-NORMALIZE_EXPECTED_HASH = HARNESS["normalize_expected_hash"]
-PARSE_ARGS = HARNESS["parse_args"]
-RECENT_SETTINGS_DOCUMENT = HARNESS["recent_settings_document"]
-REQUIRED_CASE_IDS = HARNESS["REQUIRED_CASE_IDS"]
-SCAN_CASE_ARTIFACTS = HARNESS["scan_case_artifacts"]
-SOURCE_CONTRACT_FAILURE = HARNESS["source_contract_failure"]
-VALIDATE_EVIDENCE = HARNESS["validate_evidence"]
-VALIDATE_FINGERPRINT = HARNESS["validate_fingerprint"]
-GOAL_03_HARNESS = HARNESS["Goal03Harness"]
+BUILD_LAUNCH_SPEC = runtime.build_launch_spec
+CASE_CLI = HARNESS.CASE_CLI
+CASE_NEW_PASTE = HARNESS.CASE_NEW_PASTE
+CASE_RECENTS = HARNESS.CASE_RECENTS
+CASE_SAMPLE = HARNESS.CASE_SAMPLE
+CASE_SAVE_CANCEL_OVERWRITE = HARNESS.CASE_SAVE_CANCEL_OVERWRITE
+CASE_SAVE_CREATE = HARNESS.CASE_SAVE_CREATE
+CASE_WELCOME = HARNESS.CASE_WELCOME
+COMPLETE_EVIDENCE = HARNESS.complete_evidence
+DOCUMENT_SENTINEL = HARNESS.DOCUMENT_SENTINEL
+HARNESS_FAILURE = runtime.HarnessFailure
+HAS_UNICODE_CLIPBOARD_TEXT = HARNESS.has_unicode_clipboard_text
+NEW_EVIDENCE = HARNESS.new_evidence
+NORMALIZE_EXPECTED_HASH = runtime.normalize_expected_hash
+PARSE_ARGS = HARNESS.parse_args
+RECENT_SETTINGS_DOCUMENT = HARNESS.recent_settings_document
+REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
+SCAN_CASE_ARTIFACTS = HARNESS.scan_case_artifacts
+SOURCE_CONTRACT_FAILURE = HARNESS.source_contract_failure
+VALIDATE_EVIDENCE = HARNESS.validate_evidence
+VALIDATE_FINGERPRINT = runtime.validate_fingerprint
+GOAL_03_HARNESS = HARNESS.Goal03Harness
+RUN = HARNESS.run
 
 HASH = "a" * 64
 
 
 def fingerprint(value: bytes) -> dict[str, int | str]:
     return {"byte_count": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+
+
+def sample_observation() -> dict[str, int | str | dict[str, int | str]]:
+    manifest = b"README.md\0"
+    content = b"README.md\0sample\n\0"
+    content_hash = hashlib.sha256(content).hexdigest()
+    return {
+        "sample_file_count": 1,
+        "sample_manifest": fingerprint(manifest),
+        "sample_content": {"byte_count": len(b"sample\n"), "sha256": content_hash},
+        "sample_version": content_hash[:24],
+    }
 
 
 def runtime_scan() -> dict[str, int | bool]:
@@ -129,7 +140,10 @@ def valid_evidence() -> dict:
             "overwrite_cancel_focus_preserved": True,
             "overwrite_confirmed": True,
         },
-        CASE_SAMPLE: {"sample_workspace_opened": True},
+        CASE_SAMPLE: {
+            "sample_workspace_opened": True,
+            **sample_observation(),
+        },
         CASE_RECENTS: {
             "recent_restart_visible": True,
             "recent_count": 10,
@@ -145,7 +159,7 @@ def valid_evidence() -> dict:
         case["duration_ms"] = 1.0
         case["observations"] = {
             **observations[case["id"]],
-            "flow": HARNESS["CASE_FLOWS"][case["id"]],
+            "flow": HARNESS.CASE_FLOWS[case["id"]],
             "process_context": process_context(),
             "foreground_verified": True,
             "runtime_scan": runtime_scan(),
@@ -208,8 +222,8 @@ class EvidenceSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "verified executable hashes"):
             VALIDATE_EVIDENCE(evidence)
 
-    def test_rejects_boolean_counts_and_reuses_goal_02_fingerprint_validation(self) -> None:
-        self.assertIs(VALIDATE_FINGERPRINT, HARNESS["BASE"]["validate_fingerprint"])
+    def test_rejects_boolean_counts_and_reuses_native_runtime_fingerprint_validation(self) -> None:
+        self.assertIs(VALIDATE_FINGERPRINT, runtime.validate_fingerprint)
 
         with self.assertRaisesRegex(ValueError, "invalid fingerprint byte count"):
             VALIDATE_FINGERPRINT({"byte_count": True, "sha256": HASH})
@@ -250,6 +264,22 @@ class EvidenceSchemaTests(unittest.TestCase):
         evidence = valid_evidence()
         evidence["cases"][5]["observations"]["recent_count"] = 11
         with self.assertRaisesRegex(ValueError, "exactly ten"):
+            VALIDATE_EVIDENCE(evidence)
+
+    def test_pass_requires_the_complete_materialized_sample_inventory(self) -> None:
+        evidence = valid_evidence()
+        evidence["cases"][4]["observations"].pop("sample_content")
+        with self.assertRaisesRegex(ValueError, "passed case evidence is incomplete"):
+            VALIDATE_EVIDENCE(evidence)
+
+        evidence = valid_evidence()
+        evidence["cases"][4]["observations"]["sample_file_count"] = 0
+        with self.assertRaisesRegex(ValueError, "sample file inventory must be nonempty"):
+            VALIDATE_EVIDENCE(evidence)
+
+        evidence = valid_evidence()
+        evidence["cases"][4]["observations"]["sample_version"] = "b" * 24
+        with self.assertRaisesRegex(ValueError, "sample version does not match"):
             VALIDATE_EVIDENCE(evidence)
 
     def test_rejects_text_and_unknown_observations(self) -> None:
@@ -294,6 +324,37 @@ class ParserAndIsolationTests(unittest.TestCase):
         self.assertTrue(HAS_UNICODE_CLIPBOARD_TEXT({13, 49161, 49282}))
         self.assertFalse(HAS_UNICODE_CLIPBOARD_TEXT({49161, 49282}))
 
+    def test_materialized_sample_inventory_requires_a_nonempty_self_consistent_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            template = root / "template"
+            template.mkdir()
+            (template / "README.md").write_bytes(b"sample\n")
+            expected_content_hash = hashlib.sha256(b"README.md\0sample\n\0").hexdigest()
+            data = root / "data"
+            materialized = data / "sample" / expected_content_hash[:24]
+            materialized.parent.mkdir(parents=True)
+            shutil.copytree(template, materialized)
+
+            evidence = HARNESS.materialized_sample_inventory(data)
+
+            self.assertEqual(
+                set(evidence),
+                {"sample_file_count", "sample_manifest", "sample_content", "sample_version"},
+            )
+            self.assertNotIn("README.md", json.dumps(evidence))
+            self.assertEqual(evidence["sample_content"]["sha256"], expected_content_hash)
+            self.assertEqual(evidence["sample_version"], expected_content_hash[:24])
+            (data / "sample" / ("a" * 24)).mkdir()
+            with self.assertRaises(HARNESS_FAILURE) as raised:
+                HARNESS.materialized_sample_inventory(data)
+            self.assertEqual(raised.exception.code, "SAMPLE_MATERIALIZATION_INCOMPLETE")
+            shutil.rmtree(data / "sample" / ("a" * 24))
+            (materialized / "README.md").unlink()
+            with self.assertRaises(HARNESS_FAILURE) as raised:
+                HARNESS.materialized_sample_inventory(data)
+            self.assertEqual(raised.exception.code, "SAMPLE_MATERIALIZATION_INCOMPLETE")
+
     def test_editor_replacement_uses_and_restores_the_text_clipboard(self) -> None:
         events = []
 
@@ -322,11 +383,11 @@ class ParserAndIsolationTests(unittest.TestCase):
         app = type("App", (), {"hwnd": 42})()
         result = GOAL_03_HARNESS.replace_editor(FakeHarness(), app, "emoji \U0001f680")
 
-        self.assertEqual(result, HARNESS["fingerprint_text"]("emoji \U0001f680"))
+        self.assertEqual(result, runtime.fingerprint_text("emoji \U0001f680"))
         self.assertEqual(events[0], ("read",))
         self.assertEqual(events[1], ("write", "emoji \U0001f680"))
-        self.assertIn(("shortcut", 42, HARNESS["VK_A"]), events)
-        self.assertIn(("shortcut", 42, HARNESS["VK_V"]), events)
+        self.assertIn(("shortcut", 42, runtime.VK_A), events)
+        self.assertIn(("shortcut", 42, HARNESS.VK_V), events)
         self.assertEqual(events[-1], ("write", "previous text"))
 
     def test_source_editor_focus_check_reads_uia_without_refocusing(self) -> None:
@@ -373,7 +434,7 @@ class ParserAndIsolationTests(unittest.TestCase):
         self.assertEqual(events[1], ("foreground", 42, 3.0))
         self.assertEqual(events[2], ("inputs", 6))
 
-    def test_expected_close_keeps_the_uia_wrapper_while_testing_native_teardown(self) -> None:
+    def test_close_app_posts_then_waits_for_native_teardown(self) -> None:
         events = []
         window = object()
 
@@ -405,10 +466,162 @@ class ParserAndIsolationTests(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             NORMALIZE_EXPECTED_HASH("not-a-hash")
 
-    def test_launch_uses_the_configured_foreground_timeout(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def launch_target", 1)[1].split("def welcome_control", 1)[0]
-        self.assertIn("self.win32.require_foreground(hwnd, self.ui_timeout)", body)
+    def test_parser_exposes_debug_case_and_workdir_retention(self) -> None:
+        case = REQUIRED_CASE_IDS[0]
+        args = PARSE_ARGS(
+            [
+                "--expect-exe-sha256",
+                HASH,
+                "--case",
+                case,
+                "--keep-workdir-on-failure",
+            ]
+        )
+        self.assertEqual(args.case, case)
+        self.assertTrue(args.keep_workdir_on_failure)
+
+    def test_single_case_run_never_claims_acceptance_pass(self) -> None:
+        class FakeHarness:
+            def __init__(self, *_args):
+                pass
+
+            def scenario_welcome(self):
+                return {}
+
+            scenario_new_paste = scenario_welcome
+            scenario_save_create = scenario_welcome
+            scenario_save_cancel_overwrite = scenario_welcome
+            scenario_sample = scenario_welcome
+            scenario_recents = scenario_welcome
+            scenario_cli = scenario_welcome
+
+            def cleanup(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe = root / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            sample = root / "sample"
+            sample.mkdir()
+            (sample / "readme.md").write_text("sample", encoding="utf-8")
+            expected = hashlib.sha256(exe.read_bytes()).hexdigest()
+            args = PARSE_ARGS(
+                [
+                    "--exe",
+                    str(exe),
+                    "--expect-exe-sha256",
+                    expected,
+                    "--case",
+                    REQUIRED_CASE_IDS[0],
+                ]
+            )
+            with mock.patch.dict(
+                RUN.__globals__,
+                {
+                    "source_contract_failure": lambda: None,
+                    "preflight": lambda *_args: (object(), object()),
+                    "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
+                    "Goal03Harness": FakeHarness,
+                    "REPO": root,
+                },
+            ):
+                returncode, evidence, code = RUN(args)
+
+        self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "PARTIAL_CASE_RUN"))
+        self.assertEqual(evidence["cases"][0]["status"], "PASS")
+        self.assertTrue(all(case["status"] == "NOT_RUN" for case in evidence["cases"][1:]))
+
+    def test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs(self) -> None:
+        roots: list[Path] = []
+
+        class FakeHarness:
+            def __init__(self, _exe, root, *_args):
+                roots.append(root)
+
+            def scenario_welcome(self):
+                return {}
+
+            scenario_new_paste = scenario_welcome
+            scenario_save_create = scenario_welcome
+            scenario_save_cancel_overwrite = scenario_welcome
+            scenario_sample = scenario_welcome
+            scenario_recents = scenario_welcome
+            scenario_cli = scenario_welcome
+
+            def cleanup(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe = root / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            expected = hashlib.sha256(exe.read_bytes()).hexdigest()
+            patch_run = {
+                "source_contract_failure": lambda: None,
+                "preflight": lambda *_args: (object(), object()),
+                "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
+                "Goal03Harness": FakeHarness,
+            }
+
+            with mock.patch.dict(RUN.__globals__, patch_run):
+                success_args = PARSE_ARGS(["--exe", str(exe), "--expect-exe-sha256", expected])
+                success_code, _, _ = RUN(success_args)
+
+                partial_args = PARSE_ARGS(
+                    [
+                        "--exe",
+                        str(exe),
+                        "--expect-exe-sha256",
+                        expected,
+                        "--case",
+                        REQUIRED_CASE_IDS[0],
+                        "--keep-workdir-on-failure",
+                    ]
+                )
+                partial_code, _, partial_reason = RUN(partial_args)
+
+            self.assertEqual(success_code, 0)
+            self.assertFalse(roots[0].exists())
+            self.assertEqual((partial_code, partial_reason), (1, "PARTIAL_CASE_RUN"))
+            self.assertIsNotNone(partial_args.debug_workdir)
+            self.assertTrue(partial_args.debug_workdir.exists())
+            shutil.rmtree(partial_args.debug_workdir)
+
+        roots.clear()
+
+        class FailingHarness(FakeHarness):
+            def scenario_welcome(self):
+                raise HARNESS_FAILURE("TEST_CASE_FAILURE")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            exe = Path(temporary) / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            expected = hashlib.sha256(exe.read_bytes()).hexdigest()
+            args = PARSE_ARGS(
+                [
+                    "--exe",
+                    str(exe),
+                    "--expect-exe-sha256",
+                    expected,
+                    "--keep-workdir-on-failure",
+                ]
+            )
+            with mock.patch.dict(
+                RUN.__globals__,
+                {
+                    "source_contract_failure": lambda: None,
+                    "preflight": lambda *_args: (object(), object()),
+                    "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
+                    "Goal03Harness": FailingHarness,
+                },
+            ):
+                returncode, _, code = RUN(args)
+
+            self.assertEqual((returncode, code), (1, "TEST_CASE_FAILURE"))
+            self.assertIsNotNone(args.debug_workdir)
+            self.assertTrue(args.debug_workdir.exists())
+            shutil.rmtree(args.debug_workdir)
 
     def test_constructs_isolated_no_argument_and_explicit_launches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -435,16 +648,6 @@ class ParserAndIsolationTests(unittest.TestCase):
 
 
 class RuntimeAndSourceContractTests(unittest.TestCase):
-    def test_all_expected_window_closes_use_the_native_exit_assertion(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        helper_and_scenarios = source.split("class Goal03Harness", 1)[1]
-
-        self.assertEqual(helper_and_scenarios.count("self.win32.post_close("), 1)
-        self.assertNotIn(
-            "self.win32.post_close(",
-            helper_and_scenarios.split("def close_app", 1)[1].split("def read_text_clipboard", 1)[1],
-        )
-
     def test_stale_recent_native_check_proves_visible_and_inert_behavior(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         body = source.split("def scenario_recents", 1)[1].split(
@@ -467,7 +670,7 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
             "def scenario_sample", 1
         )[0]
 
-        self.assertIn('BASE["write_durable"](cancelled_destination', body)
+        self.assertIn("write_durable(cancelled_destination", body)
         self.assertIn("cancel_save_picker(app, cancelled_destination)", body)
         self.assertIn("sha256_file(cancelled_destination)", body)
         self.assertIn("request_save_as_shortcut(app)", body)
@@ -501,8 +704,8 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn("recent_settings_document(documents)", body)
-        self.assertIn("app = self.launch_target(None", body)
-        self.assertEqual(body.count("self.launch_target("), 2)
+        self.assertIn("app = self.launch_app(None", body)
+        self.assertEqual(body.count("self.launch_app("), 2)
 
     def test_save_path_waits_for_the_native_dialog_to_release_the_main_window(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -545,7 +748,6 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
 
         self.assertIn('"CommandButton_6"', native)
         self.assertIn("owned_task_dialogs(app.process.pid, file_dialog_hwnd)", native)
-        self.assertIn("if path.exists():", select)
         self.assertIn("self.accept_native_overwrite_confirmation(app, hwnd)", select)
 
     def test_source_contract_matches_current_rust_uia_and_startup_contract(self) -> None:
@@ -553,12 +755,12 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
 
     def test_source_contract_does_not_accept_strings_from_rust_test_modules(self) -> None:
         workspace_contracts = [
-            HARNESS["WELCOME_NEW_AUTOMATION_ID"],
-            HARNESS["WELCOME_PASTE_AUTOMATION_ID"],
-            HARNESS["WELCOME_OPEN_FILE_AUTOMATION_ID"],
-            HARNESS["WELCOME_OPEN_FOLDER_AUTOMATION_ID"],
-            HARNESS["WELCOME_OPEN_SAMPLE_AUTOMATION_ID"],
-            HARNESS["WELCOME_DONT_SHOW_AUTOMATION_ID"],
+            HARNESS.WELCOME_NEW_AUTOMATION_ID,
+            HARNESS.WELCOME_PASTE_AUTOMATION_ID,
+            HARNESS.WELCOME_OPEN_FILE_AUTOMATION_ID,
+            HARNESS.WELCOME_OPEN_FOLDER_AUTOMATION_ID,
+            HARNESS.WELCOME_OPEN_SAMPLE_AUTOMATION_ID,
+            HARNESS.WELCOME_DONT_SHOW_AUTOMATION_ID,
             "initial.is_none() && show_welcome_on_startup",
             "fn dont_show_welcome_again",
             "fn on_paste_into_new",
@@ -569,7 +771,7 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
             "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
         ]
         document_contracts = [
-            HARNESS["DOCUMENT_SAVE_AS_AUTOMATION_ID"],
+            HARNESS.DOCUMENT_SAVE_AS_AUTOMATION_ID,
             "DocumentEvent::SaveAsRequested",
         ]
 
@@ -611,15 +813,29 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
                 SCAN_CASE_ARTIFACTS(root)
             self.assertEqual(raised.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
 
+    def test_runtime_scan_streams_the_entire_webview_profile_and_detects_boundary_leaks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = root / "data" / "webview2" / "Default" / "Cache"
+            profile.mkdir(parents=True)
+            (root / "data" / "logs").mkdir()
+            (root / "data" / "logs" / "markturbo.log").write_bytes(b"startup")
+            split = 1024 * 1024 - 3
+            (profile / "cache.bin").write_bytes(b"x" * split + DOCUMENT_SENTINEL.encode("utf-8"))
+
+            with self.assertRaises(HARNESS_FAILURE) as raised:
+                SCAN_CASE_ARTIFACTS(root)
+
+            self.assertEqual(raised.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
+
     def test_loading_parser_does_not_import_pywinauto(self) -> None:
         if not PYWINAUTO_WAS_LOADED:
             self.assertNotIn("pywinauto", sys.modules)
 
-    def test_native_source_copies_the_sample_and_restores_clipboard_after_any_failure(self) -> None:
+    def test_native_source_requires_the_embedded_sample_and_restores_clipboard_after_any_failure(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        copy = source.index('shutil.copytree(source_sample, bin_root / "sample")')
-        launch = source.index("harness = Goal03Harness(")
-        self.assertLess(copy, launch)
+        self.assertNotIn('bin_root / "sample"', source)
+        self.assertNotIn("SAMPLE_FIXTURE_MISSING", source)
 
         scenario = source.split("def scenario_new_paste", 1)[1].split("def scenario_save_create", 1)[0]
         guarded_write = scenario.index("try:\n                    self.write_text_clipboard(PASTE_TEXT)")

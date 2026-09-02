@@ -39,10 +39,10 @@ Built with Rust, [GPUI](https://github.com/zed-industries/zed), and
 Files stay ordinary files. No import step, no proprietary format — Codex, Claude
 Code, Cursor, OpenCode, git, and shell tools consume them unchanged.
 
-## Run a release build
+## Build and release
 
 ```sh
-./scripts/package-release.sh     # builds, verifies, and archives into dist/
+uv run --project scripts scripts/mt.py check full
 ```
 
 The **Bump version** GitHub Actions workflow publishes releases from the
@@ -64,11 +64,10 @@ suffix, while `patch` on a prerelease promotes that core version to stable,
 matching `cargo-release` semantics. The **Release** workflow can also be run for
 an existing tag, and a manually pushed `v*` tag triggers it.
 
-Every release runs Clippy and the release-profile workspace tests on native
-Linux, macOS, and Windows runners before using `package-release.sh`. Versions
-with a prerelease suffix become GitHub prereleases; stable versions become
-normal releases. The resulting assets are host-native archives, not signed
-installers or a notarized macOS application bundle.
+Every release runs the locked validation gate before publishing exactly one
+Windows `markturbo-windows-x64.exe` asset. Versions with a prerelease suffix become GitHub
+prereleases; stable versions become normal releases. Installers, signing,
+notarization, and multi-platform distributables remain future Goal 10 scope.
 
 Install the pinned release tool to use the same version logic locally:
 
@@ -117,16 +116,14 @@ MCP tools, or headless rendering without touching the UI.
 |---|---|---|
 | Mermaid | `mermaid-svg` (pure Rust) | Always |
 | D2 | `d2-little` (pure Rust, own layout) | Always |
-| LaTeX / math | RaTeX (pure Rust, no JS engine) | Fonts ship beside the binary |
+| LaTeX / math | RaTeX (pure Rust, no JS engine) | Fonts embedded in the executable |
 | PlantUML | `plantuml` CLI | Requires a local install (Java) |
 
-Mermaid and D2 need nothing installed. Math needs the KaTeX faces, which the
-release archive stages next to the executable — nothing to install, and none of
-their bytes are in the binary, because this application embeds no font it can
-ship instead. PlantUML has no usable pure-Rust implementation today. When
-either dependency is absent, blocks show an install hint rather than failing. A
-renderer that errors or panics produces an inline diagnostic with the original
-source preserved — never a crash.
+Mermaid, D2, and the KaTeX faces used by math are built into the Windows release
+executable. PlantUML has no usable pure-Rust implementation today. When it is
+absent, blocks show an install hint rather than failing. A renderer that errors
+or panics produces an inline diagnostic with the original source preserved —
+never a crash.
 
 Adding a technology is a registration: implement `BlockRenderer`, register it,
 and add the fence language to `DiagramKind::from_lang`. No parser or view change.
@@ -173,7 +170,7 @@ TOML because the file is meant to be opened: it takes comments, and it does not
 fail on a trailing comma. `$MARKTURBO_CONFIG_DIR` overrides the directory, which
 is what keeps a portable install — and the test suite — out of the real one.
 
-Every environment variable the app reads:
+Application-specific environment variables:
 
 | Variable | Effect |
 |---|---|
@@ -181,11 +178,12 @@ Every environment variable the app reads:
 | `OPENAI_API_KEY` | Key for both OpenAI providers, likewise |
 | `MARKTURBO_TRANSLATE_MODEL` | Model id, if none is set in Settings |
 | `MARKTURBO_CONFIG_DIR` | Overrides where `settings.toml` lives |
-| `MT_MATH_FONT_DIR` | Folder holding the KaTeX `.ttf` faces, when they are neither beside the executable nor installed |
+| `MARKTURBO_DATA_DIR` | Absolute override for local runtime data: logs, Windows WebView2 data, recovery, and release-sample materialization |
+| `MT_MATH_FONT_DIR` | Optional complete KaTeX font-directory override for development; incomplete or absent overrides use embedded release fonts |
 | `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug` |
 
-A value in Settings always outranks the environment. Nothing else is read —
-there is no hidden configuration.
+A value in Settings always outranks its matching environment variable. There
+is no hidden application-specific configuration.
 
 ## Security
 
@@ -229,15 +227,15 @@ implicit, and no trust level lets a document markturbo renders reach the network
 ## Tests
 
 ```sh
-uv run scripts/test_release_automation.py
-cargo test --release
+uv run --project scripts scripts/mt.py check fast
+uv run --project scripts scripts/mt.py check ci
 ```
 
-452 tests across 11 binaries, over checked-in fixtures in `fixtures/`: Markdown
-constructs including CJK and Unicode, valid and invalid examples of each diagram
-technology, MDX (Markdown-only, components, invalid, untrusted), skills (valid,
-missing metadata, malformed YAML, nested, multiple roots, name collisions),
-filesystem round-trips, and ~10K/~100K-line performance documents.
+The explicit tooling manifest and Rust workspace tests cover Markdown constructs
+including CJK and Unicode, renderer and MDX behavior, agent artifacts,
+filesystem round-trips, native-harness contracts, release automation, and
+checked-in performance fixtures. Test totals are intentionally not documented:
+they change with the code and the command output is the evidence.
 
 `--release` is the gate rather than a preference: two performance tests assert
 wall-clock bounds that a debug build cannot meet.

@@ -4,6 +4,9 @@
 **Goal:** [Goal 02 - Guarantee user-text safety](../goals/archive/02-guarantee-user-text-safety.md)
 **Status:** COMPLETE / 16 OF 16 REQUIRED CASES PROVEN. Current debug, recovery-root, formatting, lint, diff, release, capacity, executable-build, harness-unit, parser, Python compile, clipboard-free native destructive-acceptance, final report-only review, Case 10 symlink, and requirement-by-requirement audit evidence is recorded below.
 
+Commands below preserve the exact historical evidence. Use
+[`scripts/README.md`](../scripts/README.md) for current tooling entry points.
+
 ## Delivered safety boundaries
 
 - Dirty tab close, window close, and workspace replacement share one Save / Discard / Cancel lifecycle decision. Save must succeed for the exact prompted snapshot before destruction proceeds, while Discard and Cancel retain their explicit meanings.

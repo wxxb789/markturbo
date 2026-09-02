@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """Regenerate the performance fixtures under fixtures/perf/.
 
 The fixtures are committed, so a fresh clone can run `cargo test` without
@@ -11,21 +6,15 @@ note that the performance thresholds in crates/mt-doc/tests/performance.rs were
 calibrated against the current output, so changing the generator means
 re-checking those numbers.
 
-    uv run scripts/gen-perf-fixtures.py
+    uv run --project scripts scripts/mt.py fixtures
 
-Determinism matters: the seed is fixed so a regeneration produces identical
-bytes, and a regenerated fixture therefore does not show up as a spurious diff.
+Generation is deterministic, so rerunning it produces identical bytes.
 """
 
+import argparse
 import pathlib
-import random
 
-# Fixed so regeneration is reproducible. The generator does not currently use
-# randomness, but the seed is set anyway so adding variation later cannot make
-# the fixtures churn.
-random.seed(20260820)
-
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 OUT = ROOT / "fixtures" / "perf"
 
 
@@ -96,14 +85,17 @@ def write(path: pathlib.Path, text: str) -> None:
     print(f"  {path.relative_to(ROOT)}  {path.stat().st_size // 1024} KB")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args(argv)
     OUT.mkdir(parents=True, exist_ok=True)
     print("Writing performance fixtures:")
     write(OUT / "large-10k.md", make(10_000))
     write(OUT / "huge-100k.md", make(100_000))
     write(OUT / "diagram-heavy.md", make_diagram_heavy())
     print("\nRe-check the thresholds in crates/mt-doc/tests/performance.rs.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
