@@ -114,7 +114,7 @@ or CI do not substitute for this native evidence.
 
 | Command | Result |
 |---|---:|
-| `python -m uv run --project scripts scripts/mt.py check full` | PASS |
+| `uv run --project scripts scripts/mt.py check full` | PASS |
 | Tooling tests within `check full` | 208 passed |
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked` | PASS; no warnings |
