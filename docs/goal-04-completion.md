@@ -1,7 +1,7 @@
 # Goal 04 Completion and Decision Report
 
 **Date:** 2026-09-03
-**Goal:** [Goal 04 - Measure startup and decide model-transport modularity](../goals/04-measure-startup-and-decide-modularity.md)
+**Goal:** [Goal 04 - Measure startup and decide model-transport modularity](goals/archive/04-measure-startup-and-decide-modularity.md)
 **Status:** COMPLETE VIA INCONCLUSIVE STOP RULE; PROJECT-OWNER-APPROVED NO-GO DECISION.
 
 Goal 04 produced reproducible build and measurement tooling, but the current

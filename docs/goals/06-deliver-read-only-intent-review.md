@@ -113,7 +113,7 @@ source limits preserve the 8 MiB worker-frame compatibility established by Goal
 ## Evaluation standard
 
 Run Review over every artifact in immutable corpus version `goal-01-v1` under
-the fixed [Review Evaluation Contract](../PRODUCT.md#review-evaluation-contract).
+the fixed [Review Evaluation Contract](../../PRODUCT.md#review-evaluation-contract).
 Before sending a corpus artifact or scoring a result as threshold evidence,
 verify `evaluation/goal-01/MANIFEST.sha256`. Record the corpus version and
 manifest digest with every evaluation result. A hash mismatch disqualifies the
