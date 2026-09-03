@@ -31,6 +31,7 @@ FINGERPRINT_TEXT = runtime.fingerprint_text
 HARNESS_BLOCKED = runtime.HarnessBlocked
 HARNESS_FAILURE = runtime.HarnessFailure
 INSPECT_PE_BYTES = runtime.inspect_pe_bytes
+INSPECT_PE_SECTIONS = runtime.inspect_pe_sections
 LAYOUT_SOURCE_AUTOMATION_ID = runtime.LAYOUT_SOURCE_AUTOMATION_ID
 NATIVE_HARNESS = HARNESS.Goal02Harness
 NEW_EVIDENCE = HARNESS.new_evidence
@@ -203,6 +204,11 @@ def minimal_pe(machine: int = 0x8664, magic: int = 0x20B) -> bytes:
     struct.pack_into("<I", data, 0x3C, 0x80)
     data[0x80:0x84] = b"PE\0\0"
     struct.pack_into("<H", data, 0x84, machine)
+    struct.pack_into("<H", data, 0x86, 1)
     struct.pack_into("<H", data, 0x94, 0xF0)
     struct.pack_into("<H", data, 0x98, magic)
+    data[0x188:0x190] = b".text\0\0\0"
+    struct.pack_into("<I", data, 0x190, 123)
+    struct.pack_into("<I", data, 0x198, 512)
+    struct.pack_into("<I", data, 0x1AC, 0x60000020)
     return bytes(data)

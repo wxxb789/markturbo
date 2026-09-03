@@ -206,6 +206,23 @@ class PlatformAndExecutableTests(unittest.TestCase):
         self.assertEqual(result["machine"], "x86_64")
         self.assertEqual(result["format"], "PE32+")
 
+    def test_records_content_free_pe_section_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "test.exe"
+            path.write_bytes(minimal_pe())
+
+            self.assertEqual(
+                INSPECT_PE_SECTIONS(path),
+                [
+                    {
+                        "name": ".text",
+                        "virtual_size": 123,
+                        "raw_size": 512,
+                        "characteristics": 0x60000020,
+                    }
+                ],
+            )
+
     def test_rejects_non_x64_pe(self) -> None:
         with self.assertRaisesRegex(ValueError, "not AMD64 PE32"):
             INSPECT_PE_BYTES(minimal_pe(machine=0x14C, magic=0x10B))

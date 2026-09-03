@@ -10,7 +10,8 @@ Why Python rather than PowerShell: this needs Win32 for process counters, child
 window enumeration and hit testing, and `ctypes` reaches all of it without the
 assembly-loading differences between PowerShell 5 and 7.
 
-Windows only. Every subcommand except `shot` works headless.
+Windows only. Milestone startup measurement and `shot` require an active,
+unlocked input desktop; the remaining subcommands work headless.
 """
 
 from __future__ import annotations
@@ -19,16 +20,77 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections import deque
+from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
 
 from .metrics import inclusive_p95, measure_abba, nearest_rank_percentile
+from .goal04 import (
+    EVIDENCE_VARIANT_LABELS,
+    GOAL04_BUILD_VARIANTS,
+    GOAL04_TARGET,
+    MODEL_FIRST_USE_EVIDENCE_SCHEMA,
+    MODEL_TRANSPORT_DECISIONS,
+    MODEL_TRANSPORT_DECISION_SCHEMA,
+    QUIET_EVIDENCE_MAX_AGE,
+    STARTUP_BUILD_SCHEMA,
+    STARTUP_EVIDENCE_SCHEMA,
+    STARTUP_QUIET_SCHEMA,
+    STARTUP_THRESHOLD_SCHEMA,
+    STARTUP_TRACE_EVENTS,
+    STARTUP_TRACE_SCHEMA,
+    StartupSample,
+    StartupTraceReader,
+    canonical_threshold_evidence,
+    cmd_build_goal04,
+    cmd_decide_goal04,
+    evaluate_model_threshold,
+    goal04_behavior,
+    goal04_behavior_verification_command,
+    goal04_bloat_command,
+    goal04_build_command,
+    goal04_host_context,
+    goal04_platform_setup,
+    goal04_release_profile,
+    goal04_tokio_disposition,
+    goal04_tree_command,
+    load_build_evidence,
+    load_threshold_evidence,
+    measure_startup_abba,
+    milestone_comparison,
+    model_first_use_cache_state,
+    normalize_goal04_bloat_crates,
+    normalized_quiet_evidence,
+    parse_goal04_dependency_graph,
+    parse_startup_trace,
+    quiet_gate_failures,
+    read_evidence_object,
+    require_distinct_output_path,
+    safe_command,
+    source_state,
+    startup_summary,
+    summarize_startup_milestones,
+    trace_milestones,
+    validate_build_evidence,
+    validate_model_first_use_evidence,
+    validate_model_transport_decision_evidence,
+    validate_quiet_evidence,
+    validate_startup_evidence,
+    validate_startup_quiet_evidence,
+    validate_threshold_evidence,
+    write_model_first_use_evidence,
+    write_startup_evidence,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
@@ -38,6 +100,7 @@ WM_CLOSE = 0x0010
 SW_RESTORE = 9
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
+VK_F24 = 0x87
 
 if sys.platform == "win32":
     psapi = ctypes.WinDLL("psapi", use_last_error=True)
@@ -86,6 +149,14 @@ class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
+@dataclass(frozen=True)
+class ProcessMemory:
+    working_set_mb: float
+    private_mb: float
+    peak_working_set_mb: float
+    page_faults: int
+
+
 if sys.platform == "win32":
     user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
     user32.GetClientRect.restype = wt.BOOL
@@ -100,6 +171,10 @@ if sys.platform == "win32":
         ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)
     ]
     kernel32.GetSystemTimes.restype = wt.BOOL
+    kernel32.QueryPerformanceCounter.argtypes = [ctypes.POINTER(ctypes.c_longlong)]
+    kernel32.QueryPerformanceCounter.restype = wt.BOOL
+    kernel32.QueryPerformanceFrequency.argtypes = [ctypes.POINTER(ctypes.c_longlong)]
+    kernel32.QueryPerformanceFrequency.restype = wt.BOOL
     pdh.PdhOpenQueryW.argtypes = [wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)]
     pdh.PdhOpenQueryW.restype = ctypes.c_long
     pdh.PdhAddEnglishCounterW.argtypes = [
@@ -135,17 +210,42 @@ def _open(pid: int) -> int:
     return h
 
 
-def memory(pid: int) -> tuple[float, float, float]:
-    """Working set, private bytes and peak working set, in MB."""
+def process_memory(pid: int) -> ProcessMemory:
+    """Working set, private bytes, peak working set and page faults."""
     h = _open(pid)
     try:
         c = PROCESS_MEMORY_COUNTERS()
         c.cb = ctypes.sizeof(c)
         if not psapi.GetProcessMemoryInfo(h, ctypes.byref(c), c.cb):
             raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo")
-        return c.WorkingSetSize / MB, c.PagefileUsage / MB, c.PeakWorkingSetSize / MB
+        return ProcessMemory(
+            c.WorkingSetSize / MB,
+            c.PagefileUsage / MB,
+            c.PeakWorkingSetSize / MB,
+            int(c.PageFaultCount),
+        )
     finally:
         kernel32.CloseHandle(h)
+
+
+def memory(pid: int) -> tuple[float, float, float]:
+    """Working set, private bytes and peak working set, in MB."""
+    sample = process_memory(pid)
+    return sample.working_set_mb, sample.private_mb, sample.peak_working_set_mb
+
+
+def performance_counter() -> int:
+    value = ctypes.c_longlong()
+    if not kernel32.QueryPerformanceCounter(ctypes.byref(value)):
+        raise OSError(ctypes.get_last_error(), "QueryPerformanceCounter")
+    return int(value.value)
+
+
+def performance_frequency() -> int:
+    value = ctypes.c_longlong()
+    if not kernel32.QueryPerformanceFrequency(ctypes.byref(value)):
+        raise OSError(ctypes.get_last_error(), "QueryPerformanceFrequency")
+    return int(value.value)
 
 
 def cpu_seconds(pid: int) -> float:
@@ -224,24 +324,6 @@ class DiskBusyCounter:
 
     def __exit__(self, *_: object) -> None:
         self.close()
-
-
-def quiet_gate_failures(
-    cpu: list[float],
-    disk: list[float],
-    max_cpu_median: float,
-    max_cpu_p95: float,
-    max_disk_median: float,
-    max_disk_p95: float,
-) -> list[str]:
-    checks = [
-        ("CPU median", median(cpu), max_cpu_median),
-        ("CPU p95", nearest_rank_percentile(cpu, 0.95), max_cpu_p95),
-        ("disk median", median(disk), max_disk_median),
-        ("disk p95", nearest_rank_percentile(disk, 0.95), max_disk_p95),
-    ]
-    return [f"{name} {value:.2f}% > {limit:.2f}%" for name, value, limit in checks
-            if value > limit]
 
 
 def thread_count(pid: int) -> int:
@@ -498,11 +580,14 @@ def launch(exe: Path, target: str | None, settle: float,
     return p
 
 
-def kill_and_wait(p: subprocess.Popen) -> int:
+def kill_and_wait(p: subprocess.Popen, timeout: float = 5.0) -> int:
     """Terminate a probe process and always reap its handle."""
     if p.poll() is None:
         p.kill()
-    return p.wait()
+    try:
+        return p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("probe process did not exit after termination") from None
 
 
 def graceful_close(
@@ -687,6 +772,134 @@ def startup_once(exe: Path, target: str | None, timeout: float) -> float:
         kill_and_wait(p)
 
 
+def startup_milestones_once(
+    exe: Path,
+    target: str | None,
+    timeout: float,
+    *,
+    win32: object,
+    parent_context: object,
+    idle_settle: float,
+    profile_root: Path | None = None,
+) -> StartupSample:
+    """Measure named startup milestones with app-side QPC acknowledgements."""
+    from .native.runtime import security_context_failure
+
+    frequency = performance_frequency()
+    nonce = uuid.uuid4().hex
+    root_context = (
+        tempfile.TemporaryDirectory(prefix="markturbo-startup-")
+        if profile_root is None
+        else nullcontext(profile_root)
+    )
+    with root_context as directory:
+        root = Path(directory).resolve()
+        trace_path = root / f"startup-{nonce}.jsonl"
+        data_root = root / "data"
+        config_root = root / "config"
+        data_root.mkdir(exist_ok=True)
+        config_root.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        for secret in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "MARKTURBO_TRANSLATE_MODEL"):
+            env.pop(secret, None)
+        env.update(
+            {
+                "MARKTURBO_DATA_DIR": str(data_root),
+                "MARKTURBO_CONFIG_DIR": str(config_root),
+                "MARKTURBO_STARTUP_TRACE": str(trace_path),
+                "MARKTURBO_STARTUP_NONCE": nonce,
+                "RUST_LOG": "warn",
+            }
+        )
+        args = [str(exe)] + ([target] if target else [])
+        trace = StartupTraceReader(
+            trace_path,
+            nonce=nonce,
+            pid=0,
+            frequency=frequency,
+        )
+        start_counter = performance_counter()
+        p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        trace.pid = p.pid
+        process_created = performance_counter()
+        try:
+            child_context = win32.security_context(p.pid)
+            failure = security_context_failure(parent_context, child_context)
+            if failure is not None:
+                raise RuntimeError(failure)
+
+            deadline = time.perf_counter() + timeout
+            hwnd = None
+            visible_counter = None
+            input_sent = False
+            events: dict[str, StartupTraceEvent] = {}
+            while time.perf_counter() < deadline:
+                if p.poll() is not None:
+                    raise RuntimeError(
+                        f"{exe} exited with {p.returncode} before completing startup milestones"
+                    )
+                if hwnd is None:
+                    hwnd = main_window(p.pid)
+                    if hwnd is not None:
+                        visible_counter = performance_counter()
+                events = trace.read()
+                if (
+                    not input_sent
+                    and hwnd is not None
+                    and "first_frame_painted" in events
+                ):
+                    win32.send_key(hwnd, VK_F24)
+                    input_sent = True
+                if input_sent and "first_input_handled" in events:
+                    break
+                time.sleep(0.002)
+            else:
+                missing = [name for name in STARTUP_TRACE_EVENTS if name not in events]
+                if hwnd is None:
+                    missing.append("window_visible")
+                raise RuntimeError(
+                    f"{exe} did not complete startup milestones within {timeout:g}s; "
+                    f"missing {', '.join(missing) or 'input acknowledgement'}"
+                )
+
+            if visible_counter is None:
+                raise RuntimeError(f"{exe} never exposed its titled main window")
+            milestones = trace_milestones(
+                events,
+                start_counter=start_counter,
+                frequency=frequency,
+            )
+            initial_state = events["initial_state_ready"].detail
+            if initial_state not in {"welcome", "workspace", "bare"}:
+                raise RuntimeError(f"invalid initial startup state: {initial_state!r}")
+            time.sleep(idle_settle)
+            idle = process_memory(p.pid)
+            return StartupSample(
+                process_created_ms=(process_created - start_counter) / frequency * 1000,
+                process_started_ms=milestones["process_started_ms"],
+                initial_state_ready_ms=milestones["initial_state_ready_ms"],
+                window_visible_ms=(visible_counter - start_counter) / frequency * 1000,
+                first_frame_painted_ms=milestones["first_frame_painted_ms"],
+                first_input_handled_ms=milestones["first_input_handled_ms"],
+                initial_state=initial_state,
+                idle_working_set_mb=idle.working_set_mb,
+                idle_private_mb=idle.private_mb,
+                peak_working_set_mb=idle.peak_working_set_mb,
+                page_faults=idle.page_faults,
+                threads=thread_count(p.pid),
+            )
+        finally:
+            trace.close()
+            measurement_error = sys.exception()
+            try:
+                kill_and_wait(p)
+            except RuntimeError as cleanup_error:
+                if measurement_error is None:
+                    raise
+                measurement_error.add_note(f"startup probe cleanup failed: {cleanup_error}")
+            trace_path.unlink(missing_ok=True)
+
+
 def summarize_startup(label: str, samples: list[float]) -> None:
     p95 = inclusive_p95(samples)
     print(f"{label}: {len(samples)} samples")
@@ -721,19 +934,275 @@ def summarize_startup_comparison(
           f"{median(comparison.percentages):+.2f}%")
 
 
+def cmd_startup_milestones(a: argparse.Namespace, requested_exes: list[Path]) -> None:
+    from .native.runtime import HarnessBlocked, HarnessFailure, preflight, sha256_file
+
+    formal_labels = a.label in EVIDENCE_VARIANT_LABELS and (
+        not a.compare or a.compare_label in EVIDENCE_VARIANT_LABELS
+    )
+    source_snapshot = (
+        source_state()
+        if formal_labels or a.evidence or a.quiet_evidence is not None
+        else None
+    )
+    host_context: dict[str, object] | None = None
+    if a.evidence or a.quiet_evidence is not None:
+        try:
+            host_context = goal04_host_context()
+        except HarnessBlocked as error:
+            sys.exit(f"startup milestone preflight BLOCKED: {error.code}")
+        except HarnessFailure as error:
+            sys.exit(f"startup milestone preflight failed: {error.code}")
+    measurement_started_at = datetime.now(UTC)
+
+    labels = [a.label or str(a.exe)]
+    if a.compare:
+        labels.append(a.compare_label or str(a.compare))
+
+    builds: list[dict[str, object]] = []
+    threshold: dict[str, object] | None = None
+    if formal_labels:
+        assert source_snapshot is not None
+        build_paths = [a.build_evidence]
+        if a.compare:
+            build_paths.append(a.compare_build_evidence)
+        try:
+            builds = [
+                load_build_evidence(
+                    path,
+                    variant_name=label,
+                    source=source_snapshot,
+                    executable=exe,
+                )
+                for path, label, exe in zip(
+                    build_paths, labels, requested_exes, strict=True
+                )
+            ]
+        except ValueError as error:
+            sys.exit(f"startup build evidence failed: {error}")
+        if len(builds) == 2 and builds[0]["toolchain"] != builds[1]["toolchain"]:
+            sys.exit("startup comparison build manifests use different Rust toolchains")
+
+        if labels == ["full", "no-model"]:
+            try:
+                threshold = load_threshold_evidence(
+                    a.threshold_evidence,
+                    source=source_snapshot,
+                    checked_at=measurement_started_at,
+                )
+            except ValueError as error:
+                sys.exit(f"startup threshold evidence failed: {error}")
+
+    quiet_gate: dict[str, object] = {}
+    if a.quiet_evidence is not None:
+        try:
+            quiet_gate = read_evidence_object(a.quiet_evidence)
+            validate_startup_quiet_evidence(
+                quiet_gate,
+                source=source_snapshot or source_state(),
+                host=host_context or goal04_host_context(),
+                checked_at=measurement_started_at,
+            )
+            quiet_gate = normalized_quiet_evidence(quiet_gate)
+        except ValueError as error:
+            sys.exit(str(error))
+
+    with ExitStack() as resources:
+        exes = requested_exes
+        if builds:
+            directory = Path(
+                resources.enter_context(
+                    tempfile.TemporaryDirectory(prefix="markturbo-startup-binaries-")
+                )
+            ).resolve()
+            copied: list[Path] = []
+            for index, (source_exe, build) in enumerate(
+                zip(requested_exes, builds, strict=True)
+            ):
+                destination = directory / f"variant-{index}.exe"
+                shutil.copy2(source_exe, destination)
+                if sha256_file(destination).evidence() != build["executable"]:
+                    sys.exit("startup executable changed while creating the private measurement copy")
+                copied.append(destination)
+            exes = copied
+
+        preflights: list[dict[str, object]] = []
+        win32 = parent_context = None
+        try:
+            for exe in exes:
+                evidence: dict[str, object] = {"executable": {}}
+                fingerprint = sha256_file(exe)
+                current_win32, current_parent = preflight(
+                    exe,
+                    fingerprint.sha256,
+                    evidence,
+                    fingerprint=fingerprint,
+                )
+                preflights.append(evidence)
+                if win32 is None:
+                    win32, parent_context = current_win32, current_parent
+        except HarnessBlocked as error:
+            sys.exit(f"startup milestone preflight BLOCKED: {error.code}")
+        except HarnessFailure as error:
+            sys.exit(f"startup milestone preflight failed: {error.code}")
+
+        assert win32 is not None and parent_context is not None
+        profile_roots: list[Path | None] = []
+        for _ in exes:
+            if a.cache_state == "warm":
+                directory = resources.enter_context(
+                    tempfile.TemporaryDirectory(prefix="markturbo-startup-warm-")
+                )
+                profile_roots.append(Path(directory).resolve())
+            else:
+                profile_roots.append(None)
+
+        def measure(index: int) -> StartupSample:
+            exe = exes[index]
+            try:
+                return startup_milestones_once(
+                    exe,
+                    a.open,
+                    a.timeout,
+                    win32=win32,
+                    parent_context=parent_context,
+                    idle_settle=a.idle_settle,
+                    profile_root=profile_roots[index],
+                )
+            except (HarnessBlocked, HarnessFailure) as error:
+                sys.exit(f"startup milestone input failed: {error.code}")
+            except (OSError, RuntimeError, ValueError) as error:
+                sys.exit(f"startup milestone measurement failed: {error}")
+
+        for _ in range(a.warmup):
+            for index in range(len(exes)):
+                measure(index)
+
+        if a.compare:
+            samples_a, samples_b = measure_startup_abba(
+                a.rounds,
+                lambda: measure(0),
+                lambda: measure(1),
+            )
+            summarize_startup_milestones(labels[0], samples_a)
+            summarize_startup_milestones(labels[1], samples_b)
+            print(f"paired comparison: B - A ({a.rounds} A-B-B-A rounds)")
+            for field, summary in milestone_comparison(samples_a, samples_b).items():
+                print(
+                    f"  {field.removesuffix('_ms'):<27} "
+                    f"{summary['median_b_minus_a']:+7.1f}  "
+                    f"{summary['median_b_minus_a_percent']:+6.2f}%"
+                )
+        else:
+            samples_a = tuple(measure(0) for _ in range(a.rounds))
+            samples_b = ()
+            summarize_startup_milestones(labels[0], samples_a)
+
+        if a.evidence:
+            assert source_snapshot is not None and host_context is not None
+            if source_state() != source_snapshot:
+                sys.exit("source state changed during startup measurement")
+            if any(
+                sha256_file(exe).evidence() != build["executable"]
+                for exe, build in zip(exes, builds, strict=True)
+            ):
+                sys.exit("startup executable changed during measurement")
+            write_startup_evidence(
+                a.evidence,
+                label_a=labels[0],
+                samples_a=samples_a,
+                cache_state=a.cache_state,
+                rounds=a.rounds,
+                warmup=a.warmup,
+                idle_settle=a.idle_settle,
+                measurement_started_at=measurement_started_at,
+                source=source_snapshot,
+                host=host_context,
+                build_a=builds[0],
+                preflight_a=preflights[0],
+                quiet_gate=quiet_gate,
+                threshold=threshold,
+                label_b=labels[1] if a.compare else None,
+                samples_b=samples_b,
+                build_b=builds[1] if a.compare else None,
+                preflight_b=preflights[1] if a.compare else None,
+            )
+
+
 def cmd_startup(a: argparse.Namespace) -> None:
     """Repeated startup measurement, optionally interleaving two binaries."""
+    formal_labels = a.label in EVIDENCE_VARIANT_LABELS and (
+        not a.compare or a.compare_label in EVIDENCE_VARIANT_LABELS
+    )
+    model_pair = bool(a.compare and "no-model" in {a.label, a.compare_label})
+    if model_pair and [a.label, a.compare_label] != ["full", "no-model"]:
+        sys.exit("no-model comparison requires --label full --compare-label no-model")
+    decision_pair = bool(a.compare and [a.label, a.compare_label] == ["full", "no-model"])
+    if a.compare and not a.milestones:
+        sys.exit("paired startup comparisons require --milestones and build provenance")
+    if a.compare and not formal_labels:
+        sys.exit("paired milestone comparisons require recognized variant labels")
     if a.rounds < 1:
         sys.exit("--rounds must be at least 1")
     if a.warmup < 0:
         sys.exit("--warmup cannot be negative")
+    if a.milestones and formal_labels and a.cache_state == "warm" and a.warmup < 1:
+        sys.exit("formal warm startup measurement requires at least one warmup")
     if a.timeout <= 0:
         sys.exit("--timeout must be greater than zero")
+    if a.milestones and a.idle_settle < 0:
+        sys.exit("--idle-settle cannot be negative")
+    if a.evidence and not a.milestones:
+        sys.exit("--evidence requires --milestones")
+    if a.evidence and a.quiet_evidence is None:
+        sys.exit("--evidence requires --quiet-evidence from a passing quiet gate")
+    if a.milestones and formal_labels and a.build_evidence is None:
+        sys.exit("formal milestone measurement requires --build-evidence for --exe")
+    if a.evidence and a.rounds < 10:
+        sys.exit("--evidence requires at least 10 rounds")
+    if a.evidence and a.label not in EVIDENCE_VARIANT_LABELS:
+        sys.exit(
+            "--evidence requires --label as one of: "
+            + ", ".join(sorted(EVIDENCE_VARIANT_LABELS))
+        )
+    if a.evidence and a.compare:
+        if a.compare_label not in EVIDENCE_VARIANT_LABELS:
+            sys.exit(
+                "--evidence with --compare requires --compare-label as one of: "
+                + ", ".join(sorted(EVIDENCE_VARIANT_LABELS))
+            )
+        if a.compare_label == a.label:
+            sys.exit("startup evidence variant labels must be distinct")
+    if a.milestones and formal_labels and a.compare and a.compare_build_evidence is None:
+        sys.exit("formal comparison requires --compare-build-evidence")
+    if decision_pair and a.threshold_evidence is None:
+        sys.exit("full/no-model measurement requires owner-approved --threshold-evidence")
+    if a.threshold_evidence is not None and not decision_pair:
+        sys.exit("--threshold-evidence is only valid for full/no-model comparison")
+
+    if a.evidence is not None:
+        try:
+            require_distinct_output_path(
+                a.evidence,
+                a.exe,
+                a.compare,
+                a.build_evidence,
+                a.compare_build_evidence,
+                a.quiet_evidence,
+                a.threshold_evidence,
+                Path(a.open) if a.open is not None else None,
+            )
+        except ValueError as error:
+            sys.exit(str(error))
 
     exes = [a.exe] + ([a.compare] if a.compare else [])
     for exe in exes:
         if not exe.is_file():
             sys.exit(f"{exe} not found")
+
+    if a.milestones:
+        cmd_startup_milestones(a, exes)
+        return
 
     for _ in range(a.warmup):
         for exe in exes:
@@ -757,29 +1226,24 @@ def cmd_startup(a: argparse.Namespace) -> None:
 
 def duration_us(text: str) -> float:
     """Parse Rust's compact `Duration` debug form into microseconds."""
-    import re
-
     match = re.search(r"first\s+([0-9.]+)(ns|[µμu]s|ms|s)\s+subsequent", text)
     if not match:
-        raise ValueError(f"cannot parse first-formula duration from: {text}")
+        raise ValueError(f"cannot parse first/subsequent duration from: {text}")
     value = float(match.group(1))
     return value * {"ns": 0.001, "µs": 1.0, "μs": 1.0, "us": 1.0,
                     "ms": 1000.0, "s": 1_000_000.0}[match.group(2)]
 
 
-def formula_once(exe: Path, font_dir: Path | None, timeout: float) -> float:
-    env = os.environ.copy()
-    env.pop("MT_MATH_FONT_DIR", None)
-    if font_dir is not None:
-        env["MT_MATH_FONT_DIR"] = str(font_dir)
+def ignored_cost_once(
+    exe: Path,
+    test_name: str,
+    timeout: float,
+    *,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> float:
     result = subprocess.run(
-        [
-            str(exe),
-            "first_formula_costs_little_more_than_the_rest",
-            "--ignored",
-            "--nocapture",
-            "--exact",
-        ],
+        [str(exe), test_name, "--ignored", "--nocapture", "--exact"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -789,11 +1253,34 @@ def formula_once(exe: Path, font_dir: Path | None, timeout: float) -> float:
     )
     output = result.stdout + result.stderr
     if result.returncode:
-        sys.exit(f"{exe} formula probe failed with {result.returncode}:\n{output}")
+        sys.exit(f"{exe} {label} probe failed with {result.returncode}:\n{output}")
     try:
         return duration_us(output)
     except ValueError as error:
         sys.exit(str(error))
+
+
+def formula_once(exe: Path, font_dir: Path | None, timeout: float) -> float:
+    env = os.environ.copy()
+    env.pop("MT_MATH_FONT_DIR", None)
+    if font_dir is not None:
+        env["MT_MATH_FONT_DIR"] = str(font_dir)
+    return ignored_cost_once(
+        exe,
+        "first_formula_costs_little_more_than_the_rest",
+        timeout,
+        label="formula",
+        env=env,
+    )
+
+
+def model_first_use_once(exe: Path, timeout: float) -> float:
+    return ignored_cost_once(
+        exe,
+        "first_model_transport_use_cost",
+        timeout,
+        label="model first-use",
+    )
 
 
 def summarize_formula(label: str, samples: list[float]) -> None:
@@ -867,13 +1354,121 @@ def cmd_formula(a: argparse.Namespace) -> None:
     summarize_formula_comparison(comparison)
 
 
+def cmd_model_first_use(a: argparse.Namespace) -> None:
+    if a.rounds < 1:
+        sys.exit("--rounds must be at least 1")
+    if a.warmup < 0:
+        sys.exit("--warmup cannot be negative")
+    if a.timeout <= 0:
+        sys.exit("--timeout must be greater than zero")
+    if not a.exe.is_file():
+        sys.exit(f"{a.exe} not found")
+
+    if a.evidence is None:
+        for _ in range(a.warmup):
+            model_first_use_once(a.exe, a.timeout)
+        samples = [model_first_use_once(a.exe, a.timeout) for _ in range(a.rounds)]
+        summarize_formula(str(a.exe), samples)
+        return
+
+    if a.rounds < 10:
+        sys.exit("model first-use evidence requires at least 10 rounds")
+    if a.quiet_evidence is None:
+        sys.exit("model first-use evidence requires --quiet-evidence")
+    if a.build_evidence is None:
+        sys.exit("model first-use evidence requires --build-evidence")
+    if a.app_exe is None or not a.app_exe.is_file():
+        sys.exit("model first-use evidence requires an existing --app-exe")
+    if a.app_build_evidence is None:
+        sys.exit("model first-use evidence requires --app-build-evidence")
+    try:
+        require_distinct_output_path(
+            a.evidence,
+            a.exe,
+            a.app_exe,
+            a.build_evidence,
+            a.app_build_evidence,
+            a.quiet_evidence,
+        )
+    except ValueError as error:
+        sys.exit(str(error))
+
+    from .native.runtime import HarnessBlocked, HarnessFailure, sha256_file
+
+    source_snapshot = source_state()
+    try:
+        host_context = goal04_host_context()
+    except HarnessBlocked as error:
+        sys.exit(f"model first-use preflight BLOCKED: {error.code}")
+    except HarnessFailure as error:
+        sys.exit(f"model first-use preflight failed: {error.code}")
+    measurement_started_at = datetime.now(UTC)
+    try:
+        quiet_gate = read_evidence_object(a.quiet_evidence)
+        validate_startup_quiet_evidence(
+            quiet_gate,
+            source=source_snapshot,
+            host=host_context,
+            checked_at=measurement_started_at,
+        )
+        quiet_gate = normalized_quiet_evidence(quiet_gate)
+        test_build = load_build_evidence(
+            a.build_evidence,
+            variant_name="model-first-use",
+            source=source_snapshot,
+            executable=a.exe,
+        )
+        full_build = load_build_evidence(
+            a.app_build_evidence,
+            variant_name="full",
+            source=source_snapshot,
+            executable=a.app_exe,
+        )
+    except ValueError as error:
+        sys.exit(f"model first-use evidence failed: {error}")
+    if test_build["toolchain"] != full_build["toolchain"]:
+        sys.exit("model first-use build manifests use different Rust toolchains")
+
+    with tempfile.TemporaryDirectory(prefix="markturbo-model-first-use-") as directory:
+        executable = Path(directory).resolve() / "model-first-use.exe"
+        shutil.copy2(a.exe, executable)
+        if sha256_file(executable).evidence() != test_build["executable"]:
+            sys.exit("model first-use executable changed while creating its private copy")
+        for _ in range(a.warmup):
+            model_first_use_once(executable, a.timeout)
+        samples = [
+            model_first_use_once(executable, a.timeout) for _ in range(a.rounds)
+        ]
+        summarize_formula("model-first-use", samples)
+        if sha256_file(executable).evidence() != test_build["executable"]:
+            sys.exit("model first-use executable changed during measurement")
+
+    if source_state() != source_snapshot:
+        sys.exit("source state changed during model first-use measurement")
+    if sha256_file(a.app_exe).evidence() != full_build["executable"]:
+        sys.exit("full application executable changed during model first-use measurement")
+    write_model_first_use_evidence(
+        a.evidence,
+        measurement_started_at=measurement_started_at,
+        source=source_snapshot,
+        host=host_context,
+        quiet_gate=quiet_gate,
+        full_build=full_build,
+        test_build=test_build,
+        samples=samples,
+        rounds=a.rounds,
+        warmup=a.warmup,
+    )
+
+
 def cmd_memory(a: argparse.Namespace) -> None:
     p = launch(a.exe, a.open, a.settle, a.log)
     try:
-        ws, priv, peak = memory(p.pid)
-        print(f"working set {ws:8.1f} MB")
-        print(f"private     {priv:8.1f} MB")
-        print(f"peak        {peak:8.1f} MB")
+        sample = process_memory(p.pid)
+        print(f"working set {sample.working_set_mb:8.1f} MB")
+        print(f"private     {sample.private_mb:8.1f} MB")
+        print(f"peak        {sample.peak_working_set_mb:8.1f} MB")
+        print(f"page faults {sample.page_faults:8d}")
         print(f"threads     {thread_count(p.pid):8d}")
     finally:
         kill_and_wait(p)
@@ -913,6 +1508,17 @@ def cmd_quiet(a: argparse.Namespace) -> None:
         sys.exit("--samples must be at least 2")
     if a.interval <= 0:
         sys.exit("--interval must be greater than zero")
+
+    host_context: dict[str, object] | None = None
+    if a.evidence is not None:
+        from .native.runtime import HarnessBlocked, HarnessFailure
+
+        try:
+            host_context = goal04_host_context()
+        except HarnessBlocked as error:
+            sys.exit(f"quiet evidence preflight BLOCKED: {error.code}")
+        except HarnessFailure as error:
+            sys.exit(f"quiet evidence preflight failed: {error.code}")
 
     idle, kernel, user = system_cpu_times()
     cpu_samples: deque[float] = deque(maxlen=a.samples)
@@ -955,6 +1561,35 @@ def cmd_quiet(a: argparse.Namespace) -> None:
     print(f"  waited {waited:.0f}s")
     print(f"  CPU   median {cpu_median:.2f}%  p95 {cpu_p95:.2f}%")
     print(f"  disk  median {disk_median:.2f}%  p95 {disk_p95:.2f}%")
+    status = "FAIL" if last_failures else "PASS"
+    if a.evidence is not None:
+        evidence = {
+            "schema": STARTUP_QUIET_SCHEMA,
+            "created_at": datetime.now(UTC).isoformat(),
+            "status": status,
+            "command": safe_command(),
+            "source": source_state(),
+            "host": host_context,
+            "window": {"samples": a.samples, "interval_seconds": a.interval},
+            "waited_seconds": waited,
+            "thresholds": {
+                "max_cpu_median_percent": a.max_cpu_median,
+                "max_cpu_p95_percent": a.max_cpu_p95,
+                "max_disk_median_percent": a.max_disk_median,
+                "max_disk_p95_percent": a.max_disk_p95,
+            },
+            "samples": {"cpu_percent": cpu, "disk_percent": disk_values},
+            "summary": {
+                "cpu_median_percent": cpu_median,
+                "cpu_p95_percent": cpu_p95,
+                "disk_median_percent": disk_median,
+                "disk_p95_percent": disk_p95,
+            },
+            "failures": last_failures,
+        }
+        from .native.runtime import write_evidence
+
+        write_evidence(a.evidence, evidence, validate_quiet_evidence)
     if last_failures:
         for failure in last_failures:
             print(f"  FAIL  {failure}")
@@ -1221,6 +1856,64 @@ def main(argv: list[str] | None = None) -> int:
                          help="discarded launches per binary")
     startup.add_argument("--timeout", type=float, default=30.0,
                          help="seconds allowed for one launch")
+    startup.add_argument(
+        "--milestones",
+        action="store_true",
+        help="measure app-acknowledged ready, paint and input milestones",
+    )
+    startup.add_argument("--label", help="content-free label for --exe evidence")
+    startup.add_argument("--compare-label", help="content-free label for --compare evidence")
+    startup.add_argument(
+        "--cache-state",
+        choices=("warm", "fresh-profile"),
+        default="warm",
+        help="warm reuses isolated profiles; fresh-profile resets profiles without claiming OS cold",
+    )
+    startup.add_argument("--evidence", type=Path, help="write milestone evidence JSON")
+    startup.add_argument(
+        "--build-evidence",
+        type=Path,
+        help="build manifest for --exe from build-goal04",
+    )
+    startup.add_argument(
+        "--compare-build-evidence",
+        type=Path,
+        help="build manifest for --compare from build-goal04",
+    )
+    startup.add_argument(
+        "--threshold-evidence",
+        type=Path,
+        help="owner-approved materiality threshold for full/no-model evidence",
+    )
+    startup.add_argument(
+        "--quiet-evidence",
+        type=Path,
+        help="passing JSON emitted by the quiet subcommand",
+    )
+    startup.add_argument(
+        "--idle-settle",
+        type=float,
+        default=1.0,
+        help="seconds after input acknowledgement before idle counters",
+    )
+
+    build = sub.add_parser(
+        "build-goal04",
+        help="fresh-build one source-bound Goal 04 measurement artifact",
+    )
+    build.add_argument("--variant", choices=tuple(GOAL04_BUILD_VARIANTS), required=True)
+    build.add_argument("--target-dir", type=Path, required=True)
+    build.add_argument("--evidence", type=Path, required=True)
+
+    decision = sub.add_parser(
+        "decide-goal04",
+        help="bind the owner-approved model-transport decision to both cache-mode runs",
+    )
+    decision.add_argument("--warm-evidence", type=Path, required=True)
+    decision.add_argument("--fresh-profile-evidence", type=Path, required=True)
+    decision.add_argument("--decision", choices=MODEL_TRANSPORT_DECISIONS, required=True)
+    decision.add_argument("--owner-approved", action="store_true")
+    decision.add_argument("--evidence", type=Path, required=True)
 
     formula = sub.add_parser("formula", help="first-formula A-B-B-A comparison")
     formula.add_argument("--exe", type=Path, required=True,
@@ -1235,6 +1928,26 @@ def main(argv: list[str] | None = None) -> int:
     formula.add_argument("--rounds", type=int, default=10)
     formula.add_argument("--warmup", type=int, default=2)
     formula.add_argument("--timeout", type=float, default=30.0)
+
+    model = sub.add_parser(
+        "model-first-use",
+        help="full-build model transport initialization plus first loopback request",
+    )
+    model.add_argument("--exe", type=Path, required=True,
+                       help="prebuilt model_first_use_cost test executable")
+    model.add_argument("--app-exe", type=Path,
+                       help="full application executable from the same source build")
+    model.add_argument("--build-evidence", type=Path,
+                       help="model-first-use test build manifest")
+    model.add_argument("--app-build-evidence", type=Path,
+                       help="full application build manifest")
+    model.add_argument("--quiet-evidence", type=Path,
+                       help="fresh passing Goal 04 quiet evidence")
+    model.add_argument("--evidence", type=Path,
+                       help="write hash-bound model first-use evidence")
+    model.add_argument("--rounds", type=int, default=10)
+    model.add_argument("--warmup", type=int, default=2)
+    model.add_argument("--timeout", type=float, default=30.0)
 
     cpu = sub.add_parser("cpu", help="CPU over a series of windows")
     common(cpu)
@@ -1251,6 +1964,7 @@ def main(argv: list[str] | None = None) -> int:
     quiet.add_argument("--max-cpu-p95", type=float, default=10.0)
     quiet.add_argument("--max-disk-median", type=float, default=2.0)
     quiet.add_argument("--max-disk-p95", type=float, default=10.0)
+    quiet.add_argument("--evidence", type=Path, help="write PASS or FAIL evidence JSON")
 
     windows = sub.add_parser("windows", help="child windows and hit testing")
     common(windows)
@@ -1295,7 +2009,9 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if hasattr(a, "exe") and not a.exe.is_file():
         sys.exit(f"{a.exe} not found — cargo build --release first")
-    {"startup": cmd_startup, "formula": cmd_formula, "memory": cmd_memory,
+    {"startup": cmd_startup, "build-goal04": cmd_build_goal04,
+     "decide-goal04": cmd_decide_goal04, "formula": cmd_formula,
+     "model-first-use": cmd_model_first_use, "memory": cmd_memory,
      "cpu": cmd_cpu, "quiet": cmd_quiet, "windows": cmd_windows,
      "shot": cmd_shot}[a.cmd](a)
     return 0
