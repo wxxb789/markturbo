@@ -3,7 +3,7 @@ members = ["crates/mt-doc", "crates/mt-app"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.4-alpha.1"
+version = "0.1.4-alpha.2"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
