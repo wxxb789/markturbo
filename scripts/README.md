@@ -36,6 +36,13 @@ native UI acceptance cannot enter a test run through discovery. The runtime
 probe is Windows-only, but its geometry unit test and the other tooling tests
 validate portable input, source contracts, or fixture behavior without a desktop.
 
+A-B-B-A scheduling, arithmetic, and paired execution-path tests are local-only
+and are not part of `fast`, `ci`, or `full`:
+
+```sh
+uv run --project scripts python -m unittest scripts.tests.local_probe_abba
+```
+
 ## Commands
 
 ```sh
