@@ -27,12 +27,19 @@
 //! `AuthResolver` hook is deliberately unused: it exists for the inference path,
 //! and on the target path an [`AuthData::Key`] is simply carried through.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "model-transport")]
+use std::sync::OnceLock;
+#[cfg(feature = "model-transport")]
 use std::time::Duration;
 
+#[cfg(feature = "model-transport")]
 use genai::adapter::AdapterKind;
+#[cfg(feature = "model-transport")]
 use genai::chat::{ChatMessage, ChatRequest};
+#[cfg(feature = "model-transport")]
 use genai::resolver::{AuthData, Endpoint};
+#[cfg(feature = "model-transport")]
 use genai::{Client, ModelIden, ServiceTarget, WebConfig};
 use mt_doc::translate::TranslationService;
 
@@ -99,6 +106,7 @@ impl Provider {
     /// otherwise pick an adapter by sniffing the model name and land on Ollama
     /// for anything unfamiliar, which is exactly wrong for a self-hosted server
     /// serving a model named after its weights.
+    #[cfg(feature = "model-transport")]
     fn adapter(self) -> AdapterKind {
         match self {
             Provider::AnthropicMessages => AdapterKind::Anthropic,
@@ -146,30 +154,39 @@ impl Provider {
     /// a working endpoint, and one pointing at a self-hosted server overrides
     /// just the URL.
     pub fn build_with(self, settings: &AppSettings) -> Result<Arc<dyn TranslationService>, String> {
-        let api_key = self.api_key(settings).ok_or_else(|| {
-            format!(
-                "No API key. Set one in Settings, or export {} in the environment.",
-                self.key_env()
-            )
-        })?;
+        #[cfg(not(feature = "model-transport"))]
+        {
+            let _ = settings;
+            return Err("Model transport is unavailable in this Goal 04 measurement build.".into());
+        }
 
-        let base_url = base_url(
-            &non_empty(&settings.translate_base_url)
-                .unwrap_or_else(|| self.default_base_url().to_string()),
-        );
-        let model = non_empty(&settings.translate_model)
-            .or_else(|| non_empty_env("MARKTURBO_TRANSLATE_MODEL"))
-            .unwrap_or_else(|| self.default_model().to_string());
+        #[cfg(feature = "model-transport")]
+        {
+            let api_key = self.api_key(settings).ok_or_else(|| {
+                format!(
+                    "No API key. Set one in Settings, or export {} in the environment.",
+                    self.key_env()
+                )
+            })?;
 
-        // Fail here rather than on the first translation: a runtime that cannot
-        // start is a configuration problem, and reporting it at build time puts
-        // it in the same status message as a missing key.
-        transport().map_err(|e| e.to_string())?;
+            let base_url = base_url(
+                &non_empty(&settings.translate_base_url)
+                    .unwrap_or_else(|| self.default_base_url().to_string()),
+            );
+            let model = non_empty(&settings.translate_model)
+                .or_else(|| non_empty_env("MARKTURBO_TRANSLATE_MODEL"))
+                .unwrap_or_else(|| self.default_model().to_string());
 
-        Ok(Arc::new(GenAiTranslator {
-            target: self.service_target(&base_url, &api_key, &model),
-            label: self.label(),
-        }))
+            // Fail here rather than on the first translation: a runtime that cannot
+            // start is a configuration problem, and reporting it at build time puts
+            // it in the same status message as a missing key.
+            transport().map_err(|e| e.to_string())?;
+
+            Ok(Arc::new(GenAiTranslator {
+                target: self.service_target(&base_url, &api_key, &model),
+                label: self.label(),
+            }))
+        }
     }
 
     /// The endpoint, key, and model, resolved into the shape genai executes.
@@ -177,6 +194,7 @@ impl Provider {
     /// Pure and total, which is the point: every routing decision this app makes
     /// is visible in the returned value, so the mapping is testable without a
     /// socket. The `curl` version could only be checked by making a request.
+    #[cfg(feature = "model-transport")]
     fn service_target(self, base_url: &str, api_key: &str, model: &str) -> ServiceTarget {
         ServiceTarget {
             endpoint: Endpoint::from_owned(base_url),
@@ -237,6 +255,7 @@ fn non_empty_env(var: &str) -> Option<String> {
 /// reaches `/chat/completions`, which is simply the wrong endpoint for a server
 /// mounting under `/v1`. That is why the setting's help names the version
 /// segment rather than only the slash.
+#[cfg(feature = "model-transport")]
 fn base_url(raw: &str) -> String {
     if raw.ends_with('/') {
         raw.to_string()
@@ -250,6 +269,7 @@ fn base_url(raw: &str) -> String {
 /// Segments are sent as a JSON array and returned as one, so the provider
 /// cannot merge or reorder them without the count check in
 /// [`mt_doc::translate::translate`] catching it.
+#[cfg(feature = "model-transport")]
 struct GenAiTranslator {
     target: ServiceTarget,
     /// Only for error messages; naming the provider is what makes a failure
@@ -257,6 +277,7 @@ struct GenAiTranslator {
     label: &'static str,
 }
 
+#[cfg(feature = "model-transport")]
 impl TranslationService for GenAiTranslator {
     fn translate(&self, texts: &[String], target_lang: &str) -> anyhow::Result<Vec<String>> {
         let user = format!(
@@ -300,6 +321,7 @@ impl TranslationService for GenAiTranslator {
 /// `rt-multi-thread` with one worker, not `current_thread`: a current-thread
 /// runtime can only be driven by whichever thread calls `block_on`, and gpui
 /// hands each background task an arbitrary pool thread.
+#[cfg(feature = "model-transport")]
 fn transport() -> anyhow::Result<&'static (tokio::runtime::Runtime, Client)> {
     static TRANSPORT: OnceLock<std::io::Result<(tokio::runtime::Runtime, Client)>> =
         OnceLock::new();
@@ -328,12 +350,14 @@ fn transport() -> anyhow::Result<&'static (tokio::runtime::Runtime, Client)> {
     }
 }
 
+#[cfg(feature = "model-transport")]
 const SYSTEM_PROMPT: &str = "You translate prose fragments from technical Markdown documents. \
 Translate only natural-language prose. Never translate or alter identifiers, file paths, URLs, \
 command names, or code. Preserve Markdown markup characters exactly as they appear. \
 Reply with a JSON array of strings and nothing else.";
 
 /// Pull the JSON array out of a reply that may be fenced or prefixed.
+#[cfg(feature = "model-transport")]
 fn extract_json_array(text: &str) -> &str {
     let trimmed = text.trim();
     // ```json … ```
@@ -349,7 +373,7 @@ fn extract_json_array(text: &str) -> &str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "model-transport"))]
 mod tests {
     use super::*;
     use crate::settings::AppSettings;
@@ -794,5 +818,31 @@ mod tests {
             message.contains(Provider::AnthropicMessages.label()),
             "the failure must name which provider produced it: {message}"
         );
+    }
+}
+
+#[cfg(all(test, not(feature = "model-transport")))]
+mod ablation_tests {
+    use super::*;
+
+    #[test]
+    fn measurement_build_reports_the_removed_transport() {
+        let settings = AppSettings {
+            translate_api_key: "measurement-placeholder".into(),
+            ..AppSettings::default()
+        };
+
+        for provider in Provider::ALL {
+            let error = match provider.build_with(&settings) {
+                Ok(_) => panic!("{} unexpectedly built model transport", provider.label()),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                "Model transport is unavailable in this Goal 04 measurement build.",
+                "{} should report the measurement-build transport removal directly",
+                provider.label()
+            );
+        }
     }
 }

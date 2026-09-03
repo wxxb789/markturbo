@@ -123,6 +123,8 @@ fn resolve_target(args: &[String]) -> Result<Option<PathBuf>, (String, i32)> {
 }
 
 fn main() {
+    mt_app::startup::record(mt_app::startup::StartupEvent::ProcessStarted);
+
     // GPUI's DirectComposition swap chain covers ordinary child HWNDs. The
     // WebView worker therefore uses the compatibility compositor, matching
     // gpui-component's WebView example, so its WS_CHILD host can remain inside
@@ -163,6 +165,7 @@ fn main() {
         cx.set_app_identity(APP_ID, "markturbo");
         // Must come before any component is constructed.
         gpui_component::init(cx);
+        mt_app::startup::init(cx);
         // Before the first window: `Workspace::new` reads the saved theme to
         // apply it ahead of the first frame.
         mt_app::settings::AppSettings::init(cx);
@@ -215,6 +218,7 @@ fn main() {
                         let handle = workspace.read(cx).focus_handle(cx);
                         window.focus(&handle, cx);
                     }
+                    mt_app::startup::schedule_first_frame_milestone(window);
                     cx.on_release(|_, cx| cx.quit()).detach();
                 })
                 .expect("failed to configure window");

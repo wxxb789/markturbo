@@ -15,7 +15,15 @@ doctest = false
 name = "markturbo"
 path = "src/main.rs"
 
+[[bin]]
+name = "markturbo-gpui-shell"
+path = "src/bin/markturbo-gpui-shell.rs"
+
 [features]
+default = ["model-transport"]
+# Goal 04 measurement apparatus. The public build keeps this default; disabling
+# it is only the compile-time upper bound for the model/network closure.
+model-transport = ["dep:genai", "dep:reqwest", "dep:rustls", "dep:tokio"]
 profiler = ["gpui/profiler"]
 
 [dependencies]
@@ -49,12 +57,12 @@ sha2.workspace = true
 smol.workspace = true
 tempfile.workspace = true
 toml.workspace = true
-genai.workspace = true
+genai = { workspace = true, optional = true }
 # Neither is called directly. They are here to pin genai's TLS to pure Rust:
 # see the comment on `genai` in the workspace manifest.
-reqwest.workspace = true
-rustls.workspace = true
-tokio.workspace = true
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 gpui-wry.workspace = true
