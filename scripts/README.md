@@ -56,6 +56,93 @@ write fail-closed, hash-bound evidence.
 `probe formula` measures the embedded KaTeX path by default. Pass `--font-dir`
 only when intentionally measuring a complete external development override.
 
+Goal 04 startup evidence uses app-acknowledged, content-free QPC milestones.
+It requires the same active, unlocked Windows 11 x64 desktop as native
+acceptance because the harness sends `F24` through `SendInput` and records the
+GPUI action acknowledgement. Build each variant through the controlled command;
+it requires an empty target directory and writes source, lockfile, feature,
+release-profile, Cargo/Rustc versions, hashed Cargo configuration, dependency
+graph, executable hash, size, and PE-section provenance. Compared manifests
+must use the same recorded toolchain. The `full` and `no-model` manifests also include current
+`cargo-bloat 0.12.1` crate attribution and selected dependency features. The
+ablation runs the exact no-default-features unavailable-diagnostic test, proves
+`genai`/`reqwest`/`rustls` leave the target, and reports Tokio's remaining
+non-model features rather than falsely claiming Tokio disappears:
+
+```sh
+uv run --project scripts scripts/mt.py probe -- build-goal04 \
+  --variant full --target-dir .scratch/goal-04/full \
+  --evidence .scratch/goal-04/full-build.json
+uv run --project scripts scripts/mt.py probe -- build-goal04 \
+  --variant no-model --target-dir .scratch/goal-04/no-model \
+  --evidence .scratch/goal-04/no-model-build.json
+```
+
+The `no-model` build is measurement apparatus, not a supported product
+configuration: provider-backed selection, block, and document Translation all
+return the explicit Goal 04 unavailable diagnostic. Before any full/no-model
+result is visible, the owner-approved numeric materiality rule must be stored in
+the source-bound `markturbo-goal-04-threshold-v1` artifact. Its cache rule must
+require both the warm and fresh-profile runs to meet the same threshold before
+extraction can be authorized. Generate a passing quiet-gate record immediately
+before each comparison:
+
+```sh
+uv run --project scripts scripts/mt.py probe -- quiet \
+  --wait-seconds 3600 \
+  --evidence .scratch/goal-04/quiet.json
+uv run --project scripts scripts/mt.py probe -- startup \
+  --milestones \
+  --exe .scratch/goal-04/full/x86_64-pc-windows-msvc/release/markturbo.exe \
+  --compare .scratch/goal-04/no-model/x86_64-pc-windows-msvc/release/markturbo.exe \
+  --label full \
+  --compare-label no-model \
+  --build-evidence .scratch/goal-04/full-build.json \
+  --compare-build-evidence .scratch/goal-04/no-model-build.json \
+  --threshold-evidence .scratch/goal-04/threshold.json \
+  --cache-state warm \
+  --rounds 10 \
+  --quiet-evidence .scratch/goal-04/quiet.json \
+  --evidence .scratch/goal-04/full-vs-no-model-warm.json
+```
+
+Every milestone sample also records idle working set, private bytes, peak
+working set, page faults, and thread count after `--idle-settle`. The default
+`warm` mode reuses one isolated data/config profile per variant across warmups
+and measured launches. Repeat the command after a new quiet gate with
+`--cache-state fresh-profile` and write
+`.scratch/goal-04/full-vs-no-model-fresh-profile.json`. This creates fresh
+isolated profiles but explicitly does not claim to flush the Windows file cache.
+After both runs, bind the owner's final decision to both evidence files:
+
+```sh
+uv run --project scripts scripts/mt.py probe -- decide-goal04 \
+  --warm-evidence .scratch/goal-04/full-vs-no-model-warm.json \
+  --fresh-profile-evidence .scratch/goal-04/full-vs-no-model-fresh-profile.json \
+  --decision "keep in-process" \
+  --owner-approved \
+  --evidence .scratch/goal-04/model-transport-decision.json
+```
+
+Build and measure the model first-use test against a deterministic loopback
+endpoint, bound to the matching full application build. Every reported sample
+starts a fresh process and performs cold transport initialization; declared
+warmups affect only the Windows file cache, which is not flushed:
+
+```sh
+uv run --project scripts scripts/mt.py probe -- build-goal04 \
+  --variant model-first-use --target-dir .scratch/goal-04/model-first-use \
+  --evidence .scratch/goal-04/model-first-use-build.json
+uv run --project scripts scripts/mt.py probe -- model-first-use \
+  --exe .scratch/goal-04/model-first-use/goal04-artifacts/model-first-use.exe \
+  --build-evidence .scratch/goal-04/model-first-use-build.json \
+  --app-exe .scratch/goal-04/full/x86_64-pc-windows-msvc/release/markturbo.exe \
+  --app-build-evidence .scratch/goal-04/full-build.json \
+  --quiet-evidence .scratch/goal-04/quiet.json \
+  --rounds 10 \
+  --evidence .scratch/goal-04/model-first-use.json
+```
+
 Forward an underlying script's options after `--`. For example:
 
 ```sh

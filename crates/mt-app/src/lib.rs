@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod recovery;
 pub mod renderer;
 pub mod settings;
+pub mod startup;
 pub mod theme;
 pub mod translate;
 pub mod views;

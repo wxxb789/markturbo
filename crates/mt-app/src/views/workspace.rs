@@ -50,6 +50,7 @@ use crate::recovery::{
     RetirementCompletion,
 };
 use crate::renderer::RendererRegistry;
+use crate::startup::{AcknowledgeStartupInput, InitialStartupState, StartupEvent};
 use crate::translate::Provider;
 use crate::views::document::{
     DocumentEvent, DocumentView, PreparedRecovery, SaveAsMode, SaveAsOutcome, SaveMode, paths_match,
@@ -1296,6 +1297,11 @@ impl Workspace {
         cx.defer_in(window, move |this, window, cx| {
             this.start_startup_recovery(load_startup_recovery, startup_targets, window, cx);
         });
+        crate::startup::record(StartupEvent::InitialStateReady(if this.show_welcome {
+            InitialStartupState::Welcome
+        } else {
+            InitialStartupState::Workspace
+        }));
         this
     }
 
@@ -6027,6 +6033,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_translate_document))
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
+            .on_action(|_: &AcknowledgeStartupInput, _, _| {
+                crate::startup::record(StartupEvent::FirstInputHandled);
+            })
             .on_prepaint(move |bounds, _, cx| {
                 if let Some(this) = this.upgrade() {
                     this.update(cx, |this, cx| {

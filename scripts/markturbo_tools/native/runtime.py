@@ -324,6 +324,31 @@ def inspect_pe(path: Path) -> dict[str, int | str]:
     return inspect_pe_bytes(header)
 
 
+def inspect_pe_sections(path: Path) -> list[dict[str, int | str]]:
+    with path.open("rb") as handle:
+        data = handle.read(1024 * 1024)
+    inspect_pe_bytes(data)
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    table = pe_offset + 24 + optional_size
+    if section_count == 0 or table + section_count * 40 > len(data):
+        raise ValueError("truncated PE section table")
+    sections: list[dict[str, int | str]] = []
+    for index in range(section_count):
+        offset = table + index * 40
+        name = data[offset : offset + 8].split(b"\0", 1)[0].decode("ascii")
+        sections.append(
+            {
+                "name": name,
+                "virtual_size": struct.unpack_from("<I", data, offset + 8)[0],
+                "raw_size": struct.unpack_from("<I", data, offset + 16)[0],
+                "characteristics": struct.unpack_from("<I", data, offset + 36)[0],
+            }
+        )
+    return sections
+
+
 def platform_preflight_failure(
     system: str,
     windows_major: int,
@@ -797,22 +822,7 @@ def wait_until(
     raise HarnessFailure(timeout_code)
 
 
-def preflight(
-    exe: Path, expected_hash: str, evidence: dict[str, Any]
-) -> tuple[Win32, SecurityContext]:
-    if not exe.is_file():
-        raise HarnessFailure("EXECUTABLE_MISSING")
-    actual = sha256_file(exe)
-    evidence["executable"].update(actual.evidence())
-    if failure := executable_hash_failure(actual.sha256, expected_hash):
-        raise HarnessFailure(failure)
-    try:
-        pe = inspect_pe(exe)
-    except (OSError, ValueError):
-        raise HarnessFailure("EXECUTABLE_NOT_X64_PE") from None
-    evidence["executable"].update(pe)
-    evidence["executable"]["hash_verified"] = True
-
+def environment_preflight() -> tuple[Win32, SecurityContext, dict[str, Any]]:
     if sys.platform != "win32":
         raise HarnessFailure("WINDOWS_REQUIRED")
     win32 = Win32()
@@ -828,7 +838,7 @@ def preflight(
         raise HarnessBlocked("WTS_SESSION_NOT_ACTIVE")
     active_console = int(win32.kernel32.WTSGetActiveConsoleSessionId())
     input_name, thread_name = win32.input_desktop()
-    evidence["environment"] = {
+    environment = {
         "platform": "Windows 11",
         "windows_major": major,
         "windows_minor": minor,
@@ -843,6 +853,31 @@ def preflight(
         "thread_desktop": thread_name,
         "harness_process": parent.evidence(),
     }
+    return win32, parent, environment
+
+
+def preflight(
+    exe: Path,
+    expected_hash: str,
+    evidence: dict[str, Any],
+    *,
+    fingerprint: Fingerprint | None = None,
+) -> tuple[Win32, SecurityContext]:
+    if not exe.is_file():
+        raise HarnessFailure("EXECUTABLE_MISSING")
+    actual = sha256_file(exe) if fingerprint is None else fingerprint
+    evidence["executable"].update(actual.evidence())
+    if failure := executable_hash_failure(actual.sha256, expected_hash):
+        raise HarnessFailure(failure)
+    try:
+        pe = inspect_pe(exe)
+    except (OSError, ValueError):
+        raise HarnessFailure("EXECUTABLE_NOT_X64_PE") from None
+    evidence["executable"].update(pe)
+    evidence["executable"]["hash_verified"] = True
+
+    win32, parent, environment = environment_preflight()
+    evidence["environment"] = environment
     return win32, parent
 
 
