@@ -1,7 +1,7 @@
 # Goal 03 Completion and Acceptance Report
 
 **Date:** 2026-09-01
-**Goal:** [Goal 03 - Create a complete first-use document flow](../goals/archive/03-create-first-use-document-flow.md)
+**Goal:** [Goal 03 - Create a complete first-use document flow](goals/archive/03-create-first-use-document-flow.md)
 **Status:** NOT COMPLETE / POST-REVIEW CODE GATES PASS; FINAL NATIVE ACCEPTANCE IS BLOCKED BY THE CURRENT WINDOWS SESSION.
 
 Commands below preserve the exact historical evidence. Use

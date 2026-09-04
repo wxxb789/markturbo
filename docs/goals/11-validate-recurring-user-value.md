@@ -2,7 +2,7 @@
 
 ## Objective
 
-Run the [Post-Release Validation](../PRODUCT.md#post-release-validation) program
+Run the [Post-Release Validation](../../PRODUCT.md#post-release-validation) program
 for the first public-quality Windows 11 x64 release: collect privacy-compliant
 activation, Review usefulness, approved-revision, trust, and repeat-use evidence
 without collecting document or model content; produce one owner-approved
@@ -15,7 +15,7 @@ product capability merely to improve the measurement.
 
 This goal executes the target-user cohort, observation window, success criteria,
 guardrails, evidence mechanisms, and retention policy fixed in
-[Post-Release Validation](../PRODUCT.md#post-release-validation). It owns the
+[Post-Release Validation](../../PRODUCT.md#post-release-validation). It owns the
 collection, analysis, and continue/revise/stop workflow, not a second set of
 product thresholds.
 
@@ -29,7 +29,7 @@ roadmap expands again.
 ## In scope
 
 - Use the target user, observation window, cohort, and fixed criteria in
-  [Post-Release Validation](../PRODUCT.md#post-release-validation). Do not choose
+  [Post-Release Validation](../../PRODUCT.md#post-release-validation). Do not choose
   or weaken a criterion after seeing results.
 - Observe the complete activation path:
   - install and first launch;
@@ -42,7 +42,7 @@ roadmap expands again.
   question exposed an assumption, changed a decision, narrowed scope, clarified
   evidence, or correctly confirmed that no revision was needed.
 - Measure retention only under the separate-day repeat-use definition in
-  [Post-Release Validation](../PRODUCT.md#post-release-validation); several
+  [Post-Release Validation](../../PRODUCT.md#post-release-validation); several
   actions in one session are not retention.
 - Record safety and trust outcomes: abandoned setup, provider/credential failure,
   stale-result blocks, recovery use, accidental-loss reports, privacy concerns,
@@ -99,7 +99,7 @@ days after the final decision.
    report honestly records why recruitment was inconclusive and does not claim
    product validation.
 2. Results report every success criterion and guardrail in
-   [Post-Release Validation](../PRODUCT.md#post-release-validation). A missing
+   [Post-Release Validation](../../PRODUCT.md#post-release-validation). A missing
    criterion prevents `continue`.
 3. Every quantitative result includes its denominator, missing/unknown count, and
    collection method.
@@ -121,7 +121,7 @@ days after the final decision.
 ## Stop and ask
 
 Stop if the observation window, cohort, fixed criteria, or consented evidence
-method in [Post-Release Validation](../PRODUCT.md#post-release-validation) cannot
+method in [Post-Release Validation](../../PRODUCT.md#post-release-validation) cannot
 be followed. Do not infer success from repository popularity, an inadequate
 cohort, or the project owner's own sessions alone.
 

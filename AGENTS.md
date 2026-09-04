@@ -2,7 +2,7 @@
 
 ## Authority and scope
 
-Read `PRODUCT.md`, the relevant ordered goal in `goals/`,
+Read `PRODUCT.md`, the relevant ordered goal in `docs/goals/`,
 `docs/architecture.md`, and `CONCEPTS.md` before changing product behavior.
 Goals are canonical: link to them from PRs and commits rather than duplicating
 their requirements. `docs/history/` is historical context, not current scope.
