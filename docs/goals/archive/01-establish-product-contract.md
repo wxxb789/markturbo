@@ -59,7 +59,7 @@ feedback points elsewhere.
 - Reconcile the current long-form `GOAL.md` with the new contract so only one
   document is presented as current product authority. Preserve useful
   implementation history rather than silently deleting it.
-- Re-read every later file in `goals/` after approval and revise, replace, or
+- Re-read every later file in `docs/goals/` after approval and revise, replace, or
   explicitly retire any objective that no longer serves the selected user and
   promise; numeric order must not turn a rejected product hypothesis into work.
 - Assemble at least 12 rights-cleared real or anonymized artifacts, with at least
@@ -93,7 +93,7 @@ This goal is complete only when all of the following are true:
    present, contain no secrets or private data, and record provenance plus the
    right to retain and, where intended, redistribute them. Owner-local cases are
    clearly excluded from commits and release artifacts.
-4. Every later goal in `goals/` has been re-reviewed and either aligns with the
+4. Every later goal in `docs/goals/` has been re-reviewed and either aligns with the
    approved contract or is explicitly revised, replaced, or retired before work
    continues.
 5. The project owner explicitly approves the contract and evaluation set.
