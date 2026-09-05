@@ -14,21 +14,23 @@ testing.
 
 ## Why this goal was added during final review
 
-The initial ordered goals protected text integrity and worker IPC but missed the
-existing plain-text `translate_api_key` setting. Prompt and instruction documents
-may contain sensitive product or repository information, so a public Review
-feature needs both credential protection and a precise outbound-data contract
-regardless of whether Goal 05 chose a worker or retained in-process transport.
+The initial ordered goals protected text integrity and anticipated worker IPC but
+missed the existing plain-text `translate_api_key` setting. Prompt and instruction
+documents may contain sensitive product or repository information, so a public
+Review feature needs both credential protection and a precise outbound-data
+contract. Goal 05 retained the existing in-process provider boundary; this goal
+secures that boundary before Review uses it.
 
 ## Product contract alignment
 
 **Disposition:** Retained and revised on 2026-08-29.
 
 This goal implements `PRODUCT.md`'s local-first model-data policy on Windows 11
-x64: configured credentials are confidential, model traffic is always explicit,
-and local editing, rendering, search, Skill discovery, context resolution, and
-recovery send no document or context content. It preserves configured endpoint
-and Translation support without adding providers or background telemetry.
+x64 through the in-process provider boundary retained by Goal 05: configured
+credentials are confidential, model traffic is always explicit, and local
+editing, rendering, search, Skill discovery, context resolution, and recovery
+send no document or context content. It preserves configured endpoint and
+Translation support without adding providers or background telemetry.
 
 ## In scope
 
@@ -91,8 +93,9 @@ and Translation support without adding providers or background telemetry.
 - Accounts, cloud secret synchronization, organization policy, billing, or a
   hosted markturbo proxy.
 - Bundling a local model or downloading model weights.
-- Choosing worker versus in-process transport; Goal 05 owns that measured
-  architecture decision.
+- Reopening worker versus in-process transport; Goal 05 retained the existing
+  in-process provider boundary. This goal hardens that boundary rather than
+  adding another transport architecture.
 - Defining Review findings, questions, or revision behavior; Goals 06 and 07 own
   semantic product behavior.
 - Sending filesystem contents for telemetry, evaluation, crash reporting, or
@@ -156,6 +159,7 @@ or session-memory fallback; never preserve the existing plaintext setting.
 
 ## Boundary for the next goal
 
-This goal establishes secure model configuration and informed request transport.
-Goal 06 consumes that boundary to implement non-mutating Review; it must not add
-another credential store, consent model, or provider configuration path.
+This goal establishes secure model configuration and informed request transport
+inside the retained in-process provider boundary. Goal 06 consumes that boundary
+to implement non-mutating Review; it must not add another transport architecture,
+credential store, consent model, or provider configuration path.
