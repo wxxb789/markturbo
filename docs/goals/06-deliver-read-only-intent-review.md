@@ -49,8 +49,8 @@ length and raw content bytes. Binary or non-UTF-8 content contributes only its
 path, byte size, and SHA-256 metadata unless the user explicitly selects its raw
 content. The Review source limit is 512 KiB per file and 4 MiB in aggregate;
 when either limit is exceeded, report it and do not silently truncate. These
-source limits preserve the 8 MiB worker-frame compatibility established by Goal
-05.
+source limits bound user content before provider framing without introducing a
+process protocol or a second transport path.
 
 ## In scope
 
@@ -77,8 +77,10 @@ source limits preserve the 8 MiB worker-frame compatibility established by Goal
   range or line reference. Document-wide findings must say that they are
   document-wide rather than inventing a line.
 - Explicit labels separating source statements from model inferences.
-- Use Goal 05A's credential, endpoint-identity, consent, and outbound-scope
-  boundary. Request inspection must prove that the displayed outbound inventory
+- Use the existing in-process provider boundary retained by Goal 05 together
+  with Goal 05A's credential, endpoint-identity, consent, and outbound-scope
+  boundary. Do not introduce a model worker, second transport path, or process
+  protocol. Request inspection must prove that the displayed outbound inventory
   exactly equals the user-content bytes provided to the adapter, excluding
   documented protocol framing. Review must show whether it is sending a
   selection, whole document, or Agent Skill package; selection-only analysis
@@ -108,7 +110,7 @@ source limits preserve the 8 MiB worker-frame compatibility established by Goal
 - Running the reviewed prompt, comparing model outputs, or acting as an agent.
 - A generic chat transcript, prompt marketplace, template library, numerical
   quality score, or hidden model memory.
-- Adding a second transport architecture if Goal 05 was correctly skipped.
+- Adding a second transport architecture or reopening Goal 05's no-go decision.
 
 ## Evaluation standard
 
