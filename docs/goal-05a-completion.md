@@ -1,7 +1,7 @@
 # Goal 05A Completion Report
 
 **Date:** 2026-09-06
-**Goal:** [Goal 05A](goals/05a-protect-model-credentials-and-request-privacy.md) -
+**Goal:** [Goal 05A](goals/archive/05a-protect-model-credentials-and-request-privacy.md) -
 Protect model credentials and request privacy.
 **Status:** COMPLETE.
 
