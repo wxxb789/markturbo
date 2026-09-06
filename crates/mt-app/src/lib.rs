@@ -21,10 +21,12 @@
 
 pub mod app_paths;
 pub mod assets;
+pub mod credentials;
 pub mod fs;
 pub mod i18n;
 pub mod lifecycle;
 pub mod metrics;
+pub mod model;
 pub mod recovery;
 pub mod renderer;
 pub mod settings;

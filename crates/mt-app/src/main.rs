@@ -48,9 +48,12 @@ OPTIONS:
     -V, --version    Print the version
 
 ENVIRONMENT:
-    ANTHROPIC_API_KEY           Anthropic key, if not set in Settings
-    OPENAI_API_KEY              OpenAI key, if not set in Settings
-    MARKTURBO_TRANSLATE_MODEL   Model id, if not set in Settings
+    ANTHROPIC_API_KEY           Anthropic key for its default endpoint, or an
+                                explicitly authorized custom endpoint
+    OPENAI_API_KEY              OpenAI key for its default endpoint, or an
+                                explicitly authorized custom endpoint
+    MARKTURBO_MODEL             Model id, if not set in Settings
+    MARKTURBO_TRANSLATE_MODEL   Legacy model-id fallback
     MT_MATH_FONT_DIR            Optional complete KaTeX font override;
                                 otherwise embedded fonts are used
     MARKTURBO_DATA_DIR          Override the platform runtime-data directory
@@ -64,6 +67,13 @@ fn open_log_file(path: &Path) -> Option<File> {
 }
 
 fn init_logging() {
+    // genai traces complete provider response bodies. On Linux, tracing's
+    // optional `log` bridge is enabled transitively by the UI stack, so an
+    // absent subscriber would forward those events to env_logger when
+    // RUST_LOG=trace. Claim the dispatcher first and discard dependency traces.
+    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::new())
+        .expect("tracing privacy guard must initialize before any subscriber");
+
     let log_path = mt_app::app_paths::log_path();
     let file = log_path.as_deref().and_then(open_log_file);
     let active_path = file.as_ref().and(log_path);
@@ -295,6 +305,26 @@ mod tests {
         assert!(
             logging < arguments,
             "logging starts before argument handling"
+        );
+    }
+
+    #[test]
+    fn tracing_cannot_bridge_provider_response_bodies_into_application_logs() {
+        let source = include_str!("main.rs");
+        let test_module = source
+            .find("\n#[cfg(test)]")
+            .expect("the test module marker");
+        let source = &source[..test_module];
+        let privacy_guard = source
+            .find("tracing::subscriber::NoSubscriber::new()")
+            .expect("the tracing privacy guard");
+        let logger = source
+            .find("env_logger::builder()")
+            .expect("application logger initialization");
+
+        assert!(
+            privacy_guard < logger,
+            "tracing's optional log bridge is disabled before env_logger starts"
         );
     }
 

@@ -8,6 +8,7 @@ use mt_doc::DocType;
 pub mod document;
 pub mod explorer;
 pub mod harness;
+mod model_settings;
 pub mod search;
 pub mod settings_page;
 pub mod tabs;
