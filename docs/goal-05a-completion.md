@@ -33,8 +33,10 @@ Protect model credentials and request privacy.
 - Every Translation request freezes its provider inputs before disclosure. Consent is
   one-use and bound to the Translation operation, exact endpoint identity, and exact
   selection, block, or document scope. A changed document invalidates pending consent.
-- Remote endpoints require HTTPS. Verified loopback HTTP is disclosed as unencrypted
-  and bypasses proxies. Redirects are disabled, so credentials and content cannot
+- Remote endpoints require HTTPS. Only literal loopback IP addresses qualify as
+  verified loopback; their HTTP transport is disclosed as unencrypted and bypasses
+  proxies. Hostnames such as `localhost` remain remote, require HTTPS, and may use the
+  configured system proxy. Redirects are disabled, so credentials and content cannot
   follow a redirect to another identity.
 - Errors and debug output are content-free. Credential entry stays masked and is never
   prefilled after storage. The credential test sends only a fixed synthetic payload.
@@ -62,7 +64,7 @@ Protect model credentials and request privacy.
 | Replace/delete affect only one identity | `credentials::tests::replacing_one_identity_leaves_every_other_identity_untouched`; `deleting_one_identity_leaves_every_other_identity_untouched` |
 | Failed write compensation remains fail-closed | `credentials::tests::persistent_success_requires_a_verified_read_back`; `failed_compensation_quarantines_an_unverified_value_across_restart`; `replacing_a_quarantined_target_never_clears_its_existing_marker_early`; `failed_write_to_a_quarantined_target_preserves_the_target_and_marker`; `failed_verification_of_a_quarantined_target_preserves_the_quarantine`; `a_pending_marker_double_check_blocks_a_cross_process_write_race`; `failed_persistent_delete_preserves_the_session_override`; the explicit bounded global-lock proof below |
 | Exact endpoint binding and WinCred case safety | `model::tests::port_path_and_wire_format_are_identity_boundaries`; `credential_targets_do_not_collide_under_windows_case_insensitive_matching`; `settings::tests::failed_persisted_update_keeps_the_published_security_state`; the explicit WinCred acceptance below |
-| Endpoint, proxy, TLS, and redirect policy | `model::tests::invalid_endpoint_matrix_fails_closed_without_echoing_input`; `loopback_http_is_local_unencrypted_and_proxy_free`; `i18n::tests::local_https_status_discloses_encryption_and_disabled_proxy_in_both_languages`; `translate::tests::transport_builder_disables_redirects_and_keeps_certificate_validation`; `transport_clients_are_reused_within_but_not_across_proxy_policies`; `redirect_is_not_followed_to_a_second_server` |
+| Endpoint, proxy, TLS, and redirect policy | `model::tests::invalid_endpoint_matrix_fails_closed_without_echoing_input`; `loopback_http_is_local_unencrypted_and_proxy_free`; `localhost_requires_https_and_remains_proxy_eligible`; `i18n::tests::local_https_status_discloses_encryption_and_disabled_proxy_in_both_languages`; `translate::tests::transport_builder_disables_redirects_and_keeps_certificate_validation`; `transport_clients_are_reused_within_but_not_across_proxy_policies`; `redirect_is_not_followed_to_a_second_server` |
 | Local-only operations send zero requests | `views::workspace::tests::opening_and_scanning_with_model_configured_sends_no_request`; existing local document, Skill discovery, and Effective Agent Context paths have no request authorization or transport entry point |
 | Displayed scope equals provider content | `translate::tests::bound_selection_disclosure_matches_the_exact_loopback_request_body` runs `TranslationRequest::prepare -> bind_request -> disclosure -> authorize -> execute` and compares the selection kind, disclosed byte count, and captured provider JSON while proving surrounding document text is absent |
 | Consent cancellation and material changes | `views::workspace::tests::cancelling_translation_consent_sends_no_request`; `changing_the_document_invalidates_pending_translation_consent`; `approving_translation_consent_sends_one_frozen_request`; model authorization mismatch tests |

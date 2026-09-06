@@ -555,10 +555,11 @@ and after reading a credential.
 
 Every endpoint is parsed before a request exists. Userinfo, query, and fragment
 components are rejected. Remote endpoints require HTTPS with normal certificate
-validation. Plain HTTP is limited to literal loopback addresses or `localhost`, is
-identified as unencrypted in the disclosure, and bypasses proxies. Redirects are
-disabled, so authentication and request content cannot follow a response to a
-different identity.
+validation. Plain HTTP is limited to literal loopback IP addresses, is identified as
+unencrypted in the disclosure, and bypasses proxies. Hostnames, including
+`localhost`, are remote identities that require HTTPS and remain eligible for the
+configured system proxy. Redirects are disabled, so authentication and request
+content cannot follow a response to a different identity.
 
 The UI prepares the immutable outbound content first, shows the operation, endpoint
 identity, local/remote and transport facts, and content scope, then consumes a

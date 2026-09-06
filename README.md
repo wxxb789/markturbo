@@ -154,8 +154,8 @@ a custom endpoint requires explicit authorization for that exact identity. With
 no credential anywhere, translation reports that it is unconfigured rather than
 pretending to run.
 
-A base URL must include the version segment — `http://localhost:11434/v1`, not
-`http://localhost:11434`. Only the leaf path is appended, so one without it
+A base URL must include the version segment — `http://127.0.0.1:11434/v1`, not
+`http://127.0.0.1:11434`. Only the leaf path is appended, so one without it
 reaches an endpoint that is not there.
 
 ## Settings

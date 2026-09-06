@@ -1095,6 +1095,8 @@ mod tests {
             EndpointIdentity::parse(Provider::OpenAiChat, Some("http://127.0.0.1:8080/v1/"))
                 .unwrap();
         let loopback_https =
+            EndpointIdentity::parse(Provider::OpenAiChat, Some("https://[::1]/v1/")).unwrap();
+        let localhost =
             EndpointIdentity::parse(Provider::OpenAiChat, Some("https://localhost/v1/")).unwrap();
         let remote =
             EndpointIdentity::parse(Provider::OpenAiChat, Some("https://gateway.example/v1/"))
@@ -1102,6 +1104,7 @@ mod tests {
 
         assert_eq!(proxy_policy(&loopback_http), ProxyPolicy::Disabled);
         assert_eq!(proxy_policy(&loopback_https), ProxyPolicy::Disabled);
+        assert_eq!(proxy_policy(&localhost), ProxyPolicy::System);
         assert_eq!(proxy_policy(&remote), ProxyPolicy::System);
     }
 

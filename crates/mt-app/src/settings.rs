@@ -246,7 +246,7 @@ pub struct AppSettings {
     /// Empty means the schema's own default. Setting it is what points the app
     /// at a self-hosted or proxied server — the wire format is the same, so an
     /// OpenAI-compatible endpoint needs nothing else beyond including the
-    /// version segment: `http://localhost:8000/v1`, not `http://localhost:8000`.
+    /// version segment: `http://127.0.0.1:8000/v1`, not `http://127.0.0.1:8000`.
     /// Only the leaf path is appended, so a base URL missing `/v1` reaches an
     /// endpoint that is not there.
     #[serde(alias = "translate-base-url")]

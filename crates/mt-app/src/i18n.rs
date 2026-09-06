@@ -766,7 +766,7 @@ fn english(key: Key) -> &'static str {
         Key::BaseUrlHelp => {
             "Leave empty for the provider default. Custom remote endpoints require HTTPS; HTTP \
              is allowed only for a verified loopback address and uses no proxy. Include the API \
-             base path, for example `http://localhost:11434/v1`."
+             base path, for example `http://127.0.0.1:11434/v1`."
         }
         Key::ModelHelp => {
             "Leave empty to use MARKTURBO_MODEL, then MARKTURBO_TRANSLATE_MODEL, then the provider default."
@@ -991,7 +991,7 @@ fn chinese(key: Key) -> Option<&'static str> {
         }
         Key::BaseUrlHelp => {
             "留空则使用服务商默认端点。自定义远程端点必须使用 HTTPS；HTTP 仅允许已验证的回环地址，\
-             且不使用代理。需包含 API 基础路径，例如 `http://localhost:11434/v1`。"
+             且不使用代理。需包含 API 基础路径，例如 `http://127.0.0.1:11434/v1`。"
         }
         Key::ModelHelp => {
             "留空时依次使用 MARKTURBO_MODEL、MARKTURBO_TRANSLATE_MODEL 和服务商默认模型。"
@@ -1381,7 +1381,7 @@ mod tests {
     fn local_https_status_discloses_encryption_and_disabled_proxy_in_both_languages() {
         let endpoint = EndpointIdentity::parse(
             crate::model::Provider::OpenAiChat,
-            Some("https://localhost:8443/v1/"),
+            Some("https://127.0.0.1:8443/v1/"),
         )
         .unwrap();
 

@@ -241,7 +241,7 @@ impl EndpointIdentity {
             _ => return Err(EndpointIdentityError::UnsupportedScheme),
         };
         let (host, loopback) = match parsed.host() {
-            Some(Host::Domain(host)) => (host.to_owned(), host.eq_ignore_ascii_case("localhost")),
+            Some(Host::Domain(host)) => (host.to_owned(), false),
             Some(Host::Ipv4(host)) => (host.to_string(), host.is_loopback()),
             Some(Host::Ipv6(host)) => (host.to_string(), host.is_loopback()),
             None => return Err(EndpointIdentityError::MissingHost),
@@ -1235,6 +1235,10 @@ mod tests {
                 EndpointIdentityError::InsecureRemoteTransport,
             ),
             (
+                "http://localhost/v1/",
+                EndpointIdentityError::InsecureRemoteTransport,
+            ),
+            (
                 "http://0.0.0.0/v1/",
                 EndpointIdentityError::InsecureRemoteTransport,
             ),
@@ -1268,7 +1272,7 @@ mod tests {
             "",
             "https://example.com/v1/",
             "https://example.com/path@version",
-            "http://localhost:8080/v1/",
+            "http://127.0.0.1:8080/v1/",
         ] {
             assert!(endpoint_input_is_safe_to_persist(raw), "rejected {raw:?}");
         }
@@ -1277,7 +1281,6 @@ mod tests {
     #[test]
     fn loopback_http_is_local_unencrypted_and_proxy_free() {
         for raw in [
-            "http://localhost/v1",
             "http://127.0.0.1:8080/v1/",
             "http://127.1/v1/",
             "http://[::1]/v1/",
@@ -1293,7 +1296,7 @@ mod tests {
             assert!(!endpoint.transport().uses_proxy());
         }
 
-        let secure_local = endpoint(Provider::OpenAiChat, "https://localhost/v1/");
+        let secure_local = endpoint(Provider::OpenAiChat, "https://127.0.0.1/v1/");
         assert_eq!(secure_local.location(), EndpointLocation::Local);
         assert!(secure_local.transport().is_encrypted());
         assert_eq!(secure_local.transport().proxy(), ProxyDisclosure::Disabled);
@@ -1305,6 +1308,26 @@ mod tests {
             remote.transport().proxy(),
             ProxyDisclosure::MayUseConfiguredProxy
         );
+    }
+
+    #[test]
+    fn localhost_requires_https_and_remains_proxy_eligible() {
+        let error =
+            EndpointIdentity::parse(Provider::OpenAiChat, Some("http://localhost:8080/v1/"))
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            EndpointIdentityError::InsecureRemoteTransport
+        ));
+
+        let endpoint = endpoint(Provider::OpenAiChat, "https://localhost:8443/v1/");
+        assert_eq!(endpoint.location(), EndpointLocation::Remote);
+        assert!(endpoint.transport().is_encrypted());
+        assert_eq!(
+            endpoint.transport().proxy(),
+            ProxyDisclosure::MayUseConfiguredProxy
+        );
+        assert!(endpoint.transport().uses_proxy());
     }
 
     #[test]
