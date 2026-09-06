@@ -9,6 +9,8 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
+from . import privacy
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CARGO_FALLBACK = Path.home() / ".cargo" / "bin" / (
@@ -24,6 +26,7 @@ class CheckFailure(RuntimeError):
 # have unit tests here but their real UI scenarios need explicit `mt.py accept`.
 TOOLING_TESTS = (
     "scripts.tests.test_checks",
+    "scripts.tests.test_privacy",
     "scripts.tests.test_cli",
     "scripts.tests.test_icons",
     "scripts.tests.test_workflows",
@@ -106,6 +109,10 @@ def full(*, base: str | None = None, head: str | None = None) -> None:
     binary = ROOT / "target" / "release" / name
     if not binary.is_file():
         raise CheckFailure(f"release build completed without {binary}")
+    try:
+        privacy.scan(ROOT, binary)
+    except privacy.PrivacyScanError as error:
+        raise CheckFailure(str(error)) from None
 
 
 CHECKS = {

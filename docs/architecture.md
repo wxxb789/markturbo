@@ -516,6 +516,63 @@ than an oversight.
 nobody was listening. A single `observe_global` subscription is the backstop for
 the writers that are not the settings page.
 
+### Model credentials and outbound requests
+
+Model configuration is reusable application state, not Translation state. The
+settings file may contain the provider wire format, model name, base URL, and the
+non-secret identity of a custom endpoint authorized to receive a vendor
+environment credential. It never contains a newly entered credential. A legacy
+`translate-api-key` value remains recoverable but inactive until the user approves
+migration; migration writes and reads back the secure copy before removing the
+plaintext field from disk. Settings writes are serialized across application
+processes and reconcile that legacy field against the latest disk snapshot, so a
+process opened before migration cannot restore the removed plaintext later. A
+security-sensitive authorization is published to UI state only after its updated
+settings snapshot reaches disk.
+
+Model selection follows reusable precedence: the model saved in Settings,
+`MARKTURBO_MODEL`, the legacy `MARKTURBO_TRANSLATE_MODEL`, then the selected wire
+format's default. These values are non-secret and do not affect credential or
+consent identity.
+
+On Windows, persistent model credentials live in Windows Credential Manager. A
+credential target includes the application, provider wire format, scheme,
+normalized host, effective port, and normalized API base path. Session credentials
+remain only in memory. Environment credentials apply automatically only to their
+vendor-default endpoint; a custom endpoint needs an explicit authorization bound to
+its exact credential target, so changing host, port, scheme, path, or wire format
+invalidates that authorization.
+
+Windows Credential Manager compares target names case-insensitively, while an API
+path may be case-sensitive. The target therefore carries a lowercase SHA-256 digest
+of the complete exact identity, including path case, instead of relying on its
+human-readable components to remain distinct. A non-secret pending marker in the
+same secure store keeps an indeterminate write quarantined across restarts until
+rollback is verified or the user explicitly deletes or successfully replaces that
+target. A global named Windows mutex serializes these transactions across
+application processes and logon sessions, and readers check the marker both before
+and after reading a credential.
+
+Every endpoint is parsed before a request exists. Userinfo, query, and fragment
+components are rejected. Remote endpoints require HTTPS with normal certificate
+validation. Plain HTTP is limited to literal loopback addresses or `localhost`, is
+identified as unencrypted in the disclosure, and bypasses proxies. Redirects are
+disabled, so authentication and request content cannot follow a response to a
+different identity.
+
+The UI prepares the immutable outbound content first, shows the operation, endpoint
+identity, local/remote and transport facts, and content scope, then consumes a
+one-use authorization before transport can run. Opening, editing, rendering,
+searching, Skill discovery, context resolution, and recovery create no such
+authorization and send no model request. Transport failures are converted to
+content-free diagnostics; credentials, request bodies, and provider response bodies
+are not formatted into application errors or logs. The executable installs a no-op
+tracing subscriber before `env_logger`: this disables tracing's optional log bridge,
+which Linux UI dependencies enable and which would otherwise forward genai's raw
+response-body trace events under `RUST_LOG=trace`. Agent Skill packages cross a
+production adapter seam only as the frozen entries that produced the displayed path,
+byte-size, and inclusion-reason inventory.
+
 A no-argument launch deliberately shows the Welcome state; `markturbo .` is the
 explicit terminal form for opening the current directory, and any other path
 argument still bypasses Welcome. **Don't show this again** persists one scalar

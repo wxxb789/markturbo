@@ -1,0 +1,1609 @@
+//! Reusable model-provider and outbound-request privacy contracts.
+//!
+//! This module owns only non-secret configuration and request authorization.
+//! Credential storage, filesystem packaging, provider transport, and Review
+//! semantics remain separate boundaries.
+
+use std::fmt;
+use std::sync::Arc;
+
+use sha2::{Digest as _, Sha256};
+use url::{Host, Url};
+
+pub const MODEL_CREDENTIAL_APPLICATION: &str = "io.github.wxxb789.markturbo";
+
+/// A provider wire format, independent of the endpoint vendor or model name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provider {
+    AnthropicMessages,
+    OpenAiChat,
+    OpenAiResponses,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 3] = [
+        Provider::AnthropicMessages,
+        Provider::OpenAiChat,
+        Provider::OpenAiResponses,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Provider::AnthropicMessages => "anthropic",
+            Provider::OpenAiChat => "openai-chat",
+            Provider::OpenAiResponses => "openai-responses",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|provider| provider.key() == key)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Provider::AnthropicMessages => "Anthropic Messages",
+            Provider::OpenAiChat => "OpenAI Chat Completions",
+            Provider::OpenAiResponses => "OpenAI Responses",
+        }
+    }
+
+    pub const fn default_base_url(self) -> &'static str {
+        match self {
+            Provider::AnthropicMessages => "https://api.anthropic.com/v1/",
+            Provider::OpenAiChat | Provider::OpenAiResponses => "https://api.openai.com/v1/",
+        }
+    }
+
+    pub const fn default_model(self) -> &'static str {
+        match self {
+            Provider::AnthropicMessages => "claude-sonnet-5",
+            Provider::OpenAiChat | Provider::OpenAiResponses => "gpt-5",
+        }
+    }
+
+    pub const fn credential_environment_variable(self) -> &'static str {
+        match self {
+            Provider::AnthropicMessages => "ANTHROPIC_API_KEY",
+            Provider::OpenAiChat | Provider::OpenAiResponses => "OPENAI_API_KEY",
+        }
+    }
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Reusable, non-secret model configuration shared by model operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelConfig {
+    provider: Provider,
+    model: String,
+    endpoint: EndpointIdentity,
+}
+
+impl ModelConfig {
+    pub fn new(
+        provider: Provider,
+        model: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<Self, EndpointIdentityError> {
+        Ok(Self {
+            provider,
+            model: model
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .unwrap_or_else(|| provider.default_model())
+                .to_owned(),
+            endpoint: EndpointIdentity::parse(provider, base_url)?,
+        })
+    }
+
+    pub const fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn endpoint(&self) -> &EndpointIdentity {
+        &self.endpoint
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointScheme {
+    Http,
+    Https,
+}
+
+impl EndpointScheme {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EndpointScheme::Http => "http",
+            EndpointScheme::Https => "https",
+        }
+    }
+
+    const fn default_port(self) -> u16 {
+        match self {
+            EndpointScheme::Http => 80,
+            EndpointScheme::Https => 443,
+        }
+    }
+}
+
+impl fmt::Display for EndpointScheme {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointLocation {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportEncryption {
+    Encrypted,
+    Unencrypted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProxyDisclosure {
+    MayUseConfiguredProxy,
+    Disabled,
+}
+
+/// User-visible transport facts derived from the validated endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TransportDisclosure {
+    encryption: TransportEncryption,
+    proxy: ProxyDisclosure,
+}
+
+impl TransportDisclosure {
+    const HTTPS: Self = Self {
+        encryption: TransportEncryption::Encrypted,
+        proxy: ProxyDisclosure::MayUseConfiguredProxy,
+    };
+
+    const LOCAL_HTTPS: Self = Self {
+        encryption: TransportEncryption::Encrypted,
+        proxy: ProxyDisclosure::Disabled,
+    };
+
+    const LOOPBACK_HTTP: Self = Self {
+        encryption: TransportEncryption::Unencrypted,
+        proxy: ProxyDisclosure::Disabled,
+    };
+
+    pub const fn encryption(self) -> TransportEncryption {
+        self.encryption
+    }
+
+    pub const fn proxy(self) -> ProxyDisclosure {
+        self.proxy
+    }
+
+    pub const fn is_encrypted(self) -> bool {
+        matches!(self.encryption, TransportEncryption::Encrypted)
+    }
+
+    pub const fn uses_proxy(self) -> bool {
+        matches!(self.proxy, ProxyDisclosure::MayUseConfiguredProxy)
+    }
+}
+
+/// Canonical endpoint identity used by disclosure, routing, and credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EndpointIdentity {
+    application: &'static str,
+    provider: Provider,
+    scheme: EndpointScheme,
+    host: String,
+    effective_port: u16,
+    api_base_path: String,
+    base_url: String,
+    location: EndpointLocation,
+    transport: TransportDisclosure,
+}
+
+impl EndpointIdentity {
+    /// Parse a custom base URL, or the provider default when absent or blank.
+    pub fn parse(provider: Provider, raw: Option<&str>) -> Result<Self, EndpointIdentityError> {
+        let candidate = raw
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .unwrap_or(provider.default_base_url());
+        let mut parsed = Url::parse(candidate).map_err(EndpointIdentityError::InvalidUrl)?;
+
+        if has_explicit_userinfo(candidate)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(EndpointIdentityError::UserInfoNotAllowed);
+        }
+        if parsed.query().is_some() {
+            return Err(EndpointIdentityError::QueryNotAllowed);
+        }
+        if parsed.fragment().is_some() {
+            return Err(EndpointIdentityError::FragmentNotAllowed);
+        }
+
+        let scheme = match parsed.scheme() {
+            "http" => EndpointScheme::Http,
+            "https" => EndpointScheme::Https,
+            _ => return Err(EndpointIdentityError::UnsupportedScheme),
+        };
+        let (host, loopback) = match parsed.host() {
+            Some(Host::Domain(host)) => (host.to_owned(), host.eq_ignore_ascii_case("localhost")),
+            Some(Host::Ipv4(host)) => (host.to_string(), host.is_loopback()),
+            Some(Host::Ipv6(host)) => (host.to_string(), host.is_loopback()),
+            None => return Err(EndpointIdentityError::MissingHost),
+        };
+
+        if scheme == EndpointScheme::Http && !loopback {
+            return Err(EndpointIdentityError::InsecureRemoteTransport);
+        }
+
+        let effective_port = parsed
+            .port_or_known_default()
+            .expect("http and https always have a known default port");
+        if effective_port == scheme.default_port() {
+            parsed
+                .set_port(None)
+                .expect("an http or https URL can always clear its port");
+        }
+
+        let mut api_base_path = parsed.path().to_owned();
+        if !api_base_path.ends_with('/') {
+            api_base_path.push('/');
+            parsed.set_path(&api_base_path);
+            api_base_path = parsed.path().to_owned();
+        }
+
+        let location = if loopback {
+            EndpointLocation::Local
+        } else {
+            EndpointLocation::Remote
+        };
+        let transport = match (scheme, location) {
+            (EndpointScheme::Http, EndpointLocation::Local) => TransportDisclosure::LOOPBACK_HTTP,
+            (EndpointScheme::Https, EndpointLocation::Local) => TransportDisclosure::LOCAL_HTTPS,
+            (EndpointScheme::Https, EndpointLocation::Remote) => TransportDisclosure::HTTPS,
+            (EndpointScheme::Http, EndpointLocation::Remote) => {
+                unreachable!("remote http endpoints were rejected above")
+            }
+        };
+
+        Ok(Self {
+            application: MODEL_CREDENTIAL_APPLICATION,
+            provider,
+            scheme,
+            host,
+            effective_port,
+            api_base_path,
+            base_url: parsed.to_string(),
+            location,
+            transport,
+        })
+    }
+
+    pub const fn application(&self) -> &'static str {
+        self.application
+    }
+
+    pub const fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub const fn scheme(&self) -> EndpointScheme {
+        self.scheme
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub const fn effective_port(&self) -> u16 {
+        self.effective_port
+    }
+
+    pub fn api_base_path(&self) -> &str {
+        &self.api_base_path
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Canonical endpoint identity with the effective port made explicit.
+    pub fn normalized_identity(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!(
+            "{}://{}:{}{}",
+            self.scheme, host, self.effective_port, self.api_base_path
+        )
+    }
+
+    pub const fn location(&self) -> EndpointLocation {
+        self.location
+    }
+
+    pub const fn transport(&self) -> TransportDisclosure {
+        self.transport
+    }
+
+    /// Whether this identity may use the provider's ambient vendor credential.
+    pub fn is_vendor_default(&self) -> bool {
+        Self::parse(self.provider, None).is_ok_and(|default| default == *self)
+    }
+
+    /// Stable, non-secret Windows Credential Manager target identity.
+    pub fn credential_target(&self) -> CredentialTarget {
+        let mut identity = Sha256::new();
+        let port = self.effective_port.to_string();
+        for component in [
+            self.application,
+            self.provider.key(),
+            self.scheme.as_str(),
+            self.host.as_str(),
+            port.as_str(),
+            self.api_base_path.as_str(),
+        ] {
+            identity.update(component.as_bytes());
+            identity.update([0]);
+        }
+        let identity = identity.finalize();
+        CredentialTarget(format!(
+            "{}:model-credential:v2|wire={}|host={}|identity-sha256={identity:x}",
+            self.application,
+            self.provider.key(),
+            self.host,
+        ))
+    }
+}
+
+fn has_explicit_userinfo(raw: &str) -> bool {
+    let Some((_, after_scheme)) = raw.split_once("://") else {
+        return false;
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    after_scheme[..authority_end].contains('@')
+}
+
+/// Whether an endpoint value is complete and safe to persist.
+pub fn endpoint_input_is_safe_to_persist(raw: &str) -> bool {
+    raw.trim().is_empty() || EndpointIdentity::parse(Provider::OpenAiChat, Some(raw)).is_ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointIdentityError {
+    InvalidUrl(url::ParseError),
+    UnsupportedScheme,
+    MissingHost,
+    UserInfoNotAllowed,
+    QueryNotAllowed,
+    FragmentNotAllowed,
+    InsecureRemoteTransport,
+}
+
+impl fmt::Display for EndpointIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EndpointIdentityError::InvalidUrl(error) => {
+                write!(formatter, "invalid endpoint URL: {error}")
+            }
+            EndpointIdentityError::UnsupportedScheme => {
+                formatter.write_str("model endpoints must use http or https")
+            }
+            EndpointIdentityError::MissingHost => {
+                formatter.write_str("model endpoint is missing a host")
+            }
+            EndpointIdentityError::UserInfoNotAllowed => {
+                formatter.write_str("model endpoint userinfo is not allowed")
+            }
+            EndpointIdentityError::QueryNotAllowed => {
+                formatter.write_str("model endpoint query parameters are not allowed")
+            }
+            EndpointIdentityError::FragmentNotAllowed => {
+                formatter.write_str("model endpoint fragments are not allowed")
+            }
+            EndpointIdentityError::InsecureRemoteTransport => {
+                formatter.write_str("remote model endpoints must use https")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EndpointIdentityError {}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CredentialTarget(String);
+
+impl CredentialTarget {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CredentialTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CredentialTarget")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl fmt::Display for CredentialTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelOperation {
+    Review,
+    Translation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutboundScopeKind {
+    Selection,
+    Block,
+    Document,
+    DocumentWithEffectiveAgentContext,
+    AgentSkillPackage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutboundScopeDetails {
+    Selection {
+        byte_size: u64,
+    },
+    Block {
+        byte_size: u64,
+    },
+    Document {
+        byte_size: u64,
+    },
+    DocumentWithEffectiveAgentContext {
+        document_byte_size: u64,
+        sources: Vec<String>,
+    },
+    AgentSkillPackage {
+        inventory: AgentSkillInventory,
+    },
+}
+
+#[derive(Clone)]
+struct ScopeBinding(Arc<()>);
+
+impl PartialEq for ScopeBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ScopeBinding {}
+
+/// Exact displayed content scope for one disclosure/request flow.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OutboundScope {
+    binding: ScopeBinding,
+    details: OutboundScopeDetails,
+}
+
+impl OutboundScope {
+    pub fn selection(byte_size: u64) -> Self {
+        Self::new(OutboundScopeDetails::Selection { byte_size })
+    }
+
+    pub fn document(byte_size: u64) -> Self {
+        Self::new(OutboundScopeDetails::Document { byte_size })
+    }
+
+    pub fn block(byte_size: u64) -> Self {
+        Self::new(OutboundScopeDetails::Block { byte_size })
+    }
+
+    pub fn document_with_effective_agent_context<I, S>(
+        document_byte_size: u64,
+        sources: I,
+    ) -> Result<Self, OutboundScopeError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut sources = sources
+            .into_iter()
+            .map(Into::into)
+            .map(|source: String| source.trim().to_owned())
+            .collect::<Vec<_>>();
+        if sources.iter().any(String::is_empty) {
+            return Err(OutboundScopeError::EmptyEffectiveContextSource);
+        }
+        sources.sort();
+        sources.dedup();
+        if sources.is_empty() {
+            return Err(OutboundScopeError::MissingEffectiveContextSources);
+        }
+        Ok(Self::new(
+            OutboundScopeDetails::DocumentWithEffectiveAgentContext {
+                document_byte_size,
+                sources,
+            },
+        ))
+    }
+
+    fn agent_skill_package(inventory: AgentSkillInventory) -> Self {
+        Self::new(OutboundScopeDetails::AgentSkillPackage { inventory })
+    }
+
+    fn new(details: OutboundScopeDetails) -> Self {
+        Self {
+            binding: ScopeBinding(Arc::new(())),
+            details,
+        }
+    }
+
+    pub const fn kind(&self) -> OutboundScopeKind {
+        match self.details {
+            OutboundScopeDetails::Selection { .. } => OutboundScopeKind::Selection,
+            OutboundScopeDetails::Block { .. } => OutboundScopeKind::Block,
+            OutboundScopeDetails::Document { .. } => OutboundScopeKind::Document,
+            OutboundScopeDetails::DocumentWithEffectiveAgentContext { .. } => {
+                OutboundScopeKind::DocumentWithEffectiveAgentContext
+            }
+            OutboundScopeDetails::AgentSkillPackage { .. } => OutboundScopeKind::AgentSkillPackage,
+        }
+    }
+
+    pub const fn primary_content_byte_size(&self) -> u64 {
+        match &self.details {
+            OutboundScopeDetails::Selection { byte_size }
+            | OutboundScopeDetails::Block { byte_size }
+            | OutboundScopeDetails::Document { byte_size } => *byte_size,
+            OutboundScopeDetails::DocumentWithEffectiveAgentContext {
+                document_byte_size, ..
+            } => *document_byte_size,
+            OutboundScopeDetails::AgentSkillPackage { inventory } => inventory.total_byte_size(),
+        }
+    }
+
+    pub fn effective_context_sources(&self) -> &[String] {
+        match &self.details {
+            OutboundScopeDetails::DocumentWithEffectiveAgentContext { sources, .. } => sources,
+            _ => &[],
+        }
+    }
+
+    pub fn agent_skill_inventory(&self) -> Option<&AgentSkillInventory> {
+        match &self.details {
+            OutboundScopeDetails::AgentSkillPackage { inventory } => Some(inventory),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for OutboundScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OutboundScope")
+            .field("details", &self.details)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundScopeError {
+    MissingEffectiveContextSources,
+    EmptyEffectiveContextSource,
+}
+
+impl fmt::Display for OutboundScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OutboundScopeError::MissingEffectiveContextSources => {
+                formatter.write_str("effective-context scope must name at least one source")
+            }
+            OutboundScopeError::EmptyEffectiveContextSource => {
+                formatter.write_str("effective-context source names cannot be empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OutboundScopeError {}
+
+/// One file disclosed as part of an outbound Agent Skill package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillFile {
+    normalized_relative_path: String,
+    byte_size: u64,
+    inclusion_reason: String,
+}
+
+impl AgentSkillFile {
+    fn new(
+        relative_path: impl AsRef<str>,
+        byte_size: u64,
+        inclusion_reason: impl Into<String>,
+    ) -> Result<Self, AgentSkillInventoryError> {
+        let inclusion_reason = inclusion_reason.into().trim().to_owned();
+        if inclusion_reason.is_empty() {
+            return Err(AgentSkillInventoryError::EmptyInclusionReason);
+        }
+        Ok(Self {
+            normalized_relative_path: normalize_relative_path(relative_path.as_ref())?,
+            byte_size,
+            inclusion_reason,
+        })
+    }
+
+    pub fn normalized_relative_path(&self) -> &str {
+        &self.normalized_relative_path
+    }
+
+    pub const fn byte_size(&self) -> u64 {
+        self.byte_size
+    }
+
+    pub fn inclusion_reason(&self) -> &str {
+        &self.inclusion_reason
+    }
+}
+
+/// The exact file inventory disclosed for an Agent Skill request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillInventory {
+    files: Vec<AgentSkillFile>,
+    omissions: Vec<AgentSkillOmission>,
+    total_byte_size: u64,
+}
+
+impl AgentSkillInventory {
+    fn new(
+        mut files: Vec<AgentSkillFile>,
+        mut omissions: Vec<AgentSkillOmission>,
+    ) -> Result<Self, AgentSkillInventoryError> {
+        files.sort_by(|left, right| {
+            left.normalized_relative_path
+                .cmp(&right.normalized_relative_path)
+        });
+        omissions.sort_by(|left, right| {
+            left.normalized_relative_path
+                .cmp(&right.normalized_relative_path)
+        });
+        if files
+            .windows(2)
+            .any(|files| files[0].normalized_relative_path == files[1].normalized_relative_path)
+            || omissions.windows(2).any(|omissions| {
+                omissions[0].normalized_relative_path == omissions[1].normalized_relative_path
+            })
+            || files.iter().any(|file| {
+                omissions
+                    .binary_search_by(|omission| {
+                        omission
+                            .normalized_relative_path
+                            .cmp(&file.normalized_relative_path)
+                    })
+                    .is_ok()
+            })
+        {
+            return Err(AgentSkillInventoryError::DuplicatePath);
+        }
+        let total_byte_size = files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.byte_size)
+                .ok_or(AgentSkillInventoryError::ByteSizeOverflow)
+        })?;
+        Ok(Self {
+            files,
+            omissions,
+            total_byte_size,
+        })
+    }
+
+    pub fn files(&self) -> &[AgentSkillFile] {
+        &self.files
+    }
+
+    pub const fn total_byte_size(&self) -> u64 {
+        self.total_byte_size
+    }
+
+    pub fn omissions(&self) -> &[AgentSkillOmission] {
+        &self.omissions
+    }
+
+    pub const fn is_partial(&self) -> bool {
+        !self.omissions.is_empty()
+    }
+}
+
+/// One normally in-scope supporting file deliberately omitted from a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillOmission {
+    normalized_relative_path: String,
+    reason: String,
+}
+
+impl AgentSkillOmission {
+    pub fn new(
+        relative_path: impl AsRef<str>,
+        reason: impl Into<String>,
+    ) -> Result<Self, AgentSkillInventoryError> {
+        let reason = reason.into().trim().to_owned();
+        if reason.is_empty() {
+            return Err(AgentSkillInventoryError::EmptyOmissionReason);
+        }
+        Ok(Self {
+            normalized_relative_path: normalize_relative_path(relative_path.as_ref())?,
+            reason,
+        })
+    }
+
+    pub fn normalized_relative_path(&self) -> &str {
+        &self.normalized_relative_path
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// One immutable payload entry and the disclosure metadata derived from it.
+pub struct AgentSkillRequestEntry {
+    file: AgentSkillFile,
+    bytes: Box<[u8]>,
+}
+
+impl AgentSkillRequestEntry {
+    pub fn new(
+        relative_path: impl AsRef<str>,
+        inclusion_reason: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Result<Self, AgentSkillInventoryError> {
+        let bytes = bytes.into().into_boxed_slice();
+        let byte_size =
+            u64::try_from(bytes.len()).map_err(|_| AgentSkillInventoryError::ByteSizeOverflow)?;
+        Ok(Self {
+            file: AgentSkillFile::new(relative_path, byte_size, inclusion_reason)?,
+            bytes,
+        })
+    }
+
+    pub fn file(&self) -> &AgentSkillFile {
+        &self.file
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// The only Agent Skill payload view exposed to a provider adapter.
+pub struct AgentSkillProviderRequest<'a> {
+    entries: &'a [AgentSkillRequestEntry],
+}
+
+impl AgentSkillProviderRequest<'_> {
+    pub fn entries(&self) -> &[AgentSkillRequestEntry] {
+        self.entries
+    }
+}
+
+/// Provider boundary for an already frozen Agent Skill package.
+pub trait AgentSkillProviderAdapter {
+    type Error;
+
+    fn endpoint(&self) -> &EndpointIdentity;
+    fn send(&mut self, request: AgentSkillProviderRequest<'_>) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentSkillSendError<E> {
+    AuthorizationMismatch,
+    Adapter(E),
+}
+
+impl fmt::Debug for AgentSkillRequestEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentSkillRequestEntry")
+            .field("file", &self.file)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Exact Agent Skill payload paired with its non-divergent disclosure scope.
+pub struct AgentSkillRequest {
+    entries: Vec<AgentSkillRequestEntry>,
+    scope: OutboundScope,
+}
+
+impl AgentSkillRequest {
+    pub fn new(
+        mut entries: Vec<AgentSkillRequestEntry>,
+        omissions: Vec<AgentSkillOmission>,
+    ) -> Result<Self, AgentSkillInventoryError> {
+        entries.sort_by(|left, right| {
+            left.file
+                .normalized_relative_path
+                .cmp(&right.file.normalized_relative_path)
+        });
+        let inventory = AgentSkillInventory::new(
+            entries.iter().map(|entry| entry.file.clone()).collect(),
+            omissions,
+        )?;
+        Ok(Self {
+            entries,
+            scope: OutboundScope::agent_skill_package(inventory),
+        })
+    }
+
+    pub fn payload_entries(&self) -> &[AgentSkillRequestEntry] {
+        &self.entries
+    }
+
+    pub fn inventory(&self) -> &AgentSkillInventory {
+        self.scope
+            .agent_skill_inventory()
+            .expect("an Agent Skill request always owns an Agent Skill scope")
+    }
+
+    pub fn outbound_scope(&self) -> OutboundScope {
+        self.scope.clone()
+    }
+
+    pub fn disclosure(
+        &self,
+        operation: ModelOperation,
+        endpoint: EndpointIdentity,
+    ) -> ModelRequestDisclosure {
+        ModelRequestDisclosure::new(operation, endpoint, self.outbound_scope())
+    }
+
+    pub fn send_with<A>(
+        &self,
+        disclosure: &ModelRequestDisclosure,
+        authorization: RequestAuthorization,
+        adapter: &mut A,
+    ) -> Result<(), AgentSkillSendError<A::Error>>
+    where
+        A: AgentSkillProviderAdapter,
+    {
+        if disclosure.operation() != ModelOperation::Review
+            || disclosure.scope() != &self.scope
+            || adapter.endpoint() != disclosure.endpoint()
+            || !authorization.matches(disclosure)
+        {
+            return Err(AgentSkillSendError::AuthorizationMismatch);
+        }
+        adapter
+            .send(AgentSkillProviderRequest {
+                entries: &self.entries,
+            })
+            .map_err(AgentSkillSendError::Adapter)
+    }
+}
+
+impl fmt::Debug for AgentSkillRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentSkillRequest")
+            .field("inventory", self.inventory())
+            .finish_non_exhaustive()
+    }
+}
+
+fn normalize_relative_path(raw: &str) -> Result<String, AgentSkillInventoryError> {
+    if raw.is_empty() || raw.contains('\0') {
+        return Err(AgentSkillInventoryError::InvalidRelativePath);
+    }
+    let path = raw.replace('\\', "/");
+    if path.starts_with('/')
+        || path
+            .as_bytes()
+            .get(1)
+            .is_some_and(|character| *character == b':')
+    {
+        return Err(AgentSkillInventoryError::InvalidRelativePath);
+    }
+
+    let mut normalized = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return Err(AgentSkillInventoryError::InvalidRelativePath),
+            component => normalized.push(component),
+        }
+    }
+    if normalized.is_empty() {
+        return Err(AgentSkillInventoryError::InvalidRelativePath);
+    }
+    Ok(normalized.join("/"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSkillInventoryError {
+    InvalidRelativePath,
+    EmptyInclusionReason,
+    EmptyOmissionReason,
+    DuplicatePath,
+    ByteSizeOverflow,
+}
+
+impl fmt::Display for AgentSkillInventoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AgentSkillInventoryError::InvalidRelativePath => {
+                formatter.write_str("Agent Skill paths must be normalized relative paths")
+            }
+            AgentSkillInventoryError::EmptyInclusionReason => {
+                formatter.write_str("Agent Skill files require an inclusion reason")
+            }
+            AgentSkillInventoryError::EmptyOmissionReason => {
+                formatter.write_str("omitted Agent Skill files require a reason")
+            }
+            AgentSkillInventoryError::DuplicatePath => {
+                formatter.write_str("Agent Skill inventory paths must be unique")
+            }
+            AgentSkillInventoryError::ByteSizeOverflow => {
+                formatter.write_str("Agent Skill inventory byte size overflowed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentSkillInventoryError {}
+
+/// Everything the user must inspect before one model request can be authorized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRequestDisclosure {
+    operation: ModelOperation,
+    endpoint: EndpointIdentity,
+    scope: OutboundScope,
+}
+
+impl ModelRequestDisclosure {
+    pub const fn new(
+        operation: ModelOperation,
+        endpoint: EndpointIdentity,
+        scope: OutboundScope,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            scope,
+        }
+    }
+
+    pub const fn operation(&self) -> ModelOperation {
+        self.operation
+    }
+
+    pub fn endpoint(&self) -> &EndpointIdentity {
+        &self.endpoint
+    }
+
+    pub fn scope(&self) -> &OutboundScope {
+        &self.scope
+    }
+
+    pub const fn protocol_framing_crosses_boundary(&self) -> bool {
+        true
+    }
+
+    pub const fn disclosed_source_content_crosses_boundary(&self) -> bool {
+        true
+    }
+
+    fn binding(&self) -> RequestBinding {
+        RequestBinding {
+            operation: self.operation,
+            endpoint: self.endpoint.clone(),
+            scope: self.scope.binding.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentDecision {
+    Approve,
+    Cancel,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RequestBinding {
+    operation: ModelOperation,
+    endpoint: EndpointIdentity,
+    scope: ScopeBinding,
+}
+
+impl RequestBinding {
+    fn matches(&self, request: &ModelRequestDisclosure) -> bool {
+        self.operation == request.operation
+            && self.endpoint == request.endpoint
+            && self.scope == request.scope.binding
+    }
+}
+
+enum ConsentState {
+    Pending(RequestBinding),
+    Cancelled,
+    Consumed,
+}
+
+/// A non-cloneable, one-shot grant bound to one displayed request disclosure.
+pub struct ConsentCapability {
+    state: ConsentState,
+}
+
+impl ConsentCapability {
+    pub fn from_decision(disclosure: &ModelRequestDisclosure, decision: ConsentDecision) -> Self {
+        let state = match decision {
+            ConsentDecision::Approve => ConsentState::Pending(disclosure.binding()),
+            ConsentDecision::Cancel => ConsentState::Cancelled,
+        };
+        Self { state }
+    }
+
+    /// Authorize exactly one request. Any attempt consumes the capability.
+    pub fn authorize(
+        &mut self,
+        request: &ModelRequestDisclosure,
+    ) -> Result<RequestAuthorization, ConsentError> {
+        match std::mem::replace(&mut self.state, ConsentState::Consumed) {
+            ConsentState::Pending(binding) if binding.matches(request) => {
+                Ok(RequestAuthorization { binding })
+            }
+            ConsentState::Pending(_) => Err(ConsentError::Mismatch),
+            ConsentState::Cancelled => Err(ConsentError::Cancelled),
+            ConsentState::Consumed => Err(ConsentError::Consumed),
+        }
+    }
+}
+
+impl fmt::Debug for ConsentCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match self.state {
+            ConsentState::Pending(_) => "pending",
+            ConsentState::Cancelled => "cancelled",
+            ConsentState::Consumed => "consumed",
+        };
+        formatter
+            .debug_struct("ConsentCapability")
+            .field("state", &state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Proof that the matching disclosure was approved and consumed once.
+pub struct RequestAuthorization {
+    binding: RequestBinding,
+}
+
+impl RequestAuthorization {
+    pub fn matches(&self, request: &ModelRequestDisclosure) -> bool {
+        self.binding.matches(request)
+    }
+}
+
+impl fmt::Debug for RequestAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RequestAuthorization { .. }")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentError {
+    Cancelled,
+    Mismatch,
+    Consumed,
+}
+
+impl fmt::Display for ConsentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConsentError::Cancelled => formatter.write_str("model request consent was cancelled"),
+            ConsentError::Mismatch => {
+                formatter.write_str("model request does not match the approved disclosure")
+            }
+            ConsentError::Consumed => {
+                formatter.write_str("model request consent was already consumed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConsentError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(provider: Provider, raw: &str) -> EndpointIdentity {
+        EndpointIdentity::parse(provider, Some(raw)).unwrap()
+    }
+
+    #[test]
+    fn endpoint_normalization_collapses_equivalent_urls() {
+        let normalized = endpoint(
+            Provider::OpenAiResponses,
+            "HTTPS://API.OPENAI.COM:443/a/../v1",
+        );
+        let default = EndpointIdentity::parse(Provider::OpenAiResponses, None).unwrap();
+
+        assert_eq!(normalized, default);
+        assert_eq!(normalized.base_url(), "https://api.openai.com/v1/");
+        assert_eq!(normalized.host(), "api.openai.com");
+        assert_eq!(normalized.effective_port(), 443);
+        assert_eq!(normalized.api_base_path(), "/v1/");
+        assert_eq!(
+            normalized.normalized_identity(),
+            "https://api.openai.com:443/v1/"
+        );
+        assert_eq!(
+            EndpointIdentity::parse(Provider::OpenAiResponses, Some("   ")).unwrap(),
+            default
+        );
+    }
+
+    #[test]
+    fn port_path_and_wire_format_are_identity_boundaries() {
+        let chat = endpoint(Provider::OpenAiChat, "https://example.com/v1");
+        let responses = endpoint(Provider::OpenAiResponses, "https://example.com/v1/");
+        let other_port = endpoint(Provider::OpenAiChat, "https://example.com:8443/v1/");
+        let other_path = endpoint(Provider::OpenAiChat, "https://example.com/api/");
+
+        assert_ne!(chat, responses);
+        assert_ne!(chat, other_port);
+        assert_ne!(chat, other_path);
+
+        let target = other_port.credential_target().to_string();
+        for component in [
+            "markturbo",
+            "model-credential:v2",
+            "wire=openai-chat",
+            "host=example.com",
+            "identity-sha256=",
+        ] {
+            assert!(
+                target.contains(component),
+                "missing {component} in {target}"
+            );
+        }
+        assert_eq!(target, target.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn credential_targets_do_not_collide_under_windows_case_insensitive_matching() {
+        let upper = endpoint(Provider::OpenAiChat, "https://example.com/Foo/");
+        let lower = endpoint(Provider::OpenAiChat, "https://example.com/foo/");
+
+        assert_ne!(upper, lower);
+        assert_ne!(
+            upper.credential_target().as_str().to_ascii_lowercase(),
+            lower.credential_target().as_str().to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn invalid_endpoint_matrix_fails_closed_without_echoing_input() {
+        let cases = [
+            (
+                "not a url",
+                EndpointIdentityError::InvalidUrl(url::ParseError::RelativeUrlWithoutBase),
+            ),
+            (
+                "ftp://example.com/v1/",
+                EndpointIdentityError::UnsupportedScheme,
+            ),
+            (
+                "https://user:sentinel-secret@example.com/v1/",
+                EndpointIdentityError::UserInfoNotAllowed,
+            ),
+            (
+                "https://@example.com/v1/",
+                EndpointIdentityError::UserInfoNotAllowed,
+            ),
+            (
+                "https://example.com/v1/?mode=test",
+                EndpointIdentityError::QueryNotAllowed,
+            ),
+            (
+                "https://example.com/v1/#part",
+                EndpointIdentityError::FragmentNotAllowed,
+            ),
+            (
+                "http://example.com/v1/",
+                EndpointIdentityError::InsecureRemoteTransport,
+            ),
+            (
+                "http://0.0.0.0/v1/",
+                EndpointIdentityError::InsecureRemoteTransport,
+            ),
+            (
+                "http://[::]/v1/",
+                EndpointIdentityError::InsecureRemoteTransport,
+            ),
+        ];
+
+        for (raw, expected) in cases {
+            let error = EndpointIdentity::parse(Provider::OpenAiChat, Some(raw)).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+            assert!(!format!("{error:?} {error}").contains("sentinel-secret"));
+        }
+    }
+
+    #[test]
+    fn credential_shaped_endpoint_input_is_never_safe_to_persist() {
+        for raw in [
+            "https://user:sentinel-secret@example.com/v1/",
+            "https://example.com/v1/?api_key=sentinel-secret",
+            "https://example.com/v1/#sentinel-secret",
+            "user:sentinel-secret@example.com",
+        ] {
+            assert!(!endpoint_input_is_safe_to_persist(raw), "accepted {raw:?}");
+        }
+        for raw in [
+            "",
+            "https://example.com/v1/",
+            "https://example.com/path@version",
+            "http://localhost:8080/v1/",
+        ] {
+            assert!(endpoint_input_is_safe_to_persist(raw), "rejected {raw:?}");
+        }
+    }
+
+    #[test]
+    fn loopback_http_is_local_unencrypted_and_proxy_free() {
+        for raw in [
+            "http://localhost/v1",
+            "http://127.0.0.1:8080/v1/",
+            "http://127.1/v1/",
+            "http://[::1]/v1/",
+        ] {
+            let endpoint = endpoint(Provider::OpenAiChat, raw);
+            assert_eq!(endpoint.location(), EndpointLocation::Local);
+            assert_eq!(
+                endpoint.transport().encryption(),
+                TransportEncryption::Unencrypted
+            );
+            assert_eq!(endpoint.transport().proxy(), ProxyDisclosure::Disabled);
+            assert!(!endpoint.transport().is_encrypted());
+            assert!(!endpoint.transport().uses_proxy());
+        }
+
+        let secure_local = endpoint(Provider::OpenAiChat, "https://localhost/v1/");
+        assert_eq!(secure_local.location(), EndpointLocation::Local);
+        assert!(secure_local.transport().is_encrypted());
+        assert_eq!(secure_local.transport().proxy(), ProxyDisclosure::Disabled);
+        assert!(!secure_local.transport().uses_proxy());
+
+        let remote = endpoint(Provider::OpenAiChat, "https://example.com/v1/");
+        assert_eq!(remote.location(), EndpointLocation::Remote);
+        assert_eq!(
+            remote.transport().proxy(),
+            ProxyDisclosure::MayUseConfiguredProxy
+        );
+    }
+
+    #[test]
+    fn only_the_exact_vendor_default_accepts_ambient_vendor_credentials() {
+        for provider in Provider::ALL {
+            assert!(
+                EndpointIdentity::parse(provider, None)
+                    .unwrap()
+                    .is_vendor_default()
+            );
+        }
+        assert!(
+            !endpoint(Provider::OpenAiChat, "https://api.openai.com:8443/v1/").is_vendor_default()
+        );
+        assert!(
+            !endpoint(Provider::OpenAiResponses, "https://api.openai.com/custom/")
+                .is_vendor_default()
+        );
+        assert!(
+            !endpoint(Provider::AnthropicMessages, "https://proxy.example/v1/").is_vendor_default()
+        );
+    }
+
+    #[test]
+    fn model_config_uses_non_secret_provider_defaults() {
+        let config = ModelConfig::new(Provider::OpenAiResponses, Some("  "), None).unwrap();
+        assert_eq!(config.provider(), Provider::OpenAiResponses);
+        assert_eq!(config.model(), "gpt-5");
+        assert!(config.endpoint().is_vendor_default());
+        assert_eq!(
+            Provider::OpenAiResponses.credential_environment_variable(),
+            "OPENAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn consent_is_bound_to_operation_endpoint_and_scope_then_consumed() {
+        let default_endpoint = EndpointIdentity::parse(Provider::OpenAiResponses, None).unwrap();
+        let scope = OutboundScope::selection(8);
+        let disclosure = ModelRequestDisclosure::new(
+            ModelOperation::Review,
+            default_endpoint.clone(),
+            scope.clone(),
+        );
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+
+        let authorization = consent.authorize(&disclosure).unwrap();
+        assert!(authorization.matches(&disclosure));
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Consumed)
+        ));
+
+        let mismatches = [
+            ModelRequestDisclosure::new(
+                ModelOperation::Translation,
+                default_endpoint.clone(),
+                scope.clone(),
+            ),
+            ModelRequestDisclosure::new(
+                ModelOperation::Review,
+                endpoint(Provider::OpenAiResponses, "https://proxy.example/v1/"),
+                scope.clone(),
+            ),
+            ModelRequestDisclosure::new(
+                ModelOperation::Review,
+                default_endpoint,
+                OutboundScope::selection(8),
+            ),
+        ];
+        for mismatch in mismatches {
+            let mut consent =
+                ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+            assert!(matches!(
+                consent.authorize(&mismatch),
+                Err(ConsentError::Mismatch)
+            ));
+            assert!(matches!(
+                consent.authorize(&disclosure),
+                Err(ConsentError::Consumed)
+            ));
+        }
+    }
+
+    #[test]
+    fn cancellation_never_authorizes_a_request() {
+        let disclosure = ModelRequestDisclosure::new(
+            ModelOperation::Translation,
+            EndpointIdentity::parse(Provider::AnthropicMessages, None).unwrap(),
+            OutboundScope::document(42),
+        );
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Cancel);
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Cancelled)
+        ));
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Consumed)
+        ));
+    }
+
+    #[test]
+    fn effective_context_scope_names_sources_and_has_a_distinct_binding() {
+        let scope = OutboundScope::document_with_effective_agent_context(
+            100,
+            [
+                " workspace AGENTS.md ",
+                "global AGENTS.md",
+                "workspace AGENTS.md",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            scope.kind(),
+            OutboundScopeKind::DocumentWithEffectiveAgentContext
+        );
+        assert_eq!(
+            scope.effective_context_sources(),
+            &["global AGENTS.md", "workspace AGENTS.md"]
+        );
+        assert_ne!(scope, OutboundScope::document(100));
+    }
+
+    #[test]
+    fn agent_skill_request_keeps_disclosure_and_payload_exactly_aligned() {
+        struct RecordingProviderAdapter {
+            endpoint: EndpointIdentity,
+            entries: Vec<(String, u64, String, Vec<u8>)>,
+        }
+
+        impl AgentSkillProviderAdapter for RecordingProviderAdapter {
+            type Error = std::convert::Infallible;
+
+            fn endpoint(&self) -> &EndpointIdentity {
+                &self.endpoint
+            }
+
+            fn send(&mut self, request: AgentSkillProviderRequest<'_>) -> Result<(), Self::Error> {
+                self.entries = request
+                    .entries()
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.file().normalized_relative_path().to_owned(),
+                            entry.file().byte_size(),
+                            entry.file().inclusion_reason().to_owned(),
+                            entry.bytes().to_vec(),
+                        )
+                    })
+                    .collect();
+                Ok(())
+            }
+        }
+
+        let request = AgentSkillRequest::new(
+            vec![
+                AgentSkillRequestEntry::new(
+                    "references\\guide.md",
+                    "referenced support",
+                    b"guide bytes".to_vec(),
+                )
+                .unwrap(),
+                AgentSkillRequestEntry::new(
+                    ".//SKILL.md",
+                    "entrypoint",
+                    b"sentinel source body".to_vec(),
+                )
+                .unwrap(),
+            ],
+            vec![AgentSkillOmission::new("references/private.md", "excluded by policy").unwrap()],
+        )
+        .unwrap();
+        let inventory = request.inventory();
+        assert_eq!(
+            inventory.total_byte_size(),
+            u64::try_from(b"guide bytes".len() + b"sentinel source body".len()).unwrap()
+        );
+        assert!(inventory.is_partial());
+        assert_eq!(inventory.omissions().len(), 1);
+        assert_eq!(
+            inventory.omissions()[0].normalized_relative_path(),
+            "references/private.md"
+        );
+        assert_eq!(inventory.omissions()[0].reason(), "excluded by policy");
+        assert_eq!(inventory.files()[0].normalized_relative_path(), "SKILL.md");
+        assert_eq!(
+            inventory.files()[1].normalized_relative_path(),
+            "references/guide.md"
+        );
+        assert_eq!(
+            inventory.files()[1].inclusion_reason(),
+            "referenced support"
+        );
+
+        let payload = request.payload_entries();
+        assert_eq!(payload.len(), inventory.files().len());
+        for (entry, disclosed) in payload.iter().zip(inventory.files()) {
+            assert_eq!(entry.file(), disclosed);
+            assert_eq!(
+                u64::try_from(entry.bytes().len()).unwrap(),
+                disclosed.byte_size()
+            );
+        }
+        assert_eq!(payload[0].bytes(), b"sentinel source body");
+        assert_eq!(payload[1].bytes(), b"guide bytes");
+        assert!(
+            payload
+                .iter()
+                .all(|entry| entry.file().normalized_relative_path() != "private.txt")
+        );
+        assert!(!format!("{request:?}").contains("sentinel source body"));
+
+        let disclosure = request.disclosure(
+            ModelOperation::Review,
+            EndpointIdentity::parse(Provider::OpenAiResponses, None).unwrap(),
+        );
+        assert!(disclosure.protocol_framing_crosses_boundary());
+        assert!(disclosure.disclosed_source_content_crosses_boundary());
+        assert_eq!(disclosure.scope(), &request.outbound_scope());
+        let disclosed = disclosure.scope().agent_skill_inventory().unwrap();
+        assert!(disclosed.is_partial());
+        assert_eq!(disclosed.files().len(), 2);
+
+        let mut adapter = RecordingProviderAdapter {
+            endpoint: disclosure.endpoint().clone(),
+            entries: Vec::new(),
+        };
+        let mismatched_disclosure = ModelRequestDisclosure::new(
+            ModelOperation::Review,
+            disclosure.endpoint().clone(),
+            OutboundScope::document(1),
+        );
+        let mut mismatched_consent =
+            ConsentCapability::from_decision(&mismatched_disclosure, ConsentDecision::Approve);
+        let mismatched_authorization = mismatched_consent
+            .authorize(&mismatched_disclosure)
+            .unwrap();
+        assert_eq!(
+            request.send_with(&disclosure, mismatched_authorization, &mut adapter,),
+            Err(AgentSkillSendError::AuthorizationMismatch)
+        );
+        assert!(adapter.entries.is_empty());
+
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        let authorization = consent.authorize(&disclosure).unwrap();
+        let mut wrong_endpoint_adapter = RecordingProviderAdapter {
+            endpoint: EndpointIdentity::parse(Provider::AnthropicMessages, None).unwrap(),
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            request.send_with(&disclosure, authorization, &mut wrong_endpoint_adapter,),
+            Err(AgentSkillSendError::AuthorizationMismatch)
+        );
+        assert!(wrong_endpoint_adapter.entries.is_empty());
+
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        let authorization = consent.authorize(&disclosure).unwrap();
+        request
+            .send_with(&disclosure, authorization, &mut adapter)
+            .unwrap();
+        assert_eq!(adapter.entries.len(), disclosed.files().len());
+        for (sent, file) in adapter.entries.iter().zip(disclosed.files()) {
+            assert_eq!(sent.0, file.normalized_relative_path());
+            assert_eq!(sent.1, file.byte_size());
+            assert_eq!(sent.2, file.inclusion_reason());
+        }
+        assert_eq!(adapter.entries[0].3, b"sentinel source body");
+        assert_eq!(adapter.entries[1].3, b"guide bytes");
+        assert!(adapter.entries.iter().all(|entry| entry.0 != "private.txt"));
+    }
+
+    #[test]
+    fn agent_skill_request_rejects_unsafe_or_ambiguous_paths() {
+        for raw in ["", "../secret", "C:\\secret", "/absolute", "foo/../../bar"] {
+            assert!(matches!(
+                AgentSkillRequestEntry::new(raw, "support", vec![1]),
+                Err(AgentSkillInventoryError::InvalidRelativePath)
+            ));
+        }
+        let duplicate = AgentSkillRequest::new(
+            vec![
+                AgentSkillRequestEntry::new("./references/guide.md", "support", vec![1]).unwrap(),
+                AgentSkillRequestEntry::new("references\\guide.md", "support", vec![2]).unwrap(),
+            ],
+            Vec::new(),
+        );
+        assert!(matches!(
+            duplicate,
+            Err(AgentSkillInventoryError::DuplicatePath)
+        ));
+
+        let included_and_omitted = AgentSkillRequest::new(
+            vec![AgentSkillRequestEntry::new("SKILL.md", "entrypoint", vec![1]).unwrap()],
+            vec![AgentSkillOmission::new("./SKILL.md", "excluded").unwrap()],
+        );
+        assert!(matches!(
+            included_and_omitted,
+            Err(AgentSkillInventoryError::DuplicatePath)
+        ));
+    }
+}

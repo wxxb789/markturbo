@@ -146,11 +146,13 @@ the base URL at it:
 | OpenAI Chat Completions | `/v1/chat/completions` | `OPENAI_API_KEY` |
 | OpenAI Responses | `/v1/responses` | `OPENAI_API_KEY` |
 
-Configure the provider, key, model, base URL, and target language in Settings
-(`Ctrl/Cmd+,`). A key set there outranks the environment. With no key anywhere,
-translation reports that it is unconfigured rather than pretending to run —
-there is no offline stand-in that could stand in for a translation without lying
-about it.
+Configure the provider, credential, model, base URL, and target language in
+Settings (`Ctrl/Cmd+,`). Persistent credentials use Windows Credential Manager;
+session credentials remain in memory. Either outranks the environment. Vendor
+environment keys apply automatically only to the vendor's default endpoint, and
+a custom endpoint requires explicit authorization for that exact identity. With
+no credential anywhere, translation reports that it is unconfigured rather than
+pretending to run.
 
 A base URL must include the version segment — `http://localhost:11434/v1`, not
 `http://localhost:11434`. Only the leaf path is appended, so one without it
@@ -174,9 +176,10 @@ Application-specific environment variables:
 
 | Variable | Effect |
 |---|---|
-| `ANTHROPIC_API_KEY` | Key for the Anthropic Messages provider, if none is set in Settings |
-| `OPENAI_API_KEY` | Key for both OpenAI providers, likewise |
-| `MARKTURBO_TRANSLATE_MODEL` | Model id, if none is set in Settings |
+| `ANTHROPIC_API_KEY` | Anthropic key for its default endpoint or an explicitly authorized custom endpoint |
+| `OPENAI_API_KEY` | OpenAI key for its default endpoint or an explicitly authorized custom endpoint |
+| `MARKTURBO_MODEL` | Shared model id, if none is set in Settings |
+| `MARKTURBO_TRANSLATE_MODEL` | Legacy model-id fallback |
 | `MARKTURBO_CONFIG_DIR` | Overrides where `settings.toml` lives |
 | `MARKTURBO_DATA_DIR` | Absolute override for local runtime data: logs, Windows WebView2 data, recovery, and release-sample materialization |
 | `MT_MATH_FONT_DIR` | Optional complete KaTeX font-directory override for development; incomplete or absent overrides use embedded release fonts |

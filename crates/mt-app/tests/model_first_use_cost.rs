@@ -2,10 +2,34 @@
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::time::Instant;
 
+use mt_app::credentials::{CredentialError, CredentialVault, Secret, SecureCredentialStore};
+use mt_app::model::{ConsentCapability, ConsentDecision, EndpointIdentity};
 use mt_app::settings::AppSettings;
-use mt_app::translate::Provider;
+use mt_app::translate::{PreparedTranslation, Provider};
+use mt_doc::translate::{Scope, TranslationRequest};
+
+struct EmptyStore;
+
+impl SecureCredentialStore for EmptyStore {
+    fn is_supported(&self) -> bool {
+        true
+    }
+
+    fn read(&self, _: &str) -> Result<Option<Secret>, CredentialError> {
+        Ok(None)
+    }
+
+    fn write(&self, _: &str, _: &Secret) -> Result<(), CredentialError> {
+        Ok(())
+    }
+
+    fn delete(&self, _: &str) -> Result<(), CredentialError> {
+        Ok(())
+    }
+}
 
 fn local_model_server(requests: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
@@ -45,30 +69,45 @@ fn local_model_server(requests: usize) -> String {
     format!("http://{address}/v1/")
 }
 
+fn run_authorized_request(settings: &AppSettings, vault: &CredentialVault) {
+    let document = mt_doc::Document::new(None, "hello".into());
+    let request = TranslationRequest::prepare(&document, &Scope::Document);
+    let prepared = PreparedTranslation::from_settings(settings, vault)
+        .expect("the local translation is prepared");
+    let prepared = prepared.bind_request(request);
+    let mut consent =
+        ConsentCapability::from_decision(prepared.disclosure(), ConsentDecision::Approve);
+    let authorization = prepared
+        .authorize(&mut consent)
+        .expect("the measurement request is authorized once");
+    prepared
+        .execute(authorization, "fr")
+        .expect("the local request succeeds");
+}
+
 #[test]
 #[ignore = "Goal 04 model first-use measurement; run through mt.py probe"]
 fn first_model_transport_use_cost() {
-    let settings = AppSettings {
-        translate_provider: Provider::OpenAiChat.key().into(),
-        translate_api_key: "measurement-placeholder".into(),
-        translate_base_url: local_model_server(2),
-        translate_model: "measurement-model".into(),
-        ..AppSettings::default()
-    };
+    let mut settings = AppSettings::default();
+    settings.model_provider = Provider::OpenAiChat.key().into();
+    settings.model_base_url = local_model_server(2);
+    settings.model_name = "measurement-model".into();
+    let endpoint = EndpointIdentity::parse(Provider::OpenAiChat, Some(&settings.model_base_url))
+        .expect("the loopback endpoint is valid");
+    let vault = CredentialVault::with_store(Arc::new(EmptyStore));
+    vault
+        .replace_session(
+            endpoint.credential_target().to_string(),
+            "measurement-placeholder".into(),
+        )
+        .expect("the measurement credential stays in session memory");
 
     let started = Instant::now();
-    let service = Provider::OpenAiChat
-        .build_with(&settings)
-        .expect("the local transport starts");
-    service
-        .translate(&["hello".into()], "fr")
-        .expect("the first local request succeeds");
+    run_authorized_request(&settings, &vault);
     let first = started.elapsed();
 
     let started = Instant::now();
-    service
-        .translate(&["hello".into()], "fr")
-        .expect("the reused local request succeeds");
+    run_authorized_request(&settings, &vault);
     let subsequent = started.elapsed();
 
     eprintln!("model first {first:?} subsequent {subsequent:?}");
