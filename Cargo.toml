@@ -99,6 +99,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
 env_logger = "0.11"
 log = "0.4"
+# Some Linux UI dependencies enable tracing's `log` bridge. Install a no-op
+# subscriber before env_logger so dependency traces can never carry model
+# response bodies into the application log.
+tracing = "0.1"
 # Already in the graph via gpui-component; naming it here costs no extra
 # compilation and closes the data-loss path where a legacy-encoded document
 # was decoded lossily and saved back as U+FFFD.
@@ -141,6 +145,10 @@ serde_yaml = "0.9"
 # trailing comma. Already in the native tree via gpui-component, so naming it
 # costs no extra compilation.
 toml = "1.1"
+# Model endpoint identity is security-sensitive and must be parsed rather than
+# assembled as text. `url` is already in the desktop dependency graph through
+# the HTTP stack; naming it directly adds no second implementation.
+url = "2"
 # The platform's own configuration directory. Replaces four hand-rolled
 # branches, one of which was wrong: macOS is not an XDG platform, and a file in
 # ~/.config there is invisible to every macOS convention for finding it.
@@ -153,6 +161,8 @@ tempfile = "3"
 # This is a target-gated capability dependency, not a size/performance trade.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",

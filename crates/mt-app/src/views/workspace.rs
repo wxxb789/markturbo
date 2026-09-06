@@ -34,7 +34,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
-use mt_doc::translate::Scope;
+use mt_doc::translate::{Scope, TranslationRequest};
 
 use crate::fs;
 use crate::i18n;
@@ -43,6 +43,7 @@ use crate::lifecycle::{
     DocumentLifecycle,
 };
 use crate::metrics;
+use crate::model::{ConsentCapability, ConsentDecision};
 use crate::recovery::{
     CancellableRecoveryCheckpointAttempt, CheckpointAttemptTiming, CheckpointBatchOutcome,
     CheckpointSchedule, RecoveredRecord, RecoveryError, RecoveryKey, RecoveryMaintenance,
@@ -51,7 +52,7 @@ use crate::recovery::{
 };
 use crate::renderer::RendererRegistry;
 use crate::startup::{AcknowledgeStartupInput, InitialStartupState, StartupEvent};
-use crate::translate::Provider;
+use crate::translate::PreparedTranslation;
 use crate::views::document::{
     DocumentEvent, DocumentView, PreparedRecovery, SaveAsMode, SaveAsOutcome, SaveMode, paths_match,
 };
@@ -1142,7 +1143,7 @@ impl Workspace {
             harness: None,
             skill_cache: Arc::new(Mutex::new(mt_doc::skill::DiscoveryCache::default())),
             search: cx.new(|cx| SearchView::new(window, cx)),
-            settings: cx.new(SettingsView::new),
+            settings: cx.new(|cx| SettingsView::new(window, cx)),
             side_panel: SidePanel::Files,
             tabs: Tabs::default(),
             history: History::default(),
@@ -1219,12 +1220,14 @@ impl Workspace {
         // here — the WebView caches HTML with the palette baked in, which is not
         // something a settings page should have to know.
         let settings = this.settings.clone();
-        this._subscriptions.push(cx.subscribe(
+        this._subscriptions.push(cx.subscribe_in(
             &settings,
-            |this: &mut Self, _, event: &SettingsEvent, cx| match event {
+            window,
+            |this: &mut Self, _, event: &SettingsEvent, window, cx| match event {
                 SettingsEvent::ThemeChanged => this.reapply_theme(cx),
                 SettingsEvent::LanguageChanged => this.relabel(cx),
                 SettingsEvent::SkillScopeChanged => this.rescan_harness(cx),
+                SettingsEvent::TestModelCredential => this.test_model_credential(window, cx),
             },
         ));
         // And the backstop, for the writers that are not the settings page.
@@ -4351,6 +4354,67 @@ impl Workspace {
         self.translate(Scope::Block(cursor), window, cx);
     }
 
+    fn test_model_credential(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.translating {
+            return;
+        }
+        let settings = crate::settings::AppSettings::global(cx).clone();
+        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let prepared = match PreparedTranslation::from_settings(&settings, &vault) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.set_status(format!("Credential test unavailable: {error}"), cx);
+                return;
+            }
+        };
+        let provider = prepared.provider();
+        let endpoint = prepared.endpoint().normalized_identity();
+
+        self.translating = true;
+        self.set_status(
+            format!("Testing {provider} credential with {endpoint}\u{2026}"),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { prepared.test_connection() })
+                .await;
+            let result = Arc::new(Mutex::new(Some(result)));
+            loop {
+                let result = result.clone();
+                let endpoint = endpoint.clone();
+                if crate::views::try_update_in(&this, cx, move |this, _, cx| {
+                    let result = result
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    let Some(result) = result else { return };
+                    this.translating = false;
+                    match result {
+                        Ok(()) => this.set_status(
+                            format!("Credential accepted by {provider} at {endpoint}"),
+                            cx,
+                        ),
+                        Err(error) => {
+                            this.set_status(format!("Credential test failed: {error}"), cx)
+                        }
+                    }
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
     /// Translate `scope` of the active document.
     ///
     /// Runs on a background task: a network round-trip must never block the UI
@@ -4360,34 +4424,6 @@ impl Workspace {
         let Some(doc) = self.active_document().cloned() else {
             return;
         };
-        let settings = crate::settings::AppSettings::global(cx).clone();
-        let Some(provider) = Provider::resolve(&settings) else {
-            // Naming the fix rather than the symptom: "not configured" leaves
-            // the user hunting through Settings for which field is missing.
-            self.set_status(
-                "No translation API key. Set one in Settings (Ctrl/Cmd+,), or export \
-                 ANTHROPIC_API_KEY / OPENAI_API_KEY. A local server that wants no key \
-                 still needs a placeholder."
-                    .into(),
-                cx,
-            );
-            return;
-        };
-        let service = match provider.build_with(&settings) {
-            Ok(service) => service,
-            Err(err) => {
-                self.set_status(format!("Translation unavailable: {err}"), cx);
-                return;
-            }
-        };
-
-        let target = settings.translate_to.trim().to_string();
-        let target = if target.is_empty() {
-            "zh".to_string()
-        } else {
-            target
-        };
-
         // Parse the editor's *current* text rather than reusing
         // `doc.document()`: that parse is debounced by 180ms, so translating
         // right after a keystroke would translate the previous text and then
@@ -4395,73 +4431,186 @@ impl Workspace {
         let source_snapshot = doc.read(cx).async_snapshot(cx);
         let text = source_snapshot.text().to_owned();
         let doc_type = doc.read(cx).document().doc_type();
+        let source = mt_doc::Document::with_type(doc_type, text);
+        let request = TranslationRequest::prepare(&source, &scope);
+        if request.inputs().is_empty() {
+            self.set_status("No translatable text in the selected scope".into(), cx);
+            return;
+        }
+
+        let settings = crate::settings::AppSettings::global(cx).clone();
+        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let prepared = match PreparedTranslation::from_settings(&settings, &vault) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.set_status(format!("Translation unavailable: {error}"), cx);
+                return;
+            }
+        };
+        let target = settings.translate_to.trim().to_string();
+        let target = if target.is_empty() {
+            "zh".to_string()
+        } else {
+            target
+        };
+        let target = Arc::new(target);
+        let prepared = prepared.bind_request(request);
+        let provider = prepared.provider();
+        let prompt_description = i18n::model_request_disclosure(prepared.disclosure(), cx);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            i18n::t(i18n::Key::ModelRequestConsentTitle, cx),
+            Some(&prompt_description),
+            &[
+                PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx)),
+                PromptButton::cancel(i18n::t(i18n::Key::Cancel, cx)),
+            ],
+            cx,
+        );
         let doc = doc.downgrade();
 
-        self.set_status(format!("Translating via {}…", provider.label()), cx);
-        // Set before the spawn, not inside it: the button has to go inert on
-        // this frame, or the second click lands before the task even starts.
+        self.set_status(i18n::t(i18n::Key::ModelRequestWaiting, cx).into(), cx);
+        // Set before awaiting the prompt: keybindings must not stack multiple
+        // consent dialogs over the same source snapshot.
         self.translating = true;
 
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let source = mt_doc::Document::with_type(doc_type, text);
-                    mt_doc::translate::translate(&source, &scope, &target, service.as_ref())
-                })
-                .await;
+            let approved = answer.await.unwrap_or(1) == 0;
+            let pending = Arc::new(Mutex::new(Some(prepared)));
 
-            // A fallible window borrow may skip one draw frame. Retain the
-            // result and retry so the loading flag always clears and a stale
-            // result is still reported instead of disappearing silently.
-            let result = Arc::new(Mutex::new(Some(result)));
             loop {
-                let result = result.clone();
+                let pending = pending.clone();
                 let doc = doc.clone();
                 let source_snapshot = source_snapshot.clone();
+                let target = target.clone();
                 if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                    let result = result
+                    let Some(prepared) = pending
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    let Some(result) = result else { return };
-                    // Cleared in both arms — a flag left set by the error path
-                    // is a permanently dead button.
-                    this.translating = false;
-                    match result {
-                        Ok(translation) => {
-                            let applied = doc.upgrade().is_some_and(|doc| {
-                                doc.update(cx, |doc, cx| {
-                                    doc.replace_text_if_current(
-                                        &source_snapshot,
-                                        translation.text,
-                                        window,
-                                        cx,
-                                    )
-                                })
-                            });
-                            if applied {
-                                this.set_status(
-                                    format!(
-                                        "Translated {} segment(s) via {}",
-                                        translation
-                                            .segments
-                                            .iter()
-                                            .filter(|s| s.translatable)
-                                            .count(),
-                                        provider.label()
-                                    ),
-                                    cx,
-                                );
-                            } else {
-                                this.set_status(
-                                    "The document changed while translation was running. The result was not applied; run Translate again to use the latest text."
-                                        .into(),
-                                    cx,
-                                );
-                            }
-                        }
-                        Err(err) => this.set_status(format!("Translation failed: {err}"), cx),
+                        .take()
+                    else {
+                        return;
+                    };
+
+                    if !approved {
+                        this.translating = false;
+                        this.set_status(
+                            i18n::t(i18n::Key::ModelRequestCancelled, cx).into(),
+                            cx,
+                        );
+                        return;
                     }
+
+                    let Some(document) = doc.upgrade() else {
+                        this.translating = false;
+                        this.set_status(
+                            i18n::t(i18n::Key::ModelRequestDocumentClosed, cx).into(),
+                            cx,
+                        );
+                        return;
+                    };
+                    if document.read(cx).async_snapshot(cx) != source_snapshot {
+                        this.translating = false;
+                        this.set_status(
+                            i18n::t(i18n::Key::ModelRequestDocumentChanged, cx).into(),
+                            cx,
+                        );
+                        return;
+                    }
+
+                    let mut consent = ConsentCapability::from_decision(
+                        prepared.disclosure(),
+                        ConsentDecision::Approve,
+                    );
+                    let authorization = match prepared.authorize(&mut consent) {
+                        Ok(authorization) => authorization,
+                        Err(error) => {
+                            this.translating = false;
+                            this.set_status(format!("Translation unavailable: {error}"), cx);
+                            return;
+                        }
+                    };
+
+                    this.set_status(format!("Translating via {}…", provider.label()), cx);
+                    let doc = document.downgrade();
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = cx
+                            .background_spawn(async move {
+                                prepared.execute(authorization, target.as_str())
+                            })
+                            .await;
+
+                        // A fallible window borrow may skip one draw frame. Retain the
+                        // result and retry so the loading flag always clears and a stale
+                        // result is still reported instead of disappearing silently.
+                        let result = Arc::new(Mutex::new(Some(result)));
+                        loop {
+                            let result = result.clone();
+                            let doc = doc.clone();
+                            let source_snapshot = source_snapshot.clone();
+                            if crate::views::try_update_in(
+                                &this,
+                                cx,
+                                move |this, window, cx| {
+                                    let result = result
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .take();
+                                    let Some(result) = result else { return };
+                                    // Cleared in both arms — a flag left set by the error path
+                                    // is a permanently dead button.
+                                    this.translating = false;
+                                    match result {
+                                        Ok(translation) => {
+                                            let applied = doc.upgrade().is_some_and(|doc| {
+                                                doc.update(cx, |doc, cx| {
+                                                    doc.replace_text_if_current(
+                                                        &source_snapshot,
+                                                        translation.text,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                            });
+                                            if applied {
+                                                this.set_status(
+                                                    format!(
+                                                        "Translated {} segment(s) via {}",
+                                                        translation
+                                                            .segments
+                                                            .iter()
+                                                            .filter(|s| s.translatable)
+                                                            .count(),
+                                                        provider.label()
+                                                    ),
+                                                    cx,
+                                                );
+                                            } else {
+                                                this.set_status(
+                                                    "The document changed while translation was running. The result was not applied; run Translate again to use the latest text."
+                                                        .into(),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        Err(err) => this
+                                            .set_status(format!("Translation failed: {err}"), cx),
+                                    }
+                                },
+                            )
+                            .is_some()
+                            {
+                                break;
+                            }
+                            if this.upgrade().is_none() {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1))
+                                .await;
+                        }
+                    })
+                    .detach();
                 })
                 .is_some()
                 {
@@ -6055,6 +6204,7 @@ impl Render for Workspace {
 
 /// Keybindings for the workspace's actions.
 pub fn init(cx: &mut App) {
+    crate::credentials::CredentialVault::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewDocument, None),
         KeyBinding::new("ctrl-n", NewDocument, None),
@@ -6244,6 +6394,75 @@ mod tests {
         });
         cx.update(|window, app| window.draw(app).clear(app));
         (workspace, cx)
+    }
+
+    #[cfg(feature = "model-transport")]
+    fn one_shot_translation_server() -> (String, std::sync::mpsc::Receiver<()>, Arc<AtomicUsize>) {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            request_count.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(&stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            sender.send(()).unwrap();
+
+            let response =
+                r#"{"choices":[{"message":{"role":"assistant","content":"[\"Bonjour\"]"}}]}"#;
+            let mut stream = &stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        (format!("http://{address}/v1/"), receiver, requests)
+    }
+
+    #[cfg(feature = "model-transport")]
+    fn configure_test_translation(cx: &mut VisualTestContext, base_url: &str) {
+        use crate::model::{EndpointIdentity, Provider};
+
+        let endpoint = EndpointIdentity::parse(Provider::OpenAiChat, Some(base_url)).unwrap();
+        cx.update(|_, app| {
+            crate::settings::AppSettings::update(app, |settings| {
+                settings.model_provider = Provider::OpenAiChat.key().into();
+                settings.model_name = "translation-test-model".into();
+                settings.model_base_url = base_url.into();
+                settings.translate_to = "fr".into();
+            });
+            crate::credentials::CredentialVault::global(app)
+                .replace_session(
+                    endpoint.credential_target().to_string(),
+                    "synthetic-workspace-credential".into(),
+                )
+                .unwrap();
+        });
     }
 
     fn open_test_workspace_with_welcome_preference(
@@ -8702,6 +8921,171 @@ mod tests {
         document.read_with(cx, |document, app| {
             assert!(document.is_externally_changed());
             assert_eq!(document.text(app), edited);
+        });
+    }
+
+    #[cfg(feature = "model-transport")]
+    #[gpui::test]
+    fn opening_and_scanning_with_model_configured_sends_no_request(cx: &mut TestAppContext) {
+        use crate::model::{EndpointIdentity, Provider};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+        let endpoint = EndpointIdentity::parse(Provider::OpenAiChat, Some(&base_url)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local-only-open.md");
+        fs::write(&path, "Private content stays local\n").unwrap();
+
+        cx.update(|app| {
+            gpui_component::init(app);
+            crate::settings::AppSettings::init(app);
+            crate::settings::AppSettings::update(app, |settings| {
+                settings.show_welcome_on_startup = false;
+                settings.model_provider = Provider::OpenAiChat.key().into();
+                settings.model_name = "configured-model".into();
+                settings.model_base_url = base_url;
+            });
+            super::init(app);
+            crate::credentials::CredentialVault::global(app)
+                .replace_session(
+                    endpoint.credential_target().to_string(),
+                    "synthetic-local-only-credential".into(),
+                )
+                .unwrap();
+        });
+        let captured = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let captured = captured.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| {
+                    Workspace::new_with_startup_recovery(
+                        Some(path),
+                        StartupRecovery::default,
+                        window,
+                        cx,
+                    )
+                });
+                *captured.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            }
+        });
+        let workspace = captured.borrow().clone().expect("the Workspace entity");
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| workspace.rescan_harness(cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "opening, rendering, and Skill discovery must stay local"
+        );
+    }
+
+    #[cfg(feature = "model-transport")]
+    #[gpui::test]
+    fn cancelling_translation_consent_sends_no_request(cx: &mut TestAppContext) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent-cancel.md");
+        fs::write(&path, "Hello from a private document\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        configure_test_translation(cx, &base_url);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_translate_document(&super::TranslateDocument, window, cx);
+            });
+        });
+
+        assert!(cx.has_pending_prompt());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "preparing disclosure must not open a connection"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "cancelled consent must keep the endpoint untouched"
+        );
+        workspace.read_with(cx, |workspace, _| assert!(!workspace.translating));
+    }
+
+    #[cfg(feature = "model-transport")]
+    #[gpui::test]
+    fn changing_the_document_invalidates_pending_translation_consent(cx: &mut TestAppContext) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent-stale.md");
+        fs::write(&path, "Original private text\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        configure_test_translation(cx, &base_url);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_translate_document(&super::TranslateDocument, window, cx);
+            });
+        });
+        assert!(cx.has_pending_prompt());
+        replace_document(&workspace, 0, "Changed while the prompt was open\n", cx);
+
+        cx.simulate_prompt_answer("Send");
+        cx.run_until_parked();
+
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "approval for an obsolete snapshot must not open a connection"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.translating);
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(
+                    "The document changed while approval was pending. Review the updated scope and try again."
+                )
+            );
+        });
+    }
+
+    #[cfg(feature = "model-transport")]
+    #[gpui::test]
+    fn approving_translation_consent_sends_one_frozen_request(cx: &mut TestAppContext) {
+        let (base_url, received, request_count) = one_shot_translation_server();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent-approve.md");
+        fs::write(&path, "Hello\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        configure_test_translation(cx, &base_url);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_translate_document(&super::TranslateDocument, window, cx);
+            });
+        });
+
+        assert!(cx.has_pending_prompt());
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        cx.simulate_prompt_answer("Send");
+        cx.run_until_parked();
+        received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the approved request reached the configured endpoint");
+        cx.run_until_parked();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), "Bonjour\n");
         });
     }
 

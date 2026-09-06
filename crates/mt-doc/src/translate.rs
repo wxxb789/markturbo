@@ -31,6 +31,13 @@ pub enum Scope {
     Document,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationScopeKind {
+    Selection,
+    Block,
+    Document,
+}
+
 /// A translation backend. Kept as a trait so the document model never names a
 /// vendor; a provider is chosen at the application edge.
 pub trait TranslationService: Send + Sync {
@@ -48,14 +55,127 @@ pub struct Translation {
     pub segments: Vec<Segment>,
 }
 
+/// A frozen translation request whose disclosed inputs are the exact strings
+/// later supplied to the provider.
+///
+/// Preparing before user consent prevents a later editor change or a second
+/// segmentation pass from widening the outbound scope after approval.
+pub struct TranslationRequest {
+    source: String,
+    range: Range<usize>,
+    scope_kind: TranslationScopeKind,
+    segments: Vec<Segment>,
+    input_indices: Vec<usize>,
+    inputs: Vec<String>,
+}
+
+impl TranslationRequest {
+    pub fn prepare(doc: &Document, scope: &Scope) -> Self {
+        let scope_kind = match scope {
+            Scope::Selection(_) => TranslationScopeKind::Selection,
+            Scope::Block(_) => TranslationScopeKind::Block,
+            Scope::Document => TranslationScopeKind::Document,
+        };
+        let range = resolve_scope(doc, scope);
+        let segments = segment_range(doc, range.clone());
+        let input_indices = segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| {
+                segment.translatable && segment.text.chars().any(char::is_alphanumeric)
+            })
+            .map(|(ix, _)| ix)
+            .collect::<Vec<_>>();
+        let inputs = input_indices
+            .iter()
+            .map(|&ix| segments[ix].text.clone())
+            .collect();
+
+        Self {
+            source: doc.source().to_owned(),
+            range,
+            scope_kind,
+            segments,
+            input_indices,
+            inputs,
+        }
+    }
+
+    /// The complete user-content payload, excluding provider protocol framing.
+    pub fn inputs(&self) -> &[String] {
+        &self.inputs
+    }
+
+    pub fn input_bytes(&self) -> usize {
+        self.inputs.iter().map(String::len).sum()
+    }
+
+    pub const fn scope_kind(&self) -> TranslationScopeKind {
+        self.scope_kind
+    }
+
+    pub fn execute(
+        mut self,
+        target_lang: &str,
+        service: &dyn TranslationService,
+    ) -> anyhow::Result<Translation> {
+        if !self.inputs.is_empty() {
+            let outputs = service.translate(&self.inputs, target_lang)?;
+            anyhow::ensure!(
+                outputs.len() == self.inputs.len(),
+                "translation service returned {} results for {} inputs",
+                outputs.len(),
+                self.inputs.len()
+            );
+            for (&ix, out) in self.input_indices.iter().zip(outputs) {
+                // Preserve the segment's leading/trailing whitespace: it
+                // carries Markdown structure that the provider never owns.
+                let original = &self.segments[ix].text;
+                let lead: String = original.chars().take_while(|c| c.is_whitespace()).collect();
+                let trail: String = original
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_whitespace())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                self.segments[ix].text = format!("{lead}{}{trail}", out.trim());
+            }
+        }
+
+        let mut text = String::with_capacity(self.source.len());
+        text.push_str(&self.source[..self.range.start]);
+        for segment in &self.segments {
+            text.push_str(&segment.text);
+        }
+        text.push_str(&self.source[self.range.end..]);
+
+        Ok(Translation {
+            text,
+            segments: self.segments,
+        })
+    }
+}
+
 /// Resolve a scope to a byte range in `doc`.
 pub fn resolve_scope(doc: &Document, scope: &Scope) -> Range<usize> {
     match scope {
         Scope::Selection(range) => clamp(range.clone(), doc.source()),
-        Scope::Block(offset) => doc
-            .block_at(*offset)
-            .map(|b| b.range.clone())
-            .unwrap_or(0..doc.source().len()),
+        Scope::Block(offset) => {
+            let offset = (*offset).min(doc.source().len());
+            doc.block_at(offset)
+                .or_else(|| {
+                    doc.blocks().iter().rev().find(|block| {
+                        block.range.end <= offset
+                            && doc.source()[block.range.end..offset]
+                                .chars()
+                                .all(char::is_whitespace)
+                    })
+                })
+                .map(|block| block.range.clone())
+                .unwrap_or(offset..offset)
+        }
         Scope::Document => 0..doc.source().len(),
     }
 }
@@ -67,6 +187,10 @@ pub fn resolve_scope(doc: &Document, scope: &Scope) -> Range<usize> {
 /// reassembly lossless.
 pub fn segment(doc: &Document, scope: &Scope) -> Vec<Segment> {
     let range = resolve_scope(doc, scope);
+    segment_range(doc, range)
+}
+
+fn segment_range(doc: &Document, range: Range<usize>) -> Vec<Segment> {
     let source = doc.source();
     let mut segments = Vec::new();
 
@@ -366,53 +490,7 @@ pub fn translate(
     target_lang: &str,
     service: &dyn TranslationService,
 ) -> anyhow::Result<Translation> {
-    let mut segments = segment(doc, scope);
-
-    // Only send segments with actual words. Whitespace-only prose (blank lines
-    // between paragraphs) would waste a round-trip and risk being "corrected".
-    let indices: Vec<usize> = segments
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.translatable && s.text.chars().any(|c| c.is_alphanumeric()))
-        .map(|(i, _)| i)
-        .collect();
-
-    if !indices.is_empty() {
-        let inputs: Vec<String> = indices.iter().map(|&i| segments[i].text.clone()).collect();
-        let outputs = service.translate(&inputs, target_lang)?;
-        anyhow::ensure!(
-            outputs.len() == inputs.len(),
-            "translation service returned {} results for {} inputs",
-            outputs.len(),
-            inputs.len()
-        );
-        for (&i, out) in indices.iter().zip(outputs) {
-            // Preserve the segment's leading/trailing whitespace: it carries
-            // Markdown structure (indentation, line breaks) that a translator
-            // has no reason to reproduce.
-            let original = &segments[i].text;
-            let lead: String = original.chars().take_while(|c| c.is_whitespace()).collect();
-            let trail: String = original
-                .chars()
-                .rev()
-                .take_while(|c| c.is_whitespace())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            segments[i].text = format!("{lead}{}{trail}", out.trim());
-        }
-    }
-
-    let range = resolve_scope(doc, scope);
-    let mut text = String::with_capacity(doc.source().len());
-    text.push_str(&doc.source()[..range.start]);
-    for segment in &segments {
-        text.push_str(&segment.text);
-    }
-    text.push_str(&doc.source()[range.end..]);
-
-    Ok(Translation { text, segments })
+    TranslationRequest::prepare(doc, scope).execute(target_lang, service)
 }
 
 #[cfg(test)]
@@ -522,6 +600,27 @@ mod tests {
     }
 
     #[test]
+    fn block_scope_at_eof_never_falls_back_to_the_whole_document() {
+        let src = "Alpha.\n\nBeta.\n";
+        let request = TranslationRequest::prepare(&doc(src), &Scope::Block(src.len()));
+        assert_eq!(request.scope_kind(), TranslationScopeKind::Block);
+        assert_eq!(request.inputs(), &["Beta.".to_string()]);
+
+        let out = request.execute("zh", &Upper).unwrap();
+
+        assert_eq!(out.text, "Alpha.\n\nBETA.\n");
+    }
+
+    #[test]
+    fn block_scope_without_a_block_has_no_provider_inputs() {
+        let request = TranslationRequest::prepare(&doc(""), &Scope::Block(0));
+
+        assert_eq!(request.scope_kind(), TranslationScopeKind::Block);
+        assert!(request.inputs().is_empty());
+        assert_eq!(request.input_bytes(), 0);
+    }
+
+    #[test]
     fn only_word_bearing_prose_reaches_the_provider() {
         let src = "# Title\n\n```rust\nfn main() {}\n```\n\nText.\n";
         let rec = Recording(Default::default());
@@ -530,6 +629,27 @@ mod tests {
         assert!(sent.iter().all(|s| !s.contains("fn main")), "sent {sent:?}");
         assert!(sent.iter().any(|s| s.contains("Title")));
         assert!(sent.iter().any(|s| s.contains("Text.")));
+    }
+
+    #[test]
+    fn prepared_request_exposes_exactly_the_bytes_later_sent() {
+        let src = "# Keep this heading\n\nTranslate `not this` and [label](https://example.com).\n";
+        let request = TranslationRequest::prepare(&doc(src), &Scope::Document);
+        let disclosed = request.inputs().to_vec();
+        let disclosed_bytes = request.input_bytes();
+        assert_eq!(request.scope_kind(), TranslationScopeKind::Document);
+        let rec = Recording(Default::default());
+
+        request.execute("zh", &rec).unwrap();
+
+        let sent = rec.0.into_inner().unwrap();
+        assert_eq!(sent, disclosed);
+        assert_eq!(disclosed_bytes, sent.iter().map(String::len).sum::<usize>());
+        assert!(sent.iter().all(|text| !text.contains("not this")));
+        assert!(
+            sent.iter()
+                .all(|text| !text.contains("https://example.com"))
+        );
     }
 
     #[test]

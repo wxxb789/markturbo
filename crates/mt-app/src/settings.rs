@@ -20,6 +20,16 @@ use std::path::PathBuf;
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct LegacyCredential(String);
+
+impl std::fmt::Debug for LegacyCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 /// Which theme to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -225,27 +235,34 @@ pub struct AppSettings {
     pub language: Language,
     /// Target language for translation, e.g. `zh`.
     pub translate_to: String,
-    /// Provider id, matching [`crate::translate::Provider::key`].
-    pub translate_provider: String,
-    /// Model id for providers that take one.
-    pub translate_model: String,
-    /// API key for the translation endpoint.
-    ///
-    /// Takes priority over the provider's environment variable: a key typed
-    /// into Settings is an explicit choice, and there is otherwise no way to
-    /// override what the shell exported from inside the app. Empty falls back
-    /// to the environment, which remains the option for anyone who would rather
-    /// a key never touched disk.
-    pub translate_api_key: String,
-    /// Base URL of the translation endpoint.
+    /// Provider wire-format id shared by every model-backed operation.
+    #[serde(alias = "translate-provider")]
+    pub model_provider: String,
+    /// Model id shared by every model-backed operation.
+    #[serde(alias = "translate-model")]
+    pub model_name: String,
+    /// Base URL shared by every model-backed operation.
     ///
     /// Empty means the schema's own default. Setting it is what points the app
     /// at a self-hosted or proxied server — the wire format is the same, so an
     /// OpenAI-compatible endpoint needs nothing else beyond including the
-    /// version segment: `http://localhost:8000/v1`, not `http://localhost:8000`.
+    /// version segment: `http://127.0.0.1:8000/v1`, not `http://127.0.0.1:8000`.
     /// Only the leaf path is appended, so a base URL missing `/v1` reaches an
     /// endpoint that is not there.
-    pub translate_base_url: String,
+    #[serde(alias = "translate-base-url")]
+    pub model_base_url: String,
+    /// Exact custom endpoint identity authorized to receive the provider's
+    /// ambient environment credential. Empty means no custom authorization.
+    pub model_environment_key_identity: String,
+    /// A key written by an older build. It remains in the original settings
+    /// file until the user approves migration and secure storage verifies the
+    /// write; current UI never creates or displays this field.
+    #[serde(
+        rename = "translate-api-key",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_model_api_key: Option<LegacyCredential>,
     /// Scroll the preview to follow the editor in Split mode.
     ///
     /// Off by default: the mapping is proportional, so on a document with one
@@ -284,10 +301,11 @@ impl Default for AppSettings {
             translate_to: "zh".into(),
             // Empty means "whatever is configured and available", so a machine
             // that gains an API key starts using it without editing settings.
-            translate_provider: String::new(),
-            translate_model: String::new(),
-            translate_api_key: String::new(),
-            translate_base_url: String::new(),
+            model_provider: String::new(),
+            model_name: String::new(),
+            model_base_url: String::new(),
+            model_environment_key_identity: String::new(),
+            legacy_model_api_key: None,
             split_sync_scroll: false,
             watch_auto_reload: false,
             skills_include_global: true,
@@ -327,12 +345,48 @@ impl AppSettings {
     /// hand-appending its own `relabel`/`rescan` follow-up — and forgetting to
     /// for eight of the fourteen settings.
     pub fn update(cx: &mut App, edit: impl FnOnce(&mut AppSettings)) {
-        edit(Self::global_mut(cx));
+        let mut candidate = Self::global(cx).clone();
+        edit(&mut candidate);
         #[cfg(not(test))]
         {
-            let settings = Self::global(cx).clone();
-            settings.save();
+            candidate = match candidate.try_save_with_intent(SettingsWriteIntent::General) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    if let Some(path) = settings_path() {
+                        log::warn!("cannot write {}: {error}", path.display());
+                    }
+                    candidate
+                }
+            };
         }
+        *Self::global_mut(cx) = candidate;
+    }
+
+    /// Persist a security-sensitive edit before publishing it to the UI.
+    pub fn try_update(cx: &mut App, edit: impl FnOnce(&mut AppSettings)) -> std::io::Result<()> {
+        let next = Self::prepare_persisted_update(Self::global(cx), edit, |candidate| {
+            #[cfg(not(test))]
+            {
+                candidate
+                    .try_save_with_intent(SettingsWriteIntent::EnvironmentCredentialAuthorization)
+            }
+            #[cfg(test)]
+            {
+                Ok(candidate.clone())
+            }
+        })?;
+        *Self::global_mut(cx) = next;
+        Ok(())
+    }
+
+    fn prepare_persisted_update(
+        current: &Self,
+        edit: impl FnOnce(&mut Self),
+        persist: impl FnOnce(&Self) -> std::io::Result<Self>,
+    ) -> std::io::Result<Self> {
+        let mut candidate = current.clone();
+        edit(&mut candidate);
+        persist(&candidate)
     }
 
     /// Place `target` first in the recent list, replacing an older entry for
@@ -398,8 +452,10 @@ impl AppSettings {
             }
             Err(err) => {
                 // Do not delete or rewrite it: the user may have hand-edited it
-                // and a diagnostic they can act on beats silent data loss.
-                log::warn!("ignoring malformed {}: {err}", path.display());
+                // and a diagnostic they can act on beats silent data loss. The
+                // parser error can quote source text, including a legacy key.
+                let _ = err;
+                log::warn!("ignoring malformed {}", path.display());
                 Self::default()
             }
         }
@@ -408,25 +464,158 @@ impl AppSettings {
     /// Write to disk. Failures are logged, never fatal.
     pub fn save(&self) {
         let Some(path) = settings_path() else { return };
-        self.save_to(&path);
+        if let Err(error) = self.try_save_to_with_intent(&path, SettingsWriteIntent::General) {
+            log::warn!("cannot write {}: {error}", path.display());
+        }
     }
 
+    #[cfg(test)]
     pub fn save_to(&self, path: &std::path::Path) {
-        if let Some(parent) = path.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            log::warn!("cannot create {}: {err}", parent.display());
-            return;
-        }
-        match toml::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(err) = std::fs::write(path, text) {
-                    log::warn!("cannot write {}: {err}", path.display());
-                }
-            }
-            Err(err) => log::warn!("cannot serialize settings: {err}"),
+        if let Err(err) = self.write_to(path) {
+            log::warn!("cannot write {}: {err}", path.display());
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn try_save_general_to(&self, path: &std::path::Path) -> std::io::Result<Self> {
+        self.try_save_to_with_intent(path, SettingsWriteIntent::General)
+    }
+
+    #[cfg(not(test))]
+    fn try_save_with_intent(&self, intent: SettingsWriteIntent) -> std::io::Result<Self> {
+        let path = settings_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "settings path unavailable")
+        })?;
+        self.try_save_to_with_intent(&path, intent)
+    }
+
+    pub(crate) fn try_save_after_legacy_migration(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        self.try_save_to_with_intent(path, SettingsWriteIntent::LegacyCredentialMigration)
+    }
+
+    /// Serialize settings while preserving security fields this write does not
+    /// own from the latest on-disk snapshot.
+    fn try_save_to_with_intent(
+        &self,
+        path: &std::path::Path,
+        intent: SettingsWriteIntent,
+    ) -> std::io::Result<Self> {
+        let _guard = lock_settings_writes()?;
+        let current = match std::fs::read_to_string(path) {
+            Ok(current) => toml::from_str::<Self>(&current).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "existing settings are malformed",
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => return Err(error),
+        };
+        let mut candidate = self.clone();
+        if intent != SettingsWriteIntent::LegacyCredentialMigration {
+            candidate.legacy_model_api_key = current.legacy_model_api_key;
+        }
+        if intent != SettingsWriteIntent::EnvironmentCredentialAuthorization {
+            candidate.model_environment_key_identity = current.model_environment_key_identity;
+        }
+        candidate.write_to(path)?;
+        Ok(candidate)
+    }
+
+    fn write_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self).map_err(|error| {
+            std::io::Error::other(format!("cannot serialize settings: {error}"))
+        })?;
+        std::fs::write(path, text)
+    }
+
+    pub fn legacy_model_api_key(&self) -> Option<&str> {
+        self.legacy_model_api_key
+            .as_ref()
+            .map(|credential| credential.0.trim())
+            .filter(|credential| !credential.is_empty())
+    }
+
+    pub fn clear_legacy_model_api_key(&mut self) {
+        self.legacy_model_api_key = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsWriteIntent {
+    General,
+    EnvironmentCredentialAuthorization,
+    LegacyCredentialMigration,
+}
+
+#[cfg(target_os = "windows")]
+struct SettingsWriteGuard {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for SettingsWriteGuard {
+    fn drop(&mut self) {
+        use windows::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+
+        let _ = unsafe { ReleaseMutex(self.handle) };
+        let _ = unsafe { CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
+    lock_settings_writes_named("Global\\markturbo-settings-write-v1")
+}
+
+#[cfg(target_os = "windows")]
+fn lock_settings_writes_named(name: &str) -> std::io::Result<SettingsWriteGuard> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{CreateMutexW, WaitForSingleObject},
+    };
+    use windows::core::PCWSTR;
+
+    const WAIT_MILLISECONDS: u32 = 100;
+    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        .map_err(std::io::Error::other)?;
+    let wait = unsafe { WaitForSingleObject(handle, WAIT_MILLISECONDS) };
+    if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+        return Ok(SettingsWriteGuard { handle });
+    }
+
+    let error = if wait == WAIT_TIMEOUT {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "another markturbo process is writing settings",
+        )
+    } else {
+        std::io::Error::from_raw_os_error(unsafe { GetLastError() }.0 as i32)
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    Err(error)
+}
+
+#[cfg(not(target_os = "windows"))]
+struct SettingsWriteGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
+    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    Ok(SettingsWriteGuard {
+        _guard: WRITES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    })
 }
 
 /// Where settings live.
@@ -571,6 +760,143 @@ mod tests {
         assert_eq!(back, settings);
     }
 
+    #[test]
+    fn current_settings_never_serialize_an_api_credential_field() {
+        let text = toml::to_string_pretty(&AppSettings::default()).unwrap();
+
+        assert!(
+            !text.contains("api-key"),
+            "credential field leaked:\n{text}"
+        );
+    }
+
+    #[test]
+    fn failed_persisted_update_keeps_the_published_security_state() {
+        let mut current = AppSettings::default();
+        current.model_environment_key_identity = "approved-endpoint".into();
+
+        let result = AppSettings::prepare_persisted_update(
+            &current,
+            |candidate| candidate.model_environment_key_identity.clear(),
+            |_| Err(std::io::Error::other("synthetic write failure")),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(current.model_environment_key_identity, "approved-endpoint");
+    }
+
+    #[test]
+    fn persisted_update_publishes_the_reconciled_snapshot() {
+        let current: AppSettings =
+            toml::from_str("translate-api-key = \"stale-memory-sentinel\"").unwrap();
+
+        let persisted = AppSettings::prepare_persisted_update(
+            &current,
+            |_| {},
+            |candidate| {
+                let mut written = candidate.clone();
+                written.clear_legacy_model_api_key();
+                Ok(written)
+            },
+        )
+        .unwrap();
+
+        assert!(persisted.legacy_model_api_key().is_none());
+    }
+
+    #[test]
+    fn stale_general_save_cannot_restore_revoked_environment_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut authorized = AppSettings {
+            model_environment_key_identity: "markturbo:model:approved".into(),
+            ..AppSettings::default()
+        };
+        authorized.write_to(&path).unwrap();
+        let mut stale = AppSettings::load_from(&path);
+
+        authorized.model_environment_key_identity.clear();
+        let persisted = authorized
+            .try_save_to_with_intent(
+                &path,
+                SettingsWriteIntent::EnvironmentCredentialAuthorization,
+            )
+            .unwrap();
+        assert!(persisted.model_environment_key_identity.is_empty());
+
+        stale.theme = ThemePreference::Dark;
+        let persisted = stale
+            .try_save_to_with_intent(&path, SettingsWriteIntent::General)
+            .unwrap();
+        assert_eq!(persisted.theme, ThemePreference::Dark);
+        assert!(persisted.model_environment_key_identity.is_empty());
+        assert!(
+            AppSettings::load_from(&path)
+                .model_environment_key_identity
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_security_state_is_not_written_when_the_settings_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-settings.toml");
+        let stale: AppSettings = toml::from_str(
+            "model-environment-key-identity = \"stale-authorization\"\n\
+             translate-api-key = \"stale-plaintext\"\n",
+        )
+        .unwrap();
+
+        let persisted = stale
+            .try_save_to_with_intent(&path, SettingsWriteIntent::General)
+            .unwrap();
+
+        assert!(persisted.model_environment_key_identity.is_empty());
+        assert!(persisted.legacy_model_api_key().is_none());
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("stale-authorization"));
+        assert!(!text.contains("stale-plaintext"));
+    }
+
+    #[test]
+    fn malformed_current_settings_block_a_stale_security_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let malformed = "translate-api-key = \"current-plaintext\"\n[";
+        std::fs::write(&path, malformed).unwrap();
+        let stale: AppSettings = toml::from_str(
+            "model-environment-key-identity = \"stale-authorization\"\n\
+             translate-api-key = \"stale-plaintext\"\n",
+        )
+        .unwrap();
+
+        let error = stale
+            .try_save_to_with_intent(&path, SettingsWriteIntent::General)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), malformed);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn settings_writes_fail_closed_while_the_global_lock_is_busy() {
+        let name = format!(
+            "Local\\markturbo-settings-write-test-{}",
+            std::process::id()
+        );
+        let _guard = lock_settings_writes_named(&name).unwrap();
+        let error = std::thread::spawn(move || {
+            lock_settings_writes_named(&name)
+                .err()
+                .expect("the lock is busy")
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
     /// TOML cannot represent a scalar after an array table.
     ///
     /// The rule that bites: every scalar must be emitted before any table, so a
@@ -704,10 +1030,11 @@ mod tests {
             language: Language::Chinese,
             split_sync_scroll: true,
             watch_auto_reload: true,
-            translate_provider: "anthropic".into(),
-            translate_api_key: "sk-test".into(),
-            translate_base_url: "https://gw.invalid/openai".into(),
-            translate_model: "claude-sonnet-5".into(),
+            model_provider: "anthropic".into(),
+            model_base_url: "https://gw.invalid/openai".into(),
+            model_name: "claude-sonnet-5".into(),
+            model_environment_key_identity: "markturbo:model:test".into(),
+            legacy_model_api_key: None,
             skills_include_internal: true,
             skills_include_global: false,
             skills_group_by: GroupBy::Status,
@@ -723,6 +1050,68 @@ mod tests {
         settings.save_to(&path);
 
         assert_eq!(AppSettings::load_from(&path), settings);
+    }
+
+    #[test]
+    fn legacy_model_fields_load_without_becoming_the_current_serialized_schema() {
+        let legacy = r#"
+translate-provider = "openai-responses"
+translate-model = "gpt-test"
+translate-base-url = "https://gateway.invalid/v1"
+translate-api-key = "legacy-secret-sentinel"
+"#;
+
+        let mut settings: AppSettings = toml::from_str(legacy).unwrap();
+        assert_eq!(settings.model_provider, "openai-responses");
+        assert_eq!(settings.model_name, "gpt-test");
+        assert_eq!(settings.model_base_url, "https://gateway.invalid/v1");
+        assert_eq!(
+            settings.legacy_model_api_key(),
+            Some("legacy-secret-sentinel")
+        );
+
+        let before_migration = toml::to_string_pretty(&settings).unwrap();
+        assert!(before_migration.contains("legacy-secret-sentinel"));
+        assert!(before_migration.contains("model-provider"));
+        assert!(!before_migration.contains("translate-provider"));
+
+        settings.clear_legacy_model_api_key();
+        let after_migration = toml::to_string_pretty(&settings).unwrap();
+        assert!(!after_migration.contains("legacy-secret-sentinel"));
+        assert!(!after_migration.contains("translate-api-key"));
+    }
+
+    #[test]
+    fn legacy_credentials_are_redacted_from_debug_output() {
+        let settings: AppSettings =
+            toml::from_str("translate-api-key = \"debug-secret-sentinel\"").unwrap();
+
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("debug-secret-sentinel"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn unsafe_legacy_endpoint_is_preserved_until_the_user_explicitly_replaces_it() {
+        for base_url in [
+            "https://user:settings-secret@example.com/v1/",
+            "https://example.com/v1/?api_key=settings-secret",
+            "https://example.com/v1/#settings-secret",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.toml");
+            let settings = AppSettings {
+                model_base_url: base_url.into(),
+                ..AppSettings::default()
+            };
+            let original = toml::to_string_pretty(&settings).unwrap();
+            std::fs::write(&path, &original).unwrap();
+
+            let loaded = AppSettings::load_from(&path);
+
+            assert_eq!(loaded.model_base_url, base_url);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[test]
@@ -888,7 +1277,8 @@ path = "old-file.md"
             .expect("end of update")
             .0;
         assert!(update.contains("#[cfg(not(test))]"));
-        assert!(update.contains("settings.save()"));
+        assert!(update.contains("try_save_with_intent(SettingsWriteIntent::General)"));
+        assert!(update.contains("*Self::global_mut(cx) = candidate"));
     }
 
     #[test]

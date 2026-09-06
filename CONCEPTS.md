@@ -124,6 +124,31 @@ it never sees.
 How much of a document a translation covers: a selection, the block containing the cursor,
 or the whole document. Content outside the scope is left byte-identical.
 
+### Model Endpoint Identity
+The complete non-secret identity of one model destination: application, provider wire
+format, scheme, normalized host, effective port, and normalized API base path. Credentials
+and consent bind to this identity, so changing any of those parts cannot silently redirect
+an existing key or approval.
+
+### Outbound Scope
+The exact user-content boundary disclosed before one model request: a selection, the current
+block, a document, a document plus named Effective Agent Context sources, or an inventoried
+Agent Skill package.
+Protocol framing is acknowledged separately. An Outbound Scope is request-specific and is
+not permission to inspect or send the rest of a workspace.
+
+### Request Consent
+A one-use authorization for one model operation, one Model Endpoint Identity, and one
+Outbound Scope. Cancellation authorizes nothing; changing any bound part requires another
+decision. Opening, editing, rendering, searching, Skill discovery, context resolution, and
+recovery never create Request Consent and therefore cannot send model data.
+
+### Credential Vault
+The application boundary that resolves session, Windows Credential Manager, and explicitly
+eligible environment credentials without placing their values in settings or UI state after
+storage. A persistent credential is keyed by Model Endpoint Identity and is considered stored
+only after a read-back verifies the write.
+
 ## Trust
 
 ### Trust Level
