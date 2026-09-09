@@ -12,7 +12,10 @@
 //! same here as it did before the split.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::fs::{self as std_fs, File};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -34,7 +37,15 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use mt_doc::review::{
+    ArtifactLens, ByteRange, ClarificationPriority, FindingKind, MAX_SKILL_FILE_BYTES,
+    MAX_SKILL_PACKAGE_BYTES, ReviewDiagnostic, ReviewDiagnosticCode,
+    ReviewRequest as DocumentReviewRequest, ReviewStatus, SkillPackage, SkillPackageError,
+    SkillPackageFile, SkillPackageOmission, SourceAnchor, SourceLocation, SourceSnapshot,
+    StructuredText,
+};
 use mt_doc::translate::{Scope, TranslationRequest};
+use sha2::{Digest as _, Sha256};
 
 use crate::fs;
 use crate::i18n;
@@ -51,6 +62,10 @@ use crate::recovery::{
     RetirementCompletion,
 };
 use crate::renderer::RendererRegistry;
+use crate::review::{
+    PreparedReview, REVIEW_REQUEST_TIMEOUT, ReviewError, ReviewLanguage, ReviewRequestError,
+    ReviewTransportResult,
+};
 use crate::startup::{AcknowledgeStartupInput, InitialStartupState, StartupEvent};
 use crate::translate::PreparedTranslation;
 use crate::views::document::{
@@ -69,6 +84,9 @@ pub(crate) mod web_surface;
 use self::history::History;
 use self::web_surface::WebSurface;
 
+const MAX_AGENT_SKILL_INVENTORY_ENTRIES: usize = 1_024;
+const MAX_AGENT_SKILL_DIRECTORY_DEPTH: usize = 32;
+
 actions!(
     markturbo,
     [
@@ -83,6 +101,9 @@ actions!(
         TranslateDocument,
         TranslateSelection,
         TranslateBlock,
+        ReviewDocument,
+        ReviewSelection,
+        CancelReview,
         CopyPath,
         CopyRelativePath,
         ToggleLeftPanel,
@@ -107,6 +128,9 @@ const WELCOME_OPEN_FILE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-file";
 const WELCOME_OPEN_FOLDER_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-folder";
 const WELCOME_OPEN_SAMPLE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-sample";
 const WELCOME_DONT_SHOW_ACCESSIBILITY_ID: &str = "markturbo-welcome-dont-show-again";
+const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";
+const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";
+const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";
 const WELCOME_KEY_CONTEXT: &str = "Welcome";
 
 fn should_show_welcome(initial: Option<&Path>, show_welcome_on_startup: bool) -> bool {
@@ -882,6 +906,28 @@ pub struct Workspace {
     /// second request would overwrite the editor twice with two different
     /// answers to the same text.
     translating: bool,
+    /// True while a read-only Review request is waiting for consent or a
+    /// provider response. Review never shares this flag with Translation: a
+    /// user may inspect intent while a document translation is idle, but two
+    /// Review requests over one snapshot must not race to replace the result.
+    reviewing: bool,
+    /// Explicit lens corrections belong to their document, not the most
+    /// recently active tab.
+    review_lens_overrides: HashMap<DocumentId, ArtifactLens>,
+    /// The last validated Review result, retained after an edit as stale
+    /// inspection rather than being presented as a description of new text.
+    review_result: Option<WorkspaceReviewResult>,
+    /// A content-free Review diagnostic is retained in the panel so local
+    /// configuration and provider failures remain inspectable after status
+    /// messages expire.
+    review_diagnostic: Option<WorkspaceReviewDiagnostic>,
+    /// A user-selected target awaiting an explicit in-panel Run command. This
+    /// leaves the inferred lens visible and correctable before consent.
+    review_target: Option<ReviewTarget>,
+    review_target_document_id: Option<DocumentId>,
+    pending_review: Option<PendingReview>,
+    review_generation: u64,
+    review_panel_open: bool,
     /// Present while Save / Discard / Cancel is resolving a destructive action.
     pending_destructive: Option<DestructiveRequest>,
     /// True after close is authorized and while the focused platform input
@@ -917,6 +963,953 @@ pub struct Workspace {
 struct DocumentTab {
     view: Entity<DocumentView>,
     _subscriptions: [Subscription; 2],
+}
+
+/// UI-owned metadata around an immutable provider result.
+///
+/// The provider result contains only validated, inert structured data. The
+/// workspace adds the document identity and exact editor snapshot needed to
+/// decide whether it is still current. Selection anchors remain in their
+/// canonical document coordinates, while the selected range only explains
+/// the missing surrounding context in the presentation.
+struct WorkspaceReviewResult {
+    document_id: DocumentId,
+    source_snapshot: crate::lifecycle::AsyncSnapshot,
+    target: ReviewTarget,
+    selection: Option<std::ops::Range<usize>>,
+    lens: ArtifactLens,
+    partial: bool,
+    /// The non-entrypoint sources that were frozen into an Agent Skill
+    /// request. Their identities are rechecked before transport and when a
+    /// result lands, so output can never be presented as current after a
+    /// supporting source has changed.
+    skill_package: Option<FrozenSkillPackage>,
+    supporting_sources_current: bool,
+    result: ReviewTransportResult,
+}
+
+/// UI ownership for a Review diagnostic. It is intentionally separate from a
+/// validated provider result so a failure cannot be mistaken for Review output.
+struct WorkspaceReviewDiagnostic {
+    document_id: DocumentId,
+    lens: ArtifactLens,
+    diagnostic: ReviewDiagnostic,
+}
+
+/// Immutable identity of one in-flight Review. Cancellation can occur after
+/// focus moves to another tab, so its diagnostic must not use active-tab state.
+struct PendingReview {
+    cancelled: Arc<AtomicBool>,
+    document_id: DocumentId,
+    lens: ArtifactLens,
+}
+
+/// How a frozen Agent Skill package obtained its entrypoint content.
+///
+/// An unsaved editor change is an explicit UTF-8 source snapshot even when the
+/// on-disk file was opened through another encoding. A clean non-UTF-8 file is
+/// instead disclosed as metadata only, and remains bound to its raw identity.
+#[derive(Clone)]
+enum SkillEntrypointSource {
+    Disk,
+    EditorText(String),
+}
+
+/// One exact Agent Skill package snapshot. The editor snapshot owns `SKILL.md`;
+/// this additionally identifies every supporting regular file and the complete
+/// disclosed inventory, including omissions.
+#[derive(Clone)]
+struct FrozenSkillPackage {
+    root: PathBuf,
+    skill_entrypoint: SkillEntrypointSource,
+    skill_entrypoint_identity: Option<SkillSupportingFileIdentity>,
+    package: SkillPackage,
+    supporting_files: Vec<SkillSupportingFileIdentity>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SkillSupportingFileIdentity {
+    path: String,
+    byte_size: u64,
+    digest: [u8; 32],
+    modified: Option<std::time::SystemTime>,
+    object_id: Option<fs::FileObjectId>,
+}
+
+struct ReadSkillSupportingFile {
+    bytes: Vec<u8>,
+    identity: SkillSupportingFileIdentity,
+}
+
+impl FrozenSkillPackage {
+    fn revalidate(&self) -> Result<(), ReviewRequestBuildError> {
+        let current = build_frozen_agent_skill_package_with_entrypoint(
+            &self.root,
+            self.skill_entrypoint.clone(),
+        )?;
+        if current.package == self.package
+            && current.skill_entrypoint_identity == self.skill_entrypoint_identity
+            && current.supporting_files == self.supporting_files
+        {
+            Ok(())
+        } else {
+            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
+        }
+    }
+
+    fn contains_supporting_path(&self, candidate: &Path) -> bool {
+        self.supporting_files.iter().any(|file| {
+            skill_package_path(&self.root, &file.path)
+                .is_ok_and(|path| paths_match(&path, candidate))
+        })
+    }
+
+    /// Resolve only an anchor already validated against this exact package.
+    /// The model supplies a relative name, never an executable path or action.
+    fn resolve_anchor(&self, anchor: &SourceAnchor) -> Option<(PathBuf, usize)> {
+        let (path, location) = match anchor {
+            SourceAnchor::AgentSkillFile { path, location } => (path.as_str(), Some(*location)),
+            SourceAnchor::Document { .. } | SourceAnchor::DocumentWide => return None,
+        };
+        let file = self.package.files().iter().find(|file| file.path == path)?;
+        let offset = match location {
+            None => 0,
+            Some(location) => match &file.payload {
+                mt_doc::review::SkillFilePayload::Utf8 { content } => {
+                    let raw_offset = review_location_offset(location, content)?;
+                    skill_editor_offset(content, raw_offset)?
+                }
+                mt_doc::review::SkillFilePayload::RawBinary { .. } => {
+                    let SourceLocation::ByteRange { start, .. } = location else {
+                        return None;
+                    };
+                    usize::try_from(start).ok()?
+                }
+                mt_doc::review::SkillFilePayload::Binary { .. } => return None,
+            },
+        };
+        skill_package_path(&self.root, path)
+            .ok()
+            .map(|path| (path, offset))
+    }
+}
+
+/// `fs::load` removes a UTF-8 BOM and normalizes CRLF to LF for the editor.
+/// Map an anchor in the frozen on-disk UTF-8 source to that loaded buffer.
+fn skill_editor_offset(source: &str, raw_offset: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if raw_offset > bytes.len() || !source.is_char_boundary(raw_offset) {
+        return None;
+    }
+    let bom_length = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) && raw_offset >= 3 {
+        3
+    } else {
+        0
+    };
+    let removed_cr = bytes
+        .iter()
+        .enumerate()
+        .take(raw_offset)
+        .filter(|(index, byte)| **byte == b'\r' && bytes.get(index + 1) == Some(&b'\n'))
+        .count();
+    raw_offset.checked_sub(bom_length + removed_cr)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewTarget {
+    Document,
+    Selection,
+}
+
+fn review_lens_key(lens: ArtifactLens) -> i18n::Key {
+    match lens {
+        ArtifactLens::Prompt => i18n::Key::ReviewLensPrompt,
+        ArtifactLens::Specification | ArtifactLens::Plan => i18n::Key::ReviewLensSpecification,
+        ArtifactLens::AgentInstructions => i18n::Key::ReviewLensAgentInstructions,
+        ArtifactLens::AgentSkill => i18n::Key::ReviewLensAgentSkill,
+    }
+}
+
+fn review_lens_choice_is_selected(choice: ArtifactLens, visible: ArtifactLens) -> bool {
+    choice == visible || (choice == ArtifactLens::Specification && visible == ArtifactLens::Plan)
+}
+
+fn clarification_priority_label(
+    priority: ClarificationPriority,
+    cx: &Context<Workspace>,
+) -> SharedString {
+    match priority {
+        ClarificationPriority::Critical => i18n::t(i18n::Key::ReviewPriorityCritical, cx).into(),
+        ClarificationPriority::High => i18n::t(i18n::Key::ReviewPriorityHigh, cx).into(),
+        ClarificationPriority::Medium => i18n::t(i18n::Key::ReviewPriorityMedium, cx).into(),
+        ClarificationPriority::Low => i18n::t(i18n::Key::ReviewPriorityLow, cx).into(),
+    }
+}
+
+// Kept as an executable specification for the lens-cycle unit test below.
+#[allow(dead_code)]
+fn next_review_lens(lens: ArtifactLens) -> ArtifactLens {
+    match lens {
+        ArtifactLens::Prompt => ArtifactLens::Specification,
+        ArtifactLens::Specification => ArtifactLens::Plan,
+        ArtifactLens::Plan => ArtifactLens::AgentInstructions,
+        ArtifactLens::AgentInstructions => ArtifactLens::AgentSkill,
+        ArtifactLens::AgentSkill => ArtifactLens::Prompt,
+    }
+}
+
+fn push_review_text_section(
+    content: &mut Vec<AnyElement>,
+    label: impl Into<SharedString>,
+    text: &str,
+    cx: &Context<Workspace>,
+) {
+    content.push(
+        v_flex()
+            .gap(metrics::gap())
+            .child(
+                div()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label.into()),
+            )
+            // Deliberately use a plain GPUI text child. Model prose is inert
+            // structured data and must never pass through Markdown/HTML/MDX.
+            .child(div().text_sm().child(text.to_owned()))
+            .into_any_element(),
+    );
+}
+
+fn push_review_text_list(
+    content: &mut Vec<AnyElement>,
+    label: impl Into<SharedString>,
+    values: &[StructuredText],
+    cx: &Context<Workspace>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let label: SharedString = label.into();
+    let rows = values.iter().enumerate().map(|(ix, value)| {
+        ListItem::new(SharedString::from(format!("review-text-{ix}-{label}")))
+            .w_full()
+            .child(div().text_sm().child(value.as_str().to_owned()))
+            .into_any_element()
+    });
+    content.push(
+        v_flex()
+            .gap(metrics::gap())
+            .child(
+                div()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label.clone()),
+            )
+            .children(rows)
+            .into_any_element(),
+    );
+}
+
+fn review_anchor_offset(anchor: &SourceAnchor, source: &str) -> Option<usize> {
+    match anchor {
+        SourceAnchor::Document { location } => review_location_offset(*location, source),
+        // A document-wide finding intentionally does not claim a line. Opening
+        // the document at its beginning still gives it a deterministic target.
+        SourceAnchor::DocumentWide => Some(0),
+        SourceAnchor::AgentSkillFile { .. } => None,
+    }
+}
+
+fn review_location_offset(location: SourceLocation, source: &str) -> Option<usize> {
+    match location {
+        SourceLocation::ByteRange { start, .. } => usize::try_from(start).ok(),
+        SourceLocation::LineRange { start, .. } => {
+            let line = usize::try_from(start).ok()?;
+            if line == 0 {
+                return None;
+            }
+            if line == 1 {
+                return Some(0);
+            }
+            source
+                .match_indices('\n')
+                .nth(line - 2)
+                .map(|(offset, _)| offset + 1)
+        }
+    }
+}
+
+fn review_anchor_label(anchor: &SourceAnchor, cx: &Context<Workspace>) -> String {
+    match anchor {
+        SourceAnchor::DocumentWide => i18n::t(i18n::Key::ReviewDocumentWide, cx).to_string(),
+        SourceAnchor::Document { location } => review_location_label(*location),
+        SourceAnchor::AgentSkillFile { path, location } => {
+            format!("{path}:{}", review_location_label(*location))
+        }
+    }
+}
+
+fn review_location_label(location: SourceLocation) -> String {
+    match location {
+        SourceLocation::ByteRange { start, end } | SourceLocation::LineRange { start, end } => {
+            format!("{start}..{end}")
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ReviewRequestBuildError {
+    AgentSkillRootUnavailable,
+    AgentSkillEntrypointUnavailable,
+    AgentSkillSelectionUnsupported,
+    AgentSkillPathIsNotUtf8,
+    AgentSkillReadFailed,
+    AgentSkillSourceChanged,
+    AgentSkillFileTooLarge { byte_size: u64 },
+    AgentSkillPackageTooLarge { byte_size: u64 },
+    InvalidAgentSkillPackage(SkillPackageError),
+    InvalidSelection,
+    InvalidRequest(mt_doc::review::ReviewValidationError),
+}
+
+impl std::fmt::Display for ReviewRequestBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentSkillRootUnavailable => {
+                formatter.write_str("Agent Skill directory is unavailable")
+            }
+            Self::AgentSkillEntrypointUnavailable => {
+                formatter.write_str("Agent Skill entrypoint is unavailable")
+            }
+            Self::AgentSkillSelectionUnsupported => {
+                formatter.write_str("Agent Skill Review cannot use a selection")
+            }
+            Self::AgentSkillPathIsNotUtf8 => {
+                formatter.write_str("Agent Skill path is not valid UTF-8")
+            }
+            Self::AgentSkillReadFailed => {
+                formatter.write_str("Agent Skill source could not be read")
+            }
+            Self::AgentSkillSourceChanged => {
+                formatter.write_str("Agent Skill source changed while preparing Review")
+            }
+            Self::AgentSkillFileTooLarge { byte_size } => write!(
+                formatter,
+                "Agent Skill file is {byte_size} bytes, above the {MAX_SKILL_FILE_BYTES}-byte source limit"
+            ),
+            Self::AgentSkillPackageTooLarge { byte_size } => write!(
+                formatter,
+                "Agent Skill package is {byte_size} bytes, above the {MAX_SKILL_PACKAGE_BYTES}-byte source limit"
+            ),
+            Self::InvalidAgentSkillPackage(error) => error.fmt(formatter),
+            Self::InvalidSelection => formatter.write_str("selection is outside the frozen source"),
+            Self::InvalidRequest(error) => error.fmt(formatter),
+        }
+    }
+}
+
+fn review_request_build_status_key(error: &ReviewRequestBuildError) -> i18n::Key {
+    match error {
+        ReviewRequestBuildError::AgentSkillRootUnavailable => {
+            i18n::Key::ReviewSkillPackageUnavailable
+        }
+        ReviewRequestBuildError::AgentSkillEntrypointUnavailable => {
+            i18n::Key::ReviewSkillPackageEntrypointMissing
+        }
+        ReviewRequestBuildError::AgentSkillSelectionUnsupported => {
+            i18n::Key::ReviewSkillPackageSelectionUnsupported
+        }
+        ReviewRequestBuildError::AgentSkillPathIsNotUtf8 => {
+            i18n::Key::ReviewSkillPackageNonUtf8Path
+        }
+        ReviewRequestBuildError::AgentSkillReadFailed => i18n::Key::ReviewSkillPackageReadFailed,
+        ReviewRequestBuildError::AgentSkillSourceChanged => i18n::Key::ReviewSkillPackageChanged,
+        ReviewRequestBuildError::AgentSkillFileTooLarge { .. }
+        | ReviewRequestBuildError::AgentSkillPackageTooLarge { .. } => {
+            i18n::Key::ReviewSkillPackageOversized
+        }
+        ReviewRequestBuildError::InvalidAgentSkillPackage(_)
+        | ReviewRequestBuildError::InvalidSelection
+        | ReviewRequestBuildError::InvalidRequest(_) => i18n::Key::ReviewFailed,
+    }
+}
+
+fn is_skill_entrypoint(path: &Path) -> bool {
+    path.file_name() == Some(OsStr::new("SKILL.md"))
+}
+
+struct BuiltDocumentReviewRequest {
+    request: DocumentReviewRequest,
+    skill_package: Option<FrozenSkillPackage>,
+}
+
+fn build_document_review_request_with_identity(
+    target: ReviewTarget,
+    lens: ArtifactLens,
+    source_path: Option<&Path>,
+    full_text: &str,
+    selection: Option<&std::ops::Range<usize>>,
+    snapshot: SourceSnapshot,
+    skill_entrypoint_is_dirty: bool,
+) -> Result<BuiltDocumentReviewRequest, ReviewRequestBuildError> {
+    match target {
+        ReviewTarget::Selection
+            if lens == ArtifactLens::AgentSkill && source_path.is_some_and(is_skill_entrypoint) =>
+        {
+            Err(ReviewRequestBuildError::AgentSkillSelectionUnsupported)
+        }
+        ReviewTarget::Document
+            if lens == ArtifactLens::AgentSkill && source_path.is_some_and(is_skill_entrypoint) =>
+        {
+            let root = source_path
+                .and_then(Path::parent)
+                .ok_or(ReviewRequestBuildError::AgentSkillRootUnavailable)?;
+            let skill_package = build_frozen_agent_skill_package_with_dirty_entrypoint(
+                root,
+                full_text,
+                skill_entrypoint_is_dirty,
+            )?;
+            let request =
+                DocumentReviewRequest::agent_skill(skill_package.package.clone(), snapshot)
+                    .map_err(ReviewRequestBuildError::InvalidRequest)?;
+            Ok(BuiltDocumentReviewRequest {
+                request,
+                skill_package: Some(skill_package),
+            })
+        }
+        _ if lens == ArtifactLens::AgentSkill => {
+            Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable)
+        }
+        ReviewTarget::Document => {
+            let request = DocumentReviewRequest::document(lens, full_text, snapshot)
+                .map_err(ReviewRequestBuildError::InvalidRequest)?;
+            Ok(BuiltDocumentReviewRequest {
+                request,
+                skill_package: None,
+            })
+        }
+        ReviewTarget::Selection => {
+            let range = selection.ok_or(ReviewRequestBuildError::InvalidSelection)?;
+            if range.is_empty() || full_text.get(range.clone()).is_none() {
+                return Err(ReviewRequestBuildError::InvalidSelection);
+            }
+            let absolute_range = ByteRange::new(range.start as u64, range.end as u64)
+                .map_err(ReviewRequestBuildError::InvalidRequest)?;
+            let request =
+                DocumentReviewRequest::selection(lens, full_text, absolute_range, snapshot)
+                    .map_err(ReviewRequestBuildError::InvalidRequest)?;
+            Ok(BuiltDocumentReviewRequest {
+                request,
+                skill_package: None,
+            })
+        }
+    }
+}
+
+fn build_frozen_agent_skill_package_with_dirty_entrypoint(
+    root: &Path,
+    skill_entrypoint_text: &str,
+    skill_entrypoint_is_dirty: bool,
+) -> Result<FrozenSkillPackage, ReviewRequestBuildError> {
+    let entrypoint = if skill_entrypoint_is_dirty {
+        SkillEntrypointSource::EditorText(skill_entrypoint_text.to_owned())
+    } else {
+        SkillEntrypointSource::Disk
+    };
+    build_frozen_agent_skill_package_with_entrypoint(root, entrypoint)
+}
+
+fn build_frozen_agent_skill_package_with_entrypoint(
+    root: &Path,
+    requested_entrypoint: SkillEntrypointSource,
+) -> Result<FrozenSkillPackage, ReviewRequestBuildError> {
+    let root_metadata = std_fs::symlink_metadata(root)
+        .map_err(|_| ReviewRequestBuildError::AgentSkillRootUnavailable)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(ReviewRequestBuildError::AgentSkillRootUnavailable);
+    }
+
+    let mut paths = Vec::new();
+    let mut omissions = Vec::new();
+    let mut held_directories = Vec::new();
+    collect_agent_skill_paths(
+        root,
+        root,
+        &mut paths,
+        &mut omissions,
+        &mut held_directories,
+        0,
+        matches!(&requested_entrypoint, SkillEntrypointSource::EditorText(_)),
+    )?;
+    paths.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let mut files = Vec::with_capacity(paths.len());
+    let mut supporting_files = Vec::with_capacity(paths.len().saturating_sub(1));
+    let mut skill_entrypoint = None;
+    let mut skill_entrypoint_identity = None;
+    let mut total_byte_size = 0_u64;
+    let mut found_entrypoint = false;
+    for relative_path in paths {
+        let (file, byte_size) = if relative_path == "SKILL.md" {
+            found_entrypoint = true;
+            match &requested_entrypoint {
+                SkillEntrypointSource::EditorText(text) => {
+                    skill_entrypoint = Some(SkillEntrypointSource::EditorText(text.clone()));
+                    let byte_size = text.len() as u64;
+                    if byte_size > MAX_SKILL_FILE_BYTES {
+                        return Err(ReviewRequestBuildError::AgentSkillFileTooLarge { byte_size });
+                    }
+                    let file = SkillPackageFile::text(&relative_path, text, "skill entrypoint")
+                        .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?;
+                    (file, byte_size)
+                }
+                SkillEntrypointSource::Disk => {
+                    let source = read_regular_skill_supporting_file(root, &relative_path)?;
+                    skill_entrypoint = Some(SkillEntrypointSource::Disk);
+                    let byte_size = source.identity.byte_size;
+                    let file = skill_package_file_from_disk_bytes(
+                        &relative_path,
+                        &source.bytes,
+                        "skill entrypoint",
+                    )?;
+                    skill_entrypoint_identity = Some(source.identity);
+                    (file, byte_size)
+                }
+            }
+        } else {
+            let source = read_regular_skill_supporting_file(root, &relative_path)?;
+            supporting_files.push(source.identity);
+            let byte_size = source.bytes.len() as u64;
+            let file = skill_package_file_from_disk_bytes(
+                &relative_path,
+                &source.bytes,
+                "supporting file",
+            )?;
+            (file, byte_size)
+        };
+        total_byte_size = total_byte_size.checked_add(byte_size).ok_or(
+            ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                byte_size: u64::MAX,
+            },
+        )?;
+        if total_byte_size > MAX_SKILL_PACKAGE_BYTES {
+            return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                byte_size: total_byte_size,
+            });
+        }
+
+        files.push(file);
+    }
+    if matches!(&requested_entrypoint, SkillEntrypointSource::EditorText(_)) && !found_entrypoint {
+        // A dirty editor snapshot is authoritative for `SKILL.md`. The disk
+        // entrypoint may have been deleted, replaced by a link, become
+        // unreadable, or exceed the source limit while the user is editing;
+        // none of those states should prevent reviewing the valid in-memory
+        // snapshot. Remove only the corresponding disk omission, retaining
+        // every other inventory omission and its partial-result semantics.
+        let had_entrypoint_omission = omissions.iter().any(|omission| omission.path == "SKILL.md");
+        omissions.retain(|omission| omission.path != "SKILL.md");
+        if !had_entrypoint_omission
+            && files.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES
+        {
+            return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                byte_size: u64::MAX,
+            });
+        }
+        let SkillEntrypointSource::EditorText(text) = &requested_entrypoint else {
+            unreachable!("the dirty entrypoint guard above establishes EditorText");
+        };
+        let byte_size = text.len() as u64;
+        if byte_size > MAX_SKILL_FILE_BYTES {
+            return Err(ReviewRequestBuildError::AgentSkillFileTooLarge { byte_size });
+        }
+        let file = SkillPackageFile::text("SKILL.md", text, "skill entrypoint")
+            .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?;
+        total_byte_size = total_byte_size.checked_add(byte_size).ok_or(
+            ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                byte_size: u64::MAX,
+            },
+        )?;
+        if total_byte_size > MAX_SKILL_PACKAGE_BYTES {
+            return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                byte_size: total_byte_size,
+            });
+        }
+        files.push(file);
+        skill_entrypoint = Some(SkillEntrypointSource::EditorText(text.clone()));
+        found_entrypoint = true;
+    }
+    if !found_entrypoint {
+        return Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable);
+    }
+    let skill_entrypoint = skill_entrypoint.expect("found Agent Skill entrypoint has a source");
+    let package = SkillPackage::new(files, omissions)
+        .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?;
+    Ok(FrozenSkillPackage {
+        root: root.to_path_buf(),
+        skill_entrypoint,
+        skill_entrypoint_identity,
+        package,
+        supporting_files,
+    })
+}
+
+fn skill_package_file_from_disk_bytes(
+    relative_path: &str,
+    bytes: &[u8],
+    inclusion_reason: &str,
+) -> Result<SkillPackageFile, ReviewRequestBuildError> {
+    let byte_size = bytes.len() as u64;
+    let file = if mt_doc::walk::bytes_look_binary(bytes) {
+        SkillPackageFile::binary_metadata(
+            relative_path,
+            byte_size,
+            sha256_hex(bytes),
+            inclusion_reason,
+        )
+    } else if let Ok(text) = std::str::from_utf8(bytes) {
+        SkillPackageFile::text(relative_path, text, inclusion_reason)
+    } else {
+        SkillPackageFile::binary_metadata(
+            relative_path,
+            byte_size,
+            sha256_hex(bytes),
+            inclusion_reason,
+        )
+    };
+    file.map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)
+}
+
+fn collect_agent_skill_paths(
+    root: &Path,
+    directory: &Path,
+    paths: &mut Vec<String>,
+    omissions: &mut Vec<SkillPackageOmission>,
+    held_directories: &mut Vec<File>,
+    depth: usize,
+    allow_dirty_entrypoint: bool,
+) -> Result<(), ReviewRequestBuildError> {
+    if depth > MAX_AGENT_SKILL_DIRECTORY_DEPTH
+        || paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES
+    {
+        return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
+            byte_size: u64::MAX,
+        });
+    }
+    if let Some(handle) = hold_regular_skill_directory(directory)? {
+        held_directories.push(handle);
+    }
+    let entries =
+        std_fs::read_dir(directory).map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+        let path = entry.path();
+        let relative_path = normalized_skill_relative_path(root, &path)?;
+        let metadata = match std_fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) if allow_dirty_entrypoint && relative_path == "SKILL.md" => continue,
+            Err(_) => return Err(ReviewRequestBuildError::AgentSkillReadFailed),
+        };
+        if metadata.file_type().is_symlink() {
+            if paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES {
+                return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                    byte_size: u64::MAX,
+                });
+            }
+            omissions.push(
+                SkillPackageOmission::symlink(relative_path, "symbolic link omitted")
+                    .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?,
+            );
+        } else if metadata.is_dir() {
+            collect_agent_skill_paths(
+                root,
+                &path,
+                paths,
+                omissions,
+                held_directories,
+                depth.saturating_add(1),
+                allow_dirty_entrypoint,
+            )?;
+        } else if metadata.is_file() {
+            if paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES {
+                return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                    byte_size: u64::MAX,
+                });
+            }
+            paths.push(relative_path);
+        } else {
+            if paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES {
+                return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
+                    byte_size: u64::MAX,
+                });
+            }
+            omissions.push(
+                SkillPackageOmission::new(relative_path, "non-regular file omitted", false)
+                    .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Keep directories open with delete/write sharing denied on Windows while a
+/// package snapshot is assembled. Together with no-follow file opens, this
+/// prevents a checked directory from being swapped to a symlink before a child
+/// is read. Other targets use descriptor-relative no-follow opens below.
+#[cfg(windows)]
+fn hold_regular_skill_directory(path: &Path) -> Result<Option<File>, ReviewRequestBuildError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
+    };
+
+    let file = std_fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(not(windows))]
+fn hold_regular_skill_directory(path: &Path) -> Result<Option<File>, ReviewRequestBuildError> {
+    let metadata = std_fs::symlink_metadata(path)
+        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
+    }
+    Ok(None)
+}
+
+fn read_regular_skill_supporting_file(
+    root: &Path,
+    relative_path: &str,
+) -> Result<ReadSkillSupportingFile, ReviewRequestBuildError> {
+    let mut file = open_regular_skill_file(root, relative_path)
+        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    let before = file
+        .metadata()
+        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    if !opened_skill_file_is_regular(&before) {
+        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
+    }
+    if before.len() > MAX_SKILL_FILE_BYTES {
+        return Err(ReviewRequestBuildError::AgentSkillFileTooLarge {
+            byte_size: before.len(),
+        });
+    }
+    let object_id =
+        fs::file_object_id(&file).map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    file.by_ref()
+        .take(MAX_SKILL_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    if bytes.len() as u64 > MAX_SKILL_FILE_BYTES {
+        return Err(ReviewRequestBuildError::AgentSkillFileTooLarge {
+            byte_size: bytes.len() as u64,
+        });
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
+    if !opened_skill_file_is_regular(&after) || after.len() != bytes.len() as u64 {
+        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
+    }
+    Ok(ReadSkillSupportingFile {
+        identity: SkillSupportingFileIdentity {
+            path: relative_path.to_owned(),
+            byte_size: after.len(),
+            digest: Sha256::digest(&bytes).into(),
+            modified: after.modified().ok(),
+            object_id,
+        },
+        bytes,
+    })
+}
+
+#[cfg(windows)]
+fn open_regular_skill_file(root: &Path, relative_path: &str) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+
+    std_fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(skill_package_path(root, relative_path).map_err(invalid_skill_path_error)?)
+}
+
+#[cfg(target_os = "linux")]
+const UNIX_O_NOFOLLOW: i32 = 0o400000;
+
+// Darwin's `<fcntl.h>` value. Keep this target-specific rather than falling
+// back to a metadata check: a metadata check cannot close the link-swap race.
+#[cfg(target_os = "macos")]
+const UNIX_O_NOFOLLOW: i32 = 0x100;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_regular_skill_file(root: &Path, relative_path: &str) -> std::io::Result<File> {
+    open_regular_skill_file_at(root, relative_path, UNIX_O_NOFOLLOW)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn open_regular_skill_file(_: &Path, _: &str) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no descriptor-relative no-follow skill file open is available on this target",
+    ))
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn open_regular_skill_file_at(
+    root: &Path,
+    relative_path: &str,
+    no_follow: i32,
+) -> std::io::Result<File> {
+    use std::ffi::{CString, c_char, c_int};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    unsafe extern "C" {
+        fn openat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    }
+
+    let components =
+        validated_skill_relative_components(relative_path).map_err(invalid_skill_path_error)?;
+    let mut directory = std_fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(no_follow)
+        .open(root)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::other("Agent Skill root is not a directory"));
+    }
+    for (index, component) in components.iter().enumerate() {
+        let component = CString::new(*component)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        // SAFETY: `directory` owns the live directory descriptor; `component`
+        // is a NUL-terminated component with no separators; `openat` returns a
+        // newly owned descriptor only on a non-negative result.
+        let descriptor = unsafe { openat(directory.as_raw_fd(), component.as_ptr(), no_follow) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new owned descriptor above.
+        let next = unsafe { File::from_raw_fd(descriptor) };
+        if index + 1 == components.len() {
+            return Ok(next);
+        }
+        if !next.metadata()?.is_dir() {
+            return Err(std::io::Error::other(
+                "Agent Skill path component is not a directory",
+            ));
+        }
+        directory = next;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "Agent Skill supporting path is empty",
+    ))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn open_regular_skill_file(_: &Path, _: &str) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no no-follow skill file open is available on this target",
+    ))
+}
+
+#[cfg(windows)]
+fn opened_skill_file_is_regular(metadata: &std_fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
+}
+
+#[cfg(not(windows))]
+fn opened_skill_file_is_regular(metadata: &std_fs::Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink()
+}
+
+fn skill_package_path(
+    root: &Path,
+    relative_path: &str,
+) -> Result<PathBuf, ReviewRequestBuildError> {
+    let mut path = root.to_path_buf();
+    for component in validated_skill_relative_components(relative_path)? {
+        path.push(component);
+    }
+    Ok(path)
+}
+
+fn validated_skill_relative_components(
+    relative_path: &str,
+) -> Result<Vec<&str>, ReviewRequestBuildError> {
+    let components = relative_path.split('/').collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
+    }
+    // On Unix, backslash is a legal filename byte. `mt-doc` normalizes it to
+    // `/` at the package boundary, though, so accepting it here would make
+    // the path we discovered differ from the path we later reopen.
+    #[cfg(unix)]
+    if components.iter().any(|component| component.contains('\\')) {
+        return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
+    }
+    Ok(components)
+}
+
+fn invalid_skill_path_error(error: ReviewRequestBuildError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+}
+
+fn normalized_skill_relative_path(
+    root: &Path,
+    path: &Path,
+) -> Result<String, ReviewRequestBuildError> {
+    let relative_path = path
+        .strip_prefix(root)
+        .map_err(|_| ReviewRequestBuildError::AgentSkillPathIsNotUtf8)?;
+    let mut components = Vec::new();
+    for component in relative_path.components() {
+        let Component::Normal(component) = component else {
+            return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
+        };
+        components.push(
+            component
+                .to_str()
+                .ok_or(ReviewRequestBuildError::AgentSkillPathIsNotUtf8)?,
+        );
+    }
+    if components.is_empty() {
+        return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
+    }
+    let normalized = components.join("/");
+    validated_skill_relative_components(&normalized)?;
+    Ok(normalized)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 struct DocumentRecoveryState {
@@ -1097,6 +2090,63 @@ impl Workspace {
     fn document_at(&self, ix: usize) -> Option<&Entity<DocumentView>> {
         self.tabs.get(ix).map(|t| &t.payload.view)
     }
+
+    fn has_dirty_skill_supporting_document(&self, package: &FrozenSkillPackage, cx: &App) -> bool {
+        self.document_views().into_iter().any(|document| {
+            let document = document.read(cx);
+            document.is_dirty()
+                && document
+                    .source_path()
+                    .is_some_and(|path| package.contains_supporting_path(path))
+        })
+    }
+
+    fn mark_review_stale_for_document(
+        &mut self,
+        document: &Entity<DocumentView>,
+        cx: &mut Context<Self>,
+    ) {
+        let (document_id, source_path, source_snapshot, is_dirty) = {
+            let document = document.read(cx);
+            (
+                document.id(),
+                document.source_path().map(Path::to_path_buf),
+                document.async_snapshot(cx),
+                document.is_dirty(),
+            )
+        };
+        let mut changed = false;
+        if let Some(review) = &mut self.review_result {
+            // A Review over this document is no longer current as soon as the
+            // editor emits its authoritative edit event. Keep the semantic
+            // stale status in the document-domain result as well as the UI
+            // metadata so consumers cannot mistake the output for current.
+            if review.document_id == document_id && review.source_snapshot != source_snapshot {
+                review.result.result.status = ReviewStatus::Stale;
+                changed = true;
+            }
+
+            // Supporting files are not editor sources of the entrypoint
+            // snapshot, so their dirty transition needs its own invalidation
+            // bit. A dirty buffer is deliberately enough; the background
+            // watcher handles clean on-disk changes.
+            if is_dirty
+                && source_path.as_deref().is_some_and(|source_path| {
+                    review
+                        .skill_package
+                        .as_ref()
+                        .is_some_and(|package| package.contains_supporting_path(source_path))
+                })
+            {
+                review.supporting_sources_current = false;
+                review.result.result.status = ReviewStatus::Stale;
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
 }
 
 impl Workspace {
@@ -1173,6 +2223,15 @@ impl Workspace {
             left_panel_open: true,
             right_panel_open: true,
             translating: false,
+            reviewing: false,
+            review_lens_overrides: HashMap::new(),
+            review_result: None,
+            review_diagnostic: None,
+            review_target: None,
+            review_target_document_id: None,
+            pending_review: None,
+            review_generation: 0,
+            review_panel_open: false,
             pending_destructive: None,
             window_close_pending: false,
             window_close_ready: false,
@@ -1715,11 +2774,13 @@ impl Workspace {
                         this.prompt_save_as(id, window, cx);
                     }
                     DocumentEvent::Edited => {
+                        this.mark_review_stale_for_document(document, cx);
                         let key = document.read(cx).recovery_key();
                         this.pending_recovery_retirements.remove(&key);
                         this.arm_document_recovery(document, cx);
                     }
                     DocumentEvent::DirtyChanged => {
+                        this.mark_review_stale_for_document(document, cx);
                         if !document.read(cx).is_dirty() {
                             let id = document.read(cx).id();
                             let current_key = document.read(cx).recovery_key();
@@ -2740,6 +3801,8 @@ impl Workspace {
             // buffer. Cancel its deadline before invalidating any checkpoint
             // capability held by an already-running worker.
             self.retire_document_recovery(id, None, cx);
+            self.cancel_pending_review_for_document(id, cx);
+            self.review_lens_overrides.remove(&id);
         }
         let Some((closed, _dropped)) = self.tabs.close(ix) else {
             return;
@@ -3849,6 +4912,22 @@ impl Workspace {
             return;
         }
 
+        // The editor snapshot covers `SKILL.md`; an Agent Skill Review also
+        // owns every supporting package path. A watcher signal under that root
+        // makes the frozen result stale immediately, without rereading files
+        // from render or risking a current-looking result after an edit.
+        let review_supporting_source_changed = self.review_result.as_ref().is_some_and(|review| {
+            review.skill_package.as_ref().is_some_and(|package| {
+                changes
+                    .iter()
+                    .any(|change| change.path().starts_with(&package.root))
+            })
+        });
+        if review_supporting_source_changed && let Some(review) = &mut self.review_result {
+            review.supporting_sources_current = false;
+            review.result.result.status = ReviewStatus::Stale;
+        }
+
         let tree_changed = changes
             .iter()
             .any(|change| change.affects_tree() && change.path().starts_with(watcher_root));
@@ -4354,6 +5433,827 @@ impl Workspace {
         self.translate(Scope::Block(cursor), window, cx);
     }
 
+    fn on_review_document(&mut self, _: &ReviewDocument, _: &mut Window, cx: &mut Context<Self>) {
+        if self.reviewing {
+            return;
+        }
+        self.open_review_panel(ReviewTarget::Document, cx);
+    }
+
+    fn on_review_selection(&mut self, _: &ReviewSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.reviewing {
+            return;
+        }
+        self.open_review_panel(ReviewTarget::Selection, cx);
+    }
+
+    fn on_cancel_review(&mut self, _: &CancelReview, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_review.take() else {
+            return;
+        };
+        pending.cancelled.store(true, Ordering::Release);
+        self.review_generation = self.review_generation.wrapping_add(1);
+        self.reviewing = false;
+        self.set_review_diagnostic(
+            pending.document_id,
+            pending.lens,
+            ReviewDiagnostic::new(
+                ReviewDiagnosticCode::Cancelled,
+                i18n::t(i18n::Key::ReviewCancelled, cx).to_string(),
+            ),
+            cx,
+        );
+        self.set_status(i18n::t(i18n::Key::ReviewCancelled, cx).into(), cx);
+    }
+
+    fn cancel_pending_review_for_document(
+        &mut self,
+        document_id: DocumentId,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pending_review
+            .as_ref()
+            .is_none_or(|pending| pending.document_id != document_id)
+        {
+            return;
+        }
+        let pending = self
+            .pending_review
+            .take()
+            .expect("matching Review is pending");
+        pending.cancelled.store(true, Ordering::Release);
+        self.review_generation = self.review_generation.wrapping_add(1);
+        self.reviewing = false;
+        if self.review_target_document_id == Some(document_id) {
+            self.review_target = None;
+            self.review_target_document_id = None;
+        }
+        self.review_panel_open = false;
+        self.set_status(i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(), cx);
+        cx.notify();
+    }
+
+    /// Make the inferred lens observable and correctable before any outbound
+    /// consent is requested. The actual request begins only from the Review
+    /// panel's explicit Run command.
+    fn open_review_panel(&mut self, target: ReviewTarget, cx: &mut Context<Self>) {
+        let Some(document) = self.active_document() else {
+            return;
+        };
+        let document_id = document.read(cx).id();
+        self.review_result = None;
+        self.review_diagnostic = None;
+        self.review_target = Some(target);
+        self.review_target_document_id = Some(document_id);
+        self.review_panel_open = true;
+        self.right_panel_open = true;
+        cx.notify();
+    }
+
+    /// Forget a Review panel and invalidate every pending completion before it
+    /// can make the panel visible again.
+    fn dismiss_review(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_review.take() {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.review_generation = self.review_generation.wrapping_add(1);
+        self.reviewing = false;
+        self.review_panel_open = false;
+        self.review_result = None;
+        self.review_diagnostic = None;
+        self.review_target = None;
+        self.review_target_document_id = None;
+        cx.notify();
+    }
+
+    /// Continue Review after the potentially expensive Agent Skill inventory
+    /// has been frozen on the background executor. This method runs on the UI
+    /// thread: it owns document checks, consent presentation, and all UI state
+    /// mutations. The provider request remains bound to the frozen inventory.
+    #[allow(clippy::too_many_arguments)]
+    fn start_review_after_preparation(
+        &mut self,
+        built_request: Result<BuiltDocumentReviewRequest, ReviewRequestBuildError>,
+        target: ReviewTarget,
+        document_id: DocumentId,
+        lens: ArtifactLens,
+        language: ReviewLanguage,
+        selection: Option<std::ops::Range<usize>>,
+        source_snapshot: crate::lifecycle::AsyncSnapshot,
+        doc: WeakEntity<DocumentView>,
+        generation: u64,
+        cancelled: Arc<AtomicBool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.review_generation != generation || cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(document) = doc.upgrade() else {
+            self.reviewing = false;
+            self.pending_review = None;
+            self.set_status(i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(), cx);
+            return;
+        };
+        if document.read(cx).async_snapshot(cx) != source_snapshot {
+            self.reviewing = false;
+            self.pending_review = None;
+            self.set_review_diagnostic(
+                document_id,
+                lens,
+                ReviewDiagnostic::new(
+                    ReviewDiagnosticCode::InvalidRequest,
+                    i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string(),
+                ),
+                cx,
+            );
+            return;
+        }
+
+        let built_request = match built_request {
+            Ok(request) => request,
+            Err(error) => {
+                log::debug!("Review request preparation failed: {error}");
+                self.reviewing = false;
+                self.pending_review = None;
+                self.set_review_diagnostic(
+                    document_id,
+                    lens,
+                    self.review_build_diagnostic(&error, cx),
+                    cx,
+                );
+                return;
+            }
+        };
+        let partial = built_request
+            .request
+            .source
+            .package()
+            .is_some_and(SkillPackage::is_partial);
+        let skill_package = built_request.skill_package;
+        if let Some(skill_package) = &skill_package
+            && self.has_dirty_skill_supporting_document(skill_package, cx)
+        {
+            self.reviewing = false;
+            self.pending_review = None;
+            self.set_review_diagnostic(
+                document_id,
+                lens,
+                ReviewDiagnostic::new(
+                    ReviewDiagnosticCode::InvalidRequest,
+                    i18n::t(i18n::Key::ReviewSkillPackageChanged, cx).to_string(),
+                ),
+                cx,
+            );
+            return;
+        }
+
+        let settings = crate::settings::AppSettings::global(cx).clone();
+        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let prepared = match PreparedReview::from_settings(&settings, &vault) {
+            Ok(prepared) => match prepared.bind_document_request(built_request.request, language) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.reviewing = false;
+                    self.pending_review = None;
+                    self.set_review_diagnostic(
+                        document_id,
+                        lens,
+                        self.review_error_diagnostic(&error, cx),
+                        cx,
+                    );
+                    return;
+                }
+            },
+            Err(error) => {
+                self.reviewing = false;
+                self.pending_review = None;
+                self.set_review_diagnostic(
+                    document_id,
+                    lens,
+                    self.review_error_diagnostic(&error, cx),
+                    cx,
+                );
+                return;
+            }
+        };
+        let prompt_description = i18n::model_request_disclosure(prepared.disclosure(), cx);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            i18n::t(i18n::Key::ModelRequestConsentTitle, cx),
+            Some(&prompt_description),
+            &[
+                PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx)),
+                PromptButton::cancel(i18n::t(i18n::Key::Cancel, cx)),
+            ],
+            cx,
+        );
+
+        let pending = Arc::new(Mutex::new(Some(prepared)));
+        let selection_for_result = selection.clone();
+        let lens_for_result = lens;
+        let skill_package_for_result = skill_package.clone();
+        let cancelled_for_request = cancelled.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let approved = answer.await.unwrap_or(1) == 0;
+            let pending = pending.clone();
+
+            loop {
+                let pending = pending.clone();
+                let doc = doc.clone();
+                let source_snapshot = source_snapshot.clone();
+                let cancelled = cancelled_for_request.clone();
+                let selection = selection_for_result.clone();
+                let partial = partial;
+                let skill_package = skill_package_for_result.clone();
+                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
+                    let Some(prepared) = pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    else {
+                        return;
+                    };
+
+                    if this.review_generation != generation || cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if !approved {
+                        this.reviewing = false;
+                        this.pending_review = None;
+                        this.set_review_diagnostic(
+                            document_id,
+                            lens_for_result,
+                            ReviewDiagnostic::new(
+                                ReviewDiagnosticCode::Cancelled,
+                                i18n::t(i18n::Key::ReviewCancelled, cx).to_string(),
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+
+                    let Some(document) = doc.upgrade() else {
+                        this.reviewing = false;
+                        this.pending_review = None;
+                        this.set_status(i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(), cx);
+                        return;
+                    };
+                    if document.read(cx).async_snapshot(cx) != source_snapshot {
+                        this.reviewing = false;
+                        this.pending_review = None;
+                        this.set_review_diagnostic(
+                            document_id,
+                            lens_for_result,
+                            ReviewDiagnostic::new(
+                                ReviewDiagnosticCode::InvalidRequest,
+                                i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string(),
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+                    if let Some(skill_package) = &skill_package
+                        && this.has_dirty_skill_supporting_document(skill_package, cx)
+                    {
+                        this.reviewing = false;
+                        this.pending_review = None;
+                        this.set_review_diagnostic(
+                            document_id,
+                            lens_for_result,
+                            ReviewDiagnostic::new(
+                                ReviewDiagnosticCode::InvalidRequest,
+                                i18n::t(i18n::Key::ReviewSkillPackageChanged, cx).to_string(),
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+
+                    // Revalidation belongs before authorization. The frozen
+                    // package is checked on a background executor, then the UI
+                    // rechecks generation, document snapshot, and dirty
+                    // supporting buffers before creating the authorization.
+                    let pending = Arc::new(Mutex::new(Some(prepared)));
+                    let package_for_revalidation = skill_package.clone();
+                    let cancelled_for_revalidation = cancelled.clone();
+                    cx.spawn_in(window, async move |this, cx| {
+                        let revalidation = cx
+                            .background_spawn(async move {
+                                package_for_revalidation
+                                    .map_or(Ok(()), |package| package.revalidate())
+                            })
+                            .await;
+                        let revalidation = Arc::new(Mutex::new(Some(revalidation)));
+                        loop {
+                            let revalidation = revalidation.clone();
+                            let pending = pending.clone();
+                            let doc = doc.clone();
+                            let source_snapshot = source_snapshot.clone();
+                            let selection = selection.clone();
+                            let partial = partial;
+                            let skill_package = skill_package.clone();
+                            let cancelled = cancelled_for_revalidation.clone();
+                            if crate::views::try_update_in(&this, cx, move |this, window, cx| {
+                                let Some(revalidation) = revalidation
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .take()
+                                else {
+                                    return;
+                                };
+                                let Some(prepared) = pending
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .take()
+                                else {
+                                    return;
+                                };
+                                if this.review_generation != generation
+                                    || cancelled.load(Ordering::Acquire)
+                                {
+                                    return;
+                                }
+                                let Some(document) = doc.upgrade() else {
+                                    this.reviewing = false;
+                                    this.pending_review = None;
+                                    this.set_status(
+                                        i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(),
+                                        cx,
+                                    );
+                                    return;
+                                };
+                                if document.read(cx).async_snapshot(cx) != source_snapshot {
+                                    this.reviewing = false;
+                                    this.pending_review = None;
+                                    this.set_review_diagnostic(
+                                        document_id,
+                                        lens_for_result,
+                                        ReviewDiagnostic::new(
+                                            ReviewDiagnosticCode::InvalidRequest,
+                                            i18n::t(i18n::Key::ReviewDocumentChanged, cx)
+                                                .to_string(),
+                                        ),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                if let Some(skill_package) = &skill_package
+                                    && this.has_dirty_skill_supporting_document(skill_package, cx)
+                                {
+                                    this.reviewing = false;
+                                    this.pending_review = None;
+                                    this.set_review_diagnostic(
+                                        document_id,
+                                        lens_for_result,
+                                        ReviewDiagnostic::new(
+                                            ReviewDiagnosticCode::InvalidRequest,
+                                            i18n::t(
+                                                i18n::Key::ReviewSkillPackageChanged,
+                                                cx,
+                                            )
+                                            .to_string(),
+                                        ),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                if let Err(error) = revalidation {
+                                    this.reviewing = false;
+                                    this.pending_review = None;
+                                    this.set_review_diagnostic(
+                                        document_id,
+                                        lens_for_result,
+                                        this.review_build_diagnostic(&error, cx),
+                                        cx,
+                                    );
+                                    return;
+                                }
+
+                                let mut consent = ConsentCapability::from_decision(
+                                    prepared.disclosure(),
+                                    ConsentDecision::Approve,
+                                );
+                                let authorization = match prepared.authorize(&mut consent) {
+                                    Ok(authorization) => authorization,
+                                    Err(error) => {
+                                        this.reviewing = false;
+                                        this.pending_review = None;
+                                        this.set_review_diagnostic(
+                                            document_id,
+                                            lens_for_result,
+                                            this.review_error_diagnostic(&error, cx),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                };
+                                let cancel_for_request = cancelled.clone();
+                                this.set_status(
+                                    i18n::t(i18n::Key::ReviewWaiting, cx).into(),
+                                    cx,
+                                );
+                                cx.spawn_in(window, async move |this, cx| {
+                                    let result = cx
+                                        .background_spawn(async move {
+                                            prepared.execute_with(
+                                                authorization,
+                                                &cancel_for_request,
+                                                REVIEW_REQUEST_TIMEOUT,
+                                            )
+                                        })
+                                        .await;
+                                    let package_for_completion_revalidation = skill_package.clone();
+                                    let supporting_sources_revalidated = cx
+                                            .background_spawn(async move {
+                                            package_for_completion_revalidation
+                                                .is_none_or(|package| package.revalidate().is_ok())
+                                        })
+                                        .await;
+                                    let result = Arc::new(Mutex::new(Some(result)));
+                                    loop {
+                                        let result = result.clone();
+                                        let doc = doc.clone();
+                                        let source_snapshot = source_snapshot.clone();
+                                        let selection = selection.clone();
+                                        let partial = partial;
+                                        let skill_package = skill_package.clone();
+                                        if crate::views::try_update_in(&this, cx, move |this, _, cx| {
+                                            let Some(result) = result
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .take()
+                                            else {
+                                                return;
+                                            };
+                                            if this.review_generation != generation {
+                                                return;
+                                            }
+                                            this.reviewing = false;
+                                            this.pending_review = None;
+                                            match result {
+                                                Ok(mut result) => {
+                                                    let Some(document) = doc.upgrade() else {
+                                                        this.set_status(
+                                                            i18n::t(
+                                                                i18n::Key::ReviewDocumentClosed,
+                                                                cx,
+                                                            )
+                                                            .into(),
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    };
+                                                    let supporting_sources_current =
+                                                        skill_package.as_ref().is_none_or(|package| {
+                                                            supporting_sources_revalidated
+                                                                && !this
+                                                                    .has_dirty_skill_supporting_document(
+                                                                        package, cx,
+                                                                    )
+                                                        });
+                                                    let stale = document.read(cx).async_snapshot(cx)
+                                                        != source_snapshot
+                                                        || !supporting_sources_current;
+                                                    if stale {
+                                                        result.result.status = ReviewStatus::Stale;
+                                                    }
+                                                    let document_id = document.read(cx).id();
+                                                    this.review_result = Some(WorkspaceReviewResult {
+                                                        document_id,
+                                                        source_snapshot,
+                                                        target,
+                                                        selection,
+                                                        lens: lens_for_result,
+                                                        partial,
+                                                        skill_package,
+                                                        supporting_sources_current,
+                                                        result,
+                                                    });
+                                                    this.review_diagnostic = None;
+                                                    this.review_target = None;
+                                                    this.review_target_document_id = None;
+                                                    this.review_panel_open = true;
+                                                    this.set_status(
+                                                        i18n::t(
+                                                            if stale {
+                                                                i18n::Key::ReviewStale
+                                                            } else {
+                                                                i18n::Key::ReviewReady
+                                                            },
+                                                            cx,
+                                                        )
+                                                        .into(),
+                                                        cx,
+                                                    );
+                                                }
+                                                Err(error) => {
+                                                    this.set_review_diagnostic(
+                                                        document_id,
+                                                        lens_for_result,
+                                                        this.review_error_diagnostic(&error, cx),
+                                                        cx,
+                                                    );
+                                                }
+                                            }
+                                        })
+                                        .is_some()
+                                        {
+                                            break;
+                                        }
+                                        if this.upgrade().is_none() {
+                                            break;
+                                        }
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(1))
+                                            .await;
+                                    }
+                                })
+                                .detach();
+                            })
+                            .is_some()
+                            {
+                                break;
+                            }
+                            if this.upgrade().is_none() {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1))
+                                .await;
+                        }
+                    })
+                    .detach();
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Run a read-only Review over a frozen editor snapshot.
+    ///
+    /// Consent is bound to the exact provider disclosure and is consumed once.
+    /// The request is rechecked against the same snapshot after consent and
+    /// before transport; a result that lands after an edit is retained only as
+    /// stale inspection. Review never mutates editor source text.
+    fn review(&mut self, target: ReviewTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc) = self.active_document().cloned() else {
+            return;
+        };
+        let (document_id, source_path, skill_entrypoint_is_dirty) = {
+            let document = doc.read(cx);
+            (
+                document.id(),
+                document.source_path().map(Path::to_path_buf),
+                document.is_dirty(),
+            )
+        };
+        let source_snapshot = doc.read(cx).async_snapshot(cx);
+        let full_text = source_snapshot.text().to_owned();
+        // Infer a conservative first lens from the path. Once the user has
+        // corrected it in the Review panel, keep that choice for this tab.
+        let lens = self.visible_review_lens(cx);
+
+        // An attempted Review supersedes the previously displayed operation
+        // even when its scope is invalid or its provider is unavailable.
+        self.review_result = None;
+        self.review_diagnostic = None;
+        self.review_target = Some(target);
+        self.review_target_document_id = Some(document_id);
+        self.review_panel_open = true;
+        self.right_panel_open = true;
+        cx.notify();
+        let selection = match target {
+            ReviewTarget::Document => None,
+            ReviewTarget::Selection => {
+                let range = doc.read(cx).selection(cx);
+                if range.is_empty() {
+                    self.set_review_diagnostic(
+                        document_id,
+                        lens,
+                        ReviewDiagnostic::new(
+                            ReviewDiagnosticCode::EmptySelection,
+                            i18n::t(i18n::Key::ReviewEmptySelection, cx).to_string(),
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+                if full_text.get(range.clone()).is_none() {
+                    self.set_review_diagnostic(
+                        document_id,
+                        lens,
+                        ReviewDiagnostic::new(
+                            ReviewDiagnosticCode::InvalidRequest,
+                            i18n::t(i18n::Key::ReviewFailed, cx).to_string(),
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+                Some(range)
+            }
+        };
+
+        let language = match crate::settings::AppSettings::global(cx).language {
+            crate::settings::Language::English => ReviewLanguage::English,
+            crate::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
+        };
+        let document_snapshot =
+            SourceSnapshot::new(doc.read(cx).revision(), source_snapshot.source_generation());
+        let generation = self.review_generation.wrapping_add(1);
+        self.review_generation = generation;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.pending_review = Some(PendingReview {
+            cancelled: cancelled.clone(),
+            document_id,
+            lens,
+        });
+        self.reviewing = true;
+        self.review_panel_open = true;
+        self.right_panel_open = true;
+        self.set_status(i18n::t(i18n::Key::ReviewWaiting, cx).into(), cx);
+
+        let doc = doc.downgrade();
+        let source_path_for_prepare = source_path.clone();
+        let full_text_for_prepare = full_text.clone();
+        let selection_for_prepare = selection.clone();
+        let selection_for_result = selection.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let built_request = cx
+                .background_spawn(async move {
+                    build_document_review_request_with_identity(
+                        target,
+                        lens,
+                        source_path_for_prepare.as_deref(),
+                        &full_text_for_prepare,
+                        selection_for_prepare.as_ref(),
+                        document_snapshot,
+                        skill_entrypoint_is_dirty,
+                    )
+                })
+                .await;
+            let built_request = Arc::new(Mutex::new(Some(built_request)));
+            loop {
+                let built_request = built_request.clone();
+                let selection_for_update = selection_for_result.clone();
+                let source_snapshot_for_update = source_snapshot.clone();
+                let doc_for_update = doc.clone();
+                let cancelled_for_update = cancelled.clone();
+                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
+                    let Some(built_request) = built_request
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    else {
+                        return;
+                    };
+                    this.start_review_after_preparation(
+                        built_request,
+                        target,
+                        document_id,
+                        lens,
+                        language,
+                        selection_for_update,
+                        source_snapshot_for_update,
+                        doc_for_update,
+                        generation,
+                        cancelled_for_update,
+                        window,
+                        cx,
+                    );
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn set_review_diagnostic(
+        &mut self,
+        document_id: DocumentId,
+        lens: ArtifactLens,
+        diagnostic: ReviewDiagnostic,
+        cx: &mut Context<Self>,
+    ) {
+        let status = diagnostic.message.as_str().to_owned();
+        self.review_result = None;
+        self.review_diagnostic = Some(WorkspaceReviewDiagnostic {
+            document_id,
+            lens,
+            diagnostic,
+        });
+        self.review_panel_open = true;
+        self.right_panel_open = true;
+        self.set_status(status, cx);
+    }
+
+    fn review_build_diagnostic(
+        &self,
+        error: &ReviewRequestBuildError,
+        cx: &Context<Self>,
+    ) -> ReviewDiagnostic {
+        let code = match error {
+            ReviewRequestBuildError::InvalidSelection => ReviewDiagnosticCode::EmptySelection,
+            ReviewRequestBuildError::AgentSkillFileTooLarge { .. }
+            | ReviewRequestBuildError::AgentSkillPackageTooLarge { .. } => {
+                ReviewDiagnosticCode::OversizedPayload
+            }
+            _ => ReviewDiagnosticCode::InvalidRequest,
+        };
+        ReviewDiagnostic::new(
+            code,
+            i18n::t(review_request_build_status_key(error), cx).to_string(),
+        )
+    }
+
+    fn review_error_diagnostic(&self, error: &ReviewError, cx: &Context<Self>) -> ReviewDiagnostic {
+        let (code, key) = match error {
+            ReviewError::NoAvailableCredential => (
+                ReviewDiagnosticCode::NoProvider,
+                i18n::Key::ReviewNoProvider,
+            ),
+            ReviewError::MissingCredential { .. } => (
+                ReviewDiagnosticCode::Unavailable,
+                i18n::Key::ReviewMissingCredential,
+            ),
+            ReviewError::RequestTooLarge { .. }
+            | ReviewError::ResponseTooLarge { .. }
+            | ReviewError::InvalidRequest {
+                reason:
+                    ReviewRequestError::FileTooLarge { .. } | ReviewRequestError::SourceTooLarge { .. },
+            } => (
+                ReviewDiagnosticCode::OversizedPayload,
+                i18n::Key::ReviewOversized,
+            ),
+            ReviewError::Cancelled { .. } => {
+                (ReviewDiagnosticCode::Cancelled, i18n::Key::ReviewCancelled)
+            }
+            ReviewError::Timeout { .. } => {
+                (ReviewDiagnosticCode::Timeout, i18n::Key::ReviewTimeout)
+            }
+            ReviewError::MalformedResponse { .. } | ReviewError::MissingResponseText { .. } => (
+                ReviewDiagnosticCode::MalformedResponse,
+                i18n::Key::ReviewMalformed,
+            ),
+            ReviewError::TransportUnavailable { .. } | ReviewError::RequestFailed { .. } => (
+                ReviewDiagnosticCode::Unavailable,
+                i18n::Key::ReviewUnavailable,
+            ),
+            ReviewError::InvalidRequest { .. } => (
+                ReviewDiagnosticCode::InvalidRequest,
+                i18n::Key::ReviewFailed,
+            ),
+            _ => (ReviewDiagnosticCode::Unavailable, i18n::Key::ReviewFailed),
+        };
+        ReviewDiagnostic::new(code, i18n::t(key, cx).to_string())
+    }
+
+    fn visible_review_lens(&self, cx: &Context<Self>) -> ArtifactLens {
+        let Some(document) = self.active_document() else {
+            return ArtifactLens::default_lens();
+        };
+        let document = document.read(cx);
+        let document_id = document.id();
+        if let Some(lens) = self.review_lens_overrides.get(&document_id) {
+            return *lens;
+        }
+        if let Some(result) = &self.review_result
+            && result.document_id == document_id
+        {
+            return result.lens;
+        }
+        if let Some(diagnostic) = &self.review_diagnostic
+            && diagnostic.document_id == document_id
+        {
+            return diagnostic.lens;
+        }
+        document
+            .source_path()
+            .map(ArtifactLens::infer_from_path)
+            .unwrap_or_else(ArtifactLens::default_lens)
+    }
+
     fn test_model_credential(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.translating {
             return;
@@ -4629,6 +6529,394 @@ impl Workspace {
 
     // --- Rendering --------------------------------------------------------
 
+    fn render_review_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let visible_lens = self.visible_review_lens(cx);
+        let lens_options = [
+            ArtifactLens::Prompt,
+            ArtifactLens::Specification,
+            ArtifactLens::AgentInstructions,
+            ArtifactLens::AgentSkill,
+        ];
+        let mut content = Vec::<AnyElement>::new();
+        content.push(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(i18n::t(i18n::Key::ReviewReadOnly, cx))
+                .into_any_element(),
+        );
+        if self.reviewing {
+            content.push(
+                h_flex()
+                    .gap(metrics::gap())
+                    .items_center()
+                    .child(Spinner::new().small())
+                    .child(i18n::t(i18n::Key::ReviewWaiting, cx))
+                    .child(
+                        Button::new("cancel-review")
+                            .icon(IconName::Close)
+                            .xsmall()
+                            .ghost()
+                            .tooltip(i18n::t(i18n::Key::Cancel, cx))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_cancel_review(&CancelReview, window, cx)
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        content.push(
+            v_flex()
+                .gap(metrics::gap())
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(i18n::t(i18n::Key::ReviewLens, cx)),
+                )
+                .child(
+                    h_flex()
+                        .gap(metrics::gap())
+                        .flex_wrap()
+                        .children(lens_options.map(|lens| {
+                            Button::new(SharedString::from(format!("review-lens-{}", lens.label())))
+                                .label(i18n::t(review_lens_key(lens), cx))
+                                .xsmall()
+                                .disabled(self.reviewing)
+                                .when(
+                                    review_lens_choice_is_selected(lens, visible_lens),
+                                    |button| button.primary(),
+                                )
+                                .when(
+                                    !review_lens_choice_is_selected(lens, visible_lens),
+                                    |button| button.ghost(),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let document_id = this
+                                        .active_document()
+                                        .map(|document| document.read(cx).id());
+                                    if let Some(document_id) = document_id {
+                                        let target = this
+                                            .review_target
+                                            .filter(|_| {
+                                                this.review_target_document_id == Some(document_id)
+                                            })
+                                            .or_else(|| {
+                                                this.review_result.as_ref().and_then(|result| {
+                                                    (result.document_id == document_id)
+                                                        .then_some(result.target)
+                                                })
+                                            });
+                                        this.review_lens_overrides.insert(document_id, lens);
+                                        this.review_target = target;
+                                        this.review_target_document_id =
+                                            target.map(|_| document_id);
+                                    }
+                                    this.review_result = None;
+                                    this.review_diagnostic = None;
+                                    cx.notify();
+                                }))
+                        })),
+                )
+                .into_any_element(),
+        );
+
+        if let Some(target) = self.review_target
+            && self.review_target_document_id
+                == self
+                    .active_document()
+                    .map(|document| document.read(cx).id())
+            && !self.reviewing
+        {
+            content.push(
+                Button::new("run-review")
+                    .accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)
+                    .label(i18n::t(i18n::Key::ReviewRun, cx))
+                    .small()
+                    .primary()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.review(target, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let diagnostic = self.review_diagnostic.as_ref().filter(|diagnostic| {
+            self.active_document()
+                .is_some_and(|document| document.read(cx).id() == diagnostic.document_id)
+        });
+        if let Some(diagnostic) = diagnostic {
+            content.push(
+                div()
+                    .id("review-diagnostic")
+                    .role(gpui::Role::Label)
+                    .aria_value(diagnostic.diagnostic.message.as_str())
+                    .accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID)
+                    .text_sm()
+                    .text_color(cx.theme().warning)
+                    .child(diagnostic.diagnostic.message.as_str().to_owned())
+                    .into_any_element(),
+            );
+        }
+
+        let Some(review) = &self.review_result else {
+            if diagnostic.is_none() {
+                content.push(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(i18n::t(i18n::Key::ReviewNoResult, cx))
+                        .into_any_element(),
+                );
+            }
+            return v_flex()
+                .id("review-panel")
+                .size_full()
+                .p(metrics::inset())
+                .gap(metrics::gap_group())
+                .overflow_y_scroll()
+                .children(content)
+                .into_any_element();
+        };
+
+        let stale = review.result.result.status.is_stale()
+            || self.active_document().is_none_or(|document| {
+                let document = document.read(cx);
+                document.id() != review.document_id
+                    || document.async_snapshot(cx) != review.source_snapshot
+            })
+            || !review.supporting_sources_current;
+        let Some(output) = review.result.result.output.as_ref() else {
+            content.push(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(i18n::t(i18n::Key::ReviewFailed, cx))
+                    .into_any_element(),
+            );
+            return v_flex()
+                .id("review-panel")
+                .size_full()
+                .p(metrics::inset())
+                .gap(metrics::gap_group())
+                .overflow_y_scroll()
+                .children(content)
+                .into_any_element();
+        };
+        let understanding = output.sections();
+        if !stale {
+            content.push(
+                div()
+                    .id("review-result")
+                    .role(gpui::Role::Label)
+                    .aria_value(i18n::t(i18n::Key::ReviewReady, cx))
+                    .accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID)
+                    .text_sm()
+                    .font_medium()
+                    .child(i18n::t(i18n::Key::ReviewReady, cx))
+                    .into_any_element(),
+            );
+        }
+        if stale {
+            content.push(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(i18n::t(i18n::Key::ReviewStale, cx))
+                    .into_any_element(),
+            );
+        }
+        if review.selection.is_some() {
+            content.push(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(i18n::t(i18n::Key::ReviewSelectionContextOmitted, cx))
+                    .into_any_element(),
+            );
+        }
+        if review.partial {
+            content.push(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(i18n::t(i18n::Key::ReviewPartial, cx))
+                    .into_any_element(),
+            );
+        }
+        content.push(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!(
+                    "{} · {} {} · {} {} · {}",
+                    review.result.metadata.provider().label(),
+                    i18n::t(i18n::Key::ReviewRequestedModel, cx),
+                    review.result.metadata.requested_model(),
+                    i18n::t(i18n::Key::ReviewResponseModel, cx),
+                    review.result.metadata.response_model(),
+                    review.result.metadata.prompt_version(),
+                ))
+                .into_any_element(),
+        );
+
+        push_review_text_section(
+            &mut content,
+            i18n::t(i18n::Key::ReviewStatedGoal, cx),
+            understanding.stated_goal.as_str(),
+            cx,
+        );
+        push_review_text_list(
+            &mut content,
+            i18n::t(i18n::Key::ReviewContext, cx),
+            &understanding.relevant_context,
+            cx,
+        );
+        push_review_text_list(
+            &mut content,
+            i18n::t(i18n::Key::ReviewConstraints, cx),
+            &understanding.constraints,
+            cx,
+        );
+        push_review_text_list(
+            &mut content,
+            i18n::t(i18n::Key::ReviewNonGoals, cx),
+            &understanding.non_goals,
+            cx,
+        );
+        push_review_text_section(
+            &mut content,
+            i18n::t(i18n::Key::ReviewDeliverable, cx),
+            understanding.expected_deliverable.as_str(),
+            cx,
+        );
+        push_review_text_list(
+            &mut content,
+            i18n::t(i18n::Key::ReviewSuccessEvidence, cx),
+            &understanding.success_evidence,
+            cx,
+        );
+        push_review_text_list(
+            &mut content,
+            i18n::t(i18n::Key::ReviewAssumptions, cx),
+            &understanding.inferred_assumptions,
+            cx,
+        );
+        push_review_text_list(
+            &mut content,
+            i18n::t(i18n::Key::ReviewDecisions, cx),
+            &understanding.unresolved_decisions,
+            cx,
+        );
+
+        content.push(
+            div()
+                .text_xs()
+                .font_medium()
+                .text_color(cx.theme().muted_foreground)
+                .child(i18n::t(i18n::Key::ReviewFindings, cx))
+                .into_any_element(),
+        );
+        for (ix, finding) in output.findings.iter().enumerate() {
+            let anchor = finding.anchor.clone();
+            let anchor_label = review_anchor_label(&finding.anchor, cx);
+            let kind = match finding.kind {
+                FindingKind::Source | FindingKind::SourceStatement => {
+                    i18n::t(i18n::Key::ReviewSourceStatement, cx)
+                }
+                FindingKind::Inference => i18n::t(i18n::Key::ReviewInference, cx),
+            };
+            let row = ListItem::new(SharedString::from(format!("review-finding-{ix}")))
+                .w_full()
+                .child(
+                    v_flex()
+                        .gap(metrics::gap())
+                        .child(
+                            h_flex()
+                                .gap(metrics::gap())
+                                .child(div().text_xs().font_medium().child(kind))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(anchor_label),
+                                ),
+                        )
+                        .child(div().text_sm().child(finding.text.as_str().to_owned())),
+                );
+            let row = row.on_click(cx.listener(move |this, _, window, cx| {
+                this.reveal_review_anchor(&anchor, window, cx)
+            }));
+            content.push(row.into_any_element());
+        }
+        if output.findings.is_empty() {
+            content.push(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(i18n::t(i18n::Key::ReviewNoFindings, cx))
+                    .into_any_element(),
+            );
+        }
+
+        content.push(
+            div()
+                .text_xs()
+                .font_medium()
+                .text_color(cx.theme().muted_foreground)
+                .child(i18n::t(i18n::Key::ReviewQuestions, cx))
+                .into_any_element(),
+        );
+        for (ix, question) in output.clarification_questions.iter().take(5).enumerate() {
+            let impact = question
+                .impact
+                .as_ref()
+                .map(|impact| impact.as_str().to_owned());
+            content.push(
+                ListItem::new(SharedString::from(format!("review-question-{ix}")))
+                    .w_full()
+                    .child(
+                        v_flex()
+                            .gap(metrics::gap())
+                            .child(div().text_xs().font_medium().child(format!(
+                                "{} {}",
+                                i18n::t(i18n::Key::ReviewPriority, cx),
+                                clarification_priority_label(question.priority, cx)
+                            )))
+                            .child(div().text_sm().child(question.question.as_str().to_owned()))
+                            .when_some(impact, |this, impact| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(impact),
+                                )
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if output.clarification_questions.is_empty() {
+            content.push(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(i18n::t(i18n::Key::ReviewNoQuestions, cx))
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .id("review-panel")
+            .size_full()
+            .p(metrics::inset())
+            .gap(metrics::gap_group())
+            .overflow_y_scroll()
+            .children(content)
+            .into_any_element()
+    }
+
     fn render_document_details(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let (title, kind, location, status) = {
             let document = self.active_document()?.read(cx);
@@ -4690,6 +6978,65 @@ impl Workspace {
     fn render_right_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.right_panel_open {
             return None;
+        }
+        let review_belongs_to_active_document = self.active_document().is_some_and(|document| {
+            let document_id = document.read(cx).id();
+            self.review_result
+                .as_ref()
+                .is_some_and(|result| result.document_id == document_id)
+                || self
+                    .review_diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| diagnostic.document_id == document_id)
+        });
+        let review_target_belongs_to_active_document = self.review_target.is_some()
+            && self.review_target_document_id
+                == self
+                    .active_document()
+                    .map(|document| document.read(cx).id());
+        let pending_review_belongs_to_active_document =
+            self.pending_review.as_ref().is_some_and(|pending| {
+                self.active_document()
+                    .is_some_and(|document| document.read(cx).id() == pending.document_id)
+            });
+        if self.review_panel_open
+            && ((self.reviewing && pending_review_belongs_to_active_document)
+                || review_target_belongs_to_active_document
+                || review_belongs_to_active_document)
+        {
+            return Some(
+                v_flex()
+                    .size_full()
+                    .bg(cx.theme().sidebar)
+                    .child(
+                        h_flex()
+                            .h(metrics::row())
+                            .flex_shrink_0()
+                            .px(metrics::inset())
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(i18n::t(i18n::Key::Review, cx)),
+                            )
+                            .child(
+                                Button::new("dismiss-review")
+                                    .icon(IconName::Close)
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip(i18n::t(i18n::Key::ReviewDismiss, cx))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_review(cx);
+                                    })),
+                            ),
+                    )
+                    .child(self.render_review_panel(cx))
+                    .into_any_element(),
+            );
         }
         let harness_selected = self
             .harness
@@ -4862,6 +7209,54 @@ impl Workspace {
             self.record_visit(path.to_path_buf(), offset);
         }
         doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
+    }
+
+    /// Navigate a provider finding only through the frozen source it was
+    /// validated against. A package path is first looked up in that inventory,
+    /// then reconstructed from normalized components under the Skill root.
+    fn reveal_review_anchor(
+        &mut self,
+        anchor: &SourceAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = &self.review_result else {
+            return;
+        };
+        let document_id = review.document_id;
+        let supporting_sources_current = review.supporting_sources_current;
+        let document_current = self.active_document().is_some_and(|document| {
+            let document = document.read(cx);
+            document.id() == document_id && document.async_snapshot(cx) == review.source_snapshot
+        });
+        if !document_current || !supporting_sources_current {
+            self.set_status(i18n::t(i18n::Key::ReviewStale, cx).into(), cx);
+            return;
+        }
+
+        if let Some(offset) = review_anchor_offset(anchor, review.source_snapshot.text()) {
+            self.reveal_offset(offset, window, cx);
+            return;
+        }
+
+        let Some(skill_package) = review.skill_package.clone() else {
+            return;
+        };
+        if self.has_dirty_skill_supporting_document(&skill_package, cx)
+            || skill_package.revalidate().is_err()
+        {
+            if let Some(review) = &mut self.review_result {
+                review.supporting_sources_current = false;
+                review.result.result.status = ReviewStatus::Stale;
+            }
+            self.set_status(i18n::t(i18n::Key::ReviewStale, cx).into(), cx);
+            cx.notify();
+            return;
+        }
+        let Some((path, offset)) = skill_package.resolve_anchor(anchor) else {
+            return;
+        };
+        self.reveal_in(path, offset, window, cx);
     }
 
     /// Open `path` (as a preview) and put the cursor at `offset`.
@@ -5634,6 +8029,27 @@ impl Workspace {
                         }
                     })),
                 )
+                .child(
+                    ChromeIconButton::new(
+                        "review",
+                        IconName::Search,
+                        i18n::t(i18n::Key::Review, cx),
+                    )
+                    .loading(self.reviewing)
+                    .when(tooltips, |button| {
+                        button.tooltip(i18n::t(i18n::Key::Review, cx))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let has_selection = this
+                            .active_document()
+                            .is_some_and(|document| !document.read(cx).selection(cx).is_empty());
+                        if has_selection {
+                            this.on_review_selection(&ReviewSelection, window, cx)
+                        } else {
+                            this.on_review_document(&ReviewDocument, window, cx)
+                        }
+                    })),
+                )
                 .child(self.render_right_toggle(tooltips, cx))
             })
             .child(
@@ -6182,6 +8598,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_translate_document))
             .on_action(cx.listener(Self::on_translate_selection))
             .on_action(cx.listener(Self::on_translate_block))
+            .on_action(cx.listener(Self::on_review_document))
+            .on_action(cx.listener(Self::on_review_selection))
+            .on_action(cx.listener(Self::on_cancel_review))
             .on_action(|_: &AcknowledgeStartupInput, _, _| {
                 crate::startup::record(StartupEvent::FirstInputHandled);
             })
@@ -6231,6 +8650,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-l", TranslateSelection, None),
         KeyBinding::new("cmd-shift-b", TranslateBlock, None),
         KeyBinding::new("ctrl-shift-b", TranslateBlock, None),
+        KeyBinding::new("cmd-shift-r", ReviewDocument, None),
+        KeyBinding::new("ctrl-shift-r", ReviewDocument, None),
+        KeyBinding::new("cmd-shift-alt-r", ReviewSelection, None),
+        KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None),
         // The panels, on the bindings VS Code uses for the same two.
         KeyBinding::new("cmd-b", ToggleLeftPanel, None),
         KeyBinding::new("ctrl-b", ToggleLeftPanel, None),
@@ -6273,12 +8696,13 @@ mod tests {
     // limit.
     use super::{
         DestructiveAction, DestructiveRequest, DestructiveResolution, DetailsContent,
-        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RetirementCompletion, SaveAsMode,
-        SaveAsOutcome, SaveMode, SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace,
-        WorkspaceResizeEdge, checkpoint_batch_status, clamped_dragged_panel_width,
-        current_checkpoint_write_completed, details_content, document_details_status_key,
-        elide_tab_label, path_affects_harness, prepare_recovery_records,
-        resolved_workspace_panel_widths, startup_recovery_status,
+        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RetirementCompletion,
+        ReviewRequestBuildError, ReviewTarget, SaveAsMode, SaveAsOutcome, SaveMode, SidePanel,
+        StartupRecovery, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge, checkpoint_batch_status,
+        clamped_dragged_panel_width, current_checkpoint_write_completed, details_content,
+        document_details_status_key, elide_tab_label, next_review_lens, path_affects_harness,
+        prepare_recovery_records, resolved_workspace_panel_widths, review_anchor_offset,
+        startup_recovery_status,
     };
     use crate::fs::{FileStamp, Newline, SourceIdentity};
     use crate::i18n;
@@ -6295,6 +8719,27 @@ mod tests {
         AppContext as _, ClipboardItem, Context, Entity, Focusable as _, Modifiers, MouseButton,
         TestAppContext, VisualTestContext, Window, point, px,
     };
+    use mt_doc::review::{ArtifactLens, ByteRange, SourceAnchor, SourceLocation, SourceSnapshot};
+
+    fn build_document_review_request(
+        target: ReviewTarget,
+        lens: ArtifactLens,
+        source_path: Option<&Path>,
+        full_text: &str,
+        selection: Option<&std::ops::Range<usize>>,
+        snapshot: SourceSnapshot,
+    ) -> Result<mt_doc::review::ReviewRequest, ReviewRequestBuildError> {
+        super::build_document_review_request_with_identity(
+            target,
+            lens,
+            source_path,
+            full_text,
+            selection,
+            snapshot,
+            false,
+        )
+        .map(|built| built.request)
+    }
 
     fn open_test_workspace(
         cx: &mut TestAppContext,
@@ -14453,6 +16898,884 @@ mod tests {
             body.contains("skills().iter().map(|s| s.dir.clone())"),
             "the Harness scope must cover a skill's whole directory, not only \
              its SKILL.md — references and scripts are part of the skill"
+        );
+    }
+
+    #[test]
+    fn review_is_read_only_and_snapshot_guarded() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let review = source
+            .split_once("fn start_review_after_preparation(")
+            .expect("Review preparation continuation must exist")
+            .1
+            .split_once("fn set_review_diagnostic")
+            .expect("Review error mapping must follow the request path")
+            .0;
+        assert!(review.contains("async_snapshot"));
+        assert!(review.contains("build_document_review_request"));
+        assert!(source.contains("DocumentReviewRequest::agent_skill"));
+        assert!(review.contains("prepared.authorize"));
+        assert!(review.contains("execute_with"));
+        assert!(review.contains("ReviewDocumentChanged"));
+        assert!(review.contains("review_result = Some"));
+        assert!(review.contains("has_dirty_skill_supporting_document"));
+        assert!(!review.contains(".replace_text("));
+        assert!(!review.contains("set_source("));
+    }
+
+    #[test]
+    fn review_panel_exposes_lens_before_explicit_send_and_current_result_state() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let command = source
+            .split_once("fn on_review_document")
+            .expect("Review document command must exist")
+            .1
+            .split_once("fn on_review_selection")
+            .unwrap()
+            .0;
+        assert!(command.contains("self.open_review_panel(ReviewTarget::Document, cx)"));
+        assert!(!command.contains("self.review("));
+
+        let panel = source
+            .split_once("fn render_review_panel")
+            .expect("Review panel must exist")
+            .1;
+        let lens = panel
+            .find("i18n::Key::ReviewLens")
+            .expect("lens control must be visible");
+        let run = panel
+            .find("Button::new(\"run-review\")")
+            .expect("Review must require an explicit Run control");
+        assert!(lens < run);
+        assert!(panel[run..].contains("this.review(target, window, cx)"));
+        let result = panel
+            .find("REVIEW_RESULT_ACCESSIBILITY_ID")
+            .expect("current Review result must have a stable UIA id");
+        let stale_guard = panel[..result]
+            .rfind("if !stale")
+            .expect("stale results must not present the success UIA state");
+        assert!(stale_guard < result);
+    }
+
+    #[test]
+    fn review_failures_persist_and_skill_watcher_marks_results_stale_immediately() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let diagnostic = source
+            .split_once("fn set_review_diagnostic")
+            .expect("Review diagnostic setter must exist")
+            .1
+            .split_once("fn review_build_diagnostic")
+            .unwrap()
+            .0;
+        assert!(diagnostic.contains("self.review_diagnostic = Some"));
+        assert!(diagnostic.contains("self.review_panel_open = true"));
+
+        let error_map = source
+            .split_once("fn review_error_diagnostic")
+            .expect("Review error map must exist")
+            .1
+            .split_once("fn visible_review_lens")
+            .unwrap()
+            .0;
+        for key in [
+            "ReviewNoProvider",
+            "ReviewMissingCredential",
+            "ReviewTimeout",
+            "ReviewOversized",
+        ] {
+            assert!(
+                error_map.contains(key),
+                "missing localized Review state: {key}"
+            );
+        }
+        assert!(error_map.contains("ReviewError::ResponseTooLarge"));
+
+        let watcher = source
+            .split_once("let review_supporting_source_changed")
+            .expect("watcher must track frozen Agent Skill sources")
+            .1
+            .split_once("let tree_changed")
+            .unwrap()
+            .0;
+        assert!(watcher.contains("change.path().starts_with(&package.root)"));
+        assert!(watcher.contains("review.supporting_sources_current = false"));
+    }
+
+    #[test]
+    fn skill_document_review_uses_a_frozen_package_with_deterministic_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "disk entrypoint").unwrap();
+        fs::create_dir(directory.path().join("references")).unwrap();
+        fs::write(
+            directory.path().join("references").join("guide.md"),
+            "guide",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("assets")).unwrap();
+        fs::write(
+            directory.path().join("assets").join("blob.bin"),
+            [0xff, 0x00],
+        )
+        .unwrap();
+
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::AgentSkill,
+            Some(&skill),
+            "frozen entrypoint",
+            None,
+            SourceSnapshot::new(4, 9),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            request.scope,
+            mt_doc::review::ReviewScope::AgentSkillPackage
+        ));
+        let package = request.source.package().unwrap();
+        assert_eq!(
+            package
+                .files()
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["SKILL.md", "assets/blob.bin", "references/guide.md"]
+        );
+        assert!(matches!(
+            &package.files()[0].payload,
+            mt_doc::review::SkillFilePayload::Utf8 { content } if content == "disk entrypoint"
+        ));
+        assert!(package.files()[1].is_binary_metadata_only());
+    }
+
+    #[test]
+    fn clean_skill_entrypoint_preserves_raw_bytes_and_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        let raw = b"\xef\xbb\xbf# Skill\r\n";
+        fs::write(&skill, raw).unwrap();
+
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "# Skill\n",
+            false,
+        )
+        .unwrap();
+        let entrypoint = &frozen.package.files()[0];
+        assert!(matches!(
+            &entrypoint.payload,
+            mt_doc::review::SkillFilePayload::Utf8 { content } if content.as_bytes() == raw
+        ));
+        assert_eq!(
+            frozen
+                .skill_entrypoint_identity
+                .as_ref()
+                .map(|identity| identity.byte_size),
+            Some(raw.len() as u64)
+        );
+
+        fs::write(&skill, "# Skill\n").unwrap();
+        assert!(matches!(
+            frozen.revalidate(),
+            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
+        ));
+    }
+
+    #[test]
+    fn valid_utf8_binary_supporting_file_is_metadata_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "entrypoint").unwrap();
+        fs::write(directory.path().join("asset.bin"), b"valid\0utf8").unwrap();
+
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "entrypoint",
+            false,
+        )
+        .unwrap();
+        let asset = frozen
+            .package
+            .files()
+            .iter()
+            .find(|file| file.path == "asset.bin")
+            .unwrap();
+        assert!(asset.is_binary_metadata_only());
+        assert_eq!(asset.raw_bytes(), None);
+    }
+
+    #[test]
+    fn selection_review_of_skill_entrypoint_is_not_reported_as_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "entrypoint").unwrap();
+
+        let error = build_document_review_request(
+            ReviewTarget::Selection,
+            ArtifactLens::AgentSkill,
+            Some(&skill),
+            "entrypoint",
+            Some(&(0..5)),
+            SourceSnapshot::default(),
+        )
+        .unwrap_err();
+        assert!(!matches!(
+            error,
+            ReviewRequestBuildError::AgentSkillEntrypointUnavailable
+        ));
+    }
+
+    #[test]
+    fn non_utf8_skill_entrypoint_uses_raw_metadata_and_revalidates_the_raw_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        let original = [0xff, 0x81, 0x40];
+        fs::write(&skill, original).unwrap();
+
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "decoded entrypoint",
+            false,
+        )
+        .unwrap();
+        let entrypoint = &frozen.package.files()[0];
+        assert_eq!(entrypoint.path, "SKILL.md");
+        assert_eq!(entrypoint.byte_size, original.len() as u64);
+        assert!(matches!(
+            &entrypoint.payload,
+            mt_doc::review::SkillFilePayload::Binary { sha256 }
+                if sha256 == &super::sha256_hex(&original)
+        ));
+
+        fs::write(&skill, [0xff, 0x81, 0x41]).unwrap();
+        assert!(matches!(
+            frozen.revalidate(),
+            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
+        ));
+    }
+
+    #[test]
+    fn dirty_non_utf8_skill_entrypoint_sends_explicit_unsaved_utf8_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, [0xff, 0x81, 0x40]).unwrap();
+
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "unsaved UTF-8 text",
+            true,
+        )
+        .unwrap();
+        let entrypoint = &frozen.package.files()[0];
+        assert!(matches!(
+            &entrypoint.payload,
+            mt_doc::review::SkillFilePayload::Utf8 { content } if content == "unsaved UTF-8 text"
+        ));
+        assert_eq!(entrypoint.byte_size, "unsaved UTF-8 text".len() as u64);
+        fs::write(&skill, [0xff, 0x81, 0x41]).unwrap();
+        assert!(
+            frozen.revalidate().is_ok(),
+            "the frozen editor snapshot must not be recategorized from disk while the document remains unchanged"
+        );
+    }
+
+    #[test]
+    fn dirty_skill_entrypoint_ignores_deleted_or_oversized_disk_entrypoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(
+            &skill,
+            vec![b'x'; (mt_doc::review::MAX_SKILL_FILE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        for remove_disk_entrypoint in [false, true] {
+            if remove_disk_entrypoint {
+                fs::remove_file(&skill).unwrap();
+            }
+            let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+                directory.path(),
+                "unsaved entrypoint",
+                true,
+            )
+            .unwrap();
+            assert!(matches!(
+                &frozen.package.files()[0].payload,
+                mt_doc::review::SkillFilePayload::Utf8 { content }
+                    if content == "unsaved entrypoint"
+            ));
+            assert!(
+                frozen
+                    .package
+                    .omissions()
+                    .iter()
+                    .all(|omission| omission.path != "SKILL.md")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dirty_skill_entrypoint_replaces_a_symlinked_disk_entrypoint() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("outside.md");
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&target, "disk target").unwrap();
+        symlink(&target, &skill).unwrap();
+
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "unsaved entrypoint",
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            &frozen.package.files()[0].payload,
+            mt_doc::review::SkillFilePayload::Utf8 { content }
+                if content == "unsaved entrypoint"
+        ));
+        assert!(
+            frozen
+                .package
+                .omissions()
+                .iter()
+                .all(|omission| omission.path != "SKILL.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_skill_inventory_rejects_a_backslash_path_component() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("SKILL.md"), "entrypoint").unwrap();
+        fs::write(directory.path().join(r"support\name.md"), "supporting").unwrap();
+
+        assert!(matches!(
+            super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+                directory.path(),
+                "entrypoint",
+                false,
+            ),
+            Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8)
+        ));
+    }
+
+    #[test]
+    fn frozen_skill_package_rejects_changed_supporting_sources_before_send() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        let guide = directory.path().join("guide.md");
+        fs::write(&skill, "entrypoint").unwrap();
+        fs::write(&guide, "original supporting source").unwrap();
+
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "entrypoint",
+            false,
+        )
+        .unwrap();
+        fs::write(&guide, "changed supporting source").unwrap();
+
+        assert!(matches!(
+            frozen.revalidate(),
+            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
+        ));
+    }
+
+    #[test]
+    fn skill_package_size_limits_abort_before_a_request_is_built() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "entrypoint").unwrap();
+        fs::write(
+            directory.path().join("oversize.md"),
+            vec![b'x'; (mt_doc::review::MAX_SKILL_FILE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            build_document_review_request(
+                ReviewTarget::Document,
+                ArtifactLens::AgentSkill,
+                Some(&skill),
+                "entrypoint",
+                None,
+                SourceSnapshot::default(),
+            ),
+            Err(ReviewRequestBuildError::AgentSkillFileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn supporting_file_reader_rejects_an_oversize_file_before_allocating_its_length() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("oversize.md"),
+            vec![b'x'; (mt_doc::review::MAX_SKILL_FILE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            super::read_regular_skill_supporting_file(directory.path(), "oversize.md"),
+            Err(ReviewRequestBuildError::AgentSkillFileTooLarge { byte_size })
+                if byte_size == mt_doc::review::MAX_SKILL_FILE_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn agent_skill_lens_requires_a_whole_skill_entrypoint_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let not_a_skill = directory.path().join("prompt.md");
+        fs::write(&not_a_skill, "prompt").unwrap();
+
+        assert!(matches!(
+            build_document_review_request(
+                ReviewTarget::Document,
+                ArtifactLens::AgentSkill,
+                Some(&not_a_skill),
+                "prompt",
+                None,
+                SourceSnapshot::default(),
+            ),
+            Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable)
+        ));
+        assert!(matches!(
+            build_document_review_request(
+                ReviewTarget::Selection,
+                ArtifactLens::AgentSkill,
+                Some(&not_a_skill),
+                "0123456789",
+                Some(&(0..5)),
+                SourceSnapshot::default(),
+            ),
+            Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable)
+        ));
+    }
+
+    #[test]
+    fn skill_package_aggregate_limit_aborts_before_a_request_is_built() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "entrypoint").unwrap();
+        for index in 0..9 {
+            fs::write(
+                directory.path().join(format!("support-{index}.md")),
+                vec![b'x'; mt_doc::review::MAX_SKILL_FILE_BYTES as usize],
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            build_document_review_request(
+                ReviewTarget::Document,
+                ArtifactLens::AgentSkill,
+                Some(&skill),
+                "entrypoint",
+                None,
+                SourceSnapshot::default(),
+            ),
+            Err(ReviewRequestBuildError::AgentSkillPackageTooLarge { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_links_are_disclosed_as_omissions_without_being_followed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "entrypoint").unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fs::write(external.path().join("secret.md"), "must not be read").unwrap();
+        symlink(
+            external.path().join("secret.md"),
+            directory.path().join("linked.md"),
+        )
+        .unwrap();
+
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::AgentSkill,
+            Some(&skill),
+            "entrypoint",
+            None,
+            SourceSnapshot::default(),
+        )
+        .unwrap();
+        let package = request.source.package().unwrap();
+        assert!(package.files().iter().all(|file| file.path != "linked.md"));
+        assert_eq!(package.omissions().len(), 1);
+        assert_eq!(package.omissions()[0].path, "linked.md");
+        assert!(package.omissions()[0].symlink);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supporting_file_reader_refuses_a_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("secret.md");
+        fs::write(&target, "must not be read").unwrap();
+        symlink(&target, directory.path().join("linked.md")).unwrap();
+
+        assert!(matches!(
+            super::read_regular_skill_supporting_file(directory.path(), "linked.md"),
+            Err(ReviewRequestBuildError::AgentSkillReadFailed)
+                | Err(ReviewRequestBuildError::AgentSkillSourceChanged)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supporting_file_reader_refuses_a_symlink_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("secret.md");
+        let link = directory.path().join("linked.md");
+        fs::write(&target, "must not be read").unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!("skipping symlink no-follow test: {error}");
+            return;
+        }
+
+        assert!(matches!(
+            super::read_regular_skill_supporting_file(directory.path(), "linked.md"),
+            Err(ReviewRequestBuildError::AgentSkillReadFailed)
+                | Err(ReviewRequestBuildError::AgentSkillSourceChanged)
+        ));
+    }
+
+    #[test]
+    fn selection_review_preserves_full_document_coordinates_for_anchor_navigation() {
+        let selection = 10..20;
+        let request = build_document_review_request(
+            ReviewTarget::Selection,
+            ArtifactLens::Prompt,
+            None,
+            "0123456789abcdefghij",
+            Some(&selection),
+            SourceSnapshot::default(),
+        )
+        .unwrap();
+        assert_eq!(request.outbound_text(), Some("abcdefghij"));
+        assert!(matches!(
+            request.scope,
+            mt_doc::review::ReviewScope::Selection { range, .. }
+                if range == ByteRange::new(10, 20).unwrap()
+        ));
+
+        let anchor = SourceAnchor::document(SourceLocation::bytes(13, 18));
+        assert_eq!(
+            review_anchor_offset(&anchor, "0123456789abcdefghij"),
+            Some(13)
+        );
+        assert_eq!(
+            review_anchor_offset(
+                &SourceAnchor::document(SourceLocation::lines(2, 2)),
+                "first\nsecond\n",
+            ),
+            Some(6)
+        );
+        assert_eq!(
+            review_anchor_offset(&SourceAnchor::DocumentWide, "whole document"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn empty_selection_review_is_rejected_before_provider_resolution() {
+        assert!(matches!(
+            build_document_review_request(
+                ReviewTarget::Selection,
+                ArtifactLens::Prompt,
+                None,
+                "source",
+                Some(&(0..0)),
+                SourceSnapshot::default(),
+            ),
+            Err(ReviewRequestBuildError::InvalidSelection)
+        ));
+    }
+
+    #[test]
+    fn frozen_package_anchor_navigation_only_resolves_listed_relative_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "entrypoint").unwrap();
+        fs::create_dir(directory.path().join("references")).unwrap();
+        let guide = directory.path().join("references").join("guide.md");
+        fs::write(&guide, "first\nsecond\n").unwrap();
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "entrypoint",
+            false,
+        )
+        .unwrap();
+
+        let anchor =
+            SourceAnchor::agent_skill_file("references/guide.md", SourceLocation::lines(2, 2))
+                .unwrap();
+        assert_eq!(frozen.resolve_anchor(&anchor), Some((guide, 6)));
+        assert_eq!(
+            frozen.resolve_anchor(
+                &SourceAnchor::agent_skill_file(
+                    "references/guide.md",
+                    SourceLocation::bytes(6, 12),
+                )
+                .unwrap(),
+            ),
+            Some((directory.path().join("references").join("guide.md"), 6))
+        );
+        assert_eq!(
+            frozen.resolve_anchor(
+                &SourceAnchor::agent_skill_file("SKILL.md", SourceLocation::bytes(0, 0)).unwrap(),
+            ),
+            Some((skill, 0))
+        );
+        assert!(
+            frozen
+                .resolve_anchor(&SourceAnchor::AgentSkillFile {
+                    path: "../outside.md".into(),
+                    location: SourceLocation::bytes(0, 1),
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn frozen_package_anchor_navigation_maps_bom_and_crlf_to_editor_offsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        let guide = directory.path().join("guide.md");
+        fs::write(&skill, "entrypoint").unwrap();
+        fs::write(
+            &guide,
+            [&b"\xef\xbb\xbf"[..], &b"first\r\nsecond\r\n"[..]].concat(),
+        )
+        .unwrap();
+        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "entrypoint",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            frozen.resolve_anchor(
+                &SourceAnchor::agent_skill_file("guide.md", SourceLocation::bytes(10, 16)).unwrap(),
+            ),
+            Some((guide.clone(), 6))
+        );
+        assert_eq!(
+            frozen.resolve_anchor(
+                &SourceAnchor::agent_skill_file("guide.md", SourceLocation::lines(2, 2)).unwrap(),
+            ),
+            Some((guide, 6))
+        );
+    }
+
+    #[test]
+    fn supporting_buffer_edits_invalidate_agent_skill_reviews_before_navigation() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let edited = source
+            .split_once("DocumentEvent::Edited =>")
+            .expect("document edits must be observed")
+            .1
+            .split_once("DocumentEvent::DirtyChanged =>")
+            .unwrap()
+            .0;
+        assert!(edited.contains("mark_review_stale_for_document"));
+        let review = source
+            .split_once("fn start_review_after_preparation(")
+            .expect("Review preparation continuation must exist")
+            .1
+            .split_once("fn set_review_diagnostic")
+            .unwrap()
+            .0;
+        assert!(
+            review
+                .matches("has_dirty_skill_supporting_document")
+                .count()
+                >= 3
+        );
+    }
+
+    #[test]
+    fn ordinary_review_edits_retain_semantic_stale_state() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        assert!(source.contains("review.result.result.status = ReviewStatus::Stale"));
+        let panel = source
+            .split_once("fn render_review_panel")
+            .expect("Review panel must exist")
+            .1;
+        assert!(panel.contains("review.result.result.status.is_stale()"));
+        assert!(panel.contains("document.async_snapshot(cx) != review.source_snapshot"));
+    }
+
+    #[test]
+    fn skill_package_preparation_runs_before_consent_on_the_background_executor() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let review = source
+            .split_once("fn review(")
+            .expect("Review entry point must exist")
+            .1
+            .split_once("fn set_review_diagnostic")
+            .unwrap()
+            .0;
+        let background = review
+            .find("background_spawn")
+            .expect("Review preparation must use the background executor");
+        let preparation = review
+            .find("build_document_review_request_with_identity")
+            .expect("Review preparation must freeze the request before consent");
+        let consent = source
+            .split_once("fn start_review_after_preparation(")
+            .expect("Review preparation continuation must exist")
+            .1
+            .find("window.prompt")
+            .expect("consent must be presented after preparation");
+        assert!(background < preparation);
+        assert!(consent > 0);
+    }
+
+    #[test]
+    fn no_follow_reader_keeps_macos_and_linux_on_the_same_safe_open_path() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        assert!(
+            source.contains("#[cfg(target_os = \"macos\")]")
+                && source.contains("const UNIX_O_NOFOLLOW: i32 = 0x100;")
+        );
+        assert!(
+            source.contains("#[cfg(target_os = \"linux\")]")
+                && source.contains("const UNIX_O_NOFOLLOW: i32 = 0o400000;")
+        );
+        assert!(source.contains("#[cfg(any(target_os = \"linux\", target_os = \"macos\"))]"));
+        assert!(
+            source.contains("open_regular_skill_file_at(root, relative_path, UNIX_O_NOFOLLOW)")
+        );
+    }
+
+    #[test]
+    fn package_anchor_navigation_revalidates_before_opening_a_frozen_inventory_path() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let navigation = source
+            .split_once("fn reveal_review_anchor")
+            .expect("Review anchors must have a navigation path")
+            .1
+            .split_once("/// Open `path` (as a preview)")
+            .expect("ordinary preview navigation follows Review navigation")
+            .0;
+        let revalidate = navigation
+            .find("skill_package.revalidate()")
+            .expect("package anchors must revalidate their frozen source");
+        let reveal = navigation
+            .find("self.reveal_in(path, offset, window, cx)")
+            .expect("valid package anchors must open their source file");
+        assert!(revalidate < reveal);
+        assert!(navigation.contains("skill_package.resolve_anchor(anchor)"));
+    }
+
+    #[test]
+    fn dismissing_review_invalidates_pending_completion() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let dismiss = source
+            .split_once("fn dismiss_review")
+            .expect("dismissal must have its own invalidation path")
+            .1
+            .split_once("/// Run a read-only Review")
+            .expect("Review starts after dismissal")
+            .0;
+        assert!(dismiss.contains("cancelled.store(true, Ordering::Release)"));
+        assert!(dismiss.contains("review_generation"));
+        assert!(dismiss.contains("review_panel_open = false"));
+        assert!(dismiss.contains("review_result = None"));
+    }
+
+    #[test]
+    fn cancelling_review_binds_diagnostic_to_the_frozen_request() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let cancel = source
+            .split_once("fn on_cancel_review")
+            .expect("Review cancellation must exist")
+            .1
+            .split_once("fn open_review_panel")
+            .unwrap()
+            .0;
+        assert!(!cancel.contains("active_document()"));
+        assert!(cancel.contains("pending.document_id"));
+        assert!(cancel.contains("pending.lens"));
+        assert!(cancel.contains("self.set_status"));
+    }
+
+    #[test]
+    fn review_revalidates_skill_sources_before_authorization_and_on_completion() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let review = source
+            .split_once("fn start_review_after_preparation(")
+            .expect("Review preparation continuation must exist")
+            .1
+            .split_once("fn set_review_diagnostic")
+            .expect("Review error mapping must follow the request path")
+            .0;
+        let revalidation = review
+            .find("package_for_revalidation")
+            .expect("Agent Skill sources must be revalidated after consent");
+        let authorization = review
+            .find("prepared.authorize")
+            .expect("Review must still authorize the request");
+        let execute = review
+            .find("prepared.execute_with")
+            .expect("Review transport must execute the frozen request");
+        assert!(
+            revalidation < authorization,
+            "a changed supporting source must stop transport before authorization"
+        );
+        assert!(
+            authorization < execute,
+            "authorization must precede transport"
+        );
+        assert!(
+            review[..execute].rfind("background_spawn").is_some(),
+            "transport must stay on the background executor"
+        );
+        let completion_revalidation = review
+            .find("package_for_completion_revalidation")
+            .expect("completion must revalidate Agent Skill sources");
+        assert!(
+            review[completion_revalidation..].contains("background_spawn"),
+            "completion revalidation must stay on the background executor"
+        );
+        assert!(review.contains("supporting_sources_current"));
+        assert!(review.contains("self.review_result = None"));
+    }
+
+    #[test]
+    fn review_lens_correction_cycles_through_all_artifact_choices() {
+        assert_eq!(
+            next_review_lens(ArtifactLens::Prompt),
+            ArtifactLens::Specification
+        );
+        assert_eq!(
+            next_review_lens(ArtifactLens::Specification),
+            ArtifactLens::Plan
+        );
+        assert_eq!(
+            next_review_lens(ArtifactLens::Plan),
+            ArtifactLens::AgentInstructions
+        );
+        assert_eq!(
+            next_review_lens(ArtifactLens::AgentInstructions),
+            ArtifactLens::AgentSkill
+        );
+        assert_eq!(
+            next_review_lens(ArtifactLens::AgentSkill),
+            ArtifactLens::Prompt
         );
     }
 }

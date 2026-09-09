@@ -454,7 +454,7 @@ impl std::error::Error for TranslationError {}
 
 #[cfg(feature = "model-transport")]
 impl Provider {
-    fn adapter(self) -> AdapterKind {
+    pub(crate) fn adapter(self) -> AdapterKind {
         match self {
             Provider::AnthropicMessages => AdapterKind::Anthropic,
             Provider::OpenAiChat => AdapterKind::OpenAI,
@@ -464,7 +464,7 @@ impl Provider {
 }
 
 #[cfg(feature = "model-transport")]
-fn service_target(config: &ModelConfig, credential: &str) -> ServiceTarget {
+pub(crate) fn service_target(config: &ModelConfig, credential: &str) -> ServiceTarget {
     ServiceTarget {
         endpoint: Endpoint::from_owned(config.endpoint().base_url()),
         auth: AuthData::Key(credential.to_owned()),
@@ -489,7 +489,7 @@ fn proxy_policy(endpoint: &EndpointIdentity) -> ProxyPolicy {
 }
 
 #[cfg(feature = "model-transport")]
-fn client_for_endpoint(endpoint: &EndpointIdentity) -> Result<&'static Client, ()> {
+pub(crate) fn client_for_endpoint(endpoint: &EndpointIdentity) -> Result<&'static Client, ()> {
     static SYSTEM_CLIENT: OnceLock<Result<Client, ()>> = OnceLock::new();
     static NO_PROXY_CLIENT: OnceLock<Result<Client, ()>> = OnceLock::new();
 
@@ -583,7 +583,7 @@ impl TranslationService for GenAiTranslator {
 }
 
 #[cfg(feature = "model-transport")]
-fn request_failure_hint(error: &genai::Error) -> &'static str {
+pub(crate) fn request_failure_hint(error: &genai::Error) -> &'static str {
     use genai::webc::Error as WebError;
 
     let web_error = match error {
@@ -629,7 +629,7 @@ fn request_failure_hint(error: &genai::Error) -> &'static str {
 /// The one shared async runtime. HTTP clients are cached separately by proxy
 /// policy so loopback no-proxy behavior cannot bleed into remote traffic.
 #[cfg(feature = "model-transport")]
-fn runtime() -> std::io::Result<&'static tokio::runtime::Runtime> {
+pub(crate) fn runtime() -> std::io::Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
     match RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

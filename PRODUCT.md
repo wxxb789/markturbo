@@ -170,6 +170,7 @@ The initial reference configuration is:
 - OpenAI Responses wire format;
 - model `gpt-5.6-terra`, with the response-reported model identifier recorded;
 - `reasoning.effort=medium`;
+- `max_output_tokens=8192`;
 - no tools, browsing, memory, or agent actions;
 - sampling controls omitted so provider defaults apply and are recorded as such;
 - structured schema and system prompt version `review-v1`;

@@ -13,6 +13,7 @@ pub mod frontmatter;
 pub mod harness;
 pub mod instruction;
 pub mod outline;
+pub mod review;
 pub mod search;
 pub mod skill;
 pub mod translate;
@@ -25,6 +26,15 @@ pub use doctype::DocType;
 pub use harness::{GlobalRoot, Harness};
 pub use instruction::Instruction;
 pub use outline::{Heading, Outline};
+pub use review::{
+    ArtifactLens, ByteRange, ClarificationPriority, ClarificationQuestion, Finding, FindingKind,
+    MAX_CLARIFICATION_QUESTIONS, MAX_SKILL_FILE_BYTES, MAX_SKILL_PACKAGE_BYTES,
+    REVIEW_SCHEMA_VERSION, ReviewDiagnostic, ReviewDiagnosticCode, ReviewModelOutput,
+    ReviewRequest, ReviewResult, ReviewScope, ReviewScopeKind, ReviewSections, ReviewSource,
+    ReviewStatus, SkillFilePayload, SkillPackage, SkillPackageError, SkillPackageFile,
+    SkillPackageOmission, SkillSourceFrame, SourceAnchor, SourceLocation, SourceSnapshot,
+    StructuredText,
+};
 pub use search::{Match, Query, Results};
 pub use skill::{Discovery, Origin, Skill, SkillMeta};
 pub use walk::is_openable;

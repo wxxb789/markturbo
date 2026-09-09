@@ -74,6 +74,7 @@ LIFECYCLE_CLICK_FAILURE_CODES = {
 }
 TASK_DIALOG_CLASS = "#32770"
 TASK_DIALOG_BUTTON_CLASS = "CCPushButton"
+ERROR_NOT_FOUND = 1168
 
 WM_CLOSE = 0x0010
 GW_OWNER = 4
@@ -104,6 +105,25 @@ WINDOWS_LAUNCH_ERROR_CODES = {
     193: "PROCESS_LAUNCH_BAD_EXE_FORMAT",
     740: "PROCESS_LAUNCH_ELEVATION_REQUIRED",
 }
+
+
+class CREDENTIALW(ctypes.Structure):
+    """Win32 credential metadata. The blob pointer is never dereferenced."""
+
+    _fields_ = [
+        ("Flags", wt.DWORD),
+        ("Type", wt.DWORD),
+        ("TargetName", wt.LPWSTR),
+        ("Comment", wt.LPWSTR),
+        ("LastWritten", wt.FILETIME),
+        ("CredentialBlobSize", wt.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+        ("Persist", wt.DWORD),
+        ("AttributeCount", wt.DWORD),
+        ("Attributes", wt.LPVOID),
+        ("TargetAlias", wt.LPWSTR),
+        ("UserName", wt.LPWSTR),
+    ]
 
 class HarnessBlocked(RuntimeError):
     def __init__(
@@ -408,6 +428,7 @@ def build_launch_spec(
     workspace_root: Path,
     stderr_path: Path,
     base_env: dict[str, str] | None = None,
+    ephemeral_openai_api_key: str | None = None,
 ) -> LaunchSpec:
     paths = [copied_exe, data_root, config_root, workspace_root, stderr_path]
     if target is not None:
@@ -424,6 +445,10 @@ def build_launch_spec(
             "RUST_LOG": "debug",
         }
     )
+    if ephemeral_openai_api_key is not None:
+        if not ephemeral_openai_api_key:
+            raise ValueError("ephemeral OpenAI API key must not be empty")
+        env["OPENAI_API_KEY"] = ephemeral_openai_api_key
     return LaunchSpec(
         args=(str(copied_exe),) if target is None else (str(copied_exe), str(target)),
         cwd=str(workspace_root),
@@ -490,6 +515,15 @@ class Win32:
         self.advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
         self.advapi32.GetSidSubAuthority.argtypes = [wt.LPVOID, wt.DWORD]
         self.advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wt.DWORD)
+        self.advapi32.CredEnumerateW.argtypes = [
+            wt.LPCWSTR,
+            wt.DWORD,
+            ctypes.POINTER(wt.DWORD),
+            ctypes.POINTER(ctypes.POINTER(ctypes.POINTER(CREDENTIALW))),
+        ]
+        self.advapi32.CredEnumerateW.restype = wt.BOOL
+        self.advapi32.CredFree.argtypes = [wt.LPVOID]
+        self.advapi32.CredFree.restype = None
 
         self.wtsapi32.WTSQuerySessionInformationW.argtypes = [
             wt.HANDLE,
@@ -728,6 +762,31 @@ class Win32:
     def post_close(self, hwnd: int) -> None:
         if not self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
             raise HarnessFailure("WM_CLOSE_POST_FAILED")
+
+    def persistent_credential_target_exists(self, target: str) -> bool:
+        """Check an exact Credential Manager target without reading its blob."""
+        count = wt.DWORD()
+        credentials = ctypes.POINTER(ctypes.POINTER(CREDENTIALW))()
+        try:
+            found = self.advapi32.CredEnumerateW(
+                target,
+                0,
+                ctypes.byref(count),
+                ctypes.byref(credentials),
+            )
+        except OSError as error:
+            raise HarnessBlocked("PERSISTENT_CREDENTIAL_PREFLIGHT_UNAVAILABLE") from error
+        if not found:
+            if ctypes.get_last_error() == ERROR_NOT_FOUND:
+                return False
+            raise HarnessBlocked("PERSISTENT_CREDENTIAL_PREFLIGHT_UNAVAILABLE")
+        try:
+            return any(
+                credentials[index].contents.TargetName == target for index in range(count.value)
+            )
+        finally:
+            if credentials:
+                self.advapi32.CredFree(credentials)
 
     def send_inputs(self, inputs: list[INPUT]) -> None:
         if not inputs:
@@ -1004,7 +1063,13 @@ class NativeHarness:
         stderr_path: Path,
     ) -> RunningApp:
         spec = build_launch_spec(
-            self.copied_exe, target, data_root, config_root, workspace_root, stderr_path
+            self.copied_exe,
+            target,
+            data_root,
+            config_root,
+            workspace_root,
+            stderr_path,
+            ephemeral_openai_api_key=self.openai_api_key_for_child(),
         )
         try:
             with stderr_path.open("ab") as stderr:
@@ -1046,6 +1111,10 @@ class NativeHarness:
             child_context,
             data_root / "logs" / f"markturbo-{process.pid}.log",
         )
+
+    def openai_api_key_for_child(self) -> str | None:
+        """Return the one process-only credential a native harness may restore."""
+        return None
     def launch(
         self,
         target: Path,
