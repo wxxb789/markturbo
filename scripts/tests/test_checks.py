@@ -82,6 +82,9 @@ class DiffCheckTests(unittest.TestCase):
         self.assertNotIn("scripts.tests.test_native_goal02", checks.TOOLING_TESTS)
         self.assertEqual(sum(name.startswith("scripts.tests.test_native_goal02_") for name in checks.TOOLING_TESTS), 4)
 
+    def test_explicit_tooling_manifest_includes_goal06_native_harness(self) -> None:
+        self.assertIn("scripts.tests.test_native_goal06", checks.TOOLING_TESTS)
+
     def test_rejects_an_incomplete_ci_range_before_running_git(self) -> None:
         with mock.patch.object(checks, "run") as run:
             with self.assertRaisesRegex(checks.CheckFailure, "must be provided together"):

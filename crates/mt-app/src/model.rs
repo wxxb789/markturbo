@@ -468,6 +468,17 @@ pub enum OutboundScopeKind {
     AgentSkillPackage,
 }
 
+/// Maximum source bytes accepted from one Agent Skill package file.
+///
+/// These limits apply to source bytes before provider framing. They are kept
+/// here, next to the immutable outbound package model, so callers cannot
+/// accidentally implement a second, weaker limit in a UI or transport layer.
+pub const AGENT_SKILL_MAX_FILE_BYTES: usize = 512 * 1024;
+pub const AGENT_SKILL_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+const AGENT_SKILL_SHA256_BYTES: usize = 32;
+const AGENT_SKILL_FRAME_LENGTH_BYTES: usize = std::mem::size_of::<u64>();
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutboundScopeDetails {
     Selection {
@@ -596,6 +607,15 @@ impl OutboundScope {
             _ => None,
         }
     }
+
+    /// Goal 06 Review is document-only. Effective Agent Context is introduced
+    /// by Goal 08 and may remain a valid scope for other operations.
+    pub const fn permits_review(&self) -> bool {
+        !matches!(
+            self.details,
+            OutboundScopeDetails::DocumentWithEffectiveAgentContext { .. }
+        )
+    }
 }
 
 impl fmt::Debug for OutboundScope {
@@ -628,27 +648,54 @@ impl fmt::Display for OutboundScopeError {
 
 impl std::error::Error for OutboundScopeError {}
 
+/// How an Agent Skill file is represented at the provider boundary.
+///
+/// Invalid UTF-8 is metadata-only by default. A caller that explicitly chose
+/// to disclose those bytes may use `ExplicitRaw`; that distinction is retained
+/// in the frozen request so an adapter cannot mistake an omitted payload for an
+/// empty file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentSkillContentKind {
+    Utf8Text,
+    MetadataOnly,
+    ExplicitRaw,
+}
+
+impl AgentSkillContentKind {
+    pub const fn includes_raw_content(self) -> bool {
+        matches!(self, Self::Utf8Text | Self::ExplicitRaw)
+    }
+
+    pub const fn is_metadata_only(self) -> bool {
+        matches!(self, Self::MetadataOnly)
+    }
+}
+
 /// One file disclosed as part of an outbound Agent Skill package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSkillFile {
     normalized_relative_path: String,
     byte_size: u64,
+    sha256: [u8; AGENT_SKILL_SHA256_BYTES],
     inclusion_reason: String,
 }
 
 impl AgentSkillFile {
-    fn new(
+    fn new_with_sha256(
         relative_path: impl AsRef<str>,
         byte_size: u64,
+        sha256: [u8; AGENT_SKILL_SHA256_BYTES],
         inclusion_reason: impl Into<String>,
     ) -> Result<Self, AgentSkillInventoryError> {
         let inclusion_reason = inclusion_reason.into().trim().to_owned();
         if inclusion_reason.is_empty() {
             return Err(AgentSkillInventoryError::EmptyInclusionReason);
         }
+        validate_file_size(byte_size)?;
         Ok(Self {
             normalized_relative_path: normalize_relative_path(relative_path.as_ref())?,
             byte_size,
+            sha256,
             inclusion_reason,
         })
     }
@@ -657,8 +704,25 @@ impl AgentSkillFile {
         &self.normalized_relative_path
     }
 
+    /// The canonical UTF-8 bytes used for deterministic package ordering.
+    pub fn normalized_relative_path_bytes(&self) -> &[u8] {
+        self.normalized_relative_path.as_bytes()
+    }
+
     pub const fn byte_size(&self) -> u64 {
         self.byte_size
+    }
+
+    /// SHA-256 of the complete source bytes, even when raw content is omitted.
+    pub const fn sha256(&self) -> &[u8; AGENT_SKILL_SHA256_BYTES] {
+        &self.sha256
+    }
+
+    pub fn sha256_hex(&self) -> String {
+        self.sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     pub fn inclusion_reason(&self) -> &str {
@@ -679,14 +743,8 @@ impl AgentSkillInventory {
         mut files: Vec<AgentSkillFile>,
         mut omissions: Vec<AgentSkillOmission>,
     ) -> Result<Self, AgentSkillInventoryError> {
-        files.sort_by(|left, right| {
-            left.normalized_relative_path
-                .cmp(&right.normalized_relative_path)
-        });
-        omissions.sort_by(|left, right| {
-            left.normalized_relative_path
-                .cmp(&right.normalized_relative_path)
-        });
+        files.sort_by(compare_normalized_paths);
+        omissions.sort_by(compare_normalized_paths);
         if files
             .windows(2)
             .any(|files| files[0].normalized_relative_path == files[1].normalized_relative_path)
@@ -695,11 +753,7 @@ impl AgentSkillInventory {
             })
             || files.iter().any(|file| {
                 omissions
-                    .binary_search_by(|omission| {
-                        omission
-                            .normalized_relative_path
-                            .cmp(&file.normalized_relative_path)
-                    })
+                    .binary_search_by(|omission| compare_normalized_paths(omission, file))
                     .is_ok()
             })
         {
@@ -710,6 +764,7 @@ impl AgentSkillInventory {
                 .checked_add(file.byte_size)
                 .ok_or(AgentSkillInventoryError::ByteSizeOverflow)
         })?;
+        validate_total_size(total_byte_size)?;
         Ok(Self {
             files,
             omissions,
@@ -731,6 +786,20 @@ impl AgentSkillInventory {
 
     pub const fn is_partial(&self) -> bool {
         !self.omissions.is_empty()
+    }
+
+    /// Whether the supplied immutable payload exposes exactly this inventory.
+    ///
+    /// Omitted files are intentionally absent from the payload; included files
+    /// must match path, byte size, digest, and disclosure reason in the same
+    /// deterministic order.
+    pub fn matches_payload(&self, entries: &[AgentSkillRequestEntry]) -> bool {
+        self.files.len() == entries.len()
+            && self
+                .files
+                .iter()
+                .zip(entries)
+                .all(|(file, entry)| file == entry.file())
     }
 }
 
@@ -768,21 +837,85 @@ impl AgentSkillOmission {
 /// One immutable payload entry and the disclosure metadata derived from it.
 pub struct AgentSkillRequestEntry {
     file: AgentSkillFile,
-    bytes: Box<[u8]>,
+    bytes: Option<Box<[u8]>>,
+    content_kind: AgentSkillContentKind,
 }
 
 impl AgentSkillRequestEntry {
+    /// Construct an entry with explicitly selected raw content.
+    ///
+    /// This is the original Goal 05A constructor and remains an explicit raw
+    /// disclosure path for compatibility. New filesystem callers should use
+    /// [`Self::from_source_bytes`], which omits invalid UTF-8 by default.
     pub fn new(
         relative_path: impl AsRef<str>,
         inclusion_reason: impl Into<String>,
         bytes: impl Into<Vec<u8>>,
     ) -> Result<Self, AgentSkillInventoryError> {
-        let bytes = bytes.into().into_boxed_slice();
+        Self::from_bytes_with_kind(
+            relative_path,
+            inclusion_reason,
+            bytes.into(),
+            AgentSkillContentKind::ExplicitRaw,
+        )
+    }
+
+    /// Build a package entry from source bytes using the Goal 06 disclosure
+    /// policy: valid UTF-8 is sent, while binary/non-UTF-8 bytes become
+    /// metadata-only unless the caller explicitly uses [`Self::new`].
+    pub fn from_source_bytes(
+        relative_path: impl AsRef<str>,
+        inclusion_reason: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Result<Self, AgentSkillInventoryError> {
+        let bytes = bytes.into();
+        let kind = if std::str::from_utf8(&bytes).is_ok() {
+            AgentSkillContentKind::Utf8Text
+        } else {
+            AgentSkillContentKind::MetadataOnly
+        };
+        Self::from_bytes_with_kind(relative_path, inclusion_reason, bytes, kind)
+    }
+
+    /// Construct metadata without retaining or disclosing the raw source.
+    pub fn metadata_only(
+        relative_path: impl AsRef<str>,
+        inclusion_reason: impl Into<String>,
+        byte_size: u64,
+        sha256: [u8; AGENT_SKILL_SHA256_BYTES],
+    ) -> Result<Self, AgentSkillInventoryError> {
+        Ok(Self {
+            file: AgentSkillFile::new_with_sha256(
+                relative_path,
+                byte_size,
+                sha256,
+                inclusion_reason,
+            )?,
+            bytes: None,
+            content_kind: AgentSkillContentKind::MetadataOnly,
+        })
+    }
+
+    fn from_bytes_with_kind(
+        relative_path: impl AsRef<str>,
+        inclusion_reason: impl Into<String>,
+        bytes: Vec<u8>,
+        content_kind: AgentSkillContentKind,
+    ) -> Result<Self, AgentSkillInventoryError> {
         let byte_size =
             u64::try_from(bytes.len()).map_err(|_| AgentSkillInventoryError::ByteSizeOverflow)?;
+        let sha256 = sha256_digest(&bytes);
+        let file =
+            AgentSkillFile::new_with_sha256(relative_path, byte_size, sha256, inclusion_reason)?;
+        let bytes = if content_kind.includes_raw_content() {
+            Some(bytes.into_boxed_slice())
+        } else {
+            None
+        };
         Ok(Self {
-            file: AgentSkillFile::new(relative_path, byte_size, inclusion_reason)?,
+            file,
             bytes,
+            content_kind,
         })
     }
 
@@ -790,8 +923,52 @@ impl AgentSkillRequestEntry {
         &self.file
     }
 
+    pub const fn content_kind(&self) -> AgentSkillContentKind {
+        self.content_kind
+    }
+
+    pub const fn is_metadata_only(&self) -> bool {
+        self.content_kind.is_metadata_only()
+    }
+
+    pub const fn sha256(&self) -> &[u8; AGENT_SKILL_SHA256_BYTES] {
+        self.file.sha256()
+    }
+
+    pub fn sha256_hex(&self) -> String {
+        self.file.sha256_hex()
+    }
+
+    /// The raw content exposed to an adapter, if explicitly included.
+    pub fn payload_bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
+    }
+
+    /// Compatibility view for the pre-Review raw payload API.
+    /// Metadata-only entries intentionally return an empty slice; callers that
+    /// must distinguish omission from an empty file use [`Self::payload_bytes`].
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_deref().unwrap_or_default()
+    }
+
+    /// A deterministic frame that covers every disclosed inventory entry.
+    /// Metadata-only binaries contribute their path, byte size, and SHA-256
+    /// without ever retaining or exposing their raw source bytes.
+    pub fn length_delimited_frame(&self) -> Vec<u8> {
+        match self.payload_bytes() {
+            Some(bytes) => {
+                encode_length_delimited_frame(&self.file.normalized_relative_path, bytes)
+                    .expect("the entry path was normalized during construction")
+            }
+            None => encode_length_delimited_frame(
+                &self.file.normalized_relative_path,
+                &mt_doc::review::metadata_only_source_content(
+                    self.file.byte_size(),
+                    &self.file.sha256_hex(),
+                ),
+            )
+            .expect("the entry path was normalized during construction"),
+        }
     }
 }
 
@@ -803,6 +980,61 @@ pub struct AgentSkillProviderRequest<'a> {
 impl AgentSkillProviderRequest<'_> {
     pub fn entries(&self) -> &[AgentSkillRequestEntry] {
         self.entries
+    }
+
+    pub fn framed_payload(&self) -> Vec<u8> {
+        self.entries
+            .iter()
+            .flat_map(AgentSkillRequestEntry::length_delimited_frame)
+            .collect()
+    }
+
+    pub fn raw_content_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter_map(AgentSkillRequestEntry::payload_bytes)
+            .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .fold(0, u64::saturating_add)
+    }
+}
+
+/// Evidence that an immutable package inventory and the provider payload have
+/// the same included files. The proof carries counts and raw-byte accounting so
+/// request-inspection tests can report what crossed the adapter boundary
+/// without exposing source text in diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSkillPayloadProof {
+    inventory_file_count: usize,
+    payload_entry_count: usize,
+    metadata_only_entry_count: usize,
+    raw_content_bytes: u64,
+    framed_payload_bytes: u64,
+    exact: bool,
+}
+
+impl AgentSkillPayloadProof {
+    pub const fn inventory_file_count(self) -> usize {
+        self.inventory_file_count
+    }
+
+    pub const fn payload_entry_count(self) -> usize {
+        self.payload_entry_count
+    }
+
+    pub const fn metadata_only_entry_count(self) -> usize {
+        self.metadata_only_entry_count
+    }
+
+    pub const fn raw_content_bytes(self) -> u64 {
+        self.raw_content_bytes
+    }
+
+    pub const fn framed_payload_bytes(self) -> u64 {
+        self.framed_payload_bytes
+    }
+
+    pub const fn is_exact(self) -> bool {
+        self.exact
     }
 }
 
@@ -841,19 +1073,17 @@ impl AgentSkillRequest {
         mut entries: Vec<AgentSkillRequestEntry>,
         omissions: Vec<AgentSkillOmission>,
     ) -> Result<Self, AgentSkillInventoryError> {
-        entries.sort_by(|left, right| {
-            left.file
-                .normalized_relative_path
-                .cmp(&right.file.normalized_relative_path)
-        });
+        entries.sort_by(|left, right| compare_normalized_paths(&left.file, &right.file));
         let inventory = AgentSkillInventory::new(
             entries.iter().map(|entry| entry.file.clone()).collect(),
             omissions,
         )?;
-        Ok(Self {
+        let request = Self {
             entries,
             scope: OutboundScope::agent_skill_package(inventory),
-        })
+        };
+        request.verify_inventory_payload()?;
+        Ok(request)
     }
 
     pub fn payload_entries(&self) -> &[AgentSkillRequestEntry] {
@@ -868,6 +1098,61 @@ impl AgentSkillRequest {
 
     pub fn outbound_scope(&self) -> OutboundScope {
         self.scope.clone()
+    }
+
+    pub fn framed_payload(&self) -> Vec<u8> {
+        AgentSkillProviderRequest {
+            entries: &self.entries,
+        }
+        .framed_payload()
+    }
+
+    pub fn metadata_only_entries(&self) -> impl Iterator<Item = &AgentSkillRequestEntry> {
+        self.entries.iter().filter(|entry| entry.is_metadata_only())
+    }
+
+    pub fn inventory_payload_matches(&self) -> bool {
+        self.inventory().matches_payload(&self.entries)
+    }
+
+    pub fn payload_matches_inventory(&self) -> bool {
+        self.inventory_payload_matches()
+    }
+
+    pub fn verify_inventory_payload(&self) -> Result<(), AgentSkillInventoryError> {
+        if self.inventory_payload_matches() {
+            Ok(())
+        } else {
+            Err(AgentSkillInventoryError::InventoryPayloadMismatch)
+        }
+    }
+
+    pub fn payload_proof(&self) -> AgentSkillPayloadProof {
+        let provider_request = AgentSkillProviderRequest {
+            entries: &self.entries,
+        };
+        let framed_payload_bytes = self
+            .entries
+            .iter()
+            .map(AgentSkillRequestEntry::length_delimited_frame)
+            .map(|frame| u64::try_from(frame.len()).unwrap_or(u64::MAX))
+            .fold(0, u64::saturating_add);
+        AgentSkillPayloadProof {
+            inventory_file_count: self.inventory().files().len(),
+            payload_entry_count: self.entries.len(),
+            metadata_only_entry_count: self
+                .entries
+                .iter()
+                .filter(|entry| entry.is_metadata_only())
+                .count(),
+            raw_content_bytes: provider_request.raw_content_bytes(),
+            framed_payload_bytes,
+            exact: self.inventory_payload_matches(),
+        }
+    }
+
+    pub fn exact_inventory_payload_proof(&self) -> AgentSkillPayloadProof {
+        self.payload_proof()
     }
 
     pub fn disclosure(
@@ -887,7 +1172,8 @@ impl AgentSkillRequest {
     where
         A: AgentSkillProviderAdapter,
     {
-        if disclosure.operation() != ModelOperation::Review
+        if !self.inventory_payload_matches()
+            || disclosure.operation() != ModelOperation::Review
             || disclosure.scope() != &self.scope
             || adapter.endpoint() != disclosure.endpoint()
             || !authorization.matches(disclosure)
@@ -939,6 +1225,84 @@ fn normalize_relative_path(raw: &str) -> Result<String, AgentSkillInventoryError
     Ok(normalized.join("/"))
 }
 
+trait NormalizedRelativePath {
+    fn normalized_relative_path(&self) -> &str;
+}
+
+impl NormalizedRelativePath for AgentSkillFile {
+    fn normalized_relative_path(&self) -> &str {
+        &self.normalized_relative_path
+    }
+}
+
+impl NormalizedRelativePath for AgentSkillOmission {
+    fn normalized_relative_path(&self) -> &str {
+        &self.normalized_relative_path
+    }
+}
+
+fn compare_normalized_paths(
+    left: &impl NormalizedRelativePath,
+    right: &impl NormalizedRelativePath,
+) -> std::cmp::Ordering {
+    left.normalized_relative_path()
+        .as_bytes()
+        .cmp(right.normalized_relative_path().as_bytes())
+}
+
+fn validate_file_size(byte_size: u64) -> Result<(), AgentSkillInventoryError> {
+    if byte_size > AGENT_SKILL_MAX_FILE_BYTES as u64 {
+        Err(AgentSkillInventoryError::FileTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_total_size(byte_size: u64) -> Result<(), AgentSkillInventoryError> {
+    if byte_size > AGENT_SKILL_MAX_TOTAL_BYTES as u64 {
+        Err(AgentSkillInventoryError::AggregateTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn sha256_digest(bytes: &[u8]) -> [u8; AGENT_SKILL_SHA256_BYTES] {
+    let digest = Sha256::digest(bytes);
+    let mut result = [0; AGENT_SKILL_SHA256_BYTES];
+    result.copy_from_slice(&digest);
+    result
+}
+
+/// Encode one source frame as:
+///
+/// `u64-be path-length | path UTF-8 bytes | u64-be content-length | raw bytes`
+///
+/// Lengths are byte lengths, not character or line counts. Normalizing the
+/// path here makes the helper safe to use independently of package discovery.
+pub fn encode_length_delimited_frame(
+    relative_path: impl AsRef<str>,
+    content: &[u8],
+) -> Result<Vec<u8>, AgentSkillInventoryError> {
+    let path = normalize_relative_path(relative_path.as_ref())?;
+    let path_bytes = path.as_bytes();
+    let path_length =
+        u64::try_from(path_bytes.len()).map_err(|_| AgentSkillInventoryError::ByteSizeOverflow)?;
+    let content_length =
+        u64::try_from(content.len()).map_err(|_| AgentSkillInventoryError::ByteSizeOverflow)?;
+    validate_file_size(content_length)?;
+    let capacity = AGENT_SKILL_FRAME_LENGTH_BYTES
+        .checked_add(path_bytes.len())
+        .and_then(|capacity| capacity.checked_add(AGENT_SKILL_FRAME_LENGTH_BYTES))
+        .and_then(|capacity| capacity.checked_add(content.len()))
+        .ok_or(AgentSkillInventoryError::ByteSizeOverflow)?;
+    let mut frame = Vec::with_capacity(capacity);
+    frame.extend_from_slice(&path_length.to_be_bytes());
+    frame.extend_from_slice(path_bytes);
+    frame.extend_from_slice(&content_length.to_be_bytes());
+    frame.extend_from_slice(content);
+    Ok(frame)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSkillInventoryError {
     InvalidRelativePath,
@@ -946,6 +1310,10 @@ pub enum AgentSkillInventoryError {
     EmptyOmissionReason,
     DuplicatePath,
     ByteSizeOverflow,
+    FileTooLarge,
+    AggregateTooLarge,
+    NonUtf8Text,
+    InventoryPayloadMismatch,
 }
 
 impl fmt::Display for AgentSkillInventoryError {
@@ -965,6 +1333,26 @@ impl fmt::Display for AgentSkillInventoryError {
             }
             AgentSkillInventoryError::ByteSizeOverflow => {
                 formatter.write_str("Agent Skill inventory byte size overflowed")
+            }
+            AgentSkillInventoryError::FileTooLarge => {
+                write!(
+                    formatter,
+                    "Agent Skill file exceeds the {}-byte source limit",
+                    AGENT_SKILL_MAX_FILE_BYTES
+                )
+            }
+            AgentSkillInventoryError::AggregateTooLarge => {
+                write!(
+                    formatter,
+                    "Agent Skill package exceeds the {}-byte aggregate source limit",
+                    AGENT_SKILL_MAX_TOTAL_BYTES
+                )
+            }
+            AgentSkillInventoryError::NonUtf8Text => {
+                formatter.write_str("Agent Skill text content is not valid UTF-8")
+            }
+            AgentSkillInventoryError::InventoryPayloadMismatch => {
+                formatter.write_str("Agent Skill inventory and provider payload do not match")
             }
         }
     }
@@ -993,6 +1381,20 @@ impl ModelRequestDisclosure {
         }
     }
 
+    /// Fallible constructor for new Review callers. The compatibility
+    /// constructor above remains available to existing Goal 05A code, while
+    /// this API makes the Goal 06 prohibition explicit at the call site.
+    pub fn try_new(
+        operation: ModelOperation,
+        endpoint: EndpointIdentity,
+        scope: OutboundScope,
+    ) -> Result<Self, ModelRequestDisclosureError> {
+        if operation == ModelOperation::Review && !scope.permits_review() {
+            return Err(ModelRequestDisclosureError::ReviewEffectiveAgentContext);
+        }
+        Ok(Self::new(operation, endpoint, scope))
+    }
+
     pub const fn operation(&self) -> ModelOperation {
         self.operation
     }
@@ -1003,6 +1405,13 @@ impl ModelRequestDisclosure {
 
     pub fn scope(&self) -> &OutboundScope {
         &self.scope
+    }
+
+    pub const fn is_review_scope_allowed(&self) -> bool {
+        match self.operation {
+            ModelOperation::Review => self.scope.permits_review(),
+            ModelOperation::Translation => true,
+        }
     }
 
     pub const fn protocol_framing_crosses_boundary(&self) -> bool {
@@ -1021,6 +1430,23 @@ impl ModelRequestDisclosure {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRequestDisclosureError {
+    ReviewEffectiveAgentContext,
+}
+
+impl fmt::Display for ModelRequestDisclosureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReviewEffectiveAgentContext => formatter.write_str(
+                "Review cannot resolve or include Effective Agent Context before Goal 08",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelRequestDisclosureError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentDecision {
@@ -1046,6 +1472,7 @@ impl RequestBinding {
 enum ConsentState {
     Pending(RequestBinding),
     Cancelled,
+    Rejected(ModelRequestDisclosureError),
     Consumed,
 }
 
@@ -1056,9 +1483,13 @@ pub struct ConsentCapability {
 
 impl ConsentCapability {
     pub fn from_decision(disclosure: &ModelRequestDisclosure, decision: ConsentDecision) -> Self {
-        let state = match decision {
-            ConsentDecision::Approve => ConsentState::Pending(disclosure.binding()),
-            ConsentDecision::Cancel => ConsentState::Cancelled,
+        let state = if !disclosure.is_review_scope_allowed() {
+            ConsentState::Rejected(ModelRequestDisclosureError::ReviewEffectiveAgentContext)
+        } else {
+            match decision {
+                ConsentDecision::Approve => ConsentState::Pending(disclosure.binding()),
+                ConsentDecision::Cancel => ConsentState::Cancelled,
+            }
         };
         Self { state }
     }
@@ -1074,6 +1505,7 @@ impl ConsentCapability {
             }
             ConsentState::Pending(_) => Err(ConsentError::Mismatch),
             ConsentState::Cancelled => Err(ConsentError::Cancelled),
+            ConsentState::Rejected(error) => Err(ConsentError::Rejected(error)),
             ConsentState::Consumed => Err(ConsentError::Consumed),
         }
     }
@@ -1084,6 +1516,7 @@ impl fmt::Debug for ConsentCapability {
         let state = match self.state {
             ConsentState::Pending(_) => "pending",
             ConsentState::Cancelled => "cancelled",
+            ConsentState::Rejected(_) => "rejected",
             ConsentState::Consumed => "consumed",
         };
         formatter
@@ -1114,6 +1547,7 @@ impl fmt::Debug for RequestAuthorization {
 pub enum ConsentError {
     Cancelled,
     Mismatch,
+    Rejected(ModelRequestDisclosureError),
     Consumed,
 }
 
@@ -1124,6 +1558,7 @@ impl fmt::Display for ConsentError {
             ConsentError::Mismatch => {
                 formatter.write_str("model request does not match the approved disclosure")
             }
+            ConsentError::Rejected(error) => error.fmt(formatter),
             ConsentError::Consumed => {
                 formatter.write_str("model request consent was already consumed")
             }
@@ -1628,5 +2063,237 @@ mod tests {
             included_and_omitted,
             Err(AgentSkillInventoryError::DuplicatePath)
         ));
+    }
+
+    #[test]
+    fn source_bytes_default_to_metadata_for_non_utf8_and_raw_requires_opt_in() {
+        let binary = AgentSkillRequestEntry::from_source_bytes(
+            "assets\\blob.bin",
+            "support asset",
+            vec![0xff, 0x00, 0x80],
+        )
+        .unwrap();
+        assert!(binary.is_metadata_only());
+        assert!(binary.payload_bytes().is_none());
+        assert!(binary.bytes().is_empty());
+        assert_eq!(binary.file().normalized_relative_path(), "assets/blob.bin");
+        assert_eq!(binary.file().byte_size(), 3);
+        assert_eq!(
+            binary.file().sha256_hex(),
+            "ef192b7af54e943f206ab27075ec1805384c972c9959fc5820f1fa7d5268fcef"
+        );
+
+        let explicit = AgentSkillRequestEntry::new(
+            "assets/blob.bin",
+            "explicitly selected binary",
+            vec![0xff, 0x00, 0x80],
+        )
+        .unwrap();
+        assert_eq!(explicit.content_kind(), AgentSkillContentKind::ExplicitRaw);
+        assert_eq!(explicit.payload_bytes(), Some(&[0xff, 0x00, 0x80][..]));
+
+        let text = AgentSkillRequestEntry::from_source_bytes(
+            "docs/readme.md",
+            "support text",
+            "中文 text".as_bytes().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(text.content_kind(), AgentSkillContentKind::Utf8Text);
+        assert_eq!(text.payload_bytes(), Some("中文 text".as_bytes()));
+    }
+
+    #[test]
+    fn skill_source_limits_apply_per_file_and_in_aggregate() {
+        let at_file_limit = AgentSkillRequestEntry::from_source_bytes(
+            "at-limit.md",
+            "support",
+            vec![b'x'; AGENT_SKILL_MAX_FILE_BYTES],
+        )
+        .unwrap();
+        assert_eq!(
+            at_file_limit.file().byte_size(),
+            AGENT_SKILL_MAX_FILE_BYTES as u64
+        );
+
+        assert!(matches!(
+            AgentSkillRequestEntry::from_source_bytes(
+                "too-large.md",
+                "support",
+                vec![b'x'; AGENT_SKILL_MAX_FILE_BYTES + 1],
+            ),
+            Err(AgentSkillInventoryError::FileTooLarge)
+        ));
+
+        let entries = (0..8)
+            .map(|index| {
+                AgentSkillRequestEntry::from_source_bytes(
+                    format!("part-{index}.md"),
+                    "support",
+                    vec![b'x'; AGENT_SKILL_MAX_FILE_BYTES],
+                )
+                .unwrap()
+            })
+            .collect();
+        let request = AgentSkillRequest::new(entries, Vec::new()).unwrap();
+        assert_eq!(
+            request.inventory().total_byte_size(),
+            AGENT_SKILL_MAX_TOTAL_BYTES as u64
+        );
+
+        let entries = (0..9)
+            .map(|index| {
+                AgentSkillRequestEntry::from_source_bytes(
+                    format!("part-{index}.md"),
+                    "support",
+                    vec![b'x'; AGENT_SKILL_MAX_FILE_BYTES],
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(matches!(
+            AgentSkillRequest::new(entries, Vec::new()),
+            Err(AgentSkillInventoryError::AggregateTooLarge)
+        ));
+    }
+
+    #[test]
+    fn package_order_is_normalized_and_compared_by_utf8_path_bytes() {
+        let request = AgentSkillRequest::new(
+            vec![
+                AgentSkillRequestEntry::new("z\\b.md", "support", b"z".to_vec()).unwrap(),
+                AgentSkillRequestEntry::new("./a\\é.md", "support", b"unicode".to_vec()).unwrap(),
+                AgentSkillRequestEntry::new("a/z.md", "support", b"ascii".to_vec()).unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let paths = request
+            .inventory()
+            .files()
+            .iter()
+            .map(AgentSkillFile::normalized_relative_path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["a/z.md", "a/é.md", "z/b.md"]);
+        assert!(
+            request
+                .inventory()
+                .files()
+                .windows(2)
+                .all(|pair| pair[0].normalized_relative_path_bytes()
+                    <= pair[1].normalized_relative_path_bytes())
+        );
+    }
+
+    #[test]
+    fn source_frame_is_length_delimited_and_metadata_entries_are_hashed_without_raw_bytes() {
+        let entry = AgentSkillRequestEntry::new(
+            "./refs\\guide.bin",
+            "explicit support",
+            vec![0xff, 0x00, 0x01],
+        )
+        .unwrap();
+        let frame = entry.length_delimited_frame();
+        let path_length = u64::from_be_bytes(frame[..8].try_into().unwrap()) as usize;
+        assert_eq!(&frame[8..8 + path_length], b"refs/guide.bin");
+        let content_length_offset = 8 + path_length;
+        let content_length = u64::from_be_bytes(
+            frame[content_length_offset..content_length_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(content_length, 3);
+        assert_eq!(
+            &frame[content_length_offset + 8..content_length_offset + 8 + content_length],
+            &[0xff, 0x00, 0x01]
+        );
+
+        let metadata = AgentSkillRequestEntry::from_source_bytes(
+            "refs/blob.bin",
+            "binary support",
+            vec![0xff, 0x00, 0x01],
+        )
+        .unwrap();
+        let metadata_frame = metadata.length_delimited_frame();
+        let metadata_path_length =
+            u64::from_be_bytes(metadata_frame[..8].try_into().unwrap()) as usize;
+        assert_eq!(
+            &metadata_frame[8..8 + metadata_path_length],
+            b"refs/blob.bin"
+        );
+        let metadata_content_offset = 8 + metadata_path_length;
+        let metadata_content_length = u64::from_be_bytes(
+            metadata_frame[metadata_content_offset..metadata_content_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(
+            metadata_content_length,
+            b"markturbo-agent-skill-metadata-v1\0".len() + 8 + 64
+        );
+        assert_ne!(
+            &metadata_frame[metadata_content_offset + 8..],
+            &[0xff, 0x00, 0x01]
+        );
+        let changed_metadata = AgentSkillRequestEntry::from_source_bytes(
+            "refs/blob.bin",
+            "binary support",
+            vec![0xfe, 0x00, 0x01],
+        )
+        .unwrap();
+        assert_ne!(metadata_frame, changed_metadata.length_delimited_frame());
+
+        let raw_frame_length = entry.length_delimited_frame().len();
+        let request = AgentSkillRequest::new(vec![entry, metadata], Vec::new()).unwrap();
+        let proof = request.payload_proof();
+        assert!(proof.is_exact());
+        assert_eq!(proof.inventory_file_count(), 2);
+        assert_eq!(proof.payload_entry_count(), 2);
+        assert_eq!(proof.metadata_only_entry_count(), 1);
+        assert_eq!(proof.raw_content_bytes(), 3);
+        assert_eq!(
+            proof.framed_payload_bytes(),
+            (raw_frame_length + metadata_frame.len()) as u64
+        );
+        assert_eq!(
+            request.framed_payload().len(),
+            proof.framed_payload_bytes() as usize
+        );
+    }
+
+    #[test]
+    fn review_cannot_authorize_effective_agent_context() {
+        let scope = OutboundScope::document_with_effective_agent_context(4, ["AGENTS.md"]).unwrap();
+        let endpoint = EndpointIdentity::parse(Provider::OpenAiResponses, None).unwrap();
+        assert_eq!(
+            ModelRequestDisclosure::try_new(
+                ModelOperation::Review,
+                endpoint.clone(),
+                scope.clone()
+            ),
+            Err(ModelRequestDisclosureError::ReviewEffectiveAgentContext)
+        );
+
+        let disclosure = ModelRequestDisclosure::new(ModelOperation::Review, endpoint, scope);
+        assert!(!disclosure.is_review_scope_allowed());
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Rejected(
+                ModelRequestDisclosureError::ReviewEffectiveAgentContext
+            ))
+        ));
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Consumed)
+        ));
+
+        let translation = ModelRequestDisclosure::new(
+            ModelOperation::Translation,
+            disclosure.endpoint().clone(),
+            disclosure.scope().clone(),
+        );
+        let mut translation_consent =
+            ConsentCapability::from_decision(&translation, ConsentDecision::Approve);
+        assert!(translation_consent.authorize(&translation).is_ok());
     }
 }
