@@ -17,10 +17,13 @@ UTILITY_COMMANDS = {
     "fixtures": "scripts.markturbo_tools.perf_fixtures",
     "probe": "scripts.markturbo_tools.probe",
     "capacity": "scripts.markturbo_tools.recovery_capacity",
+    "evaluation": "scripts.markturbo_tools.evaluation",
+    "evaluate": "scripts.markturbo_tools.evaluation",
 }
 ACCEPTANCE_GOALS = {
     "goal-02": "scripts.markturbo_tools.native.goal02",
     "goal-03": "scripts.markturbo_tools.native.goal03",
+    "goal-06": "scripts.markturbo_tools.native.goal06",
 }
 NATIVE_EXIT_CODES = frozenset({0, 1, 2})
 
@@ -67,6 +70,9 @@ def native_exit_code(returncode: int) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if len(raw_argv) == 2 and raw_argv[0] in UTILITY_COMMANDS and raw_argv[1] in {"-h", "--help"}:
+        return run_module(UTILITY_COMMANDS[raw_argv[0]], ("--help",))
     namespace = parser().parse_args(argv)
     if namespace.command == "check":
         try:

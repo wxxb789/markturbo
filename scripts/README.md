@@ -50,8 +50,12 @@ uv run --project scripts scripts/mt.py icons
 uv run --project scripts scripts/mt.py fixtures
 uv run --project scripts scripts/mt.py probe -- memory
 uv run --project scripts scripts/mt.py capacity
+uv run --project scripts scripts/mt.py evaluation verify-manifest
+uv run --project scripts scripts/mt.py evaluation scaffold --evidence .scratch/goal-06/evaluation.json
+uv run --project scripts scripts/mt.py evaluation record --owner-input-dir <owner-local-dir> --evidence .scratch/goal-06/evaluation.json
 uv run --project scripts scripts/mt.py accept goal-02 -- --help
 uv run --project scripts scripts/mt.py accept goal-03 -- --help
+uv run --project scripts scripts/mt.py accept goal-06 -- --help
 ```
 
 `icons` regenerates the platform icon outputs. `fixtures` deterministically
@@ -59,6 +63,21 @@ regenerates committed performance fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The two `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence.
+
+`evaluation verify-manifest` verifies the immutable `goal-01-v1` corpus and
+prints only paths, byte counts, and SHA-256 values. `evaluation scaffold`
+creates a 12-artifact, content-free Goal 06 evidence record. `evaluation
+record` consumes one metadata-only owner judgment JSON per artifact; it never
+contacts a model endpoint. Without complete owner-local inputs it writes a
+fail-closed `not_evaluated` scaffold and exits with status `2`. Model output,
+source text, credentials, endpoint URLs, and local absolute paths are never
+written to the evidence record. Each owner file is named `<artifact-id>.json`
+and contains only `artifact_id`, `decoded_completely`, sorted ID arrays for
+`surfaced_item_ids` and registry-linked `unsupported_claim_ids`, plus total
+`unsupported_claim_count`, `false_source_anchor_count`, and
+`boilerplate_question_count`, `question_count`, `materially_misleading`,
+`usefulness`, and `model_reported_id`. The evidence destination must remain
+outside the immutable `evaluation/goal-01/` corpus.
 
 `probe formula` measures the embedded KaTeX path by default. Pass `--font-dir`
 only when intentionally measuring a complete external development override.
@@ -158,6 +177,11 @@ uv run --project scripts scripts/mt.py accept goal-03 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
   --evidence .scratch/goal-03-native-acceptance-v1.json
+
+uv run --project scripts scripts/mt.py accept goal-06 -- \
+  --exe target/release/markturbo.exe \
+  --expect-exe-sha256 <sha256> \
+  --evidence .scratch/goal-06-native-acceptance-v1.json
 ```
 
 Delegated commands run from the repository root. Therefore paths supplied to

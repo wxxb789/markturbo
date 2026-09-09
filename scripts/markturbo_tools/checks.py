@@ -28,6 +28,7 @@ TOOLING_TESTS = (
     "scripts.tests.test_checks",
     "scripts.tests.test_privacy",
     "scripts.tests.test_cli",
+    "scripts.tests.test_evaluation",
     "scripts.tests.test_icons",
     "scripts.tests.test_workflows",
     "scripts.tests.test_perf_fixtures",
@@ -37,6 +38,7 @@ TOOLING_TESTS = (
     "scripts.tests.test_native_goal02_runtime",
     "scripts.tests.test_native_goal02_execution",
     "scripts.tests.test_native_goal03",
+    "scripts.tests.test_native_goal06",
     "scripts.tests.test_probe",
 )
 

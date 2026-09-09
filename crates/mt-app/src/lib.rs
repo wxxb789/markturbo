@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod model;
 pub mod recovery;
 pub mod renderer;
+pub mod review;
 pub mod settings;
 pub mod startup;
 pub mod theme;
