@@ -53,6 +53,12 @@ pub const REVIEW_MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum serialized user payload sent to a provider.
 pub const REVIEW_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum provider-generated tokens requested for one Review response.
+pub const REVIEW_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
+/// Maximum decoded response text retained from a provider.
+pub const REVIEW_MAX_DECODED_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
 /// Default upper bound for one provider request.
 pub const REVIEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -676,6 +682,12 @@ pub enum ReviewError {
         byte_size: usize,
         limit: usize,
     },
+    ResponseTooLarge {
+        byte_size: usize,
+        limit: usize,
+        provider: Provider,
+        endpoint: EndpointIdentity,
+    },
     Cancelled {
         provider: Provider,
         endpoint: EndpointIdentity,
@@ -720,6 +732,7 @@ impl ReviewError {
             Self::AuthorizationMismatch { .. } => "authorization_mismatch",
             Self::InvalidRequest { .. } => "invalid_request",
             Self::RequestTooLarge { .. } => "request_too_large",
+            Self::ResponseTooLarge { .. } => "response_too_large",
             Self::Cancelled { .. } => "cancelled",
             Self::Timeout { .. } => "timeout",
             Self::TransportUnavailable { .. } => "transport_unavailable",
@@ -798,6 +811,16 @@ impl fmt::Display for ReviewError {
             Self::RequestTooLarge { byte_size, limit } => write!(
                 formatter,
                 "Review request is {byte_size} bytes, over the {limit}-byte request limit; narrow the source scope.",
+            ),
+            Self::ResponseTooLarge {
+                byte_size,
+                limit,
+                provider,
+                endpoint,
+            } => write!(
+                formatter,
+                "{provider} at {} returned {byte_size} decoded Review bytes, over the {limit}-byte response limit.",
+                endpoint.normalized_identity()
             ),
             Self::Cancelled { provider, endpoint } => write!(
                 formatter,
@@ -1446,7 +1469,11 @@ fn domain_review_schema(request: &doc_review::ReviewRequest) -> serde_json::Valu
         "required": ["kind", "quote"],
         "properties": {
             "kind": {"enum": ["document_quote"]},
-            "quote": {"type": "string", "minLength": 1}
+            "quote": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": doc_review::MAX_REVIEW_SOURCE_QUOTE_BYTES
+            }
         }
     });
     let skill_file_quote = serde_json::json!({
@@ -1454,8 +1481,16 @@ fn domain_review_schema(request: &doc_review::ReviewRequest) -> serde_json::Valu
         "required": ["kind", "path", "quote"],
         "properties": {
             "kind": {"enum": ["agent_skill_file_quote"]},
-            "path": {"type": "string", "minLength": 1},
-            "quote": {"type": "string", "minLength": 1}
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+            },
+            "quote": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": doc_review::MAX_REVIEW_SOURCE_QUOTE_BYTES
+            }
         }
     });
     let document_wide = serde_json::json!({
@@ -1508,7 +1543,11 @@ fn domain_review_schema(request: &doc_review::ReviewRequest) -> serde_json::Valu
         "required": ["kind", "text", "anchor"],
         "properties": {
             "kind": {"type": "string", "enum": ["source", "source_statement"]},
-            "text": {"type": "string"},
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+            },
             "anchor": source_anchor
         }
     });
@@ -1517,7 +1556,11 @@ fn domain_review_schema(request: &doc_review::ReviewRequest) -> serde_json::Valu
         "required": ["kind", "text", "anchor"],
         "properties": {
             "kind": {"type": "string", "enum": ["inference"]},
-            "text": {"type": "string"},
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+            },
             "anchor": inference_anchor
         }
     });
@@ -1536,34 +1579,131 @@ fn domain_review_schema(request: &doc_review::ReviewRequest) -> serde_json::Valu
                     "unresolved_decisions"
                 ],
                 "properties": {
-                    "stated_goal": {"type": "string"},
-                    "relevant_context": {"type": "array", "items": {"type": "string"}},
-                    "constraints": {"type": "array", "items": {"type": "string"}},
-                    "non_goals": {"type": "array", "items": {"type": "string"}},
-                    "expected_deliverable": {"type": "string"},
-                    "success_evidence": {"type": "array", "items": {"type": "string"}},
-                    "inferred_assumptions": {"type": "array", "items": {"type": "string"}},
-                    "unresolved_decisions": {"type": "array", "items": {"type": "string"}}
+                    "stated_goal": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                    },
+                    "relevant_context": {
+                        "type": "array",
+                        "maxItems": doc_review::MAX_REVIEW_INTENT_LIST_ENTRIES,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        }
+                    },
+                    "constraints": {
+                        "type": "array",
+                        "maxItems": doc_review::MAX_REVIEW_INTENT_LIST_ENTRIES,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        }
+                    },
+                    "non_goals": {
+                        "type": "array",
+                        "maxItems": doc_review::MAX_REVIEW_INTENT_LIST_ENTRIES,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        }
+                    },
+                    "expected_deliverable": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                    },
+                    "success_evidence": {
+                        "type": "array",
+                        "maxItems": doc_review::MAX_REVIEW_INTENT_LIST_ENTRIES,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        }
+                    },
+                    "inferred_assumptions": {
+                        "type": "array",
+                        "maxItems": doc_review::MAX_REVIEW_INTENT_LIST_ENTRIES,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        }
+                    },
+                    "unresolved_decisions": {
+                        "type": "array",
+                        "maxItems": doc_review::MAX_REVIEW_INTENT_LIST_ENTRIES,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        }
+                    }
                 }
             },
             "findings": {
                 "type": "array",
+                "maxItems": doc_review::MAX_REVIEW_FINDINGS,
                 "items": {"anyOf": [source_finding, inference_finding]}
             },
             "clarification_questions": {
-                "type": "array", "maxItems": 5,
+                "type": "array", "maxItems": doc_review::MAX_CLARIFICATION_QUESTIONS,
                 "items": {
                     "type": "object", "additionalProperties": false,
                     "required": ["question", "priority", "impact"],
                     "properties": {
-                        "question": {"type": "string"},
+                        "question": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        },
                         "priority": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
-                        "impact": {"type": ["string", "null"]}
+                        "impact": {
+                            "type": ["string", "null"],
+                            "maxLength": doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES
+                        }
                     }
                 }
             }
         }
     })
+}
+
+fn provider_review_schema(
+    request: &doc_review::ReviewRequest,
+    provider: Provider,
+) -> serde_json::Value {
+    let mut schema = domain_review_schema(request);
+    if provider == Provider::AnthropicMessages {
+        strip_anthropic_unsupported_constraints(&mut schema);
+    }
+    schema
+}
+
+fn strip_anthropic_unsupported_constraints(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in ["minLength", "maxLength", "maxItems"] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                strip_anthropic_unsupported_constraints(child);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                strip_anthropic_unsupported_constraints(value);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
 }
 
 #[cfg(feature = "model-transport")]
@@ -1604,9 +1744,10 @@ impl GenAiReviewer {
         let chat_request = ChatRequest::from_system(REVIEW_SYSTEM_PROMPT)
             .append_message(ChatMessage::user(user_payload.to_owned()));
         let options = ChatOptions::default()
+            .with_max_tokens(REVIEW_MAX_OUTPUT_TOKENS)
             .with_response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
                 "markturbo_review",
-                domain_review_schema(request),
+                provider_review_schema(request, self.provider),
             )))
             .with_reasoning_effort(ReasoningEffort::Medium);
         let response = self
@@ -1631,6 +1772,14 @@ impl GenAiReviewer {
                 user_payload.to_owned(),
             )
         })?;
+        if text.len() > REVIEW_MAX_DECODED_RESPONSE_BYTES {
+            return Err(ReviewExecutionError::new(ReviewError::ResponseTooLarge {
+                provider: self.provider,
+                endpoint: self.endpoint.clone(),
+                byte_size: text.len(),
+                limit: REVIEW_MAX_DECODED_RESPONSE_BYTES,
+            }));
+        }
         let metadata =
             ReviewMetadata::new(self.provider, self.requested_model.clone(), response_model)
                 .map_err(|_| {
@@ -2143,6 +2292,79 @@ mod tests {
                 serde_json::json!(["agent_skill_file_quote"])
             );
         }
+    }
+
+    #[cfg(feature = "model-transport")]
+    #[test]
+    fn review_schema_contains_structured_output_bounds() {
+        let request = doc_review::ReviewRequest::document(
+            doc_review::ArtifactLens::Prompt,
+            "source",
+            doc_review::SourceSnapshot::default(),
+        )
+        .unwrap();
+        let schema = domain_review_schema(&request);
+        let findings = schema["properties"]["findings"]["items"]["anyOf"]
+            .as_array()
+            .expect("finding schema branches");
+
+        assert_eq!(
+            schema["properties"]["findings"]["maxItems"],
+            serde_json::json!(doc_review::MAX_REVIEW_FINDINGS)
+        );
+        assert_eq!(
+            findings[0]["properties"]["text"]["maxLength"],
+            serde_json::json!(doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES)
+        );
+        assert_eq!(
+            findings[0]["properties"]["anchor"]["properties"]["quote"]["maxLength"],
+            serde_json::json!(doc_review::MAX_REVIEW_SOURCE_QUOTE_BYTES)
+        );
+        assert_eq!(
+            schema["properties"]["understood_intent"]["properties"]["relevant_context"]["maxItems"],
+            serde_json::json!(doc_review::MAX_REVIEW_INTENT_LIST_ENTRIES)
+        );
+        assert_eq!(
+            schema["properties"]["understood_intent"]["properties"]["relevant_context"]["items"]["maxLength"],
+            serde_json::json!(doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES)
+        );
+        assert_eq!(
+            schema["properties"]["clarification_questions"]["items"]["properties"]["question"]["maxLength"],
+            serde_json::json!(doc_review::MAX_REVIEW_GENERATED_TEXT_BYTES)
+        );
+    }
+
+    #[cfg(feature = "model-transport")]
+    #[test]
+    fn anthropic_schema_omits_unsupported_constraints_but_keeps_structure() {
+        let request = doc_review::ReviewRequest::document(
+            doc_review::ArtifactLens::Prompt,
+            "source",
+            doc_review::SourceSnapshot::default(),
+        )
+        .unwrap();
+        let schema = provider_review_schema(&request, Provider::AnthropicMessages);
+        let serialized = schema.to_string();
+        let openai_schema = provider_review_schema(&request, Provider::OpenAiChat).to_string();
+        assert!(openai_schema.contains("\"maxLength\""));
+        assert!(openai_schema.contains("\"maxItems\""));
+
+        for unsupported in ["minLength", "maxLength", "maxItems"] {
+            assert!(
+                !serialized.contains(&format!("\"{unsupported}\"")),
+                "Anthropic schema retained unsupported keyword {unsupported}"
+            );
+        }
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert!(schema["required"].as_array().is_some());
+        assert_eq!(
+            schema["properties"]["schema_version"]["enum"],
+            serde_json::json!([doc_review::REVIEW_SCHEMA_VERSION])
+        );
+        assert_eq!(
+            schema["properties"]["findings"]["items"]["anyOf"][0]["properties"]["kind"]["enum"],
+            serde_json::json!(["source", "source_statement"])
+        );
     }
 
     #[cfg(feature = "model-transport")]
@@ -2993,6 +3215,64 @@ mod tests {
 
     #[cfg(feature = "model-transport")]
     #[test]
+    fn oversized_decoded_response_is_content_free_and_does_not_retain_raw_text() {
+        let raw_response = format!(
+            "oversized-review-response-sentinel{}",
+            "r".repeat(REVIEW_MAX_DECODED_RESPONSE_BYTES)
+        );
+        let (base_url, requests) = one_shot_server(Provider::AnthropicMessages, raw_response);
+        let settings = settings(Provider::AnthropicMessages, &base_url);
+        let vault = CredentialVault::with_store(Arc::new(EmptyStore));
+        let endpoint =
+            EndpointIdentity::parse(Provider::AnthropicMessages, Some(&base_url)).unwrap();
+        vault
+            .replace_session(
+                endpoint.credential_target().to_string(),
+                "oversized-response-credential".into(),
+            )
+            .unwrap();
+        let prepared = PreparedReview::from_settings(&settings, &vault)
+            .unwrap()
+            .bind_document_request(
+                doc_review::ReviewRequest::document(
+                    doc_review::ArtifactLens::Prompt,
+                    "source body",
+                    doc_review::SourceSnapshot::default(),
+                )
+                .unwrap(),
+                ReviewLanguage::English,
+            )
+            .unwrap();
+        let disclosure = prepared.disclosure().clone();
+        let mut consent =
+            ConsentCapability::from_decision(&disclosure, crate::model::ConsentDecision::Approve);
+        let authorization = prepared.authorize(&mut consent).unwrap();
+
+        let error = prepared
+            .execute_with_record(
+                authorization,
+                &AtomicBool::new(false),
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.error().code(), "response_too_large");
+        assert!(matches!(
+            error.error(),
+            ReviewError::ResponseTooLarge {
+                byte_size,
+                limit,
+                ..
+            } if *byte_size > *limit && *limit == REVIEW_MAX_DECODED_RESPONSE_BYTES
+        ));
+        assert!(error.user_payload().is_none());
+        assert!(error.raw_model_response().is_none());
+        assert!(!format!("{error:?}").contains("oversized-review-response-sentinel"));
+        assert!(requests.recv().is_ok());
+    }
+
+    #[cfg(feature = "model-transport")]
+    #[test]
     fn loopback_fixtures_cover_all_supported_wire_formats() {
         let response = serde_json::json!({
             "schema_version": doc_review::REVIEW_SCHEMA_VERSION,
@@ -3051,6 +3331,22 @@ mod tests {
             assert!(serialized.contains("source body"));
             assert!(serialized.contains(REVIEW_PROMPT_VERSION));
             assert!(!serialized.contains("loopback-secret"));
+            let max_tokens = match provider {
+                Provider::OpenAiResponses => &body["max_output_tokens"],
+                Provider::OpenAiChat | Provider::AnthropicMessages => &body["max_tokens"],
+            };
+            assert_eq!(max_tokens, &serde_json::json!(REVIEW_MAX_OUTPUT_TOKENS));
+            if provider == Provider::AnthropicMessages {
+                for unsupported in ["minLength", "maxLength", "maxItems"] {
+                    assert!(
+                        !serialized.contains(&format!("\"{unsupported}\"")),
+                        "Anthropic payload retained unsupported keyword {unsupported}"
+                    );
+                }
+                assert!(serialized.contains("\"additionalProperties\":false"));
+                assert!(serialized.contains("\"required\""));
+                assert!(serialized.contains("\"enum\""));
+            }
         }
     }
 }

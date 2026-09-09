@@ -6,7 +6,7 @@
 //! only to a caller-selected directory outside the repository.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
     fs::{self, OpenOptions},
@@ -19,7 +19,10 @@ use std::{
 use mt_app::{
     credentials::{CredentialError, CredentialVault, Secret, SecureCredentialStore},
     model::{ConsentCapability, ConsentDecision, EndpointIdentity, Provider},
-    review::{PreparedReview, ReviewExecutionError, ReviewExecutionRecord, ReviewLanguage},
+    review::{
+        PreparedReview, REVIEW_MAX_OUTPUT_TOKENS, ReviewExecutionError, ReviewExecutionRecord,
+        ReviewLanguage, inspect_document_request,
+    },
     settings::AppSettings,
 };
 use mt_doc::review::{
@@ -453,6 +456,12 @@ fn verify_manifest(repo: &Path) -> Result<Manifest, &'static str> {
     if entries.len() != EXPECTED_MANIFEST_ENTRIES {
         return Err("evaluation manifest entry count is invalid");
     }
+    let mut actual = BTreeSet::new();
+    collect_regular_corpus_files(repo, &repo.join("evaluation/goal-01"), &mut actual)?;
+    let expected = entries.keys().cloned().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("manifest coverage does not match regular files in the corpus");
+    }
     for (relative, expected) in &entries {
         let path = repo.join(relative);
         let metadata =
@@ -466,6 +475,59 @@ fn verify_manifest(repo: &Path) -> Result<Manifest, &'static str> {
         }
     }
     Ok(Manifest { entries })
+}
+
+/// Walk the corpus without following symbolic links so manifest coverage is
+/// exact and no unlisted path can enter the evaluation source scope.
+fn collect_regular_corpus_files(
+    repo: &Path,
+    directory: &Path,
+    actual: &mut BTreeSet<String>,
+) -> Result<(), &'static str> {
+    let directory_metadata =
+        fs::symlink_metadata(directory).map_err(|_| "evaluation corpus is unavailable")?;
+    if directory_metadata.file_type().is_symlink() {
+        return Err("evaluation corpus must not contain symbolic links");
+    }
+    if !directory_metadata.is_dir() {
+        return Err("evaluation corpus is unavailable");
+    }
+
+    for entry in fs::read_dir(directory).map_err(|_| "evaluation corpus is unavailable")? {
+        let entry = entry.map_err(|_| "evaluation corpus is unavailable")?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| "evaluation corpus is unavailable")?;
+        if metadata.file_type().is_symlink() {
+            return Err("evaluation corpus must not contain symbolic links");
+        }
+        if metadata.is_dir() {
+            collect_regular_corpus_files(repo, &path, actual)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err("evaluation corpus entry is not a regular file");
+        }
+        let relative_path = path
+            .strip_prefix(repo)
+            .map_err(|_| "evaluation corpus path is outside the repository")?;
+        if relative_path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|component| component.contains('\\'))
+        }) {
+            return Err("evaluation corpus path contains a backslash");
+        }
+        let relative = relative_path
+            .to_str()
+            .ok_or("evaluation corpus path is not UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if relative != MANIFEST_PATH {
+            actual.insert(relative);
+        }
+    }
+    Ok(())
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -578,11 +640,16 @@ fn write_completed_record(
 }
 
 fn inspection_json(record: &ReviewExecutionRecord) -> Result<Value, &'static str> {
-    let source_bytes = record.request().outbound_bytes();
+    inspection_json_for_request(record.request())
+}
+
+fn inspection_json_for_request(request: &ReviewRequest) -> Result<Value, &'static str> {
+    let inspection = inspect_document_request(request)
+        .map_err(|_| "could not inspect the completed evaluation request")?;
     Ok(json!({
-        "source_byte_size": source_bytes.len(),
-        "canonical_byte_size": source_bytes.len(),
-        "canonical_sha256": sha256(&source_bytes),
+        "source_byte_size": inspection.source_byte_size(),
+        "canonical_byte_size": inspection.canonical_byte_size(),
+        "canonical_sha256": inspection.canonical_sha256(),
     }))
 }
 
@@ -623,6 +690,7 @@ fn fixed_configuration() -> Value {
         "endpoint": ENDPOINT,
         "model_requested": MODEL,
         "reasoning_effort": "medium",
+        "max_output_tokens": REVIEW_MAX_OUTPUT_TOKENS,
         "sampling": "provider-defaults-omitted",
         "prompt_version": "review-v1",
         "tools": false,
@@ -673,6 +741,114 @@ mod tests {
                 .iter()
                 .all(|artifact| artifact.path.starts_with("evaluation/goal-01/"))
         );
+    }
+
+    #[test]
+    fn fixed_configuration_records_the_complete_request_contract() {
+        assert_eq!(
+            fixed_configuration(),
+            serde_json::json!({
+                "provider_wire_format": "openai-responses",
+                "endpoint": ENDPOINT,
+                "model_requested": MODEL,
+                "reasoning_effort": "medium",
+                "max_output_tokens": 8_192,
+                "sampling": "provider-defaults-omitted",
+                "prompt_version": "review-v1",
+                "tools": false,
+                "browsing": false,
+                "memory": false,
+                "agent_actions": false,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_skill_inspection_separates_source_and_canonical_bytes() {
+        let package = SkillPackage::new(
+            vec![
+                SkillPackageFile::text("SKILL.md", "entry", "entry file").unwrap(),
+                SkillPackageFile::text("references/readme.md", "support", "supporting file")
+                    .unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let request = ReviewRequest::agent_skill(package, SourceSnapshot::default()).unwrap();
+        let canonical = request.outbound_bytes();
+        let inspection = inspection_json_for_request(&request).unwrap();
+
+        assert_eq!(inspection["source_byte_size"], serde_json::json!(12));
+        assert_eq!(
+            inspection["canonical_byte_size"],
+            serde_json::json!(canonical.len())
+        );
+        assert_eq!(
+            inspection["canonical_sha256"],
+            serde_json::json!(sha256(&canonical))
+        );
+        assert!(canonical.len() > 12);
+    }
+
+    #[test]
+    fn manifest_rejects_unmanifested_regular_corpus_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        copy_corpus_for_test(temporary.path());
+        fs::write(
+            temporary
+                .path()
+                .join("evaluation/goal-01/snapshots/skills/gpui/unmanifested-support.md"),
+            b"regular supporting file not covered by the manifest",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            verify_manifest(temporary.path()),
+            Err("manifest coverage does not match regular files in the corpus")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_rejects_backslash_path_that_would_collide_after_normalization() {
+        let temporary = tempfile::tempdir().unwrap();
+        copy_corpus_for_test(temporary.path());
+        fs::write(
+            temporary
+                .path()
+                .join("evaluation/goal-01")
+                .join(r"snapshots\skills\gpui\SKILL.md"),
+            b"unmanifested regular file with a collision-shaped name",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            verify_manifest(temporary.path()),
+            Err("evaluation corpus path contains a backslash")
+        ));
+    }
+
+    fn copy_corpus_for_test(destination_root: &Path) {
+        let source = repository_root().unwrap().join("evaluation/goal-01");
+        let destination = destination_root.join("evaluation/goal-01");
+        copy_directory_for_test(&source, &destination);
+    }
+
+    fn copy_directory_for_test(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                copy_directory_for_test(&source_path, &destination_path);
+            } else {
+                assert!(metadata.is_file());
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
     }
 
     #[test]

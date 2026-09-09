@@ -11,12 +11,21 @@ use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The structured response schema used by the first Review implementation.
 pub const REVIEW_SCHEMA_VERSION: &str = "review-v1";
 
 /// Review never displays more clarification questions than this.
 pub const MAX_CLARIFICATION_QUESTIONS: usize = 5;
+/// Maximum number of findings retained in one structured Review.
+pub const MAX_REVIEW_FINDINGS: usize = 64;
+/// Maximum number of entries in each intent-list section.
+pub const MAX_REVIEW_INTENT_LIST_ENTRIES: usize = 32;
+/// Maximum UTF-8 byte length of ordinary generated Review prose.
+pub const MAX_REVIEW_GENERATED_TEXT_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 byte length of one source quote retained by a Review.
+pub const MAX_REVIEW_SOURCE_QUOTE_BYTES: usize = 128 * 1024;
 /// Maximum source bytes represented by one Agent Skill file.
 pub const MAX_SKILL_FILE_BYTES: u64 = 512 * 1024;
 /// Maximum source bytes represented by one Agent Skill package.
@@ -427,9 +436,10 @@ impl SkillPackageFile {
                     actual: bytes.len() as u64,
                 });
             }
-            SkillFilePayload::Binary { sha256 } | SkillFilePayload::RawBinary { sha256, .. }
-                if !valid_sha256(sha256) =>
-            {
+            SkillFilePayload::Binary { sha256 } if !valid_sha256(sha256) => {
+                return Err(SkillPackageError::InvalidSha256);
+            }
+            SkillFilePayload::RawBinary { bytes, sha256 } if !sha256_matches(bytes, sha256) => {
                 return Err(SkillPackageError::InvalidSha256);
             }
             _ => {}
@@ -500,7 +510,7 @@ impl SkillPackageFile {
                         actual: bytes.len() as u64,
                     });
                 }
-                if !valid_sha256(sha256) {
+                if !sha256_matches(bytes, sha256) {
                     return Err(SkillPackageError::InvalidSha256);
                 }
             }
@@ -575,12 +585,35 @@ impl SkillPackageOmission {
 }
 
 /// A deterministic, bounded Agent Skill package.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillPackage {
     pub files: Vec<SkillPackageFile>,
     #[serde(default)]
     pub omissions: Vec<SkillPackageOmission>,
+}
+
+impl<'de> Deserialize<'de> for SkillPackage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SkillPackageWire {
+            files: Vec<SkillPackageFile>,
+            #[serde(default)]
+            omissions: Vec<SkillPackageOmission>,
+        }
+
+        let wire = SkillPackageWire::deserialize(deserializer)?;
+        let package = Self {
+            files: wire.files,
+            omissions: wire.omissions,
+        };
+        package.validate().map_err(serde::de::Error::custom)?;
+        Ok(package)
+    }
 }
 
 impl SkillPackage {
@@ -595,7 +628,8 @@ impl SkillPackage {
     }
 
     pub fn validate(&self) -> Result<(), SkillPackageError> {
-        validate_skill_package_entries(&self.files, &self.omissions)
+        validate_skill_package_entries(&self.files, &self.omissions)?;
+        validate_skill_package_order(&self.files, &self.omissions)
     }
 
     pub fn total_byte_size(&self) -> u64 {
@@ -924,7 +958,15 @@ pub struct StructuredText(String);
 impl StructuredText {
     pub fn new(text: impl Into<String>) -> Result<Self, ReviewValidationError> {
         let text = text.into();
-        non_empty(text, "structured text").map(Self)
+        let text = non_empty(text, "structured text")?;
+        if text.len() > MAX_REVIEW_GENERATED_TEXT_BYTES {
+            return Err(ReviewValidationError::TextTooLarge {
+                field: "structured text",
+                byte_size: text.len(),
+                limit: MAX_REVIEW_GENERATED_TEXT_BYTES,
+            });
+        }
+        Ok(Self(text))
     }
 
     pub fn as_str(&self) -> &str {
@@ -970,18 +1012,28 @@ pub struct ReviewSections {
 
 impl ReviewSections {
     pub fn validate(&self) -> Result<(), ReviewValidationError> {
-        validate_text(&self.stated_goal)?;
-        validate_text(&self.expected_deliverable)?;
-        for list in [
-            &self.relevant_context,
-            &self.constraints,
-            &self.non_goals,
-            &self.success_evidence,
-            &self.inferred_assumptions,
-            &self.unresolved_decisions,
+        validate_text_field(&self.stated_goal, "understood_intent.stated_goal")?;
+        validate_text_field(
+            &self.expected_deliverable,
+            "understood_intent.expected_deliverable",
+        )?;
+        for (field, list) in [
+            ("understood_intent.relevant_context", &self.relevant_context),
+            ("understood_intent.constraints", &self.constraints),
+            ("understood_intent.non_goals", &self.non_goals),
+            ("understood_intent.success_evidence", &self.success_evidence),
+            (
+                "understood_intent.inferred_assumptions",
+                &self.inferred_assumptions,
+            ),
+            (
+                "understood_intent.unresolved_decisions",
+                &self.unresolved_decisions,
+            ),
         ] {
+            validate_intent_list(field, list)?;
             for text in list.iter() {
-                validate_text(text)?;
+                validate_text_field(text, field)?;
             }
         }
         Ok(())
@@ -1108,25 +1160,34 @@ impl ReviewModelOutput {
     }
 
     pub fn validate_shape(&self) -> Result<(), ReviewValidationError> {
+        validate_schema_version(&self.schema_version)?;
         if self.schema_version != REVIEW_SCHEMA_VERSION {
             return Err(ReviewValidationError::UnsupportedSchemaVersion(
                 self.schema_version.clone(),
             ));
         }
         self.understood_intent.validate()?;
+        validate_finding_count(self.findings.len())?;
+        for finding in &self.findings {
+            match finding.kind {
+                FindingKind::Source | FindingKind::SourceStatement => {
+                    validate_source_quote(&finding.text)?;
+                }
+                FindingKind::Inference => {
+                    validate_text_field(&finding.text, "finding.text")?;
+                }
+            }
+        }
         if self.clarification_questions.len() > MAX_CLARIFICATION_QUESTIONS {
             return Err(ReviewValidationError::TooManyClarificationQuestions {
                 count: self.clarification_questions.len(),
                 max: MAX_CLARIFICATION_QUESTIONS,
             });
         }
-        for finding in &self.findings {
-            validate_text(&finding.text)?;
-        }
         for question in &self.clarification_questions {
-            validate_text(&question.question)?;
+            validate_text_field(&question.question, "clarification_questions.question")?;
             if let Some(impact) = &question.impact {
-                validate_text(impact)?;
+                validate_text_field(impact, "clarification_questions.impact")?;
             }
         }
         if !self.scope.missing_context() && matches!(self.scope, ReviewScope::Selection { .. }) {
@@ -1193,12 +1254,14 @@ impl ReviewModelOutputWire {
     }
 
     fn validate_shape(&self) -> Result<(), ReviewValidationError> {
+        validate_schema_version(&self.schema_version)?;
         if self.schema_version != REVIEW_SCHEMA_VERSION {
             return Err(ReviewValidationError::UnsupportedSchemaVersion(
                 self.schema_version.clone(),
             ));
         }
         self.understood_intent.validate()?;
+        validate_finding_count(self.findings.len())?;
         if self.clarification_questions.len() > MAX_CLARIFICATION_QUESTIONS {
             return Err(ReviewValidationError::TooManyClarificationQuestions {
                 count: self.clarification_questions.len(),
@@ -1209,9 +1272,9 @@ impl ReviewModelOutputWire {
             finding.validate()?;
         }
         for question in &self.clarification_questions {
-            validate_text(&question.question)?;
+            validate_text_field(&question.question, "clarification_questions.question")?;
             if let Some(impact) = &question.impact {
-                validate_text(impact)?;
+                validate_text_field(impact, "clarification_questions.impact")?;
             }
         }
         if !self.scope.missing_context() && matches!(self.scope, ReviewScope::Selection { .. }) {
@@ -1256,9 +1319,7 @@ struct ReviewFindingWire {
 
 impl ReviewFindingWire {
     fn validate(&self) -> Result<(), ReviewValidationError> {
-        if self.kind == FindingKind::Inference {
-            validate_text(&self.text)?;
-        }
+        validate_text_field(&self.text, "finding.text")?;
         self.anchor.validate()
     }
 
@@ -1300,8 +1361,10 @@ enum ReviewAnchorWire {
 impl ReviewAnchorWire {
     fn validate(&self) -> Result<(), ReviewValidationError> {
         match self {
-            Self::DocumentQuote { quote } | Self::AgentSkillFileQuote { quote, .. } => {
-                validate_text(quote)
+            Self::DocumentQuote { quote } => validate_source_quote(quote),
+            Self::AgentSkillFileQuote { path, quote } => {
+                validate_string_field(path, "finding.anchor.path")?;
+                validate_source_quote(quote)
             }
             Self::DocumentWide => Ok(()),
         }
@@ -1553,6 +1616,11 @@ impl std::error::Error for ReviewDecodeError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewValidationError {
     EmptyText(&'static str),
+    TextTooLarge {
+        field: &'static str,
+        byte_size: usize,
+        limit: usize,
+    },
     InvalidByteRange {
         start: u64,
         end: u64,
@@ -1592,6 +1660,15 @@ pub enum ReviewValidationError {
         count: usize,
         max: usize,
     },
+    TooManyFindings {
+        count: usize,
+        max: usize,
+    },
+    TooManyIntentListEntries {
+        field: &'static str,
+        count: usize,
+        max: usize,
+    },
     InvalidResultState,
 }
 
@@ -1599,6 +1676,14 @@ impl fmt::Display for ReviewValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyText(field) => write!(formatter, "{field} must not be empty"),
+            Self::TextTooLarge {
+                field,
+                byte_size,
+                limit,
+            } => write!(
+                formatter,
+                "{field} is {byte_size} UTF-8 bytes; maximum is {limit}"
+            ),
             Self::InvalidByteRange { start, end } => {
                 write!(formatter, "invalid byte range {start}..{end}")
             }
@@ -1672,6 +1757,16 @@ impl fmt::Display for ReviewValidationError {
                     "Review contains {count} clarification questions; maximum is {max}"
                 )
             }
+            Self::TooManyFindings { count, max } => {
+                write!(
+                    formatter,
+                    "findings contains {count} items; maximum is {max}"
+                )
+            }
+            Self::TooManyIntentListEntries { field, count, max } => write!(
+                formatter,
+                "{field} contains {count} entries; maximum is {max}"
+            ),
             Self::InvalidResultState => formatter.write_str("invalid Review result status payload"),
         }
     }
@@ -1687,6 +1782,7 @@ pub enum SkillPackageError {
     EmptyOmissionReason,
     DuplicatePath,
     ByteSizeOverflow,
+    NonCanonicalOrder,
     FileTooLarge {
         path: String,
         byte_size: u64,
@@ -1720,6 +1816,9 @@ impl fmt::Display for SkillPackageError {
             Self::DuplicatePath => formatter.write_str("Agent Skill package paths must be unique"),
             Self::ByteSizeOverflow => {
                 formatter.write_str("Agent Skill package byte size overflowed")
+            }
+            Self::NonCanonicalOrder => {
+                formatter.write_str("Agent Skill package paths must be sorted in UTF-8 byte order")
             }
             Self::FileTooLarge {
                 path,
@@ -1757,11 +1856,79 @@ impl fmt::Display for SkillPackageError {
 impl std::error::Error for SkillPackageError {}
 
 fn validate_text(text: &StructuredText) -> Result<(), ReviewValidationError> {
-    if text.as_str().trim().is_empty() {
-        Err(ReviewValidationError::EmptyText("structured text"))
-    } else {
-        Ok(())
+    validate_text_field(text, "structured text")
+}
+
+fn validate_text_field(
+    text: &StructuredText,
+    field: &'static str,
+) -> Result<(), ReviewValidationError> {
+    validate_string_field_with_limit(text.as_str(), field, MAX_REVIEW_GENERATED_TEXT_BYTES)
+}
+
+fn validate_source_quote(text: &StructuredText) -> Result<(), ReviewValidationError> {
+    validate_string_field_with_limit(
+        text.as_str(),
+        "finding.anchor.quote",
+        MAX_REVIEW_SOURCE_QUOTE_BYTES,
+    )
+}
+
+fn validate_string_field(value: &str, field: &'static str) -> Result<(), ReviewValidationError> {
+    validate_string_field_with_limit(value, field, MAX_REVIEW_GENERATED_TEXT_BYTES)
+}
+
+fn validate_string_field_with_limit(
+    value: &str,
+    field: &'static str,
+    limit: usize,
+) -> Result<(), ReviewValidationError> {
+    if value.trim().is_empty() {
+        return Err(ReviewValidationError::EmptyText(field));
     }
+    if value.len() > limit {
+        return Err(ReviewValidationError::TextTooLarge {
+            field,
+            byte_size: value.len(),
+            limit,
+        });
+    }
+    Ok(())
+}
+
+fn validate_schema_version(value: &str) -> Result<(), ReviewValidationError> {
+    if value.len() > MAX_REVIEW_GENERATED_TEXT_BYTES {
+        return Err(ReviewValidationError::TextTooLarge {
+            field: "schema_version",
+            byte_size: value.len(),
+            limit: MAX_REVIEW_GENERATED_TEXT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_finding_count(count: usize) -> Result<(), ReviewValidationError> {
+    if count > MAX_REVIEW_FINDINGS {
+        return Err(ReviewValidationError::TooManyFindings {
+            count,
+            max: MAX_REVIEW_FINDINGS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_intent_list(
+    field: &'static str,
+    values: &[StructuredText],
+) -> Result<(), ReviewValidationError> {
+    if values.len() > MAX_REVIEW_INTENT_LIST_ENTRIES {
+        return Err(ReviewValidationError::TooManyIntentListEntries {
+            field,
+            count: values.len(),
+            max: MAX_REVIEW_INTENT_LIST_ENTRIES,
+        });
+    }
+    Ok(())
 }
 
 fn non_empty(value: String, field: &'static str) -> Result<String, ReviewValidationError> {
@@ -1774,6 +1941,29 @@ fn non_empty(value: String, field: &'static str) -> Result<String, ReviewValidat
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
+    if !valid_sha256(expected) {
+        return false;
+    }
+
+    let digest = Sha256::digest(bytes);
+    digest
+        .iter()
+        .zip(expected.as_bytes().as_chunks::<2>().0)
+        .all(|(byte, pair)| {
+            hex_value(pair[0]) == Some(byte >> 4) && hex_value(pair[1]) == Some(byte & 0x0f)
+        })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn normalize_relative_path(raw: &str) -> Result<String, ReviewValidationError> {
@@ -1830,6 +2020,23 @@ fn validate_skill_package_entries(
     Ok(())
 }
 
+fn validate_skill_package_order(
+    files: &[SkillPackageFile],
+    omissions: &[SkillPackageOmission],
+) -> Result<(), SkillPackageError> {
+    let files_are_sorted = files
+        .windows(2)
+        .all(|pair| pair[0].path.as_bytes() <= pair[1].path.as_bytes());
+    let omissions_are_sorted = omissions
+        .windows(2)
+        .all(|pair| pair[0].path.as_bytes() <= pair[1].path.as_bytes());
+    if files_are_sorted && omissions_are_sorted {
+        Ok(())
+    } else {
+        Err(SkillPackageError::NonCanonicalOrder)
+    }
+}
+
 fn has_duplicate_paths(files: &[SkillPackageFile], omissions: &[SkillPackageOmission]) -> bool {
     let mut paths = Vec::with_capacity(files.len() + omissions.len());
     paths.extend(files.iter().map(|file| file.path.as_str()));
@@ -1872,6 +2079,7 @@ fn validate_package_anchor(
             return Err(ReviewValidationError::AnchorOutsideSource);
         }
     };
+    validate_string_field(path, "finding.anchor.path")?;
     let normalized = normalize_relative_path(path)?;
     if normalized != *path {
         return Err(ReviewValidationError::AnchorPathNotNormalized);
@@ -2208,6 +2416,152 @@ mod tests {
             too_many.validate_shape(),
             Err(ReviewValidationError::TooManyClarificationQuestions { .. })
         ));
+    }
+
+    #[test]
+    fn structured_output_bounds_cover_domain_and_wire_validation() {
+        let request =
+            ReviewRequest::document(ArtifactLens::Prompt, "source", SourceSnapshot::default())
+                .unwrap();
+        let response = serde_json::json!({
+            "schema_version": REVIEW_SCHEMA_VERSION,
+            "scope": {"kind": "document"},
+            "understood_intent": {
+                "stated_goal": "review the source",
+                "relevant_context": [],
+                "constraints": [],
+                "non_goals": [],
+                "expected_deliverable": "a review",
+                "success_evidence": [],
+                "inferred_assumptions": [],
+                "unresolved_decisions": []
+            },
+            "findings": [],
+            "clarification_questions": []
+        });
+
+        let mut oversized_text = response.clone();
+        oversized_text["understood_intent"]["stated_goal"] =
+            serde_json::json!("x".repeat(MAX_REVIEW_GENERATED_TEXT_BYTES + 1));
+        let error = ReviewModelOutput::decode(&oversized_text.to_string(), &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ReviewDecodeError::Validation(ReviewValidationError::TextTooLarge {
+                field: "understood_intent.stated_goal",
+                byte_size,
+                limit: MAX_REVIEW_GENERATED_TEXT_BYTES,
+            }) if byte_size == MAX_REVIEW_GENERATED_TEXT_BYTES + 1
+        ));
+        assert!(!error.to_string().contains("xxxxxxxx"));
+
+        let mut oversized_list = response.clone();
+        oversized_list["understood_intent"]["relevant_context"] = serde_json::json!(
+            (0..=MAX_REVIEW_INTENT_LIST_ENTRIES)
+                .map(|index| format!("context {index}"))
+                .collect::<Vec<_>>()
+        );
+        let error = ReviewModelOutput::decode(&oversized_list.to_string(), &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ReviewDecodeError::Validation(ReviewValidationError::TooManyIntentListEntries {
+                field: "understood_intent.relevant_context",
+                count,
+                max: MAX_REVIEW_INTENT_LIST_ENTRIES,
+            }) if count == MAX_REVIEW_INTENT_LIST_ENTRIES + 1
+        ));
+
+        let mut oversized_findings = response;
+        oversized_findings["findings"] = serde_json::json!(
+            (0..=MAX_REVIEW_FINDINGS)
+                .map(|_| serde_json::json!({
+                    "kind": "inference",
+                    "text": "inference",
+                    "anchor": {"kind": "document_wide"}
+                }))
+                .collect::<Vec<_>>()
+        );
+        let error =
+            ReviewModelOutput::decode(&oversized_findings.to_string(), &request).unwrap_err();
+        assert!(matches!(
+            error,
+            ReviewDecodeError::Validation(ReviewValidationError::TooManyFindings {
+                count,
+                max: MAX_REVIEW_FINDINGS,
+            }) if count == MAX_REVIEW_FINDINGS + 1
+        ));
+
+        let mut direct = output(
+            ReviewScope::Document,
+            SourceAnchor::document(SourceLocation::bytes(0, 6)),
+        );
+        direct.understood_intent.relevant_context = (0..=MAX_REVIEW_INTENT_LIST_ENTRIES)
+            .map(|index| format!("context {index}").into())
+            .collect();
+        assert!(matches!(
+            direct.validate_shape(),
+            Err(ReviewValidationError::TooManyIntentListEntries {
+                field: "understood_intent.relevant_context",
+                ..
+            })
+        ));
+        direct.understood_intent.relevant_context.clear();
+        direct.findings = (0..=MAX_REVIEW_FINDINGS)
+            .map(|_| Finding::inference("inference", SourceAnchor::DocumentWide))
+            .collect();
+        assert!(matches!(
+            direct.validate_shape(),
+            Err(ReviewValidationError::TooManyFindings { .. })
+        ));
+    }
+
+    #[test]
+    fn source_quote_limit_is_larger_than_generated_text_and_is_enforced() {
+        const {
+            assert!(MAX_REVIEW_SOURCE_QUOTE_BYTES > MAX_REVIEW_GENERATED_TEXT_BYTES);
+        }
+        let source = "q".repeat(MAX_REVIEW_SOURCE_QUOTE_BYTES);
+        let request = ReviewRequest::document(
+            ArtifactLens::Prompt,
+            source.clone(),
+            SourceSnapshot::default(),
+        )
+        .unwrap();
+        let response = provider_document_finding(
+            request.scope,
+            "source",
+            "short generated label",
+            serde_json::json!({"kind": "document_quote", "quote": source}),
+        );
+        let decoded = ReviewModelOutput::decode(&response.to_string(), &request).unwrap();
+        assert_eq!(
+            decoded.findings[0].text.as_str().len(),
+            MAX_REVIEW_SOURCE_QUOTE_BYTES
+        );
+
+        let oversized_quote = "q".repeat(MAX_REVIEW_SOURCE_QUOTE_BYTES + 1);
+        let oversized_request = ReviewRequest::document(
+            ArtifactLens::Prompt,
+            oversized_quote.clone(),
+            SourceSnapshot::default(),
+        )
+        .unwrap();
+        let response = provider_document_finding(
+            oversized_request.scope,
+            "source",
+            "short generated label",
+            serde_json::json!({"kind": "document_quote", "quote": oversized_quote}),
+        );
+        let error =
+            ReviewModelOutput::decode(&response.to_string(), &oversized_request).unwrap_err();
+        assert!(matches!(
+            error,
+            ReviewDecodeError::Validation(ReviewValidationError::TextTooLarge {
+                field: "finding.anchor.quote",
+                byte_size,
+                limit: MAX_REVIEW_SOURCE_QUOTE_BYTES,
+            }) if byte_size == MAX_REVIEW_SOURCE_QUOTE_BYTES + 1
+        ));
+        assert!(!error.to_string().contains("qqqq"));
     }
 
     #[test]
@@ -2552,6 +2906,59 @@ mod tests {
             .with_current_snapshot(SourceSnapshot::new(2, 1));
         assert_eq!(result.status, ReviewStatus::Stale);
         assert!(result.output.is_some());
+    }
+
+    #[test]
+    fn raw_binary_requires_a_digest_that_matches_the_bytes() {
+        let bytes = b"raw bytes".to_vec();
+        let digest = "9ab366ad455508d5f47b0128d7d243a2c0e4f5ce399b5f85cd10b343e745a4dc";
+        assert!(SkillPackageFile::binary_raw(
+            "asset.bin",
+            bytes.clone(),
+            digest,
+            "explicitly selected",
+        )
+        .is_ok());
+        assert!(matches!(
+            SkillPackageFile::binary_raw(
+                "asset.bin",
+                bytes,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "explicitly selected",
+            )
+            .unwrap_err(),
+            SkillPackageError::InvalidSha256
+        ));
+    }
+
+    #[test]
+    fn skill_package_deserialization_rejects_noncanonical_file_order() {
+        let unsorted = SkillPackage {
+            files: vec![
+                SkillPackageFile::text("b.md", "B", "supporting file").unwrap(),
+                SkillPackageFile::text("a.md", "A", "supporting file").unwrap(),
+            ],
+            omissions: Vec::new(),
+        };
+        assert!(matches!(
+            unsorted.validate(),
+            Err(SkillPackageError::NonCanonicalOrder)
+        ));
+
+        let request = serde_json::json!({
+            "lens": "agent_skill",
+            "scope": {"kind": "agent_skill_package"},
+            "source": {
+                "kind": "agent_skill_package",
+                "package": unsorted,
+            },
+            "snapshot": {"revision": 0, "source_generation": 0},
+        });
+        let error = ReviewRequest::decode_json(&request.to_string()).unwrap_err();
+        assert!(matches!(
+            error,
+            ReviewDecodeError::Serde(message) if message.contains("sorted in UTF-8 byte order")
+        ));
     }
 
     #[test]

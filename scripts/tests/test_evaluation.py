@@ -130,6 +130,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["evaluation"]["status"], "not_evaluated")
         self.assertFalse(evidence["evaluation"]["eligible_for_threshold"])
         self.assertEqual(len(evidence["results"]), 12)
+        self.assertEqual(evidence["configuration"]["max_output_tokens"], 8192)
         serialized = json.dumps(evidence, sort_keys=True)
         for forbidden in ('"response":', '"source_text":', '"request_body":', '"api_key":', '"endpoint_url":'):
             self.assertNotIn(forbidden, serialized)
@@ -152,7 +153,15 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["evaluation"]["surfaced_item_count"], 60)
         self.assertEqual(evidence["evaluation"]["false_source_anchor_count"], 0)
         self.assertEqual(evidence["evaluation"]["max_question_count"], 0)
+        self.assertEqual(evidence["configuration"]["max_output_tokens"], 8192)
         self.assertTrue(all("model_reported_id" in result for result in evidence["results"]))
+
+    def test_evidence_rejects_a_non_fixed_output_token_cap(self) -> None:
+        evidence = evaluation.scaffold_evidence(self.verification)
+        evidence["configuration"]["max_output_tokens"] = 4096
+
+        with self.assertRaisesRegex(evaluation.EvaluationError, "reference configuration"):
+            evaluation.validate_evidence(evidence, verification=self.verification)
 
     def test_owner_input_with_response_content_is_rejected(self) -> None:
         value = owner_input("TP-01")
@@ -189,9 +198,6 @@ class EvidenceTests(unittest.TestCase):
             "glpat-abcdefghijklmnopqrstuvwxyz1234567890",
             "AIzaabcdefghijklmnopqrstuvwxyz1234567890",
             "AKIAABCDEFGHIJKLMNOPQRSTUVWXYZ1234",
-            "llama3.2:latest",
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "slack-summary-approved",
         ):
             with self.subTest(model_reported_id=model_reported_id):
                 inputs = complete_owner_inputs(self.verification)
@@ -200,12 +206,21 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(evaluation.EvaluationError, "model_reported_id"):
                     evaluation.evidence_from_owner_inputs(self.verification, inputs)
 
-    def test_owner_input_accepts_only_the_fixed_reference_model_identifier(self) -> None:
+    def test_owner_input_accepts_the_reference_model_identifier(self) -> None:
         inputs = complete_owner_inputs(self.verification)
 
         evidence = evaluation.evidence_from_owner_inputs(self.verification, inputs)
 
         self.assertEqual(evidence["results"][0]["model_reported_id"], evaluation.REFERENCE_MODEL_REPORTED_ID)
+
+    def test_owner_input_preserves_a_versioned_provider_model_identifier(self) -> None:
+        inputs = complete_owner_inputs(self.verification)
+        provider_model_id = "gpt-5.6-terra-2026-08-19-deployment-42"
+        inputs["TP-01"]["model_reported_id"] = provider_model_id
+
+        evidence = evaluation.evidence_from_owner_inputs(self.verification, inputs)
+
+        self.assertEqual(evidence["results"][0]["model_reported_id"], provider_model_id)
 
     def test_scored_ids_must_be_fixed_for_the_same_artifact(self) -> None:
         inputs = complete_owner_inputs(self.verification)

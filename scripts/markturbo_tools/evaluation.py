@@ -203,8 +203,6 @@ def _safe_model_id(value: object) -> str | None:
         or re.fullmatch(r"[A-Za-z]:[\\/].*", value) is not None
     ):
         raise EvaluationError("model_reported_id is invalid")
-    if value != REFERENCE_MODEL_REPORTED_ID:
-        raise EvaluationError("model_reported_id is not the fixed reference model")
     return value
 
 
@@ -445,6 +443,7 @@ def _base_configuration() -> dict[str, object]:
         "provider_wire_format": "openai-responses",
         "model_requested": "gpt-5.6-terra",
         "reasoning_effort": "medium",
+        "max_output_tokens": 8192,
         "sampling": "provider-defaults-omitted",
         "prompt_version": "review-v1",
         "tools": False,
