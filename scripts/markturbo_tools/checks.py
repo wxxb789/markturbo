@@ -97,15 +97,28 @@ def fast(*, base: str | None = None, head: str | None = None) -> None:
     run_tooling_tests()
 
 
-def ci(*, base: str | None = None, head: str | None = None) -> None:
+def doc(*, base: str | None = None, head: str | None = None) -> None:
+    """Validate the headless document engine without compiling the desktop app."""
+
     fast(base=base, head=head)
     run(cargo("fmt", "--all", "--", "--check"))
-    run(cargo("clippy", "--workspace", "--all-targets", "--locked"))
-    run(cargo("test", "--release", "--workspace", "--locked"))
+    run(cargo("test", "--profile", "ci", "-p", "mt-doc", "--locked"))
+
+
+def rust_checks(profile: str) -> None:
+    run(cargo("fmt", "--all", "--", "--check"))
+    run(cargo("clippy", "--profile", profile, "--workspace", "--all-targets", "--locked"))
+    run(cargo("test", "--profile", profile, "--workspace", "--locked"))
+
+
+def ci(*, base: str | None = None, head: str | None = None) -> None:
+    fast(base=base, head=head)
+    rust_checks("ci")
 
 
 def full(*, base: str | None = None, head: str | None = None) -> None:
-    ci(base=base, head=head)
+    fast(base=base, head=head)
+    rust_checks("release")
     run(cargo("build", "--release", "--locked", "-p", "mt-app", "--bin", "markturbo"))
     name = "markturbo.exe" if sys.platform == "win32" else "markturbo"
     binary = ROOT / "target" / "release" / name
@@ -119,6 +132,7 @@ def full(*, base: str | None = None, head: str | None = None) -> None:
 
 CHECKS = {
     "fast": fast,
+    "doc": doc,
     "ci": ci,
     "full": full,
 }

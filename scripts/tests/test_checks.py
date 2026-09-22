@@ -108,10 +108,44 @@ class DiffCheckTests(unittest.TestCase):
             [
                 (sys.executable, "-m", "unittest", *checks.TOOLING_TESTS),
                 ("cargo", "fmt", "--all", "--", "--check"),
-                ("cargo", "clippy", "--workspace", "--all-targets", "--locked"),
-                ("cargo", "test", "--release", "--workspace", "--locked"),
+                ("cargo", "clippy", "--profile", "ci", "--workspace", "--all-targets", "--locked"),
+                ("cargo", "test", "--profile", "ci", "--workspace", "--locked"),
             ],
         )
+
+
+class ValidationBoundaryTests(unittest.TestCase):
+    def test_doc_tier_never_requests_desktop_or_workspace_builds(self) -> None:
+        with (
+            mock.patch.object(checks, "fast") as fast,
+            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+            mock.patch.object(checks, "run") as run,
+        ):
+            checks.run_check("doc", base="base", head="head")
+        fast.assert_called_once_with(base="base", head="head")
+        commands = [call.args[0] for call in run.call_args_list]
+        tests = [command for command in commands if command[1] == "test"]
+        self.assertEqual(len(tests), 1)
+        self.assertEqual(tests[0][tests[0].index("-p") + 1], "mt-doc")
+        self.assertIn("--locked", tests[0])
+        self.assertFalse(any("--workspace" in command or "build" in command for command in commands))
+
+    def test_ci_stops_before_tests_when_clippy_fails(self) -> None:
+        calls = []
+
+        def run(command: tuple[str, ...]) -> None:
+            calls.append(command)
+            if "clippy" in command:
+                raise checks.CheckFailure("lint failed")
+
+        with (
+            mock.patch.object(checks, "fast"),
+            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+            mock.patch.object(checks, "run", side_effect=run),
+        ):
+            with self.assertRaisesRegex(checks.CheckFailure, "lint failed"):
+                checks.ci()
+        self.assertFalse(any("test" in command for command in calls))
 
 
 if __name__ == "__main__":

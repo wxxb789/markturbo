@@ -381,13 +381,15 @@ class CheckIntegrationTests(unittest.TestCase):
             with (
                 mock.patch.object(checks, "ROOT", root),
                 mock.patch.object(checks.sys, "platform", "win32"),
-                mock.patch.object(checks, "ci"),
+                mock.patch.object(checks, "fast"),
+                mock.patch.object(checks, "rust_checks") as rust_checks,
                 mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
                 mock.patch.object(checks, "run", side_effect=run),
                 mock.patch.object(checks.privacy, "scan", side_effect=scan),
             ):
                 checks.full()
 
+        rust_checks.assert_called_once_with("release")
         self.assertEqual(events, ["build", "scan"])
 
     def test_ci_does_not_run_the_release_binary_privacy_scan(self) -> None:
@@ -413,7 +415,8 @@ class CheckIntegrationTests(unittest.TestCase):
             with (
                 mock.patch.object(checks, "ROOT", root),
                 mock.patch.object(checks.sys, "platform", "win32"),
-                mock.patch.object(checks, "ci"),
+                mock.patch.object(checks, "fast"),
+                mock.patch.object(checks, "rust_checks") as rust_checks,
                 mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
                 mock.patch.object(checks, "run", side_effect=run),
                 mock.patch.object(

@@ -91,7 +91,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(check["env"], prepare["env"])
         self.assertEqual(
             check["run"],
-            "uv run --project scripts scripts/mt.py check ci",
+            "uv run --locked --project scripts scripts/mt.py check ci",
         )
         self.assertEqual(
             [step["name"] for step in steps if "run" in step and step["name"] != "Check"],
@@ -102,7 +102,7 @@ class WorkflowContractTests(unittest.TestCase):
             ],
         )
 
-    def test_pr_cross_platform_jobs_only_run_locked_release_tests(self) -> None:
+    def test_pr_cross_platform_jobs_run_locked_optimized_tests(self) -> None:
         release_tests = self.pull_request["jobs"]["release-tests"]
         self.assertEqual(
             release_tests["strategy"]["matrix"]["include"],
@@ -125,7 +125,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assert_rust_cache(steps)
         self.assertEqual(
             step_named(steps, "Test")["run"],
-            "cargo test --locked --release --workspace",
+            "cargo test --locked --profile ci --workspace",
         )
         self.assertEqual(
             [step["name"] for step in steps if "run" in step],
@@ -175,7 +175,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assert_uv_cache(step_using(build_steps, SETUP_UV))
         self.assertEqual(
             step_named(build_steps, "Check")["run"],
-            "uv run --project scripts scripts/mt.py check full",
+            "uv run --locked --project scripts scripts/mt.py check full",
         )
         self.assertFalse(
             any(
@@ -219,7 +219,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('cargo install cargo-release --version "$CARGO_RELEASE_VERSION" --locked', install)
         self.assertEqual(
             step_named(self.bump["jobs"]["bump"]["steps"], "Test tooling")["run"],
-            "uv run --project scripts scripts/mt.py check fast",
+            "uv run --locked --project scripts scripts/mt.py check fast",
         )
         self.assert_uv_cache(step_using(self.bump["jobs"]["bump"]["steps"], SETUP_UV))
         self.assert_rust_cache(self.bump["jobs"]["bump"]["steps"])

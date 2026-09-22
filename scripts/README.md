@@ -13,15 +13,23 @@ tooling, and `scripts/uv.lock` pins its complete resolved dependency graph.
 
 ```sh
 uv run --project scripts scripts/mt.py check fast
+uv run --project scripts scripts/mt.py check doc
 uv run --project scripts scripts/mt.py check ci
 uv run --project scripts scripts/mt.py check full
 ```
 
 - `fast`: whitespace validation and every explicit non-desktop tooling test.
-- `ci`: `fast`, Rust formatting, locked Clippy, and locked release workspace
-  tests.
-- `full`: `ci` and a locked production build of `markturbo`; it never launches
-  the desktop app.
+- `doc`: `fast`, Rust formatting and locked `mt-doc` tests in the optimized `ci`
+  profile; it does not compile the desktop app.
+- `ci`: `fast`, Rust formatting, locked Clippy and workspace tests in the
+  optimized `ci` profile (no LTO, 16 codegen units).
+- `full`: `fast`, formatting, production release-profile Clippy and workspace
+  tests, a locked production build, and the binary privacy scan. It does not
+  first run the `ci` profile, and never launches the desktop app.
+
+Choose the tier using [development validation](../docs/development.md).
+Small tasks do not require `full` or native acceptance. Missing native evidence
+is tracked separately from implementation; safety failures remain blockers.
 
 `fast` checks both unstaged and staged whitespace changes locally. In CI, a
 complete `BASE_SHA`/`HEAD_SHA` pair checks that revision range instead and does
@@ -61,7 +69,7 @@ uv run --project scripts scripts/mt.py accept goal-06 -- --help
 `icons` regenerates the platform icon outputs. `fixtures` deterministically
 regenerates committed performance fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
-Cargo processes. The two `accept` commands drive real Windows UI workflows and
+Cargo processes. The three `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence.
 
 `evaluation verify-manifest` verifies the immutable `goal-01-v1` corpus and
