@@ -32,14 +32,14 @@ pub mod workspace;
 /// here is either a refresh or a debounced reparse that a later notification
 /// repeats anyway.
 pub fn try_update<T, R>(
-    entity: &gpui::WeakEntity<T>,
-    cx: &mut gpui::AsyncApp,
-    f: impl FnOnce(&mut T, &mut gpui::Context<T>) -> R,
+    entity: &gpui_kit::WeakEntity<T>,
+    cx: &mut gpui_kit::AsyncApp,
+    f: impl FnOnce(&mut T, &mut gpui_kit::Context<T>) -> R,
 ) -> Option<R>
 where
     T: 'static,
 {
-    use gpui::AppContext as _;
+    use gpui_kit::AppContext as _;
 
     let entity = entity.upgrade()?;
     cx.with_window(entity.entity_id(), |_, app| app.update_entity(&entity, f))
@@ -52,14 +52,14 @@ where
 /// described above. `with_window` hands out the `Window` from a
 /// `try_borrow_mut`, which is why the same work can be skipped instead.
 pub fn try_update_in<T, R>(
-    entity: &gpui::WeakEntity<T>,
-    cx: &mut gpui::AsyncApp,
-    f: impl FnOnce(&mut T, &mut gpui::Window, &mut gpui::Context<T>) -> R,
+    entity: &gpui_kit::WeakEntity<T>,
+    cx: &mut gpui_kit::AsyncApp,
+    f: impl FnOnce(&mut T, &mut gpui_kit::Window, &mut gpui_kit::Context<T>) -> R,
 ) -> Option<R>
 where
     T: 'static,
 {
-    use gpui::AppContext as _;
+    use gpui_kit::AppContext as _;
 
     let entity = entity.upgrade()?;
     cx.with_window(entity.entity_id(), |window, app| {

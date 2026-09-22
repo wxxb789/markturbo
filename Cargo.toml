@@ -11,21 +11,10 @@ license = "Apache-2.0"
 [workspace.dependencies]
 mt-doc = { path = "crates/mt-doc" }
 
-# gpui must use EXACTLY the same source as gpui-component (same URL, no rev),
-# or Cargo treats them as distinct sources and the graph ends up with two
-# incompatible gpui crates. Cargo.lock is what actually pins the revision.
-#
-# `stacker` became opt-in upstream after this workspace first adopted GPUI.
-# Keep it explicit: deeply nested Markdown can produce equally deep element
-# trees, and silently dropping the previous layout/prepaint stack protection is
-# not an acceptable dependency-upgrade behavior change.
-gpui = { git = "https://github.com/zed-industries/zed", features = ["stacker"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
-    "font-kit",
-    "x11",
-    "wayland",
-    "runtime_shaders",
-] }
+# Kit and its GPUI snapshot must resolve to one registry source. Kit does not
+# forward `stacker`: retain this direct dependency to enable deep-layout stack
+# protection for the same gpui-pre package used by Kit.
+gpui = { package = "gpui-pre", version = "=0.3.6", features = ["stacker"] }
 # Grammars named one at a time, not `tree-sitter-languages`. That feature is
 # gpui-component's "everything" switch — 34 generated C parse tables, and they
 # are `.rdata` rather than code, which is why the binary's `.rdata` used to be
@@ -69,7 +58,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
 # and never a panic (`SyntaxHighlighter::new` logs and builds an inert
 # highlighter). `tree-sitter-tsx` is the one addition that costs 0 bytes: it
 # reuses the `tree-sitter-typescript` parse table already compiled in.
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b", features = [
+gpui-kit = { version = "=0.6.6", features = [
     # Markdown itself, plus the inline grammar it needs. One feature, two variants.
     "tree-sitter-markdown",
     # The rest are fence languages, ordered by how often they appear in one.
@@ -86,12 +75,7 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
     # `Language::Make`, and the variant only exists with this feature on.
     "tree-sitter-make",
 ] }
-# Already in the graph through gpui-component. The workspace chrome uses the
-# Base behavior directly for its compact custom buttons and toggles while
-# retaining the same theme tokens and accessibility semantics.
-gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b" }
-gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "14ba7869c9adb3c0684b604f1d1394858a98de2b" }
+gpui-wry = "=0.6.6"
 # GPUI's X11 window icon is an `image::RgbaImage`. Keep only PNG decoding: the
 # icon is the one place markturbo names this already-transitive crate directly.
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -243,8 +227,8 @@ resvg = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
-gpui = { opt-level = 3 }
-gpui_platform = { opt-level = 3 }
+gpui-pre = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
 
 [profile.release]
 # `debug = false` alone leaves the symbols in; `strip` is what actually removes

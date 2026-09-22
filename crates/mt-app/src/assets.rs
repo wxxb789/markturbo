@@ -7,11 +7,11 @@
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui_kit::{AssetSource, Result, SharedString};
 
 /// Fonts GPUI's SVG renderer asks for by name.
 ///
-/// `gpui::svg_renderer::load_bundled_fonts` requests exactly these two paths on
+/// `gpui_kit::svg_renderer::load_bundled_fonts` requests exactly these two paths on
 /// first SVG render, and `fix_generic_font_families` then points `sans-serif`
 /// and `monospace` at them when the system has no match. Every diagram this app
 /// renders reaches text through that path — `mermaid-svg` emits
@@ -136,11 +136,11 @@ impl AssetSource for Assets {
             return Ok(Some(file));
         }
         // Delegate rather than replace: this is what supplies every `IconName`.
-        gpui_component_assets::Assets.load(path)
+        gpui_kit::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut items = gpui_component_assets::Assets.list(path)?;
+        let mut items = gpui_kit::assets::Assets.list(path)?;
         let own = Fonts::iter()
             .chain(Icons::iter())
             .filter(|p| p.starts_with(path));

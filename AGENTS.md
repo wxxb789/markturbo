@@ -45,6 +45,8 @@ Use `uv run --locked --project scripts scripts/mt.py check <tier>`:
 | `ci` | Settled Rust changes: fast, formatting, optimized Clippy/workspace tests |
 | `full` | Release artifacts: production-profile checks, build and privacy scan |
 
+For UI interactions, reuse GPUI Kit headless fixtures and stable element IDs
+before adding native automation; see `docs/development.md` for a runnable example.
 During iteration, filter the affected Rust test or Python test module; see
 `docs/development.md`. Fast does not test Rust; doc does not compile mt-app.
 CI on the final proposed revision can supply the workspace gate. Do not repeat a
@@ -73,7 +75,7 @@ Performance claims require production-profile measurements; consult existing
 - Ship required fonts/sample inside the executable. Windows 11 x64 is the only
   public-quality target; Linux/macOS CI provides compatibility coverage.
 - Read Cargo.toml dependency comments. Prefer crates.io, retain the sole local
-  patch, and keep shared Git source selectors aligned. Update manifests and
+  patch, and keep the Kit/GPUI snapshot family on one registry source. Update manifests and
   locks together; changing dependency provenance requires explicit review.
 - Use English in code/docs/commits/PRs. Make cohesive PRs, link the goal for
   product work, format changed Rust code, and avoid unrelated formatting churn.

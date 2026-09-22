@@ -13,8 +13,8 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 
-use gpui::*;
-use gpui_component::Root;
+use gpui_kit::component::Root;
+use gpui_kit::*;
 use mt_app::assets::Assets;
 use mt_app::views::workspace::Workspace;
 
@@ -167,14 +167,14 @@ fn main() {
         }
     };
 
-    let app = gpui_platform::application().with_assets(Assets);
+    let app = gpui_kit::application().with_assets(Assets);
 
     app.run(move |cx| {
         // Set the process identity before opening a window. Windows uses this
         // as its AppUserModelID; Linux matches it to the staged desktop file.
         cx.set_app_identity(APP_ID, "markturbo");
         // Must come before any component is constructed.
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         mt_app::startup::init(cx);
         // Before the first window: `Workspace::new` reads the saved theme to
         // apply it ahead of the first frame.
@@ -193,18 +193,18 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds)),
                 app_id: Some(APP_ID.to_owned()),
-                window_min_size: Some(gpui::Size {
+                window_min_size: Some(gpui_kit::Size {
                     width: px(720.),
                     height: px(480.),
                 }),
                 #[cfg(target_os = "linux")]
-                window_background: gpui::WindowBackgroundAppearance::Transparent,
+                window_background: gpui_kit::WindowBackgroundAppearance::Transparent,
                 #[cfg(target_os = "linux")]
-                window_decorations: Some(gpui::WindowDecorations::Client),
+                window_decorations: Some(gpui_kit::WindowDecorations::Client),
                 #[cfg(target_os = "linux")]
                 icon: Some(linux_window_icon()),
                 kind: WindowKind::Normal,
-                ..gpui_component::TitleBar::window_options()
+                ..gpui_kit::component::TitleBar::window_options()
             };
 
             // Held so the window can focus it below: keybindings only dispatch
@@ -239,7 +239,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    // Import selectively: the `gpui::*` glob in the parent re-exports a `test`
+    // Import selectively: the `gpui_kit::*` glob in the parent re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::{open_log_file, resolve_target};
@@ -262,7 +262,7 @@ mod tests {
             .find(&format!("set_var(\"{disable_key}\""))
             .expect("the compatibility switch");
         let application = source
-            .find("gpui_platform::application()")
+            .find("gpui_kit::application()")
             .expect("GPUI application initialization");
 
         assert!(
