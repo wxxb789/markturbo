@@ -240,8 +240,11 @@ filesystem round-trips, native-harness contracts, release automation, and
 checked-in performance fixtures. Test totals are intentionally not documented:
 they change with the code and the command output is the evidence.
 
-`--release` is the gate rather than a preference: two performance tests assert
-wall-clock bounds that a debug build cannot meet.
+PR tests use the optimized `ci` profile: timing-sensitive tests need optimization,
+but do not need production LTO or single-unit code generation. `check full` keeps
+the production release-profile gate for final artifacts. See
+[development validation](docs/development.md) for focused commands and when native
+acceptance is needed.
 
 Measurement lives in `scripts/` — memory, idle CPU, child windows and hit
 testing against a running build. See `scripts/README.md`.

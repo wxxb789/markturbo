@@ -116,6 +116,14 @@ At least eight fixtures must collectively cover:
 One fixture may cover several cases, but the completion report must map every
 case to an assertion.
 
+## Validation cadence
+
+Follow [development validation](../development.md). Focused tests and PR CI gate
+implementation changes; native checks, owner evaluation and broad visual matrices
+are collected at the relevant integrated milestone, not after every small task.
+Report implementation and acceptance separately. The completion evidence below
+still gates full goal acceptance and public-quality delivery.
+
 ## Completion evidence
 
 - The checked-in profile cites authoritative documentation or inspected upstream
