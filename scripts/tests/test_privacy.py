@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -362,17 +363,23 @@ class CheckIntegrationTests(unittest.TestCase):
     def test_full_scans_the_release_binary_after_building_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            binary = root / "target" / "release" / "markturbo.exe"
+            binary = root / "custom-target" / "x86_64-pc-windows-msvc" / "release" / "markturbo.exe"
             events: list[str] = []
 
-            def run(command: tuple[str, ...]) -> None:
+            def run(command: tuple[str, ...], *, capture_stdout: bool = False) -> str:
+                self.assertTrue(capture_stdout)
                 self.assertEqual(
                     command,
-                    ("cargo", "build", "--release", "--locked", "-p", "mt-app", "--bin", "markturbo"),
+                    ("cargo", "build", "--release", "--locked", "-p", "mt-app", "--bin", "markturbo",
+                     "--message-format=json-render-diagnostics"),
                 )
                 binary.parent.mkdir(parents=True)
                 binary.write_bytes(b"release binary")
                 events.append("build")
+                return json.dumps({
+                    "reason": "compiler-artifact", "target": {"name": "markturbo", "kind": ["bin"]},
+                    "executable": str(binary),
+                })
 
             def scan(repository: Path, release_binary: Path) -> None:
                 self.assertEqual((repository, release_binary), (root, binary))
@@ -408,9 +415,13 @@ class CheckIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             binary = root / "target" / "release" / "markturbo.exe"
 
-            def run(_command: tuple[str, ...]) -> None:
+            def run(_command: tuple[str, ...], **_kwargs: object) -> str:
                 binary.parent.mkdir(parents=True)
                 binary.write_bytes(b"release binary")
+                return json.dumps({
+                    "reason": "compiler-artifact", "target": {"name": "markturbo", "kind": ["bin"]},
+                    "executable": str(binary),
+                })
 
             with (
                 mock.patch.object(checks, "ROOT", root),

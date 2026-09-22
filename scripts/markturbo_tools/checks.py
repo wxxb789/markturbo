@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -43,15 +44,22 @@ TOOLING_TESTS = (
 )
 
 
-def run(command: Iterable[str], *, cwd: Path = ROOT) -> None:
+def run(command: Iterable[str], *, cwd: Path = ROOT, capture_stdout: bool = False) -> str:
     args = list(command)
     print("+", subprocess.list2cmdline(args), flush=True)
     try:
-        completed = subprocess.run(args, cwd=cwd, check=False)
+        completed = subprocess.run(
+            args,
+            cwd=cwd,
+            check=False,
+            stdout=subprocess.PIPE if capture_stdout else None,
+            encoding="utf-8",
+        )
     except OSError as error:
         raise CheckFailure(f"could not start {args[0]!r}: {error}") from error
     if completed.returncode:
         raise CheckFailure(f"command failed with exit code {completed.returncode}: {args[0]}")
+    return completed.stdout or ""
 
 
 def cargo(*args: str) -> tuple[str, ...]:
@@ -116,14 +124,42 @@ def ci(*, base: str | None = None, head: str | None = None) -> None:
     rust_checks("ci")
 
 
+def build_release_binary() -> Path:
+    """Use Cargo's artifact path, including custom target directories/triples."""
+
+    output = run(
+        cargo(
+            "build", "--release", "--locked", "-p", "mt-app", "--bin", "markturbo",
+            "--message-format=json-render-diagnostics",
+        ),
+        capture_stdout=True,
+    )
+    binaries: set[Path] = set()
+    for line in output.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            raise CheckFailure("cargo build returned invalid artifact output") from None
+        if (
+            isinstance(message, dict)
+            and message.get("reason") == "compiler-artifact"
+            and message.get("target", {}).get("name") == "markturbo"
+            and "bin" in message.get("target", {}).get("kind", [])
+            and message.get("executable")
+        ):
+            binaries.add(Path(message["executable"]))
+    if len(binaries) != 1:
+        raise CheckFailure("cargo build did not report exactly one markturbo executable")
+    binary = binaries.pop()
+    if not binary.is_file():
+        raise CheckFailure(f"release build completed without {binary}")
+    return binary
+
+
 def full(*, base: str | None = None, head: str | None = None) -> None:
     fast(base=base, head=head)
     rust_checks("release")
-    run(cargo("build", "--release", "--locked", "-p", "mt-app", "--bin", "markturbo"))
-    name = "markturbo.exe" if sys.platform == "win32" else "markturbo"
-    binary = ROOT / "target" / "release" / name
-    if not binary.is_file():
-        raise CheckFailure(f"release build completed without {binary}")
+    binary = build_release_binary()
     try:
         privacy.scan(ROOT, binary)
     except privacy.PrivacyScanError as error:

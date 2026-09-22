@@ -1,102 +1,79 @@
 # MarkTurbo agent instructions
 
-## Authority and scope
+## Load only the context the change needs
 
-Read `PRODUCT.md`, the relevant ordered goal in `docs/goals/`,
-`docs/architecture.md`, and `CONCEPTS.md` before changing product behavior.
-Goals are canonical: link to them from PRs and commits rather than duplicating
-their requirements. `docs/history/` is historical context, not current scope.
-Update `CONCEPTS.md` only when project vocabulary changes.
+- Product behavior: read the relevant PRODUCT.md contract and goal in
+  `docs/goals/`, then the affected architecture section. Read CONCEPTS.md when
+  a term is unclear or changes; update it only when vocabulary changes.
+- Tooling/CI/dependencies: start with the affected script, manifest and tests.
+  Do not load the entire product roadmap, corpus or historical reports.
+- UI: use the relevant checked-in GPUI Skill guidance, but verify APIs in the
+  source selected by Cargo.lock. Live upstream docs may describe a different
+  version. Project product/architecture decisions govern over generic library
+  examples; no upstream guide requires rewriting unrelated application code.
 
-Keep changes scoped. Preserve user work and generated evidence. Goal numbers
-order product delivery, not every coding task. Follow `docs/development.md` for
-validation cadence and pending acceptance; do not weaken product thresholds or
-represent missing evidence as a pass. Read only the relevant code and guidance,
-not all historical completion reports or every Skill reference.
+PRODUCT.md owns product scope, goals own acceptance, `docs/development.md` owns
+validation cadence, and source/tests establish current implementation. History
+and `docs/goals/archive/` do not establish current acceptance. Preserve user work,
+immutable evaluation snapshots and existing evidence. CLAUDE.md shares this file.
 
-## Platform and release status
+## Work to a bounded result
 
-Windows 11 x64 is the only public-quality target. CI tests Linux, macOS, and
-Windows for compatibility, not as a release promise. CD publishes one
-Windows `markturbo-windows-x64.exe` asset. Installers, signing, notarization, and
-multi-platform distributables are future Goal 10 work.
+Identify the behavior, smallest useful change, affected invariant and verification
+command before editing; a brief task/PR note is enough. Prefer an existing module
+and public library capability over a new layer. Do not add a goal file, harness,
+evidence schema, configuration option or abstraction for every small task.
 
-Use the canonical tooling entry point:
+Fix a regression at the lowest boundary that demonstrates it. Prefer behavior
+assertions over source-text/spelling assertions. Source scans guard structure;
+they do not prove GUI behavior. During final review, remove machinery that adds
+no distinct value and preserve only changes needed by the task.
 
-```sh
-uv run --project scripts scripts/mt.py check fast
-uv run --project scripts scripts/mt.py check doc
-uv run --project scripts scripts/mt.py check ci
-uv run --project scripts scripts/mt.py check full
-```
+Continue independent implementation when a desktop, credential or owner session
+is unavailable. Record pending acceptance in the PR or existing report. Known
+safety failures block affected delivery; missing evidence is never a pass.
+Do not weaken a goal threshold or claim completion because its file is archived.
 
-`fast` runs whitespace and non-desktop tooling tests. `doc` adds formatting and
-optimized `mt-doc` tests without compiling the desktop app. `ci` adds formatting,
-Clippy and optimized workspace tests without distribution LTO. `full` uses the
-production release profile for Clippy, tests, build and binary privacy scan.
-With `--base`/`--head` or `BASE_SHA`/`HEAD_SHA`, whitespace checks use that range.
+## Validation
 
-## Validation and evidence
+Use `uv run --locked --project scripts scripts/mt.py check <tier>`:
 
-Choose validation from the changed behavior, not the goal number:
+| Tier | Use |
+| --- | --- |
+| `fast` | Docs/tooling: whitespace and non-desktop Python tests |
+| `doc` | Headless document changes: fast, formatting and optimized mt-doc tests |
+| `ci` | Settled Rust changes: fast, formatting, optimized Clippy/workspace tests |
+| `full` | Release artifacts: production-profile checks, build and privacy scan |
 
-- Docs/tooling: `check fast` plus any focused tooling tests.
-- Headless document logic: `check doc`; use a test-name filter while iterating.
-- Application logic or dependencies: focused tests, then `check ci` once for
-  the reviewable change. CI on that commit can supply the full workspace gate;
-  do not duplicate a successful run locally just to open a PR.
-- Native interaction: test the changed workflow when a suitable desktop is
-  available. Do not run every old goal harness or the visual matrix for a small
-  UI change. Batch full native acceptance at an integrated milestone/release.
-- Release or performance claims: `check full` and the relevant native/probe
-  evidence on the exact artifact. Never use the `ci` binary for those claims.
+During iteration, filter the affected Rust test or Python test module; see
+`docs/development.md`. Fast does not test Rust; doc does not compile mt-app.
+CI on the final proposed revision can supply the workspace gate. Do not repeat a
+successful gate locally merely to open a PR, require a clean worktree while
+iterating, or run full/native suites for every small task. Re-run after relevant
+code/configuration/dependency changes or an unresolved failure, not arbitrarily.
 
-Do not require a clean worktree while iterating or to open a draft PR. Before
-merge, required checks must cover the final proposed revision. Report commands,
-actual results and anything not run; never invent a test count.
+Native acceptance remains explicit (`mt.py accept <goal> -- ...`), on an active,
+unlocked Windows 11 x64 desktop with current hash-bound evidence. Check only the
+changed workflow while iterating; batch full suites and the visual matrix at
+integrated milestones. A single-case run or BLOCKED is not acceptance. Make at
+most one retry after a concrete environment correction; otherwise record the
+limitation and continue independent work. Behavioral failures require diagnosis.
 
-Separate **implementation status** from **native/product acceptance status**.
-A missing desktop or owner evaluation does not block independent implementation
-or an accurately scoped PR. Record the pending check in the PR or existing goal
-report and continue. Known data-loss, privacy, trust or destructive-interaction
-failures block affected delivery; absence of evidence never makes them safe.
-A full goal acceptance claim still requires its stated evidence. See
-`docs/development.md` before handling `BLOCKED` or a partially verified goal.
+Report commands, actual outcomes, pending checks and their next checkpoint.
+Performance claims require production-profile measurements; consult existing
+`.scratch/perf-and-size/` evidence and avoid concurrent builds on that machine.
 
-Prefer deterministic behavior tests at the lowest useful boundary. Add a
-regression test for a real failure mode, not every small edit. Source-scanning
-tests are structural guardrails, not proof of runtime GUI behavior; do not add
-new spelling/layout assertions when a behavior test is practical. Preserve the
-invariant when refactoring, rather than freezing implementation text.
+## Invariants and delivery
 
-Performance work uses `scripts/`; consult `.scratch/perf-and-size/`, repeat
-measurements, and do not run concurrent release builds on the measured machine.
-Native acceptance stays explicit (`mt.py accept goal-02|goal-03|goal-06 -- ...`).
-It requires an active unlocked Windows desktop, a current hash-bound executable
-and a PASS evidence file. `BLOCKED` and single-case runs are not acceptance.
-Do not spend a feature task repairing unrelated GUI automation: record the
-concrete limitation and follow the retry policy in `docs/development.md`.
-
-## Structural and privacy invariants
-
-- `mt-doc` has no GPUI dependency.
-- Keep `panic = "unwind"` and the allocation clamp in `vendor/ratex-parser`.
-- Never mutate a WebView from `render`; set `web_dirty` and defer the update.
-- Content failures are diagnostics. Broken documents remain editable and source
-  text remains preserved.
-- Native evidence may record content-free timings, hashes, byte counts, status,
-  and OS/session/integrity metadata needed to validate a run. Test text,
-  filesystem paths, credentials, and user documents must not leak.
-- The shipped executable includes the fonts and bundled sample it needs; do not
-  reintroduce a sidecar release layout.
-
-## Dependencies and delivery
-
-Read workspace `Cargo.toml` comments before changing dependencies. Prefer
-crates.io; `vendor/ratex-parser` is the sole local patch. Dependencies sharing
-a git source must use the same source selector.
-
-Use English in code, comments, docs, commits, and PRs. Make cohesive PRs, not
-an arbitrary one-commit rule. Commit subjects name the user-visible impact and,
-for product work, the goal file advanced. Run the formatter once before the
-commit that contains its intended edits.
+- `mt-doc` stays GPUI-free. Keep `panic = "unwind"` and the vendored RaTeX
+  allocation clamp. Content failures become diagnostics; preserve editable text.
+- Never mutate a WebView from render; mark `web_dirty` and defer the update.
+- Preserve consent, credential confidentiality and content-free native evidence.
+  Do not log test text, user documents, secrets or local paths into that evidence.
+- Ship required fonts/sample inside the executable. Windows 11 x64 is the only
+  public-quality target; Linux/macOS CI provides compatibility coverage.
+- Read Cargo.toml dependency comments. Prefer crates.io, retain the sole local
+  patch, and keep shared Git source selectors aligned. Update manifests and
+  locks together; changing dependency provenance requires explicit review.
+- Use English in code/docs/commits/PRs. Make cohesive PRs, link the goal for
+  product work, format changed Rust code, and avoid unrelated formatting churn.

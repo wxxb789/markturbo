@@ -25,7 +25,9 @@ uv run --project scripts scripts/mt.py check full
   optimized `ci` profile (no LTO, 16 codegen units).
 - `full`: `fast`, formatting, production release-profile Clippy and workspace
   tests, a locked production build, and the binary privacy scan. It does not
-  first run the `ci` profile, and never launches the desktop app.
+  first run the `ci` profile, and never launches the desktop app. The privacy scan
+  uses Cargo's reported executable, honoring custom target directories/triples;
+  missing build artifact output is an error, even if an old binary exists.
 
 Choose the tier using [development validation](../docs/development.md).
 Small tasks do not require `full` or native acceptance. Missing native evidence

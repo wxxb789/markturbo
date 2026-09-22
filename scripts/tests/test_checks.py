@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import sys
 import unittest
@@ -146,6 +147,55 @@ class ValidationBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(checks.CheckFailure, "lint failed"):
                 checks.ci()
         self.assertFalse(any("test" in command for command in calls))
+
+
+class ReleaseArtifactTests(unittest.TestCase):
+    def test_missing_artifact_never_falls_back_to_a_stale_default_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stale = root / "target" / "release" / "markturbo"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"old build")
+            with (
+                mock.patch.object(checks, "ROOT", root),
+                mock.patch.object(checks, "fast"),
+                mock.patch.object(checks, "rust_checks"),
+                mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+                mock.patch.object(checks, "run", return_value='{"reason":"build-finished","success":true}'),
+                mock.patch.object(checks.privacy, "scan") as scan,
+            ):
+                with self.assertRaisesRegex(checks.CheckFailure, "exactly one"):
+                    checks.full()
+            scan.assert_not_called()
+
+    def test_build_failure_does_not_scan_an_old_artifact(self) -> None:
+        with (
+            mock.patch.object(checks, "fast"),
+            mock.patch.object(checks, "rust_checks"),
+            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+            mock.patch.object(checks, "run", side_effect=checks.CheckFailure("build failed")),
+            mock.patch.object(checks.privacy, "scan") as scan,
+        ):
+            with self.assertRaisesRegex(checks.CheckFailure, "build failed"):
+                checks.full()
+        scan.assert_not_called()
+
+    def test_invalid_or_ambiguous_artifacts_fail_closed(self) -> None:
+        def artifact(path: str) -> str:
+            return json.dumps({
+                "reason": "compiler-artifact",
+                "target": {"name": "markturbo", "kind": ["bin"]},
+                "executable": path,
+            })
+
+        for output in ("not JSON", artifact("a") + "\n" + artifact("b")):
+            with (
+                self.subTest(output=output),
+                mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+                mock.patch.object(checks, "run", return_value=output),
+            ):
+                with self.assertRaises(checks.CheckFailure):
+                    checks.build_release_binary()
 
 
 if __name__ == "__main__":

@@ -44,6 +44,30 @@ costs on every PR and keeps timing-sensitive tests optimized. It is not an
 artifact-size or runtime-performance baseline. `check full` runs production
 release validation directly, without first rebuilding a second test profile.
 No measured speedup is claimed until comparable CI timings are available.
+The release privacy scan takes its executable path from Cargo's build artifact
+messages, including custom target directories and target triples; it never falls
+back to a potentially stale `target/release/markturbo` binary.
+
+## Keep the test boundary honest
+
+Prefer these layers in order: pure domain/state tests, GPUI headless
+interaction tests, then real Windows automation. A headless test can dispatch
+keyboard/pointer events and check component state/focus/layout; it cannot prove
+Windows IME composition, the OS clipboard, native dialogs, WebView2 focus or
+DPAPI/session behavior. Keep native coverage for those boundaries.
+
+The current project already enables GPUI `test-support` in dev-dependencies.
+Reuse `open_test_workspace*` and the existing 125 GPUI tests in
+`crates/mt-app/src/views/workspace.rs` before adding another harness.
+Use locked-version APIs for focused tests today; the newer Kit helpers are
+a migration opportunity, not a prerequisite to testing or the next feature.
+Do not replace every native/source assertion in one sweep. Move one recurrent
+failure to a lower-level regression test when working on that behavior.
+
+Consult the test result for the relevant revision and environment. A failed
+lint/test/build is not environmental merely because a GUI was unavailable.
+After a repair, rerun the failed test plus its affected suite; avoid rebuilding
+unrelated profiles or redoing manual acceptance without a changed dependency.
 
 ## Implementation and acceptance are separate
 
