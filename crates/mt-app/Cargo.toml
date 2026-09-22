@@ -24,7 +24,7 @@ default = ["model-transport"]
 # Goal 04 measurement apparatus. The public build keeps this default; disabling
 # it is only the compile-time upper bound for the model/network closure.
 model-transport = ["dep:genai", "dep:reqwest", "dep:rustls", "dep:tokio"]
-profiler = ["gpui/profiler"]
+profiler = ["gpui-kit/profiler"]
 
 [dependencies]
 mt-doc.workspace = true
@@ -33,10 +33,7 @@ anyhow.workspace = true
 chardetng.workspace = true
 dirs.workspace = true
 gpui.workspace = true
-gpui_platform.workspace = true
-gpui-base.workspace = true
-gpui-component.workspace = true
-gpui-component-assets.workspace = true
+gpui-kit.workspace = true
 log.workspace = true
 tracing.workspace = true
 d2-little.workspace = true
@@ -84,6 +81,5 @@ embed-resource = "3"
 
 [dev-dependencies]
 image.workspace = true
-gpui = { workspace = true, features = ["test-support"] }
-gpui_platform = { workspace = true, features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

@@ -3,8 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -12,6 +11,7 @@ use gpui_component::{
     setting::{SettingField, SettingGroup, SettingItem, SettingPage},
     v_flex,
 };
+use gpui_kit::*;
 
 use crate::credentials::{
     CredentialError, CredentialErrorKind, CredentialVault, LegacyCredentialMigrationError,

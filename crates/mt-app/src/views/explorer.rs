@@ -8,13 +8,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex,
     list::ListItem,
     tree::{TreeEvent, TreeItem, TreeState, tree},
     v_flex,
 };
+use gpui_kit::*;
 
 use crate::metrics;
 use crate::workspace::{self, FileNode};
@@ -248,7 +248,7 @@ impl Render for Explorer {
 
         v_flex()
             .id("explorer")
-            .role(gpui::Role::Tree)
+            .role(gpui_kit::Role::Tree)
             .aria_label("Workspace files")
             .track_focus(&self.focus_handle)
             .size_full()
@@ -312,10 +312,10 @@ impl Render for Explorer {
 
 #[cfg(test)]
 mod tests {
-    // Import selectively: `gpui::*` in the parent re-exports a `test` attribute
+    // Import selectively: `gpui_kit::*` in the parent re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
     use super::icon_for;
-    use gpui_component::IconNamed as _;
+    use gpui_kit::component::IconNamed as _;
     use std::path::Path;
 
     /// `IconName` is macro-generated and implements neither `PartialEq` nor

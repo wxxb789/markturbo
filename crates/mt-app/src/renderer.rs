@@ -1,7 +1,7 @@
 //! Block renderer registry.
 //!
 //! Diagram and math blocks are rendered out-of-band into SVG, which the native
-//! path displays via `gpui::Image::from_bytes(ImageFormat::Svg, …)` and the
+//! path displays via `gpui_kit::Image::from_bytes(ImageFormat::Svg, …)` and the
 //! WebView embeds directly. A renderer is looked up by the block's
 //! `renderer_id()`, so adding one is a registration — the Markdown parser and
 //! the view code do not change.

@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -21,6 +19,8 @@ use gpui_component::{
     tab::{Tab, TabBar},
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use mt_doc::{Instruction, Origin, Severity, Skill, instruction, skill};
 
 use crate::i18n;
@@ -845,7 +845,7 @@ impl Render for HarnessView {
 
         v_flex()
             .id("harness")
-            .role(gpui::Role::List)
+            .role(gpui_kit::Role::List)
             .aria_label("Harness artifacts")
             .track_focus(&self.focus_handle)
             .size_full()
@@ -959,7 +959,7 @@ impl Render for HarnessView {
 
 #[cfg(test)]
 mod tests {
-    // Import selectively: the `gpui::*` glob above re-exports a `test`
+    // Import selectively: the `gpui_kit::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::{Row, Section, artifacts_under, group, populated_section};

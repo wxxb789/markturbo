@@ -30,14 +30,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, h_flex,
     input::{Input, InputEvent, InputState},
     list::ListItem,
     tab::{Tab, TabBar},
     v_flex,
 };
+use gpui_kit::*;
 use mt_doc::search::{self, Query, Results};
 
 use crate::i18n;
@@ -425,7 +425,7 @@ impl Render for SearchView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .id("search")
-            .role(gpui::Role::Search)
+            .role(gpui_kit::Role::Search)
             .aria_label("Search documents")
             .track_focus(&self.focus_handle)
             .size_full()
@@ -443,7 +443,7 @@ impl Render for SearchView {
 
 #[cfg(test)]
 mod tests {
-    // Import selectively: the `gpui::*` glob above re-exports a `test`
+    // Import selectively: the `gpui_kit::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::Scope;

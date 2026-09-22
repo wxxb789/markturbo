@@ -9,7 +9,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use gpui::{App, Global};
+use gpui_kit::{App, Global};
 use sha2::{Digest as _, Sha256};
 
 use crate::settings::AppSettings;

@@ -26,7 +26,7 @@
 
 use std::ops::Range;
 
-use gpui::{Pixels, px};
+use gpui_kit::{Pixels, px};
 
 /// Distance from a window edge to the content inside it.
 ///

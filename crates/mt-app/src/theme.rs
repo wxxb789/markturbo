@@ -1,6 +1,6 @@
 //! Preset themes.
 //!
-//! One preset drives two renderers. GPUI's chrome reads `gpui_component::Theme`
+//! One preset drives two renderers. GPUI's chrome reads `gpui_kit::component::Theme`
 //! and the Web preview renders in its own browser context, so a preset that only
 //! set one of them would put Split mode in two different themes side by side.
 //! [`Preset::tokens`] is therefore the single source: [`apply`] projects it onto
@@ -13,8 +13,8 @@
 //! by mixing towards the foreground or background rather than authored, so
 //! adding a preset stays a single row here.
 
-use gpui::{App, Hsla, Window, px, rgb};
-use gpui_component::{Theme, ThemeMode, ThemeTokens};
+use gpui_kit::component::{Theme, ThemeMode, ThemeTokens};
+use gpui_kit::{App, Hsla, Window, px, rgb};
 
 /// The document colors a preset authors.
 ///
@@ -440,7 +440,7 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
     theme.table_row_border = h(t.border);
     theme.table_even = h(c.subtle);
 
-    theme.tab = gpui::transparent_black();
+    theme.tab = gpui_kit::transparent_black();
     theme.tab_bar = h(c.subtle);
     theme.tab_bar_segmented = h(c.subtle);
     // The page background, so the active tab and the document below it read as
@@ -463,7 +463,7 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
     theme.sidebar_primary = h(t.accent);
     theme.sidebar_primary_foreground = h(c.on_accent);
 
-    theme.scrollbar = gpui::transparent_black();
+    theme.scrollbar = gpui_kit::transparent_black();
     theme.scrollbar_thumb = h(c.scrollbar_thumb);
     theme.scrollbar_thumb_hover = h(c.scrollbar_thumb_hover);
 
@@ -538,7 +538,7 @@ pub fn apply(preset: &Preset, window: Option<&mut Window>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_component::ThemeColor;
+    use gpui_kit::component::ThemeColor;
 
     #[test]
     fn every_preset_has_a_unique_id_within_its_mode() {
@@ -694,7 +694,7 @@ mod tests {
         for preset in PRESETS {
             let t = preset.tokens;
             let fill = selection_fill(t);
-            let rgba = gpui::Rgba::from(fill);
+            let rgba = gpui_kit::Rgba::from(fill);
             let a = rgba.a;
 
             for (shift, got, want) in [
@@ -727,7 +727,7 @@ mod tests {
         // through; a preset needing more than half would have to be reporting
         // a selection color too far from its own background to be plausible.
         for preset in PRESETS {
-            let a = gpui::Rgba::from(selection_fill(preset.tokens)).a;
+            let a = gpui_kit::Rgba::from(selection_fill(preset.tokens)).a;
             assert!(
                 a <= 0.5,
                 "{}'s selection is {a} opaque, which veils the glyphs under it",
@@ -744,7 +744,7 @@ mod tests {
         // nothing happens. The floor is what a preset whose selection barely
         // differs from its page would otherwise fall through.
         for preset in PRESETS {
-            let a = gpui::Rgba::from(selection_fill(preset.tokens)).a;
+            let a = gpui_kit::Rgba::from(selection_fill(preset.tokens)).a;
             assert!(
                 a >= SELECTION_ALPHA_FLOOR,
                 "{}'s selection is {a} opaque, which is not a visible band",

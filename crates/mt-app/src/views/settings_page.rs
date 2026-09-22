@@ -11,11 +11,11 @@
 //! those are the [`SettingsEvent`]s, named for what changed rather than for the
 //! response the workspace chooses.
 
-use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
 };
+use gpui_kit::*;
 
 use crate::i18n::{self, Key};
 use crate::settings::{AppSettings, GroupBy, Language, ThemePreference};
@@ -305,7 +305,7 @@ impl Render for SettingsView {
 
 #[cfg(test)]
 mod tests {
-    // Import selectively: the `gpui::*` glob above re-exports a `test`
+    // Import selectively: the `gpui_kit::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -316,7 +316,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     use crate::model::{EndpointIdentity, ModelOperation, ModelRequestDisclosure, OutboundScope};
     use crate::settings::{AppSettings, Language};
-    use gpui::AppContext as _;
+    use gpui_kit::AppContext as _;
     #[cfg(target_os = "windows")]
     use mt_doc::{
         DocType, Document,
@@ -366,18 +366,18 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     struct PrivacyScreenshotSurface {
-        settings: gpui::Entity<SettingsView>,
+        settings: gpui_kit::Entity<SettingsView>,
         _request: TranslationRequest,
     }
 
     #[cfg(target_os = "windows")]
-    impl gpui::Render for PrivacyScreenshotSurface {
+    impl gpui_kit::Render for PrivacyScreenshotSurface {
         fn render(
             &mut self,
-            _: &mut gpui::Window,
-            cx: &mut gpui::Context<Self>,
-        ) -> impl gpui::IntoElement {
-            gpui_component::setting::Settings::new("privacy-settings")
+            _: &mut gpui_kit::Window,
+            cx: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            gpui_kit::component::setting::Settings::new("privacy-settings")
                 .page(self.settings.read(cx).model.translation(&self.settings, cx))
         }
     }
@@ -509,15 +509,15 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn credential_ui_state_never_prefills_sensitive_settings(cx: &mut gpui::TestAppContext) {
+    #[gpui_kit::test]
+    fn credential_ui_state_never_prefills_sensitive_settings(cx: &mut gpui_kit::TestAppContext) {
         let settings: AppSettings = toml::from_str(
             "translate-api-key = \"legacy-ui-secret\"\n\
              model-base-url = \"https://user:endpoint-secret@example.com/v1/\"\n",
         )
         .unwrap();
         cx.update(|app| {
-            gpui_component::init(app);
+            gpui_kit::init(app);
             app.set_global(settings);
             CredentialVault::init(app);
         });
@@ -527,7 +527,7 @@ mod tests {
             move |window, cx| {
                 let view = cx.new(|cx| SettingsView::new(window, cx));
                 *captured.borrow_mut() = Some(view.clone());
-                gpui_component::Root::new(view, window, cx)
+                gpui_kit::component::Root::new(view, window, cx)
             }
         });
         let view = captured.borrow().clone().expect("the SettingsView entity");
@@ -547,9 +547,9 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn goal_05a_credential_lifecycle_cancel_preserves_the_legacy_copy(
-        cx: &mut gpui::TestAppContext,
+        cx: &mut gpui_kit::TestAppContext,
     ) {
         let settings: AppSettings = toml::from_str(
             "model-provider = \"openai-chat\"\n\
@@ -558,7 +558,7 @@ mod tests {
         .unwrap();
         let store = std::sync::Arc::new(RecordingCredentialStore::default());
         cx.update(|app| {
-            gpui_component::init(app);
+            gpui_kit::init(app);
             app.set_global(settings);
             app.set_global(CredentialVault::with_store(store.clone()));
         });
@@ -568,7 +568,7 @@ mod tests {
             move |window, cx| {
                 let view = cx.new(|cx| SettingsView::new(window, cx));
                 *captured.borrow_mut() = Some(view.clone());
-                gpui_component::Root::new(view, window, cx)
+                gpui_kit::component::Root::new(view, window, cx)
             }
         });
         let view = captured.borrow().clone().expect("the SettingsView entity");
@@ -720,20 +720,20 @@ mod tests {
         }
 
         fn open_surface(
-            cx: &mut gpui::App,
+            cx: &mut gpui_kit::App,
             credential: &str,
             request: TranslationRequest,
             disclosure: ModelRequestDisclosure,
-        ) -> gpui::WindowHandle<gpui_component::Root> {
+        ) -> gpui_kit::WindowHandle<gpui_kit::component::Root> {
             let credential = credential.to_owned();
             cx.open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                        origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-                        size: gpui::size(gpui::px(1000.0), gpui::px(700.0)),
+                gpui_kit::WindowOptions {
+                    window_bounds: Some(gpui_kit::WindowBounds::Windowed(gpui_kit::Bounds {
+                        origin: gpui_kit::point(gpui_kit::px(0.0), gpui_kit::px(0.0)),
+                        size: gpui_kit::size(gpui_kit::px(1000.0), gpui_kit::px(700.0)),
                     })),
                     show: false,
-                    ..gpui_component::TitleBar::window_options()
+                    ..gpui_kit::component::TitleBar::window_options()
                 },
                 move |window, cx| {
                     let settings = cx.new(|cx| SettingsView::new(window, cx));
@@ -746,14 +746,14 @@ mod tests {
                         settings,
                         _request: request,
                     });
-                    let root = cx.new(|cx| gpui_component::Root::new(surface, window, cx));
+                    let root = cx.new(|cx| gpui_kit::component::Root::new(surface, window, cx));
                     std::mem::drop(window.prompt(
-                        gpui::PromptLevel::Warning,
+                        gpui_kit::PromptLevel::Warning,
                         i18n::t(Key::ModelRequestConsentTitle, cx),
                         Some(&prompt_description),
                         &[
-                            gpui::PromptButton::ok(i18n::t(Key::SendToModel, cx)),
-                            gpui::PromptButton::cancel(i18n::t(Key::Cancel, cx)),
+                            gpui_kit::PromptButton::ok(i18n::t(Key::SendToModel, cx)),
+                            gpui_kit::PromptButton::cancel(i18n::t(Key::Cancel, cx)),
                         ],
                         cx,
                     ));
@@ -771,11 +771,11 @@ mod tests {
 
         let (sender, receiver) = mpsc::sync_channel(1);
         unsafe { std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true") };
-        gpui_platform::application()
+        gpui_kit::application()
             .with_assets(crate::assets::Assets)
             .run(move |cx| {
-                gpui_component::init(cx);
-                cx.set_prompt_builder(gpui::fallback_prompt_renderer);
+                gpui_kit::init(cx);
+                cx.set_prompt_builder(gpui_kit::fallback_prompt_renderer);
                 let settings: AppSettings =
                     toml::from_str("model-provider = \"openai-chat\"\n").unwrap();
                 cx.set_global(settings);

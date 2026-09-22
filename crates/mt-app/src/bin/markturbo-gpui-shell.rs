@@ -3,8 +3,8 @@
     windows_subsystem = "windows"
 )]
 
-use gpui::*;
-use gpui_component::Root;
+use gpui_kit::component::Root;
+use gpui_kit::*;
 use mt_app::{assets::Assets, startup};
 
 const APP_ID: &str = "io.github.wxxb789.markturbo";
@@ -39,9 +39,9 @@ fn main() {
         std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true")
     };
 
-    gpui_platform::application().with_assets(Assets).run(|cx| {
+    gpui_kit::application().with_assets(Assets).run(|cx| {
         cx.set_app_identity(APP_ID, "markturbo");
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         startup::init(cx);
 
         let mut window_size = size(px(1400.0), px(900.0));
@@ -61,7 +61,7 @@ fn main() {
                     height: px(480.),
                 }),
                 kind: WindowKind::Normal,
-                ..gpui_component::TitleBar::window_options()
+                ..gpui_kit::component::TitleBar::window_options()
             };
             let mut shell = None;
             let window = cx

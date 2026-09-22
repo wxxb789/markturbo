@@ -11,9 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{IconName, h_flex};
+use gpui_kit::component::{IconName, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use super::{ChromeIconButton, NavigateBack, NavigateForward, Workspace};
 use crate::i18n;
@@ -204,7 +204,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    // Nothing is glob-imported: the `gpui::*` above re-exports a `test`
+    // Nothing is glob-imported: the `gpui_kit::*` above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
 

@@ -42,7 +42,7 @@ Upstream references:
 | `dirs` | 6.0.0 | 7.0.0 | Major migration. Validate Windows/macOS/Linux config/data paths; a changed directory must not make settings or recovery appear lost. |
 | Workspace `sha2` | 0.10.9 | 0.11.0, already transitive | Breaking 0.x version step. Evaluate API migration and exact digest fixtures separately; transitive 0.10 users may still prevent deduplication. |
 | Workspace `windows` | 0.61.3 | 0.62.2, already transitive | Coordinate native API and handle-type interoperability; requires Windows compilation and affected native smoke. |
-| GPUI + component/base/assets/wry | Git-locked 0.5.x component family | Kit family 0.6.6 + gpui-pre 0.3.6 | Worth a separate coordinated migration for text/editor fixes and headless helpers; see below. Do not chase Zed HEAD. |
+| GPUI + component/base/assets/wry | Kit family 0.6.6 + gpui-pre 0.3.6 | Coordinated registry migration | Migrated in the separate Kit change; native acceptance remains pending. Do not chase Zed HEAD. |
 | RaTeX family | 0.1.14 | 0.1.14 | Keep the vendored parser allocation clamp until a verified upstream release includes it. |
 
 Registry checks also found no newer stable release for the directly used
@@ -56,9 +56,9 @@ Reproduce version discovery using the primary APIs
 `https://pypi.org/pypi/<package>/json`; filter prereleases and yanked releases,
 then compare with the actual lockfile, not only the manifest range.
 
-## GPUI follow-up: upgrade is worthwhile, but it is a migration
+## GPUI Kit migration
 
-The workspace uses Zed GPUI at `8ee36b682cf1971e51032cbd932dd16def575364`
+Before migration the workspace used Zed GPUI at `8ee36b682cf1971e51032cbd932dd16def575364`
 and the component family at `14ba7869c9adb3c0684b604f1d1394858a98de2b`.
 Upstream has rebranded to GPUI Kit and moved the family to crates.io snapshots.
 The observed non-yanked versions are **Kit/component/base/assets/wry 0.6.6** and
@@ -86,34 +86,27 @@ These are upstream changes, not measured MarkTurbo performance gains. Zed editor
 features are not automatically GPUI features. Likewise, commits after the chosen
 published snapshot must not be counted as benefits already in that package.
 
-Recommended migration boundary:
+Implemented migration boundary:
 
-1. Start with the released 0.6.6 family, not main. Change all GPUI sources
-   coherently. If preserving existing imports minimizes churn, use Cargo package
-   aliases for `gpui-pre`, `gpui-pre-platform` and `gpui-kit-assets`, with the
-   matching registry component/base/wry dependencies. Do not mix registry GPUI
-   with the existing Git GPUI types. The Kit facade can simplify imports where
-   useful; a blanket import rewrite is not the goal.
-2. Preserve `stacker`, the explicitly selected grammar features, profiler wiring,
-   and target-gated WebView dependencies. The 0.6.6 gpui-wry still uses lb-wry
-   0.53.3. Review dev profile package overrides for the new package names.
-   Kit does not expose every underlying GPUI feature, so verify feature union
-   rather than assuming a single facade dependency preserves stacker.
-3. Run all three platform compile/test gates; check the dependency graph for
-   duplicate GPUI sources. Resolve API changes in text/input/theme and macro
-   imports against the published source. Keep test-support in dev-dependencies.
-4. Reuse the existing workspace headless fixtures and migrate one useful
-   interaction regression to the new helpers. Do not introduce a second test
-   framework or rewrite 125 existing GPUI workspace tests as upgrade busywork.
-5. Run focused Windows CJK/IME, selection/undo, clipboard, save-dialog and
-   WebView-focus smoke against the upgraded artifact. Measure Markdown editing
-   or scrolling only if claiming a performance benefit. Keep the upgrade
-   independently revertible from the workflow change.
+- Application imports, startup and tests use the `gpui_kit` facade. Kit resolves
+  component/base/assets 0.6.6 and GPUI/platform 0.3.6 from crates.io; the old Zed
+  and component Git sources are removed. `gpui-wry` is pinned to 0.6.6 and
+  remains Windows/macOS-only with lb-wry 0.53.3.
+- Kit does not forward `stacker`, so the direct `gpui` alias for exactly
+  `gpui-pre =0.3.6` enables it on the same package. The original grammar subset,
+  profiler wiring and optimized dev package overrides are preserved.
+- Kit `test-support` stays in dev-dependencies. Existing context fixtures and
+  behavioral tests remain; the welcome regression uses `TestWindowExt` to
+  click New, check welcome dismissal and a single buffer, then type through
+  the focused input. No second harness or desktop session is required.
+- The migration is separately reviewable from development-process changes.
+  All three platform compile/test gates are required before merge. Focused
+  Windows CJK/IME, selection/undo, clipboard, save-dialog and WebView-focus
+  acceptance remains pending against the upgraded artifact. Headless passing
+  does not resolve historical Goal 03 native evidence.
 
-The current project already has `TestAppContext`/`VisualTestContext` fixtures and
-125 `#[gpui::test]` cases in `views/workspace.rs`. Headless testing is therefore
-available **before** this migration. For ordinary behavior work, reusing those
-fixtures is the immediate productivity improvement.
+See `docs/development.md` for the targeted command and testing boundary. No
+application performance or production binary-size improvement is claimed.
 
 Sources: [published Kit 0.6.6](https://docs.rs/crate/gpui-kit/0.6.6),
 [registry metadata](https://crates.io/api/v1/crates/gpui-kit),
