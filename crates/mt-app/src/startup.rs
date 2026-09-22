@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use gpui::{App, KeyBinding, Window, actions};
+use gpui_kit::{App, KeyBinding, Window, actions};
 use serde::Serialize;
 
 const TRACE_PATH_ENV: &str = "MARKTURBO_STARTUP_TRACE";
@@ -257,9 +257,9 @@ mod tests {
             "GPUI_DISABLE_DIRECT_COMPOSITION",
             "application().with_assets(Assets)",
             "set_app_identity(APP_ID, \"markturbo\")",
-            "gpui_component::init(cx)",
+            "gpui_kit::init(cx)",
             "size(px(1400.0), px(900.0))",
-            "gpui_component::TitleBar::window_options()",
+            "gpui_kit::component::TitleBar::window_options()",
             "window.set_window_title(\"markturbo\")",
         ] {
             assert!(

@@ -5,7 +5,7 @@
 //! WebView2 pumps messages while it is mutated, and doing that on GPUI's thread
 //! can re-enter `AppCell` while a draw already holds the mutable borrow.
 
-use gpui::*;
+use gpui_kit::*;
 
 use super::Workspace;
 

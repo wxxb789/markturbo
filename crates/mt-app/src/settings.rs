@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, Global};
+use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -645,7 +645,11 @@ pub fn settings_path() -> Option<PathBuf> {
 ///
 /// This recolors GPUI. It does *not* rebuild the Web preview, which caches HTML
 /// with the palette baked in; see `Workspace::reapply_theme`.
-pub fn apply_theme(preference: ThemePreference, window: Option<&mut gpui::Window>, cx: &mut App) {
+pub fn apply_theme(
+    preference: ThemePreference,
+    window: Option<&mut gpui_kit::Window>,
+    cx: &mut App,
+) {
     let dark = resolve_dark(preference, window.as_deref(), cx);
     let settings = AppSettings::global(cx);
     let id = if dark {
@@ -661,8 +665,8 @@ pub fn apply_theme(preference: ThemePreference, window: Option<&mut gpui::Window
 /// For `System` this is the window's appearance where there is a window, and the
 /// app-level one otherwise. gpui-component's own `sync_system_appearance` prefers
 /// the window for the same reason: the app-level query errors on Linux.
-fn resolve_dark(preference: ThemePreference, window: Option<&gpui::Window>, cx: &App) -> bool {
-    use gpui_component::ThemeMode;
+fn resolve_dark(preference: ThemePreference, window: Option<&gpui_kit::Window>, cx: &App) -> bool {
+    use gpui_kit::component::ThemeMode;
 
     match preference {
         ThemePreference::Light => false,
@@ -694,7 +698,7 @@ pub fn active_preset(cx: &App) -> &'static crate::theme::Preset {
 /// The Web preview needs this: it renders in its own browser context and has no
 /// access to the GPUI theme.
 pub fn is_dark(cx: &App) -> bool {
-    gpui_component::Theme::global(cx).mode.is_dark()
+    gpui_kit::component::Theme::global(cx).mode.is_dark()
 }
 
 fn config_dir() -> Option<PathBuf> {

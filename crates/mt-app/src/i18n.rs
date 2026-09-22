@@ -281,7 +281,7 @@ pub enum Key {
 }
 
 /// The string for `key` in the language the user picked.
-pub fn t(key: Key, cx: &gpui::App) -> &'static str {
+pub fn t(key: Key, cx: &gpui_kit::App) -> &'static str {
     text(key, AppSettings::global(cx).language)
 }
 
@@ -297,7 +297,7 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| quoted_path(path))
 }
 
-pub fn replace_file_title(path: &std::path::Path, cx: &gpui::App) -> String {
+pub fn replace_file_title(path: &std::path::Path, cx: &gpui_kit::App) -> String {
     replace_file_title_in(path, AppSettings::global(cx).language)
 }
 
@@ -309,7 +309,7 @@ fn replace_file_title_in(path: &std::path::Path, language: Language) -> String {
     }
 }
 
-pub fn replace_file_description(path: &std::path::Path, cx: &gpui::App) -> String {
+pub fn replace_file_description(path: &std::path::Path, cx: &gpui_kit::App) -> String {
     replace_file_description_in(path, AppSettings::global(cx).language)
 }
 
@@ -323,19 +323,19 @@ fn replace_file_description_in(path: &std::path::Path, language: Language) -> St
     }
 }
 
-pub fn open_recent_target_label(path: &std::path::Path, cx: &gpui::App) -> String {
+pub fn open_recent_target_label(path: &std::path::Path, cx: &gpui_kit::App) -> String {
     recent_target_label_in(path, AppSettings::global(cx).language, true)
 }
 
-pub fn remove_recent_target_label(path: &std::path::Path, cx: &gpui::App) -> String {
+pub fn remove_recent_target_label(path: &std::path::Path, cx: &gpui_kit::App) -> String {
     recent_target_label_in(path, AppSettings::global(cx).language, false)
 }
 
-pub fn save_as_snapshot_changed_message(cx: &gpui::App) -> &'static str {
+pub fn save_as_snapshot_changed_message(cx: &gpui_kit::App) -> &'static str {
     t(Key::SaveAsSnapshotChanged, cx)
 }
 
-pub fn save_as_path_already_open_message(path: &std::path::Path, cx: &gpui::App) -> String {
+pub fn save_as_path_already_open_message(path: &std::path::Path, cx: &gpui_kit::App) -> String {
     let path = quoted_path(path);
     match AppSettings::global(cx).language {
         Language::English => {
@@ -367,7 +367,7 @@ pub fn text(key: Key, language: Language) -> &'static str {
     }
 }
 
-pub fn model_endpoint_status(endpoint: &EndpointIdentity, cx: &gpui::App) -> String {
+pub fn model_endpoint_status(endpoint: &EndpointIdentity, cx: &gpui_kit::App) -> String {
     model_endpoint_status_in(endpoint, AppSettings::global(cx).language)
 }
 
@@ -406,7 +406,7 @@ fn model_endpoint_status_in(endpoint: &EndpointIdentity, language: Language) -> 
     }
 }
 
-pub fn model_request_disclosure(disclosure: &ModelRequestDisclosure, cx: &gpui::App) -> String {
+pub fn model_request_disclosure(disclosure: &ModelRequestDisclosure, cx: &gpui_kit::App) -> String {
     model_request_disclosure_in(disclosure, AppSettings::global(cx).language)
 }
 
@@ -558,7 +558,7 @@ fn model_request_disclosure_in(disclosure: &ModelRequestDisclosure, language: La
     }
 }
 
-pub fn model_endpoint_error(error: &EndpointIdentityError, cx: &gpui::App) -> String {
+pub fn model_endpoint_error(error: &EndpointIdentityError, cx: &gpui_kit::App) -> String {
     let key = match error {
         EndpointIdentityError::InvalidUrl(_) => Key::EndpointInvalidUrl,
         EndpointIdentityError::UnsupportedScheme => Key::EndpointUnsupportedScheme,
@@ -574,7 +574,7 @@ pub fn model_endpoint_error(error: &EndpointIdentityError, cx: &gpui::App) -> St
 pub fn environment_credential_description(
     variable: &str,
     endpoint: &EndpointIdentity,
-    cx: &gpui::App,
+    cx: &gpui_kit::App,
 ) -> String {
     let base_url = endpoint.base_url();
     match AppSettings::global(cx).language {
@@ -587,7 +587,10 @@ pub fn environment_credential_description(
     }
 }
 
-pub fn delete_model_credential_description(endpoint: &EndpointIdentity, cx: &gpui::App) -> String {
+pub fn delete_model_credential_description(
+    endpoint: &EndpointIdentity,
+    cx: &gpui_kit::App,
+) -> String {
     let provider = endpoint.provider().label();
     let base_url = endpoint.base_url();
     match AppSettings::global(cx).language {
@@ -602,7 +605,7 @@ pub fn delete_model_credential_description(endpoint: &EndpointIdentity, cx: &gpu
 
 pub fn migrate_legacy_credential_description(
     endpoint: &EndpointIdentity,
-    cx: &gpui::App,
+    cx: &gpui_kit::App,
 ) -> String {
     let provider = endpoint.provider().label();
     let base_url = endpoint.base_url();

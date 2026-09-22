@@ -56,13 +56,27 @@ keyboard/pointer events and check component state/focus/layout; it cannot prove
 Windows IME composition, the OS clipboard, native dialogs, WebView2 focus or
 DPAPI/session behavior. Keep native coverage for those boundaries.
 
-The current project already enables GPUI `test-support` in dev-dependencies.
-Reuse `open_test_workspace*` and the existing 125 GPUI tests in
-`crates/mt-app/src/views/workspace.rs` before adding another harness.
-Use locked-version APIs for focused tests today; the newer Kit helpers are
-a migration opportunity, not a prerequisite to testing or the next feature.
-Do not replace every native/source assertion in one sweep. Move one recurrent
-failure to a lower-level regression test when working on that behavior.
+GPUI Kit `test-support` is enabled only for dev-dependencies. Reuse
+`open_test_workspace*` in `crates/mt-app/src/views/workspace.rs`; ordinary UI
+iterations need no external desktop runner. For example:
+
+```sh
+cargo test --locked --profile ci -p mt-app kit_welcome_new_click
+```
+
+The regression renders the real welcome page, clicks its stable `ElementId`
+with `gpui_kit::test::TestWindowExt`, checks that welcome disappears and exactly
+one buffer opens, then types into the focused editor and checks its dirty text.
+Use `window.render_frame(app)` before snapshots after external state changes;
+Kit clicks also render frames. Kit/Base controls already expose observations;
+custom identified elements can use `TestSupportExt::test_support()` (inert in
+production). Prefer IDs over coordinates and import test types explicitly to
+avoid glob-importing Kit's `test` macro over Rust's built-in `#[test]`.
+
+These helpers test events, state, focus and layout, not rendered pixels. Do not
+add screenshot/foreground automation for ordinary state changes, or replace
+all native/source assertions in one sweep. Keep integrated native acceptance
+for the OS boundaries above and visual review for actual appearance changes.
 
 Consult the test result for the relevant revision and environment. A failed
 lint/test/build is not environmental merely because a GUI was unavailable.

@@ -425,7 +425,7 @@ def source_contract_failure() -> str | None:
         "accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)",
         "accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID)",
         "accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID)",
-        "gpui::Role::Label",
+        "gpui_kit::Role::Label",
         'KeyBinding::new("ctrl-shift-r", ReviewDocument, None)',
         'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None)',
         "ReviewError::MissingCredential",

@@ -8,9 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{
+use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -21,6 +19,8 @@ use gpui_component::{
     text::{TextView, TextViewState, TextViewStyle},
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use mt_doc::{DocType, Document, Severity};
 
 use crate::fs::{self, FileStamp, LoadedFile, Newline, SaveError, SourceIdentity};
@@ -295,7 +295,7 @@ pub struct DocumentView {
     ///
     /// `Clone` copies the revision rather than minting a new one, which is what
     /// makes the guard match from the second frame onwards.
-    preview_extensions: gpui_component::text::MarkdownExtensions,
+    preview_extensions: gpui_kit::component::text::MarkdownExtensions,
     layout: Layout,
     trust: Trust,
     dirty: bool,
@@ -1622,7 +1622,10 @@ impl DocumentView {
         let focus_handle = self.editor.read(cx).focus_handle(cx);
         div()
             .id("source")
-            .role(gpui::Role::MultilineTextInput)
+            // Kit's headless test support observes the real editor surface;
+            // this is inert in production builds.
+            .test_support()
+            .role(gpui_kit::Role::MultilineTextInput)
             .accessibility_id(SOURCE_EDITOR_ACCESSIBILITY_ID)
             .aria_label("Source editor")
             .track_focus(&focus_handle)
@@ -1759,8 +1762,8 @@ impl DocumentView {
 /// Graphviz means adding a `DiagramKind` — not editing this function.
 pub fn diagram_extensions(
     registry: Arc<RendererRegistry>,
-) -> gpui_component::text::MarkdownExtensions {
-    use gpui_component::text::{MarkdownExtensions, MarkdownNode, markdown_ast};
+) -> gpui_kit::component::text::MarkdownExtensions {
+    use gpui_kit::component::text::{MarkdownExtensions, MarkdownNode, markdown_ast};
 
     let parse_registry = registry.clone();
     MarkdownExtensions::default()
@@ -2062,7 +2065,7 @@ impl Render for DocumentView {
             // technology announce the whole window instead of the document —
             // gpui logs exactly that. `Group` is the right one for a container
             // holding a toolbar, an editor and a preview.
-            .role(gpui::Role::Group)
+            .role(gpui_kit::Role::Group)
             .aria_label(title)
             .track_focus(&self.focus_handle)
             .size_full()
@@ -2074,7 +2077,7 @@ impl Render for DocumentView {
 
 #[cfg(test)]
 mod tests {
-    // Import selectively: the `gpui::*` glob above re-exports a `test` attribute
+    // Import selectively: the `gpui_kit::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
     use super::{
         AsyncSnapshot, DocumentView, Layout, SaveIssue, available_layouts, editor_language,
@@ -2082,7 +2085,7 @@ mod tests {
     };
     use crate::fs::{FileStamp, Newline, SourceIdentity};
     use crate::recovery::{RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord};
-    use gpui_component::highlighter::Language;
+    use gpui_kit::component::highlighter::Language;
     use mt_doc::DocType;
     use std::path::Path;
     use std::time::SystemTime;
@@ -2945,7 +2948,7 @@ mod tests {
         assert!(banner.contains("accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID)"));
 
         let editor = fn_body("fn render_editor", "\n    /// The native preview");
-        assert!(editor.contains("gpui::Role::MultilineTextInput"));
+        assert!(editor.contains("gpui_kit::Role::MultilineTextInput"));
         assert!(editor.contains("accessibility_id(SOURCE_EDITOR_ACCESSIBILITY_ID)"));
         assert!(editor.contains("track_focus(&focus_handle)"));
         assert!(

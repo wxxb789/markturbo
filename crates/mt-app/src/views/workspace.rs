@@ -22,10 +22,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_base::{Button as BaseButton, GlobalState, Toggle as BaseToggle};
-use gpui_component::{
+use gpui_kit::base::{Button as BaseButton, GlobalState, Toggle as BaseToggle};
+use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
     StyledExt as _, TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
     button::{Button, ButtonVariants as _},
@@ -37,6 +35,8 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use mt_doc::review::{
     ArtifactLens, ByteRange, ClarificationPriority, FindingKind, MAX_SKILL_FILE_BYTES,
     MAX_SKILL_PACKAGE_BYTES, ReviewDiagnostic, ReviewDiagnosticCode,
@@ -6650,7 +6650,7 @@ impl Workspace {
             content.push(
                 div()
                     .id("review-diagnostic")
-                    .role(gpui::Role::Label)
+                    .role(gpui_kit::Role::Label)
                     .aria_value(diagnostic.diagnostic.message.as_str())
                     .accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID)
                     .text_sm()
@@ -6709,7 +6709,7 @@ impl Workspace {
             content.push(
                 div()
                     .id("review-result")
-                    .role(gpui::Role::Label)
+                    .role(gpui_kit::Role::Label)
                     .aria_value(i18n::t(i18n::Key::ReviewReady, cx))
                     .accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID)
                     .text_sm()
@@ -6947,7 +6947,7 @@ impl Workspace {
         Some(
             v_flex()
                 .id("document-details")
-                .role(gpui::Role::DescriptionList)
+                .role(gpui_kit::Role::DescriptionList)
                 .aria_label(accessibility_label)
                 .p(metrics::inset())
                 .gap(metrics::gap())
@@ -7493,7 +7493,7 @@ impl Workspace {
                         if dirty {
                             div()
                                 .id(SharedString::from(format!("dirty-{ix}")))
-                                .role(gpui::Role::Button)
+                                .role(gpui_kit::Role::Button)
                                 .aria_label("Close document")
                                 .when(active_single_document, |this| {
                                     this.accessibility_id(TAB_CLOSE_ACCESSIBILITY_ID)
@@ -7554,7 +7554,7 @@ impl Workspace {
 
         v_flex()
             .id("welcome")
-            .role(gpui::Role::Group)
+            .role(gpui_kit::Role::Group)
             .aria_label(i18n::t(i18n::Key::WelcomeTitle, cx))
             .size_full()
             .min_h_0()
@@ -7703,7 +7703,7 @@ impl Workspace {
                                     };
                                     let open_button = if issue.is_some() {
                                         BaseButton::new(open_id)
-                                            .role(gpui::Role::Button)
+                                            .role(gpui_kit::Role::Button)
                                             .disabled(true)
                                             .accessibility_label(open_label)
                                             .accessibility_id(open_accessibility_id)
@@ -7770,7 +7770,7 @@ impl Workspace {
                                             this.child(
                                                 div()
                                                     .id(status_id.clone())
-                                                    .role(gpui::Role::Label)
+                                                    .role(gpui_kit::Role::Label)
                                                     .aria_value(label)
                                                     .accessibility_id(status_id)
                                                     .text_xs()
@@ -7897,9 +7897,15 @@ impl Workspace {
         // read-only on Windows even when SetValue is handled. Keep the same
         // interaction contract under Slider until the consumer is fixed.
         let (role, orientation) = if cfg!(target_os = "windows") {
-            (gpui::Role::Slider, gpui::accesskit::Orientation::Horizontal)
+            (
+                gpui_kit::Role::Slider,
+                gpui_kit::accesskit::Orientation::Horizontal,
+            )
         } else {
-            (gpui::Role::Splitter, gpui::accesskit::Orientation::Vertical)
+            (
+                gpui_kit::Role::Splitter,
+                gpui_kit::accesskit::Orientation::Vertical,
+            )
         };
 
         div()
@@ -7935,24 +7941,30 @@ impl Workspace {
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 this.on_panel_resize_key_down(edge, event, window, cx)
             }))
-            .on_a11y_action(gpui::accesskit::Action::Increment, move |_, window, cx| {
-                if let Some(this) = increment.upgrade() {
-                    this.update(cx, |this, cx| {
-                        this.resize_panel_by_delta(edge, metrics::gap_group(), window, cx);
-                    });
-                }
-            })
-            .on_a11y_action(gpui::accesskit::Action::Decrement, move |_, window, cx| {
-                if let Some(this) = decrement.upgrade() {
-                    this.update(cx, |this, cx| {
-                        this.resize_panel_by_delta(edge, -metrics::gap_group(), window, cx);
-                    });
-                }
-            })
             .on_a11y_action(
-                gpui::accesskit::Action::SetValue,
+                gpui_kit::accesskit::Action::Increment,
+                move |_, window, cx| {
+                    if let Some(this) = increment.upgrade() {
+                        this.update(cx, |this, cx| {
+                            this.resize_panel_by_delta(edge, metrics::gap_group(), window, cx);
+                        });
+                    }
+                },
+            )
+            .on_a11y_action(
+                gpui_kit::accesskit::Action::Decrement,
+                move |_, window, cx| {
+                    if let Some(this) = decrement.upgrade() {
+                        this.update(cx, |this, cx| {
+                            this.resize_panel_by_delta(edge, -metrics::gap_group(), window, cx);
+                        });
+                    }
+                },
+            )
+            .on_a11y_action(
+                gpui_kit::accesskit::Action::SetValue,
                 move |data, window, cx| {
-                    let Some(gpui::accesskit::ActionData::NumericValue(value)) = data else {
+                    let Some(gpui_kit::accesskit::ActionData::NumericValue(value)) = data else {
                         return;
                     };
                     if !value.is_finite() {
@@ -8349,7 +8361,7 @@ fn detail_field(
     let value = value.into();
     h_flex()
         .id(id)
-        .role(gpui::Role::Group)
+        .role(gpui_kit::Role::Group)
         .aria_label(format!("{name}: {value}"))
         .gap_2()
         .items_start()
@@ -8565,7 +8577,7 @@ impl Render for Workspace {
             // Without a role the whole window is announced instead of the
             // focused element; gpui logs exactly that. `Application` is the
             // right one for a window whose own keybindings drive it.
-            .role(gpui::Role::Application)
+            .role(gpui_kit::Role::Application)
             .aria_label("markturbo workspace")
             .track_focus(&self.focus_handle)
             .key_context(if self.show_welcome && !self.settings_open {
@@ -8691,7 +8703,7 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    // Import selectively: the `gpui::*` glob above re-exports a `test`
+    // Import selectively: the `gpui_kit::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::{
@@ -8715,7 +8727,7 @@ mod tests {
     use crate::views::Layout;
     use crate::watcher::Change;
     use crate::web::{self, Trust};
-    use gpui::{
+    use gpui_kit::{
         AppContext as _, ClipboardItem, Context, Entity, Focusable as _, Modifiers, MouseButton,
         TestAppContext, VisualTestContext, Window, point, px,
     };
@@ -8797,7 +8809,7 @@ mod tests {
     {
         let initial_is_none = initial.is_none();
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::settings::AppSettings::init(cx);
             // Most workspace tests use an empty state as a fixture for
             // document and panel behavior. First-use tests opt in below.
@@ -8821,7 +8833,7 @@ mod tests {
                     workspace
                 });
                 *captured.borrow_mut() = Some(workspace.clone());
-                gpui_component::Root::new(workspace, window, cx)
+                gpui_kit::component::Root::new(workspace, window, cx)
             }
         });
         let workspace = captured.borrow().clone().expect("the Workspace entity");
@@ -8915,7 +8927,7 @@ mod tests {
         show_welcome_on_startup: bool,
     ) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::settings::AppSettings::init(cx);
             crate::settings::AppSettings::update(cx, |settings| {
                 settings.show_welcome_on_startup = show_welcome_on_startup;
@@ -8930,7 +8942,7 @@ mod tests {
                     Workspace::new_with_startup_recovery(None, StartupRecovery::default, window, cx)
                 });
                 *captured.borrow_mut() = Some(workspace.clone());
-                gpui_component::Root::new(workspace, window, cx)
+                gpui_kit::component::Root::new(workspace, window, cx)
             }
         });
         let workspace = captured.borrow().clone().expect("the Workspace entity");
@@ -9177,7 +9189,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn a_clean_tab_closes_immediately(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clean.md");
@@ -9193,7 +9205,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn memory_documents_are_pathless_dirty_when_pasted_and_excluded_from_path_only_surfaces(
         cx: &mut TestAppContext,
     ) {
@@ -9244,7 +9256,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_as_migrates_a_memory_document_to_a_file_identity(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("saved-from-memory.md");
@@ -9317,7 +9329,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_as_outside_the_workspace_keeps_real_watcher_conflict_detection(
         cx: &mut TestAppContext,
     ) {
@@ -9378,7 +9390,7 @@ mod tests {
         assert!(!super::should_show_welcome(None, false));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn no_argument_workspace_starts_on_the_welcome_state(cx: &mut TestAppContext) {
         let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
         workspace.read_with(cx, |workspace, _| {
@@ -9388,7 +9400,44 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    // Exercise rendered controls and native GPUI event dispatch, not handlers.
+    // This guards the first-use path without requiring a foreground desktop.
+    #[gpui_kit::test]
+    fn kit_welcome_new_click_opens_one_editable_document(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+
+        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
+        cx.update(|window, app| {
+            window.render_frame(app);
+            assert!(window.find("welcome-new").visible());
+            window.click("welcome-new", app);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert!(!workspace.show_welcome);
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), None);
+            assert_eq!(document.text(app), "");
+            assert!(!document.is_dirty());
+        });
+        cx.update(|window, app| {
+            window.render_frame(app);
+            assert!(window.try_find("welcome-new").is_none());
+            window.click("source", app);
+            assert_eq!(window.find("source").focused(), Some(true));
+            window.input("# Headless edit", app);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), "# Headless edit");
+            assert!(document.is_dirty());
+        });
+    }
+
+    #[gpui_kit::test]
     fn explicit_path_bypasses_welcome_and_records_its_file_target(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opened.md");
@@ -9407,7 +9456,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn paste_creates_an_exact_dirty_memory_document(cx: &mut TestAppContext) {
         let text = "# \u{7cbe}\u{8d34} \u{1f680}\nexact clipboard text\n";
         let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
@@ -9426,7 +9475,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn unavailable_welcome_clipboard_preserves_the_surface_and_reports_the_reason(
         cx: &mut TestAppContext,
     ) {
@@ -9449,7 +9498,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn welcome_ctrl_v_pastes_into_a_new_document(cx: &mut TestAppContext) {
         let text = "# Clipboard shortcut\nexact \u{4e2d}\u{6587} \u{1f680}\n";
         let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
@@ -9467,7 +9516,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn welcome_paste_shortcut_is_inactive_while_settings_is_visible(cx: &mut TestAppContext) {
         let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
         cx.update(|window, app| {
@@ -9488,7 +9537,7 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
-    #[gpui::test]
+    #[gpui_kit::test]
     fn failed_file_open_keeps_welcome_root_tabs_and_focus_unchanged(cx: &mut TestAppContext) {
         use std::os::windows::fs::OpenOptionsExt as _;
 
@@ -9519,7 +9568,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelling_file_and_folder_pickers_preserves_the_welcome_state_and_focus(
         cx: &mut TestAppContext,
     ) {
@@ -9561,7 +9610,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn bundled_sample_opens_from_welcome_and_becomes_the_recent_workspace(cx: &mut TestAppContext) {
         let sample = crate::app_paths::bundled_sample_dir().expect("the debug sample");
         let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
@@ -9584,7 +9633,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn unavailable_bundled_sample_keeps_welcome_visible_and_reports_status(
         cx: &mut TestAppContext,
     ) {
@@ -9611,7 +9660,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn missing_recent_target_is_disabled_and_removable_without_opening_anything(
         cx: &mut TestAppContext,
     ) {
@@ -9680,7 +9729,7 @@ mod tests {
         assert!(welcome.contains("builder.parent_node().set_disabled()"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn valid_recent_file_reopens_through_the_shared_target_path(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recent.md");
@@ -9713,7 +9762,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dont_show_welcome_again_persists_and_starts_an_empty_memory_document(
         cx: &mut TestAppContext,
     ) {
@@ -9733,7 +9782,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn clean_window_close_defers_teardown_until_the_focused_input_handler_can_drain(
         cx: &mut TestAppContext,
     ) {
@@ -9797,7 +9846,7 @@ mod tests {
         assert!(native.contains("WM_CLOSE"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn disabled_welcome_starts_future_no_argument_workspaces_with_a_new_buffer(
         cx: &mut TestAppContext,
     ) {
@@ -9864,7 +9913,7 @@ mod tests {
         }
         assert!(source.contains(".accessibility_id("));
         assert!(source.contains("markturbo-welcome-recent-status-"));
-        assert!(source.contains(".role(gpui::Role::Label)"));
+        assert!(source.contains(".role(gpui_kit::Role::Label)"));
         assert!(source.contains(".aria_value(label)"));
         let welcome = source
             .split_once("fn render_welcome")
@@ -9992,7 +10041,7 @@ mod tests {
         assert!(commands.contains("i18n::Key::Settings"));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn ten_recent_targets_scroll_into_view_at_the_minimum_window_size(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let mut targets = Vec::new();
@@ -10007,19 +10056,19 @@ mod tests {
         }
 
         cx.update(|app| {
-            gpui_component::init(app);
+            gpui_kit::init(app);
             crate::settings::AppSettings::init(app);
             super::init(app);
         });
         let captured = Rc::new(RefCell::new(None));
-        let window = cx.open_window(gpui::size(px(720.), px(480.)), {
+        let window = cx.open_window(gpui_kit::size(px(720.), px(480.)), {
             let captured = captured.clone();
             move |window, app| {
                 let workspace = app.new(|cx| {
                     Workspace::new_with_startup_recovery(None, StartupRecovery::default, window, cx)
                 });
                 *captured.borrow_mut() = Some(workspace.clone());
-                gpui_component::Root::new(workspace, window, app)
+                gpui_kit::component::Root::new(workspace, window, app)
             }
         });
         let mut cx = VisualTestContext::from_window(window.into(), cx);
@@ -10055,9 +10104,9 @@ mod tests {
         assert!(bounds.top() >= crate::metrics::title_bar());
         assert!(bounds.bottom() <= px(480.) - crate::metrics::status_bar());
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui_kit::ScrollWheelEvent {
             position: point(px(360.), px(240.)),
-            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-2_000.))),
+            delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-2_000.))),
             ..Default::default()
         });
         cx.update(|window, app| window.draw(app).clear(app));
@@ -10070,7 +10119,7 @@ mod tests {
         assert_eq!(after.y, -max.y, "the full recent list must be reachable");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelling_save_as_overwrite_keeps_destination_and_buffer_byte_identical(
         cx: &mut TestAppContext,
     ) {
@@ -10115,7 +10164,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn confirmed_save_as_overwrite_replaces_only_the_selected_destination(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("existing.md");
@@ -10156,7 +10205,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn replace_confirmation_refuses_a_destination_changed_while_the_prompt_is_open(
         cx: &mut TestAppContext,
     ) {
@@ -10201,7 +10250,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_as_picker_cancellation_is_a_total_no_op(cx: &mut TestAppContext) {
         let text = "unsaved \u{4fdd}\u{7559} \u{1f680}\n";
         let (workspace, cx) = open_test_workspace_with(cx, None);
@@ -10227,7 +10276,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_as_rejects_an_equivalent_path_already_open_in_another_tab(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let open_path = dir.path().join("open.md");
@@ -10265,7 +10314,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn memory_dirty_close_save_keeps_the_destructive_request_open_for_save_as(
         cx: &mut TestAppContext,
     ) {
@@ -10320,7 +10369,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelling_memory_dirty_close_save_as_keeps_the_buffer_open_and_recoverable(
         cx: &mut TestAppContext,
     ) {
@@ -10352,7 +10401,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelling_an_existing_save_as_destination_keeps_a_dirty_close_buffer_open(
         cx: &mut TestAppContext,
     ) {
@@ -10399,7 +10448,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn replacing_an_existing_save_as_destination_completes_the_dirty_close(
         cx: &mut TestAppContext,
     ) {
@@ -10448,7 +10497,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dropping_a_folder_then_file_uses_the_shared_target_lifecycle(cx: &mut TestAppContext) {
         let folder = tempfile::tempdir().unwrap();
         let document_path = folder.path().join("dropped.md");
@@ -10502,7 +10551,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_as_snapshot_drift_cancels_the_pending_close_without_writing(cx: &mut TestAppContext) {
         let initial = "initial \u{4fdd}\u{7559} \u{1f680}\n";
         let revised = "revised \u{4fdd}\u{7559} \u{1f680}\n";
@@ -10544,7 +10593,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn pathless_recovery_restores_as_a_memory_document_with_its_original_key(
         cx: &mut TestAppContext,
     ) {
@@ -10578,7 +10627,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn failed_history_navigation_keeps_the_active_memory_document_and_no_preview(
         cx: &mut TestAppContext,
     ) {
@@ -10618,7 +10667,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dirty_close_saves_exact_text_before_closing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("save.md");
@@ -10639,7 +10688,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), edited);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dirty_close_discard_never_writes(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("discard.md");
@@ -10658,7 +10707,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn discard_waits_for_startup_store_before_closing_and_retiring(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("discard-before-startup.md");
@@ -10716,7 +10765,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelling_a_new_dirty_prompt_rearms_a_startup_discarded_document(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("startup-discard-first.md");
@@ -10812,7 +10861,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_waits_for_startup_store_before_closing_and_retiring(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("save-before-startup.md");
@@ -10853,7 +10902,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn saved_preview_is_kept_until_startup_retirement_is_durable(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first-preview.md");
@@ -10900,7 +10949,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn preview_remains_while_retirement_is_queued_behind_an_old_owner(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("queued-preview-first.md");
@@ -10942,7 +10991,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn unavailable_startup_store_keeps_waiting_discard_open(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("discard-without-store.md");
@@ -10989,7 +11038,7 @@ mod tests {
         assert_eq!(document_text(&workspace, 0, cx), "must remain open\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dirty_close_cancel_preserves_the_tab_and_exact_text(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cancel.md");
@@ -11010,7 +11059,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn failed_save_during_close_keeps_the_tab_and_exact_text(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conflict.md");
@@ -11032,7 +11081,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "disk two\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_action_refuses_missing_source_and_preserves_exact_editor_text(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.md");
@@ -11056,7 +11105,7 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_action_refuses_retargeted_symlink_without_overwriting_either_target(
         cx: &mut TestAppContext,
     ) {
@@ -11090,7 +11139,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_action_refuses_decode_loss_without_changing_original_bytes(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invalid.md");
@@ -11113,7 +11162,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_action_refuses_unrepresentable_text_without_changing_gbk_bytes(
         cx: &mut TestAppContext,
     ) {
@@ -11138,7 +11187,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn document_save_actions_compose_overwrite_and_utf8_conversion(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invalid.md");
@@ -11190,7 +11239,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn editing_after_overwrite_authorization_requires_a_new_overwrite_decision(
         cx: &mut TestAppContext,
     ) {
@@ -11225,7 +11274,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn auto_reload_cannot_replace_a_dirty_editor(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("external.md");
@@ -11247,7 +11296,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn watcher_auto_reload_waits_for_startup_recovery_and_preserves_conflict(
         cx: &mut TestAppContext,
     ) {
@@ -11303,7 +11352,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn clean_auto_reload_deletion_enters_the_missing_source_state(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("removed-clean.md");
@@ -11339,7 +11388,7 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
-    #[gpui::test]
+    #[gpui_kit::test]
     fn resolved_symlink_target_change_marks_dirty_document_without_replacing_text(
         cx: &mut TestAppContext,
     ) {
@@ -11370,7 +11419,7 @@ mod tests {
     }
 
     #[cfg(feature = "model-transport")]
-    #[gpui::test]
+    #[gpui_kit::test]
     fn opening_and_scanning_with_model_configured_sends_no_request(cx: &mut TestAppContext) {
         use crate::model::{EndpointIdentity, Provider};
 
@@ -11383,7 +11432,7 @@ mod tests {
         fs::write(&path, "Private content stays local\n").unwrap();
 
         cx.update(|app| {
-            gpui_component::init(app);
+            gpui_kit::init(app);
             crate::settings::AppSettings::init(app);
             crate::settings::AppSettings::update(app, |settings| {
                 settings.show_welcome_on_startup = false;
@@ -11412,7 +11461,7 @@ mod tests {
                     )
                 });
                 *captured.borrow_mut() = Some(workspace.clone());
-                gpui_component::Root::new(workspace, window, cx)
+                gpui_kit::component::Root::new(workspace, window, cx)
             }
         });
         let workspace = captured.borrow().clone().expect("the Workspace entity");
@@ -11428,7 +11477,7 @@ mod tests {
     }
 
     #[cfg(feature = "model-transport")]
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelling_translation_consent_sends_no_request(cx: &mut TestAppContext) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -11462,7 +11511,7 @@ mod tests {
     }
 
     #[cfg(feature = "model-transport")]
-    #[gpui::test]
+    #[gpui_kit::test]
     fn changing_the_document_invalidates_pending_translation_consent(cx: &mut TestAppContext) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -11501,7 +11550,7 @@ mod tests {
     }
 
     #[cfg(feature = "model-transport")]
-    #[gpui::test]
+    #[gpui_kit::test]
     fn approving_translation_consent_sends_one_frozen_request(cx: &mut TestAppContext) {
         let (base_url, received, request_count) = one_shot_translation_server();
         let dir = tempfile::tempdir().unwrap();
@@ -11534,7 +11583,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn stale_transformation_result_keeps_the_newer_editor_revision_and_text(
         cx: &mut TestAppContext,
     ) {
@@ -11568,7 +11617,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_as_rejects_a_transformation_from_the_previous_source_identity(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("translation.md");
@@ -11607,7 +11656,7 @@ mod tests {
         assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn trusted_mdx_save_as_html_is_restricted_before_the_new_web_payload(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("trusted.mdx");
@@ -11641,7 +11690,7 @@ mod tests {
         assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn trusted_html_path_only_save_as_rebuilds_as_restricted_data_url(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("trusted-before.html");
@@ -11678,7 +11727,7 @@ mod tests {
         assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn failed_save_as_preserves_trust_and_the_existing_web_payload(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("trusted.html");
@@ -11714,7 +11763,7 @@ mod tests {
         assert!(!failed_path.exists());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn markdown_save_as_preserves_content_layout_and_restricted_payload(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("before.md");
@@ -11752,7 +11801,7 @@ mod tests {
         assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn discard_keeps_the_tab_open_when_recovery_retirement_fails(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("discard-retirement-failure.md");
@@ -11826,7 +11875,7 @@ mod tests {
         assert_eq!(recovered.records[0].record.text, edited);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn discard_proceeds_after_the_record_is_retired_even_if_cleanup_fails(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("discard-cleanup-failure.md");
@@ -11867,7 +11916,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_retries_a_failed_durable_recovery_retirement(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("save-retirement-retry.md");
@@ -11934,7 +11983,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn unrelated_failed_retirement_does_not_block_clean_close_tab(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("failed-retirement.md");
@@ -12000,7 +12049,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn close_tab_waits_for_its_pre_save_as_startup_key(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("before-save-as.md");
@@ -12049,7 +12098,7 @@ mod tests {
         assert_eq!(fs::read_to_string(saved_as).unwrap(), "saved elsewhere\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn saving_during_startup_clears_the_save_as_recovery_key(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("document.md");
@@ -12104,7 +12153,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn clean_document_opened_during_startup_retires_its_old_key_after_save_as(
         cx: &mut TestAppContext,
     ) {
@@ -12190,7 +12239,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn full_workspace_actions_include_all_pending_keys_in_one_batch(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("full-action-first.md");
@@ -12279,7 +12328,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn second_save_replaces_a_stale_ui_retirement_owner(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("second-save-stale-owner.md");
@@ -12326,7 +12375,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn matched_old_completion_replays_a_queued_save_retirement(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queued-save-replay.md");
@@ -12377,7 +12426,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn edit_cancels_only_the_queued_retirement_intent(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edit-cancels-queued-retirement.md");
@@ -12416,7 +12465,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn stale_batch_takeover_resumes_the_destructive_action(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stale-batch-takeover.md");
@@ -12476,7 +12525,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn replay_persist_failure_keeps_destructive_action_open_until_retry(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay-persist-failure.md");
@@ -12543,7 +12592,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn marker_write_retry_does_not_suppress_later_batch_cleanup_retry(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("marker-retry-first.md");
@@ -12653,7 +12702,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_and_discard_clear_the_recovery_record(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recovery.md");
@@ -12712,7 +12761,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn save_and_discard_supersede_an_in_flight_checkpoint(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("in-flight.md");
@@ -12782,7 +12831,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn clean_and_closed_documents_retire_recovery_deadlines(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deadline.md");
@@ -12835,7 +12884,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn stale_recovery_completion_cannot_clear_a_newer_attempt(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stale-completion.md");
@@ -12901,7 +12950,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn editing_one_document_does_not_cancel_other_recovery_attempts(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first_path = dir.path().join("first-cancelled.md");
@@ -12982,7 +13031,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelled_checkpoint_catches_up_after_the_retry_throttle(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cancelled-catch-up.md");
@@ -13062,7 +13111,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn active_checkpoint_worker_coalesces_repeated_edits_into_one_latest_follow_up(
         cx: &mut TestAppContext,
     ) {
@@ -13202,7 +13251,7 @@ mod tests {
         assert_eq!(recovered.records[0].record.text, latest);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn checkpoint_returning_after_its_durable_deadline_keeps_the_warning(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store-late.md");
@@ -13253,7 +13302,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn checkpoint_returning_on_time_clears_a_warning_even_when_ui_delivery_is_late(
         cx: &mut TestAppContext,
     ) {
@@ -13312,7 +13361,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn overdue_checkpoint_waits_for_the_physical_worker_before_retrying(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("overdue-stuck.md");
@@ -13391,7 +13440,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn overdue_checkpoint_retries_and_clears_warning_after_becoming_durable(
         cx: &mut TestAppContext,
     ) {
@@ -13514,7 +13563,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn obvious_oversized_revision_does_no_physical_work_until_a_smaller_edit(
         cx: &mut TestAppContext,
     ) {
@@ -13570,7 +13619,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn ciphertext_oversize_is_not_retried_until_the_document_is_edited(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ciphertext-oversized.md");
@@ -13610,7 +13659,7 @@ mod tests {
         assert_eq!(store.checkpoint_batch_count_for_test(), 2);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn transient_protection_failure_retries_the_same_revision_and_succeeds(
         cx: &mut TestAppContext,
     ) {
@@ -13650,7 +13699,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn stale_written_checkpoint_does_not_clear_an_existing_recovery_warning(
         cx: &mut TestAppContext,
     ) {
@@ -13722,7 +13771,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn eviction_reservation_warns_until_a_later_checkpoint_is_written(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reserved-document.md");
@@ -13795,7 +13844,7 @@ mod tests {
         assert_eq!(records[0].record.text, edited);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn continued_edits_checkpoint_without_postponing_the_oldest_uncovered_text(
         cx: &mut TestAppContext,
     ) {
@@ -13844,7 +13893,7 @@ mod tests {
         assert_eq!(after_deadline.records[0].record.text, latest);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn simultaneously_due_documents_share_one_recovery_scan(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.md");
@@ -13896,7 +13945,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn recovery_idle_deadline_restores_exact_cjk_and_emoji_text(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint.md");
@@ -13951,7 +14000,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn no_record_startup_recovery_clears_pending_state(cx: &mut TestAppContext) {
         let (workspace, cx) =
             open_test_workspace_with_startup_recovery(cx, None, StartupRecovery::default);
@@ -13964,7 +14013,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn early_edit_keeps_its_deadline_until_startup_recovery_is_available(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("startup-pending.md");
@@ -14040,7 +14089,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn populated_startup_recovery_does_not_block_initial_file_or_early_edits(
         cx: &mut TestAppContext,
     ) {
@@ -14102,7 +14151,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn clean_initial_file_accepts_recovery_without_recheckpointing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("same-path.md");
@@ -14157,7 +14206,7 @@ mod tests {
         assert_eq!(store.recover().unwrap().records[0].record.text, latest);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn restored_dirty_checkpoint_refreshes_at_ten_seconds_from_its_durable_baseline(
         cx: &mut TestAppContext,
     ) {
@@ -14224,7 +14273,7 @@ mod tests {
         assert!(refreshed.records[0].record.checkpointed_at > baseline_checkpointed_at);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn changed_initial_source_restores_recovery_as_conflicted(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("changed-source.md");
@@ -14273,7 +14322,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn file_opened_during_startup_accepts_matching_recovery(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opened-during-startup.md");
@@ -14302,7 +14351,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn watcher_conflict_survives_startup_recovery_application(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("watcher-before-recovery.md");
@@ -14336,7 +14385,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn queued_retirement_filters_a_startup_record_before_restore(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("saved-before-recovery.md");
@@ -14377,7 +14426,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn startup_recovery_counts_each_scan_issue_once(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let scan = RecoveryScan {
@@ -14406,7 +14455,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn malformed_startup_recovery_is_reported_without_blocking_editing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("editing-remains-available.md");
@@ -14464,7 +14513,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn startup_recovery_reports_error_beside_restored_or_skipped_summary(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("startup-mixed.md");
@@ -14543,7 +14592,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn checkpoint_batch_failure_stays_visible_beside_maintenance_issues(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("checkpoint-first.md");
@@ -14661,7 +14710,7 @@ mod tests {
         assert_eq!(fs::read_to_string(first).unwrap(), "first\n");
         assert_eq!(fs::read_to_string(second).unwrap(), "second\n");
     }
-    #[gpui::test]
+    #[gpui_kit::test]
     fn multi_document_discard_keeps_every_record_when_batch_retirement_fails(
         cx: &mut TestAppContext,
     ) {
@@ -14745,7 +14794,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dirty_owned_old_retirement_delays_the_full_discard_batch(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("old-retirement-first.md");
@@ -14875,7 +14924,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn saved_document_retirement_does_not_block_later_discard_batch(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("save-then-discard-first.md");
@@ -14937,7 +14986,7 @@ mod tests {
         assert!(store.recover().unwrap().records.is_empty());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn window_close_walks_multiple_dirty_documents(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.md");
@@ -14968,7 +15017,7 @@ mod tests {
         assert!(workspace.read_with(cx, |workspace, _| workspace.window_close_pending));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn cancelling_a_multi_document_close_keeps_all_recovery_records(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first-recovery.md");
@@ -15020,7 +15069,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn window_close_rechecks_documents_that_become_dirty_during_a_prompt(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first-dirty.md");
@@ -15051,7 +15100,7 @@ mod tests {
         assert_eq!(document_text(&workspace, 1, cx), "new async text\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dirty_close_reprompts_when_the_prompted_document_changes(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prompted-document.md");
@@ -15078,7 +15127,7 @@ mod tests {
         assert_eq!(document_text(&workspace, 0, cx), "newer draft\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn workspace_replace_rechecks_documents_that_become_dirty_during_a_prompt(
         cx: &mut TestAppContext,
     ) {
@@ -15119,7 +15168,7 @@ mod tests {
         assert_eq!(document_text(&workspace, 1, cx), "new async text\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn workspace_replace_save_persists_text_before_switching_roots(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let replacement = tempfile::tempdir().unwrap();
@@ -15145,7 +15194,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), edited);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn workspace_replace_discard_switches_roots_without_writing(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let replacement = tempfile::tempdir().unwrap();
@@ -15170,7 +15219,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn workspace_replace_cancel_preserves_root_tab_and_text(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let replacement = tempfile::tempdir().unwrap();
@@ -15197,7 +15246,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "disk\n");
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn removed_watcher_event_preserves_dirty_text_until_recreate_or_save_as(
         cx: &mut TestAppContext,
     ) {
@@ -15235,7 +15284,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn rename_shaped_watcher_events_preserve_dirty_text_until_recreate_or_save_as(
         cx: &mut TestAppContext,
     ) {
@@ -15284,7 +15333,7 @@ mod tests {
             cx,
         );
     }
-    #[gpui::test]
+    #[gpui_kit::test]
     fn recovered_document_retains_text_metadata_and_conflict_state(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.txt");
@@ -15345,84 +15394,87 @@ mod tests {
     #[test]
     fn workspace_panel_widths_preserve_preferences_and_the_document_floor() {
         let widths = resolved_workspace_panel_widths(
-            gpui::px(224.),
-            gpui::px(288.),
+            gpui_kit::px(224.),
+            gpui_kit::px(288.),
             true,
             true,
-            gpui::px(1200.),
+            gpui_kit::px(1200.),
         );
 
-        assert_eq!(widths.left, gpui::px(224.));
-        assert_eq!(widths.right, gpui::px(288.));
+        assert_eq!(widths.left, gpui_kit::px(224.));
+        assert_eq!(widths.right, gpui_kit::px(288.));
 
         let collapsed = resolved_workspace_panel_widths(
-            gpui::px(224.),
-            gpui::px(288.),
+            gpui_kit::px(224.),
+            gpui_kit::px(288.),
             false,
             false,
-            gpui::px(1200.),
+            gpui_kit::px(1200.),
         );
-        assert_eq!(collapsed.left, gpui::px(0.));
-        assert_eq!(collapsed.right, gpui::px(0.));
+        assert_eq!(collapsed.left, gpui_kit::px(0.));
+        assert_eq!(collapsed.right, gpui_kit::px(0.));
 
         let restored = resolved_workspace_panel_widths(
-            gpui::px(224.),
-            gpui::px(288.),
+            gpui_kit::px(224.),
+            gpui_kit::px(288.),
             true,
             true,
-            gpui::px(1200.),
+            gpui_kit::px(1200.),
         );
-        assert_eq!(restored.left, gpui::px(224.));
-        assert_eq!(restored.right, gpui::px(288.));
+        assert_eq!(restored.left, gpui_kit::px(224.));
+        assert_eq!(restored.right, gpui_kit::px(288.));
 
         let narrowed = resolved_workspace_panel_widths(
-            gpui::px(640.),
-            gpui::px(720.),
+            gpui_kit::px(640.),
+            gpui_kit::px(720.),
             true,
             true,
-            gpui::px(720.),
+            gpui_kit::px(720.),
         );
         assert_eq!(
             narrowed.left + narrowed.right,
-            gpui::px(440.),
+            gpui_kit::px(440.),
             "restoring both panels must leave the document its 280px \
              useful-width floor"
         );
-        assert_eq!(narrowed.left, gpui::px(crate::metrics::SIDE_PANEL.min));
-        assert_eq!(narrowed.right, gpui::px(crate::metrics::RIGHT_PANEL.min));
+        assert_eq!(narrowed.left, gpui_kit::px(crate::metrics::SIDE_PANEL.min));
+        assert_eq!(
+            narrowed.right,
+            gpui_kit::px(crate::metrics::RIGHT_PANEL.min)
+        );
 
         let left_only = resolved_workspace_panel_widths(
-            gpui::px(640.),
-            gpui::px(288.),
+            gpui_kit::px(640.),
+            gpui_kit::px(288.),
             true,
             false,
-            gpui::px(720.),
+            gpui_kit::px(720.),
         );
-        assert_eq!(left_only.left, gpui::px(440.));
+        assert_eq!(left_only.left, gpui_kit::px(440.));
 
         for (viewport, expected_side_budget) in [(600., 320.), (300., 20.)] {
             let forced = resolved_workspace_panel_widths(
-                gpui::px(640.),
-                gpui::px(720.),
+                gpui_kit::px(640.),
+                gpui_kit::px(720.),
                 true,
                 true,
-                gpui::px(viewport),
+                gpui_kit::px(viewport),
             );
             assert_eq!(
                 forced.left + forced.right,
-                gpui::px(expected_side_budget),
+                gpui_kit::px(expected_side_budget),
                 "forced viewport {viewport}px must preserve the document budget"
             );
         }
 
         let tiny_right = resolved_workspace_panel_widths(
-            gpui::px(224.),
-            gpui::px(720.),
+            gpui_kit::px(224.),
+            gpui_kit::px(720.),
             false,
             true,
-            gpui::px(300.),
+            gpui_kit::px(300.),
         );
-        assert_eq!(tiny_right.right, gpui::px(20.));
+        assert_eq!(tiny_right.right, gpui_kit::px(20.));
     }
 
     #[test]
@@ -15458,42 +15510,42 @@ mod tests {
         assert_eq!(
             clamped_dragged_panel_width(
                 WorkspaceResizeEdge::Left,
-                gpui::px(900.),
-                gpui::px(288.),
+                gpui_kit::px(900.),
+                gpui_kit::px(288.),
                 true,
-                gpui::px(1200.),
+                gpui_kit::px(1200.),
             ),
-            gpui::px(632.),
+            gpui_kit::px(632.),
             "the opposite panel and document floor bound the dragged side"
         );
         assert_eq!(
             clamped_dragged_panel_width(
                 WorkspaceResizeEdge::Right,
-                gpui::px(40.),
-                gpui::px(224.),
+                gpui_kit::px(40.),
+                gpui_kit::px(224.),
                 true,
-                gpui::px(1200.),
+                gpui_kit::px(1200.),
             ),
-            gpui::px(crate::metrics::RIGHT_PANEL.min),
+            gpui_kit::px(crate::metrics::RIGHT_PANEL.min),
             "normal viewports retain the panel's useful minimum"
         );
         assert_eq!(
             clamped_dragged_panel_width(
                 WorkspaceResizeEdge::Right,
-                gpui::px(720.),
-                gpui::px(180.),
+                gpui_kit::px(720.),
+                gpui_kit::px(180.),
                 true,
-                gpui::px(300.),
+                gpui_kit::px(300.),
             ),
-            gpui::px(0.),
+            gpui_kit::px(0.),
             "a forced tiny viewport yields to the document rather than panicking"
         );
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn dragging_the_workspace_divider_updates_the_owned_column(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::settings::AppSettings::init(cx);
             crate::settings::AppSettings::update(cx, |settings| {
                 settings.show_welcome_on_startup = false;
@@ -15505,7 +15557,7 @@ mod tests {
             move |window, cx| {
                 let workspace = cx.new(|cx| Workspace::new(None, window, cx));
                 *captured.borrow_mut() = Some(workspace.clone());
-                gpui_component::Root::new(workspace, window, cx)
+                gpui_kit::component::Root::new(workspace, window, cx)
             }
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -15561,10 +15613,10 @@ mod tests {
         assert_eq!(column.size.width, after);
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn keyboard_resizes_the_focused_workspace_divider(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             crate::settings::AppSettings::init(cx);
             crate::settings::AppSettings::update(cx, |settings| {
                 settings.show_welcome_on_startup = false;
@@ -15576,7 +15628,7 @@ mod tests {
             move |window, cx| {
                 let workspace = cx.new(|cx| Workspace::new(None, window, cx));
                 *captured.borrow_mut() = Some(workspace.clone());
-                gpui_component::Root::new(workspace, window, cx)
+                gpui_kit::component::Root::new(workspace, window, cx)
             }
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -15617,12 +15669,12 @@ mod tests {
             .unwrap_or(resize);
 
         assert!(resize.contains("if cfg!(target_os = \"windows\")"));
-        assert!(resize.contains("gpui::Role::Slider"));
-        assert!(resize.contains("gpui::accesskit::Orientation::Horizontal"));
-        assert!(resize.contains("gpui::Role::Splitter"));
-        assert!(resize.contains("gpui::accesskit::Orientation::Vertical"));
-        assert!(resize.contains("gpui::accesskit::Action::SetValue"));
-        assert!(resize.contains("gpui::accesskit::ActionData::NumericValue(value)"));
+        assert!(resize.contains("gpui_kit::Role::Slider"));
+        assert!(resize.contains("gpui_kit::accesskit::Orientation::Horizontal"));
+        assert!(resize.contains("gpui_kit::Role::Splitter"));
+        assert!(resize.contains("gpui_kit::accesskit::Orientation::Vertical"));
+        assert!(resize.contains("gpui_kit::accesskit::Action::SetValue"));
+        assert!(resize.contains("gpui_kit::accesskit::ActionData::NumericValue(value)"));
     }
 
     #[test]
@@ -15675,7 +15727,7 @@ mod tests {
             2,
             "both the dirty marker and clean close button need the same active-document UIA id"
         );
-        assert!(body.contains(".role(gpui::Role::Button)"));
+        assert!(body.contains(".role(gpui_kit::Role::Button)"));
     }
 
     #[test]
