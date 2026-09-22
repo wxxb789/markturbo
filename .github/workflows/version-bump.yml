@@ -63,7 +63,7 @@ jobs:
         run: cargo install cargo-release --version "$CARGO_RELEASE_VERSION" --locked
 
       - name: Test tooling
-        run: uv run --project scripts scripts/mt.py check fast
+        run: uv run --locked --project scripts scripts/mt.py check fast
 
       - name: Bump workspace version
         id: version

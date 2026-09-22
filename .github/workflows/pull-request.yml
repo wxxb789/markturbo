@@ -70,7 +70,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: uv run --project scripts scripts/mt.py check ci
+        run: uv run --locked --project scripts scripts/mt.py check ci
 
   release-tests:
     strategy:
@@ -102,4 +102,4 @@ jobs:
           shared-key: markturbo-${{ matrix.cache }}
 
       - name: Test
-        run: cargo test --locked --release --workspace
+        run: cargo test --locked --profile ci --workspace

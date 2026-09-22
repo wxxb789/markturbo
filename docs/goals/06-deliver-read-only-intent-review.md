@@ -134,6 +134,14 @@ For each artifact, record:
 Do not weaken the contract after seeing results. Exact prose is not compared;
 grounded meaning and question usefulness are.
 
+## Validation cadence
+
+Follow [development validation](../development.md). Focused tests and PR CI gate
+implementation changes; native checks, owner evaluation and broad visual matrices
+are collected at the relevant integrated milestone, not after every small task.
+Report implementation and acceptance separately. The completion evidence below
+still gates full goal acceptance and public-quality delivery.
+
 ## Completion evidence
 
 1. Document and selection Review both work from a clean profile after explicit

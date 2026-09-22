@@ -2,7 +2,7 @@
 
 ## Objective
 
-Extend the accepted read-only Review from Goal 06 so a user can answer its
+Extend the implemented read-only Review from Goal 06 so a user can answer its
 clarification questions, request a revision against the reviewed source
 snapshot, inspect a local diff with a reason for every proposed change, accept or
 reject individual hunks, and copy or save only the approved result; prove with
@@ -124,6 +124,14 @@ Automated tests must cover at least:
 12. Generated HTML/MDX remains inert in Review, and applying an executable change
     to a Trusted document revokes trust until the user approves that new revision.
 
+## Validation cadence
+
+Follow [development validation](../development.md). Focused tests and PR CI gate
+implementation changes; native checks, owner evaluation and broad visual matrices
+are collected at the relevant integrated milestone, not after every small task.
+Report implementation and acceptance separately. The completion evidence below
+still gates full goal acceptance and public-quality delivery.
+
 ## Completion evidence
 
 - Every revision-eligible artifact in `evaluation/goal-01/CORPUS.md` has a
@@ -142,8 +150,10 @@ Automated tests must cover at least:
 
 Stop if the editor cannot represent a multi-hunk Apply as one reliable undo
 transaction, if the provider cannot return a proposal that can be validated
-without trusting opaque model instructions, or if Goal 06 did not meet its
-evaluation gate. Do not substitute unreviewed whole-document replacement or
+without trusting opaque model instructions, or if Goal 06's evaluation demonstrates a failure on which this behavior
+depends. Missing owner evaluation alone does not block deterministic diff/undo
+implementation against validated Review fixtures; integrated acceptance still
+requires Goal 06 to pass. Do not substitute unreviewed whole-document replacement or
 multiple uncoordinated writes for the approved-diff contract.
 
 ## Boundary for the next goal

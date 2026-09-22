@@ -1,81 +1,79 @@
 # MarkTurbo agent instructions
 
-## Authority and scope
+## Load only the context the change needs
 
-Read `PRODUCT.md`, the relevant ordered goal in `docs/goals/`,
-`docs/architecture.md`, and `CONCEPTS.md` before changing product behavior.
-Goals are canonical: link to them from PRs and commits rather than duplicating
-their requirements. `docs/history/` is historical context, not current scope.
-Update `CONCEPTS.md` only when project vocabulary changes.
+- Product behavior: read the relevant PRODUCT.md contract and goal in
+  `docs/goals/`, then the affected architecture section. Read CONCEPTS.md when
+  a term is unclear or changes; update it only when vocabulary changes.
+- Tooling/CI/dependencies: start with the affected script, manifest and tests.
+  Do not load the entire product roadmap, corpus or historical reports.
+- UI: use the relevant checked-in GPUI Skill guidance, but verify APIs in the
+  source selected by Cargo.lock. Live upstream docs may describe a different
+  version. Project product/architecture decisions govern over generic library
+  examples; no upstream guide requires rewriting unrelated application code.
 
-Keep changes scoped. Preserve user work and generated evidence. Do not change
-later goals to bypass an earlier goal's acceptance gate.
+PRODUCT.md owns product scope, goals own acceptance, `docs/development.md` owns
+validation cadence, and source/tests establish current implementation. History
+and `docs/goals/archive/` do not establish current acceptance. Preserve user work,
+immutable evaluation snapshots and existing evidence. CLAUDE.md shares this file.
 
-## Platform and release status
+## Work to a bounded result
 
-Windows 11 x64 is the only public-quality target. CI tests Linux, macOS, and
-Windows for compatibility, not as a release promise. CD publishes one
-Windows `markturbo-windows-x64.exe` asset. Installers, signing, notarization, and
-multi-platform distributables are future Goal 10 work.
+Identify the behavior, smallest useful change, affected invariant and verification
+command before editing; a brief task/PR note is enough. Prefer an existing module
+and public library capability over a new layer. Do not add a goal file, harness,
+evidence schema, configuration option or abstraction for every small task.
 
-Use the canonical tooling entry point:
+Fix a regression at the lowest boundary that demonstrates it. Prefer behavior
+assertions over source-text/spelling assertions. Source scans guard structure;
+they do not prove GUI behavior. During final review, remove machinery that adds
+no distinct value and preserve only changes needed by the task.
 
-```sh
-uv run --project scripts scripts/mt.py check fast
-uv run --project scripts scripts/mt.py check ci
-uv run --project scripts scripts/mt.py check full
-```
+Continue independent implementation when a desktop, credential or owner session
+is unavailable. Record pending acceptance in the PR or existing report. Known
+safety failures block affected delivery; missing evidence is never a pass.
+Do not weaken a goal threshold or claim completion because its file is archived.
 
-`fast` checks unstaged and staged whitespace changes plus explicit tooling
-tests. With `BASE_SHA` and `HEAD_SHA` (or `--base` and `--head`), it checks only
-that explicit CI revision range without changing the index. `ci` adds formatting,
-Clippy, and locked release-profile workspace tests. `full` adds the safe local
-release binary build. Native UI acceptance is always explicit:
+## Validation
 
-```sh
-uv run --project scripts scripts/mt.py accept goal-02 -- <arguments>
-uv run --project scripts scripts/mt.py accept goal-03 -- <arguments>
-```
+Use `uv run --locked --project scripts scripts/mt.py check <tier>`:
 
-Never claim native acceptance from source tests or CI. It requires an active,
-unlocked Windows desktop, a current hash-bound executable, and a PASS evidence
-file. A BLOCKED result is not acceptance evidence.
+| Tier | Use |
+| --- | --- |
+| `fast` | Docs/tooling: whitespace and non-desktop Python tests |
+| `doc` | Headless document changes: fast, formatting and optimized mt-doc tests |
+| `ci` | Settled Rust changes: fast, formatting, optimized Clippy/workspace tests |
+| `full` | Release artifacts: production-profile checks, build and privacy scan |
 
-## Validation and evidence
+During iteration, filter the affected Rust test or Python test module; see
+`docs/development.md`. Fast does not test Rust; doc does not compile mt-app.
+CI on the final proposed revision can supply the workspace gate. Do not repeat a
+successful gate locally merely to open a PR, require a clean worktree while
+iterating, or run full/native suites for every small task. Re-run after relevant
+code/configuration/dependency changes or an unresolved failure, not arbitrarily.
 
-Run the narrowest relevant tier while iterating. Before opening or merging a PR,
-run `check ci` on the proposed commit from a clean tree. Before a goal completion
-or release, run `check full` and report the actual pass count. Explain any test
-not run.
+Native acceptance remains explicit (`mt.py accept <goal> -- ...`), on an active,
+unlocked Windows 11 x64 desktop with current hash-bound evidence. Check only the
+changed workflow while iterating; batch full suites and the visual matrix at
+integrated milestones. A single-case run or BLOCKED is not acceptance. Make at
+most one retry after a concrete environment correction; otherwise record the
+limitation and continue independent work. Behavioral failures require diagnosis.
 
-Every reported measurement must name the command or evidence file. Performance
-work uses `scripts/`; consult `.scratch/perf-and-size/`, repeat measurements, and
-do not run concurrent release builds on this noisy machine. Regression tests
-should demonstrate the failure first when practical; for desktop, WebView, GPU,
-or foreground-gated behavior, state why a safe red proof is unavailable.
-Source-scanning tests are coverage for those boundaries; preserve equivalent
-coverage when moving the code they name.
+Report commands, actual outcomes, pending checks and their next checkpoint.
+Performance claims require production-profile measurements; consult existing
+`.scratch/perf-and-size/` evidence and avoid concurrent builds on that machine.
 
-## Structural and privacy invariants
+## Invariants and delivery
 
-- `mt-doc` has no GPUI dependency.
-- Keep `panic = "unwind"` and the allocation clamp in `vendor/ratex-parser`.
-- Never mutate a WebView from `render`; set `web_dirty` and defer the update.
-- Content failures are diagnostics. Broken documents remain editable and source
-  text remains preserved.
-- Native evidence may record content-free timings, hashes, byte counts, status,
-  and OS/session/integrity metadata needed to validate a run. Test text,
-  filesystem paths, credentials, and user documents must not leak.
-- The shipped executable includes the fonts and bundled sample it needs; do not
-  reintroduce a sidecar release layout.
-
-## Dependencies and delivery
-
-Read workspace `Cargo.toml` comments before changing dependencies. Prefer
-crates.io; `vendor/ratex-parser` is the sole local patch. Dependencies sharing
-a git source must use the same source selector.
-
-Use English in code, comments, docs, commits, and PRs. Make cohesive PRs, not
-an arbitrary one-commit rule. Commit subjects name the user-visible impact and,
-for product work, the goal file advanced. Run the formatter once before the
-commit that contains its intended edits.
+- `mt-doc` stays GPUI-free. Keep `panic = "unwind"` and the vendored RaTeX
+  allocation clamp. Content failures become diagnostics; preserve editable text.
+- Never mutate a WebView from render; mark `web_dirty` and defer the update.
+- Preserve consent, credential confidentiality and content-free native evidence.
+  Do not log test text, user documents, secrets or local paths into that evidence.
+- Ship required fonts/sample inside the executable. Windows 11 x64 is the only
+  public-quality target; Linux/macOS CI provides compatibility coverage.
+- Read Cargo.toml dependency comments. Prefer crates.io, retain the sole local
+  patch, and keep shared Git source selectors aligned. Update manifests and
+  locks together; changing dependency provenance requires explicit review.
+- Use English in code/docs/commits/PRs. Make cohesive PRs, link the goal for
+  product work, format changed Rust code, and avoid unrelated formatting churn.

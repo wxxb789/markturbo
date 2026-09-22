@@ -262,3 +262,11 @@ lto = "thin"
 # `catch_unwind` so a panic in a diagram backend becomes an inline diagnostic
 # instead of killing the app. `panic = "abort"` would silently defeat that.
 panic = "unwind"
+
+# Keep optimized execution and release assertions for timing-sensitive tests,
+# without paying for distribution-size optimizations on every PR. Production
+# builds and final artifact validation continue to use [profile.release].
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16

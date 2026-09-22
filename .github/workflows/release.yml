@@ -97,7 +97,7 @@ jobs:
         run: rustup component add rustfmt clippy
 
       - name: Check
-        run: uv run --project scripts scripts/mt.py check full
+        run: uv run --locked --project scripts scripts/mt.py check full
 
       - name: Stage executable
         run: |

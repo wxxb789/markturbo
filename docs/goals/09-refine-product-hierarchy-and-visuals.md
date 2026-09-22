@@ -92,6 +92,14 @@ Each state must be checked at the configured minimum, normal default, and a wide
 window width, in effective light and dark modes. Platform-identical captures may
 be automated; platform-specific WebView states require their real runtime.
 
+## Validation cadence
+
+Follow [development validation](../development.md). Focused tests and PR CI gate
+implementation changes; native checks, owner evaluation and broad visual matrices
+are collected at the relevant integrated milestone, not after every small task.
+Report implementation and acceptance separately. The completion evidence below
+still gates full goal acceptance and public-quality delivery.
+
 ## Completion evidence
 
 - The project owner approves one state matrix produced from a release build and
