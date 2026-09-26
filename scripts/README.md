@@ -63,15 +63,19 @@ uv run --project scripts scripts/mt.py capacity
 uv run --project scripts scripts/mt.py evaluation verify-manifest
 uv run --project scripts scripts/mt.py evaluation scaffold --evidence .scratch/goal-06/evaluation.json
 uv run --project scripts scripts/mt.py evaluation record --owner-input-dir <owner-local-dir> --evidence .scratch/goal-06/evaluation.json
+uv run --project scripts scripts/mt.py revision-evaluation verify-manifest
+uv run --project scripts scripts/mt.py revision-evaluation scaffold --evidence .scratch/goal-07-revision.json
+uv run --project scripts scripts/mt.py revision-evaluation record --owner-input-dir <owner-local-dir> --evidence .scratch/goal-07-revision.json
 uv run --project scripts scripts/mt.py accept goal-02 -- --help
 uv run --project scripts scripts/mt.py accept goal-03 -- --help
 uv run --project scripts scripts/mt.py accept goal-06 -- --help
+uv run --project scripts scripts/mt.py accept goal-07 -- --help
 ```
 
 `icons` regenerates the platform icon outputs. `fixtures` deterministically
 regenerates committed performance fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
-Cargo processes. The three `accept` commands drive real Windows UI workflows and
+Cargo processes. The `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence.
 
 `evaluation verify-manifest` verifies the immutable `goal-01-v1` corpus and
@@ -88,6 +92,100 @@ and contains only `artifact_id`, `decoded_completely`, sorted ID arrays for
 `boilerplate_question_count`, `question_count`, `materially_misleading`,
 `usefulness`, and `model_reported_id`. The evidence destination must remain
 outside the immutable `evaluation/goal-01/` corpus.
+
+`revision-evaluation verify-manifest` verifies the same immutable corpus for
+Goal 07. `revision-evaluation scaffold` writes a fail-closed v2 record without
+inventing owner values. `revision-evaluation record` consumes an external
+eligibility registry, a v2 machine receipt, a separately hash-bound native
+Goal 07 `PASS` receipt, and one metadata-only owner JSON per artifact. The
+machine receipt schema is `markturbo-goal-07-machine-receipt-v2`. Per case,
+`editable_source_sha256` and `editable_source_byte_count` are the SHA-256 and
+UTF-8 byte count of `proposal.source()`; `source_binding_sha256` is
+`binding.source_sha256()`; and `review_context_sha256` is
+`binding.review_context_digest()`. Machine facts also bind
+`corpus_artifact_sha256`, `corpus_artifact_lens`, the Rust-verified request
+artifact (`request_artifact_sha256` and byte count), and the serialized capture
+request (`review_scope_sha256`). Proposed edits are grouped by `ChangeId` and
+each group contains at least one hunk.
+The union of every machine `intent_change_ids` list must exactly match the
+registry annotation for that artifact; an evaluator receipt that cannot supply
+that mapping fails closed.
+Each composition decision file uses
+`markturbo-goal-07-owner-composition-v2`. Its binding fields can be copied
+mechanically from the matching machine receipt `cases[artifact_id]`:
+`proposal_sha256`, `editable_source_sha256`, `editable_source_byte_count`,
+`source_binding_sha256`, `source_revision`, `source_generation`,
+`artifact_lens_sha256`, `review_context_sha256`, and `answers_sha256`. Add the
+owner's `accepted` choices and the required, sorted, duplicate-free
+`intent_change_ids` arrays; the producer never infers those IDs.
+Single-file corpus artifacts bind the editable source to their sole manifest
+file; Agent Skill artifacts bind the editable `SKILL.md` entrypoint and the
+full request package digest to the fresh manifest.
+Each owner JSON file must contain `approved_output_sha256`,
+`approved_proposal_sha256`, `approved_decision_set_sha256`, and
+`approved_decision_file_sha256`. Copy them unchanged from the matching machine
+receipt case's `approved_output`: `result_sha256`, `proposal_sha256`,
+`decision_set_sha256`, and `decision_file_sha256`, respectively. For a
+`not_composed` approved output, all four owner fields are `null`.
+Owner decisions are per `ChangeId`, question coverage is
+explicit, and at least one eligible case must confirm
+`clearer_due_to_answered_question`. Exit status `0` means the explicit
+all-cases contract is satisfied, `1` means invalid or recorded-but-failed
+evidence, and `2` means required owner inputs are missing. Evidence remains
+content-free and must be written outside the immutable corpus.
+
+The `record` command also requires the corresponding `--approved-*-sha256`
+anchors for the registry, machine receipt and runner executable, plus
+`--native-evidence`, `--approved-native-evidence-sha256`, and
+`--approved-native-executable-sha256`. These anchors are supplied by the
+owner; the command never derives or guesses them.
+
+### End-to-end machine receipt and record
+
+The following PowerShell flow builds the offline evaluator, creates one
+machine receipt from every capture in a directory, computes the external
+anchors, and records the owner judgments. The capture JSON files are private
+owner-local inputs; the receipt and final evidence must remain outside
+`evaluation/goal-01/`.
+
+```powershell
+$runner = "target\release\markturbo-goal07-evaluate.exe"
+$captureDir = ".scratch\goal-07\captures"
+$decisionDir = ".scratch\goal-07\composition-decisions"
+$machineReceipt = ".scratch\goal-07\machine-receipt.json"
+$registry = ".scratch\goal-07\eligibility.json"
+$ownerDir = ".scratch\goal-07\owner-input"
+$nativeEvidence = ".scratch\goal-07\goal-07-native-acceptance-v1.json"
+$evidence = ".scratch\goal-07\revision-evaluation.json"
+
+cargo build --release --locked -p mt-app --bin markturbo-goal07-evaluate
+$runnerSha = (Get-FileHash $runner -Algorithm SHA256).Hash.ToLowerInvariant()
+$captureArgs = Get-ChildItem $captureDir -Filter *.json | Sort-Object Name | ForEach-Object {
+  "--input"; $_.FullName
+}
+$decisionArgs = Get-ChildItem $decisionDir -Filter *.json | Sort-Object Name | ForEach-Object {
+  "--decisions"; $_.FullName
+}
+& $runner @captureArgs @decisionArgs --receipt $machineReceipt --runner-sha256 $runnerSha
+if ($LASTEXITCODE -ne 0) { throw "machine receipt generation failed" }
+
+$machineSha = (Get-FileHash $machineReceipt -Algorithm SHA256).Hash.ToLowerInvariant()
+$registrySha = (uv run --project scripts python -c "import json,sys; from pathlib import Path; from scripts.markturbo_tools.revision_evaluation import canonical_registry_digest; print(canonical_registry_digest(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))))" $registry).Trim()
+$nativeEvidenceSha = (Get-FileHash $nativeEvidence -Algorithm SHA256).Hash.ToLowerInvariant()
+$nativeExecutableSha = (Get-FileHash "target\release\markturbo.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+
+uv run --project scripts scripts/mt.py revision-evaluation record `
+  --owner-input-dir $ownerDir `
+  --evidence $evidence `
+  --eligibility-registry $registry `
+  --approved-registry-sha256 $registrySha `
+  --machine-receipt $machineReceipt `
+  --approved-machine-receipt-sha256 $machineSha `
+  --approved-runner-executable-sha256 $runnerSha `
+  --native-evidence $nativeEvidence `
+  --approved-native-evidence-sha256 $nativeEvidenceSha `
+  --approved-native-executable-sha256 $nativeExecutableSha
+```
 
 `probe formula` measures the embedded KaTeX path by default. Pass `--font-dir`
 only when intentionally measuring a complete external development override.
@@ -192,6 +290,11 @@ uv run --project scripts scripts/mt.py accept goal-06 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
   --evidence .scratch/goal-06-native-acceptance-v1.json
+
+uv run --project scripts scripts/mt.py accept goal-07 -- \
+  --exe target/release/markturbo.exe \
+  --expect-exe-sha256 <sha256> \
+  --evidence .scratch/goal-07-native-acceptance-v1.json
 ```
 
 Delegated commands run from the repository root. Therefore paths supplied to
