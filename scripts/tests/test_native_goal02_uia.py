@@ -35,6 +35,7 @@ class FakeControl:
         self.value_pattern_missing = value_pattern_missing
         self.click_error = click_error
         self.click_count = 0
+        self.select_count = 0
         self.value_pattern_count = 0
 
     def _property(self, value: str) -> str:
@@ -151,6 +152,9 @@ class FakeUIAWrapper:
         self.control.click_count += 1
         if self.control.click_error is not None:
             raise self.control.click_error
+
+    def select(self) -> None:
+        self.control.select_count += 1
 
     @property
     def iface_value(self) -> FakeValuePattern:
@@ -330,6 +334,7 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
 
         win32 = object.__new__(runtime.Win32)
         win32.user32 = FakeUser32()
+        win32.send_inputs = lambda _inputs: None
 
         with self.assertRaises(HARNESS_BLOCKED) as raised:
             win32.require_foreground(123, timeout=0.0)
@@ -339,13 +344,85 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
             raised.exception.diagnostics,
             {
                 "requested_hwnd": 123,
-                "foreground_hwnd": 0,
+                "foreground_hwnd": 456,
                 "show_window_return": True,
                 "bring_to_top_return": False,
                 "set_foreground_return": False,
                 "foreground_attempts": 0,
             },
         )
+
+    def test_foreground_activation_retries_until_the_window_is_ready(self) -> None:
+        class FakeUser32:
+            def __init__(self) -> None:
+                self.foreground = 0
+                self.set_calls = 0
+
+            def ShowWindow(self, _hwnd, _command):
+                return 1
+
+            def BringWindowToTop(self, _hwnd):
+                return 1
+
+            def SetForegroundWindow(self, hwnd):
+                self.set_calls += 1
+                if self.set_calls == 2:
+                    self.foreground = hwnd
+                return self.foreground == hwnd
+
+            def GetForegroundWindow(self):
+                return self.foreground
+
+        user32 = FakeUser32()
+        win32 = object.__new__(runtime.Win32)
+        win32.user32 = user32
+        win32.send_inputs = lambda _inputs: None
+
+        win32.require_foreground(123, timeout=0.2)
+
+        self.assertEqual(user32.foreground, 123)
+        self.assertEqual(user32.set_calls, 2)
+
+    def test_foreground_activation_uses_one_alt_unlock_before_rechecking(self) -> None:
+        class FakeUser32:
+            def __init__(self) -> None:
+                self.foreground = 0
+                self.alt_sent = False
+
+            def ShowWindow(self, _hwnd, _command):
+                return 1
+
+            def BringWindowToTop(self, _hwnd):
+                return 1
+
+            def SetForegroundWindow(self, hwnd):
+                if self.alt_sent:
+                    self.foreground = hwnd
+                return self.foreground == hwnd
+
+            def GetForegroundWindow(self):
+                return self.foreground
+
+        user32 = FakeUser32()
+        sent: list[list[runtime.INPUT]] = []
+        win32 = object.__new__(runtime.Win32)
+        win32.user32 = user32
+
+        def send_inputs(inputs):
+            sent.append(inputs)
+            user32.alt_sent = True
+
+        win32.send_inputs = send_inputs
+
+        win32.require_foreground(123, timeout=0.0)
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual([item.ki.wVk for item in sent[0]], [runtime.VK_MENU, runtime.VK_MENU])
+        self.assertEqual(
+            [item.ki.dwFlags for item in sent[0]],
+            [0, runtime.KEYEVENTF_KEYUP],
+        )
+        self.assertEqual(user32.foreground, 123)
 
 
 class SelectorAndOrchestrationTests(unittest.TestCase):
@@ -354,6 +431,16 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(SOURCE_EDITOR_AUTOMATION_ID, "markturbo-document-source-editor")
         self.assertEqual(TAB_CLOSE_AUTOMATION_ID, "markturbo-document-tab-close")
         self.assertEqual(CONFLICT_OVERWRITE_AUTOMATION_ID, "markturbo-conflict-overwrite")
+
+    def test_source_layout_uses_the_tab_selection_contract(self) -> None:
+        source_layout = FakeControl(LAYOUT_SOURCE_AUTOMATION_ID, "TabItem")
+        editor = FakeControl(SOURCE_EDITOR_AUTOMATION_ID, "Edit")
+        harness = native_harness(FreshRootFactory([FakeRoot([source_layout, editor])]))
+
+        harness.activate_source_layout(running_app())
+
+        self.assertEqual(source_layout.select_count, 1)
+        self.assertEqual(source_layout.click_count, 0)
 
     def test_lifecycle_dialog_uses_owned_taskdialog_and_exact_raw_buttons(self) -> None:
         save = FakeControl("CommandButton_1", "Button", name="Save", class_name="CCPushButton")
@@ -918,8 +1005,89 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                 app = harness.launch_app(None, data, config, workspace, stderr)
 
         self.assertEqual(app.spec.args, (str(root / "markturbo.exe"),))
-        self.assertEqual(events[-1], ("foreground", 73, 3.5))
+        self.assertEqual(events[-1], ("foreground", 73, 2.0))
         self.assertEqual(popen.call_args.args[0], app.spec.args)
+
+    def test_launch_clicks_the_window_center_before_retrying_foreground(self) -> None:
+        events: list[tuple[object, ...]] = []
+        context = runtime.SecurityContext(1, 0x2000, "medium")
+
+        class FakeProcess:
+            pid = 91
+
+            def poll(self):
+                return None
+
+        class FakeBounds:
+            def width(self):
+                return 800
+
+            def height(self):
+                return 600
+
+        class FakeWindow:
+            handle = 73
+
+            def wait(self, state, timeout):
+                events.append(("wait", state, timeout))
+
+            def rectangle(self):
+                return FakeBounds()
+
+            def click_input(self, coords):
+                events.append(("click", coords))
+
+        class FakeApplication:
+            def __init__(self, backend):
+                events.append(("backend", backend))
+
+            def connect(self, process, timeout):
+                events.append(("connect", process, timeout))
+                return self
+
+            def top_window(self):
+                return FakeWindow()
+
+        class FakeWin32:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def security_context(self, pid):
+                return context
+
+            def require_foreground(self, hwnd, timeout):
+                self.calls += 1
+                events.append(("foreground", hwnd, timeout))
+                if self.calls == 1:
+                    raise runtime.HarnessBlocked("FOREGROUND_PERMISSION_DENIED")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            data = root / "data"
+            config = root / "config"
+            workspace = root / "workspace"
+            stderr = root / "stderr.log"
+            for directory in (data, config, workspace):
+                directory.mkdir()
+            process = FakeProcess()
+            harness = runtime.NativeHarness(
+                root / "markturbo.exe",
+                root,
+                3.5,
+                FakeWin32(),
+                FakeApplication,
+                object,
+                object,
+                object,
+                object,
+                context,
+            )
+            with mock.patch.object(runtime.subprocess, "Popen", return_value=process):
+                harness.launch_app(None, data, config, workspace, stderr)
+
+        self.assertIn(("foreground", 73, 2.0), events)
+        self.assertIn(("click", (400, 300)), events)
+        self.assertEqual(events[-1], ("foreground", 73, 3.5))
 
     def test_recovery_waits_for_success_log_not_record_existence(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

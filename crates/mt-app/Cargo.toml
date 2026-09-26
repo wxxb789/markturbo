@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "markturbo-gpui-shell"
 path = "src/bin/markturbo-gpui-shell.rs"
 
+[[bin]]
+name = "markturbo-goal07-evaluate"
+path = "src/bin/markturbo-goal07-evaluate.rs"
+
 [features]
 default = ["model-transport"]
 # Goal 04 measurement apparatus. The public build keeps this default; disabling

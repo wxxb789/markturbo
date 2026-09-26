@@ -456,6 +456,7 @@ impl fmt::Display for CredentialTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelOperation {
     Review,
+    Revision,
     Translation,
 }
 
@@ -614,6 +615,18 @@ impl OutboundScope {
         !matches!(
             self.details,
             OutboundScopeDetails::DocumentWithEffectiveAgentContext { .. }
+        )
+    }
+
+    /// Goal 07 Revision may disclose only a document, selection, or frozen
+    /// Agent Skill package. Blocks and Effective Agent Context are separate
+    /// flows and cannot inherit Revision consent.
+    pub const fn permits_revision(&self) -> bool {
+        matches!(
+            self.details,
+            OutboundScopeDetails::Selection { .. }
+                | OutboundScopeDetails::Document { .. }
+                | OutboundScopeDetails::AgentSkillPackage { .. }
         )
     }
 }
@@ -1163,6 +1176,23 @@ impl AgentSkillRequest {
         ModelRequestDisclosure::new(operation, endpoint, self.outbound_scope())
     }
 
+    /// Build a complete Revision disclosure for this exact frozen Agent Skill
+    /// inventory. The generic provider adapter below intentionally remains a
+    /// Review-only path; Revision transport has its own provider boundary.
+    pub fn revision_disclosure(
+        &self,
+        endpoint: EndpointIdentity,
+        binding: RevisionRequestBinding,
+        details: RevisionDisclosureDetails,
+    ) -> ModelRequestDisclosure {
+        ModelRequestDisclosure::revision_with_details(
+            endpoint,
+            self.outbound_scope(),
+            binding,
+            details,
+        )
+    }
+
     pub fn send_with<A>(
         &self,
         disclosure: &ModelRequestDisclosure,
@@ -1360,12 +1390,104 @@ impl fmt::Display for AgentSkillInventoryError {
 
 impl std::error::Error for AgentSkillInventoryError {}
 
+/// Immutable identity for one Revision request.
+///
+/// Every field comes from the reviewed source and the answers currently shown
+/// to the user. Keeping these values together prevents a caller from binding
+/// only the two model-context digests while silently changing the source or
+/// artifact lens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RevisionRequestBinding {
+    source_sha256: [u8; 32],
+    source_revision: u64,
+    source_generation: u64,
+    artifact_lens_digest: [u8; 32],
+    review_context_digest: [u8; 32],
+    answers_digest: [u8; 32],
+}
+
+impl RevisionRequestBinding {
+    pub const fn new(
+        source_sha256: [u8; 32],
+        source_revision: u64,
+        source_generation: u64,
+        artifact_lens_digest: [u8; 32],
+        review_context_digest: [u8; 32],
+        answers_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            source_sha256,
+            source_revision,
+            source_generation,
+            artifact_lens_digest,
+            review_context_digest,
+            answers_digest,
+        }
+    }
+
+    pub const fn source_sha256(&self) -> &[u8; 32] {
+        &self.source_sha256
+    }
+
+    pub const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    pub const fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    pub const fn artifact_lens_digest(&self) -> &[u8; 32] {
+        &self.artifact_lens_digest
+    }
+
+    pub const fn review_context_digest(&self) -> &[u8; 32] {
+        &self.review_context_digest
+    }
+
+    pub const fn answers_digest(&self) -> &[u8; 32] {
+        &self.answers_digest
+    }
+}
+
+/// Everything the user must inspect before one model request can be authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevisionDisclosureDetails {
+    review_context_bytes: u64,
+    answers_bytes: u64,
+    answer_count: u32,
+}
+
+impl RevisionDisclosureDetails {
+    pub const fn new(review_context_bytes: u64, answers_bytes: u64, answer_count: u32) -> Self {
+        Self {
+            review_context_bytes,
+            answers_bytes,
+            answer_count,
+        }
+    }
+
+    pub const fn review_context_bytes(self) -> u64 {
+        self.review_context_bytes
+    }
+
+    pub const fn answers_bytes(self) -> u64 {
+        self.answers_bytes
+    }
+
+    pub const fn answer_count(self) -> u32 {
+        self.answer_count
+    }
+}
+
 /// Everything the user must inspect before one model request can be authorized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequestDisclosure {
     operation: ModelOperation,
     endpoint: EndpointIdentity,
     scope: OutboundScope,
+    revision_binding: Option<RevisionRequestBinding>,
+    revision_details: Option<RevisionDisclosureDetails>,
 }
 
 impl ModelRequestDisclosure {
@@ -1378,19 +1500,58 @@ impl ModelRequestDisclosure {
             operation,
             endpoint,
             scope,
+            revision_binding: None,
+            revision_details: None,
         }
     }
 
-    /// Fallible constructor for new Review callers. The compatibility
-    /// constructor above remains available to existing Goal 05A code, while
-    /// this API makes the Goal 06 prohibition explicit at the call site.
+    /// Create an incomplete Revision disclosure.
+    ///
+    /// This compatibility constructor deliberately omits the displayed Review
+    /// context and answer sizes. Such a disclosure is never authorizable;
+    /// callers must use [`Self::revision_with_details`] for a real request.
+    pub fn revision(
+        endpoint: EndpointIdentity,
+        scope: OutboundScope,
+        binding: RevisionRequestBinding,
+    ) -> Self {
+        Self {
+            operation: ModelOperation::Revision,
+            endpoint,
+            scope,
+            revision_binding: Some(binding),
+            revision_details: None,
+        }
+    }
+
+    pub fn revision_with_details(
+        endpoint: EndpointIdentity,
+        scope: OutboundScope,
+        binding: RevisionRequestBinding,
+        details: RevisionDisclosureDetails,
+    ) -> Self {
+        Self {
+            operation: ModelOperation::Revision,
+            endpoint,
+            scope,
+            revision_binding: Some(binding),
+            revision_details: Some(details),
+        }
+    }
+
+    /// Fallible constructor for Review and Translation callers. Revision must
+    /// use [`Self::revision_with_details`] because consent requires its
+    /// complete typed binding and disclosure details.
     pub fn try_new(
         operation: ModelOperation,
         endpoint: EndpointIdentity,
         scope: OutboundScope,
     ) -> Result<Self, ModelRequestDisclosureError> {
-        if operation == ModelOperation::Review && !scope.permits_review() {
-            return Err(ModelRequestDisclosureError::ReviewEffectiveAgentContext);
+        if let Some(error) = Self::validation_error(operation, &scope) {
+            return Err(error);
+        }
+        if operation == ModelOperation::Revision {
+            return Err(ModelRequestDisclosureError::RevisionMissingDigests);
         }
         Ok(Self::new(operation, endpoint, scope))
     }
@@ -1407,9 +1568,46 @@ impl ModelRequestDisclosure {
         &self.scope
     }
 
+    pub fn revision_binding(&self) -> Option<&RevisionRequestBinding> {
+        self.revision_binding.as_ref()
+    }
+
+    pub const fn revision_details(&self) -> Option<RevisionDisclosureDetails> {
+        self.revision_details
+    }
+
+    pub fn review_context_digest(&self) -> Option<&[u8; 32]> {
+        self.revision_binding
+            .as_ref()
+            .map(RevisionRequestBinding::review_context_digest)
+    }
+
+    pub fn answers_digest(&self) -> Option<&[u8; 32]> {
+        self.revision_binding
+            .as_ref()
+            .map(RevisionRequestBinding::answers_digest)
+    }
+
     pub const fn is_review_scope_allowed(&self) -> bool {
         match self.operation {
             ModelOperation::Review => self.scope.permits_review(),
+            ModelOperation::Revision => false,
+            ModelOperation::Translation => true,
+        }
+    }
+
+    pub const fn is_revision_scope_allowed(&self) -> bool {
+        matches!(self.operation, ModelOperation::Revision)
+            && self.scope.permits_revision()
+            && self.scope.permits_review()
+            && self.revision_binding.is_some()
+            && self.revision_details.is_some()
+    }
+
+    pub const fn is_scope_allowed(&self) -> bool {
+        match self.operation {
+            ModelOperation::Review => self.scope.permits_review(),
+            ModelOperation::Revision => self.is_revision_scope_allowed(),
             ModelOperation::Translation => true,
         }
     }
@@ -1427,6 +1625,47 @@ impl ModelRequestDisclosure {
             operation: self.operation,
             endpoint: self.endpoint.clone(),
             scope: self.scope.binding.clone(),
+            revision_binding: self.revision_binding,
+            revision_details: self.revision_details,
+        }
+    }
+
+    fn validation_error(
+        operation: ModelOperation,
+        scope: &OutboundScope,
+    ) -> Option<ModelRequestDisclosureError> {
+        match operation {
+            ModelOperation::Review if !scope.permits_review() => {
+                Some(ModelRequestDisclosureError::ReviewEffectiveAgentContext)
+            }
+            ModelOperation::Revision if !scope.permits_review() => {
+                Some(ModelRequestDisclosureError::RevisionEffectiveAgentContext)
+            }
+            ModelOperation::Revision if !scope.permits_revision() => {
+                Some(ModelRequestDisclosureError::RevisionScopeNotAllowed)
+            }
+            ModelOperation::Translation | ModelOperation::Review | ModelOperation::Revision => None,
+        }
+    }
+
+    fn rejection_error(&self) -> Option<ModelRequestDisclosureError> {
+        match self.operation {
+            ModelOperation::Review if !self.scope.permits_review() => {
+                Some(ModelRequestDisclosureError::ReviewEffectiveAgentContext)
+            }
+            ModelOperation::Revision if !self.scope.permits_review() => {
+                Some(ModelRequestDisclosureError::RevisionEffectiveAgentContext)
+            }
+            ModelOperation::Revision if !self.scope.permits_revision() => {
+                Some(ModelRequestDisclosureError::RevisionScopeNotAllowed)
+            }
+            ModelOperation::Revision if self.revision_binding.is_none() => {
+                Some(ModelRequestDisclosureError::RevisionMissingDigests)
+            }
+            ModelOperation::Revision if self.revision_details.is_none() => {
+                Some(ModelRequestDisclosureError::RevisionMissingDetails)
+            }
+            ModelOperation::Review | ModelOperation::Revision | ModelOperation::Translation => None,
         }
     }
 }
@@ -1434,6 +1673,10 @@ impl ModelRequestDisclosure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelRequestDisclosureError {
     ReviewEffectiveAgentContext,
+    RevisionEffectiveAgentContext,
+    RevisionScopeNotAllowed,
+    RevisionMissingDigests,
+    RevisionMissingDetails,
 }
 
 impl fmt::Display for ModelRequestDisclosureError {
@@ -1441,6 +1684,17 @@ impl fmt::Display for ModelRequestDisclosureError {
         match self {
             Self::ReviewEffectiveAgentContext => formatter.write_str(
                 "Review cannot resolve or include Effective Agent Context before Goal 08",
+            ),
+            Self::RevisionEffectiveAgentContext => formatter.write_str(
+                "Revision cannot resolve or include Effective Agent Context before Goal 08",
+            ),
+            Self::RevisionScopeNotAllowed => formatter.write_str(
+                "Revision scope must be a document, selection, or frozen Agent Skill package",
+            ),
+            Self::RevisionMissingDigests => formatter
+                .write_str("Revision consent requires a complete source and Review binding"),
+            Self::RevisionMissingDetails => formatter.write_str(
+                "Revision consent requires displayed Review context and answer disclosure details",
             ),
         }
     }
@@ -1459,6 +1713,8 @@ struct RequestBinding {
     operation: ModelOperation,
     endpoint: EndpointIdentity,
     scope: ScopeBinding,
+    revision_binding: Option<RevisionRequestBinding>,
+    revision_details: Option<RevisionDisclosureDetails>,
 }
 
 impl RequestBinding {
@@ -1466,11 +1722,13 @@ impl RequestBinding {
         self.operation == request.operation
             && self.endpoint == request.endpoint
             && self.scope == request.scope.binding
+            && self.revision_binding == request.revision_binding
+            && self.revision_details == request.revision_details
     }
 }
 
 enum ConsentState {
-    Pending(RequestBinding),
+    Pending(Box<RequestBinding>),
     Cancelled,
     Rejected(ModelRequestDisclosureError),
     Consumed,
@@ -1483,11 +1741,11 @@ pub struct ConsentCapability {
 
 impl ConsentCapability {
     pub fn from_decision(disclosure: &ModelRequestDisclosure, decision: ConsentDecision) -> Self {
-        let state = if !disclosure.is_review_scope_allowed() {
-            ConsentState::Rejected(ModelRequestDisclosureError::ReviewEffectiveAgentContext)
+        let state = if let Some(error) = disclosure.rejection_error() {
+            ConsentState::Rejected(error)
         } else {
             match decision {
-                ConsentDecision::Approve => ConsentState::Pending(disclosure.binding()),
+                ConsentDecision::Approve => ConsentState::Pending(Box::new(disclosure.binding())),
                 ConsentDecision::Cancel => ConsentState::Cancelled,
             }
         };
@@ -1501,7 +1759,7 @@ impl ConsentCapability {
     ) -> Result<RequestAuthorization, ConsentError> {
         match std::mem::replace(&mut self.state, ConsentState::Consumed) {
             ConsentState::Pending(binding) if binding.matches(request) => {
-                Ok(RequestAuthorization { binding })
+                Ok(RequestAuthorization { binding: *binding })
             }
             ConsentState::Pending(_) => Err(ConsentError::Mismatch),
             ConsentState::Cancelled => Err(ConsentError::Cancelled),
@@ -1574,6 +1832,27 @@ mod tests {
 
     fn endpoint(provider: Provider, raw: &str) -> EndpointIdentity {
         EndpointIdentity::parse(provider, Some(raw)).unwrap()
+    }
+
+    fn revision_disclosure(
+        endpoint: EndpointIdentity,
+        source_scope: OutboundScope,
+        review_context_digest: [u8; 32],
+        answers_digest: [u8; 32],
+    ) -> ModelRequestDisclosure {
+        ModelRequestDisclosure::revision_with_details(
+            endpoint,
+            source_scope,
+            RevisionRequestBinding::new(
+                [9; 32],
+                7,
+                11,
+                [8; 32],
+                review_context_digest,
+                answers_digest,
+            ),
+            RevisionDisclosureDetails::new(128, 64, 2),
+        )
     }
 
     #[test]
@@ -2295,5 +2574,347 @@ mod tests {
         let mut translation_consent =
             ConsentCapability::from_decision(&translation, ConsentDecision::Approve);
         assert!(translation_consent.authorize(&translation).is_ok());
+    }
+
+    #[test]
+    fn review_consent_cannot_authorize_revision() {
+        let endpoint = endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/");
+        let source_scope = OutboundScope::document(128);
+        let review = ModelRequestDisclosure::new(
+            ModelOperation::Review,
+            endpoint.clone(),
+            source_scope.clone(),
+        );
+        let revision = revision_disclosure(endpoint, source_scope, [1; 32], [2; 32]);
+
+        let mut consent = ConsentCapability::from_decision(&review, ConsentDecision::Approve);
+        assert!(matches!(
+            consent.authorize(&revision),
+            Err(ConsentError::Mismatch)
+        ));
+        assert!(matches!(
+            consent.authorize(&review),
+            Err(ConsentError::Consumed)
+        ));
+    }
+
+    #[test]
+    fn revision_consent_is_fresh_and_one_shot() {
+        let base_endpoint = endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/");
+        let revision = revision_disclosure(
+            base_endpoint,
+            OutboundScope::document(128),
+            [1; 32],
+            [2; 32],
+        );
+
+        let mut consent = ConsentCapability::from_decision(&revision, ConsentDecision::Approve);
+        assert!(consent.authorize(&revision).is_ok());
+        assert!(matches!(
+            consent.authorize(&revision),
+            Err(ConsentError::Consumed)
+        ));
+
+        let selection = revision_disclosure(
+            endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/"),
+            OutboundScope::selection(128),
+            [1; 32],
+            [2; 32],
+        );
+        let mut selection_consent =
+            ConsentCapability::from_decision(&selection, ConsentDecision::Approve);
+        assert!(selection_consent.authorize(&selection).is_ok());
+    }
+
+    #[test]
+    fn revision_without_complete_binding_is_rejected() {
+        let disclosure = ModelRequestDisclosure::new(
+            ModelOperation::Revision,
+            endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/"),
+            OutboundScope::document(128),
+        );
+
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Rejected(
+                ModelRequestDisclosureError::RevisionMissingDigests
+            ))
+        ));
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Consumed)
+        ));
+    }
+
+    #[test]
+    fn revision_without_disclosure_details_is_rejected() {
+        let disclosure = ModelRequestDisclosure::revision(
+            endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/"),
+            OutboundScope::document(128),
+            RevisionRequestBinding::new([1; 32], 7, 11, [2; 32], [3; 32], [4; 32]),
+        );
+
+        assert!(!disclosure.is_revision_scope_allowed());
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Rejected(
+                ModelRequestDisclosureError::RevisionMissingDetails
+            ))
+        ));
+        assert!(matches!(
+            consent.authorize(&disclosure),
+            Err(ConsentError::Consumed)
+        ));
+    }
+
+    #[test]
+    fn revision_consent_rejects_endpoint_scope_and_digest_changes() {
+        let base_endpoint = endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/");
+        let source_scope = OutboundScope::document(128);
+        let expected = revision_disclosure(
+            base_endpoint.clone(),
+            source_scope.clone(),
+            [1; 32],
+            [2; 32],
+        );
+        let mismatches = [
+            revision_disclosure(
+                endpoint(Provider::OpenAiResponses, "https://proxy.example/v1/"),
+                source_scope.clone(),
+                [1; 32],
+                [2; 32],
+            ),
+            revision_disclosure(
+                base_endpoint.clone(),
+                OutboundScope::selection(128),
+                [1; 32],
+                [2; 32],
+            ),
+            revision_disclosure(
+                base_endpoint.clone(),
+                source_scope.clone(),
+                [3; 32],
+                [2; 32],
+            ),
+            revision_disclosure(base_endpoint, source_scope, [1; 32], [4; 32]),
+        ];
+
+        for mismatch in mismatches {
+            let mut consent = ConsentCapability::from_decision(&expected, ConsentDecision::Approve);
+            assert!(matches!(
+                consent.authorize(&mismatch),
+                Err(ConsentError::Mismatch)
+            ));
+            assert!(matches!(
+                consent.authorize(&expected),
+                Err(ConsentError::Consumed)
+            ));
+        }
+    }
+
+    #[test]
+    fn revision_consent_rejects_source_snapshot_and_lens_binding_changes() {
+        let endpoint = endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/");
+        let scope = OutboundScope::document(128);
+        let expected_binding =
+            RevisionRequestBinding::new([1; 32], 7, 11, [4; 32], [2; 32], [3; 32]);
+        let details = RevisionDisclosureDetails::new(128, 64, 2);
+        let expected = ModelRequestDisclosure::revision_with_details(
+            endpoint.clone(),
+            scope.clone(),
+            expected_binding,
+            details,
+        );
+        let mismatches = [
+            RevisionRequestBinding::new([9; 32], 7, 11, [4; 32], [2; 32], [3; 32]),
+            RevisionRequestBinding::new([1; 32], 8, 11, [4; 32], [2; 32], [3; 32]),
+            RevisionRequestBinding::new([1; 32], 7, 12, [4; 32], [2; 32], [3; 32]),
+            RevisionRequestBinding::new([1; 32], 7, 11, [5; 32], [2; 32], [3; 32]),
+            RevisionRequestBinding::new([1; 32], 7, 11, [4; 32], [6; 32], [3; 32]),
+            RevisionRequestBinding::new([1; 32], 7, 11, [4; 32], [2; 32], [7; 32]),
+        ];
+
+        for binding in mismatches {
+            let changed = ModelRequestDisclosure::revision_with_details(
+                endpoint.clone(),
+                scope.clone(),
+                binding,
+                details,
+            );
+            let mut consent = ConsentCapability::from_decision(&expected, ConsentDecision::Approve);
+            assert!(matches!(
+                consent.authorize(&changed),
+                Err(ConsentError::Mismatch)
+            ));
+            assert!(matches!(
+                consent.authorize(&expected),
+                Err(ConsentError::Consumed)
+            ));
+        }
+    }
+
+    #[test]
+    fn revision_consent_rejects_block_scope() {
+        let endpoint = endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/");
+        let revision = revision_disclosure(
+            endpoint.clone(),
+            OutboundScope::block(128),
+            [1; 32],
+            [2; 32],
+        );
+        assert_eq!(
+            ModelRequestDisclosure::try_new(
+                ModelOperation::Revision,
+                endpoint,
+                OutboundScope::block(128),
+            ),
+            Err(ModelRequestDisclosureError::RevisionScopeNotAllowed)
+        );
+
+        let mut consent = ConsentCapability::from_decision(&revision, ConsentDecision::Approve);
+        assert!(matches!(
+            consent.authorize(&revision),
+            Err(ConsentError::Rejected(
+                ModelRequestDisclosureError::RevisionScopeNotAllowed
+            ))
+        ));
+        assert!(matches!(
+            consent.authorize(&revision),
+            Err(ConsentError::Consumed)
+        ));
+    }
+
+    #[test]
+    fn revision_consent_cannot_expand_to_effective_agent_context() {
+        let endpoint = endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/");
+        let scope =
+            OutboundScope::document_with_effective_agent_context(128, ["workspace/AGENTS.md"])
+                .unwrap();
+        let revision = revision_disclosure(endpoint, scope, [1; 32], [2; 32]);
+
+        assert!(
+            !revision.is_revision_scope_allowed(),
+            "Effective Agent Context must never be a Revision scope"
+        );
+        let mut consent = ConsentCapability::from_decision(&revision, ConsentDecision::Approve);
+        assert!(matches!(
+            consent.authorize(&revision),
+            Err(ConsentError::Rejected(
+                ModelRequestDisclosureError::RevisionEffectiveAgentContext
+            ))
+        ));
+        assert!(matches!(
+            consent.authorize(&revision),
+            Err(ConsentError::Consumed)
+        ));
+    }
+
+    #[test]
+    fn revision_consent_does_not_mutate_model_settings_or_credential_identity() {
+        let mut settings = crate::settings::AppSettings::default();
+        settings.model_provider = Provider::OpenAiResponses.key().to_owned();
+        settings.model_name = "revision-test-model".to_owned();
+        settings.model_base_url = "https://proxy.example/v1/".to_owned();
+        let settings_before = settings.clone();
+        let config = ModelConfig::new(
+            Provider::OpenAiResponses,
+            Some(settings.model_name.as_str()),
+            Some(settings.model_base_url.as_str()),
+        )
+        .unwrap();
+        let config_before = config.clone();
+        let endpoint = config.endpoint().clone();
+        let credential_target_before = endpoint.credential_target();
+        let revision =
+            revision_disclosure(endpoint, OutboundScope::document(128), [1; 32], [2; 32]);
+
+        let mut consent = ConsentCapability::from_decision(&revision, ConsentDecision::Approve);
+        let authorization = consent.authorize(&revision).unwrap();
+        assert!(authorization.matches(&revision));
+        assert_eq!(settings, settings_before);
+        assert_eq!(config, config_before);
+        assert_eq!(
+            config.endpoint().credential_target(),
+            credential_target_before
+        );
+    }
+
+    #[test]
+    fn agent_skill_revision_requires_the_frozen_inventory_scope() {
+        struct RecordingProviderAdapter {
+            endpoint: EndpointIdentity,
+            send_count: usize,
+        }
+
+        impl AgentSkillProviderAdapter for RecordingProviderAdapter {
+            type Error = std::convert::Infallible;
+
+            fn endpoint(&self) -> &EndpointIdentity {
+                &self.endpoint
+            }
+
+            fn send(&mut self, _request: AgentSkillProviderRequest<'_>) -> Result<(), Self::Error> {
+                self.send_count += 1;
+                Ok(())
+            }
+        }
+
+        let request = AgentSkillRequest::new(
+            vec![
+                AgentSkillRequestEntry::new(
+                    "SKILL.md",
+                    "entrypoint",
+                    b"frozen skill source".to_vec(),
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let endpoint = endpoint(Provider::OpenAiResponses, "https://api.openai.com/v1/");
+        let generic_revision = request.disclosure(ModelOperation::Revision, endpoint.clone());
+        let mut generic_consent =
+            ConsentCapability::from_decision(&generic_revision, ConsentDecision::Approve);
+        assert!(matches!(
+            generic_consent.authorize(&generic_revision),
+            Err(ConsentError::Rejected(
+                ModelRequestDisclosureError::RevisionMissingDigests
+            ))
+        ));
+        let binding = RevisionRequestBinding::new([3; 32], 7, 11, [4; 32], [1; 32], [2; 32]);
+        let inventory_scope = request.outbound_scope();
+        let details = RevisionDisclosureDetails::new(0, 0, 0);
+        let inventory_disclosure = request.revision_disclosure(endpoint.clone(), binding, details);
+        assert_eq!(inventory_disclosure.scope(), &inventory_scope);
+        assert_eq!(inventory_disclosure.revision_details(), Some(details));
+        let mut consent =
+            ConsentCapability::from_decision(&inventory_disclosure, ConsentDecision::Approve);
+        let authorization = consent.authorize(&inventory_disclosure).unwrap();
+        let mut adapter = RecordingProviderAdapter {
+            endpoint: endpoint.clone(),
+            send_count: 0,
+        };
+        assert_eq!(
+            request.send_with(&inventory_disclosure, authorization, &mut adapter),
+            Err(AgentSkillSendError::AuthorizationMismatch)
+        );
+        assert_eq!(adapter.send_count, 0);
+
+        let broad_disclosure = ModelRequestDisclosure::revision_with_details(
+            endpoint,
+            OutboundScope::document(request.inventory().total_byte_size()),
+            binding,
+            RevisionDisclosureDetails::new(0, 0, 0),
+        );
+        let mut broad_consent =
+            ConsentCapability::from_decision(&broad_disclosure, ConsentDecision::Approve);
+        let broad_authorization = broad_consent.authorize(&broad_disclosure).unwrap();
+        assert_eq!(
+            request.send_with(&broad_disclosure, broad_authorization, &mut adapter),
+            Err(AgentSkillSendError::AuthorizationMismatch)
+        );
+        assert_eq!(adapter.send_count, 0);
     }
 }

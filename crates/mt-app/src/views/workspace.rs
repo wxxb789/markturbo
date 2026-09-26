@@ -11,7 +11,7 @@
 //! their methods to `Workspace` from there, so `self.web_dirty(cx)` reads the
 //! same here as it did before the split.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self as std_fs, File};
 use std::io::Read;
@@ -28,6 +28,7 @@ use gpui_kit::component::{
     StyledExt as _, TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
+    input::{Input, InputEvent, InputState},
     list::ListItem,
     menu::ContextMenuExt as _,
     spinner::Spinner,
@@ -39,12 +40,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mt_doc::review::{
     ArtifactLens, ByteRange, ClarificationPriority, FindingKind, MAX_SKILL_FILE_BYTES,
-    MAX_SKILL_PACKAGE_BYTES, ReviewDiagnostic, ReviewDiagnosticCode,
+    MAX_SKILL_PACKAGE_BYTES, ReviewDiagnostic, ReviewDiagnosticCode, ReviewModelOutput,
     ReviewRequest as DocumentReviewRequest, ReviewStatus, SkillPackage, SkillPackageError,
     SkillPackageFile, SkillPackageOmission, SourceAnchor, SourceLocation, SourceSnapshot,
     StructuredText,
 };
+use mt_doc::revision::ChangeId;
 use mt_doc::translate::{Scope, TranslationRequest};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::fs;
@@ -54,17 +57,18 @@ use crate::lifecycle::{
     DocumentLifecycle,
 };
 use crate::metrics;
-use crate::model::{ConsentCapability, ConsentDecision};
+use crate::model::{ConsentCapability, ConsentDecision, RevisionRequestBinding};
 use crate::recovery::{
     CancellableRecoveryCheckpointAttempt, CheckpointAttemptTiming, CheckpointBatchOutcome,
     CheckpointSchedule, RecoveredRecord, RecoveryError, RecoveryKey, RecoveryMaintenance,
     RecoveryRetirement, RecoveryRetirementBatch, RecoveryStore, RecoveryToken,
-    RetirementCompletion,
+    RetirementCompletion, RevisionRecovery,
 };
 use crate::renderer::RendererRegistry;
 use crate::review::{
     PreparedReview, REVIEW_REQUEST_TIMEOUT, ReviewError, ReviewLanguage, ReviewRequestError,
-    ReviewTransportResult,
+    ReviewTransportResult, RevisionAnswer, RevisionAnswers, RevisionError,
+    RevisionQuestionCoverageStatus, RevisionTransportResult,
 };
 use crate::startup::{AcknowledgeStartupInput, InitialStartupState, StartupEvent};
 use crate::translate::PreparedTranslation;
@@ -131,6 +135,22 @@ const WELCOME_DONT_SHOW_ACCESSIBILITY_ID: &str = "markturbo-welcome-dont-show-ag
 const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";
 const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";
 const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";
+const REVISION_RUN_ACCESSIBILITY_ID: &str = "markturbo-revision-run";
+const REVISION_RETRY_ACCESSIBILITY_ID: &str = "markturbo-revision-retry";
+const REVISION_DISMISS_ACCESSIBILITY_ID: &str = "markturbo-revision-dismiss";
+const REVISION_ACCEPT_ALL_ACCESSIBILITY_ID: &str = "markturbo-revision-accept-all";
+const REVISION_REJECT_ALL_ACCESSIBILITY_ID: &str = "markturbo-revision-reject-all";
+const REVISION_APPLY_ACCESSIBILITY_ID: &str = "markturbo-revision-apply";
+const REVISION_COPY_ACCESSIBILITY_ID: &str = "markturbo-revision-copy";
+const REVISION_SAVE_ACCESSIBILITY_ID: &str = "markturbo-revision-save";
+const REVISION_SAVE_AS_ACCESSIBILITY_ID: &str = "markturbo-revision-save-as";
+const REVISION_STALE_ACCESSIBILITY_ID: &str = "markturbo-revision-stale";
+const REVISION_RESULT_DISMISS_ACCESSIBILITY_ID: &str = "markturbo-revision-result-dismiss";
+const REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str = "markturbo-revision-recovered-answers";
+const REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
+    "markturbo-revision-copy-recovered-answers";
+const REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
+    "markturbo-revision-discard-recovered-answers";
 const WELCOME_KEY_CONTEXT: &str = "Welcome";
 
 fn should_show_welcome(initial: Option<&Path>, show_welcome_on_startup: bool) -> bool {
@@ -857,6 +877,14 @@ pub struct Workspace {
     recovery_retirement_batches: HashMap<RecoveryKey, RecoveryRetirementBatch>,
     recovery_retirement_retries: HashSet<RecoveryKey>,
     recovery_schedules: HashMap<crate::lifecycle::DocumentId, DocumentRecoveryState>,
+    /// Content identities paused until retirement resolves, scoped to a
+    /// document incarnation so reopening the same path is not suppressed.
+    recovery_retirement_suppressions:
+        HashMap<RecoveryKey, HashMap<DocumentId, RecoveryContentIdentity>>,
+    /// Exact source plus Revision binding used by the current recovery state.
+    /// This is separate from the editor revision because answers can change
+    /// while the document bytes stay untouched.
+    recovery_content_identities: HashMap<crate::lifecycle::DocumentId, RecoveryContentIdentity>,
     /// True while the one physical checkpoint batch owned by this workspace is running.
     recovery_checkpoint_worker_active: bool,
     recovery_warning: Option<String>,
@@ -928,6 +956,26 @@ pub struct Workspace {
     pending_review: Option<PendingReview>,
     review_generation: u64,
     review_panel_open: bool,
+    /// Frozen Review context and the user's answer drafts for Goal 07. The
+    /// request and output remain bound to the exact Review source snapshot so
+    /// retry cannot silently apply answers to another document revision.
+    revision_context: Option<WorkspaceRevisionContext>,
+    /// The validated Revision proposal currently shown in the panel.
+    revision_result: Option<WorkspaceRevisionResult>,
+    revision_diagnostic: Option<String>,
+    revision_running: bool,
+    revision_generation: u64,
+    pending_revision: Option<PendingRevision>,
+    revision_answer_subscriptions: Vec<Subscription>,
+    /// Recovery may restore answers before the corresponding Review result is
+    /// available. Keep only typed bindings/answers until each result lands.
+    recovered_revision_records: HashMap<RecoveryKey, RevisionRecovery>,
+    /// Preserve the recovery key that owns a document's answer-only state when
+    /// Save As changes the document's current source key.
+    recovered_revision_documents: HashMap<DocumentId, RecoveryKey>,
+    /// Answer records hidden only after durable retirement starts; a failed
+    /// completion restores them before the error is surfaced.
+    pending_revision_recoveries: HashMap<RecoveryKey, (DocumentId, RevisionRecovery)>,
     /// Present while Save / Discard / Cancel is resolving a destructive action.
     pending_destructive: Option<DestructiveRequest>,
     /// True after close is authorized and while the focused platform input
@@ -986,6 +1034,72 @@ struct WorkspaceReviewResult {
     skill_package: Option<FrozenSkillPackage>,
     supporting_sources_current: bool,
     result: ReviewTransportResult,
+}
+
+/// The immutable inputs needed to retry a Goal 07 Revision request. Input
+/// entities are UI state only; the provider boundary receives the typed
+/// `RevisionAnswers` rebuilt from `answer_states` at Run time.
+struct WorkspaceRevisionContext {
+    document_id: DocumentId,
+    source_snapshot: crate::lifecycle::AsyncSnapshot,
+    request: DocumentReviewRequest,
+    review_output: ReviewModelOutput,
+    skill_package: Option<FrozenSkillPackage>,
+    supporting_sources_current: bool,
+    applied: bool,
+    /// Identity of the exact approved preview that was applied. A boolean
+    /// alone is insufficient because the user may change decisions afterward.
+    applied_preview: Option<String>,
+    applied_decisions: Option<Vec<(ChangeId, bool)>>,
+    /// Copy/export resolves answer recovery without pretending the document
+    /// source was applied or saved.
+    answers_exported: bool,
+    answer_states: Vec<RevisionAnswer>,
+    answer_inputs: Vec<Entity<InputState>>,
+}
+
+/// UI-owned metadata around one validated Revision provider result.
+struct WorkspaceRevisionResult {
+    document_id: DocumentId,
+    source_snapshot: crate::lifecycle::AsyncSnapshot,
+    result: RevisionTransportResult,
+    decisions: Vec<(ChangeId, bool)>,
+    preview: String,
+}
+
+/// Immutable identity of one in-flight Revision. Like Review cancellation,
+/// this is bound to the originating document rather than the active tab.
+struct PendingRevision {
+    cancelled: Arc<AtomicBool>,
+    document_id: DocumentId,
+}
+
+#[derive(Serialize)]
+struct WorkspaceRevisionAnswerRecord {
+    question_index: usize,
+    question_id: String,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceRevisionRecoveryExport {
+    source_sha256: String,
+    source_revision: u64,
+    source_generation: u64,
+    artifact_lens_sha256: String,
+    review_context_sha256: String,
+    answers_sha256: String,
+    answers: Vec<WorkspaceRevisionExportAnswer>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceRevisionExportAnswer {
+    question_index: usize,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer: Option<String>,
 }
 
 /// UI ownership for a Review diagnostic. It is intentionally separate from a
@@ -1119,6 +1233,134 @@ fn skill_editor_offset(source: &str, raw_offset: usize) -> Option<usize> {
 enum ReviewTarget {
     Document,
     Selection,
+}
+
+fn revision_change_ids(proposal: &mt_doc::revision::RevisionProposal) -> Vec<ChangeId> {
+    proposal
+        .hunks()
+        .iter()
+        .map(|hunk| hunk.change_id())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn revision_answer_is_incorporated(
+    answer: &RevisionAnswer,
+    coverage: Option<&RevisionQuestionCoverageStatus>,
+    decisions: &[(ChangeId, bool)],
+) -> bool {
+    match answer {
+        RevisionAnswer::Unanswered => true,
+        RevisionAnswer::IntentionallyUnspecified => matches!(
+            coverage,
+            Some(RevisionQuestionCoverageStatus::IntentionallyOmitted { .. })
+        ),
+        RevisionAnswer::Answered(_) => {
+            let Some(RevisionQuestionCoverageStatus::Represented { change_ids }) = coverage else {
+                return false;
+            };
+            !change_ids.is_empty()
+                && change_ids.iter().all(|change_id| {
+                    decisions
+                        .iter()
+                        .find(|(candidate, _)| candidate == change_id)
+                        .is_some_and(|(_, accepted)| *accepted)
+                })
+        }
+    }
+}
+
+fn revision_apply_identity_matches(
+    applied_preview: Option<&str>,
+    applied_decisions: Option<&[(ChangeId, bool)]>,
+    current_preview: &str,
+    current_decisions: &[(ChangeId, bool)],
+) -> bool {
+    applied_preview == Some(current_preview) && applied_decisions == Some(current_decisions)
+}
+
+fn revision_question_accessibility_id(
+    index: usize,
+    question: &mt_doc::review::ClarificationQuestion,
+) -> String {
+    format!(
+        "markturbo-revision-question-{}",
+        revision_question_binding_id(index, question)
+    )
+}
+
+fn revision_question_binding_id(
+    index: usize,
+    question: &mt_doc::review::ClarificationQuestion,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"markturbo-revision-question-v1\0");
+    digest.update((index as u64).to_be_bytes());
+    digest.update(question.question.as_str().as_bytes());
+    digest.update([match question.priority {
+        ClarificationPriority::Critical => 0,
+        ClarificationPriority::High => 1,
+        ClarificationPriority::Medium => 2,
+        ClarificationPriority::Low => 3,
+    }]);
+    if let Some(impact) = &question.impact {
+        digest.update([1]);
+        digest.update(impact.as_str().as_bytes());
+    } else {
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn build_revision_recovery(
+    request: &DocumentReviewRequest,
+    review_output: &ReviewModelOutput,
+    answer_states: &[RevisionAnswer],
+) -> Option<RevisionRecovery> {
+    let answers = RevisionAnswers::for_recovery(answer_states.to_vec()).ok()?;
+    let answer_records = review_output
+        .clarification_questions
+        .iter()
+        .enumerate()
+        .zip(answer_states.iter())
+        .map(
+            |((question_index, question), answer)| WorkspaceRevisionAnswerRecord {
+                question_index,
+                question_id: revision_question_binding_id(question_index, question),
+                state: match answer {
+                    RevisionAnswer::Unanswered => "unanswered".to_owned(),
+                    RevisionAnswer::IntentionallyUnspecified => {
+                        "intentionally_unspecified".to_owned()
+                    }
+                    RevisionAnswer::Answered(_) => "answered".to_owned(),
+                },
+                answer: match answer {
+                    RevisionAnswer::Answered(value) => Some(value.clone()),
+                    RevisionAnswer::Unanswered | RevisionAnswer::IntentionallyUnspecified => None,
+                },
+            },
+        )
+        .collect::<Vec<_>>();
+    let lens_bytes = serde_json::to_vec(&request.lens).ok()?;
+    let review_bytes = serde_json::to_vec(review_output).ok()?;
+    let answer_bytes = serde_json::to_vec(&answer_records).ok()?;
+    let digest = |bytes: &[u8]| {
+        let mut output = [0_u8; 32];
+        output.copy_from_slice(&Sha256::digest(bytes));
+        output
+    };
+    Some(RevisionRecovery::new(
+        RevisionRequestBinding::new(
+            digest(&request.outbound_bytes()),
+            request.snapshot.revision,
+            request.snapshot.source_generation,
+            digest(&lens_bytes),
+            digest(&review_bytes),
+            digest(&answer_bytes),
+        ),
+        answers,
+    ))
 }
 
 fn review_lens_key(lens: ArtifactLens) -> i18n::Key {
@@ -1912,10 +2154,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 struct DocumentRecoveryState {
     key: RecoveryKey,
     revision: u64,
-    suppressed_oversized_revision: Option<u64>,
+    content_identity: RecoveryContentIdentity,
+    suppressed_oversized_revision: Option<RecoveryContentIdentity>,
     token: Option<RecoveryToken>,
     schedule: CheckpointSchedule,
     in_flight: Option<RecoveryAttempt>,
@@ -1929,8 +2176,31 @@ struct DocumentRecoveryState {
 struct RecoveryAttempt {
     token: RecoveryToken,
     revision: u64,
+    content_identity: RecoveryContentIdentity,
     timing: CheckpointAttemptTiming,
     cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryContentIdentity {
+    revision: u64,
+    revision_binding: Option<RevisionRequestBinding>,
+}
+
+impl RecoveryContentIdentity {
+    fn for_revision(revision: u64) -> Self {
+        Self {
+            revision,
+            revision_binding: None,
+        }
+    }
+
+    fn from_revision_recovery(revision: u64, revision_recovery: Option<&RevisionRecovery>) -> Self {
+        Self {
+            revision,
+            revision_binding: revision_recovery.map(|recovery| *recovery.binding()),
+        }
+    }
 }
 
 impl RecoveryAttempt {
@@ -1943,12 +2213,20 @@ impl PartialEq for RecoveryAttempt {
     fn eq(&self, other: &Self) -> bool {
         self.token == other.token
             && self.revision == other.revision
+            && self.content_identity == other.content_identity
             && self.timing == other.timing
             && Arc::ptr_eq(&self.cancelled, &other.cancelled)
     }
 }
 
 impl Eq for RecoveryAttempt {}
+
+fn cancel_recovery_attempt(state: &mut DocumentRecoveryState) {
+    let Some(attempt) = state.in_flight.as_ref() else {
+        return;
+    };
+    attempt.cancel();
+}
 
 fn current_checkpoint_write_completed(
     attempt_is_current: bool,
@@ -1958,6 +2236,17 @@ fn current_checkpoint_write_completed(
 ) -> bool {
     attempt_is_current
         && state_revision == attempt_revision
+        && matches!(outcome, CheckpointBatchOutcome::Written)
+}
+
+fn current_checkpoint_write_completed_for_identity(
+    attempt_is_current: bool,
+    state_identity: RecoveryContentIdentity,
+    attempt_identity: RecoveryContentIdentity,
+    outcome: &CheckpointBatchOutcome,
+) -> bool {
+    attempt_is_current
+        && state_identity == attempt_identity
         && matches!(outcome, CheckpointBatchOutcome::Written)
 }
 
@@ -2143,6 +2432,18 @@ impl Workspace {
                 changed = true;
             }
         }
+        if is_dirty
+            && source_path.as_deref().is_some_and(|source_path| {
+                self.revision_context
+                    .as_ref()
+                    .and_then(|context| context.skill_package.as_ref())
+                    .is_some_and(|package| package.contains_supporting_path(source_path))
+            })
+            && let Some(context) = &mut self.revision_context
+        {
+            context.supporting_sources_current = false;
+            changed = true;
+        }
         if changed {
             cx.notify();
         }
@@ -2208,6 +2509,8 @@ impl Workspace {
             recovery_retirement_batches: HashMap::new(),
             recovery_retirement_retries: HashSet::new(),
             recovery_schedules: HashMap::new(),
+            recovery_retirement_suppressions: HashMap::new(),
+            recovery_content_identities: HashMap::new(),
             recovery_checkpoint_worker_active: false,
             recovery_warning: None,
             status: None,
@@ -2232,6 +2535,16 @@ impl Workspace {
             pending_review: None,
             review_generation: 0,
             review_panel_open: false,
+            revision_context: None,
+            revision_result: None,
+            revision_diagnostic: None,
+            revision_running: false,
+            revision_generation: 0,
+            pending_revision: None,
+            revision_answer_subscriptions: Vec::new(),
+            recovered_revision_records: HashMap::new(),
+            recovered_revision_documents: HashMap::new(),
+            pending_revision_recoveries: HashMap::new(),
             pending_destructive: None,
             window_close_pending: false,
             window_close_ready: false,
@@ -2496,12 +2809,15 @@ impl Workspace {
         {
             let preserve = self.tabs.get(ix).is_some_and(|tab| {
                 let document = tab.payload.view.read(cx);
+                let document_id = document.id();
                 let key = self
                     .startup_recovery_keys
-                    .get(&document.id())
+                    .get(&document_id)
                     .cloned()
                     .unwrap_or_else(|| document.recovery_key());
-                document.is_dirty() || self.is_undurable_recovery_retirement(&key)
+                document.is_dirty()
+                    || self.is_undurable_recovery_retirement(&key)
+                    || self.revision_has_authored_answers_for_document(document_id, cx)
             });
             if preserve {
                 // Keep it: promoting beats losing unsaved work.
@@ -2775,14 +3091,17 @@ impl Workspace {
                     }
                     DocumentEvent::Edited => {
                         this.mark_review_stale_for_document(document, cx);
+                        this.refresh_revision_applied_state(document, cx);
                         let key = document.read(cx).recovery_key();
                         this.pending_recovery_retirements.remove(&key);
                         this.arm_document_recovery(document, cx);
                     }
                     DocumentEvent::DirtyChanged => {
                         this.mark_review_stale_for_document(document, cx);
-                        if !document.read(cx).is_dirty() {
-                            let id = document.read(cx).id();
+                        let id = document.read(cx).id();
+                        if !document.read(cx).is_dirty()
+                            && !this.revision_has_authored_answers_for_document(id, cx)
+                        {
                             let current_key = document.read(cx).recovery_key();
                             let startup_key = this.startup_recovery_keys.remove(&id);
                             let save_as_key = this.save_as_recovery_keys.remove(&id);
@@ -2835,8 +3154,10 @@ impl Workspace {
     ) -> (usize, usize) {
         let mut restored = 0;
         let mut skipped = 0;
-        for prepared in documents {
+        for mut prepared in documents {
             let source_path = prepared.source_path().map(Path::to_path_buf);
+            let recovery_key = prepared.recovery_key();
+            let revision_recovery = prepared.take_revision_recovery();
             if let Some(ref path) = source_path
                 && let Some(ix) = self.tabs.index_of(path)
             {
@@ -2863,6 +3184,12 @@ impl Workspace {
                 } else {
                     skipped += 1;
                 }
+                if let Some(revision_recovery) = revision_recovery {
+                    self.recovered_revision_records
+                        .insert(recovery_key.clone(), revision_recovery);
+                    self.recovered_revision_documents
+                        .insert(document.read(cx).id(), recovery_key);
+                }
                 continue;
             }
 
@@ -2880,6 +3207,12 @@ impl Workspace {
                 self.insert_memory_document(view.clone(), false, window, cx);
             }
             self.register_restored_recovery(&view, cx);
+            if let Some(revision_recovery) = revision_recovery {
+                self.recovered_revision_records
+                    .insert(recovery_key.clone(), revision_recovery);
+                self.recovered_revision_documents
+                    .insert(view.read(cx).id(), recovery_key);
+            }
             restored += 1;
         }
         (restored, skipped)
@@ -2905,6 +3238,7 @@ impl Workspace {
             DocumentRecoveryState {
                 key,
                 revision,
+                content_identity: RecoveryContentIdentity::for_revision(revision),
                 suppressed_oversized_revision: None,
                 token: Some(token),
                 schedule,
@@ -2913,6 +3247,8 @@ impl Workspace {
                 protection_warning,
             },
         );
+        self.recovery_content_identities
+            .insert(id, RecoveryContentIdentity::for_revision(revision));
         self.schedule_recovery_timer(cx);
         self.refresh_recovery_warning(cx);
     }
@@ -2979,19 +3315,38 @@ impl Workspace {
     ) {
         match pending.request.revalidate(&self.lifecycle_documents(cx)) {
             DestructiveResolution::Prompt(_) => {
+                self.release_recovery_retirement_suppressions(
+                    pending.keys.iter().map(|(key, _)| key),
+                    cx,
+                );
                 self.rearm_dirty_recovery(cx);
                 self.pending_destructive_recovery.extend(pending.keys);
                 self.pending_destructive = Some(pending.request);
                 self.prompt_destructive(window, cx);
             }
-            DestructiveResolution::Proceed(action) => self.perform_after_discard_retirement(
-                pending.request,
-                action,
-                pending.keys,
-                window,
-                cx,
-            ),
+            DestructiveResolution::Proceed(action) => {
+                if self.destructive_action_has_revision_answers(&action, cx) {
+                    self.release_recovery_retirement_suppressions(
+                        pending.keys.iter().map(|(key, _)| key),
+                        cx,
+                    );
+                    self.rearm_dirty_recovery(cx);
+                    self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+                    return;
+                }
+                self.perform_after_discard_retirement(
+                    pending.request,
+                    action,
+                    pending.keys,
+                    window,
+                    cx,
+                );
+            }
             DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
+                self.release_recovery_retirement_suppressions(
+                    pending.keys.iter().map(|(key, _)| key),
+                    cx,
+                );
                 self.rearm_dirty_recovery(cx);
             }
         }
@@ -3095,6 +3450,97 @@ impl Workspace {
         self.pending_recovery_retirements.contains_key(key)
     }
 
+    fn recovery_content_retirement_suppressed(
+        &self,
+        key: &RecoveryKey,
+        document_id: DocumentId,
+        content_identity: RecoveryContentIdentity,
+    ) -> bool {
+        self.recovery_retirement_suppressions
+            .get(key)
+            .and_then(|documents| documents.get(&document_id))
+            == Some(&content_identity)
+    }
+
+    fn destructive_retirement_waits_for_key(&self, key: &RecoveryKey) -> bool {
+        self.pending_startup_destructive
+            .as_ref()
+            .is_some_and(|pending| {
+                pending
+                    .keys
+                    .iter()
+                    .any(|(pending_key, _)| pending_key == key)
+            })
+    }
+
+    fn recovery_content_identity_for_retirement(
+        &self,
+        key: &RecoveryKey,
+        document_id: Option<DocumentId>,
+        cx: &App,
+    ) -> Option<(DocumentId, RecoveryContentIdentity)> {
+        if let Some(document_id) = document_id {
+            if let Some(document) = self.document_by_id(document_id, cx) {
+                let document = document.read(cx);
+                if document.recovery_key() == *key {
+                    let revision = document.revision();
+                    let revision_recovery = self.revision_recovery_for_document(document_id, key);
+                    return Some((
+                        document_id,
+                        RecoveryContentIdentity::from_revision_recovery(
+                            revision,
+                            revision_recovery.as_ref(),
+                        ),
+                    ));
+                }
+            }
+            if let Some(state) = self
+                .recovery_schedules
+                .get(&document_id)
+                .filter(|state| state.key == *key)
+            {
+                return Some((document_id, state.content_identity));
+            }
+            return None;
+        }
+        if let Some((document_id, state)) = self
+            .recovery_schedules
+            .iter()
+            .find(|(_, state)| state.key == *key)
+        {
+            return Some((*document_id, state.content_identity));
+        }
+        self.tabs.iter().find_map(|tab| {
+            let document = tab.payload.view.read(cx);
+            if document.recovery_key() != *key {
+                return None;
+            }
+            let document_id = document.id();
+            let revision_recovery = self.revision_recovery_for_document(document_id, key);
+            Some((
+                document_id,
+                RecoveryContentIdentity::from_revision_recovery(
+                    document.revision(),
+                    revision_recovery.as_ref(),
+                ),
+            ))
+        })
+    }
+
+    fn release_recovery_retirement_suppressions<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'a RecoveryKey>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for key in keys {
+            changed |= self.recovery_retirement_suppressions.remove(key).is_some();
+        }
+        if changed {
+            self.schedule_recovery_timer(cx);
+        }
+    }
+
     fn lifecycle_documents(&self, cx: &App) -> Vec<DocumentLifecycle> {
         self.tabs
             .iter()
@@ -3134,6 +3580,21 @@ impl Workspace {
         }
     }
 
+    fn destructive_action_has_revision_answers(
+        &self,
+        action: &DestructiveAction,
+        cx: &App,
+    ) -> bool {
+        match action {
+            DestructiveAction::CloseTab(id) => {
+                self.revision_has_authored_answers_for_document(*id, cx)
+            }
+            DestructiveAction::CloseWindow | DestructiveAction::ReplaceWorkspace(_) => {
+                self.revision_has_authored_answers()
+            }
+        }
+    }
+
     /// Keep the platform window alive long enough to release a focused input
     /// handler before the application exits.
     fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -3153,6 +3614,7 @@ impl Workspace {
         if self.window_close_pending {
             return;
         }
+        self.cancel_pending_revision(cx);
         self.window_close_pending = true;
         window.disable_focus(cx);
         let workspace = cx.entity().downgrade();
@@ -3216,6 +3678,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.destructive_action_has_revision_answers(&action, cx) {
+            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+            return false;
+        }
         if self.pending_destructive.is_some() || self.pending_startup_destructive.is_some() {
             return false;
         }
@@ -3587,6 +4053,17 @@ impl Workspace {
             self.recovery_retirement_batches
                 .insert(key.clone(), batch.clone());
         }
+        // The marker is durable now; pause only the current content identity.
+        for (key, document_id) in &scoped_keys {
+            if let Some((document_id, content_identity)) =
+                self.recovery_content_identity_for_retirement(key, *document_id, cx)
+            {
+                self.recovery_retirement_suppressions
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(document_id, content_identity);
+            }
+        }
         self.pending_destructive = Some(request);
         self.schedule_recovery_timer(cx);
         self.refresh_recovery_warning(cx);
@@ -3691,6 +4168,8 @@ impl Workspace {
             return;
         }
         let Some(mut request) = self.pending_destructive.take() else {
+            self.release_recovery_retirement_suppressions(keys.iter(), cx);
+            self.rearm_dirty_recovery(cx);
             return;
         };
 
@@ -3711,6 +4190,18 @@ impl Workspace {
             }
             Err(error) => {
                 self.finish_recovery_retirement_batch(&keys, &batch, cx);
+                let mut suppression_changed = false;
+                for key in &keys {
+                    if !self.recovery_retirements.contains_key(key)
+                        && !self.recovery_retirement_batches.contains_key(key)
+                    {
+                        suppression_changed |=
+                            self.recovery_retirement_suppressions.remove(key).is_some();
+                    }
+                }
+                if suppression_changed {
+                    self.schedule_recovery_timer(cx);
+                }
                 self.rearm_dirty_recovery(cx);
                 self.set_status(
                     format!(
@@ -3735,12 +4226,19 @@ impl Workspace {
 
         match request.revalidate(&self.lifecycle_documents(cx)) {
             DestructiveResolution::Prompt(_) => {
+                self.release_recovery_retirement_suppressions(keys.iter(), cx);
                 self.rearm_dirty_recovery(cx);
                 self.pending_destructive_recovery.extend(scoped_keys);
                 self.pending_destructive = Some(request);
                 self.prompt_destructive(window, cx);
             }
             DestructiveResolution::Proceed(action) => {
+                if self.destructive_action_has_revision_answers(&action, cx) {
+                    self.release_recovery_retirement_suppressions(keys.iter(), cx);
+                    self.rearm_dirty_recovery(cx);
+                    self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+                    return;
+                }
                 for (key, _) in scoped_keys {
                     self.remove_recovery_state_for_key(&key, cx);
                 }
@@ -3750,6 +4248,7 @@ impl Workspace {
                 self.perform_destructive(action, window, cx);
             }
             DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
+                self.release_recovery_retirement_suppressions(keys.iter(), cx);
                 self.rearm_dirty_recovery(cx);
             }
         }
@@ -3759,7 +4258,13 @@ impl Workspace {
         let dirty: Vec<_> = self
             .document_views()
             .into_iter()
-            .filter(|document| document.read(cx).is_dirty())
+            .filter(|document| {
+                let (document_id, dirty) = {
+                    let document = document.read(cx);
+                    (document.id(), document.is_dirty())
+                };
+                dirty || self.revision_has_authored_answers_for_document(document_id, cx)
+            })
             .collect();
         for document in dirty {
             self.arm_document_recovery(&document, cx);
@@ -3802,7 +4307,9 @@ impl Workspace {
             // capability held by an already-running worker.
             self.retire_document_recovery(id, None, cx);
             self.cancel_pending_review_for_document(id, cx);
+            self.cancel_pending_revision_for_document(id, cx);
             self.review_lens_overrides.remove(&id);
+            self.recovered_revision_documents.remove(&id);
         }
         let Some((closed, _dropped)) = self.tabs.close(ix) else {
             return;
@@ -4026,6 +4533,7 @@ impl Workspace {
             }
             state.key
         });
+        self.recovery_content_identities.remove(&id);
         self.schedule_recovery_timer(cx);
         self.refresh_recovery_warning(cx);
         key
@@ -4043,6 +4551,7 @@ impl Workspace {
             key.clone(),
             document_id,
         );
+        let content_identity = self.recovery_content_identity_for_retirement(key, document_id, cx);
         let had_owner = self.recovery_retirements.contains_key(key)
             || self.recovery_retirement_batches.contains_key(key);
         let Some(store) = self.recovery.clone() else {
@@ -4056,6 +4565,7 @@ impl Workspace {
                     cx,
                 );
                 if !had_owner {
+                    self.rearm_dirty_recovery(cx);
                     self.schedule_recovery_retirement_retry(key.clone(), cx);
                 }
                 return;
@@ -4079,6 +4589,14 @@ impl Workspace {
         }
         self.recovery_retirements
             .insert(key.clone(), ticket.clone());
+        // `begin_retirement` has published the non-restorable marker.
+        if let Some((document_id, content_identity)) = content_identity {
+            self.recovery_retirement_suppressions
+                .entry(key.clone())
+                .or_default()
+                .insert(document_id, content_identity);
+        }
+        self.schedule_recovery_timer(cx);
         self.spawn_recovery_retirement_completion(
             key.clone(),
             ticket,
@@ -4164,11 +4682,16 @@ impl Workspace {
             return;
         }
         self.recovery_retirement_retries.remove(&key);
+        let pending_revision_recovery = self.pending_revision_recoveries.remove(&key);
         match result {
             Ok(RetirementCompletion::Retired { .. }) => {
                 self.recovery_retirements.remove(&key);
                 if let Some(&document_id) = self.pending_recovery_retirements.get(&key) {
                     self.invalidate_recovery(&key, document_id, cx);
+                } else if !self.destructive_retirement_waits_for_key(&key) {
+                    // A replay ticket may finish before its destructive walk resumes.
+                    self.release_recovery_retirement_suppressions(std::iter::once(&key), cx);
+                    self.rearm_dirty_recovery(cx);
                 }
             }
             Ok(RetirementCompletion::CleanupPending { error }) => {
@@ -4182,6 +4705,13 @@ impl Workspace {
             }
             Err(error) => {
                 self.recovery_retirements.remove(&key);
+                if let Some((document_id, recovery)) = pending_revision_recovery {
+                    self.recovered_revision_records
+                        .insert(key.clone(), recovery);
+                    self.recovered_revision_documents
+                        .insert(document_id, key.clone());
+                    self.rearm_dirty_recovery(cx);
+                }
                 insert_scoped_recovery_key(
                     &mut self.pending_recovery_retirements,
                     key.clone(),
@@ -4352,6 +4882,8 @@ impl Workspace {
                     this.recovery_retirement_retries.remove(&key);
                     if let Some(document_id) = pending {
                         this.invalidate_recovery(&key, document_id, cx);
+                    } else {
+                        this.release_recovery_retirement_suppressions(std::iter::once(&key), cx);
                     }
                 })
                 .is_some()
@@ -4414,6 +4946,9 @@ impl Workspace {
                 true
             }
         });
+        self.recovery_retirement_suppressions.remove(key);
+        self.recovery_content_identities
+            .retain(|id, _| self.recovery_schedules.contains_key(id));
         self.schedule_recovery_timer(cx);
         self.refresh_recovery_warning(cx);
     }
@@ -4433,16 +4968,23 @@ impl Workspace {
             let document = document.read(cx);
             (document.id(), document.revision(), document.recovery_key())
         };
+        let revision_recovery = self.revision_recovery_for_document(id, &key);
+        let content_identity =
+            RecoveryContentIdentity::from_revision_recovery(revision, revision_recovery.as_ref());
+        self.recovery_content_identities
+            .insert(id, content_identity);
         let replaced_key = self.recovery_schedules.get_mut(&id).and_then(|state| {
             (state.key != key).then(|| {
-                if let Some(attempt) = &state.in_flight {
-                    attempt.cancel();
-                }
+                cancel_recovery_attempt(state);
                 state.key.clone()
             })
         });
         if let Some(previous_key) = replaced_key {
             self.invalidate_recovery(&previous_key, Some(id), cx);
+        }
+        if self.recovery_content_retirement_suppressed(&key, id, content_identity) {
+            self.remove_recovery_schedule(id, cx);
+            return;
         }
         match self.recovery_schedules.entry(id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -4455,6 +4997,7 @@ impl Workspace {
                 entry.insert(DocumentRecoveryState {
                     key,
                     revision,
+                    content_identity,
                     suppressed_oversized_revision: None,
                     token,
                     schedule,
@@ -4466,9 +5009,7 @@ impl Workspace {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let state = entry.get_mut();
                 if state.key != key {
-                    if let Some(attempt) = &state.in_flight {
-                        attempt.cancel();
-                    }
+                    cancel_recovery_attempt(state);
                     state.key = key.clone();
                     let (token, protection_warning) =
                         store.as_ref().map_or((None, false), |store| {
@@ -4479,15 +5020,15 @@ impl Workspace {
                     state.schedule = CheckpointSchedule::default();
                     state.in_flight = None;
                     state.deadline_reported = false;
+                    state.content_identity = content_identity;
                     state.suppressed_oversized_revision = None;
                     state.protection_warning = protection_warning;
-                } else if state.revision != revision {
-                    if let Some(attempt) = &state.in_flight {
-                        attempt.cancel();
-                    }
+                } else if state.content_identity != content_identity {
+                    cancel_recovery_attempt(state);
                     if state.suppressed_oversized_revision.take().is_some() {
                         state.schedule = CheckpointSchedule::default();
                     }
+                    state.content_identity = content_identity;
                 }
                 if state.token.is_none()
                     && let Some(store) = &store
@@ -4515,9 +5056,22 @@ impl Workspace {
         let now = cx.background_executor().now();
         let Some(deadline) = self
             .recovery_schedules
-            .values()
-            .filter_map(|state| match &state.in_flight {
-                _ if state.suppressed_oversized_revision == Some(state.revision) => None,
+            .iter()
+            .filter_map(|(id, state)| match &state.in_flight {
+                _ if self.recovery_content_retirement_suppressed(
+                    &state.key,
+                    *id,
+                    state.content_identity,
+                ) =>
+                {
+                    None
+                }
+                _ if state.suppressed_oversized_revision.is_some_and(|identity| {
+                    self.recovery_content_identities.get(id).copied() == Some(identity)
+                }) =>
+                {
+                    None
+                }
                 Some(attempt) if !state.deadline_reported => {
                     Some(attempt.timing.durable_complete_by)
                 }
@@ -4563,7 +5117,15 @@ impl Workspace {
 
     fn checkpoint_recovery_at(&mut self, now: Instant, cx: &mut Context<Self>) {
         let Some(store) = self.recovery.clone() else {
-            for state in self.recovery_schedules.values_mut() {
+            let suppressions = &self.recovery_retirement_suppressions;
+            for (id, state) in self.recovery_schedules.iter_mut() {
+                if suppressions
+                    .get(&state.key)
+                    .and_then(|documents| documents.get(id))
+                    == Some(&state.content_identity)
+                {
+                    continue;
+                }
                 if state.in_flight.is_none() && state.schedule.is_due(now) {
                     state.protection_warning = true;
                 }
@@ -4591,13 +5153,35 @@ impl Workspace {
                 )
             };
             open_ids.insert(id);
-            if !dirty {
+            let answer_dirty = self.revision_has_authored_answers_for_document(id, cx);
+            if !dirty && !answer_dirty {
                 if let Some(state) = self.recovery_schedules.remove(&id) {
                     self.invalidate_recovery(&state.key, Some(id), cx);
                 }
+                self.recovery_content_identities.remove(&id);
                 continue;
             }
             active_keys.insert(key.clone());
+            let revision_recovery = self.revision_recovery_for_document(id, &key);
+            let content_identity = RecoveryContentIdentity::from_revision_recovery(
+                revision,
+                revision_recovery.as_ref(),
+            );
+            self.recovery_content_identities
+                .insert(id, content_identity);
+
+            if self.recovery_content_retirement_suppressed(&key, id, content_identity) {
+                if let Some(mut state) = self.recovery_schedules.remove(&id) {
+                    if let Some(attempt) = state.in_flight.take() {
+                        attempt.cancel();
+                    }
+                    if state.key != key {
+                        self.invalidate_recovery(&state.key, Some(id), cx);
+                    }
+                }
+                self.recovery_content_identities.remove(&id);
+                continue;
+            }
 
             let replaced_key = self.recovery_schedules.get_mut(&id).and_then(|state| {
                 (state.key != key).then(|| {
@@ -4617,6 +5201,7 @@ impl Workspace {
                 DocumentRecoveryState {
                     key: key.clone(),
                     revision,
+                    content_identity,
                     suppressed_oversized_revision: None,
                     token: Some(token),
                     schedule,
@@ -4626,11 +5211,10 @@ impl Workspace {
                 }
             });
             if state.key != key {
-                if let Some(attempt) = &state.in_flight {
-                    attempt.cancel();
-                }
+                cancel_recovery_attempt(state);
                 state.key = key.clone();
                 state.revision = revision;
+                state.content_identity = content_identity;
                 let (token, protection_warning) = store.activate_and_current_token(&key);
                 state.token = Some(token);
                 state.schedule = CheckpointSchedule::default();
@@ -4639,14 +5223,13 @@ impl Workspace {
                 state.deadline_reported = false;
                 state.suppressed_oversized_revision = None;
                 state.protection_warning = protection_warning;
-            } else if state.revision != revision {
-                if let Some(attempt) = &state.in_flight {
-                    attempt.cancel();
-                }
+            } else if state.content_identity != content_identity {
+                cancel_recovery_attempt(state);
                 state.revision = revision;
                 if state.suppressed_oversized_revision.take().is_some() {
                     state.schedule = CheckpointSchedule::default();
                 }
+                state.content_identity = content_identity;
                 state.schedule.mark_dirty(now);
             }
             if let Some(attempt) = state.in_flight.as_ref()
@@ -4660,7 +5243,7 @@ impl Workspace {
                 state.protection_warning = true;
             }
             if state.in_flight.is_none() && state.schedule.is_due(now) {
-                if state.suppressed_oversized_revision == Some(revision) {
+                if state.suppressed_oversized_revision == Some(content_identity) {
                     continue;
                 }
                 if worker_active {
@@ -4670,7 +5253,7 @@ impl Workspace {
                 }
                 let plaintext_ceiling = store.plaintext_admission_ceiling();
                 if text_byte_len as u64 > plaintext_ceiling {
-                    state.suppressed_oversized_revision = Some(revision);
+                    state.suppressed_oversized_revision = Some(content_identity);
                     state.protection_warning = true;
                     preflight_error = Some(
                         RecoveryError::OversizedCheckpoint {
@@ -4694,15 +5277,24 @@ impl Workspace {
                         .clone()
                         .expect("a ready recovery store must provide a checkpoint token"),
                     revision,
+                    content_identity,
                     timing,
                     cancelled: Arc::new(AtomicBool::new(false)),
                 };
                 state.in_flight = Some(attempt.clone());
                 state.deadline_reported = false;
-                due.push((id, attempt, document.read(cx).recovery_checkpoint(cx)));
+                due.push((
+                    id,
+                    attempt,
+                    document
+                        .read(cx)
+                        .recovery_checkpoint_with_revision(cx, revision_recovery),
+                ));
             }
         }
         self.recovery_schedules
+            .retain(|id, _| open_ids.contains(id));
+        self.recovery_content_identities
             .retain(|id, _| open_ids.contains(id));
         self.refresh_recovery_warning(cx);
         if let Some(error) = preflight_error {
@@ -4804,6 +5396,11 @@ impl Workspace {
                         state.revision,
                         attempt.revision,
                         &outcome,
+                    ) && current_checkpoint_write_completed_for_identity(
+                        attempt_is_current,
+                        state.content_identity,
+                        attempt.content_identity,
+                        &outcome,
                     )
                 });
             if let Some(state) = self.recovery_schedules.get_mut(&id)
@@ -4814,13 +5411,15 @@ impl Workspace {
                     .take()
                     .expect("the current recovery attempt must still be in flight");
                 let deadline_reported = std::mem::take(&mut state.deadline_reported);
-                let oversized_revision_is_current = state.revision == current.revision
+                let content_identity_is_current =
+                    state.content_identity == current.content_identity;
+                let oversized_revision_is_current = content_identity_is_current
                     && matches!(
                         &outcome,
                         CheckpointBatchOutcome::Failed(RecoveryError::OversizedCheckpoint { .. })
                     );
                 if oversized_revision_is_current {
-                    state.suppressed_oversized_revision = Some(current.revision);
+                    state.suppressed_oversized_revision = Some(current.content_identity);
                     state.protection_warning = true;
                 } else if store_returned_at > current.timing.durable_complete_by {
                     if !deadline_reported {
@@ -4831,16 +5430,25 @@ impl Workspace {
                     state.protection_warning = true;
                 } else {
                     match &outcome {
-                        CheckpointBatchOutcome::Written => {
-                            if deadline_reported && state.revision == current.revision {
+                        CheckpointBatchOutcome::Written if content_identity_is_current => {
+                            if deadline_reported
+                                && state.content_identity == current.content_identity
+                            {
                                 state
                                     .schedule
                                     .mark_durable_baseline(current.timing.snapshot_at);
                             } else if !deadline_reported {
                                 state.schedule.checkpoint_written(current.timing);
                             }
-                            if state.revision == current.revision {
+                            if state.content_identity == current.content_identity {
                                 state.protection_warning = false;
+                            }
+                        }
+                        CheckpointBatchOutcome::Written => {
+                            if !deadline_reported {
+                                state
+                                    .schedule
+                                    .checkpoint_cancelled(current.timing, store_returned_at);
                             }
                         }
                         CheckpointBatchOutcome::Superseded if !deadline_reported => {
@@ -4926,6 +5534,18 @@ impl Workspace {
         if review_supporting_source_changed && let Some(review) = &mut self.review_result {
             review.supporting_sources_current = false;
             review.result.result.status = ReviewStatus::Stale;
+        }
+        let revision_supporting_source_changed = self
+            .revision_context
+            .as_ref()
+            .and_then(|context| context.skill_package.as_ref())
+            .is_some_and(|package| {
+                changes
+                    .iter()
+                    .any(|change| change.path().starts_with(&package.root))
+            });
+        if revision_supporting_source_changed && let Some(context) = &mut self.revision_context {
+            context.supporting_sources_current = false;
         }
 
         let tree_changed = changes
@@ -5050,9 +5670,10 @@ impl Workspace {
 
     fn on_save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(doc) = self.active_document().cloned() {
-            doc.update(cx, |doc, cx| {
-                doc.save(SaveMode::Normal, cx);
-            });
+            let id = doc.read(cx).id();
+            if doc.update(cx, |doc, cx| doc.save(SaveMode::Normal, cx)) {
+                self.clear_revision_after_save(id, cx);
+            }
         }
     }
 
@@ -5235,6 +5856,7 @@ impl Workspace {
                 self.record_recent_file(path.clone(), cx);
                 self.record_visit(path, 0);
                 self.web_dirty(cx);
+                self.clear_revision_after_save(id, cx);
                 self.complete_pending_destructive_save_as(
                     id,
                     saved_snapshot,
@@ -5494,6 +6116,35 @@ impl Workspace {
         cx.notify();
     }
 
+    fn cancel_pending_revision_for_document(
+        &mut self,
+        document_id: DocumentId,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pending_revision
+            .as_ref()
+            .is_none_or(|pending| pending.document_id != document_id)
+        {
+            return;
+        }
+        if let Some(pending) = self.pending_revision.take() {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.revision_generation = self.revision_generation.wrapping_add(1);
+        self.revision_running = false;
+        cx.notify();
+    }
+
+    fn cancel_pending_revision(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_revision.take() {
+            pending.cancelled.store(true, Ordering::Release);
+            self.revision_generation = self.revision_generation.wrapping_add(1);
+            self.revision_running = false;
+            cx.notify();
+        }
+    }
+
     /// Make the inferred lens observable and correctable before any outbound
     /// consent is requested. The actual request begins only from the Review
     /// panel's explicit Run command.
@@ -5502,6 +6153,19 @@ impl Workspace {
             return;
         };
         let document_id = document.read(cx).id();
+        if self.revision_context_has_authored_answers_for_other_document(document_id) {
+            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+            return;
+        }
+        if self.revision_has_authored_answers_for_document(document_id, cx) {
+            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+            self.review_target = Some(target);
+            self.review_target_document_id = Some(document_id);
+            self.review_panel_open = true;
+            self.right_panel_open = true;
+            cx.notify();
+            return;
+        }
         self.review_result = None;
         self.review_diagnostic = None;
         self.review_target = Some(target);
@@ -5514,6 +6178,19 @@ impl Workspace {
     /// Forget a Review panel and invalidate every pending completion before it
     /// can make the panel visible again.
     fn dismiss_review(&mut self, cx: &mut Context<Self>) {
+        let authored_for_active_document = self
+            .active_document()
+            .map(|document| document.read(cx).id())
+            .is_some_and(|document_id| {
+                self.revision_has_authored_answers_for_document(document_id, cx)
+            });
+        if authored_for_active_document {
+            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+            self.review_panel_open = true;
+            self.right_panel_open = true;
+            cx.notify();
+            return;
+        }
         if let Some(pending) = self.pending_review.take() {
             pending.cancelled.store(true, Ordering::Release);
         }
@@ -5525,6 +6202,1215 @@ impl Workspace {
         self.review_target = None;
         self.review_target_document_id = None;
         cx.notify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_revision_context(
+        &mut self,
+        document_id: DocumentId,
+        recovery_key: RecoveryKey,
+        source_snapshot: crate::lifecycle::AsyncSnapshot,
+        request: DocumentReviewRequest,
+        review_output: ReviewModelOutput,
+        skill_package: Option<FrozenSkillPackage>,
+        supporting_sources_current: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_pending_revision(cx);
+        self.revision_answer_subscriptions.clear();
+        let mut answer_inputs = Vec::with_capacity(review_output.clarification_questions.len());
+        for _ in 0..review_output.clarification_questions.len() {
+            answer_inputs.push(cx.new(|cx| InputState::new(window, cx)));
+        }
+        let mut answer_states = (0..answer_inputs.len())
+            .map(|_| RevisionAnswer::unanswered())
+            .collect::<Vec<_>>();
+        let recovered_key = self
+            .recovered_revision_record_for_document(document_id, &recovery_key)
+            .map(|(key, _)| key);
+        if let Some(recovered_key) = recovered_key
+            && let Some(recovery) = self.recovered_revision_records.remove(&recovered_key)
+        {
+            let source_digest = Sha256::digest(request.outbound_bytes());
+            let binding = recovery.binding();
+            let source_matches = binding.source_sha256().as_slice() == source_digest.as_slice();
+            let binding_matches = source_matches
+                && recovery.answers().len() == answer_states.len()
+                && build_revision_recovery(&request, &review_output, recovery.answers().as_slice())
+                    .is_some_and(|expected| {
+                        let expected = expected.binding();
+                        expected.source_sha256() == binding.source_sha256()
+                            && expected.artifact_lens_digest() == binding.artifact_lens_digest()
+                            && expected.review_context_digest() == binding.review_context_digest()
+                            && expected.answers_digest() == binding.answers_digest()
+                    });
+            if binding_matches {
+                answer_states = recovery.answers().as_slice().to_vec();
+                if self
+                    .recovered_revision_documents
+                    .get(&document_id)
+                    .is_some_and(|key| *key == recovered_key)
+                {
+                    self.recovered_revision_documents.remove(&document_id);
+                }
+            } else {
+                // Keep a mismatched record quarantined rather than binding its
+                // answers to a newer source snapshot.
+                self.recovered_revision_records
+                    .insert(recovered_key.clone(), recovery);
+                self.recovered_revision_documents
+                    .insert(document_id, recovered_key);
+            }
+        }
+
+        // Restore the visible editor value before subscribing to Change. The
+        // typed answer state is the recovery authority, while InputState is
+        // only its editable UI projection.
+        for (input, state) in answer_inputs.iter().zip(answer_states.iter()) {
+            if let RevisionAnswer::Answered(value) = state {
+                input.update(cx, |input, cx| {
+                    input.set_value(value.clone(), window, cx);
+                });
+            }
+        }
+        for (index, input) in answer_inputs.iter().enumerate() {
+            let subscription = cx.subscribe_in(
+                input,
+                window,
+                move |this: &mut Self, _, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.on_revision_answer_input(index, cx);
+                    }
+                },
+            );
+            self.revision_answer_subscriptions.push(subscription);
+        }
+        self.revision_context = Some(WorkspaceRevisionContext {
+            document_id,
+            source_snapshot,
+            request,
+            review_output,
+            skill_package,
+            supporting_sources_current,
+            applied: false,
+            applied_preview: None,
+            applied_decisions: None,
+            answers_exported: false,
+            answer_states,
+            answer_inputs,
+        });
+        self.revision_result = None;
+        self.revision_diagnostic = None;
+        self.revision_running = false;
+        cx.notify();
+    }
+
+    fn on_revision_answer_input(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.revision_running || self.revision_result.is_some() {
+            return;
+        }
+        let value = self
+            .revision_context
+            .as_ref()
+            .and_then(|context| context.answer_inputs.get(index))
+            .map(|input| input.read(cx).value().to_string());
+        let Some(value) = value else {
+            return;
+        };
+        let Some(context) = &mut self.revision_context else {
+            return;
+        };
+        if matches!(
+            context.answer_states.get(index),
+            Some(RevisionAnswer::Answered(_))
+        ) {
+            context.answer_states[index] = RevisionAnswer::answered(value);
+            Self::clear_revision_applied_state(context);
+            context.answers_exported = false;
+            self.revision_result = None;
+            self.revision_diagnostic = None;
+            if let Some(document) = self.active_document().cloned() {
+                self.arm_document_recovery(&document, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn set_revision_answer_state(
+        &mut self,
+        index: usize,
+        state: RevisionAnswer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.revision_running || self.revision_result.is_some() {
+            return;
+        }
+        let Some(context) = &mut self.revision_context else {
+            return;
+        };
+        if index >= context.answer_states.len() {
+            return;
+        }
+        let should_focus = matches!(state, RevisionAnswer::Answered(_));
+        context.answer_states[index] = state;
+        Self::clear_revision_applied_state(context);
+        context.answers_exported = false;
+        self.revision_result = None;
+        self.revision_diagnostic = None;
+        if should_focus && let Some(input) = context.answer_inputs.get(index) {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        if let Some(document) = self.active_document().cloned() {
+            self.arm_document_recovery(&document, cx);
+        }
+        cx.notify();
+    }
+
+    fn revision_answers(&self) -> Result<RevisionAnswers, RevisionError> {
+        let Some(context) = &self.revision_context else {
+            return Err(RevisionError::InvalidRequest);
+        };
+        RevisionAnswers::new(context.answer_states.clone())
+            .map_err(|_| RevisionError::InvalidAnswers)
+    }
+
+    fn revision_recovery_for_document(
+        &self,
+        document_id: DocumentId,
+        recovery_key: &RecoveryKey,
+    ) -> Option<RevisionRecovery> {
+        if let Some(context) = self.revision_context.as_ref().filter(|context| {
+            context.document_id == document_id
+                && !context.answers_exported
+                && context
+                    .answer_states
+                    .iter()
+                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
+        }) {
+            return build_revision_recovery(
+                &context.request,
+                &context.review_output,
+                &context.answer_states,
+            );
+        }
+        self.recovered_revision_record_for_document(document_id, recovery_key)
+            .map(|(_, recovery)| recovery)
+    }
+
+    fn revision_context_is_current(&self, cx: &Context<Self>) -> bool {
+        let Some(context) = &self.revision_context else {
+            return false;
+        };
+        let source_current = self.active_document().is_some_and(|document| {
+            let document = document.read(cx);
+            document.id() == context.document_id
+                && document.async_snapshot(cx) == context.source_snapshot
+        });
+        source_current
+            && context.supporting_sources_current
+            && context.skill_package.as_ref().is_none_or(|package| {
+                !self.has_dirty_skill_supporting_document(package, cx)
+                    && package.revalidate().is_ok()
+            })
+    }
+
+    fn revision_result_is_current(
+        &self,
+        revision: &WorkspaceRevisionResult,
+        cx: &Context<Self>,
+    ) -> bool {
+        let source_current = self.active_document().is_some_and(|document| {
+            let document = document.read(cx);
+            document.id() == revision.document_id
+                && document.async_snapshot(cx) == revision.source_snapshot
+        });
+        let package_current = self
+            .revision_context
+            .as_ref()
+            .filter(|context| context.document_id == revision.document_id)
+            .is_none_or(|context| {
+                context.supporting_sources_current
+                    && context.skill_package.as_ref().is_none_or(|package| {
+                        !self.has_dirty_skill_supporting_document(package, cx)
+                    })
+            });
+        source_current && package_current
+    }
+
+    fn revision_result_is_current_for_commit(&mut self, cx: &Context<Self>) -> bool {
+        let current = self
+            .revision_result
+            .as_ref()
+            .is_some_and(|revision| self.revision_result_is_current(revision, cx));
+        if !current {
+            return false;
+        }
+        let package_current = self
+            .revision_context
+            .as_ref()
+            .and_then(|context| context.skill_package.as_ref())
+            .is_none_or(|package| package.revalidate().is_ok());
+        if !package_current && let Some(context) = &mut self.revision_context {
+            context.supporting_sources_current = false;
+        }
+        package_current
+    }
+
+    fn set_revision_diagnostic(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.revision_diagnostic = Some(message.into());
+        self.revision_running = false;
+        self.pending_revision = None;
+        cx.notify();
+    }
+
+    fn on_revision_provider_failure(&mut self, error: RevisionError, cx: &mut Context<Self>) {
+        self.set_revision_diagnostic(
+            format!(
+                "{}: {error}",
+                i18n::t(i18n::Key::RevisionProviderFailed, cx)
+            ),
+            cx,
+        );
+    }
+
+    fn on_cancel_revision(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_revision.take() else {
+            return;
+        };
+        pending.cancelled.store(true, Ordering::Release);
+        self.revision_generation = self.revision_generation.wrapping_add(1);
+        self.revision_running = false;
+        self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionCancelledAnswersRetained, cx), cx);
+    }
+
+    fn dismiss_revision(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_revision.take() {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.revision_generation = self.revision_generation.wrapping_add(1);
+        self.revision_running = false;
+        self.revision_result = None;
+        self.revision_diagnostic = None;
+        // Deliberately retain `revision_context`: dismissing a provider result
+        // must not discard user-authored answers before an explicit discard.
+        cx.notify();
+    }
+
+    fn revision_has_authored_answers(&self) -> bool {
+        self.revision_context_has_authored_answers()
+            || self.recovered_revision_records.values().any(|recovery| {
+                recovery
+                    .answers()
+                    .as_slice()
+                    .iter()
+                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
+            })
+    }
+
+    fn revision_context_has_authored_answers(&self) -> bool {
+        self.revision_context.as_ref().is_some_and(|context| {
+            context
+                .answer_states
+                .iter()
+                .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
+                && !context.answers_exported
+        })
+    }
+
+    fn revision_context_has_authored_answers_for_other_document(
+        &self,
+        document_id: DocumentId,
+    ) -> bool {
+        self.revision_context.as_ref().is_some_and(|context| {
+            context.document_id != document_id
+                && context
+                    .answer_states
+                    .iter()
+                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
+                && !context.answers_exported
+        })
+    }
+
+    fn recovered_revision_answers_for_active_document(
+        &self,
+        cx: &App,
+    ) -> Option<(RecoveryKey, RevisionRecovery)> {
+        let document = self.active_document()?.read(cx);
+        self.recovered_revision_record_for_document(document.id(), &document.recovery_key())
+    }
+
+    fn recovered_revision_record_for_document(
+        &self,
+        document_id: DocumentId,
+        current_key: &RecoveryKey,
+    ) -> Option<(RecoveryKey, RevisionRecovery)> {
+        let key = if self.recovered_revision_records.contains_key(current_key) {
+            current_key.clone()
+        } else {
+            self.recovered_revision_documents.get(&document_id)?.clone()
+        };
+        self.recovered_revision_records
+            .get(&key)
+            .cloned()
+            .map(|recovery| (key, recovery))
+    }
+
+    fn remove_recovered_revision_record(&mut self, key: &RecoveryKey) {
+        self.recovered_revision_records.remove(key);
+        self.recovered_revision_documents
+            .retain(|_, candidate| candidate != key);
+    }
+
+    fn begin_revision_recovery_retirement(
+        &mut self,
+        document_id: DocumentId,
+        key: RecoveryKey,
+        recovery: RevisionRecovery,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.retire_document_recovery(document_id, Some(key.clone()), cx);
+        let durable_start = self.recovery_retirements.contains_key(&key)
+            || self.recovery_retirement_batches.contains_key(&key);
+        if durable_start {
+            self.remove_recovered_revision_record(&key);
+            // This retires quarantined answers, not the current editor or its live answers.
+            self.release_recovery_retirement_suppressions(std::iter::once(&key), cx);
+            self.pending_revision_recoveries
+                .insert(key, (document_id, recovery));
+        }
+        durable_start
+    }
+
+    fn copy_recovered_revision_answers(&mut self, cx: &mut Context<Self>) {
+        let Some((key, recovery)) = self.recovered_revision_answers_for_active_document(cx) else {
+            return;
+        };
+        let answers = recovery
+            .answers()
+            .as_slice()
+            .iter()
+            .enumerate()
+            .map(|(question_index, answer)| match answer {
+                RevisionAnswer::Unanswered => WorkspaceRevisionExportAnswer {
+                    question_index,
+                    state: "unanswered".to_owned(),
+                    answer: None,
+                },
+                RevisionAnswer::IntentionallyUnspecified => WorkspaceRevisionExportAnswer {
+                    question_index,
+                    state: "intentionally_unspecified".to_owned(),
+                    answer: None,
+                },
+                RevisionAnswer::Answered(value) => WorkspaceRevisionExportAnswer {
+                    question_index,
+                    state: "answered".to_owned(),
+                    answer: Some(value.clone()),
+                },
+            })
+            .collect::<Vec<_>>();
+        let binding = recovery.binding();
+        let payload = WorkspaceRevisionRecoveryExport {
+            source_sha256: hex_bytes(binding.source_sha256()),
+            source_revision: binding.source_revision(),
+            source_generation: binding.source_generation(),
+            artifact_lens_sha256: hex_bytes(binding.artifact_lens_digest()),
+            review_context_sha256: hex_bytes(binding.review_context_digest()),
+            answers_sha256: hex_bytes(binding.answers_digest()),
+            answers,
+        };
+        let Ok(text) = serde_json::to_string_pretty(&payload) else {
+            return;
+        };
+        let Some(document) = self.active_document().cloned() else {
+            return;
+        };
+        let document_id = document.read(cx).id();
+        if !self.begin_revision_recovery_retirement(document_id, key, recovery, cx) {
+            self.set_status(
+                i18n::t(i18n::Key::RevisionRecoveryRetirementFailed, cx).into(),
+                cx,
+            );
+            return;
+        }
+        if document.read(cx).is_dirty()
+            || self.revision_has_authored_answers_for_document(document_id, cx)
+        {
+            self.arm_document_recovery(&document, cx);
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.set_status(
+            i18n::t(i18n::Key::RevisionRecoveredAnswersCopied, cx).into(),
+            cx,
+        );
+    }
+
+    fn discard_recovered_revision_answers(&mut self, cx: &mut Context<Self>) {
+        let Some((key, recovery)) = self.recovered_revision_answers_for_active_document(cx) else {
+            return;
+        };
+        if let Some(document) = self.active_document().cloned() {
+            let (id, dirty) = {
+                let document = document.read(cx);
+                (document.id(), document.is_dirty())
+            };
+            if !self.begin_revision_recovery_retirement(id, key, recovery, cx) {
+                self.set_status(
+                    i18n::t(i18n::Key::RevisionRecoveryRetirementFailed, cx).into(),
+                    cx,
+                );
+                return;
+            }
+            if dirty || self.revision_has_authored_answers_for_document(id, cx) {
+                self.arm_document_recovery(&document, cx);
+            }
+        }
+        self.set_status(i18n::t(i18n::Key::RevisionAnswersDiscarded, cx).into(), cx);
+    }
+
+    fn revision_answers_incorporated(&self) -> bool {
+        let Some(context) = &self.revision_context else {
+            return false;
+        };
+        let Some(revision) = self
+            .revision_result
+            .as_ref()
+            .filter(|revision| revision.document_id == context.document_id)
+        else {
+            return false;
+        };
+        context
+            .answer_states
+            .iter()
+            .enumerate()
+            .all(|(index, answer)| {
+                let status = revision
+                    .result
+                    .question_coverage()
+                    .iter()
+                    .find(|coverage| coverage.question_index() == index)
+                    .map(|coverage| coverage.status());
+                revision_answer_is_incorporated(answer, status, &revision.decisions)
+            })
+    }
+
+    fn revision_has_authored_answers_for_document(
+        &self,
+        document_id: DocumentId,
+        cx: &App,
+    ) -> bool {
+        let context_has_answers = self.revision_context.as_ref().is_some_and(|context| {
+            context.document_id == document_id
+                && context
+                    .answer_states
+                    .iter()
+                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
+                && !context.answers_exported
+        });
+        if context_has_answers {
+            return true;
+        }
+        let Some(document) = self.document_by_id(document_id, cx) else {
+            return false;
+        };
+        let document = document.read(cx);
+        self.recovered_revision_record_for_document(document.id(), &document.recovery_key())
+            .map(|(_, recovery)| recovery)
+            .is_some_and(|recovery| {
+                recovery
+                    .answers()
+                    .as_slice()
+                    .iter()
+                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
+            })
+    }
+
+    fn discard_revision_answers(&mut self, cx: &mut Context<Self>) {
+        if self.revision_context.is_none()
+            && self
+                .recovered_revision_answers_for_active_document(cx)
+                .is_some()
+        {
+            self.discard_recovered_revision_answers(cx);
+            return;
+        }
+        let document = self.active_document().cloned();
+        let mut retirement_started = false;
+        let document_state = document.as_ref().map(|document| {
+            let document = document.read(cx);
+            (document.id(), document.recovery_key(), document.is_dirty())
+        });
+        if let Some((id, key, _)) = &document_state
+            && self.revision_context.as_ref().is_some_and(|context| {
+                context.document_id == *id
+                    && context
+                        .answer_states
+                        .iter()
+                        .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
+                    && !context.answers_exported
+            })
+        {
+            self.retire_document_recovery(*id, Some(key.clone()), cx);
+            retirement_started = self.recovery_retirements.contains_key(key)
+                || self.recovery_retirement_batches.contains_key(key);
+            if !retirement_started {
+                self.set_status(
+                    i18n::t(i18n::Key::RevisionRecoveryRetirementFailed, cx).into(),
+                    cx,
+                );
+                return;
+            }
+        }
+        if let Some(pending) = self.pending_revision.take() {
+            pending.cancelled.store(true, Ordering::Release);
+        }
+        self.revision_generation = self.revision_generation.wrapping_add(1);
+        self.revision_running = false;
+        self.revision_result = None;
+        self.revision_context = None;
+        self.revision_answer_subscriptions.clear();
+        self.revision_diagnostic = None;
+        if let Some(document) = document
+            && let Some((id, key, dirty)) = document_state
+        {
+            if !retirement_started {
+                self.retire_document_recovery(id, Some(key), cx);
+            }
+            if dirty {
+                self.arm_document_recovery(&document, cx);
+            }
+        }
+        self.set_status(i18n::t(i18n::Key::RevisionAnswersDiscarded, cx).into(), cx);
+    }
+
+    fn clear_revision_after_save(&mut self, document_id: DocumentId, cx: &mut Context<Self>) {
+        let applied = self
+            .revision_context
+            .as_ref()
+            .is_some_and(|context| context.document_id == document_id && context.applied);
+        if !applied {
+            return;
+        }
+        if !self.revision_answers_incorporated() {
+            if let Some(document) = self.document_by_id(document_id, cx) {
+                self.arm_document_recovery(&document, cx);
+            }
+            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+            return;
+        }
+
+        {
+            self.revision_result = None;
+            self.revision_context = None;
+            self.revision_answer_subscriptions.clear();
+            self.revision_diagnostic = None;
+            if let Some(document) = self.document_by_id(document_id, cx) {
+                let current_key = document.read(cx).recovery_key();
+                let startup_key = self.startup_recovery_keys.remove(&document_id);
+                let save_as_key = self.save_as_recovery_keys.remove(&document_id);
+                let key = save_as_key.or(startup_key).unwrap_or(current_key);
+                self.retire_document_recovery(document_id, Some(key), cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn refresh_revision_applied_state(
+        &mut self,
+        document: &Entity<DocumentView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(context) = self
+            .revision_context
+            .as_ref()
+            .filter(|context| context.applied)
+        else {
+            return;
+        };
+        let document_id = context.document_id;
+        let applied_preview = context.applied_preview.as_deref();
+        let applied_decisions = context.applied_decisions.as_ref();
+        let still_applied = self.revision_result.as_ref().is_some_and(|revision| {
+            applied_preview == Some(revision.preview.as_str())
+                && applied_decisions == Some(&revision.decisions)
+                && revision.document_id == document_id
+                && {
+                    let document = document.read(cx);
+                    document.id() == document_id && document.text(cx) == revision.preview
+                }
+        });
+        if !still_applied
+            && let Some(context) = &mut self.revision_context
+            && context.document_id == document_id
+        {
+            Self::clear_revision_applied_state(context);
+            cx.notify();
+        }
+    }
+
+    fn clear_revision_applied_state(context: &mut WorkspaceRevisionContext) {
+        context.applied = false;
+        context.applied_preview = None;
+        context.applied_decisions = None;
+    }
+
+    fn mark_revision_applied(
+        context: &mut WorkspaceRevisionContext,
+        preview: &str,
+        decisions: &[(ChangeId, bool)],
+    ) {
+        context.applied = true;
+        context.applied_preview = Some(preview.to_owned());
+        context.applied_decisions = Some(decisions.to_vec());
+    }
+
+    fn revision_applied_state_is_current_for_commit(&mut self, cx: &Context<Self>) -> bool {
+        let Some(context) = self
+            .revision_context
+            .as_ref()
+            .filter(|context| context.applied)
+        else {
+            return false;
+        };
+        let Some(revision) = self
+            .revision_result
+            .as_ref()
+            .filter(|revision| revision.document_id == context.document_id)
+        else {
+            return false;
+        };
+        let Some(document) = self.active_document() else {
+            return false;
+        };
+        if document.read(cx).id() != context.document_id
+            || document.read(cx).text(cx) != revision.preview
+            || !revision_apply_identity_matches(
+                context.applied_preview.as_deref(),
+                context.applied_decisions.as_deref(),
+                &revision.preview,
+                &revision.decisions,
+            )
+        {
+            return false;
+        }
+        let package_current = context.supporting_sources_current
+            && context.skill_package.as_ref().is_none_or(|package| {
+                !self.has_dirty_skill_supporting_document(package, cx)
+                    && package.revalidate().is_ok()
+            });
+        if !package_current && let Some(context) = &mut self.revision_context {
+            context.supporting_sources_current = false;
+        }
+        package_current
+    }
+
+    fn set_revision_decision(
+        &mut self,
+        change_id: ChangeId,
+        accepted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = {
+            let Some(revision) = &mut self.revision_result else {
+                return;
+            };
+            if let Some((_, decision)) = revision
+                .decisions
+                .iter_mut()
+                .find(|(id, _)| *id == change_id)
+            {
+                if *decision == accepted {
+                    false
+                } else {
+                    *decision = accepted;
+                    true
+                }
+            } else {
+                revision.decisions.push((change_id, accepted));
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        if let Some(revision) = &mut self.revision_result
+            && let Ok(preview) = revision.result.proposal().compose(&revision.decisions)
+        {
+            revision.preview = preview;
+        }
+        if let Some(context) = &mut self.revision_context {
+            Self::clear_revision_applied_state(context);
+            context.answers_exported = false;
+        }
+        cx.notify();
+    }
+
+    fn set_all_revision_decisions(&mut self, accepted: bool, cx: &mut Context<Self>) {
+        let changed = {
+            let Some(revision) = &mut self.revision_result else {
+                return;
+            };
+            let decisions = revision_change_ids(revision.result.proposal())
+                .into_iter()
+                .map(|change_id| (change_id, accepted))
+                .collect::<Vec<_>>();
+            if revision.decisions == decisions {
+                false
+            } else {
+                revision.decisions = decisions;
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        if let Some(revision) = &mut self.revision_result
+            && let Ok(preview) = revision.result.proposal().compose(&revision.decisions)
+        {
+            revision.preview = preview;
+        }
+        if let Some(context) = &mut self.revision_context {
+            Self::clear_revision_applied_state(context);
+            context.answers_exported = false;
+        }
+        cx.notify();
+    }
+
+    fn revision_preview(&self) -> Option<String> {
+        self.revision_result
+            .as_ref()
+            .map(|revision| revision.preview.clone())
+    }
+
+    fn start_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.revision_running {
+            return;
+        }
+        let Some(context) = &self.revision_context else {
+            return;
+        };
+        let document_id = context.document_id;
+        let request = context.request.clone();
+        let review_output = context.review_output.clone();
+        let source_snapshot = context.source_snapshot.clone();
+        let skill_package = context.skill_package.clone();
+        let supporting_sources_current = context.supporting_sources_current;
+        if !self.revision_context_is_current(cx) {
+            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionSourceChanged, cx), cx);
+            return;
+        }
+        let answers = match self.revision_answers() {
+            Ok(answers) => answers,
+            Err(error) => {
+                self.set_revision_diagnostic(error.to_string(), cx);
+                return;
+            }
+        };
+        let language = match crate::settings::AppSettings::global(cx).language {
+            crate::settings::Language::English => ReviewLanguage::English,
+            crate::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
+        };
+        let settings = crate::settings::AppSettings::global(cx).clone();
+        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let prepared = match PreparedReview::from_settings(&settings, &vault) {
+            Ok(prepared) => {
+                match prepared.bind_revision_request(request, review_output, answers, language) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.set_revision_diagnostic(
+                            format!(
+                                "{}: {error}",
+                                i18n::t(i18n::Key::RevisionPreparationFailed, cx)
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                self.set_revision_diagnostic(
+                    format!(
+                        "{}: {error}",
+                        i18n::t(i18n::Key::RevisionPreparationFailed, cx)
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+
+        let prompt_description = i18n::model_request_disclosure(prepared.disclosure(), cx);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            i18n::t(i18n::Key::RevisionConsentTitle, cx),
+            Some(&prompt_description),
+            &[
+                PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx)),
+                PromptButton::cancel(i18n::t(i18n::Key::Cancel, cx)),
+            ],
+            cx,
+        );
+        let pending = Arc::new(Mutex::new(Some(prepared)));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let generation = self.revision_generation.wrapping_add(1);
+        self.revision_generation = generation;
+        self.pending_revision = Some(PendingRevision {
+            cancelled: cancelled.clone(),
+            document_id,
+        });
+        self.revision_running = true;
+        self.revision_result = None;
+        self.revision_diagnostic = None;
+        self.set_status(i18n::t(i18n::Key::RevisionWaitingForConsent, cx).into(), cx);
+
+        let doc = self
+            .active_document()
+            .cloned()
+            .map(|document| document.downgrade());
+        let cancelled_for_request = cancelled.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let approved = answer.await.unwrap_or(1) == 0;
+            let pending = pending.clone();
+            loop {
+                let pending = pending.clone();
+                let cancelled = cancelled_for_request.clone();
+                let doc = doc.clone();
+                let source_snapshot = source_snapshot.clone();
+                let skill_package = skill_package.clone();
+                let supporting_sources_current = supporting_sources_current;
+                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
+                    let Some(prepared) = pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    else {
+                        return;
+                    };
+                    if this.revision_generation != generation || cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if !approved {
+                        this.revision_running = false;
+                        this.pending_revision = None;
+                        this.set_revision_diagnostic(
+                            i18n::t(i18n::Key::RevisionConsentCancelledAnswersRetained, cx),
+                            cx,
+                        );
+                        return;
+                    }
+                    if !this.revision_context_is_current(cx) {
+                        this.set_revision_diagnostic(
+                            i18n::t(i18n::Key::RevisionScopeChangedDuringConsent, cx),
+                            cx,
+                        );
+                        return;
+                    }
+                    let mut consent = ConsentCapability::from_decision(
+                        prepared.disclosure(),
+                        ConsentDecision::Approve,
+                    );
+                    let authorization = match prepared.authorize(&mut consent) {
+                        Ok(authorization) => authorization,
+                        Err(error) => {
+                            this.set_revision_diagnostic(
+                                format!(
+                                    "{}: {error}",
+                                    i18n::t(i18n::Key::RevisionAuthorizationFailed, cx)
+                                ),
+                                cx,
+                            );
+                            return;
+                        }
+                    };
+                    this.set_status(i18n::t(i18n::Key::RevisionRunning, cx).into(), cx);
+                    let cancel_for_request = cancelled.clone();
+                    let doc = doc.clone();
+                    let skill_package = skill_package.clone();
+                    let supporting_sources_current = supporting_sources_current;
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = cx
+                            .background_spawn(async move {
+                                prepared.execute_with(
+                                    authorization,
+                                    &cancel_for_request,
+                                    crate::review::REVISION_REQUEST_TIMEOUT,
+                                )
+                            })
+                            .await;
+                        let result = Arc::new(Mutex::new(Some(result)));
+                        loop {
+                            let result = result.clone();
+                            let doc = doc.clone();
+                            let source_snapshot = source_snapshot.clone();
+                            let skill_package = skill_package.clone();
+                            let supporting_sources_current = supporting_sources_current;
+                            if crate::views::try_update_in(&this, cx, move |this, _, cx| {
+                                let Some(result) = result
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .take()
+                                else {
+                                    return;
+                                };
+                                if this.revision_generation != generation {
+                                    return;
+                                }
+                                this.revision_running = false;
+                                this.pending_revision = None;
+                                match result {
+                                    Ok(result) => {
+                                        let Some(document) =
+                                            doc.as_ref().and_then(WeakEntity::upgrade)
+                                        else {
+                                            this.set_revision_diagnostic(
+                                                i18n::t(i18n::Key::RevisionDocumentClosed, cx),
+                                                cx,
+                                            );
+                                            return;
+                                        };
+                                        let supporting_sources_current = supporting_sources_current
+                                            && skill_package.as_ref().is_none_or(|package| {
+                                                !this.has_dirty_skill_supporting_document(
+                                                    package, cx,
+                                                ) && package.revalidate().is_ok()
+                                            });
+                                        let stale = document.read(cx).async_snapshot(cx)
+                                            != source_snapshot
+                                            || !supporting_sources_current;
+                                        if let Some(context) = &mut this.revision_context {
+                                            context.supporting_sources_current =
+                                                supporting_sources_current;
+                                        }
+                                        let decisions = revision_change_ids(result.proposal())
+                                            .into_iter()
+                                            .map(|change_id| (change_id, false))
+                                            .collect::<Vec<_>>();
+                                        let preview = result
+                                            .proposal()
+                                            .compose(&decisions)
+                                            .expect("a validated reject-all preview must compose");
+                                        this.revision_result = Some(WorkspaceRevisionResult {
+                                            document_id,
+                                            source_snapshot: source_snapshot.clone(),
+                                            result,
+                                            decisions,
+                                            preview,
+                                        });
+                                        this.revision_diagnostic = stale.then(|| {
+                                            i18n::t(i18n::Key::RevisionStale, cx).to_owned()
+                                        });
+                                        this.set_status(
+                                            i18n::t(
+                                                if stale {
+                                                    i18n::Key::RevisionReadyStale
+                                                } else {
+                                                    i18n::Key::RevisionReady
+                                                },
+                                                cx,
+                                            )
+                                            .into(),
+                                            cx,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        this.on_revision_provider_failure(error.error(), cx);
+                                    }
+                                }
+                            })
+                            .is_some()
+                            {
+                                break;
+                            }
+                            if this.upgrade().is_none() {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1))
+                                .await;
+                        }
+                    })
+                    .detach();
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn apply_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.revision_result.is_none() {
+            return false;
+        }
+        if !self.revision_result_is_current_for_commit(cx) {
+            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
+            return false;
+        }
+        let revision = self
+            .revision_result
+            .as_ref()
+            .expect("a current Revision result must remain installed");
+        let Some(document) = self.active_document().cloned() else {
+            return false;
+        };
+        let proposal = revision.result.proposal().clone();
+        let decisions = revision.decisions.clone();
+        let preview = revision.preview.clone();
+        match document.update(cx, |document, cx| {
+            document.apply_approved_revision(&proposal, &decisions, window, cx)
+        }) {
+            Ok(true) => {
+                // Keep the stale proposal and answer context inspectable until
+                // an explicit Save/Discard boundary completes. This is what
+                // lets Save, Save As cancellation, and conflict prompts retain
+                // the user's answers rather than silently retiring them.
+                if let Some(context) = &mut self.revision_context {
+                    Self::mark_revision_applied(context, &preview, &decisions);
+                }
+                self.revision_diagnostic = None;
+                self.set_status(i18n::t(i18n::Key::RevisionApplied, cx).into(), cx);
+                true
+            }
+            Ok(false) => {
+                if let Some(context) = &mut self.revision_context {
+                    // A current reject-all or empty proposal is already the
+                    // document's exact text. Treat it as an approved no-op so
+                    // Save and Save As still cross the normal safe boundary.
+                    Self::mark_revision_applied(context, &preview, &decisions);
+                }
+                self.set_status(i18n::t(i18n::Key::RevisionNoApprovedChanges, cx).into(), cx);
+                false
+            }
+            Err(error) => {
+                if let Some(context) = &mut self.revision_context {
+                    Self::clear_revision_applied_state(context);
+                }
+                self.set_revision_diagnostic(
+                    format!("{}: {error}", i18n::t(i18n::Key::RevisionApplyFailed, cx)),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    fn copy_revision(&mut self, cx: &mut Context<Self>) {
+        let applied_preview_current = self.revision_applied_state_is_current_for_commit(cx);
+        if !applied_preview_current && !self.revision_result_is_current_for_commit(cx) {
+            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
+            return;
+        }
+        let Some(text) = self.revision_preview() else {
+            return;
+        };
+        let answers_incorporated = self.revision_answers_incorporated();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some(context) = &mut self.revision_context {
+            // Copy exports only the approved artifact. Retire answer recovery
+            // only when every authored answer is present in that exact output.
+            context.answers_exported = answers_incorporated;
+        }
+        self.checkpoint_recovery_at(cx.background_executor().now(), cx);
+        self.set_status(i18n::t(i18n::Key::RevisionCopied, cx).into(), cx);
+    }
+
+    fn save_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document_id) = self
+            .revision_context
+            .as_ref()
+            .map(|context| context.document_id)
+        else {
+            return;
+        };
+        if self
+            .active_document()
+            .is_none_or(|document| document.read(cx).id() != document_id)
+        {
+            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
+            return;
+        }
+        if self
+            .revision_context
+            .as_ref()
+            .is_some_and(|context| context.applied)
+        {
+            if self.revision_applied_state_is_current_for_commit(cx) {
+                self.on_save(&Save, window, cx);
+                return;
+            }
+            if let Some(context) = &mut self.revision_context {
+                Self::clear_revision_applied_state(context);
+            }
+        }
+        if self.apply_revision(window, cx)
+            || self
+                .revision_context
+                .as_ref()
+                .is_some_and(|context| context.applied)
+        {
+            // `replace_all` publishes the editor Change after this action
+            // returns. Save on the next UI update so that event establishes
+            // the approved preview as the document's current dirty revision
+            // before the normal safe save path clears it.
+            cx.defer_in(window, |this, window, cx| {
+                if this.revision_applied_state_is_current_for_commit(cx) {
+                    this.on_save(&Save, window, cx);
+                } else {
+                    if let Some(context) = &mut this.revision_context {
+                        Self::clear_revision_applied_state(context);
+                    }
+                    this.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
+                }
+            });
+        }
+    }
+
+    fn save_as_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(document_id) = self
+            .revision_context
+            .as_ref()
+            .map(|context| context.document_id)
+        else {
+            return;
+        };
+        if self
+            .active_document()
+            .is_none_or(|document| document.read(cx).id() != document_id)
+        {
+            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
+            return;
+        }
+        if self
+            .revision_context
+            .as_ref()
+            .is_some_and(|context| context.applied)
+        {
+            if self.revision_applied_state_is_current_for_commit(cx) {
+                self.on_save_as(&SaveAs, window, cx);
+                return;
+            }
+            if let Some(context) = &mut self.revision_context {
+                Self::clear_revision_applied_state(context);
+            }
+        }
+        if self.apply_revision(window, cx)
+            || self
+                .revision_context
+                .as_ref()
+                .is_some_and(|context| context.applied)
+        {
+            self.on_save_as(&SaveAs, window, cx);
+        }
     }
 
     /// Continue Review after the potentially expensive Agent Skill inventory
@@ -5591,6 +7477,7 @@ impl Workspace {
             .source
             .package()
             .is_some_and(SkillPackage::is_partial);
+        let frozen_request = built_request.request.clone();
         let skill_package = built_request.skill_package;
         if let Some(skill_package) = &skill_package
             && self.has_dirty_skill_supporting_document(skill_package, cx)
@@ -5652,6 +7539,7 @@ impl Workspace {
 
         let pending = Arc::new(Mutex::new(Some(prepared)));
         let selection_for_result = selection.clone();
+        let request_for_result = frozen_request.clone();
         let lens_for_result = lens;
         let skill_package_for_result = skill_package.clone();
         let cancelled_for_request = cancelled.clone();
@@ -5666,6 +7554,7 @@ impl Workspace {
                 let cancelled = cancelled_for_request.clone();
                 let selection = selection_for_result.clone();
                 let partial = partial;
+                let request_for_result = request_for_result.clone();
                 let skill_package = skill_package_for_result.clone();
                 if crate::views::try_update_in(&this, cx, move |this, window, cx| {
                     let Some(prepared) = pending
@@ -5753,6 +7642,8 @@ impl Workspace {
                             let source_snapshot = source_snapshot.clone();
                             let selection = selection.clone();
                             let partial = partial;
+                            let request_for_result = request_for_result.clone();
+                            let request_for_result_for_update = request_for_result.clone();
                             let skill_package = skill_package.clone();
                             let cancelled = cancelled_for_revalidation.clone();
                             if crate::views::try_update_in(&this, cx, move |this, window, cx| {
@@ -5879,7 +7770,9 @@ impl Workspace {
                                         let selection = selection.clone();
                                         let partial = partial;
                                         let skill_package = skill_package.clone();
-                                        if crate::views::try_update_in(&this, cx, move |this, _, cx| {
+                                        let request_for_result_for_update =
+                                            request_for_result_for_update.clone();
+                                        if crate::views::try_update_in(&this, cx, move |this, window, cx| {
                                             let Some(result) = result
                                                 .lock()
                                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5920,17 +7813,52 @@ impl Workspace {
                                                         result.result.status = ReviewStatus::Stale;
                                                     }
                                                     let document_id = document.read(cx).id();
+                                                    let recovery_key = document.read(cx).recovery_key();
+                                                    if this
+                                                        .revision_context_has_authored_answers_for_other_document(
+                                                            document_id,
+                                                        )
+                                                    {
+                                                        this.review_target = None;
+                                                        this.review_target_document_id = None;
+                                                        this.set_status(
+                                                            i18n::t(
+                                                                i18n::Key::RevisionAnswersRetained,
+                                                                cx,
+                                                            )
+                                                            .into(),
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    }
                                                     this.review_result = Some(WorkspaceReviewResult {
                                                         document_id,
-                                                        source_snapshot,
+                                                        source_snapshot: source_snapshot.clone(),
                                                         target,
                                                         selection,
                                                         lens: lens_for_result,
                                                         partial,
-                                                        skill_package,
+                                                        skill_package: skill_package.clone(),
                                                         supporting_sources_current,
                                                         result,
                                                     });
+                                                    if let Some(output) = this
+                                                        .review_result
+                                                        .as_ref()
+                                                        .and_then(|review| review.result.result.output.clone())
+                                                    {
+                                                        this.install_revision_context(
+                                                            document_id,
+                                                            recovery_key,
+                                                            source_snapshot.clone(),
+                                                            request_for_result_for_update,
+                                                            output,
+                                                            skill_package,
+                                                            supporting_sources_current,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
                                                     this.review_diagnostic = None;
                                                     this.review_target = None;
                                                     this.review_target_document_id = None;
@@ -6019,6 +7947,15 @@ impl Workspace {
                 document.is_dirty(),
             )
         };
+        if self.revision_has_authored_answers_for_document(document_id, cx) {
+            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
+            self.review_target = Some(target);
+            self.review_target_document_id = Some(document_id);
+            self.review_panel_open = true;
+            self.right_panel_open = true;
+            cx.notify();
+            return;
+        }
         let source_snapshot = doc.read(cx).async_snapshot(cx);
         let full_text = source_snapshot.text().to_owned();
         // Infer a conservative first lens from the path. Once the user has
@@ -6529,8 +8466,97 @@ impl Workspace {
 
     // --- Rendering --------------------------------------------------------
 
+    fn render_recovered_revision_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let answer_count = self
+            .recovered_revision_answers_for_active_document(cx)
+            .map_or(0, |(_, recovery)| recovery.answers().len());
+        v_flex()
+            .id("review-panel")
+            .size_full()
+            .p(metrics::inset())
+            .gap(metrics::gap_group())
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .id("revision-recovered-answers")
+                    .role(gpui::Role::Group)
+                    .aria_label(i18n::t(i18n::Key::RevisionRecoveredAnswers, cx))
+                    .accessibility_id(REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID)
+                    .gap(metrics::gap())
+                    .child(div().text_xs().font_medium().child(format!(
+                        "{} ({answer_count})",
+                        i18n::t(i18n::Key::RevisionRecoveredAnswers, cx)
+                    )))
+                    .child(
+                        h_flex()
+                            .gap(metrics::gap())
+                            .child(
+                                Button::new("revision-copy-recovered-answers")
+                                    .accessibility_id(
+                                        REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
+                                    )
+                                    .label(i18n::t(i18n::Key::RevisionCopyRecoveredAnswers, cx))
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.copy_recovered_revision_answers(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("revision-discard-recovered-answers")
+                                    .accessibility_id(
+                                        REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
+                                    )
+                                    .label(i18n::t(i18n::Key::RevisionDiscardRecoveredAnswers, cx))
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_recovered_revision_answers(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_review_idle_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let run_target = self.review_target.filter(|_| {
+            self.review_target_document_id
+                == self
+                    .active_document()
+                    .map(|document| document.read(cx).id())
+        });
+        v_flex()
+            .id("review-panel")
+            .size_full()
+            .p(metrics::inset())
+            .gap(metrics::gap_group())
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(i18n::t(i18n::Key::ReviewNoResult, cx)),
+            )
+            .when_some(run_target, |this, target| {
+                this.child(
+                    Button::new("run-review")
+                        .accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)
+                        .label(i18n::t(i18n::Key::ReviewRun, cx))
+                        .small()
+                        .primary()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.review(target, window, cx);
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_review_panel(&self, cx: &Context<Self>) -> AnyElement {
         let visible_lens = self.visible_review_lens(cx);
+        let active_document_has_authored_answers = self.active_document().is_some_and(|document| {
+            self.revision_has_authored_answers_for_document(document.read(cx).id(), cx)
+        });
         let lens_options = [
             ArtifactLens::Prompt,
             ArtifactLens::Specification,
@@ -6583,7 +8609,12 @@ impl Workspace {
                             Button::new(SharedString::from(format!("review-lens-{}", lens.label())))
                                 .label(i18n::t(review_lens_key(lens), cx))
                                 .xsmall()
-                                .disabled(self.reviewing)
+                                .disabled(
+                                    self.reviewing
+                                        || self.revision_running
+                                        || self.revision_result.is_some()
+                                        || active_document_has_authored_answers,
+                                )
                                 .when(
                                     review_lens_choice_is_selected(lens, visible_lens),
                                     |button| button.primary(),
@@ -6597,6 +8628,17 @@ impl Workspace {
                                         .active_document()
                                         .map(|document| document.read(cx).id());
                                     if let Some(document_id) = document_id {
+                                        if this.revision_has_authored_answers_for_document(
+                                            document_id,
+                                            cx,
+                                        ) {
+                                            this.set_status(
+                                                i18n::t(i18n::Key::RevisionAnswersRetained, cx)
+                                                    .into(),
+                                                cx,
+                                            );
+                                            return;
+                                        }
                                         let target = this
                                             .review_target
                                             .filter(|_| {
@@ -6628,6 +8670,7 @@ impl Workspace {
                     .active_document()
                     .map(|document| document.read(cx).id())
             && !self.reviewing
+            && !active_document_has_authored_answers
         {
             content.push(
                 Button::new("run-review")
@@ -6656,6 +8699,53 @@ impl Workspace {
                     .text_sm()
                     .text_color(cx.theme().warning)
                     .child(diagnostic.diagnostic.message.as_str().to_owned())
+                    .into_any_element(),
+            );
+        }
+
+        let recovered_answers = self
+            .recovered_revision_answers_for_active_document(cx)
+            .map(|(_, recovery)| recovery.answers().clone());
+        if let Some(recovered_answers) = recovered_answers {
+            let answer_count = recovered_answers.len();
+            content.push(
+                v_flex()
+                    .id("revision-recovered-answers")
+                    .role(gpui::Role::Group)
+                    .aria_label(i18n::t(i18n::Key::RevisionRecoveredAnswers, cx))
+                    .accessibility_id(REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID)
+                    .gap(metrics::gap())
+                    .child(div().text_xs().font_medium().child(format!(
+                        "{} ({answer_count})",
+                        i18n::t(i18n::Key::RevisionRecoveredAnswers, cx)
+                    )))
+                    .child(
+                        h_flex()
+                            .gap(metrics::gap())
+                            .child(
+                                Button::new("revision-copy-recovered-answers")
+                                    .accessibility_id(
+                                        REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
+                                    )
+                                    .label(i18n::t(i18n::Key::RevisionCopyRecoveredAnswers, cx))
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.copy_recovered_revision_answers(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("revision-discard-recovered-answers")
+                                    .accessibility_id(
+                                        REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
+                                    )
+                                    .label(i18n::t(i18n::Key::RevisionDiscardRecoveredAnswers, cx))
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_recovered_revision_answers(cx);
+                                    })),
+                            ),
+                    )
                     .into_any_element(),
             );
         }
@@ -6907,6 +8997,542 @@ impl Workspace {
             );
         }
 
+        let active_document_id = self
+            .active_document()
+            .map(|document| document.read(cx).id());
+        let revision_context = self.revision_context.as_ref().filter(|context| {
+            Some(context.document_id) == active_document_id
+                && self
+                    .review_result
+                    .as_ref()
+                    .is_some_and(|review| review.document_id == context.document_id)
+        });
+        if let Some(context) = revision_context {
+            content.push(
+                div()
+                    .id("revision-answers")
+                    .role(gpui::Role::Group)
+                    .aria_label(i18n::t(i18n::Key::RevisionAnswers, cx))
+                    .accessibility_id("markturbo-revision-answers")
+                    .text_xs()
+                    .font_medium()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(i18n::t(i18n::Key::RevisionAnswers, cx))
+                    .into_any_element(),
+            );
+            for (index, question) in output.clarification_questions.iter().enumerate() {
+                let Some(input) = context.answer_inputs.get(index).cloned() else {
+                    continue;
+                };
+                let state = context
+                    .answer_states
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(RevisionAnswer::unanswered);
+                let answered = matches!(state, RevisionAnswer::Answered(_));
+                let unanswered_selected = matches!(state, RevisionAnswer::Unanswered);
+                let unspecified_selected =
+                    matches!(state, RevisionAnswer::IntentionallyUnspecified);
+                let question_id = revision_question_accessibility_id(index, question);
+                let question_text = question.question.as_str().to_owned();
+                content.push(
+                    v_flex()
+                        .id(question_id.clone())
+                        .accessibility_id(question_id.clone())
+                        .gap(metrics::gap())
+                        .child(div().text_sm().child(question_text.clone()))
+                        .child(
+                            h_flex()
+                                .gap(metrics::gap())
+                                .flex_wrap()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "{question_id}-unanswered"
+                                    )))
+                                    .label(i18n::t(i18n::Key::RevisionAnswerUnanswered, cx))
+                                    .xsmall()
+                                    .accessibility_id(SharedString::from(format!(
+                                        "{question_id}-unanswered"
+                                    )))
+                                    .when(unanswered_selected, |button| button.primary())
+                                    .when(!unanswered_selected, |button| button.ghost())
+                                    .disabled(
+                                        self.revision_running || self.revision_result.is_some(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_revision_answer_state(
+                                            index,
+                                            RevisionAnswer::unanswered(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "{question_id}-unspecified"
+                                    )))
+                                    .label(i18n::t(
+                                        i18n::Key::RevisionAnswerIntentionallyUnspecified,
+                                        cx,
+                                    ))
+                                    .xsmall()
+                                    .accessibility_id(SharedString::from(format!(
+                                        "{question_id}-unspecified"
+                                    )))
+                                    .when(unspecified_selected, |button| button.primary())
+                                    .when(!unspecified_selected, |button| button.ghost())
+                                    .disabled(
+                                        self.revision_running || self.revision_result.is_some(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_revision_answer_state(
+                                            index,
+                                            RevisionAnswer::intentionally_unspecified(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "{question_id}-answered"
+                                    )))
+                                    .label(i18n::t(i18n::Key::RevisionAnswerAnswered, cx))
+                                    .xsmall()
+                                    .accessibility_id(SharedString::from(format!(
+                                        "{question_id}-answered"
+                                    )))
+                                    .when(answered, |button| button.primary())
+                                    .when(!answered, |button| button.ghost())
+                                    .disabled(
+                                        self.revision_running || self.revision_result.is_some(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let value = this
+                                            .revision_context
+                                            .as_ref()
+                                            .and_then(|context| context.answer_inputs.get(index))
+                                            .map(|input| input.read(cx).value().to_string())
+                                            .unwrap_or_default();
+                                        this.set_revision_answer_state(
+                                            index,
+                                            RevisionAnswer::answered(value),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                ),
+                        )
+                        .child(
+                            Input::new(&input)
+                                .small()
+                                .w_full()
+                                .aria_label(question_text)
+                                .accessibility_id(SharedString::from(format!(
+                                    "{question_id}-input"
+                                )))
+                                .disabled(
+                                    !answered
+                                        || self.revision_running
+                                        || self.revision_result.is_some(),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if !self.revision_running && self.revision_result.is_none() {
+                content.push(
+                    h_flex()
+                        .gap(metrics::gap())
+                        .child(
+                            Button::new("revision-run")
+                                .accessibility_id(REVISION_RUN_ACCESSIBILITY_ID)
+                                .label(i18n::t(i18n::Key::RevisionRun, cx))
+                                .small()
+                                .primary()
+                                .disabled(stale)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_revision(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("revision-discard-answers")
+                                .label(i18n::t(i18n::Key::RevisionDiscardAnswers, cx))
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_revision_answers(cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        if self.revision_running {
+            content.push(
+                h_flex()
+                    .id("revision-running")
+                    .items_center()
+                    .gap(metrics::gap())
+                    .child(Spinner::new().small())
+                    .child(i18n::t(i18n::Key::RevisionRunning, cx))
+                    .child(
+                        Button::new("revision-cancel")
+                            .icon(IconName::Close)
+                            .xsmall()
+                            .ghost()
+                            .tooltip(i18n::t(i18n::Key::Cancel, cx))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.on_cancel_revision(cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some(diagnostic) = &self.revision_diagnostic {
+            content.push(
+                div()
+                    .id("revision-diagnostic")
+                    .accessibility_id("markturbo-revision-diagnostic")
+                    .text_sm()
+                    .text_color(cx.theme().warning)
+                    .child(diagnostic.clone())
+                    .into_any_element(),
+            );
+            if revision_context.is_some() && !self.revision_running {
+                content.push(
+                    h_flex()
+                        .gap(metrics::gap())
+                        .child(
+                            Button::new("revision-retry")
+                                .accessibility_id(REVISION_RETRY_ACCESSIBILITY_ID)
+                                .label(i18n::t(i18n::Key::RevisionRetry, cx))
+                                .small()
+                                .primary()
+                                .disabled(stale)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_revision(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("revision-dismiss")
+                                .accessibility_id(REVISION_DISMISS_ACCESSIBILITY_ID)
+                                .label(i18n::t(i18n::Key::RevisionDismiss, cx))
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_revision(cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        if let Some(revision) = &self.revision_result {
+            let revision_stale = !self.revision_result_is_current(revision, cx);
+            let applied_awaiting_save = self.revision_context.as_ref().is_some_and(|context| {
+                context.document_id == revision.document_id && context.applied
+            });
+            let revision_document_active = self
+                .active_document()
+                .is_some_and(|document| document.read(cx).id() == revision.document_id);
+            let can_export = revision_document_active && (!revision_stale || applied_awaiting_save);
+            if revision_stale {
+                content.push(
+                    div()
+                        .id("revision-stale")
+                        .accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)
+                        .role(gpui::Role::Label)
+                        .aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))
+                        .text_xs()
+                        .text_color(cx.theme().warning)
+                        .child(i18n::t(i18n::Key::RevisionStaleInspection, cx))
+                        .into_any_element(),
+                );
+            }
+            content.push(
+                div()
+                    .id("revision-result")
+                    .role(gpui::Role::Group)
+                    .aria_label(i18n::t(i18n::Key::RevisionResult, cx))
+                    .accessibility_id("markturbo-revision-result")
+                    .text_sm()
+                    .font_medium()
+                    .text_color(if revision_stale {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().foreground
+                    })
+                    .child(i18n::t(
+                        if applied_awaiting_save {
+                            i18n::Key::RevisionAppliedSavePending
+                        } else if revision_stale {
+                            i18n::Key::RevisionStaleInspection
+                        } else {
+                            i18n::Key::RevisionResult
+                        },
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+            content.push(
+                h_flex()
+                    .gap(metrics::gap())
+                    .flex_wrap()
+                    .child(
+                        Button::new("revision-accept-all")
+                            .accessibility_id(REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)
+                            .label(i18n::t(i18n::Key::RevisionAcceptAll, cx))
+                            .small()
+                            .primary()
+                            .disabled(revision_stale)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_all_revision_decisions(true, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("revision-reject-all")
+                            .accessibility_id(REVISION_REJECT_ALL_ACCESSIBILITY_ID)
+                            .label(i18n::t(i18n::Key::RevisionRejectAll, cx))
+                            .small()
+                            .ghost()
+                            .disabled(revision_stale)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_all_revision_decisions(false, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("revision-copy")
+                            .accessibility_id(REVISION_COPY_ACCESSIBILITY_ID)
+                            .label(i18n::t(i18n::Key::RevisionCopy, cx))
+                            .small()
+                            .outline()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.copy_revision(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("revision-apply")
+                            .accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)
+                            .label(i18n::t(i18n::Key::RevisionApply, cx))
+                            .small()
+                            .primary()
+                            .disabled(revision_stale)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_revision(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("revision-save")
+                            .accessibility_id(REVISION_SAVE_ACCESSIBILITY_ID)
+                            .label(i18n::t(i18n::Key::Save, cx))
+                            .small()
+                            .outline()
+                            .disabled(!can_export)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_revision(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("revision-save-as")
+                            .accessibility_id(REVISION_SAVE_AS_ACCESSIBILITY_ID)
+                            .label(i18n::t(i18n::Key::SaveAsPicker, cx))
+                            .small()
+                            .outline()
+                            .disabled(!can_export)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_as_revision(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("revision-dismiss-result")
+                            .accessibility_id(REVISION_RESULT_DISMISS_ACCESSIBILITY_ID)
+                            .label(i18n::t(i18n::Key::RevisionDismiss, cx))
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dismiss_revision(cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+            let proposal = revision.result.proposal();
+            for change_id in revision_change_ids(proposal) {
+                let accepted = revision
+                    .decisions
+                    .iter()
+                    .find(|(id, _)| *id == change_id)
+                    .is_some_and(|(_, accepted)| *accepted);
+                let change_hunks: Vec<_> = proposal
+                    .hunks()
+                    .iter()
+                    .filter(|hunk| hunk.change_id() == change_id)
+                    .collect();
+                let rationale = change_hunks
+                    .first()
+                    .map(|hunk| hunk.rationale().to_owned())
+                    .unwrap_or_default();
+                let change_id_for_accept = change_id;
+                let change_id_for_reject = change_id;
+                let mut group =
+                    v_flex()
+                        .id(SharedString::from(format!(
+                            "revision-change-{}",
+                            change_id.0
+                        )))
+                        .role(gpui::Role::Group)
+                        .aria_label(SharedString::from(format!(
+                            "{} {}",
+                            i18n::t(i18n::Key::RevisionChange, cx),
+                            change_id.0
+                        )))
+                        .accessibility_id(SharedString::from(format!(
+                            "markturbo-revision-change-{}",
+                            change_id.0
+                        )))
+                        .gap(metrics::gap())
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .p(metrics::inset())
+                        .child(div().text_sm().font_medium().child(format!(
+                            "{} {} · {}",
+                            i18n::t(i18n::Key::RevisionChange, cx),
+                            change_id.0,
+                            i18n::t(
+                                if accepted {
+                                    i18n::Key::RevisionChangeAccepted
+                                } else {
+                                    i18n::Key::RevisionChangeRejected
+                                },
+                                cx,
+                            )
+                        )))
+                        .child(div().text_xs().child(format!(
+                            "{}: {rationale}",
+                            i18n::t(i18n::Key::RevisionRationale, cx)
+                        )))
+                        .child(
+                            h_flex()
+                                .gap(metrics::gap())
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "revision-change-{}-accept",
+                                        change_id.0
+                                    )))
+                                    .label(i18n::t(i18n::Key::RevisionAccept, cx))
+                                    .xsmall()
+                                    .accessibility_id(SharedString::from(format!(
+                                        "markturbo-revision-change-{}-accept",
+                                        change_id.0
+                                    )))
+                                    .when(accepted, |button| button.primary())
+                                    .when(!accepted, |button| button.ghost())
+                                    .disabled(revision_stale)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_revision_decision(change_id_for_accept, true, cx);
+                                    })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "revision-change-{}-reject",
+                                        change_id.0
+                                    )))
+                                    .label(i18n::t(i18n::Key::RevisionReject, cx))
+                                    .xsmall()
+                                    .accessibility_id(SharedString::from(format!(
+                                        "markturbo-revision-change-{}-reject",
+                                        change_id.0
+                                    )))
+                                    .when(!accepted, |button| button.primary())
+                                    .when(accepted, |button| button.ghost())
+                                    .disabled(revision_stale)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_revision_decision(change_id_for_reject, false, cx);
+                                    })),
+                                ),
+                        );
+                for hunk in change_hunks {
+                    group = group.child(div().text_xs().child(format!(
+                        "{}..{}: {} -> {}",
+                        hunk.source().start,
+                        hunk.source().end,
+                        hunk.expected_source(),
+                        hunk.replacement()
+                    )));
+                }
+                content.push(group.into_any_element());
+            }
+            let preview: SharedString = self.revision_preview().unwrap_or_default().into();
+            content.push(
+                v_flex()
+                    .id("revision-preview")
+                    .role(gpui::Role::Group)
+                    .aria_label(i18n::t(i18n::Key::RevisionFinalPreview, cx))
+                    .accessibility_id("markturbo-revision-preview")
+                    .gap(metrics::gap())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .child(i18n::t(i18n::Key::RevisionFinalPreview, cx)),
+                    )
+                    .child(
+                        div()
+                            .id("revision-preview-source")
+                            .role(gpui::Role::Label)
+                            .aria_label(i18n::t(i18n::Key::RevisionFinalPreviewSource, cx))
+                            .aria_value(preview.clone())
+                            .accessibility_id("markturbo-revision-preview-source")
+                            .text_xs()
+                            .font_family("monospace")
+                            .child(preview),
+                    )
+                    .into_any_element(),
+            );
+            content.push(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} {}",
+                        revision.result.question_coverage().len(),
+                        i18n::t(i18n::Key::RevisionCoverageValidated, cx)
+                    ))
+                    .into_any_element(),
+            );
+            for coverage in revision.result.question_coverage() {
+                let status = match coverage.status() {
+                    RevisionQuestionCoverageStatus::Represented { change_ids } => {
+                        format!(
+                            "{} {:?}",
+                            i18n::t(i18n::Key::RevisionCoverageRepresented, cx),
+                            change_ids
+                        )
+                    }
+                    RevisionQuestionCoverageStatus::IntentionallyOmitted { reason } => {
+                        format!(
+                            "{}: {reason}",
+                            i18n::t(i18n::Key::RevisionCoverageIntentionallyOmitted, cx)
+                        )
+                    }
+                    RevisionQuestionCoverageStatus::NotAddressed => {
+                        i18n::t(i18n::Key::RevisionCoverageNotAddressed, cx).to_owned()
+                    }
+                };
+                content.push(
+                    div()
+                        .text_xs()
+                        .child(format!(
+                            "{} {}: {status}",
+                            i18n::t(i18n::Key::RevisionCoverageQuestion, cx),
+                            coverage.question_index()
+                        ))
+                        .into_any_element(),
+                );
+            }
+        }
+
         v_flex()
             .id("review-panel")
             .size_full()
@@ -7004,6 +9630,32 @@ impl Workspace {
                 || review_target_belongs_to_active_document
                 || review_belongs_to_active_document)
         {
+            let dismiss_review = Button::new("dismiss-review")
+                .icon(IconName::Close)
+                .xsmall()
+                .ghost()
+                .tooltip(i18n::t(i18n::Key::ReviewDismiss, cx))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.dismiss_review(cx);
+                }));
+            let review_panel = if self.review_result.is_none()
+                && !self.reviewing
+                && self.revision_context.is_none()
+                && self.review_diagnostic.is_none()
+                && self
+                    .recovered_revision_answers_for_active_document(cx)
+                    .is_some()
+            {
+                self.render_recovered_revision_panel(cx)
+            } else if self.review_result.is_none()
+                && !self.reviewing
+                && self.revision_context.is_none()
+                && self.review_diagnostic.is_none()
+            {
+                self.render_review_idle_panel(cx)
+            } else {
+                self.render_review_panel(cx)
+            };
             return Some(
                 v_flex()
                     .size_full()
@@ -7023,18 +9675,9 @@ impl Workspace {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(i18n::t(i18n::Key::Review, cx)),
                             )
-                            .child(
-                                Button::new("dismiss-review")
-                                    .icon(IconName::Close)
-                                    .xsmall()
-                                    .ghost()
-                                    .tooltip(i18n::t(i18n::Key::ReviewDismiss, cx))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.dismiss_review(cx);
-                                    })),
-                            ),
+                            .child(dismiss_review),
                     )
-                    .child(self.render_review_panel(cx))
+                    .child(review_panel)
                     .into_any_element(),
             );
         }
@@ -8708,21 +11351,27 @@ mod tests {
     // limit.
     use super::{
         DestructiveAction, DestructiveRequest, DestructiveResolution, DetailsContent,
-        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RetirementCompletion,
-        ReviewRequestBuildError, ReviewTarget, SaveAsMode, SaveAsOutcome, SaveMode, SidePanel,
-        StartupRecovery, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge, checkpoint_batch_status,
-        clamped_dragged_panel_width, current_checkpoint_write_completed, details_content,
-        document_details_status_key, elide_tab_label, next_review_lens, path_affects_harness,
-        prepare_recovery_records, resolved_workspace_panel_widths, review_anchor_offset,
+        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RecoveryContentIdentity,
+        RetirementCompletion, ReviewRequestBuildError, ReviewTarget, SaveAsMode, SaveAsOutcome,
+        SaveMode, SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge,
+        checkpoint_batch_status, clamped_dragged_panel_width, current_checkpoint_write_completed,
+        current_checkpoint_write_completed_for_identity, details_content,
+        document_details_status_key, elide_tab_label, hex_bytes, next_review_lens,
+        path_affects_harness, prepare_recovery_records, resolved_workspace_panel_widths,
+        review_anchor_offset, revision_answer_is_incorporated, revision_apply_identity_matches,
         startup_recovery_status,
     };
     use crate::fs::{FileStamp, Newline, SourceIdentity};
     use crate::i18n;
+    use crate::model::RevisionRequestBinding;
     use crate::recovery::{
         CheckpointBatchOutcome, CheckpointOutcome, CheckpointSchedule, RecoveredRecord,
         RecoveryCheckpoint, RecoveryError, RecoveryIssue, RecoveryKey, RecoveryLimits,
         RecoveryMaintenance, RecoveryMetadata, RecoveryProtector, RecoveryRecord, RecoveryScan,
-        RecoveryStore, RecoveryToken,
+        RecoveryStore, RecoveryToken, RevisionRecovery,
+    };
+    use crate::review::{
+        RevisionAnswer, RevisionAnswers, RevisionQuestionCoverageStatus, decode_revision_capture,
     };
     use crate::views::Layout;
     use crate::watcher::Change;
@@ -8731,7 +11380,11 @@ mod tests {
         AppContext as _, ClipboardItem, Context, Entity, Focusable as _, Modifiers, MouseButton,
         TestAppContext, VisualTestContext, Window, point, px,
     };
-    use mt_doc::review::{ArtifactLens, ByteRange, SourceAnchor, SourceLocation, SourceSnapshot};
+    use mt_doc::review::{
+        ArtifactLens, ByteRange, ClarificationPriority, ClarificationQuestion, ReviewModelOutput,
+        ReviewSections, SourceAnchor, SourceLocation, SourceSnapshot,
+    };
+    use mt_doc::revision::ChangeId;
 
     fn build_document_review_request(
         target: ReviewTarget,
@@ -8972,6 +11625,7 @@ mod tests {
             key: RecoveryKey::for_path(path),
             text: text.to_string(),
             metadata: RecoveryMetadata::from_loaded_file(&loaded),
+            revision: None,
         };
         store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
     }
@@ -8997,6 +11651,7 @@ mod tests {
                         source_identity: SourceIdentity::Regular,
                         decode_had_errors: false,
                     },
+                    revision: None,
                 },
                 &HashSet::new(),
             )
@@ -9184,6 +11839,7 @@ mod tests {
         RecoveryAttempt {
             token,
             revision,
+            content_identity: RecoveryContentIdentity::for_revision(revision),
             timing,
             cancelled,
         }
@@ -11833,6 +14489,7 @@ mod tests {
                     .clone()
                     .expect("a ready test store must provide a recovery token"),
                 revision: document.revision(),
+                content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                 timing: schedule.checkpoint_dispatched(now).unwrap(),
                 cancelled: Arc::new(AtomicBool::new(false)),
             };
@@ -12568,6 +15225,17 @@ mod tests {
                 workspace
                     .pending_recovery_retirements
                     .insert(key.clone(), Some(id));
+                let content_identity = workspace
+                    .recovery_schedules
+                    .get(&id)
+                    .expect("the dirty tab has a checkpoint schedule")
+                    .content_identity;
+                workspace
+                    .recovery_retirement_suppressions
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(id, content_identity);
+                workspace.schedule_recovery_timer(cx);
                 workspace.finish_discard_retirements(
                     vec![(key.clone(), Some(id))],
                     old_batch.clone(),
@@ -12590,6 +15258,341 @@ mod tests {
 
         assert!(workspace.read_with(cx, |workspace, _| workspace.tabs.is_empty()));
         assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn newer_edit_rearms_recovery_during_retirement_cleanup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit-during-retirement.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let retired_text = "retirement removes this checkpoint\n";
+        replace_document(&workspace, 0, retired_text, cx);
+        let (id, checkpoint, retired_identity) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            (
+                document.id(),
+                document.recovery_checkpoint(app),
+                state.content_identity,
+            )
+        });
+        let key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([key.clone()]))
+            .unwrap();
+        store.fail_next_delete_for_test();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.invalidate_recovery(&key, Some(id), cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace
+                    .recovery_retirement_suppressions
+                    .get(&key)
+                    .and_then(|documents| documents.get(&id)),
+                Some(&retired_identity)
+            );
+            assert!(workspace.recovery_retirements.contains_key(&key));
+        });
+
+        let new_text = "newly authored text remains recoverable\n";
+        replace_document(&workspace, 0, new_text, cx);
+        workspace.read_with(cx, |workspace, _| {
+            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert_ne!(state.content_identity, retired_identity);
+            assert_eq!(
+                workspace
+                    .recovery_retirement_suppressions
+                    .get(&key)
+                    .and_then(|documents| documents.get(&id)),
+                Some(&retired_identity),
+                "the new content must not release the old identity's suppression"
+            );
+        });
+
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(now + Duration::from_secs(2), cx);
+        });
+        cx.run_until_parked();
+
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.recovery_retirements.contains_key(&key));
+            assert!(
+                !workspace
+                    .recovery_retirement_suppressions
+                    .contains_key(&key)
+            );
+        });
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(now + Duration::from_secs(2), cx);
+        });
+        cx.run_until_parked();
+
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(recovered.records[0].record.text, new_text);
+    }
+
+    #[gpui_kit::test]
+    fn reopened_same_path_is_not_suppressed_by_retired_document(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopened-retirement.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "old document revision one\n", cx);
+        let (old_id, checkpoint, retired_identity) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            (
+                document.id(),
+                document.recovery_checkpoint(app),
+                state.content_identity,
+            )
+        });
+        let key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([key.clone()]))
+            .unwrap();
+        store.fail_next_delete_for_test();
+        workspace.update(cx, |workspace, cx| {
+            workspace.invalidate_recovery(&key, Some(old_id), cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.remove_recovery_schedule(old_id, cx),
+                Some(key.clone())
+            );
+            assert!(workspace.tabs.close(0).is_some());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.open_file(path.clone(), window, cx));
+            });
+        });
+        cx.run_until_parked();
+
+        let new_text = "new document at the same path\n";
+        replace_document(&workspace, 0, new_text, cx);
+        let (new_id, new_identity) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (
+                document.id(),
+                workspace
+                    .recovery_schedules
+                    .get(&document.id())
+                    .unwrap()
+                    .content_identity,
+            )
+        });
+        assert_ne!(new_id, old_id);
+        assert_eq!(new_identity, retired_identity);
+        workspace.read_with(cx, |workspace, _| {
+            let suppressions = workspace
+                .recovery_retirement_suppressions
+                .get(&key)
+                .unwrap();
+            assert_eq!(suppressions.get(&old_id), Some(&retired_identity));
+            assert!(!suppressions.contains_key(&new_id));
+            assert!(workspace.recovery_schedules.contains_key(&new_id));
+        });
+
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(now + Duration::from_secs(2), cx);
+        });
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.recovery_retirements.contains_key(&key));
+            assert!(
+                !workspace
+                    .recovery_retirement_suppressions
+                    .contains_key(&key)
+            );
+        });
+
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(now + Duration::from_secs(2), cx);
+        });
+        cx.run_until_parked();
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(recovered.records[0].record.text, new_text);
+    }
+
+    #[gpui_kit::test]
+    fn answers_authored_during_retirement_block_tab_close(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("answers-during-retirement.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let text = "dirty source remains open\n";
+        replace_document(&workspace, 0, text, cx);
+        let (id, checkpoint, binding) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (
+                document.id(),
+                document.recovery_checkpoint(app),
+                RevisionRequestBinding::new(
+                    [1; 32],
+                    document.revision(),
+                    0,
+                    [2; 32],
+                    [3; 32],
+                    [4; 32],
+                ),
+            )
+        });
+        let key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([key.clone()]))
+            .unwrap();
+        let batch = store.begin_retirements([key.clone()]).unwrap();
+        let completion = store.complete_retirements(batch.clone()).unwrap();
+
+        let answers_text = "preserve this answer while closing";
+        let revision_recovery = RevisionRecovery::new(
+            binding,
+            RevisionAnswers::for_recovery(vec![RevisionAnswer::answered(answers_text)]).unwrap(),
+        );
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let documents = workspace.lifecycle_documents(cx);
+                let mut request =
+                    DestructiveRequest::new(DestructiveAction::CloseTab(id), &documents);
+                assert!(matches!(
+                    request.decide(DirtyDecision::Discard, None, &documents),
+                    DestructiveResolution::Proceed(_)
+                ));
+                let content_identity = workspace
+                    .recovery_schedules
+                    .get(&id)
+                    .expect("the dirty tab has a checkpoint schedule")
+                    .content_identity;
+                workspace.pending_destructive = Some(request);
+                workspace
+                    .recovery_retirement_batches
+                    .insert(key.clone(), batch.clone());
+                workspace
+                    .recovery_retirement_suppressions
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(id, content_identity);
+                workspace
+                    .recovered_revision_records
+                    .insert(key.clone(), revision_recovery);
+                workspace
+                    .recovered_revision_documents
+                    .insert(id, key.clone());
+                workspace.finish_discard_retirements(
+                    vec![(key.clone(), Some(id))],
+                    batch.clone(),
+                    Ok(completion),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.revision_has_authored_answers_for_document(id, app));
+            assert!(
+                !workspace
+                    .recovery_retirement_suppressions
+                    .contains_key(&key)
+            );
+            assert!(
+                workspace
+                    .recovery_schedules
+                    .get(&id)
+                    .is_some_and(|state| { state.content_identity.revision_binding.is_some() })
+            );
+            let expected_status: String = i18n::t(i18n::Key::RevisionAnswersRetained, app).into();
+            assert_eq!(workspace.status.as_deref(), Some(expected_status.as_str()));
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), text);
+        });
+
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(now + Duration::from_secs(2), cx);
+        });
+        cx.run_until_parked();
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(recovered.records[0].record.text, text);
+        let revision = recovered.records[0]
+            .record
+            .revision
+            .as_ref()
+            .expect("the answer authored during retirement must be checkpointed");
+        assert_eq!(revision.answers().as_slice().len(), 1);
+        assert_eq!(
+            revision.answers().as_slice()[0],
+            RevisionAnswer::answered(answers_text)
+        );
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let documents = workspace.lifecycle_documents(cx);
+                let mut request =
+                    DestructiveRequest::new(DestructiveAction::CloseTab(id), &documents);
+                assert!(matches!(
+                    request.decide(DirtyDecision::Discard, None, &documents),
+                    DestructiveResolution::Proceed(_)
+                ));
+                workspace.resume_recovery_destructive(
+                    super::PendingStartupDestructive {
+                        request,
+                        keys: vec![(key.clone(), Some(id))],
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            assert!(workspace.revision_has_authored_answers_for_document(id, app));
+            assert!(workspace.recovery_retirement_batches.is_empty());
+            assert!(workspace.pending_startup_destructive.is_none());
+        });
     }
 
     #[gpui_kit::test]
@@ -12911,6 +15914,7 @@ mod tests {
         let attempt = super::RecoveryAttempt {
             token: new_token.clone(),
             revision: 7,
+            content_identity: super::RecoveryContentIdentity::for_revision(7),
             timing,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -12923,6 +15927,7 @@ mod tests {
                 super::DocumentRecoveryState {
                     key,
                     revision: 7,
+                    content_identity: super::RecoveryContentIdentity::for_revision(7),
                     suppressed_oversized_revision: None,
                     token: Some(new_token),
                     schedule,
@@ -12992,6 +15997,7 @@ mod tests {
                 let attempt = RecoveryAttempt {
                     token: store.activate_and_current_token(&document.recovery_key()).0,
                     revision: document.revision(),
+                    content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(now).unwrap(),
                     cancelled: if id == first_id {
                         first_cancelled.clone()
@@ -13004,6 +16010,9 @@ mod tests {
                     DocumentRecoveryState {
                         key: document.recovery_key(),
                         revision: document.revision(),
+                        content_identity: RecoveryContentIdentity::for_revision(
+                            document.revision(),
+                        ),
                         suppressed_oversized_revision: None,
                         token: Some(attempt.token.clone()),
                         schedule,
@@ -13061,6 +16070,7 @@ mod tests {
                         .clone()
                         .expect("a ready test store must provide a recovery token"),
                     revision: document.revision(),
+                    content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(now).unwrap(),
                     cancelled: Arc::new(AtomicBool::new(false)),
                 },
@@ -13148,6 +16158,7 @@ mod tests {
                 RecoveryAttempt {
                     token: state.token.clone().unwrap(),
                     revision: document.revision(),
+                    content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule
                         .checkpoint_dispatched(edited_at + Duration::from_secs(2))
                         .unwrap(),
@@ -13269,6 +16280,7 @@ mod tests {
                 RecoveryAttempt {
                     token: state.token.clone().unwrap(),
                     revision: document.revision(),
+                    content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(dispatched_at).unwrap(),
                     cancelled: Arc::new(AtomicBool::new(false)),
                 },
@@ -13322,6 +16334,7 @@ mod tests {
                 RecoveryAttempt {
                     token: state.token.clone().unwrap(),
                     revision: document.revision(),
+                    content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(dispatched_at).unwrap(),
                     cancelled: Arc::new(AtomicBool::new(false)),
                 },
@@ -13396,6 +16409,7 @@ mod tests {
         let attempt = RecoveryAttempt {
             token,
             revision,
+            content_identity: RecoveryContentIdentity::for_revision(revision),
             timing: schedule.checkpoint_dispatched(now).unwrap(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -13478,6 +16492,7 @@ mod tests {
         let attempt = RecoveryAttempt {
             token: token.clone(),
             revision,
+            content_identity: RecoveryContentIdentity::for_revision(revision),
             timing,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -13487,6 +16502,7 @@ mod tests {
                 DocumentRecoveryState {
                     key,
                     revision,
+                    content_identity: RecoveryContentIdentity::for_revision(revision),
                     suppressed_oversized_revision: None,
                     token: Some(token),
                     schedule,
@@ -13735,9 +16751,17 @@ mod tests {
         schedule.mark_dirty(now);
         let timing = schedule.checkpoint_dispatched(now).unwrap();
         schedule.mark_dirty(now + Duration::from_secs(1));
+        let stale_binding =
+            RevisionRequestBinding::new([1; 32], revision, 0, [2; 32], [3; 32], [4; 32]);
+        let current_binding =
+            RevisionRequestBinding::new([1; 32], revision, 0, [2; 32], [3; 32], [5; 32]);
         let attempt = RecoveryAttempt {
             token: token.clone(),
-            revision: revision.saturating_sub(1),
+            revision,
+            content_identity: RecoveryContentIdentity {
+                revision,
+                revision_binding: Some(stale_binding),
+            },
             timing,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -13748,6 +16772,10 @@ mod tests {
                 DocumentRecoveryState {
                     key,
                     revision,
+                    content_identity: RecoveryContentIdentity {
+                        revision,
+                        revision_binding: Some(current_binding),
+                    },
                     suppressed_oversized_revision: None,
                     token: Some(token),
                     schedule,
@@ -13794,6 +16822,7 @@ mod tests {
             key: RecoveryKey::for_path(&incoming_path),
             text: "incoming recovery text\n".into(),
             metadata: RecoveryMetadata::from_loaded_file(&crate::fs::load(&incoming_path).unwrap()),
+            revision: None,
         };
         let token = store.current_token(&incoming.key);
         let (reserved, release) = store.pause_after_eviction_reservation_for_test();
@@ -14230,6 +17259,7 @@ mod tests {
                     text: recovered_text.into(),
                     metadata: RecoveryMetadata::from_loaded_file(&loaded),
                     checkpointed_at: baseline_checkpointed_at,
+                    revision: None,
                 },
                 source_conflicted: false,
             }],
@@ -14291,6 +17321,7 @@ mod tests {
                     key: RecoveryKey::for_path(&path),
                     text: recovered.to_string(),
                     metadata: RecoveryMetadata::from_loaded_file(&loaded),
+                    revision: None,
                 },
                 &HashSet::new(),
             )
@@ -14574,6 +17605,1165 @@ mod tests {
     }
 
     #[test]
+    fn revision_answer_binding_invalidates_same_revision_checkpoint() {
+        let first_binding = RevisionRequestBinding::new([1; 32], 7, 3, [2; 32], [3; 32], [4; 32]);
+        let second_binding = RevisionRequestBinding::new([1; 32], 7, 3, [2; 32], [3; 32], [5; 32]);
+        let first = RecoveryContentIdentity {
+            revision: 7,
+            revision_binding: Some(first_binding),
+        };
+        let second = RecoveryContentIdentity {
+            revision: 7,
+            revision_binding: Some(second_binding),
+        };
+        let written = CheckpointBatchOutcome::Written;
+
+        assert_ne!(first, second);
+        assert!(current_checkpoint_write_completed_for_identity(
+            true, first, first, &written
+        ));
+        assert!(!current_checkpoint_write_completed_for_identity(
+            true, second, first, &written
+        ));
+    }
+
+    #[test]
+    fn revision_answer_retirement_requires_accepted_representation() {
+        let accepted = [(ChangeId(0), true), (ChangeId(1), true)];
+        let partial = [(ChangeId(0), true), (ChangeId(1), false)];
+        let represented = RevisionQuestionCoverageStatus::Represented {
+            change_ids: vec![ChangeId(0), ChangeId(1)],
+        };
+        let omitted = RevisionQuestionCoverageStatus::IntentionallyOmitted {
+            reason: "deliberately absent".to_owned(),
+        };
+
+        assert!(revision_answer_is_incorporated(
+            &RevisionAnswer::unanswered(),
+            None,
+            &partial
+        ));
+        assert!(revision_answer_is_incorporated(
+            &RevisionAnswer::intentionally_unspecified(),
+            Some(&omitted),
+            &partial
+        ));
+        assert!(revision_answer_is_incorporated(
+            &RevisionAnswer::answered("keep this"),
+            Some(&represented),
+            &accepted
+        ));
+        assert!(!revision_answer_is_incorporated(
+            &RevisionAnswer::answered("keep this"),
+            Some(&represented),
+            &partial
+        ));
+        assert!(!revision_answer_is_incorporated(
+            &RevisionAnswer::answered("keep this"),
+            Some(&omitted),
+            &accepted
+        ));
+    }
+
+    #[test]
+    fn revision_apply_identity_blocks_stale_save_after_decision_changes() {
+        let reject_all = [(ChangeId(0), false)];
+        let accept_all = [(ChangeId(0), true)];
+
+        assert!(revision_apply_identity_matches(
+            Some("old"),
+            Some(&reject_all),
+            "old",
+            &reject_all,
+        ));
+        assert!(!revision_apply_identity_matches(
+            Some("old"),
+            Some(&reject_all),
+            "new",
+            &accept_all,
+        ));
+        assert!(revision_apply_identity_matches(
+            Some("new"),
+            Some(&accept_all),
+            "new",
+            &accept_all,
+        ));
+        assert!(!revision_apply_identity_matches(
+            Some("new"),
+            Some(&accept_all),
+            "old",
+            &reject_all,
+        ));
+    }
+
+    #[gpui::test]
+    fn revision_recovered_answers_can_open_review_export_and_discard(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovered-answer-actions.md");
+        fs::write(&path, "# Recovery\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path);
+        let key = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).recovery_key()
+        });
+        let recovery = RevisionRecovery::new(
+            RevisionRequestBinding::new([1; 32], 7, 3, [2; 32], [3; 32], [4; 32]),
+            RevisionAnswers::for_recovery(vec![RevisionAnswer::answered("recovered answer text")])
+                .unwrap(),
+        )
+        .with_source_dirty(false);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .recovered_revision_records
+                .insert(key.clone(), recovery.clone());
+            workspace.open_review_panel(ReviewTarget::Document, cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.review_panel_open);
+            assert!(workspace.recovered_revision_records.contains_key(&key));
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.copy_recovered_revision_answers(cx);
+        });
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("recovered answers must be exported as text");
+        assert!(copied.contains("recovered answer text"));
+        let copied_json: serde_json::Value =
+            serde_json::from_str(&copied).expect("recovered answers export must be JSON");
+        assert_eq!(
+            copied_json["source_revision"],
+            serde_json::json!(recovery.binding().source_revision())
+        );
+        assert_eq!(
+            copied_json["source_generation"],
+            serde_json::json!(recovery.binding().source_generation())
+        );
+        assert_eq!(
+            copied_json["source_sha256"],
+            serde_json::json!(hex_bytes(recovery.binding().source_sha256()))
+        );
+        assert_eq!(
+            copied_json["artifact_lens_sha256"],
+            serde_json::json!(hex_bytes(recovery.binding().artifact_lens_digest()))
+        );
+        assert_eq!(
+            copied_json["review_context_sha256"],
+            serde_json::json!(hex_bytes(recovery.binding().review_context_digest()))
+        );
+        assert_eq!(
+            copied_json["answers_sha256"],
+            serde_json::json!(hex_bytes(recovery.binding().answers_digest()))
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.recovered_revision_records.contains_key(&key));
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .recovered_revision_records
+                .insert(key.clone(), recovery);
+            workspace.discard_revision_answers(cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.recovered_revision_records.contains_key(&key));
+        });
+    }
+
+    #[gpui::test]
+    fn revision_copy_rearms_dirty_source_and_clears_revision_envelope(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("copy-dirty-revision.md");
+        fs::write(&path, "disk source\n").unwrap();
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        replace_document(&workspace, 0, "dirty source survives copy\n", cx);
+        let key = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).recovery_key()
+        });
+        let recovery = RevisionRecovery::new(
+            RevisionRequestBinding::new([7; 32], 4, 2, [8; 32], [9; 32], [10; 32]),
+            RevisionAnswers::for_recovery(vec![RevisionAnswer::answered("keep intent")]).unwrap(),
+        )
+        .with_source_dirty(true);
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .recovered_revision_records
+                .insert(key.clone(), recovery);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.copy_recovered_revision_answers(cx);
+        });
+        assert!(workspace.read_with(cx, |workspace, _| {
+            workspace
+                .recovery_schedules
+                .values()
+                .any(|state| state.key == key)
+        }));
+
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(now + Duration::from_secs(1), cx);
+        });
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        assert_eq!(
+            recovered.records[0].record.text,
+            "dirty source survives copy\n"
+        );
+        assert!(recovered.records[0].record.revision.is_none());
+    }
+
+    #[gpui::test]
+    fn reject_all_apply_then_accept_save_writes_latest_preview(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("revision-save-order.md");
+        fs::write(&path, "old\n").unwrap();
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (
+                document.id(),
+                document.async_snapshot(app),
+                document.revision(),
+            )
+        });
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Prompt,
+            Some(&path),
+            "old\n",
+            None,
+            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+        )
+        .unwrap();
+        let question = ClarificationQuestion::new(
+            "Which text should be retained?",
+            ClarificationPriority::Critical,
+        );
+        let output = ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: request.scope,
+            understood_intent: ReviewSections {
+                stated_goal: "update the text".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "updated text".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![question.clone()],
+        };
+        let answer_states = vec![RevisionAnswer::answered("keep")];
+        let answers = RevisionAnswers::new(answer_states.clone()).unwrap();
+        let recovery = super::build_revision_recovery(&request, &output, &answer_states)
+            .expect("the real Review envelope must be recoverable");
+        let checkpoint = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let mut checkpoint = document.recovery_checkpoint(app);
+            checkpoint.revision = Some(recovery);
+            checkpoint
+        });
+        let old_recovery_key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([old_recovery_key.clone()]))
+            .unwrap();
+        assert_eq!(store.recover().unwrap().records.len(), 1);
+        let question_id = super::revision_question_binding_id(0, &question);
+        let raw_response = serde_json::json!({
+            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "groups": [{
+                "rationale": "Apply the requested wording",
+                "edits": [{
+                    "range": {"start": 0, "end": 3},
+                    "expected_source": "old",
+                    "replacement": "new"
+                }]
+            }],
+            "question_coverage": [{
+                "question_index": 0,
+                "question_id": question_id,
+                "status": {"kind": "represented", "change_ids": [0]}
+            }]
+        })
+        .to_string();
+        let transport = decode_revision_capture(&request, &output, &answers, &raw_response)
+            .unwrap()
+            .into_transport_result_for_test();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.revision_context = Some(super::WorkspaceRevisionContext {
+                    document_id,
+                    source_snapshot: source_snapshot.clone(),
+                    request: request.clone(),
+                    review_output: output.clone(),
+                    skill_package: None,
+                    supporting_sources_current: true,
+                    applied: false,
+                    applied_preview: None,
+                    applied_decisions: None,
+                    answers_exported: false,
+                    answer_states: vec![RevisionAnswer::answered("keep")],
+                    answer_inputs: Vec::new(),
+                });
+                workspace.revision_result = Some(super::WorkspaceRevisionResult {
+                    document_id,
+                    source_snapshot,
+                    result: transport,
+                    decisions: vec![(ChangeId(0), false)],
+                    preview: "old\n".to_owned(),
+                });
+                assert!(!workspace.apply_revision(window, cx));
+            });
+        });
+        assert_eq!(document_text(&workspace, 0, cx), "old\n");
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_revision_decision(ChangeId(0), true, cx);
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.save_revision(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(document_text(&workspace, 0, cx), "new\n");
+        let recovered = store.recover().unwrap();
+        assert!(
+            recovered
+                .records
+                .iter()
+                .all(|record| record.record.key != old_recovery_key)
+        );
+        assert!(recovered.records.is_empty());
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(path.as_path()));
+            assert!(workspace.revision_context.is_none());
+            assert!(workspace.revision_result.is_none());
+            assert!(!document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn reject_all_apply_then_accept_save_as_writes_latest_preview(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("revision-save-as-order.md");
+        let destination = directory.path().join("revision-save-as-target.md");
+        fs::write(&path, "old\n").unwrap();
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (
+                document.id(),
+                document.async_snapshot(app),
+                document.revision(),
+            )
+        });
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Prompt,
+            Some(&path),
+            "old\n",
+            None,
+            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+        )
+        .unwrap();
+        let question = ClarificationQuestion::new(
+            "Which text should be retained?",
+            ClarificationPriority::Critical,
+        );
+        let output = ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: request.scope,
+            understood_intent: ReviewSections {
+                stated_goal: "update the text".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "updated text".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![question.clone()],
+        };
+        let answer_states = vec![RevisionAnswer::answered("keep")];
+        let answers = RevisionAnswers::new(answer_states.clone()).unwrap();
+        let recovery = super::build_revision_recovery(&request, &output, &answer_states)
+            .expect("the real Review envelope must be recoverable");
+        let checkpoint = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let mut checkpoint = document.recovery_checkpoint(app);
+            checkpoint.revision = Some(recovery);
+            checkpoint
+        });
+        let old_recovery_key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([old_recovery_key.clone()]))
+            .unwrap();
+        assert_eq!(store.recover().unwrap().records.len(), 1);
+        let question_id = super::revision_question_binding_id(0, &question);
+        let raw_response = serde_json::json!({
+            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "groups": [{
+                "rationale": "Apply the requested wording",
+                "edits": [{
+                    "range": {"start": 0, "end": 3},
+                    "expected_source": "old",
+                    "replacement": "new"
+                }]
+            }],
+            "question_coverage": [{
+                "question_index": 0,
+                "question_id": question_id,
+                "status": {"kind": "represented", "change_ids": [0]}
+            }]
+        })
+        .to_string();
+        let transport = decode_revision_capture(&request, &output, &answers, &raw_response)
+            .unwrap()
+            .into_transport_result_for_test();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.revision_context = Some(super::WorkspaceRevisionContext {
+                    document_id,
+                    source_snapshot: source_snapshot.clone(),
+                    request: request.clone(),
+                    review_output: output.clone(),
+                    skill_package: None,
+                    supporting_sources_current: true,
+                    applied: false,
+                    applied_preview: None,
+                    applied_decisions: None,
+                    answers_exported: false,
+                    answer_states: vec![RevisionAnswer::answered("keep")],
+                    answer_inputs: Vec::new(),
+                });
+                workspace.revision_result = Some(super::WorkspaceRevisionResult {
+                    document_id,
+                    source_snapshot,
+                    result: transport,
+                    decisions: vec![(ChangeId(0), false)],
+                    preview: "old\n".to_owned(),
+                });
+                assert!(!workspace.apply_revision(window, cx));
+            });
+        });
+        assert_eq!(document_text(&workspace, 0, cx), "old\n");
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_revision_decision(ChangeId(0), true, cx);
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
+        cx.simulate_new_path_selection(|parent| {
+            assert_eq!(parent, directory.path());
+            Some(destination.clone())
+        });
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&path).unwrap(), b"old\n");
+        assert_eq!(fs::read(&destination).unwrap(), b"new\n");
+        let recovered = store.recover().unwrap();
+        assert!(
+            recovered
+                .records
+                .iter()
+                .all(|record| record.record.key != old_recovery_key)
+        );
+        assert!(recovered.records.is_empty());
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(destination.as_path()));
+            assert_eq!(document.text(app), "new\n");
+            assert!(workspace.revision_context.is_none());
+            assert!(workspace.revision_result.is_none());
+            assert!(!document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn revision_copy_after_apply_preserves_clipboard_when_source_turns_stale(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("revision-copy-stale.md");
+        fs::write(&path, "old\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (
+                document.id(),
+                document.async_snapshot(app),
+                document.revision(),
+            )
+        });
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Prompt,
+            Some(&path),
+            "old\n",
+            None,
+            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+        )
+        .unwrap();
+        let question = ClarificationQuestion::new(
+            "Which text should be retained?",
+            ClarificationPriority::Critical,
+        );
+        let output = ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: request.scope,
+            understood_intent: ReviewSections {
+                stated_goal: "update the text".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "updated text".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![question.clone()],
+        };
+        let answer_states = vec![RevisionAnswer::answered("keep")];
+        let answers = RevisionAnswers::new(answer_states.clone()).unwrap();
+        let question_id = super::revision_question_binding_id(0, &question);
+        let raw_response = serde_json::json!({
+            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "groups": [{
+                "rationale": "Apply the requested wording",
+                "edits": [{
+                    "range": {"start": 0, "end": 3},
+                    "expected_source": "old",
+                    "replacement": "new"
+                }]
+            }],
+            "question_coverage": [{
+                "question_index": 0,
+                "question_id": question_id,
+                "status": {"kind": "represented", "change_ids": [0]}
+            }]
+        })
+        .to_string();
+        let transport = decode_revision_capture(&request, &output, &answers, &raw_response)
+            .unwrap()
+            .into_transport_result_for_test();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.review_panel_open = true;
+                workspace.right_panel_open = true;
+                workspace.revision_context = Some(super::WorkspaceRevisionContext {
+                    document_id,
+                    source_snapshot: source_snapshot.clone(),
+                    request,
+                    review_output: output,
+                    skill_package: None,
+                    supporting_sources_current: true,
+                    applied: false,
+                    applied_preview: None,
+                    applied_decisions: None,
+                    answers_exported: false,
+                    answer_states,
+                    answer_inputs: Vec::new(),
+                });
+                workspace.revision_result = Some(super::WorkspaceRevisionResult {
+                    document_id,
+                    source_snapshot,
+                    result: transport,
+                    decisions: vec![(ChangeId(0), true)],
+                    preview: "new\n".to_owned(),
+                });
+                assert!(workspace.apply_revision(window, cx));
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.copy_revision(cx);
+        });
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("new\n".to_owned())
+        );
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), "new\n");
+            assert!(document.is_dirty());
+        });
+        assert_eq!(fs::read(&path).unwrap(), b"old\n");
+
+        replace_document(&workspace, 0, "manual edit\n", cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_owned()));
+        workspace.update(cx, |workspace, cx| {
+            workspace.copy_revision(cx);
+        });
+
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("sentinel".to_owned())
+        );
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.review_panel_open);
+            assert!(workspace.right_panel_open);
+            assert_eq!(
+                workspace.revision_diagnostic.as_deref(),
+                Some(i18n::t(i18n::Key::RevisionStale, app))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn revision_restored_answers_ignore_runtime_counters_and_mismatches_stay_quarantined(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("restored-revision.md");
+        let text = "# Restored\n\nKeep this intent.\n";
+        fs::write(&path, text).unwrap();
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let (document, document_id, recovery_key, revision, source_snapshot) =
+            workspace.read_with(cx, |workspace, app| {
+                let document = workspace.document_at(0).unwrap();
+                let document_read = document.read(app);
+                (
+                    document.clone(),
+                    document_read.id(),
+                    document_read.recovery_key(),
+                    document_read.revision(),
+                    document_read.async_snapshot(app),
+                )
+            });
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Plan,
+            Some(&path),
+            text,
+            None,
+            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+        )
+        .unwrap();
+        let output = mt_doc::review::ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: request.scope,
+            understood_intent: mt_doc::review::ReviewSections {
+                stated_goal: "preserve the document intent".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "a clearer document".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![mt_doc::review::ClarificationQuestion::new(
+                "What must remain unchanged?",
+                mt_doc::review::ClarificationPriority::High,
+            )],
+        };
+        let recovery = super::build_revision_recovery(
+            &request,
+            &output,
+            &[RevisionAnswer::answered(
+                "Keep the original intent and heading.",
+            )],
+        )
+        .unwrap();
+        let binding = recovery.binding();
+        let shifted_recovery = RevisionRecovery::new(
+            RevisionRequestBinding::new(
+                *binding.source_sha256(),
+                binding.source_revision().wrapping_add(100),
+                binding.source_generation().wrapping_add(100),
+                *binding.artifact_lens_digest(),
+                *binding.review_context_digest(),
+                *binding.answers_digest(),
+            ),
+            recovery.answers().clone(),
+        );
+        let mismatched_recovery = RevisionRecovery::new(
+            RevisionRequestBinding::new(
+                [9; 32],
+                binding.source_revision(),
+                binding.source_generation(),
+                *binding.artifact_lens_digest(),
+                *binding.review_context_digest(),
+                *binding.answers_digest(),
+            ),
+            recovery.answers().clone(),
+        );
+        let mismatched_checkpoint = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let mut checkpoint = document.recovery_checkpoint(app);
+            checkpoint.revision = Some(mismatched_recovery.clone());
+            checkpoint
+        });
+        store
+            .checkpoint(
+                &mismatched_checkpoint,
+                &HashSet::from([recovery_key.clone()]),
+            )
+            .unwrap();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace
+                    .recovered_revision_records
+                    .insert(recovery_key.clone(), shifted_recovery);
+                workspace.install_revision_context(
+                    document_id,
+                    recovery_key.clone(),
+                    source_snapshot.clone(),
+                    request.clone(),
+                    output.clone(),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            let context = workspace
+                .revision_context
+                .as_ref()
+                .expect("the revision context must be installed");
+            assert_eq!(
+                context.answer_states,
+                vec![RevisionAnswer::answered(
+                    "Keep the original intent and heading."
+                )]
+            );
+            assert_eq!(
+                context.answer_inputs[0].read(app).value().as_ref(),
+                "Keep the original intent and heading."
+            );
+            assert!(
+                !workspace
+                    .recovered_revision_records
+                    .contains_key(&recovery_key)
+            );
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace
+                    .recovered_revision_records
+                    .insert(recovery_key.clone(), mismatched_recovery.clone());
+                workspace.install_revision_context(
+                    document_id,
+                    recovery_key.clone(),
+                    source_snapshot,
+                    request,
+                    output,
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            let context = workspace
+                .revision_context
+                .as_ref()
+                .expect("the mismatched context must remain visible but unanswered");
+            assert_eq!(context.answer_states, vec![RevisionAnswer::unanswered()]);
+            assert!(context.answer_inputs[0].read(app).value().is_empty());
+            assert_eq!(
+                workspace
+                    .recovered_revision_records
+                    .get(&recovery_key)
+                    .map(RevisionRecovery::binding),
+                Some(mismatched_recovery.binding())
+            );
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.set_revision_answer_state(
+                    0,
+                    RevisionAnswer::answered("Keep the new answer."),
+                    window,
+                    cx,
+                );
+            });
+        });
+        workspace.read_with(cx, |workspace, _| {
+            let live = workspace
+                .revision_recovery_for_document(document_id, &recovery_key)
+                .expect("the live answer must supersede quarantined recovery for checkpointing");
+            assert_eq!(
+                live.answers().as_slice(),
+                &[RevisionAnswer::answered("Keep the new answer.")]
+            );
+            assert_ne!(live.binding(), mismatched_recovery.binding());
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.discard_recovered_revision_answers(cx);
+            assert!(
+                workspace
+                    .recovery_schedules
+                    .get(&document_id)
+                    .is_some_and(|state| state.key == recovery_key),
+                "retiring quarantined answers must re-arm clean documents with live answers"
+            );
+        });
+        cx.run_until_parked();
+        let now = cx.background_executor.now();
+        workspace.update(cx, |workspace, cx| {
+            workspace.checkpoint_recovery_at(now + Duration::from_secs(1), cx);
+        });
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let recovered = store.recover().unwrap();
+        assert_eq!(recovered.records.len(), 1);
+        let persisted = recovered.records[0]
+            .record
+            .revision
+            .as_ref()
+            .expect("the live Revision answers must be durable");
+        assert_eq!(
+            persisted.answers().as_slice(),
+            &[RevisionAnswer::answered("Keep the new answer.")]
+        );
+        assert_ne!(persisted.binding(), mismatched_recovery.binding());
+        let _ = document;
+    }
+
+    #[gpui::test]
+    fn revision_context_stays_bound_to_one_document_and_cancels_older_work(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.md");
+        let second_path = directory.path().join("second.md");
+        let first_text = "# First\n";
+        let second_text = "# Second\n";
+        fs::write(&first_path, first_text).unwrap();
+        fs::write(&second_path, second_text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, first_path.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second_path.clone(), window, cx);
+            });
+        });
+        let (
+            first_id,
+            first_key,
+            first_revision,
+            first_snapshot,
+            second_id,
+            second_key,
+            second_revision,
+            second_snapshot,
+        ) = workspace.read_with(cx, |workspace, app| {
+            let first = workspace.document_at(0).unwrap().read(app);
+            let second = workspace.document_at(1).unwrap().read(app);
+            (
+                first.id(),
+                first.recovery_key(),
+                first.revision(),
+                first.async_snapshot(app),
+                second.id(),
+                second.recovery_key(),
+                second.revision(),
+                second.async_snapshot(app),
+            )
+        });
+        let first_request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Plan,
+            Some(&first_path),
+            first_text,
+            None,
+            SourceSnapshot::new(first_revision, first_snapshot.source_generation()),
+        )
+        .unwrap();
+        let second_request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Plan,
+            Some(&second_path),
+            second_text,
+            None,
+            SourceSnapshot::new(second_revision, second_snapshot.source_generation()),
+        )
+        .unwrap();
+        let output_for = |scope| mt_doc::review::ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope,
+            understood_intent: mt_doc::review::ReviewSections {
+                stated_goal: "preserve the document intent".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "a clearer document".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![mt_doc::review::ClarificationQuestion::new(
+                "What must remain unchanged?",
+                mt_doc::review::ClarificationPriority::High,
+            )],
+        };
+        let first_output = output_for(first_request.scope);
+        let second_output = output_for(second_request.scope);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.install_revision_context(
+                    first_id,
+                    first_key,
+                    first_snapshot.clone(),
+                    first_request,
+                    first_output,
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+                workspace.revision_context.as_mut().unwrap().answer_states[0] =
+                    RevisionAnswer::answered("Keep the first document intent.");
+                workspace.open_review_panel(ReviewTarget::Document, cx);
+            });
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().document_id,
+                first_id
+            );
+            assert_ne!(workspace.review_target_document_id, Some(second_id));
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let previous_generation =
+            workspace.read_with(cx, |workspace, _| workspace.revision_generation);
+        workspace.update(cx, |workspace, _| {
+            workspace.revision_context.as_mut().unwrap().answer_states[0] =
+                RevisionAnswer::unanswered();
+            workspace.pending_revision = Some(super::PendingRevision {
+                cancelled: cancelled.clone(),
+                document_id: first_id,
+            });
+            workspace.revision_running = true;
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.install_revision_context(
+                    second_id,
+                    second_key,
+                    second_snapshot,
+                    second_request,
+                    second_output,
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            });
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(workspace.pending_revision.is_none());
+            assert_eq!(
+                workspace.revision_generation,
+                previous_generation.wrapping_add(1)
+            );
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().document_id,
+                second_id
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn revision_provider_failure_preserves_answer_source_and_editor_until_dismissal(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("revision-provider-failure.md");
+        fs::write(&path, "disk source\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let reviewed_text = "edited reviewed source\n";
+        replace_document(&workspace, 0, reviewed_text, cx);
+
+        let (document_id, recovery_key, source_snapshot, revision) =
+            workspace.read_with(cx, |workspace, app| {
+                let document = workspace.document_at(0).unwrap().read(app);
+                (
+                    document.id(),
+                    document.recovery_key(),
+                    document.async_snapshot(app),
+                    document.revision(),
+                )
+            });
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Prompt,
+            Some(&path),
+            reviewed_text,
+            None,
+            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+        )
+        .unwrap();
+        let question = ClarificationQuestion::new(
+            "What must remain unchanged?",
+            ClarificationPriority::Critical,
+        );
+        let output = ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: request.scope,
+            understood_intent: ReviewSections {
+                stated_goal: "preserve the requested behavior".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "an unchanged source unless approved".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![question],
+        };
+        let answer_text = "Keep the reviewed source intact.";
+        let answer = RevisionAnswer::answered(answer_text);
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.install_revision_context(
+                    document_id,
+                    recovery_key,
+                    source_snapshot.clone(),
+                    request.clone(),
+                    output,
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+                workspace.set_revision_answer_state(
+                    0,
+                    RevisionAnswer::answered(String::new()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        let input = workspace.read_with(cx, |workspace, _| {
+            workspace.revision_context.as_ref().unwrap().answer_inputs[0].clone()
+        });
+        cx.update(|window, app| {
+            input.update(app, |input, cx| input.replace_all(answer_text, window, cx));
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.on_revision_provider_failure(crate::review::RevisionError::RequestFailed, cx);
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), reviewed_text);
+            assert!(document.is_dirty());
+
+            let context = workspace
+                .revision_context
+                .as_ref()
+                .expect("provider failure must retain the reviewed answer context");
+            assert_eq!(context.document_id, document_id);
+            assert_eq!(context.source_snapshot, source_snapshot);
+            assert_eq!(context.request.snapshot, request.snapshot);
+            assert_eq!(context.answer_states, vec![answer.clone()]);
+            assert_eq!(
+                context.answer_inputs[0].read(app).value().to_string(),
+                "Keep the reviewed source intact."
+            );
+            assert!(!workspace.revision_running);
+            assert!(workspace.revision_diagnostic.is_some());
+            assert!(workspace.revision_result.is_none());
+        });
+
+        workspace.update(cx, |workspace, cx| workspace.dismiss_revision(cx));
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), reviewed_text);
+            assert!(document.is_dirty());
+            assert!(workspace.revision_diagnostic.is_none());
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().answer_states,
+                vec![answer]
+            );
+        });
+    }
+
+    #[test]
     fn checkpoint_batch_status_keeps_single_signal_messages_and_combines_both() {
         assert_eq!(checkpoint_batch_status(0, None), None);
         assert_eq!(
@@ -14639,12 +18829,14 @@ mod tests {
             let first_attempt = RecoveryAttempt {
                 token: first_token.clone(),
                 revision: first_revision,
+                content_identity: RecoveryContentIdentity::for_revision(first_revision),
                 timing: first_schedule.checkpoint_dispatched(now).unwrap(),
                 cancelled: Arc::new(AtomicBool::new(false)),
             };
             let second_attempt = RecoveryAttempt {
                 token: second_token.clone(),
                 revision: second_revision,
+                content_identity: RecoveryContentIdentity::for_revision(second_revision),
                 timing: second_schedule.checkpoint_dispatched(now).unwrap(),
                 cancelled: Arc::new(AtomicBool::new(false)),
             };
@@ -14653,6 +18845,7 @@ mod tests {
                 DocumentRecoveryState {
                     key: first_key,
                     revision: first_revision,
+                    content_identity: RecoveryContentIdentity::for_revision(first_revision),
                     suppressed_oversized_revision: None,
                     token: Some(first_token),
                     schedule: first_schedule,
@@ -14666,6 +18859,7 @@ mod tests {
                 DocumentRecoveryState {
                     key: second_key,
                     revision: second_revision,
+                    content_identity: RecoveryContentIdentity::for_revision(second_revision),
                     suppressed_oversized_revision: None,
                     token: Some(second_token),
                     schedule: second_schedule,
@@ -15349,6 +19543,7 @@ mod tests {
                     text: recovered_text.into(),
                     metadata,
                     checkpointed_at: SystemTime::now(),
+                    revision: None,
                 },
                 source_conflicted: true,
             }],
@@ -16834,7 +21029,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(checkpoint.contains("background_spawn"));
-        assert!(checkpoint.contains("recovery_checkpoint(cx)"));
+        assert!(checkpoint.contains("recovery_checkpoint_with_revision(cx, revision_recovery)"));
         assert!(checkpoint.contains("checkpoint_batch_if_current"));
         assert!(checkpoint.contains("CancellableRecoveryCheckpointAttempt"));
         assert!(checkpoint.contains("recovery_checkpoint_worker_active"));
@@ -17051,6 +21246,139 @@ mod tests {
             .0;
         assert!(watcher.contains("change.path().starts_with(&package.root)"));
         assert!(watcher.contains("review.supporting_sources_current = false"));
+        assert!(watcher.contains("context.supporting_sources_current = false"));
+
+        let commit_guard = source
+            .split_once("fn revision_result_is_current_for_commit")
+            .expect("Revision commit guard must exist")
+            .1
+            .split_once("fn set_revision_diagnostic")
+            .unwrap()
+            .0;
+        assert!(commit_guard.contains("package.revalidate().is_ok()"));
+    }
+
+    #[gpui::test]
+    fn revision_skill_supporting_changes_remain_stale_after_save(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        let support_dir = directory.path().join("references");
+        let support = support_dir.join("guide.md");
+        fs::create_dir(&support_dir).unwrap();
+        fs::write(&skill, "# Skill\n").unwrap();
+        fs::write(&support, "original support\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, skill.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(support.clone(), window, cx);
+            });
+        });
+        let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (
+                document.id(),
+                document.async_snapshot(app),
+                document.revision(),
+            )
+        });
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::AgentSkill,
+            Some(&skill),
+            "# Skill\n",
+            None,
+            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+        )
+        .unwrap();
+        let output = mt_doc::review::ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: request.scope,
+            understood_intent: mt_doc::review::ReviewSections {
+                stated_goal: "preserve the skill".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "a reviewed skill".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: Vec::new(),
+        };
+        let package = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
+            directory.path(),
+            "# Skill\n",
+            false,
+        )
+        .unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace.revision_context = Some(super::WorkspaceRevisionContext {
+                document_id,
+                source_snapshot,
+                request,
+                review_output: output,
+                skill_package: Some(package.clone()),
+                supporting_sources_current: true,
+                applied: false,
+                applied_preview: None,
+                applied_decisions: None,
+                answers_exported: false,
+                answer_states: Vec::new(),
+                answer_inputs: Vec::new(),
+            });
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(
+                directory.path(),
+                &[Change::Modified(support.clone())],
+                cx,
+            );
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace
+                    .revision_context
+                    .as_ref()
+                    .unwrap()
+                    .supporting_sources_current
+            );
+        });
+
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .revision_context
+                .as_mut()
+                .unwrap()
+                .supporting_sources_current = true;
+        });
+        replace_document(&workspace, 1, "changed support\n", cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace
+                    .revision_context
+                    .as_ref()
+                    .unwrap()
+                    .supporting_sources_current
+            );
+        });
+        let support_document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(1).cloned())
+            .unwrap();
+        support_document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+        assert!(package.revalidate().is_err());
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace
+                    .revision_context
+                    .as_ref()
+                    .unwrap()
+                    .supporting_sources_current
+            );
+        });
     }
 
     #[test]
@@ -17805,6 +22133,34 @@ mod tests {
         );
         assert!(review.contains("supporting_sources_current"));
         assert!(review.contains("self.review_result = None"));
+    }
+
+    #[test]
+    fn review_completion_cannot_replace_another_documents_authored_revision_context() {
+        let source = crate::views::production_source(include_str!("workspace.rs"));
+        let review = source
+            .split_once("fn start_review_after_preparation(")
+            .expect("Review preparation continuation must exist")
+            .1
+            .split_once("fn set_review_diagnostic")
+            .expect("Review error mapping must follow the request path")
+            .0;
+        let guard = review
+            .find("revision_context_has_authored_answers_for_other_document")
+            .expect("Review completion must preserve another document's authored answers");
+        let replace = review
+            .find("this.review_result = Some")
+            .expect("Review completion must publish its result");
+        assert!(guard < replace);
+
+        let install = source
+            .split_once("fn install_revision_context")
+            .expect("Revision context installer must exist")
+            .1
+            .split_once("fn on_revision_answer_input")
+            .unwrap()
+            .0;
+        assert!(install.contains("self.cancel_pending_revision(cx)"));
     }
 
     #[test]
