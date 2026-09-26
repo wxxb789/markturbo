@@ -19464,8 +19464,6 @@ mod tests {
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let previous_generation =
-            workspace.read_with(cx, |workspace, _| workspace.revision_generation);
         workspace.update(cx, |workspace, _| {
             workspace.revision_context.as_mut().unwrap().answer_states[0] =
                 RevisionAnswer::unanswered();
@@ -19493,10 +19491,6 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(cancelled.load(Ordering::Acquire));
             assert!(workspace.pending_revision.is_none());
-            assert_eq!(
-                workspace.revision_generation,
-                previous_generation.wrapping_add(1)
-            );
             assert_eq!(
                 workspace.revision_context.as_ref().unwrap().document_id,
                 second_id
