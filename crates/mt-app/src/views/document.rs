@@ -3615,6 +3615,16 @@ mod tests {
         });
         assert_eq!(edited_events.get(), 3);
         assert_eq!(dirty_events.get(), 3);
+
+        std::fs::write(&path, b"external writer\n").expect("external modification after Apply");
+        let saved = document.update(cx, |document, cx| document.save(SaveMode::Normal, cx));
+        assert!(!saved, "normal Save must refuse the newer disk version");
+        assert_eq!(std::fs::read(&path).unwrap(), b"external writer\n");
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), stale_text);
+            assert!(document.is_dirty());
+            assert!(document.is_externally_changed());
+        });
     }
 
     #[gpui::test]

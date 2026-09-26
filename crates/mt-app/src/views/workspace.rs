@@ -9242,6 +9242,7 @@ impl Workspace {
                 content.push(
                     div()
                         .id("revision-stale")
+                        .test_support()
                         .accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)
                         .role(gpui::Role::Label)
                         .aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))
@@ -18199,6 +18200,26 @@ mod tests {
             workspace.update(app, |workspace, cx| {
                 workspace.review_panel_open = true;
                 workspace.right_panel_open = true;
+                workspace.review_result = Some(super::WorkspaceReviewResult {
+                    document_id,
+                    source_snapshot: source_snapshot.clone(),
+                    target: ReviewTarget::Document,
+                    selection: None,
+                    lens: ArtifactLens::Prompt,
+                    partial: false,
+                    skill_package: None,
+                    supporting_sources_current: true,
+                    result: crate::review::ReviewTransportResult {
+                        result: mt_doc::review::ReviewResult::ready(&request, output.clone())
+                            .unwrap(),
+                        metadata: crate::review::ReviewMetadata::from_response(
+                            crate::model::Provider::OpenAiResponses,
+                            "test-model",
+                            "test-model",
+                        )
+                        .unwrap(),
+                    },
+                });
                 workspace.revision_context = Some(super::WorkspaceRevisionContext {
                     document_id,
                     source_snapshot: source_snapshot.clone(),
@@ -18257,6 +18278,20 @@ mod tests {
                 Some(i18n::t(i18n::Key::RevisionStale, app))
             );
         });
+        cx.update(|window, app| {
+            use gpui_kit::test::TestWindowExt as _;
+
+            window.render_frame(app);
+            let stale = window.find("revision-stale");
+            assert!(stale.visible());
+            assert_eq!(
+                stale.label(),
+                Some(i18n::t(i18n::Key::RevisionStaleInspection, app))
+            );
+            window.click("revision-apply", app);
+        });
+        cx.run_until_parked();
+        assert_eq!(document_text(&workspace, 0, cx), "manual edit\n");
     }
 
     #[gpui::test]
