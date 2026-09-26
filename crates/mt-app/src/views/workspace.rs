@@ -978,6 +978,12 @@ pub struct Workspace {
     pending_revision_recoveries: HashMap<RecoveryKey, (DocumentId, RevisionRecovery)>,
     /// Present while Save / Discard / Cancel is resolving a destructive action.
     pending_destructive: Option<DestructiveRequest>,
+    /// Invalidates path-picker and Replace callbacks from superseded requests.
+    save_as_request_generation: u64,
+    /// Distinguishes a later explicit Apply, including a reject-all no-op.
+    revision_approval_epoch: u64,
+    /// The active ticket and its origin-specific write authorization.
+    pending_save_as: Option<PendingSaveAsRequest>,
     /// True after close is authorized and while the focused platform input
     /// handler drains across the final rendered frame.
     window_close_pending: bool,
@@ -1065,6 +1071,30 @@ struct WorkspaceRevisionResult {
     result: RevisionTransportResult,
     decisions: Vec<(ChangeId, bool)>,
     preview: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveAsRequestOrigin {
+    Normal,
+    Destructive,
+    Revision,
+}
+
+/// Compact identity of the explicit Apply authorized for a Revision Save As.
+#[derive(Clone, Copy)]
+struct RevisionSaveAsApproval {
+    source_stamp: (u64, u64),
+    revision_generation: u64,
+    approval_epoch: u64,
+}
+
+/// The sole Save As request allowed to consume an asynchronous picker answer.
+#[derive(Clone, Copy)]
+struct PendingSaveAsRequest {
+    ticket: u64,
+    document_id: DocumentId,
+    origin: SaveAsRequestOrigin,
+    revision_approval: Option<RevisionSaveAsApproval>,
 }
 
 /// Immutable identity of one in-flight Revision. Like Review cancellation,
@@ -2546,6 +2576,9 @@ impl Workspace {
             recovered_revision_documents: HashMap::new(),
             pending_revision_recoveries: HashMap::new(),
             pending_destructive: None,
+            save_as_request_generation: 0,
+            revision_approval_epoch: 0,
+            pending_save_as: None,
             window_close_pending: false,
             window_close_ready: false,
             pending_startup_destructive: None,
@@ -3797,7 +3830,7 @@ impl Workspace {
             // A memory buffer has no normal Save destination. Keep the exact
             // request alive until Save As writes the snapshot the user chose.
             self.pending_destructive = Some(request);
-            self.prompt_save_as(document.read(cx).id(), window, cx);
+            self.prompt_destructive_save_as(document.read(cx).id(), window, cx);
             return;
         }
         let save_succeeded = current_document.is_some_and(|document| {
@@ -4302,6 +4335,15 @@ impl Workspace {
         // reach this only after the destructive interlock has granted access.
         let recovery_id = self.document_at(ix).map(|document| document.read(cx).id());
         if let Some(id) = recovery_id {
+            if let Some(request) = self
+                .pending_save_as
+                .filter(|request| request.document_id == id)
+            {
+                self.pending_save_as = None;
+                if request.origin == SaveAsRequestOrigin::Destructive {
+                    self.pending_destructive_recovery.clear();
+                }
+            }
             // A close is the last intentional lifecycle decision for this
             // buffer. Cancel its deadline before invalidating any checkpoint
             // capability held by an already-running worker.
@@ -5689,9 +5731,30 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.start_save_as_picker(id, SaveAsRequestOrigin::Normal, None, window, cx);
+    }
+
+    fn prompt_destructive_save_as(
+        &mut self,
+        id: crate::lifecycle::DocumentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_save_as_picker(id, SaveAsRequestOrigin::Destructive, None, window, cx);
+    }
+
+    fn start_save_as_picker(
+        &mut self,
+        id: DocumentId,
+        origin: SaveAsRequestOrigin,
+        revision_approval: Option<RevisionSaveAsApproval>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(document) = self.document_by_id(id, cx) else {
             return;
         };
+        let ticket = self.begin_save_as_request(id, origin, revision_approval);
         let source = document.read(cx).source_path().map(Path::to_path_buf);
         let directory = source
             .as_deref()
@@ -5711,7 +5774,7 @@ impl Workspace {
             let path = path.await.ok().and_then(Result::ok).flatten();
             loop {
                 if crate::views::try_update_in(&this, cx, |this, window, cx| {
-                    this.finish_save_as_selection(id, path.clone(), window, cx);
+                    this.finish_save_as_selection_for_request(id, ticket, path.clone(), window, cx);
                 })
                 .is_some()
                 {
@@ -5728,6 +5791,59 @@ impl Workspace {
         .detach();
     }
 
+    fn begin_save_as_request(
+        &mut self,
+        document_id: DocumentId,
+        origin: SaveAsRequestOrigin,
+        revision_approval: Option<RevisionSaveAsApproval>,
+    ) -> u64 {
+        if let Some(previous) = self.pending_save_as
+            && previous.origin == SaveAsRequestOrigin::Destructive
+            && origin != SaveAsRequestOrigin::Destructive
+        {
+            self.cancel_pending_destructive_save_as(previous.document_id);
+        }
+        self.save_as_request_generation = self.save_as_request_generation.wrapping_add(1);
+        let ticket = self.save_as_request_generation;
+        self.pending_save_as = Some(PendingSaveAsRequest {
+            ticket,
+            document_id,
+            origin,
+            revision_approval,
+        });
+        ticket
+    }
+
+    fn save_as_request_is_current(&self, document_id: DocumentId, ticket: u64) -> bool {
+        self.pending_save_as
+            .is_some_and(|request| request.document_id == document_id && request.ticket == ticket)
+    }
+
+    fn current_save_as_request(&self, document_id: DocumentId) -> Option<PendingSaveAsRequest> {
+        self.pending_save_as
+            .filter(|request| request.document_id == document_id)
+    }
+
+    fn clear_save_as_request(&mut self, document_id: DocumentId, ticket: u64) {
+        if self.save_as_request_is_current(document_id, ticket) {
+            self.pending_save_as = None;
+        }
+    }
+
+    fn cancel_save_as_request(&mut self, document_id: DocumentId, ticket: u64) {
+        let Some(request) = self
+            .pending_save_as
+            .filter(|request| request.document_id == document_id && request.ticket == ticket)
+        else {
+            return;
+        };
+        self.pending_save_as = None;
+        if request.origin == SaveAsRequestOrigin::Destructive {
+            self.cancel_pending_destructive_save_as(document_id);
+        }
+    }
+
+    #[cfg(test)]
     fn finish_save_as_selection(
         &mut self,
         id: crate::lifecycle::DocumentId,
@@ -5737,21 +5853,55 @@ impl Workspace {
     ) {
         match path {
             Some(path) => self.finish_save_as(id, path, SaveAsMode::CreateOnly, window, cx),
-            None => self.cancel_pending_destructive_save_as(id),
+            None => {
+                if let Some(request) = self.current_save_as_request(id) {
+                    self.cancel_save_as_request(id, request.ticket);
+                } else {
+                    self.cancel_pending_destructive_save_as(id);
+                }
+            }
+        }
+    }
+
+    fn finish_save_as_selection_for_request(
+        &mut self,
+        id: DocumentId,
+        ticket: u64,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.save_as_request_is_current(id, ticket) {
+            return;
+        }
+        match path {
+            Some(path) => self.finish_save_as_for_request(
+                id,
+                ticket,
+                path,
+                SaveAsMode::CreateOnly,
+                window,
+                cx,
+            ),
+            None => self.cancel_save_as_request(id, ticket),
         }
     }
 
     fn prompt_save_as_overwrite(
         &mut self,
-        id: crate::lifecycle::DocumentId,
+        id: DocumentId,
+        ticket: u64,
         path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.save_as_request_is_current(id, ticket) {
+            return;
+        }
         let authorization = match fs::SaveAsOverwriteAuthorization::capture(&path) {
             Ok(authorization) => Arc::new(authorization),
             Err(error) => {
-                self.cancel_pending_destructive_save_as(id);
+                self.cancel_save_as_request(id, ticket);
                 self.set_status(format!("Save As failed: {error}"), cx);
                 return;
             }
@@ -5772,16 +5922,20 @@ impl Workspace {
             let replace = answer.await.unwrap_or(1) == 0;
             loop {
                 if crate::views::try_update_in(&this, cx, |this, window, cx| {
+                    if !this.save_as_request_is_current(id, ticket) {
+                        return;
+                    }
                     if replace {
-                        this.finish_save_as(
+                        this.finish_save_as_for_request(
                             id,
+                            ticket,
                             path.clone(),
                             SaveAsMode::Overwrite(authorization.clone()),
                             window,
                             cx,
                         );
                     } else {
-                        this.cancel_pending_destructive_save_as(id);
+                        this.cancel_save_as_request(id, ticket);
                     }
                 })
                 .is_some()
@@ -5799,20 +5953,55 @@ impl Workspace {
         .detach();
     }
 
+    #[cfg(test)]
     fn finish_save_as(
         &mut self,
-        id: crate::lifecycle::DocumentId,
+        id: DocumentId,
         path: PathBuf,
         mode: SaveAsMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ticket = self.current_save_as_request(id).map_or_else(
+            || {
+                let origin = if self
+                    .pending_destructive
+                    .as_ref()
+                    .and_then(DestructiveRequest::current)
+                    == Some(id)
+                {
+                    SaveAsRequestOrigin::Destructive
+                } else {
+                    SaveAsRequestOrigin::Normal
+                };
+                self.begin_save_as_request(id, origin, None)
+            },
+            |request| request.ticket,
+        );
+        self.finish_save_as_for_request(id, ticket, path, mode, window, cx);
+    }
+
+    fn finish_save_as_for_request(
+        &mut self,
+        id: DocumentId,
+        ticket: u64,
+        path: PathBuf,
+        mode: SaveAsMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.save_as_request_is_current(id, ticket) {
+            return;
+        }
+        let request = self
+            .current_save_as_request(id)
+            .expect("the Save As ticket must remain current during a UI update");
         let Some(ix) = self.document_index(id, cx) else {
-            self.cancel_pending_destructive_save_as(id);
+            self.cancel_save_as_request(id, ticket);
             return;
         };
         if !self.save_as_snapshot_is_current(id, cx) {
-            self.cancel_pending_destructive_save_as(id);
+            self.cancel_save_as_request(id, ticket);
             self.set_status(i18n::save_as_snapshot_changed_message(cx).into(), cx);
             return;
         }
@@ -5822,7 +6011,7 @@ impl Workspace {
                     .path()
                     .is_some_and(|candidate| paths_match(candidate, &path))
         }) {
-            self.cancel_pending_destructive_save_as(id);
+            self.cancel_save_as_request(id, ticket);
             self.set_status(i18n::save_as_path_already_open_message(&path, cx), cx);
             return;
         }
@@ -5832,14 +6021,25 @@ impl Workspace {
             (
                 document.source_path().map(Path::to_path_buf),
                 document.recovery_key(),
-                document.source_snapshot(cx),
+                (request.origin == SaveAsRequestOrigin::Destructive)
+                    .then(|| document.source_snapshot(cx)),
             )
         };
         let create_only = mode == SaveAsMode::CreateOnly;
+        if !self.save_as_request_is_current(id, ticket) {
+            return;
+        }
+        if request.origin == SaveAsRequestOrigin::Revision
+            && !self.revision_save_as_approval_is_current(request, cx)
+        {
+            self.reject_stale_revision_save_as(request, cx);
+            return;
+        }
         self.save_as_recovery_keys
             .insert(id, old_recovery_key.clone());
         match document.update(cx, |document, cx| document.save_as(&path, mode, cx)) {
             SaveAsOutcome::Saved => {
+                self.clear_save_as_request(id, ticket);
                 self.tabs
                     .replace_identity(ix, TabIdentity::File(path.clone()));
                 if let Some(old_path) = old_path {
@@ -5857,23 +6057,67 @@ impl Workspace {
                 self.record_visit(path, 0);
                 self.web_dirty(cx);
                 self.clear_revision_after_save(id, cx);
-                self.complete_pending_destructive_save_as(
-                    id,
-                    saved_snapshot,
-                    old_recovery_key,
-                    window,
-                    cx,
-                );
+                if request.origin == SaveAsRequestOrigin::Destructive {
+                    self.complete_pending_destructive_save_as(
+                        id,
+                        saved_snapshot.expect("destructive Save As captures its close snapshot"),
+                        old_recovery_key,
+                        window,
+                        cx,
+                    );
+                }
                 cx.notify();
             }
             SaveAsOutcome::DestinationExists if create_only => {
                 self.save_as_recovery_keys.remove(&id);
-                self.prompt_save_as_overwrite(id, path, window, cx);
+                self.prompt_save_as_overwrite(id, ticket, path, window, cx);
             }
             SaveAsOutcome::DestinationExists | SaveAsOutcome::Failed => {
                 self.save_as_recovery_keys.remove(&id);
-                self.cancel_pending_destructive_save_as(id);
+                self.cancel_save_as_request(id, ticket);
             }
+        }
+    }
+
+    fn revision_save_as_approval_is_current(
+        &mut self,
+        request: PendingSaveAsRequest,
+        cx: &Context<Self>,
+    ) -> bool {
+        let Some(approval) = request.revision_approval else {
+            return false;
+        };
+        if request.origin != SaveAsRequestOrigin::Revision
+            || self.revision_generation != approval.revision_generation
+            || self.revision_approval_epoch != approval.approval_epoch
+        {
+            return false;
+        }
+        let Some(document) = self.document_by_id(request.document_id, cx) else {
+            return false;
+        };
+        document.read(cx).source_stamp() == approval.source_stamp
+            && self.revision_applied_state_is_current_for_document(request.document_id, cx)
+    }
+
+    fn reject_stale_revision_save_as(
+        &mut self,
+        request: PendingSaveAsRequest,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_save_as_request(request.document_id, request.ticket);
+        if let Some(approval) = request.revision_approval
+            && self.revision_generation == approval.revision_generation
+            && self.revision_approval_epoch == approval.approval_epoch
+            && self
+                .revision_context
+                .as_ref()
+                .is_some_and(|context| context.document_id == request.document_id)
+        {
+            if let Some(context) = &mut self.revision_context {
+                Self::clear_revision_applied_state(context);
+            }
+            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
         }
     }
 
@@ -6218,6 +6462,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.cancel_pending_revision(cx);
+        // A newly installed Review context cannot inherit an older Save As
+        // approval, even when it belongs to the same document and text.
+        self.revision_generation = self.revision_generation.wrapping_add(1);
         self.revision_answer_subscriptions.clear();
         let mut answer_inputs = Vec::with_capacity(review_output.clarification_questions.len());
         for _ in 0..review_output.clarification_questions.len() {
@@ -6865,11 +7112,11 @@ impl Workspace {
         context.applied_decisions = Some(decisions.to_vec());
     }
 
-    fn revision_applied_state_is_current_for_commit(&mut self, cx: &Context<Self>) -> bool {
+    fn revision_applied_state_is_current_for_render(&self, cx: &Context<Self>) -> bool {
         let Some(context) = self
             .revision_context
             .as_ref()
-            .filter(|context| context.applied)
+            .filter(|context| context.applied && context.supporting_sources_current)
         else {
             return false;
         };
@@ -6883,8 +7130,53 @@ impl Workspace {
         let Some(document) = self.active_document() else {
             return false;
         };
+        let document = document.read(cx);
+        // Document edits clear this cached state; Save revalidates the exact text.
+        document.id() == context.document_id
+            && revision_apply_identity_matches(
+                context.applied_preview.as_deref(),
+                context.applied_decisions.as_deref(),
+                &revision.preview,
+                &revision.decisions,
+            )
+    }
+
+    /// Interactive Revision actions are scoped to the currently active tab.
+    fn revision_applied_state_is_current_for_commit(&mut self, cx: &Context<Self>) -> bool {
+        let Some(document_id) = self
+            .active_document()
+            .map(|document| document.read(cx).id())
+        else {
+            return false;
+        };
+        self.revision_applied_state_is_current_for_document(document_id, cx)
+    }
+
+    /// Async Save As continuations stay bound to their captured tab if focus moves.
+    fn revision_applied_state_is_current_for_document(
+        &mut self,
+        document_id: DocumentId,
+        cx: &Context<Self>,
+    ) -> bool {
+        let Some(context) = self
+            .revision_context
+            .as_ref()
+            .filter(|context| context.applied && context.document_id == document_id)
+        else {
+            return false;
+        };
+        let Some(revision) = self
+            .revision_result
+            .as_ref()
+            .filter(|revision| revision.document_id == context.document_id)
+        else {
+            return false;
+        };
+        let Some(document) = self.document_by_id(document_id, cx) else {
+            return false;
+        };
         if document.read(cx).id() != context.document_id
-            || document.read(cx).text(cx) != revision.preview
+            || !document.read(cx).text_matches(&revision.preview, cx)
             || !revision_apply_identity_matches(
                 context.applied_preview.as_deref(),
                 context.applied_decisions.as_deref(),
@@ -7277,6 +7569,7 @@ impl Workspace {
                 if let Some(context) = &mut self.revision_context {
                     Self::mark_revision_applied(context, &preview, &decisions);
                 }
+                self.revision_approval_epoch = self.revision_approval_epoch.wrapping_add(1);
                 self.revision_diagnostic = None;
                 self.set_status(i18n::t(i18n::Key::RevisionApplied, cx).into(), cx);
                 true
@@ -7288,6 +7581,7 @@ impl Workspace {
                     // Save and Save As still cross the normal safe boundary.
                     Self::mark_revision_applied(context, &preview, &decisions);
                 }
+                self.revision_approval_epoch = self.revision_approval_epoch.wrapping_add(1);
                 self.set_status(i18n::t(i18n::Key::RevisionNoApprovedChanges, cx).into(), cx);
                 false
             }
@@ -7339,40 +7633,30 @@ impl Workspace {
             self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
             return;
         }
-        if self
+        if !self
             .revision_context
             .as_ref()
             .is_some_and(|context| context.applied)
         {
-            if self.revision_applied_state_is_current_for_commit(cx) {
-                self.on_save(&Save, window, cx);
+            return;
+        }
+        if self.revision_applied_state_is_current_for_commit(cx) {
+            let Some(document) = self.document_by_id(document_id, cx) else {
                 return;
+            };
+            if document.read(cx).is_on_disk() {
+                self.on_save(&Save, window, cx);
+            } else {
+                // DocumentView::save would emit SaveAsRequested and lose this
+                // approval's binding in the ordinary SaveAs picker.
+                self.start_revision_save_as_picker(document_id, window, cx);
             }
-            if let Some(context) = &mut self.revision_context {
-                Self::clear_revision_applied_state(context);
-            }
+            return;
         }
-        if self.apply_revision(window, cx)
-            || self
-                .revision_context
-                .as_ref()
-                .is_some_and(|context| context.applied)
-        {
-            // `replace_all` publishes the editor Change after this action
-            // returns. Save on the next UI update so that event establishes
-            // the approved preview as the document's current dirty revision
-            // before the normal safe save path clears it.
-            cx.defer_in(window, |this, window, cx| {
-                if this.revision_applied_state_is_current_for_commit(cx) {
-                    this.on_save(&Save, window, cx);
-                } else {
-                    if let Some(context) = &mut this.revision_context {
-                        Self::clear_revision_applied_state(context);
-                    }
-                    this.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
-                }
-            });
+        if let Some(context) = &mut self.revision_context {
+            Self::clear_revision_applied_state(context);
         }
+        self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
     }
 
     fn save_as_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7390,27 +7674,44 @@ impl Workspace {
             self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
             return;
         }
-        if self
+        if !self
             .revision_context
             .as_ref()
             .is_some_and(|context| context.applied)
         {
-            if self.revision_applied_state_is_current_for_commit(cx) {
-                self.on_save_as(&SaveAs, window, cx);
-                return;
-            }
-            if let Some(context) = &mut self.revision_context {
-                Self::clear_revision_applied_state(context);
-            }
+            return;
         }
-        if self.apply_revision(window, cx)
-            || self
-                .revision_context
-                .as_ref()
-                .is_some_and(|context| context.applied)
-        {
-            self.on_save_as(&SaveAs, window, cx);
+        if self.revision_applied_state_is_current_for_commit(cx) {
+            self.start_revision_save_as_picker(document_id, window, cx);
+            return;
         }
+        if let Some(context) = &mut self.revision_context {
+            Self::clear_revision_applied_state(context);
+        }
+        self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
+    }
+
+    fn start_revision_save_as_picker(
+        &mut self,
+        document_id: DocumentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(document) = self.document_by_id(document_id, cx) else {
+            return;
+        };
+        let approval = RevisionSaveAsApproval {
+            source_stamp: document.read(cx).source_stamp(),
+            revision_generation: self.revision_generation,
+            approval_epoch: self.revision_approval_epoch,
+        };
+        self.start_save_as_picker(
+            document_id,
+            SaveAsRequestOrigin::Revision,
+            Some(approval),
+            window,
+            cx,
+        );
     }
 
     /// Continue Review after the potentially expensive Agent Skill inventory
@@ -9229,15 +9530,9 @@ impl Workspace {
                 );
             }
         }
+        let applied_awaiting_save = self.revision_applied_state_is_current_for_render(cx);
         if let Some(revision) = &self.revision_result {
             let revision_stale = !self.revision_result_is_current(revision, cx);
-            let applied_awaiting_save = self.revision_context.as_ref().is_some_and(|context| {
-                context.document_id == revision.document_id && context.applied
-            });
-            let revision_document_active = self
-                .active_document()
-                .is_some_and(|document| document.read(cx).id() == revision.document_id);
-            let can_export = revision_document_active && (!revision_stale || applied_awaiting_save);
             if revision_stale {
                 content.push(
                     div()
@@ -9330,7 +9625,7 @@ impl Workspace {
                             .label(i18n::t(i18n::Key::Save, cx))
                             .small()
                             .outline()
-                            .disabled(!can_export)
+                            .disabled(!applied_awaiting_save)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_revision(window, cx);
                             })),
@@ -9341,7 +9636,7 @@ impl Workspace {
                             .label(i18n::t(i18n::Key::SaveAsPicker, cx))
                             .small()
                             .outline()
-                            .disabled(!can_export)
+                            .disabled(!applied_awaiting_save)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_as_revision(window, cx);
                             })),
@@ -17957,6 +18252,38 @@ mod tests {
         });
         cx.run_until_parked();
 
+        assert_eq!(fs::read(&path).unwrap(), b"old\n");
+        assert_eq!(document_text(&workspace, 0, cx), "old\n");
+        let pre_apply_recovered = store.recover().unwrap();
+        assert!(
+            pre_apply_recovered
+                .records
+                .iter()
+                .any(|record| record.record.key == old_recovery_key)
+        );
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert!(!document.is_dirty());
+            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert!(workspace.revision_result.is_some());
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.apply_revision(window, cx));
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.document_at(0).unwrap().read(app).is_dirty());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.save_revision(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
         assert_eq!(fs::read(&path).unwrap(), b"new\n");
         assert_eq!(document_text(&workspace, 0, cx), "new\n");
         let recovered = store.recover().unwrap();
@@ -18101,6 +18428,40 @@ mod tests {
                 workspace.save_as_revision(window, cx);
             });
         });
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&path).unwrap(), b"old\n");
+        assert!(!destination.exists());
+        assert_eq!(document_text(&workspace, 0, cx), "old\n");
+        let pre_apply_recovered = store.recover().unwrap();
+        assert!(
+            pre_apply_recovered
+                .records
+                .iter()
+                .any(|record| record.record.key == old_recovery_key)
+        );
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.source_path(), Some(path.as_path()));
+            assert!(!document.is_dirty());
+            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert!(workspace.revision_result.is_some());
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.apply_revision(window, cx));
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.document_at(0).unwrap().read(app).is_dirty());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
         cx.simulate_new_path_selection(|parent| {
             assert_eq!(parent, directory.path());
             Some(destination.clone())
@@ -18124,6 +18485,472 @@ mod tests {
             assert!(workspace.revision_context.is_none());
             assert!(workspace.revision_result.is_none());
             assert!(!document.is_dirty());
+        });
+    }
+
+    fn prepare_reject_all_revision_for_save_as(
+        workspace: &Entity<Workspace>,
+        path: Option<&Path>,
+        store: &RecoveryStore,
+        cx: &mut VisualTestContext,
+    ) -> (super::DocumentId, RecoveryKey) {
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery = Some(store.clone());
+        });
+        let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            (
+                document.id(),
+                document.async_snapshot(app),
+                document.revision(),
+            )
+        });
+        let request = build_document_review_request(
+            ReviewTarget::Document,
+            ArtifactLens::Prompt,
+            path,
+            "old\n",
+            None,
+            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+        )
+        .unwrap();
+        let question = ClarificationQuestion::new(
+            "Which text should be retained?",
+            ClarificationPriority::Critical,
+        );
+        let output = ReviewModelOutput {
+            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: request.scope,
+            understood_intent: ReviewSections {
+                stated_goal: "update the text".into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "updated text".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![question.clone()],
+        };
+        let answer_states = vec![RevisionAnswer::answered("keep")];
+        let answers = RevisionAnswers::new(answer_states.clone()).unwrap();
+        let recovery = super::build_revision_recovery(&request, &output, &answer_states)
+            .expect("the Review envelope must preserve the authored answer");
+        let checkpoint = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            let mut checkpoint = document.recovery_checkpoint(app);
+            checkpoint.revision = Some(recovery);
+            checkpoint
+        });
+        let recovery_key = checkpoint.key.clone();
+        store
+            .checkpoint(&checkpoint, &HashSet::from([recovery_key.clone()]))
+            .unwrap();
+        let question_id = super::revision_question_binding_id(0, &question);
+        let raw_response = serde_json::json!({
+            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "groups": [{
+                "rationale": "Apply the requested wording",
+                "edits": [{
+                    "range": {"start": 0, "end": 3},
+                    "expected_source": "old",
+                    "replacement": "new"
+                }]
+            }],
+            "question_coverage": [{
+                "question_index": 0,
+                "question_id": question_id,
+                "status": {"kind": "represented", "change_ids": [0]}
+            }]
+        })
+        .to_string();
+        let transport = decode_revision_capture(&request, &output, &answers, &raw_response)
+            .unwrap()
+            .into_transport_result_for_test();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.revision_context = Some(super::WorkspaceRevisionContext {
+                    document_id,
+                    source_snapshot: source_snapshot.clone(),
+                    request: request.clone(),
+                    review_output: output.clone(),
+                    skill_package: None,
+                    supporting_sources_current: true,
+                    applied: false,
+                    applied_preview: None,
+                    applied_decisions: None,
+                    answers_exported: false,
+                    answer_states: answer_states.clone(),
+                    answer_inputs: Vec::new(),
+                });
+                workspace.revision_result = Some(super::WorkspaceRevisionResult {
+                    document_id,
+                    source_snapshot,
+                    result: transport,
+                    decisions: vec![(ChangeId(0), false)],
+                    preview: "old\n".to_owned(),
+                });
+                assert!(!workspace.apply_revision(window, cx));
+            });
+        });
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), "old\n");
+            assert_eq!(document.is_dirty(), path.is_none());
+            assert!(workspace.revision_context.as_ref().unwrap().applied);
+        });
+        (document_id, recovery_key)
+    }
+
+    fn add_secondary_memory_tab(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> crate::lifecycle::DocumentId {
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.new_memory("other tab\n".to_owned(), window, cx);
+                workspace
+                    .active_document()
+                    .expect("the secondary memory tab becomes active")
+                    .read(cx)
+                    .id()
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn revision_save_as_rejects_clean_reload_during_picker_and_replace(cx: &mut TestAppContext) {
+        let picker_directory = tempfile::tempdir().unwrap();
+        let picker_source = picker_directory.path().join("picker-source.md");
+        let picker_destination = picker_directory.path().join("picker-output.md");
+        fs::write(&picker_source, "old\n").unwrap();
+        let picker_store = RecoveryStore::new_at(
+            picker_directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (picker_workspace, cx) = open_test_workspace(cx, picker_source.clone());
+        let (picker_document_id, picker_recovery_key) = prepare_reject_all_revision_for_save_as(
+            &picker_workspace,
+            Some(&picker_source),
+            &picker_store,
+            cx,
+        );
+        let document = picker_workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let source_stamp_before_reload =
+            document.read_with(cx, |document, _| document.source_stamp());
+        cx.update(|window, app| {
+            picker_workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
+        fs::write(&picker_source, "old\n").unwrap();
+        cx.update(|window, app| {
+            document.update(app, |document, cx| document.reload(window, cx));
+        });
+        let source_stamp_after_reload =
+            document.read_with(cx, |document, _| document.source_stamp());
+        assert_ne!(
+            source_stamp_before_reload, source_stamp_after_reload,
+            "even a same-text clean reload advances the document source stamp"
+        );
+        cx.simulate_new_path_selection(|parent| {
+            assert_eq!(parent, picker_directory.path());
+            Some(picker_destination.clone())
+        });
+        cx.run_until_parked();
+
+        assert!(!picker_destination.exists());
+        assert_eq!(fs::read(&picker_source).unwrap(), b"old\n");
+        picker_workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.id(), picker_document_id);
+            assert_eq!(document.source_path(), Some(picker_source.as_path()));
+            assert_eq!(document.text(app), "old\n");
+            assert!(!document.is_dirty());
+            assert!(workspace.pending_save_as.is_none());
+            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().answer_states,
+                vec![RevisionAnswer::answered("keep")]
+            );
+            assert!(workspace.revision_result.is_some());
+            assert!(workspace.revision_diagnostic.is_some());
+        });
+        let picker_recovered = picker_store.recover().unwrap();
+        let picker_record = picker_recovered
+            .records
+            .iter()
+            .find(|record| record.record.key == picker_recovery_key)
+            .expect("a stale Save As must preserve answer recovery");
+        assert_eq!(
+            picker_record
+                .record
+                .revision
+                .as_ref()
+                .unwrap()
+                .answers()
+                .as_slice(),
+            &[RevisionAnswer::answered("keep")]
+        );
+
+        let replace_directory = tempfile::tempdir().unwrap();
+        let replace_source = replace_directory.path().join("replace-source.md");
+        let replace_destination = replace_directory.path().join("existing-output.md");
+        let original_destination = b"keep existing destination\n";
+        let externally_reloaded = "new unapproved source text\n";
+        fs::write(&replace_source, "old\n").unwrap();
+        fs::write(&replace_destination, original_destination).unwrap();
+        let replace_store = RecoveryStore::new_at(
+            replace_directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (replace_workspace, cx) = open_test_workspace(cx, replace_source.clone());
+        let (replace_document_id, replace_recovery_key) = prepare_reject_all_revision_for_save_as(
+            &replace_workspace,
+            Some(&replace_source),
+            &replace_store,
+            cx,
+        );
+        let document = replace_workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let source_stamp_before_reload =
+            document.read_with(cx, |document, _| document.source_stamp());
+        cx.update(|window, app| {
+            replace_workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
+        cx.simulate_new_path_selection(|parent| {
+            assert_eq!(parent, replace_directory.path());
+            Some(replace_destination.clone())
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.has_pending_prompt(),
+            "the existing target requires Replace"
+        );
+
+        fs::write(&replace_source, externally_reloaded).unwrap();
+        cx.update(|window, app| {
+            document.update(app, |document, cx| document.reload(window, cx));
+        });
+        let source_stamp_after_reload =
+            document.read_with(cx, |document, _| document.source_stamp());
+        assert_ne!(source_stamp_before_reload, source_stamp_after_reload);
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+
+        assert_eq!(
+            fs::read(&replace_destination).unwrap(),
+            original_destination
+        );
+        assert_eq!(
+            fs::read(&replace_source).unwrap(),
+            externally_reloaded.as_bytes()
+        );
+        replace_workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.id(), replace_document_id);
+            assert_eq!(document.source_path(), Some(replace_source.as_path()));
+            assert_eq!(document.text(app), externally_reloaded);
+            assert!(!document.is_dirty());
+            assert!(workspace.pending_save_as.is_none());
+            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().answer_states,
+                vec![RevisionAnswer::answered("keep")]
+            );
+            assert!(workspace.revision_result.is_some());
+            assert!(workspace.revision_diagnostic.is_some());
+        });
+        let replace_recovered = replace_store.recover().unwrap();
+        let replace_record = replace_recovered
+            .records
+            .iter()
+            .find(|record| record.record.key == replace_recovery_key)
+            .expect("Replace after a stale approval must preserve answer recovery");
+        assert_eq!(
+            replace_record
+                .record
+                .revision
+                .as_ref()
+                .unwrap()
+                .answers()
+                .as_slice(),
+            &[RevisionAnswer::answered("keep")]
+        );
+
+        let pathless_directory = tempfile::tempdir().unwrap();
+        let pathless_destination = pathless_directory.path().join("pathless-output.md");
+        let pathless_store = RecoveryStore::new_at(
+            pathless_directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (pathless_workspace, cx) = open_test_workspace_with(cx, None);
+        let created_pathless_document_id = cx.update(|window, app| {
+            pathless_workspace.update(app, |workspace, cx| {
+                workspace.new_memory("old\n".to_owned(), window, cx);
+                workspace.active_document().unwrap().read(cx).id()
+            })
+        });
+        let (pathless_document_id, pathless_recovery_key) =
+            prepare_reject_all_revision_for_save_as(&pathless_workspace, None, &pathless_store, cx);
+        assert_eq!(pathless_document_id, created_pathless_document_id);
+        cx.update(|window, app| {
+            pathless_workspace.update(app, |workspace, cx| {
+                workspace.save_revision(window, cx);
+            });
+        });
+        replace_document(&pathless_workspace, 0, "new unapproved memory text\n", cx);
+        cx.simulate_new_path_selection(|_| Some(pathless_destination.clone()));
+        cx.run_until_parked();
+
+        assert!(
+            !pathless_destination.exists(),
+            "Revision Save on a memory document must not downgrade to an ordinary Save As"
+        );
+        pathless_workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_by_id(pathless_document_id, app).unwrap();
+            let document = document.read(app);
+            assert_eq!(document.text(app), "new unapproved memory text\n");
+            assert_eq!(document.source_path(), None);
+            assert!(document.is_dirty());
+            assert!(workspace.pending_save_as.is_none());
+            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().answer_states,
+                vec![RevisionAnswer::answered("keep")]
+            );
+            assert!(workspace.revision_result.is_some());
+        });
+        let pathless_recovered = pathless_store.recover().unwrap();
+        let pathless_record = pathless_recovered
+            .records
+            .iter()
+            .find(|record| record.record.key == pathless_recovery_key)
+            .expect("a stale pathless Revision Save must retain answer recovery");
+        assert_eq!(
+            pathless_record
+                .record
+                .revision
+                .as_ref()
+                .unwrap()
+                .answers()
+                .as_slice(),
+            &[RevisionAnswer::answered("keep")]
+        );
+
+        let picker_switch_directory = tempfile::tempdir().unwrap();
+        let picker_switch_source = picker_switch_directory.path().join("source.md");
+        let picker_switch_destination = picker_switch_directory.path().join("picker-output.md");
+        fs::write(&picker_switch_source, "old\n").unwrap();
+        let picker_switch_store = RecoveryStore::new_at(
+            picker_switch_directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (picker_switch_workspace, cx) = open_test_workspace(cx, picker_switch_source.clone());
+        let (picker_switch_document_id, _) = prepare_reject_all_revision_for_save_as(
+            &picker_switch_workspace,
+            Some(&picker_switch_source),
+            &picker_switch_store,
+            cx,
+        );
+        cx.update(|window, app| {
+            picker_switch_workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
+        let picker_switch_active_id = add_secondary_memory_tab(&picker_switch_workspace, cx);
+        cx.simulate_new_path_selection(|parent| {
+            assert_eq!(parent, picker_switch_directory.path());
+            Some(picker_switch_destination.clone())
+        });
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&picker_switch_destination).unwrap(), b"old\n");
+        picker_switch_workspace.read_with(cx, |workspace, app| {
+            let document = workspace
+                .document_by_id(picker_switch_document_id, app)
+                .unwrap();
+            let document = document.read(app);
+            assert_eq!(
+                document.source_path(),
+                Some(picker_switch_destination.as_path())
+            );
+            assert_eq!(document.text(app), "old\n");
+            assert_eq!(
+                workspace.active_document().unwrap().read(app).id(),
+                picker_switch_active_id
+            );
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().answer_states,
+                vec![RevisionAnswer::answered("keep")]
+            );
+            assert!(workspace.pending_save_as.is_none());
+        });
+
+        let replace_switch_directory = tempfile::tempdir().unwrap();
+        let replace_switch_source = replace_switch_directory.path().join("source.md");
+        let replace_switch_destination = replace_switch_directory.path().join("existing.md");
+        fs::write(&replace_switch_source, "old\n").unwrap();
+        fs::write(&replace_switch_destination, "original destination\n").unwrap();
+        let replace_switch_store = RecoveryStore::new_at(
+            replace_switch_directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (replace_switch_workspace, cx) = open_test_workspace(cx, replace_switch_source.clone());
+        let (replace_switch_document_id, _) = prepare_reject_all_revision_for_save_as(
+            &replace_switch_workspace,
+            Some(&replace_switch_source),
+            &replace_switch_store,
+            cx,
+        );
+        cx.update(|window, app| {
+            replace_switch_workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
+        cx.simulate_new_path_selection(|parent| {
+            assert_eq!(parent, replace_switch_directory.path());
+            Some(replace_switch_destination.clone())
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        let replace_switch_active_id = add_secondary_memory_tab(&replace_switch_workspace, cx);
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&replace_switch_destination).unwrap(), b"old\n");
+        replace_switch_workspace.read_with(cx, |workspace, app| {
+            let document = workspace
+                .document_by_id(replace_switch_document_id, app)
+                .unwrap();
+            let document = document.read(app);
+            assert_eq!(
+                document.source_path(),
+                Some(replace_switch_destination.as_path())
+            );
+            assert_eq!(document.text(app), "old\n");
+            assert_eq!(
+                workspace.active_document().unwrap().read(app).id(),
+                replace_switch_active_id
+            );
+            assert_eq!(
+                workspace.revision_context.as_ref().unwrap().answer_states,
+                vec![RevisionAnswer::answered("keep")]
+            );
+            assert!(workspace.pending_save_as.is_none());
         });
     }
 

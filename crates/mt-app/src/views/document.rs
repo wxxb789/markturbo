@@ -788,6 +788,15 @@ impl DocumentView {
         self.editor.read(cx).text().len()
     }
 
+    pub(crate) fn text_matches(&self, expected: &str, cx: &App) -> bool {
+        self.editor.read(cx).text() == expected
+    }
+
+    /// Allocation-free identity for editor and source changes.
+    pub(crate) fn source_stamp(&self) -> (u64, u64) {
+        (self.revision, self.source_generation)
+    }
+
     pub fn source_snapshot(&self, cx: &App) -> BufferSnapshot {
         BufferSnapshot::new(self.revision, self.text(cx))
     }
