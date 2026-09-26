@@ -1724,7 +1724,8 @@ mod tests {
     }
 
     fn write_temp_decision(value: &Value, label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        // macOS can spell its temporary root through the /var symlink.
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "markturbo-g07-{label}-{}-{:x}.json",
             std::process::id(),
             Sha256::digest(label.as_bytes())
@@ -1983,7 +1984,7 @@ mod tests {
 
     #[test]
     fn private_file_reader_enforces_bound_from_open_handle() {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "markturbo-g07-private-bound-{}",
             std::process::id()
         ));
