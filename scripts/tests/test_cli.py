@@ -29,6 +29,39 @@ class ToolingCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Exercise Goal 03", result.stdout)
 
+    def test_goal07_native_module_is_invocable_through_the_cli(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/mt.py", "accept", "goal-07", "--", "--help"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Goal 07 native acceptance harness", result.stdout)
+
+    def test_revision_evaluation_module_is_invocable_through_the_cli(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scripts/mt.py", "revision-evaluation", "verify-manifest"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"corpus_version": "goal-01-v1"', result.stdout)
+
+    def test_revision_evaluation_help_is_forwarded(self) -> None:
+        completed = subprocess.CompletedProcess([], 0)
+        with mock.patch.object(cli.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(cli.main(["revision-evaluation", "--help"]), 0)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[1:3], ["-m", "scripts.markturbo_tools.revision_evaluation"])
+        self.assertEqual(command[-1], "--help")
+
     def test_delegated_modules_run_from_the_repository_root(self) -> None:
         completed = subprocess.CompletedProcess([], 0)
         with mock.patch.object(cli.subprocess, "run", return_value=completed) as run:

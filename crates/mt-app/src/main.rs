@@ -66,6 +66,16 @@ fn open_log_file(path: &Path) -> Option<File> {
     OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
+fn apply_private_dependency_log_filters(builder: &mut env_logger::Builder) {
+    for target in [
+        "html5ever::tree_builder",
+        "html5ever::tokenizer",
+        "html5ever::tokenizer::char_ref",
+    ] {
+        builder.filter_module(target, log::LevelFilter::Off);
+    }
+}
+
 fn init_logging() {
     // genai traces complete provider response bodies. On Linux, tracing's
     // optional `log` bridge is enabled transitively by the UI stack, so an
@@ -81,9 +91,12 @@ fn init_logging() {
         .map(|file| env_logger::Target::Pipe(Box::new(file)))
         .unwrap_or_else(|| env_logger::Target::Pipe(Box::new(io::sink())));
 
-    env_logger::builder()
+    let mut builder = env_logger::builder();
+    builder
         .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
+        .parse_default_env();
+    apply_private_dependency_log_filters(&mut builder);
+    builder
         .write_style(env_logger::WriteStyle::Never)
         .target(target)
         .init();
@@ -242,7 +255,7 @@ mod tests {
     // Import selectively: the `gpui_kit::*` glob in the parent re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{open_log_file, resolve_target};
+    use super::{apply_private_dependency_log_filters, open_log_file, resolve_target};
     use std::io::Write as _;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -326,6 +339,31 @@ mod tests {
             privacy_guard < logger,
             "tracing's optional log bridge is disabled before env_logger starts"
         );
+    }
+
+    #[test]
+    fn html_parser_debug_logs_stay_disabled_after_environment_filters() {
+        use log::Log as _;
+
+        let mut builder = env_logger::Builder::new();
+        builder.parse_filters(
+            "markturbo=debug,html5ever::tree_builder=debug,html5ever::tokenizer=trace,html5ever::tokenizer::char_ref=debug",
+        );
+        apply_private_dependency_log_filters(&mut builder);
+        let logger = builder.build();
+        let enabled = |target| {
+            logger.enabled(
+                &log::Metadata::builder()
+                    .level(log::Level::Debug)
+                    .target(target)
+                    .build(),
+            )
+        };
+
+        assert!(enabled("markturbo"));
+        assert!(!enabled("html5ever::tree_builder"));
+        assert!(!enabled("html5ever::tokenizer"));
+        assert!(!enabled("html5ever::tokenizer::char_ref"));
     }
 
     #[test]

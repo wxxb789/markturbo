@@ -95,6 +95,62 @@ pub enum Key {
     ReviewAnchor,
     ReviewRun,
     ReviewDismiss,
+
+    // Approved Revision workflow
+    RevisionAnswers,
+    RevisionRecoveredAnswers,
+    RevisionCopyRecoveredAnswers,
+    RevisionDiscardRecoveredAnswers,
+    RevisionRecoveredAnswersCopied,
+    RevisionAnswerUnanswered,
+    RevisionAnswerIntentionallyUnspecified,
+    RevisionAnswerAnswered,
+    RevisionRun,
+    RevisionDiscardAnswers,
+    RevisionRetry,
+    RevisionDismiss,
+    RevisionConsentTitle,
+    RevisionWaitingForConsent,
+    RevisionRunning,
+    RevisionPreparationFailed,
+    RevisionAuthorizationFailed,
+    RevisionProviderFailed,
+    RevisionApplyFailed,
+    RevisionSourceChanged,
+    RevisionScopeChangedDuringConsent,
+    RevisionDocumentClosed,
+    RevisionConsentCancelledAnswersRetained,
+    RevisionCancelledAnswersRetained,
+    RevisionAnswersRetained,
+    RevisionAnswersDiscarded,
+    RevisionRecoveryRetirementFailed,
+    RevisionStale,
+    RevisionStaleInspection,
+    RevisionReady,
+    RevisionReadyStale,
+    RevisionApplied,
+    RevisionAppliedSavePending,
+    RevisionNoApprovedChanges,
+    RevisionCopied,
+    RevisionResult,
+    RevisionChange,
+    RevisionChangeAccepted,
+    RevisionChangeRejected,
+    RevisionRationale,
+    RevisionAccept,
+    RevisionReject,
+    RevisionAcceptAll,
+    RevisionRejectAll,
+    RevisionCopy,
+    RevisionApply,
+    RevisionFinalPreview,
+    RevisionFinalPreviewSource,
+    RevisionCoverage,
+    RevisionCoverageValidated,
+    RevisionCoverageQuestion,
+    RevisionCoverageRepresented,
+    RevisionCoverageIntentionallyOmitted,
+    RevisionCoverageNotAddressed,
     SendToModel,
     ModelRequestConsentTitle,
     ModelRequestWaiting,
@@ -416,6 +472,7 @@ fn model_request_disclosure_in(disclosure: &ModelRequestDisclosure, language: La
         Language::English => (
             match disclosure.operation() {
                 ModelOperation::Review => "Review",
+                ModelOperation::Revision => "Revision",
                 ModelOperation::Translation => "Translation",
             },
             match endpoint.location() {
@@ -435,6 +492,7 @@ fn model_request_disclosure_in(disclosure: &ModelRequestDisclosure, language: La
         Language::Chinese => (
             match disclosure.operation() {
                 ModelOperation::Review => "审查",
+                ModelOperation::Revision => "修订",
                 ModelOperation::Translation => "翻译",
             },
             match endpoint.location() {
@@ -543,19 +601,83 @@ fn model_request_disclosure_in(disclosure: &ModelRequestDisclosure, language: La
             }
         }
     };
+    let revision_details = match (language, disclosure.operation()) {
+        (Language::English, ModelOperation::Revision) => match disclosure.revision_binding() {
+            Some(binding) => {
+                let content = disclosure.revision_details().map_or_else(
+                    || "\nRevision content sizes are unavailable.".to_owned(),
+                    |details| {
+                        format!(
+                            "\nReview context: {} UTF-8 JSON bytes.\nAnswers: {} states, {} UTF-8 JSON bytes.",
+                            details.review_context_bytes(),
+                            details.answer_count(),
+                            details.answers_bytes(),
+                        )
+                    },
+                );
+                format!(
+                    "\nSource scope is frozen for this Revision.\nSource SHA-256: {}\nSource revision: {}\nSource generation: {}\nArtifact lens digest: {}\nReview context digest: {}\nAnswers digest: {}{content}",
+                    disclosure_digest_label(Some(binding.source_sha256())),
+                    binding.source_revision(),
+                    binding.source_generation(),
+                    disclosure_digest_label(Some(binding.artifact_lens_digest())),
+                    disclosure_digest_label(Some(binding.review_context_digest())),
+                    disclosure_digest_label(Some(binding.answers_digest())),
+                )
+            }
+            None => "\nRevision binding is unavailable.".to_owned(),
+        },
+        (Language::Chinese, ModelOperation::Revision) => match disclosure.revision_binding() {
+            Some(binding) => {
+                let content = disclosure.revision_details().map_or_else(
+                    || "\n修订内容大小不可用。".to_owned(),
+                    |details| {
+                        format!(
+                            "\n审查上下文：{} UTF-8 JSON 字节。\n答案：{} 个状态，共 {} UTF-8 JSON 字节。",
+                            details.review_context_bytes(),
+                            details.answer_count(),
+                            details.answers_bytes(),
+                        )
+                    },
+                );
+                format!(
+                    "\n此修订的源范围已冻结。\n源 SHA-256：{}\n源修订：{}\n源代次：{}\n工件 lens 摘要：{}\n审查上下文摘要：{}\n答案摘要：{}{content}",
+                    disclosure_digest_label(Some(binding.source_sha256())),
+                    binding.source_revision(),
+                    binding.source_generation(),
+                    disclosure_digest_label(Some(binding.artifact_lens_digest())),
+                    disclosure_digest_label(Some(binding.review_context_digest())),
+                    disclosure_digest_label(Some(binding.answers_digest())),
+                )
+            }
+            None => "\n修订绑定不可用。".to_owned(),
+        },
+        _ => String::new(),
+    };
 
     match language {
         Language::English => format!(
-            "Operation: {operation}\nEndpoint: {location}\nWire format: {}\nIdentity: {}\nTransport: {encryption}; {proxy}\n{scope}\n\n{suffix}",
+            "Operation: {operation}\nEndpoint: {location}\nWire format: {}\nIdentity: {}\nTransport: {encryption}; {proxy}\n{scope}{revision_details}\n\n{suffix}",
             endpoint.provider().label(),
             endpoint.normalized_identity(),
         ),
         Language::Chinese => format!(
-            "操作：{operation}\n端点：{location}\n协议格式：{}\n端点标识：{}\n传输：{encryption}；{proxy}\n{scope}\n\n{suffix}",
+            "操作：{operation}\n端点：{location}\n协议格式：{}\n端点标识：{}\n传输：{encryption}；{proxy}\n{scope}{revision_details}\n\n{suffix}",
             endpoint.provider().label(),
             endpoint.normalized_identity(),
         ),
     }
+}
+
+fn disclosure_digest_label(digest: Option<&[u8; 32]>) -> String {
+    digest
+        .map(|digest| {
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| "unavailable".to_owned())
 }
 
 pub fn model_endpoint_error(error: &EndpointIdentityError, cx: &gpui_kit::App) -> String {
@@ -709,6 +831,69 @@ fn english(key: Key) -> &'static str {
         Key::ReviewAnchor => "Source anchor",
         Key::ReviewRun => "Run Review",
         Key::ReviewDismiss => "Dismiss Review",
+
+        Key::RevisionAnswers => "Revision answers",
+        Key::RevisionRecoveredAnswers => "Recovered Revision answers",
+        Key::RevisionCopyRecoveredAnswers => "Copy recovered answers",
+        Key::RevisionDiscardRecoveredAnswers => "Discard recovered answers",
+        Key::RevisionRecoveredAnswersCopied => "Recovered Revision answers copied",
+        Key::RevisionAnswerUnanswered => "Unanswered",
+        Key::RevisionAnswerIntentionallyUnspecified => "Intentionally unspecified",
+        Key::RevisionAnswerAnswered => "Answered",
+        Key::RevisionRun => "Run Revision",
+        Key::RevisionDiscardAnswers => "Discard Revision answers",
+        Key::RevisionRetry => "Retry",
+        Key::RevisionDismiss => "Dismiss",
+        Key::RevisionConsentTitle => "Revision consent",
+        Key::RevisionWaitingForConsent => "Revision waiting for consent",
+        Key::RevisionRunning => "Revision running",
+        Key::RevisionPreparationFailed => "Revision preparation failed",
+        Key::RevisionAuthorizationFailed => "Revision authorization failed",
+        Key::RevisionProviderFailed => "Revision provider failed",
+        Key::RevisionApplyFailed => "Revision could not be applied",
+        Key::RevisionSourceChanged => {
+            "The reviewed source changed. Rerun Review before requesting a Revision."
+        }
+        Key::RevisionScopeChangedDuringConsent => {
+            "The reviewed source or Agent Skill package changed while consent was open."
+        }
+        Key::RevisionDocumentClosed => "The document closed before the Revision completed.",
+        Key::RevisionConsentCancelledAnswersRetained => {
+            "Revision consent was cancelled; answers were retained."
+        }
+        Key::RevisionCancelledAnswersRetained => "Revision cancelled; answers were retained.",
+        Key::RevisionAnswersRetained => "Revision answers are retained.",
+        Key::RevisionAnswersDiscarded => "Revision answers discarded",
+        Key::RevisionRecoveryRetirementFailed => {
+            "Could not clear the recovery checkpoint. Recovered Revision answers were retained."
+        }
+        Key::RevisionStale => "Revision is stale and cannot be applied. Rerun Review first.",
+        Key::RevisionStaleInspection => "Revision result is stale and inspectable only",
+        Key::RevisionReady => "Revision ready for inspection",
+        Key::RevisionReadyStale => "Revision ready for inspection, but stale",
+        Key::RevisionApplied => "Approved Revision applied",
+        Key::RevisionAppliedSavePending => "Approved Revision applied; save is still pending",
+        Key::RevisionNoApprovedChanges => "No approved changes to apply",
+        Key::RevisionCopied => "Copied approved Revision preview",
+        Key::RevisionResult => "Revision result",
+        Key::RevisionChange => "Revision change",
+        Key::RevisionChangeAccepted => "accepted",
+        Key::RevisionChangeRejected => "rejected",
+        Key::RevisionRationale => "Rationale",
+        Key::RevisionAccept => "Accept",
+        Key::RevisionReject => "Reject",
+        Key::RevisionAcceptAll => "Accept all",
+        Key::RevisionRejectAll => "Reject all",
+        Key::RevisionCopy => "Copy",
+        Key::RevisionApply => "Apply",
+        Key::RevisionFinalPreview => "Final preview",
+        Key::RevisionFinalPreviewSource => "Final approved Revision source",
+        Key::RevisionCoverage => "Question coverage",
+        Key::RevisionCoverageValidated => "validated question coverage entries",
+        Key::RevisionCoverageQuestion => "Question",
+        Key::RevisionCoverageRepresented => "represented by",
+        Key::RevisionCoverageIntentionallyOmitted => "intentionally omitted",
+        Key::RevisionCoverageNotAddressed => "not addressed",
         Key::SendToModel => "Send",
         Key::ModelRequestConsentTitle => "Send content to model?",
         Key::ModelRequestWaiting => "Waiting for model request approval…",
@@ -1014,6 +1199,63 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::ReviewAnchor => "源锚点",
         Key::ReviewRun => "运行审查",
         Key::ReviewDismiss => "关闭审查",
+
+        Key::RevisionAnswers => "修订答案",
+        Key::RevisionRecoveredAnswers => "已恢复的修订答案",
+        Key::RevisionCopyRecoveredAnswers => "复制已恢复答案",
+        Key::RevisionDiscardRecoveredAnswers => "丢弃已恢复答案",
+        Key::RevisionRecoveredAnswersCopied => "已复制恢复的修订答案",
+        Key::RevisionAnswerUnanswered => "未回答",
+        Key::RevisionAnswerIntentionallyUnspecified => "有意不指定",
+        Key::RevisionAnswerAnswered => "已回答",
+        Key::RevisionRun => "运行修订",
+        Key::RevisionDiscardAnswers => "丢弃修订答案",
+        Key::RevisionRetry => "重试",
+        Key::RevisionDismiss => "关闭",
+        Key::RevisionConsentTitle => "修订授权",
+        Key::RevisionWaitingForConsent => "修订正在等待授权",
+        Key::RevisionRunning => "正在运行修订",
+        Key::RevisionPreparationFailed => "修订准备失败",
+        Key::RevisionAuthorizationFailed => "修订授权失败",
+        Key::RevisionProviderFailed => "修订服务失败",
+        Key::RevisionApplyFailed => "修订无法应用",
+        Key::RevisionSourceChanged => "审查的源文本已更改。请求修订前请重新运行 Review。",
+        Key::RevisionScopeChangedDuringConsent => {
+            "授权对话期间审查的源文本或 Agent Skill 包已更改。"
+        }
+        Key::RevisionDocumentClosed => "修订完成前文档已关闭。",
+        Key::RevisionConsentCancelledAnswersRetained => "修订授权已取消；答案已保留。",
+        Key::RevisionCancelledAnswersRetained => "修订已取消；答案已保留。",
+        Key::RevisionAnswersRetained => "修订答案已保留。",
+        Key::RevisionAnswersDiscarded => "已丢弃修订答案",
+        Key::RevisionRecoveryRetirementFailed => "无法清除恢复检查点，已保留恢复的修订答案。",
+        Key::RevisionStale => "修订已过期，无法应用。请先重新运行 Review。",
+        Key::RevisionStaleInspection => "修订结果已过期，只能查看，不能应用",
+        Key::RevisionReady => "修订已准备好查看",
+        Key::RevisionReadyStale => "修订已准备好查看，但已过期",
+        Key::RevisionApplied => "已应用批准的修订",
+        Key::RevisionAppliedSavePending => "已应用批准的修订；等待保存",
+        Key::RevisionNoApprovedChanges => "没有可应用的批准变更",
+        Key::RevisionCopied => "已复制批准的修订预览",
+        Key::RevisionResult => "修订结果",
+        Key::RevisionChange => "修订变更",
+        Key::RevisionChangeAccepted => "已接受",
+        Key::RevisionChangeRejected => "已拒绝",
+        Key::RevisionRationale => "理由",
+        Key::RevisionAccept => "接受",
+        Key::RevisionReject => "拒绝",
+        Key::RevisionAcceptAll => "全部接受",
+        Key::RevisionRejectAll => "全部拒绝",
+        Key::RevisionCopy => "复制",
+        Key::RevisionApply => "应用",
+        Key::RevisionFinalPreview => "最终预览",
+        Key::RevisionFinalPreviewSource => "最终批准的修订源文本",
+        Key::RevisionCoverage => "问题覆盖",
+        Key::RevisionCoverageValidated => "个已验证的问题覆盖条目",
+        Key::RevisionCoverageQuestion => "问题",
+        Key::RevisionCoverageRepresented => "由以下变更表示",
+        Key::RevisionCoverageIntentionallyOmitted => "有意省略",
+        Key::RevisionCoverageNotAddressed => "未处理",
         Key::SendToModel => "发送",
         Key::ModelRequestConsentTitle => "将内容发送给模型？",
         Key::ModelRequestWaiting => "正在等待模型请求授权…",
@@ -1294,6 +1536,60 @@ mod tests {
         Key::ReviewAnchor,
         Key::ReviewRun,
         Key::ReviewDismiss,
+        Key::RevisionAnswers,
+        Key::RevisionRecoveredAnswers,
+        Key::RevisionCopyRecoveredAnswers,
+        Key::RevisionDiscardRecoveredAnswers,
+        Key::RevisionRecoveredAnswersCopied,
+        Key::RevisionAnswerUnanswered,
+        Key::RevisionAnswerIntentionallyUnspecified,
+        Key::RevisionAnswerAnswered,
+        Key::RevisionRun,
+        Key::RevisionDiscardAnswers,
+        Key::RevisionRetry,
+        Key::RevisionDismiss,
+        Key::RevisionConsentTitle,
+        Key::RevisionWaitingForConsent,
+        Key::RevisionRunning,
+        Key::RevisionPreparationFailed,
+        Key::RevisionAuthorizationFailed,
+        Key::RevisionProviderFailed,
+        Key::RevisionApplyFailed,
+        Key::RevisionSourceChanged,
+        Key::RevisionScopeChangedDuringConsent,
+        Key::RevisionDocumentClosed,
+        Key::RevisionConsentCancelledAnswersRetained,
+        Key::RevisionCancelledAnswersRetained,
+        Key::RevisionAnswersRetained,
+        Key::RevisionAnswersDiscarded,
+        Key::RevisionRecoveryRetirementFailed,
+        Key::RevisionStale,
+        Key::RevisionStaleInspection,
+        Key::RevisionReady,
+        Key::RevisionReadyStale,
+        Key::RevisionApplied,
+        Key::RevisionAppliedSavePending,
+        Key::RevisionNoApprovedChanges,
+        Key::RevisionCopied,
+        Key::RevisionResult,
+        Key::RevisionChange,
+        Key::RevisionChangeAccepted,
+        Key::RevisionChangeRejected,
+        Key::RevisionRationale,
+        Key::RevisionAccept,
+        Key::RevisionReject,
+        Key::RevisionAcceptAll,
+        Key::RevisionRejectAll,
+        Key::RevisionCopy,
+        Key::RevisionApply,
+        Key::RevisionFinalPreview,
+        Key::RevisionFinalPreviewSource,
+        Key::RevisionCoverage,
+        Key::RevisionCoverageValidated,
+        Key::RevisionCoverageQuestion,
+        Key::RevisionCoverageRepresented,
+        Key::RevisionCoverageIntentionallyOmitted,
+        Key::RevisionCoverageNotAddressed,
         Key::SendToModel,
         Key::ModelRequestConsentTitle,
         Key::ModelRequestWaiting,
@@ -1544,7 +1840,10 @@ mod tests {
 
     #[test]
     fn model_request_disclosure_is_complete_in_each_interface_language() {
-        use crate::model::{AgentSkillRequest, AgentSkillRequestEntry, OutboundScope};
+        use crate::model::{
+            AgentSkillRequest, AgentSkillRequestEntry, OutboundScope, RevisionDisclosureDetails,
+            RevisionRequestBinding,
+        };
 
         let endpoint = EndpointIdentity::parse(
             crate::model::Provider::OpenAiResponses,
@@ -1586,6 +1885,52 @@ mod tests {
             assert!(
                 chinese.contains(expected),
                 "missing {expected:?} in {chinese:?}"
+            );
+        }
+
+        let revision = ModelRequestDisclosure::revision_with_details(
+            endpoint.clone(),
+            OutboundScope::document(37),
+            RevisionRequestBinding::new([0x03; 32], 7, 11, [0x04; 32], [0x01; 32], [0x02; 32]),
+            RevisionDisclosureDetails::new(123, 45, 2),
+        );
+        let revision_english = model_request_disclosure_in(&revision, Language::English);
+        for expected in [
+            "Operation: Revision",
+            "Scope: document, 37 UTF-8 content bytes",
+            "Source scope is frozen for this Revision.",
+            "Source SHA-256: 030303",
+            "Source revision: 7",
+            "Source generation: 11",
+            "Artifact lens digest: 040404",
+            "Review context digest: 010101",
+            "Answers digest: 020202",
+            "Review context: 123 UTF-8 JSON bytes.",
+            "Answers: 2 states, 45 UTF-8 JSON bytes.",
+        ] {
+            assert!(
+                revision_english.contains(expected),
+                "missing {expected:?} in {revision_english:?}"
+            );
+        }
+
+        let revision_chinese = model_request_disclosure_in(&revision, Language::Chinese);
+        for expected in [
+            "操作：修订",
+            "范围：文档，37 UTF-8 内容字节",
+            "此修订的源范围已冻结。",
+            "源 SHA-256：030303",
+            "源修订：7",
+            "源代次：11",
+            "工件 lens 摘要：040404",
+            "审查上下文摘要：010101",
+            "答案摘要：020202",
+            "审查上下文：123 UTF-8 JSON 字节。",
+            "答案：2 个状态，共 45 UTF-8 JSON 字节。",
+        ] {
+            assert!(
+                revision_chinese.contains(expected),
+                "missing {expected:?} in {revision_chinese:?}"
             );
         }
 

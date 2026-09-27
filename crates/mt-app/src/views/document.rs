@@ -21,13 +21,20 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mt_doc::{DocType, Document, Severity};
+use mt_doc::{
+    DocType, Document, Severity,
+    review::SourceSnapshot,
+    revision::{ChangeId, RevisionError, RevisionProposal},
+};
+use sha2::{Digest as _, Sha256};
 
 use crate::fs::{self, FileStamp, LoadedFile, Newline, SaveError, SourceIdentity};
 use crate::i18n;
 use crate::lifecycle::{AsyncSnapshot, BufferSnapshot, DocumentId};
 use crate::metrics;
-use crate::recovery::{RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata};
+use crate::recovery::{
+    RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RevisionRecovery,
+};
 use crate::renderer::RendererRegistry;
 use crate::views::{Layout, PreviewKind};
 use crate::web::{self, Trust};
@@ -76,6 +83,7 @@ const LIVE_PREVIEW_LIMIT: usize = 512 * 1024;
 const SOURCE_LAYOUT_ACCESSIBILITY_ID: &str = "markturbo-layout-source";
 const SOURCE_EDITOR_ACCESSIBILITY_ID: &str = "markturbo-document-source-editor";
 const CONFLICT_OVERWRITE_ACCESSIBILITY_ID: &str = "markturbo-conflict-overwrite";
+const DOCUMENT_TRUST_ACCESSIBILITY_ID: &str = "markturbo-document-trust";
 const DOCUMENT_SAVE_AS_ACCESSIBILITY_ID: &str = "markturbo-document-save-as";
 
 /// Events a document view emits to the workspace.
@@ -203,10 +211,43 @@ enum SaveIssue {
     },
 }
 
+const APPLY_UNDO_HISTORY_LIMIT: usize = 1_000;
+
+/// A bounded identity for editor text. Apply history must never retain whole
+/// document copies just to recognize one later undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextFingerprint {
+    byte_count: usize,
+    sha256: [u8; 32],
+}
+
+impl TextFingerprint {
+    fn from_text(text: &str) -> Self {
+        Self {
+            byte_count: text.len(),
+            sha256: Sha256::digest(text.as_bytes()).into(),
+        }
+    }
+}
+
+/// One bounded Apply transaction, kept long enough to recognize its matching
+/// undo without confusing a later edit with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplyUndoMarker {
+    original: TextFingerprint,
+    applied: TextFingerprint,
+    pre_apply_dirty: bool,
+    apply_revision_before: u64,
+    undo_revision: u64,
+    source_generation: u64,
+}
+
 pub(crate) struct PreparedRecovery {
     origin: DocumentOrigin,
     document: Document,
     source_conflicted: bool,
+    revision: Option<RevisionRecovery>,
+    source_dirty: bool,
 }
 
 impl PreparedRecovery {
@@ -216,6 +257,16 @@ impl PreparedRecovery {
 
     pub(crate) fn recovery_key(&self) -> RecoveryKey {
         self.origin.recovery_key()
+    }
+
+    /// Move the answer-only revision state to the workspace owner.
+    ///
+    /// Recovery never stores a proposal or provider response. The workspace
+    /// consumes this binding and its answers before handing the prepared
+    /// document to [`DocumentView::from_recovery`] or
+    /// [`DocumentView::apply_startup_recovery`].
+    pub(crate) fn take_revision_recovery(&mut self) -> Option<RevisionRecovery> {
+        self.revision.take()
     }
 }
 
@@ -302,6 +353,8 @@ pub struct DocumentView {
     /// Monotonic identity for the authoritative editor text. Async operations
     /// must carry the revision they read and re-check it before applying.
     revision: u64,
+    /// Bounded Apply history; the top entry is the only undo currently eligible.
+    apply_undo_history: Vec<ApplyUndoMarker>,
     /// Changes when Save As gives the current buffer a different source.
     ///
     /// Revision and text may remain unchanged across that boundary, but an old
@@ -452,6 +505,7 @@ impl DocumentView {
             trust: Trust::Restricted,
             dirty: false,
             revision: 0,
+            apply_undo_history: Vec::new(),
             source_generation: 0,
             externally_changed: false,
             save_issue: None,
@@ -501,6 +555,12 @@ impl DocumentView {
             origin,
             document,
             source_conflicted: recovered.source_conflicted,
+            source_dirty: recovered
+                .record
+                .revision
+                .as_ref()
+                .is_none_or(RevisionRecovery::source_dirty),
+            revision: recovered.record.revision.clone(),
         })
     }
 
@@ -514,10 +574,12 @@ impl DocumentView {
             origin,
             document,
             source_conflicted,
+            source_dirty,
+            ..
         } = prepared;
         let mut document = Self::new_with_document(origin, document, registry, window, cx);
-        document.dirty = true;
-        document.revision = 1;
+        document.dirty = source_dirty;
+        document.revision = u64::from(source_dirty);
         document.externally_changed = source_conflicted;
         if source_conflicted {
             document.save_issue = Some(SaveIssue::Conflict);
@@ -542,17 +604,20 @@ impl DocumentView {
             origin,
             document,
             source_conflicted,
+            source_dirty,
+            ..
         } = prepared;
         let source_conflicted = source_conflicted || self.externally_changed;
         let text = document.source().to_owned();
         self._reparse = None;
         self._reload = None;
+        self.apply_undo_history.clear();
         self.origin = origin;
         self.editor.update(cx, |state, cx| {
             state.set_value(text.clone(), window, cx);
         });
         self.revision = self.revision.wrapping_add(1);
-        self.dirty = true;
+        self.dirty = source_dirty;
         self.externally_changed = source_conflicted;
         self.save_issue = source_conflicted.then_some(SaveIssue::Conflict);
         self.save_authorization = fs::SaveAuthorization::normal();
@@ -561,7 +626,9 @@ impl DocumentView {
             state.set_text(&text, cx);
         });
         self.refresh_web(cx);
-        cx.emit(DocumentEvent::DirtyChanged);
+        if source_dirty {
+            cx.emit(DocumentEvent::DirtyChanged);
+        }
         cx.notify();
     }
 
@@ -602,6 +669,16 @@ impl DocumentView {
     }
 
     pub fn recovery_checkpoint(&self, cx: &App) -> RecoveryCheckpoint {
+        self.recovery_checkpoint_with_revision(cx, None)
+    }
+
+    /// Build a recovery checkpoint while optionally carrying the user's
+    /// answer-only Revision state owned by the workspace.
+    pub fn recovery_checkpoint_with_revision(
+        &self,
+        cx: &App,
+        revision: Option<RevisionRecovery>,
+    ) -> RecoveryCheckpoint {
         let metadata = self.origin.file().map_or_else(
             || RecoveryMetadata {
                 source_path: None,
@@ -623,6 +700,7 @@ impl DocumentView {
             key: self.recovery_key(),
             text: self.text(cx),
             metadata,
+            revision: revision.map(|revision| revision.with_source_dirty(self.dirty)),
         }
     }
 
@@ -708,6 +786,15 @@ impl DocumentView {
     /// UTF-8 bytes in the authoritative editor buffer, without materializing it.
     pub fn text_byte_len(&self, cx: &App) -> usize {
         self.editor.read(cx).text().len()
+    }
+
+    pub(crate) fn text_matches(&self, expected: &str, cx: &App) -> bool {
+        self.editor.read(cx).text() == expected
+    }
+
+    /// Allocation-free identity for editor and source changes.
+    pub(crate) fn source_stamp(&self) -> (u64, u64) {
+        (self.revision, self.source_generation)
     }
 
     pub fn source_snapshot(&self, cx: &App) -> BufferSnapshot {
@@ -847,7 +934,6 @@ impl DocumentView {
         self.editor.update(cx, |state, cx| {
             state.replace_all(text, window, cx);
         });
-        self.on_edit(window, cx);
     }
 
     /// Apply an asynchronous transformation only to the exact source revision
@@ -864,6 +950,55 @@ impl DocumentView {
         }
         self.replace_text(text, window, cx);
         true
+    }
+
+    /// Apply the locally validated proposal against the current editor source.
+    ///
+    /// `RevisionProposal` owns hunk validation and source binding. This
+    /// boundary rechecks that binding immediately before the one undoable
+    /// editor replacement; the editor's synchronous `InputEvent::Change`
+    /// drives [`Self::on_edit`] exactly once.
+    pub fn apply_approved_revision(
+        &mut self,
+        proposal: &RevisionProposal,
+        decisions: &[(ChangeId, bool)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, RevisionError> {
+        let current_text = self.text(cx);
+        let current_snapshot = SourceSnapshot::new(self.revision, self.source_generation);
+        let final_text = proposal.compose_against(&current_text, current_snapshot, decisions)?;
+        if current_text == final_text {
+            return Ok(false);
+        }
+
+        // Trusted HTML uses a file origin and trusted MDX permits scripts.
+        // Any approved source change in either executable-capable document
+        // type invalidates that prior decision; ordinary Markdown and plain
+        // text never churn trust state here.
+        let revoke_trust = self.trust == Trust::Trusted
+            && matches!(self.document.doc_type(), DocType::Html | DocType::Mdx)
+            && current_text != final_text;
+
+        if self.apply_undo_history.len() == APPLY_UNDO_HISTORY_LIMIT {
+            self.apply_undo_history.remove(0);
+        }
+        self.apply_undo_history.push(ApplyUndoMarker {
+            original: TextFingerprint::from_text(&current_text),
+            applied: TextFingerprint::from_text(&final_text),
+            pre_apply_dirty: self.dirty,
+            apply_revision_before: self.revision,
+            undo_revision: self.revision.wrapping_add(1),
+            source_generation: self.source_generation,
+        });
+
+        if revoke_trust {
+            self.trust = Trust::Restricted;
+            self.rebuild_web(cx);
+            cx.notify();
+        }
+        self.replace_text(final_text, window, cx);
+        Ok(true)
     }
 
     /// Note that the file changed on disk. Does not touch editor state.
@@ -915,6 +1050,7 @@ impl DocumentView {
         cx: &mut Context<Self>,
     ) {
         let text = file.text.clone();
+        self.apply_undo_history.clear();
         self.origin = DocumentOrigin::File(file);
         // `set_value` suppresses the `Change` event, so this does not re-enter
         // `on_edit` and mark the document dirty again.
@@ -1097,6 +1233,7 @@ impl DocumentView {
                 file.had_bom = saved.had_bom;
                 file.decode_had_errors = false;
                 file.source_identity = saved.source_identity;
+                self.apply_undo_history.clear();
                 self.dirty = false;
                 self.externally_changed = false;
                 self.save_issue = None;
@@ -1189,6 +1326,7 @@ impl DocumentView {
                 self._reload = None;
                 self._reparse = None;
                 self.source_generation = self.source_generation.wrapping_add(1);
+                self.apply_undo_history.clear();
                 self.origin = DocumentOrigin::File(file);
                 self.document = Document::new(Some(path.to_path_buf()), text);
                 let doc_type = self.document.doc_type();
@@ -1235,12 +1373,44 @@ impl DocumentView {
     /// Called on every keystroke. Marks dirty immediately (cheap) and schedules
     /// a reparse (not cheap).
     fn on_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let current_fingerprint = if self.apply_undo_history.is_empty() {
+            None
+        } else {
+            Some(TextFingerprint::from_text(&self.text(cx)))
+        };
+        let (undo_pre_dirty, is_apply_edit) =
+            self.apply_undo_history
+                .last()
+                .map_or((None, false), |marker| {
+                    let same_source = marker.source_generation == self.source_generation;
+                    let is_apply_edit = same_source
+                        && marker.apply_revision_before == self.revision
+                        && current_fingerprint == Some(marker.applied);
+                    let is_undo = same_source
+                        && marker.undo_revision == self.revision
+                        && current_fingerprint == Some(marker.original);
+                    (is_undo.then_some(marker.pre_apply_dirty), is_apply_edit)
+                });
+
+        // A history survives only the Apply Change and its matching undo. Any
+        // other editor change is a divergent edit and invalidates all entries.
+        if undo_pre_dirty.is_none() && !is_apply_edit {
+            self.apply_undo_history.clear();
+        }
+
         self.revision = self.revision.wrapping_add(1);
         self.save_authorization = fs::SaveAuthorization::normal();
         cx.emit(DocumentEvent::Edited);
-        if !self.dirty {
-            self.dirty = true;
+        let desired_dirty = undo_pre_dirty.unwrap_or(true);
+        if self.dirty != desired_dirty {
+            self.dirty = desired_dirty;
             cx.emit(DocumentEvent::DirtyChanged);
+        }
+        if undo_pre_dirty.is_some() {
+            self.apply_undo_history.pop();
+            if let Some(parent) = self.apply_undo_history.last_mut() {
+                parent.undo_revision = self.revision;
+            }
         }
 
         // Replacing the task cancels the previous one, which is the debounce:
@@ -1485,6 +1655,7 @@ impl DocumentView {
                 let trust = self.trust;
                 this.child(
                     Button::new("trust")
+                        .accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID)
                         .label(match trust {
                             Trust::Restricted => i18n::t(i18n::Key::TrustThisDocument, cx),
                             Trust::Trusted => i18n::t(i18n::Key::Trusted, cx),
@@ -2080,15 +2251,27 @@ mod tests {
     // Import selectively: the `gpui_kit::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
     use super::{
-        AsyncSnapshot, DocumentView, Layout, SaveIssue, available_layouts, editor_language,
-        first_line_title, reload_snapshot_matches,
+        AsyncSnapshot, DocumentEvent, DocumentView, Layout, SaveIssue, SaveMode, available_layouts,
+        editor_language, first_line_title, reload_snapshot_matches,
     };
     use crate::fs::{FileStamp, Newline, SourceIdentity};
-    use crate::recovery::{RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord};
+    use crate::model::RevisionRequestBinding;
+    use crate::recovery::{
+        RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord, RevisionRecovery,
+    };
+    use crate::renderer::RendererRegistry;
+    use crate::review::{RevisionAnswer, RevisionAnswers};
+    use crate::web::Trust;
     use gpui_kit::component::highlighter::Language;
-    use mt_doc::DocType;
-    use std::path::Path;
-    use std::time::SystemTime;
+    use gpui_kit::{Focusable as _, TestAppContext};
+    use mt_doc::{
+        DocType,
+        review::{ByteRange, SourceSnapshot},
+        revision::{
+            ChangeId, RevisionChange, RevisionEdit, RevisionError, RevisionLimits, RevisionProposal,
+        },
+    };
+    use std::{cell::Cell, path::Path, rc::Rc, sync::Arc, time::SystemTime};
 
     /// This file's source between `signature` and the next `end` marker.
     ///
@@ -2145,6 +2328,7 @@ mod tests {
         assert!(toolbar.contains("Button::new(\"save-as-document\")"));
         assert!(toolbar.contains("Key::SaveAsPicker"));
         assert!(toolbar.contains("DOCUMENT_SAVE_AS_ACCESSIBILITY_ID"));
+        assert!(toolbar.contains("DOCUMENT_TRUST_ACCESSIBILITY_ID"));
         assert!(toolbar.contains("DocumentEvent::SaveAsRequested"));
     }
 
@@ -2170,6 +2354,7 @@ mod tests {
                     decode_had_errors: false,
                 },
                 checkpointed_at: SystemTime::now(),
+                revision: None,
             },
             source_conflicted: false,
         };
@@ -2178,6 +2363,75 @@ mod tests {
         assert_eq!(prepared.source_path(), None);
         assert_eq!(prepared.recovery_key(), key);
         assert_eq!(prepared.document.source(), "# Pasted prompt\n");
+    }
+
+    #[test]
+    fn prepared_recovery_hands_off_revision_binding_and_answers_once() {
+        let key = RecoveryKey::new_memory();
+        let binding = RevisionRequestBinding::new([1; 32], 7, 11, [2; 32], [3; 32], [4; 32]);
+        let answers = RevisionAnswers::new(vec![
+            RevisionAnswer::answered("keep the heading"),
+            RevisionAnswer::intentionally_unspecified(),
+        ])
+        .expect("valid revision answers");
+        let revision = RevisionRecovery::new(binding, answers).with_source_dirty(false);
+        let recovered = RecoveredRecord {
+            record: RecoveryRecord {
+                key: key.clone(),
+                text: "# Recovered prompt\n".to_string(),
+                metadata: RecoveryMetadata {
+                    source_path: None,
+                    encoding_name: "UTF-8".to_string(),
+                    had_bom: false,
+                    newline: Newline::Lf,
+                    original_stamp: FileStamp {
+                        modified: None,
+                        len: 0,
+                        digest: [0; 32],
+                        object_id: None,
+                    },
+                    source_identity: SourceIdentity::Regular,
+                    decode_had_errors: false,
+                },
+                checkpointed_at: SystemTime::now(),
+                revision: Some(revision.clone()),
+            },
+            source_conflicted: false,
+        };
+
+        let mut prepared = DocumentView::prepare_recovery(recovered).expect("recovery prepares");
+        assert!(!prepared.source_dirty);
+        assert_eq!(prepared.take_revision_recovery(), Some(revision));
+        assert!(prepared.take_revision_recovery().is_none());
+    }
+
+    #[gpui::test]
+    fn recovery_checkpoint_can_carry_answer_only_revision_state(cx: &mut TestAppContext) {
+        let binding = RevisionRequestBinding::new([5; 32], 13, 17, [6; 32], [7; 32], [8; 32]);
+        let revision = RevisionRecovery::new(
+            binding,
+            RevisionAnswers::new(vec![RevisionAnswer::answered("preserve this answer")])
+                .expect("valid revision answers"),
+        );
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new_memory(
+                "# Draft\n".to_string(),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+        let checkpoint = cx.update(|_, app| {
+            document
+                .read(app)
+                .recovery_checkpoint_with_revision(app, Some(revision.clone()))
+        });
+        assert_eq!(checkpoint.revision, Some(revision));
     }
 
     #[test]
@@ -2224,7 +2478,7 @@ mod tests {
             .find("checkpoint_dispatched(now)")
             .expect("checkpoint timing starts only for admitted snapshots");
         let clone = checkpoint
-            .find("recovery_checkpoint(cx)")
+            .find("recovery_checkpoint_with_revision(cx, revision_recovery)")
             .expect("the owned recovery snapshot");
         assert!(size_check < dispatch && dispatch < clone);
 
@@ -3161,5 +3415,930 @@ mod tests {
             "the banner's button is user-initiated and one-shot, so it keeps \
              the synchronous path; the watcher is the one that must not"
         );
+    }
+
+    #[gpui::test]
+    fn revision_apply_rejects_all_applies_selected_hunks_and_undoes_once(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("approved.md");
+        let original = "one\nmiddle\nthree\n";
+        std::fs::write(&path, original).expect("test source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+
+        let edited_events = Rc::new(Cell::new(0));
+        let dirty_events = Rc::new(Cell::new(0));
+        let event_document = document.clone();
+        let _events = cx.update({
+            let edited_events = edited_events.clone();
+            let dirty_events = dirty_events.clone();
+            move |_, app| {
+                app.subscribe(
+                    &event_document,
+                    move |_, event: &DocumentEvent, _| match event {
+                        DocumentEvent::Edited => edited_events.set(edited_events.get() + 1),
+                        DocumentEvent::DirtyChanged => dirty_events.set(dirty_events.get() + 1),
+                        _ => {}
+                    },
+                )
+            }
+        });
+        cx.run_until_parked();
+
+        let first_start = original.find("one").expect("first hunk") as u64;
+        let second_start = original.find("three").expect("second hunk") as u64;
+        let snapshot = SourceSnapshot::new(0, 0);
+        let proposal = RevisionProposal::validate(
+            original,
+            snapshot,
+            vec![
+                RevisionChange::new(
+                    "capitalize the first item",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(first_start, first_start + 3).unwrap(),
+                        "one",
+                        "ONE",
+                    )],
+                ),
+                RevisionChange::new(
+                    "capitalize the last item",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(second_start, second_start + 5).unwrap(),
+                        "three",
+                        "THREE",
+                    )],
+                ),
+            ],
+            RevisionLimits::default(),
+        )
+        .expect("validated multi-hunk proposal");
+        let original_text_before_apply = document.read_with(cx, |document, app| document.text(app));
+        let pre_apply_dirty = document.read_with(cx, |document, _| document.is_dirty());
+        let pre_apply_revision = document.read_with(cx, |document, _| document.revision());
+
+        let rejected = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(
+                    &proposal,
+                    &[(ChangeId(0), false), (ChangeId(1), false)],
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert_eq!(rejected, Ok(false));
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), original_text_before_apply);
+            assert_eq!(document.revision(), pre_apply_revision);
+            assert_eq!(document.is_dirty(), pre_apply_dirty);
+        });
+        assert_eq!(edited_events.get(), 0);
+        assert_eq!(dirty_events.get(), 0);
+
+        let decisions = vec![(ChangeId(0), true), (ChangeId(1), true)];
+        let applied_text = "ONE\nmiddle\nTHREE\n".to_owned();
+
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&proposal, &decisions, window, cx)
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), applied_text);
+            assert_eq!(document.revision(), pre_apply_revision + 1);
+            assert!(document.is_dirty());
+        });
+        assert_eq!(edited_events.get(), 1);
+        assert_eq!(dirty_events.get(), 1);
+
+        cx.update(|_window, app| {
+            document.update(app, |document, cx| {
+                document.set_layout(Layout::Source, cx);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| window.draw(app).clear(app));
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                });
+            });
+        });
+        let editor_focus = document.read_with(cx, |document, app| {
+            document.editor.read(app).focus_handle(app).clone()
+        });
+        cx.update(|window, app| {
+            editor_focus.dispatch_action(&gpui_kit::component::input::Undo, window, app);
+        });
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(
+                document.text(app),
+                original_text_before_apply,
+                "one real undo must restore the exact pre-Apply source"
+            );
+            assert_eq!(document.is_dirty(), pre_apply_dirty);
+            assert_eq!(document.revision(), pre_apply_revision + 2);
+        });
+        assert_eq!(edited_events.get(), 2);
+        assert_eq!(dirty_events.get(), 2);
+
+        let selective_snapshot = SourceSnapshot::new(pre_apply_revision + 2, 0);
+        let selective_proposal = RevisionProposal::validate(
+            original,
+            selective_snapshot,
+            vec![
+                RevisionChange::new(
+                    "capitalize the first item",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(first_start, first_start + 3).unwrap(),
+                        "one",
+                        "ONE",
+                    )],
+                ),
+                RevisionChange::new(
+                    "capitalize the last item",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(second_start, second_start + 5).unwrap(),
+                        "three",
+                        "THREE",
+                    )],
+                ),
+            ],
+            RevisionLimits::default(),
+        )
+        .expect("validated selective proposal after undo");
+        let selective_decisions = vec![(ChangeId(0), true), (ChangeId(1), false)];
+        let selective = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(
+                    &selective_proposal,
+                    &selective_decisions,
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert_eq!(selective, Ok(true));
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), "ONE\nmiddle\nthree\n");
+            assert_eq!(document.revision(), pre_apply_revision + 3);
+            assert!(document.is_dirty());
+        });
+        assert_eq!(edited_events.get(), 3);
+        assert_eq!(dirty_events.get(), 3);
+
+        let stale_text = document.read_with(cx, |document, app| document.text(app));
+        let stale_revision = document.read_with(cx, |document, _| document.revision());
+        let stale = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(
+                    &selective_proposal,
+                    &selective_decisions,
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(matches!(stale, Err(RevisionError::StaleSnapshot { .. })));
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), stale_text);
+            assert_eq!(document.revision(), stale_revision);
+            assert!(document.is_dirty());
+        });
+        assert_eq!(edited_events.get(), 3);
+        assert_eq!(dirty_events.get(), 3);
+
+        std::fs::write(&path, b"external writer\n").expect("external modification after Apply");
+        let saved = document.update(cx, |document, cx| document.save(SaveMode::Normal, cx));
+        assert!(!saved, "normal Save must refuse the newer disk version");
+        assert_eq!(std::fs::read(&path).unwrap(), b"external writer\n");
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), stale_text);
+            assert!(document.is_dirty());
+            assert!(document.is_externally_changed());
+        });
+    }
+
+    #[gpui::test]
+    fn manual_edit_before_apply_returns_stale_without_mutating_any_document_state(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("stale.mdx");
+        let original = "export const answer = \"old\";\n\n# Prompt\n";
+        let manual = "export const answer = \"manual\";\n\n# Prompt\n";
+        std::fs::write(&path, original).expect("test source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+        document.update(cx, |document, cx| {
+            assert_eq!(document.document().doc_type(), DocType::Mdx);
+            document.set_trust(Trust::Trusted, cx);
+        });
+
+        let edited_events = Rc::new(Cell::new(0));
+        let dirty_events = Rc::new(Cell::new(0));
+        let event_document = document.clone();
+        let _events = cx.update({
+            let edited_events = edited_events.clone();
+            let dirty_events = dirty_events.clone();
+            move |_, app| {
+                app.subscribe(
+                    &event_document,
+                    move |_, event: &DocumentEvent, _| match event {
+                        DocumentEvent::Edited => edited_events.set(edited_events.get() + 1),
+                        DocumentEvent::DirtyChanged => dirty_events.set(dirty_events.get() + 1),
+                        _ => {}
+                    },
+                )
+            }
+        });
+        cx.run_until_parked();
+
+        let start = original.find("old").expect("proposal hunk") as u64;
+        let proposal = RevisionProposal::validate(
+            original,
+            SourceSnapshot::new(0, 0),
+            vec![RevisionChange::new(
+                "update the answer",
+                vec![RevisionEdit::new(
+                    ByteRange::new(start, start + 3).unwrap(),
+                    "old",
+                    "new",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("validated proposal");
+
+        // The proposal is now stale: a manual edit changes the authoritative
+        // revision before the owner has accepted the hunk.
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text(manual.to_owned(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let before = document.read_with(cx, |document, app| {
+            (
+                document.text(app),
+                document.revision(),
+                document.is_dirty(),
+                document.trust(),
+            )
+        });
+        let edited_before = edited_events.get();
+        let dirty_before = dirty_events.get();
+
+        let result = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&proposal, &[(ChangeId(0), true)], window, cx)
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(RevisionError::StaleSnapshot { .. }) | Err(RevisionError::SourceMismatch)
+        ));
+        cx.run_until_parked();
+
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), before.0);
+            assert_eq!(document.revision(), before.1);
+            assert_eq!(document.is_dirty(), before.2);
+            assert_eq!(document.trust(), before.3);
+        });
+        assert_eq!(edited_events.get(), edited_before);
+        assert_eq!(dirty_events.get(), dirty_before);
+    }
+
+    #[gpui::test]
+    fn loaded_crlf_unicode_markdown_applies_selected_hunks_and_saves_crlf(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("unicode.md");
+        let original = "---\ntitle: 你好\n---\n\n# 标题 😀\n\n```rust\nlet value = \"旧\";\n```\n\n[链接](https://example.com)\n";
+        let disk_original = original.replace('\n', "\r\n");
+        std::fs::write(&path, disk_original.as_bytes()).expect("CRLF source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load CRLF source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), original);
+            assert!(!document.is_dirty());
+        });
+
+        let title_start = original.find("你好").expect("frontmatter value") as u64;
+        let emoji_start = original.find("😀").expect("emoji") as u64;
+        let code_start = original.find("旧").expect("fenced code value") as u64;
+        let link_start = original.find("链接").expect("link label") as u64;
+        let proposal = RevisionProposal::validate(
+            original,
+            SourceSnapshot::new(0, 0),
+            vec![
+                RevisionChange::new(
+                    "clarify the frontmatter title",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(title_start, title_start + "你好".len() as u64).unwrap(),
+                        "你好",
+                        "世界",
+                    )],
+                ),
+                RevisionChange::new(
+                    "update the heading marker",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(emoji_start, emoji_start + "😀".len() as u64).unwrap(),
+                        "😀",
+                        "🚀",
+                    )],
+                ),
+                RevisionChange::new(
+                    "update the fenced example",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(code_start, code_start + "旧".len() as u64).unwrap(),
+                        "旧",
+                        "新",
+                    )],
+                ),
+                RevisionChange::new(
+                    "make the link label explicit",
+                    vec![RevisionEdit::new(
+                        ByteRange::new(link_start, link_start + "链接".len() as u64).unwrap(),
+                        "链接",
+                        "Link",
+                    )],
+                ),
+            ],
+            RevisionLimits::default(),
+        )
+        .expect("validated Unicode multi-hunk proposal");
+        let expected = "---\ntitle: 世界\n---\n\n# 标题 🚀\n\n```rust\nlet value = \"旧\";\n```\n\n[Link](https://example.com)\n";
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(
+                    &proposal,
+                    &[
+                        (ChangeId(0), true),
+                        (ChangeId(1), true),
+                        (ChangeId(2), false),
+                        (ChangeId(3), true),
+                    ],
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), expected);
+            assert!(document.is_dirty());
+        });
+
+        let saved = cx.update(|_, app| {
+            document.update(app, |document, cx| document.save(SaveMode::Normal, cx))
+        });
+        assert!(saved);
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(&path).expect("saved bytes"),
+            expected.replace('\n', "\r\n").as_bytes()
+        );
+        document.read_with(cx, |document, _| assert!(!document.is_dirty()));
+    }
+
+    #[gpui::test]
+    fn consecutive_apply_undo_history_restores_each_revision_and_dirty_state(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("stacked-approved.md");
+        let first_text = "one\nmiddle\nthree\n";
+        std::fs::write(&path, first_text).expect("test source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+
+        let edited_events = Rc::new(Cell::new(0));
+        let dirty_events = Rc::new(Cell::new(0));
+        let event_document = document.clone();
+        let _events = cx.update({
+            let edited_events = edited_events.clone();
+            let dirty_events = dirty_events.clone();
+            move |_, app| {
+                app.subscribe(
+                    &event_document,
+                    move |_, event: &DocumentEvent, _| match event {
+                        DocumentEvent::Edited => edited_events.set(edited_events.get() + 1),
+                        DocumentEvent::DirtyChanged => dirty_events.set(dirty_events.get() + 1),
+                        _ => {}
+                    },
+                )
+            }
+        });
+        cx.run_until_parked();
+
+        let first_snapshot = SourceSnapshot::new(0, 0);
+        let one_start = first_text.find("one").unwrap() as u64;
+        let first_proposal = RevisionProposal::validate(
+            first_text,
+            first_snapshot,
+            vec![RevisionChange::new(
+                "capitalize the first item",
+                vec![RevisionEdit::new(
+                    ByteRange::new(one_start, one_start + 3).unwrap(),
+                    "one",
+                    "ONE",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("first validated proposal");
+        let first_decisions = vec![(ChangeId(0), true)];
+        let second_text = first_proposal
+            .compose_against(first_text, first_snapshot, &first_decisions)
+            .unwrap();
+
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&first_proposal, &first_decisions, window, cx)
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        cx.run_until_parked();
+
+        let second_snapshot = SourceSnapshot::new(1, 0);
+        let middle_start = second_text.find("middle").unwrap() as u64;
+        let second_proposal = RevisionProposal::validate(
+            &second_text,
+            second_snapshot,
+            vec![RevisionChange::new(
+                "capitalize the middle item",
+                vec![RevisionEdit::new(
+                    ByteRange::new(middle_start, middle_start + 6).unwrap(),
+                    "middle",
+                    "MIDDLE",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("second validated proposal");
+        let second_decisions = vec![(ChangeId(0), true)];
+        let third_text = second_proposal
+            .compose_against(&second_text, second_snapshot, &second_decisions)
+            .unwrap();
+
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&second_proposal, &second_decisions, window, cx)
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), third_text);
+            assert_eq!(document.revision(), 2);
+            assert!(document.is_dirty());
+        });
+        assert_eq!(edited_events.get(), 2);
+        assert_eq!(dirty_events.get(), 1);
+
+        cx.update(|_window, app| {
+            document.update(app, |document, cx| {
+                document.set_layout(Layout::Source, cx);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| window.draw(app).clear(app));
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                });
+            });
+        });
+        let editor_focus = document.read_with(cx, |document, app| {
+            document.editor.read(app).focus_handle(app).clone()
+        });
+
+        cx.update(|window, app| {
+            editor_focus.dispatch_action(&gpui_kit::component::input::Undo, window, app);
+        });
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), second_text);
+            assert!(document.is_dirty());
+            assert_eq!(document.revision(), 3);
+        });
+
+        cx.update(|window, app| {
+            editor_focus.dispatch_action(&gpui_kit::component::input::Undo, window, app);
+        });
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), first_text);
+            assert!(!document.is_dirty());
+            assert_eq!(document.revision(), 4);
+        });
+        assert_eq!(edited_events.get(), 4);
+        assert_eq!(dirty_events.get(), 2);
+    }
+
+    #[gpui::test]
+    fn applying_and_undoing_from_a_dirty_document_restores_dirty_state(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("dirty-approved.md");
+        let disk_text = "one\nmiddle\nthree\n";
+        let dirty_text = "one\nmiddle\nthree changed\n";
+        std::fs::write(&path, disk_text).expect("test source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text(dirty_text.to_owned(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let edited_events = Rc::new(Cell::new(0));
+        let dirty_events = Rc::new(Cell::new(0));
+        let event_document = document.clone();
+        let _events = cx.update({
+            let edited_events = edited_events.clone();
+            let dirty_events = dirty_events.clone();
+            move |_, app| {
+                app.subscribe(
+                    &event_document,
+                    move |_, event: &DocumentEvent, _| match event {
+                        DocumentEvent::Edited => edited_events.set(edited_events.get() + 1),
+                        DocumentEvent::DirtyChanged => dirty_events.set(dirty_events.get() + 1),
+                        _ => {}
+                    },
+                )
+            }
+        });
+        cx.run_until_parked();
+        edited_events.set(0);
+        dirty_events.set(0);
+
+        let pre_apply_revision = document.read_with(cx, |document, _| document.revision());
+        let pre_apply_dirty = document.read_with(cx, |document, _| document.is_dirty());
+        assert!(pre_apply_dirty);
+        let snapshot = SourceSnapshot::new(pre_apply_revision, 0);
+        let start = dirty_text.find("middle").expect("dirty hunk") as u64;
+        let proposal = RevisionProposal::validate(
+            dirty_text,
+            snapshot,
+            vec![RevisionChange::new(
+                "capitalize the middle item",
+                vec![RevisionEdit::new(
+                    ByteRange::new(start, start + 6).unwrap(),
+                    "middle",
+                    "MIDDLE",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("validated dirty proposal");
+        let decisions = vec![(ChangeId(0), true)];
+        let applied_text = proposal
+            .compose_against(dirty_text, snapshot, &decisions)
+            .expect("compose dirty proposal");
+
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&proposal, &decisions, window, cx)
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), applied_text);
+            assert_eq!(document.revision(), pre_apply_revision + 1);
+            assert!(document.is_dirty());
+        });
+        assert_eq!(edited_events.get(), 1);
+        assert_eq!(dirty_events.get(), 0);
+
+        cx.update(|_window, app| {
+            document.update(app, |document, cx| {
+                document.set_layout(Layout::Source, cx);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| window.draw(app).clear(app));
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                });
+            });
+        });
+        let editor_focus = document.read_with(cx, |document, app| {
+            document.editor.read(app).focus_handle(app).clone()
+        });
+        cx.update(|window, app| {
+            editor_focus.dispatch_action(&gpui_kit::component::input::Undo, window, app);
+        });
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), dirty_text);
+            assert_eq!(document.is_dirty(), pre_apply_dirty);
+            assert_eq!(document.revision(), pre_apply_revision + 2);
+        });
+        assert_eq!(edited_events.get(), 2);
+        assert_eq!(dirty_events.get(), 0);
+    }
+
+    #[gpui::test]
+    fn divergent_manual_edit_clears_apply_history_before_a_later_undo(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("divergent-approved.md");
+        let original = "one\nmiddle\nthree\n";
+        let manual = "manual divergence\n";
+        std::fs::write(&path, original).expect("test source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+
+        let snapshot = SourceSnapshot::new(0, 0);
+        let start = original.find("one").unwrap() as u64;
+        let proposal = RevisionProposal::validate(
+            original,
+            snapshot,
+            vec![RevisionChange::new(
+                "capitalize the first item",
+                vec![RevisionEdit::new(
+                    ByteRange::new(start, start + 3).unwrap(),
+                    "one",
+                    "ONE",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("validated proposal");
+        let decisions = vec![(ChangeId(0), true)];
+        let applied_text = proposal
+            .compose_against(original, snapshot, &decisions)
+            .unwrap();
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&proposal, &decisions, window, cx)
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text(manual.to_owned(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        document.read_with(cx, |document, _| {
+            assert!(
+                document.apply_undo_history.is_empty(),
+                "a divergent editor change must clear all Apply history immediately"
+            );
+        });
+
+        cx.update(|_window, app| {
+            document.update(app, |document, cx| {
+                document.set_layout(Layout::Source, cx);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| window.draw(app).clear(app));
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                });
+            });
+        });
+        let editor_focus = document.read_with(cx, |document, app| {
+            document.editor.read(app).focus_handle(app).clone()
+        });
+        cx.update(|window, app| {
+            editor_focus.dispatch_action(&gpui_kit::component::input::Undo, window, app);
+        });
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), applied_text);
+            assert!(document.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn trusted_html_apply_restricts_before_mutation_and_undo_keeps_it_restricted(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("trusted.html");
+        let original = "<!doctype html><html><body><script>window.before=1</script></body></html>";
+        std::fs::write(&path, original).expect("test source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+        document.update(cx, |document, cx| {
+            document.set_trust(Trust::Trusted, cx);
+        });
+        document.read_with(cx, |document, _| {
+            assert_eq!(document.trust(), Trust::Trusted);
+            assert!(document.web_html().unwrap().starts_with("file://"));
+        });
+
+        let start = original.find("before=1").expect("executable hunk") as u64;
+        let snapshot = SourceSnapshot::new(0, 0);
+        let proposal = RevisionProposal::validate(
+            original,
+            snapshot,
+            vec![RevisionChange::new(
+                "change executable HTML content",
+                vec![RevisionEdit::new(
+                    ByteRange::new(start, start + 8).unwrap(),
+                    "before=1",
+                    "before=2",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("validated HTML proposal");
+        let decisions = vec![(ChangeId(0), true)];
+
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&proposal, &decisions, window, cx)
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        document.read_with(cx, |document, _| {
+            let payload = document.web_html().expect("restricted payload");
+            assert_eq!(document.trust(), Trust::Restricted);
+            assert!(!payload.starts_with("file://"));
+            assert!(payload.contains("script-src 'none'"));
+        });
+
+        cx.update(|_window, app| {
+            document.update(app, |document, cx| {
+                document.set_layout(Layout::Source, cx);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| window.draw(app).clear(app));
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.editor.update(cx, |editor, cx| {
+                    editor.focus(window, cx);
+                });
+            });
+        });
+        let editor_focus = document.read_with(cx, |document, app| {
+            document.editor.read(app).focus_handle(app).clone()
+        });
+        cx.update(|window, app| {
+            editor_focus.dispatch_action(&gpui_kit::component::input::Undo, window, app);
+        });
+        cx.run_until_parked();
+        document.read_with(cx, |document, _| {
+            assert_eq!(document.trust(), Trust::Restricted);
+            assert!(!document.web_html().unwrap().starts_with("file://"));
+        });
+    }
+
+    #[gpui::test]
+    fn trusted_mdx_apply_restricts_before_mutation(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().expect("test source directory");
+        let path = directory.path().join("trusted.mdx");
+        let original = "export const answer = \"old\";\n\n# Prompt\n";
+        std::fs::write(&path, original).expect("test source");
+
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let (document, cx) = cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                crate::fs::load(&path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        });
+        document.update(cx, |document, cx| {
+            assert_eq!(document.document().doc_type(), DocType::Mdx);
+            document.set_trust(Trust::Trusted, cx);
+        });
+        document.read_with(cx, |document, _| {
+            assert_eq!(document.trust(), Trust::Trusted)
+        });
+
+        let start = original.find("old").expect("executable hunk") as u64;
+        let proposal = RevisionProposal::validate(
+            original,
+            SourceSnapshot::new(0, 0),
+            vec![RevisionChange::new(
+                "change executable MDX content",
+                vec![RevisionEdit::new(
+                    ByteRange::new(start, start + 3).unwrap(),
+                    "old",
+                    "new",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("validated MDX proposal");
+        let applied = cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.apply_approved_revision(&proposal, &[(ChangeId(0), true)], window, cx)
+            })
+        });
+        assert_eq!(applied, Ok(true));
+        cx.run_until_parked();
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.text(app), original.replace("old", "new"));
+            assert_eq!(document.trust(), Trust::Restricted);
+        });
     }
 }

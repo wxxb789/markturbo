@@ -14,6 +14,7 @@ pub mod harness;
 pub mod instruction;
 pub mod outline;
 pub mod review;
+pub mod revision;
 pub mod search;
 pub mod skill;
 pub mod translate;

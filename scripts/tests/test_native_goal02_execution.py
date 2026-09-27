@@ -4,6 +4,28 @@ from ._native_goal02_support import *
 
 
 class PrivacyAndCliTests(unittest.TestCase):
+    def test_isolation_cleanup_retries_transient_permission_errors(self) -> None:
+        root = Path("temporary-native-root")
+        with (
+            mock.patch.object(
+                runtime.shutil,
+                "rmtree",
+                side_effect=[PermissionError(), PermissionError(), None],
+            ) as remove,
+            mock.patch.object(runtime.time, "sleep") as sleep,
+        ):
+            runtime.remove_tree_with_retry(root, timeout=1.0)
+
+        self.assertEqual(remove.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_isolation_cleanup_still_fails_after_the_retry_budget(self) -> None:
+        with mock.patch.object(
+            runtime.shutil, "rmtree", side_effect=PermissionError()
+        ):
+            with self.assertRaises(PermissionError):
+                runtime.remove_tree_with_retry(Path("temporary-native-root"), timeout=0.0)
+
     def test_loading_parser_does_not_import_pywinauto(self) -> None:
         if not PYWINAUTO_WAS_LOADED:
             self.assertNotIn("pywinauto", sys.modules)

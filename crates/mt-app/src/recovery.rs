@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::fs::{FileObjectId, FileStamp, LoadedFile, Newline, SourceIdentity};
+use crate::model::RevisionRequestBinding;
+use crate::review::{RevisionAnswer, RevisionAnswerError, RevisionAnswers};
 #[cfg(windows)]
 use crate::{app_paths, fs::file_object_id};
 
@@ -35,6 +37,8 @@ const IDLE_CHECKPOINT_DELAY: Duration = Duration::from_secs(2);
 const CHECKPOINT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const RECORD_EXTENSION: &str = "mtrecovery";
 const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION_WITH_REVISION: u8 = 2;
+const REVISION_ENVELOPE_VERSION: u8 = 1;
 const TRANSACTION_VERSION: u8 = 1;
 const TRANSACTION_JOURNAL_NAME: &str = ".markturbo-recovery-transaction.json";
 const TRANSACTION_COMMIT_NAME: &str = ".markturbo-recovery-transaction.commit";
@@ -42,7 +46,7 @@ const ARTIFACT_PREFIX: &str = ".markturbo-recovery-";
 const RETIREMENT_MARKER_PREFIX: &str = ".markturbo-recovery-retiring-";
 const RETIREMENT_MARKER_VERSION: u8 = 1;
 const MAX_PARALLEL_RECOVERY_WORKERS: usize = 4;
-const CHECKPOINT_WAVE_METADATA_OVERHEAD_BYTES: u64 = 4 * 1024;
+const CHECKPOINT_WAVE_PROTECTION_OVERHEAD_BYTES: u64 = 4 * 1024;
 static NEXT_MEMORY_RECOVERY_KEY: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 const LOCAL_RECOVERY_ROOT_REQUIRED: &str = "recovery root must be on a local volume";
@@ -196,21 +200,98 @@ impl RecoveryMetadata {
     }
 }
 
+/// User-authored clarification answers retained with the exact Revision
+/// request binding that produced them.
+///
+/// Recovery intentionally stores no provider proposal, response body, or raw
+/// transport payload.  The binding's source digest remains the complete
+/// reviewed scope, including every file in an Agent Skill package.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RevisionRecovery {
+    binding: RevisionRequestBinding,
+    answers: RevisionAnswers,
+    source_dirty: bool,
+}
+
+impl RevisionRecovery {
+    pub fn new(binding: RevisionRequestBinding, answers: RevisionAnswers) -> Self {
+        Self {
+            binding,
+            answers,
+            source_dirty: true,
+        }
+    }
+
+    pub fn with_source_dirty(mut self, source_dirty: bool) -> Self {
+        self.source_dirty = source_dirty;
+        self
+    }
+
+    pub fn binding(&self) -> &RevisionRequestBinding {
+        &self.binding
+    }
+
+    pub fn answers(&self) -> &RevisionAnswers {
+        &self.answers
+    }
+
+    pub const fn source_dirty(&self) -> bool {
+        self.source_dirty
+    }
+}
+
+impl fmt::Debug for RevisionRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RevisionRecovery")
+            .field("binding", &self.binding)
+            .field("answers", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Exact text and metadata to persist for one dirty buffer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryCheckpoint {
     pub key: RecoveryKey,
     pub text: String,
     pub metadata: RecoveryMetadata,
+    pub revision: Option<RevisionRecovery>,
+}
+
+impl fmt::Debug for RecoveryCheckpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryCheckpoint")
+            .field("key", &self.key)
+            .field("text_bytes", &self.text.len())
+            .field("metadata", &self.metadata)
+            .field("revision", &self.revision)
+            .finish()
+    }
 }
 
 /// A decoded recovery record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryRecord {
     pub key: RecoveryKey,
     pub text: String,
     pub metadata: RecoveryMetadata,
     pub checkpointed_at: SystemTime,
+    pub revision: Option<RevisionRecovery>,
+}
+
+impl fmt::Debug for RecoveryRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryRecord")
+            .field("key", &self.key)
+            .field("text_bytes", &self.text.len())
+            .field("metadata", &self.metadata)
+            .field("checkpointed_at", &self.checkpointed_at)
+            .field("revision", &self.revision)
+            .finish()
+    }
 }
 
 /// A record that can be offered for recovery, with its source safety state.
@@ -1140,7 +1221,7 @@ impl RecoveryStore {
         let now = SystemTime::now();
         let input_bytes: Vec<_> = current
             .iter()
-            .map(|attempt| checkpoint_wave_input_bytes(attempt.checkpoint))
+            .map(|attempt| checkpoint_wave_input_bytes(attempt.checkpoint, now))
             .collect();
         let ranges = recovery_wave_ranges(&input_bytes, self.limits.max_total_bytes);
         let (sender, receiver) = std::sync::mpsc::sync_channel(0);
@@ -3388,33 +3469,25 @@ fn recovery_wave_ranges_with_worker_limit(
     ranges
 }
 
-fn checkpoint_wave_input_bytes(checkpoint: &RecoveryCheckpoint) -> u64 {
-    let mut bytes = checkpoint.text.len().try_into().unwrap_or(u64::MAX);
-    bytes = bytes.saturating_add(checkpoint.key.0.len().try_into().unwrap_or(u64::MAX));
-    bytes = bytes.saturating_add(
-        checkpoint
-            .metadata
-            .encoding_name
-            .len()
-            .try_into()
-            .unwrap_or(u64::MAX),
-    );
-    if let Some(path) = &checkpoint.metadata.source_path {
-        bytes = bytes.saturating_add(path_wave_input_bytes(path));
-    }
-    if let SourceIdentity::SymbolicLink {
-        link_target,
-        resolved_target,
-    } = &checkpoint.metadata.source_identity
-    {
-        bytes = bytes.saturating_add(path_wave_input_bytes(link_target));
-        bytes = bytes.saturating_add(path_wave_input_bytes(resolved_target));
-    }
-    bytes.saturating_add(CHECKPOINT_WAVE_METADATA_OVERHEAD_BYTES)
-}
-
-fn path_wave_input_bytes(path: &Path) -> u64 {
-    path.to_string_lossy().len().try_into().unwrap_or(u64::MAX)
+/// Estimate one preparation wave from the exact serialized recovery envelope.
+///
+/// The old estimate counted selected source fields and could undercount a
+/// revision envelope (JSON field names, escaped answers, and the complete
+/// binding were all omitted).  Serialization is deliberately repeated here
+/// before the parallel protection work so the wave bound follows the bytes
+/// that will actually cross the encryption boundary.  The fixed allowance is
+/// for protector framing and per-item worker bookkeeping; a serialization
+/// failure is treated as an unbounded item and therefore gets its own wave.
+fn checkpoint_wave_input_bytes(
+    checkpoint: &RecoveryCheckpoint,
+    checkpointed_at: SystemTime,
+) -> u64 {
+    let envelope_bytes = DiskRecord::from_checkpoint(checkpoint, checkpointed_at)
+        .ok()
+        .and_then(|record| serde_json::to_vec(&record).ok())
+        .and_then(|bytes| u64::try_from(bytes.len()).ok())
+        .unwrap_or(u64::MAX);
+    envelope_bytes.saturating_add(CHECKPOINT_WAVE_PROTECTION_OVERHEAD_BYTES)
 }
 
 fn run_recovery_wave<T, R>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R>
@@ -3457,13 +3530,30 @@ fn is_expired(checkpointed_at: SystemTime, now: SystemTime, max_age: Duration) -
         .is_ok_and(|age| age >= max_age)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiskRecord {
     version: u8,
     key: String,
     checkpointed_at: DiskTimestamp,
     text: String,
     metadata: DiskMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<DiskRevisionRecovery>,
+}
+
+impl fmt::Debug for DiskRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiskRecord")
+            .field("version", &self.version)
+            .field("key", &self.key)
+            .field("checkpointed_at", &self.checkpointed_at)
+            .field("text_bytes", &self.text.len())
+            .field("metadata", &self.metadata)
+            .field("revision", &self.revision)
+            .finish()
+    }
 }
 
 impl DiskRecord {
@@ -3471,30 +3561,226 @@ impl DiskRecord {
         checkpoint: &RecoveryCheckpoint,
         checkpointed_at: SystemTime,
     ) -> Result<Self, RecoveryError> {
+        let revision = checkpoint
+            .revision
+            .as_ref()
+            .map(DiskRevisionRecovery::from_revision);
         Ok(Self {
-            version: RECORD_VERSION,
+            version: if revision.is_some() {
+                RECORD_VERSION_WITH_REVISION
+            } else {
+                RECORD_VERSION
+            },
             key: checkpoint.key.0.clone(),
             checkpointed_at: DiskTimestamp::from_system_time(checkpointed_at)?,
             text: checkpoint.text.clone(),
             metadata: DiskMetadata::from_metadata(&checkpoint.metadata)?,
+            revision,
         })
     }
 
     fn into_record(self) -> Result<RecoveryRecord, RecoveryError> {
-        let key = RecoveryKey(self.key);
-        if self.version != RECORD_VERSION || !key.is_valid() {
+        let Self {
+            version,
+            key: raw_key,
+            checkpointed_at,
+            text,
+            metadata,
+            revision,
+        } = self;
+        let key = RecoveryKey(raw_key);
+        let revision = match (version, revision) {
+            (RECORD_VERSION, None) => None,
+            (RECORD_VERSION, Some(_)) => {
+                return Err(RecoveryError::Unavailable("unsupported recovery record"));
+            }
+            (RECORD_VERSION_WITH_REVISION, Some(revision)) => Some(revision.into_revision()?),
+            (RECORD_VERSION_WITH_REVISION, None) => {
+                return Err(RecoveryError::Unavailable("unsupported recovery record"));
+            }
+            _ => {
+                return Err(RecoveryError::Unavailable("unsupported recovery record"));
+            }
+        };
+        if !key.is_valid() {
             return Err(RecoveryError::Unavailable("unsupported recovery record"));
         }
         Ok(RecoveryRecord {
             key,
-            text: self.text,
-            metadata: self.metadata.into_metadata()?,
-            checkpointed_at: self.checkpointed_at.into_system_time()?,
+            text,
+            metadata: metadata.into_metadata()?,
+            checkpointed_at: checkpointed_at.into_system_time()?,
+            revision,
         })
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskRevisionRecovery {
+    version: u8,
+    binding: DiskRevisionBinding,
+    answers: Vec<DiskRevisionAnswer>,
+    #[serde(default = "default_true")]
+    source_dirty: bool,
+}
+
+impl fmt::Debug for DiskRevisionRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiskRevisionRecovery")
+            .field("version", &self.version)
+            .field("binding", &self.binding)
+            .field("answer_count", &self.answers.len())
+            .finish()
+    }
+}
+
+impl DiskRevisionRecovery {
+    fn from_revision(revision: &RevisionRecovery) -> Self {
+        Self {
+            version: REVISION_ENVELOPE_VERSION,
+            binding: DiskRevisionBinding::from_binding(revision.binding()),
+            answers: revision
+                .answers()
+                .as_slice()
+                .iter()
+                .map(DiskRevisionAnswer::from_answer)
+                .collect(),
+            source_dirty: revision.source_dirty(),
+        }
+    }
+
+    fn into_revision(self) -> Result<RevisionRecovery, RecoveryError> {
+        if self.version != REVISION_ENVELOPE_VERSION {
+            return Err(RecoveryError::Unavailable(
+                "unsupported recovery revision envelope",
+            ));
+        }
+        let answers = self
+            .answers
+            .into_iter()
+            .map(DiskRevisionAnswer::into_answer)
+            .collect::<Result<Vec<_>, _>>()?;
+        let answers = RevisionAnswers::for_recovery(answers).map_err(revision_answer_error)?;
+        Ok(RevisionRecovery::new(self.binding.into_binding(), answers)
+            .with_source_dirty(self.source_dirty))
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskRevisionBinding {
+    source_sha256: [u8; 32],
+    source_revision: u64,
+    source_generation: u64,
+    artifact_lens_digest: [u8; 32],
+    review_context_digest: [u8; 32],
+    answers_digest: [u8; 32],
+}
+
+impl DiskRevisionBinding {
+    /// `source_sha256` is the digest of the complete reviewed outbound source
+    /// scope.  For an Agent Skill Revision this is the full normalized package
+    /// framing (`ReviewRequest::outbound_bytes()`), never only `SKILL.md`.
+    fn from_binding(binding: &RevisionRequestBinding) -> Self {
+        Self {
+            source_sha256: *binding.source_sha256(),
+            source_revision: binding.source_revision(),
+            source_generation: binding.source_generation(),
+            artifact_lens_digest: *binding.artifact_lens_digest(),
+            review_context_digest: *binding.review_context_digest(),
+            answers_digest: *binding.answers_digest(),
+        }
+    }
+
+    fn into_binding(self) -> RevisionRequestBinding {
+        RevisionRequestBinding::new(
+            self.source_sha256,
+            self.source_revision,
+            self.source_generation,
+            self.artifact_lens_digest,
+            self.review_context_digest,
+            self.answers_digest,
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskRevisionAnswer {
+    state: DiskRevisionAnswerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answer: Option<String>,
+}
+
+impl fmt::Debug for DiskRevisionAnswer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiskRevisionAnswer")
+            .field("state", &self.state)
+            .field("answer_present", &self.answer.is_some())
+            .finish()
+    }
+}
+
+impl DiskRevisionAnswer {
+    fn from_answer(answer: &RevisionAnswer) -> Self {
+        match answer {
+            RevisionAnswer::Unanswered => Self {
+                state: DiskRevisionAnswerState::Unanswered,
+                answer: None,
+            },
+            RevisionAnswer::IntentionallyUnspecified => Self {
+                state: DiskRevisionAnswerState::IntentionallyUnspecified,
+                answer: None,
+            },
+            RevisionAnswer::Answered(value) => Self {
+                state: DiskRevisionAnswerState::Answered,
+                answer: Some(value.clone()),
+            },
+        }
+    }
+
+    fn into_answer(self) -> Result<RevisionAnswer, RecoveryError> {
+        match (self.state, self.answer) {
+            (DiskRevisionAnswerState::Unanswered, None) => Ok(RevisionAnswer::Unanswered),
+            (DiskRevisionAnswerState::IntentionallyUnspecified, None) => {
+                Ok(RevisionAnswer::IntentionallyUnspecified)
+            }
+            (DiskRevisionAnswerState::Answered, Some(value)) => Ok(RevisionAnswer::Answered(value)),
+            _ => Err(RecoveryError::Unavailable(
+                "invalid recovery revision answer",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskRevisionAnswerState {
+    Unanswered,
+    IntentionallyUnspecified,
+    Answered,
+}
+
+fn revision_answer_error(error: RevisionAnswerError) -> RecoveryError {
+    match error {
+        RevisionAnswerError::TooManyAnswers
+        | RevisionAnswerError::EmptyAnswer
+        | RevisionAnswerError::AnswerTooLarge
+        | RevisionAnswerError::QuestionCountMismatch { .. } => {
+            RecoveryError::Unavailable("invalid recovery revision answers")
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiskMetadata {
     source_path: Option<PathBuf>,
     encoding_name: String,
@@ -3532,6 +3818,7 @@ impl DiskMetadata {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum DiskNewline {
     Lf,
     Crlf,
@@ -3556,6 +3843,7 @@ impl From<DiskNewline> for Newline {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiskFileStamp {
     modified: Option<DiskTimestamp>,
     len: u64,
@@ -3591,6 +3879,7 @@ impl DiskFileStamp {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum DiskSourceIdentity {
     Regular,
     SymbolicLink {
@@ -3630,6 +3919,7 @@ impl From<DiskSourceIdentity> for SourceIdentity {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiskTimestamp {
     seconds: i64,
     nanos: u32,
@@ -3858,6 +4148,8 @@ mod tests {
         time::{Duration, Instant, SystemTime},
     };
 
+    use crate::review::REVISION_MAX_ANSWER_BYTES;
+
     use super::*;
 
     #[derive(Default)]
@@ -3870,6 +4162,19 @@ mod tests {
 
         fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
             Ok(ciphertext.iter().rev().copied().collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct NonLeakingProtector;
+
+    impl RecoveryProtector for NonLeakingProtector {
+        fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
+            Ok(plaintext.iter().map(|byte| byte ^ 0xA5).collect())
+        }
+
+        fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
+            Ok(ciphertext.iter().map(|byte| byte ^ 0xA5).collect())
         }
     }
 
@@ -4138,7 +4443,443 @@ mod tests {
             key: RecoveryKey::for_document_id(name),
             text: text.to_owned(),
             metadata: metadata(),
+            revision: None,
         }
+    }
+
+    fn revision_binding() -> RevisionRequestBinding {
+        RevisionRequestBinding::new([1; 32], 7, 11, [2; 32], [3; 32], [4; 32])
+    }
+
+    fn revision_answers() -> RevisionAnswers {
+        RevisionAnswers::new(vec![
+            RevisionAnswer::unanswered(),
+            RevisionAnswer::intentionally_unspecified(),
+            RevisionAnswer::answered("保留原意，加入中文说明 🚀"),
+        ])
+        .unwrap()
+    }
+
+    fn revision_checkpoint(name: &str, text: &str) -> RecoveryCheckpoint {
+        RecoveryCheckpoint {
+            key: RecoveryKey::for_document_id(name),
+            text: text.to_owned(),
+            metadata: metadata(),
+            revision: Some(RevisionRecovery::new(
+                revision_binding(),
+                revision_answers(),
+            )),
+        }
+    }
+
+    fn rewrite_record_json(
+        store: &RecoveryStore,
+        key: &RecoveryKey,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let ciphertext = fs::read(store.record_path(key)).unwrap();
+        let plaintext = store.protector.unprotect(&ciphertext).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        mutate(&mut value);
+        let plaintext = serde_json::to_vec(&value).unwrap();
+        let ciphertext = store.protector.protect(&plaintext).unwrap();
+        fs::write(store.record_path(key), ciphertext).unwrap();
+    }
+
+    #[test]
+    fn revision_answers_round_trip_with_three_states_and_unicode() {
+        let (_dir, store) = test_store();
+        let checkpoint = revision_checkpoint("revision-round-trip", "source 中文 🚀\n");
+        let expected = checkpoint.revision.clone().unwrap();
+
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+
+        let scan = store.recover().unwrap();
+        assert!(scan.issues.is_empty());
+        assert_eq!(scan.records.len(), 1);
+        let recovered = &scan.records[0].record;
+        let revision = recovered
+            .revision
+            .as_ref()
+            .expect("revision answers must survive recovery");
+        assert_eq!(revision.binding(), expected.binding());
+        assert_eq!(revision.answers(), expected.answers());
+        assert_eq!(recovered.text, checkpoint.text);
+    }
+
+    #[test]
+    fn revision_source_clean_answer_only_recovery_keeps_current_source_text() {
+        let (_dir, store) = test_store();
+        let current_source = "the reviewed source is still current 中文 🚀\n";
+        let mut checkpoint = revision_checkpoint("answer-only-source", current_source);
+        checkpoint.revision = checkpoint
+            .revision
+            .take()
+            .map(|revision| revision.with_source_dirty(false));
+
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+
+        let recovered = &store.recover().unwrap().records[0].record;
+        assert_eq!(recovered.text, current_source);
+        assert_eq!(
+            recovered.revision.as_ref().unwrap().answers(),
+            &revision_answers()
+        );
+        assert!(!recovered.revision.as_ref().unwrap().source_dirty());
+    }
+
+    #[test]
+    fn revision_debug_and_ciphertext_do_not_expose_answer_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            RecoveryStore::new_at(dir.path().join("recovery"), Arc::new(NonLeakingProtector))
+                .unwrap();
+        let answer = "保留原意，加入中文说明 🚀";
+        let checkpoint = revision_checkpoint("revision-redaction", "source\n");
+
+        let debug = format!("{checkpoint:?}");
+        assert!(!debug.contains(answer));
+        assert!(!format!("{:?}", checkpoint.revision.as_ref().unwrap()).contains(answer));
+
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+        let ciphertext = fs::read(store.record_path(&checkpoint.key)).unwrap();
+        assert!(
+            !ciphertext
+                .windows(answer.len())
+                .any(|window| window == answer.as_bytes())
+        );
+
+        let disk = DiskRecord::from_checkpoint(&checkpoint, SystemTime::now()).unwrap();
+        let disk_debug = format!("{disk:?}");
+        assert!(!disk_debug.contains(answer));
+    }
+
+    #[test]
+    fn agent_skill_revision_binding_preserves_the_full_package_digest() {
+        // The Review layer computes this digest from the complete normalized
+        // Agent Skill package framing, including supporting files. Recovery
+        // must carry that opaque binding unchanged rather than narrowing it to
+        // the active SKILL.md entrypoint.
+        let mut hasher = Sha256::new();
+        hasher.update(b"SKILL.md\0entry\0supporting/rules.md\0rules\0");
+        let mut package_digest = [0_u8; 32];
+        package_digest.copy_from_slice(&hasher.finalize());
+        let binding =
+            RevisionRequestBinding::new(package_digest, 19, 23, [9; 32], [8; 32], [7; 32]);
+        let answers = revision_answers();
+        let checkpoint = RecoveryCheckpoint {
+            key: RecoveryKey::for_document_id("agent-skill-package-binding"),
+            text: "entry\n".to_owned(),
+            metadata: metadata(),
+            revision: Some(RevisionRecovery::new(binding, answers)),
+        };
+        let (_dir, store) = test_store();
+
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+
+        let recovered = &store.recover().unwrap().records[0].record;
+        assert_eq!(
+            recovered
+                .revision
+                .as_ref()
+                .unwrap()
+                .binding()
+                .source_sha256(),
+            &package_digest
+        );
+    }
+
+    #[test]
+    fn malformed_revision_answer_shape_is_skipped_without_exposing_answer_text() {
+        let (_dir, store) = test_store();
+        let checkpoint = revision_checkpoint("malformed-revision-answer", "source\n");
+        let answer = "secret answer that must not enter diagnostics";
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+        rewrite_record_json(&store, &checkpoint.key, |value| {
+            value["revision"]["answers"][0]["answer"] = serde_json::json!(answer);
+        });
+
+        let scan = store.recover().unwrap();
+        assert!(scan.records.is_empty());
+        let debug = format!("{scan:?}");
+        assert!(!debug.contains(answer));
+        assert!(scan.issues.iter().any(
+            |issue| matches!(issue, RecoveryIssue::Malformed { path } if path == &store.record_path(&checkpoint.key))
+        ));
+    }
+
+    #[test]
+    fn revision_decode_errors_do_not_echo_answer_text() {
+        let answer = "answer text must remain private";
+        let error = DiskRevisionAnswer {
+            state: DiskRevisionAnswerState::Unanswered,
+            answer: Some(answer.to_owned()),
+        }
+        .into_answer()
+        .unwrap_err();
+
+        assert!(!error.to_string().contains(answer));
+        assert!(!format!("{error:?}").contains(answer));
+    }
+
+    #[test]
+    fn revision_checkpoint_uses_v2_record_with_a_revision_envelope() {
+        let (_dir, store) = test_store();
+        let checkpoint = revision_checkpoint("revision-record-v2", "source\n");
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+
+        let ciphertext = fs::read(store.record_path(&checkpoint.key)).unwrap();
+        let plaintext = store.protector.unprotect(&ciphertext).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(
+            value.get("version").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert!(value.get("revision").is_some());
+    }
+
+    #[test]
+    fn v1_record_without_revision_remains_compatible() {
+        let (_dir, store) = test_store();
+        let checkpoint = checkpoint("revision-v1-compatibility", "legacy source\n");
+        write_record_at(&store, &checkpoint, SystemTime::now());
+
+        let scan = store.recover().unwrap();
+        assert!(scan.issues.is_empty());
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records[0].record.text, checkpoint.text);
+        assert!(scan.records[0].record.revision.is_none());
+    }
+
+    #[test]
+    fn unknown_record_version_fails_closed_without_recovery() {
+        let (_dir, store) = test_store();
+        let checkpoint = checkpoint("unknown-record-version", "source\n");
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+        rewrite_record_json(&store, &checkpoint.key, |value| {
+            value["version"] = serde_json::json!(251);
+        });
+
+        let scan = store.recover().unwrap();
+        assert!(scan.records.is_empty());
+        assert!(scan.issues.iter().any(
+            |issue| matches!(issue, RecoveryIssue::Malformed { path } if path == &store.record_path(&checkpoint.key))
+        ));
+    }
+
+    #[test]
+    fn unknown_revision_envelope_version_fails_closed_without_recovery() {
+        let (_dir, store) = test_store();
+        let checkpoint = revision_checkpoint("unknown-revision-envelope", "source\n");
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+        rewrite_record_json(&store, &checkpoint.key, |value| {
+            value["revision"]["version"] = serde_json::json!(251);
+        });
+
+        let scan = store.recover().unwrap();
+        assert!(scan.records.is_empty());
+        assert!(scan.issues.iter().any(
+            |issue| matches!(issue, RecoveryIssue::Malformed { path } if path == &store.record_path(&checkpoint.key))
+        ));
+    }
+
+    #[test]
+    fn v2_record_without_a_revision_envelope_fails_closed() {
+        let (_dir, store) = test_store();
+        let checkpoint = checkpoint("missing-revision-envelope", "source\n");
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+        rewrite_record_json(&store, &checkpoint.key, |value| {
+            value["version"] = serde_json::json!(RECORD_VERSION_WITH_REVISION);
+        });
+
+        let scan = store.recover().unwrap();
+        assert!(scan.records.is_empty());
+        assert!(scan.issues.iter().any(
+            |issue| matches!(issue, RecoveryIssue::Malformed { path } if path == &store.record_path(&checkpoint.key))
+        ));
+    }
+
+    #[test]
+    fn revision_envelope_unknown_fields_fail_closed() {
+        let (_dir, store) = test_store();
+        let checkpoint = revision_checkpoint("unknown-revision-field", "source\n");
+        store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+        rewrite_record_json(&store, &checkpoint.key, |value| {
+            value["revision"]["unknown"] = serde_json::json!(true);
+        });
+
+        let scan = store.recover().unwrap();
+        assert!(scan.records.is_empty());
+        assert!(scan.issues.iter().any(
+            |issue| matches!(issue, RecoveryIssue::Malformed { path } if path == &store.record_path(&checkpoint.key))
+        ));
+    }
+
+    #[test]
+    fn recovery_metadata_unknown_fields_fail_closed_for_v1_and_v2_records() {
+        for (name, checkpoint) in [
+            (
+                "unknown-metadata-v1",
+                checkpoint("unknown-metadata-v1", "source\n"),
+            ),
+            (
+                "unknown-metadata-v2",
+                revision_checkpoint("unknown-metadata-v2", "source\n"),
+            ),
+        ] {
+            let (_dir, store) = test_store();
+            store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+            rewrite_record_json(&store, &checkpoint.key, |value| {
+                value["metadata"]["unknown"] = serde_json::json!(true);
+            });
+
+            let scan = store.recover().unwrap();
+            assert!(scan.records.is_empty(), "{name} must not be recovered");
+            assert!(scan.issues.iter().any(
+                |issue| matches!(issue, RecoveryIssue::Malformed { path } if path == &store.record_path(&checkpoint.key))
+            ));
+        }
+    }
+
+    #[test]
+    fn source_only_replacement_clears_revision_atomically_and_failed_write_keeps_answers() {
+        let (_dir, store) = test_store();
+        let previous = revision_checkpoint("revision-source-replacement", "old source\n");
+        store.checkpoint(&previous, &HashSet::new()).unwrap();
+
+        let replacement = checkpoint("revision-source-replacement", "new source\n");
+        store.fail_next_persist_for_test();
+        assert!(matches!(
+            store.checkpoint(&replacement, &HashSet::new()),
+            Err(RecoveryError::Io(_))
+        ));
+        let after_failure = &store.recover().unwrap().records[0].record;
+        assert_eq!(after_failure.text, previous.text);
+        assert_eq!(
+            after_failure.revision.as_ref().unwrap().answers(),
+            &revision_answers()
+        );
+
+        store.checkpoint(&replacement, &HashSet::new()).unwrap();
+        let after_replace = &store.recover().unwrap().records[0].record;
+        assert_eq!(after_replace.text, replacement.text);
+        assert!(after_replace.revision.is_none());
+    }
+
+    #[test]
+    fn retired_revision_does_not_resurrect_after_reopen_or_replacement() {
+        let (_dir, store) = test_store();
+        let previous = revision_checkpoint("revision-retirement", "retired source\n");
+        store.checkpoint(&previous, &HashSet::new()).unwrap();
+        let ticket = store.begin_retirement(&previous.key).unwrap();
+        let root = store.root().to_path_buf();
+        drop(ticket);
+        drop(store);
+
+        let reopened = RecoveryStore::new_at(root, Arc::new(TestProtector)).unwrap();
+        assert!(reopened.recover().unwrap().records.is_empty());
+
+        let replacement = checkpoint("revision-retirement", "replacement source\n");
+        let token = reopened.current_token(&replacement.key);
+        assert!(matches!(
+            reopened
+                .checkpoint_if_current(&replacement, &HashSet::new(), token)
+                .unwrap(),
+            CheckpointOutcome::Written(_)
+        ));
+        let records = reopened.recover().unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.text, replacement.text);
+        assert!(records[0].record.revision.is_none());
+    }
+
+    #[test]
+    fn invalid_empty_or_oversized_revision_answers_are_rejected() {
+        assert!(matches!(
+            RevisionAnswers::new(vec![RevisionAnswer::answered(" \t\n")]),
+            Err(RevisionAnswerError::EmptyAnswer)
+        ));
+        assert!(matches!(
+            RevisionAnswers::new(vec![RevisionAnswer::answered(
+                "x".repeat(REVISION_MAX_ANSWER_BYTES + 1)
+            )]),
+            Err(RevisionAnswerError::AnswerTooLarge)
+        ));
+    }
+
+    #[test]
+    fn invalid_revision_answer_drafts_remain_recoverable_but_not_sendable() {
+        for (index, answer) in [
+            RevisionAnswer::answered(" \t\n"),
+            RevisionAnswer::answered("x".repeat(REVISION_MAX_ANSWER_BYTES + 1)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_dir, store) = test_store();
+            let answers = RevisionAnswers::for_recovery(vec![answer.clone()]).unwrap();
+            let key_id = format!("revision-draft-{index}");
+            let checkpoint = RecoveryCheckpoint {
+                key: RecoveryKey::for_document_id(&key_id),
+                text: "source\n".to_owned(),
+                metadata: metadata(),
+                revision: Some(RevisionRecovery::new(revision_binding(), answers)),
+            };
+
+            store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
+
+            let recovered = store.recover().unwrap().records.remove(0);
+            assert_eq!(
+                recovered.record.revision.unwrap().answers().as_slice(),
+                std::slice::from_ref(&answer)
+            );
+            assert!(RevisionAnswers::new(vec![answer]).is_err());
+        }
+    }
+
+    #[test]
+    fn revision_record_still_obeys_existing_record_size_limit() {
+        let limits = RecoveryLimits {
+            max_records: 50,
+            max_record_bytes: 1_024,
+            max_total_bytes: 1_000_000,
+            max_age: Duration::from_secs(7 * 24 * 60 * 60),
+        };
+        let (_dir, store) = test_store_with_limits(limits);
+        let answers =
+            RevisionAnswers::new(vec![RevisionAnswer::answered("x".repeat(1_200))]).unwrap();
+        let checkpoint = RecoveryCheckpoint {
+            key: RecoveryKey::for_document_id("revision-record-size"),
+            text: "source\n".to_owned(),
+            metadata: metadata(),
+            revision: Some(RevisionRecovery::new(revision_binding(), answers)),
+        };
+
+        assert!(matches!(
+            store.checkpoint(&checkpoint, &HashSet::new()),
+            Err(RecoveryError::OversizedCheckpoint { .. })
+        ));
+        assert!(store.recover().unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn revision_records_keep_existing_retention_eviction_behavior() {
+        let limits = RecoveryLimits {
+            max_records: 1,
+            max_record_bytes: 32 * 1024,
+            max_total_bytes: 64 * 1024,
+            max_age: Duration::from_secs(7 * 24 * 60 * 60),
+        };
+        let (_dir, store) = test_store_with_limits(limits);
+        let first = revision_checkpoint("revision-retention-first", "first\n");
+        let second = checkpoint("revision-retention-second", "second\n");
+        store.checkpoint(&first, &HashSet::new()).unwrap();
+        store.checkpoint(&second, &HashSet::new()).unwrap();
+
+        let records = store.recover().unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.key, second.key);
+        assert!(records[0].record.revision.is_none());
     }
 
     #[test]
@@ -4506,11 +5247,13 @@ mod tests {
             key: RecoveryKey::for_path(Path::new(r"C:\case-sensitive\Plan.md")),
             text: "upper".to_owned(),
             metadata: metadata(),
+            revision: None,
         };
         let lower = RecoveryCheckpoint {
             key: RecoveryKey::for_path(Path::new(r"C:\case-sensitive\plan.md")),
             text: "lower".to_owned(),
             metadata: metadata(),
+            revision: None,
         };
 
         store.checkpoint(&upper, &HashSet::new()).unwrap();
@@ -4671,6 +5414,7 @@ mod tests {
             key: RecoveryKey::for_path(&source),
             text: "recovered text\n".to_owned(),
             metadata: RecoveryMetadata::from_loaded_file(&loaded),
+            revision: None,
         };
         store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
 
@@ -4705,6 +5449,7 @@ mod tests {
             key: RecoveryKey::for_path(&source),
             text: loaded.text.clone(),
             metadata: RecoveryMetadata::from_loaded_file(&loaded),
+            revision: None,
         };
         store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
 
@@ -5202,6 +5947,33 @@ mod tests {
         let oversized =
             recovery_wave_ranges_with_worker_limit(&[BYTE_BUDGET + 1, 1], BYTE_BUDGET, 4);
         assert_eq!(oversized, [0..1, 1..2]);
+    }
+
+    #[test]
+    fn recovery_wave_size_uses_the_serialized_revision_envelope() {
+        let plain = checkpoint("wave-size-plain", "source\n");
+        let revision = revision_checkpoint("wave-size-revision", "source\n");
+        let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let disk = DiskRecord::from_checkpoint(&revision, at).unwrap();
+        let serialized = serde_json::to_vec(&disk).unwrap();
+        let measured = checkpoint_wave_input_bytes(&revision, at);
+
+        assert_eq!(
+            measured,
+            u64::try_from(serialized.len())
+                .unwrap()
+                .saturating_add(CHECKPOINT_WAVE_PROTECTION_OVERHEAD_BYTES)
+        );
+        assert!(
+            measured > checkpoint_wave_input_bytes(&plain, at),
+            "the revision envelope must account for its binding and answer bytes"
+        );
+
+        let first = checkpoint_wave_input_bytes(&plain, at);
+        let second = checkpoint_wave_input_bytes(&revision, at);
+        let budget = second.saturating_sub(1);
+        let ranges = recovery_wave_ranges_with_worker_limit(&[first, second], budget, 4);
+        assert_eq!(ranges, [0..1, 1..2]);
     }
 
     #[test]
@@ -8199,6 +8971,7 @@ mod tests {
                     key,
                     text: initial_text.clone(),
                     metadata: metadata(),
+                    revision: None,
                 })
                 .collect();
             let initial_tokens: Vec<_> = initial
@@ -8255,6 +9028,7 @@ mod tests {
                     key,
                     text: updated_text.clone(),
                     metadata: metadata(),
+                    revision: None,
                 })
                 .collect();
             let updated_tokens: Vec<_> = updated
