@@ -115,7 +115,7 @@ process protocol or a second transport path.
 ## Evaluation standard
 
 Run Review over every artifact in immutable corpus version `goal-01-v1` under
-the fixed [Review Evaluation Contract](../../PRODUCT.md#review-evaluation-contract).
+the fixed [Review Evaluation Contract](../../../PRODUCT.md#review-evaluation-contract).
 Before sending a corpus artifact or scoring a result as threshold evidence,
 verify `evaluation/goal-01/MANIFEST.sha256`. Record the corpus version and
 manifest digest with every evaluation result. A hash mismatch disqualifies the
@@ -136,7 +136,7 @@ grounded meaning and question usefulness are.
 
 ## Validation cadence
 
-Follow [development validation](../development.md). Focused tests and PR CI gate
+Follow [development validation](../../development.md). Focused tests and PR CI gate
 implementation changes; native checks, owner evaluation and broad visual matrices
 are collected at the relevant integrated milestone, not after every small task.
 Report implementation and acceptance separately. The completion evidence below

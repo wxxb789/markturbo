@@ -126,7 +126,7 @@ Automated tests must cover at least:
 
 ## Validation cadence
 
-Follow [development validation](../development.md). Focused tests and PR CI gate
+Follow [development validation](../../development.md). Focused tests and PR CI gate
 implementation changes; native checks, owner evaluation and broad visual matrices
 are collected at the relevant integrated milestone, not after every small task.
 Report implementation and acceptance separately. The completion evidence below
