@@ -416,6 +416,15 @@ exposing retired text. An unreadable, unsupported, or path/key-misbound marker
 fails recovery closed rather than exposing a possibly retired record; that
 recovery failure does not make editing or source-file Save unavailable.
 
+While marker cleanup is pending, the workspace pauses checkpoint scheduling for
+the retired document incarnation and content identity, including an otherwise
+due dirty-buffer timer. An edit, a changed clarification answer, or a new tab at
+the same path remains eligible for recovery. Retiring quarantined restored
+answers does not suppress the current editor or its live answers. Before a
+delayed destructive action proceeds, the workspace rechecks both editor
+snapshots and newly authored answers; an answer entered during cleanup keeps
+the document open and re-arms recovery.
+
 The workspace keeps action-scoped queued intent separate from durable cleanup
 ownership. `pending_recovery_retirements` records the originating document when
 known, so a tab-close action waits only for its own pending key; an unknown

@@ -19,11 +19,13 @@ UTILITY_COMMANDS = {
     "capacity": "scripts.markturbo_tools.recovery_capacity",
     "evaluation": "scripts.markturbo_tools.evaluation",
     "evaluate": "scripts.markturbo_tools.evaluation",
+    "revision-evaluation": "scripts.markturbo_tools.revision_evaluation",
 }
 ACCEPTANCE_GOALS = {
     "goal-02": "scripts.markturbo_tools.native.goal02",
     "goal-03": "scripts.markturbo_tools.native.goal03",
     "goal-06": "scripts.markturbo_tools.native.goal06",
+    "goal-07": "scripts.markturbo_tools.native.goal07",
 }
 NATIVE_EXIT_CODES = frozenset({0, 1, 2})
 

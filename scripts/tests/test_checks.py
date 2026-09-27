@@ -86,6 +86,12 @@ class DiffCheckTests(unittest.TestCase):
     def test_explicit_tooling_manifest_includes_goal06_native_harness(self) -> None:
         self.assertIn("scripts.tests.test_native_goal06", checks.TOOLING_TESTS)
 
+    def test_explicit_tooling_manifest_includes_goal07_revision_evaluation(self) -> None:
+        self.assertIn("scripts.tests.test_revision_evaluation", checks.TOOLING_TESTS)
+
+    def test_explicit_tooling_manifest_includes_goal07_native_harness(self) -> None:
+        self.assertIn("scripts.tests.test_native_goal07", checks.TOOLING_TESTS)
+
     def test_rejects_an_incomplete_ci_range_before_running_git(self) -> None:
         with mock.patch.object(checks, "run") as run:
             with self.assertRaisesRegex(checks.CheckFailure, "must be provided together"):

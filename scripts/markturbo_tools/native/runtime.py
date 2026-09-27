@@ -80,6 +80,7 @@ WM_CLOSE = 0x0010
 GW_OWNER = 4
 SW_RESTORE = 9
 VK_CONTROL = 0x11
+VK_MENU = 0x12
 VK_A = 0x41
 VK_BACK = 0x08
 VK_S = 0x53
@@ -105,6 +106,8 @@ WINDOWS_LAUNCH_ERROR_CODES = {
     193: "PROCESS_LAUNCH_BAD_EXE_FORMAT",
     740: "PROCESS_LAUNCH_ELEVATION_REQUIRED",
 }
+ISOLATION_CLEANUP_TIMEOUT = 5.0
+ISOLATION_CLEANUP_RETRY_INTERVAL = 0.05
 
 
 class CREDENTIALW(ctypes.Structure):
@@ -709,14 +712,32 @@ class Win32:
         show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
         bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
         set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        if foreground == hwnd:
+            return
+        try:
+            self.send_inputs([key_input(VK_MENU, False), key_input(VK_MENU, True)])
+        except HarnessFailure:
+            try:
+                self.send_inputs([key_input(VK_MENU, True)])
+            except HarnessFailure:
+                pass
+        show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+        bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
+        set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        if foreground == hwnd:
+            return
         deadline = time.perf_counter() + timeout
         attempts = 0
-        foreground = 0
         while time.perf_counter() < deadline:
             attempts += 1
             foreground = int(self.user32.GetForegroundWindow() or 0)
             if foreground == hwnd:
                 return
+            show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+            bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
+            set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
             time.sleep(0.025)
         raise HarnessBlocked(
             "FOREGROUND_PERMISSION_DENIED",
@@ -838,6 +859,20 @@ def key_input(key: int, key_up: bool) -> INPUT:
 def unicode_input(unit: int, key_up: bool) -> INPUT:
     flags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if key_up else 0)
     return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(0, unit, flags, 0, 0))
+
+
+def remove_tree_with_retry(root: Path, timeout: float = ISOLATION_CLEANUP_TIMEOUT) -> None:
+    deadline = time.perf_counter() + timeout
+    while True:
+        try:
+            shutil.rmtree(root)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if time.perf_counter() >= deadline:
+                raise
+            time.sleep(ISOLATION_CLEANUP_RETRY_INTERVAL)
 
 
 def integrity_name(rid: int) -> str:
@@ -1102,7 +1137,19 @@ class NativeHarness:
             raise HarnessFailure("MAIN_WINDOW_UIA_TIMEOUT", safe_exception_name(error)) from None
         if not hwnd:
             raise HarnessBlocked("UIA_MAIN_WINDOW_HANDLE_MISSING")
-        self.win32.require_foreground(hwnd, self.ui_timeout)
+        try:
+            self.win32.require_foreground(hwnd, min(self.ui_timeout, 2.0))
+        except HarnessBlocked as error:
+            if error.code != "FOREGROUND_PERMISSION_DENIED":
+                raise
+            try:
+                bounds = window.rectangle()
+                window.click_input(
+                    coords=(max(1, bounds.width() // 2), max(1, bounds.height() // 2))
+                )
+            except Exception:
+                raise error from None
+            self.win32.require_foreground(hwnd, self.ui_timeout)
         return RunningApp(
             process,
             window,
@@ -1226,7 +1273,12 @@ class NativeHarness:
             "SOURCE_LAYOUT_UIA_TIMEOUT",
             "SOURCE_LAYOUT_UIA_CONTRACT_MISMATCH",
         )
-        self.click_control(source_layout, "SOURCE_LAYOUT_CLICK_FAILED")
+        try:
+            source_layout.select()
+        except Exception as error:
+            raise HarnessFailure(
+                "SOURCE_LAYOUT_SELECT_FAILED", safe_exception_name(error)
+            ) from None
         self.find_control(
             app,
             SOURCE_EDITOR_AUTOMATION_ID,
@@ -1670,7 +1722,7 @@ def run_native_acceptance(
             args.debug_workdir = root
         else:
             try:
-                shutil.rmtree(root)
+                remove_tree_with_retry(root)
             except OSError as error:
                 returncode, code = 1, "ISOLATION_CLEANUP_FAILED"
                 _record_cleanup_failure(
