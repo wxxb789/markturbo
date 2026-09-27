@@ -45,7 +45,7 @@ NATIVE_REQUIRED_CASE_IDS = frozenset(
     }
 )
 REVISION_CONTRACT = (
-    "docs/goals/07-apply-only-approved-revisions.md#revision-evaluation-standard"
+    "docs/goals/archive/07-apply-only-approved-revisions.md#revision-evaluation-standard"
 )
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 STABLE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
