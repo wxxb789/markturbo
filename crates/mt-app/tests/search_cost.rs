@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mt_doc::search::{self, Query, Results};
+use mt_core::workspace::search::{self, Query, Results};
 
 fn bench_dir() -> PathBuf {
     std::env::var("MARKTURBO_BENCH_DIR")
@@ -57,7 +57,10 @@ fn attribute_the_cost_of_a_folder_search() {
 #[ignore = "reports timings against the real harness; run explicitly"]
 fn attribute_the_cost_of_a_harness_search() {
     let started = Instant::now();
-    let skills = mt_doc::skill::discover_with(Path::new("."), mt_doc::Discovery::everything());
+    let skills = mt_core::agent_artifacts::skill::discover_with(
+        Path::new("."),
+        mt_core::Discovery::everything(),
+    );
     let discover = started.elapsed();
 
     let started = Instant::now();

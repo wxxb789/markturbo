@@ -39,18 +39,18 @@ fn attribute_the_cost_of_opening_a_folder() {
     };
 
     time("read_dir (depth 0)", &mut || {
-        let nodes = mt_app::workspace::read_dir(&root).unwrap_or_default();
+        let nodes = mt_core::workspace::read_dir(&root).unwrap_or_default();
         format!("{} entries", nodes.len())
     });
 
     time("read_dir (depth 1)", &mut || {
-        let nodes = mt_app::workspace::read_dir_deep(&root, 1).unwrap_or_default();
+        let nodes = mt_core::workspace::read_dir_deep(&root, 1).unwrap_or_default();
         let children: usize = nodes.iter().map(|n| n.children.len()).sum();
         format!("{} entries, {children} children", nodes.len())
     });
 
     time("Watcher::new (recursive)", &mut || {
-        match mt_app::watcher::Watcher::new(&root) {
+        match mt_core::workspace::watcher::Watcher::new(&root) {
             Ok(w) => {
                 // Hold it until the timer stops: dropping early would measure
                 // setup without the registration it performs.
@@ -62,16 +62,19 @@ fn attribute_the_cost_of_opening_a_folder() {
     });
 
     time("skill::discover (workspace)", &mut || {
-        format!("{} skills", mt_doc::skill::discover(&root).len())
+        format!(
+            "{} skills",
+            mt_core::agent_artifacts::skill::discover(&root).len()
+        )
     });
 
-    let mut skill_cache = mt_doc::skill::DiscoveryCache::default();
+    let mut skill_cache = mt_core::agent_artifacts::skill::DiscoveryCache::default();
     for sample in 1..=3 {
         skill_cache.clear();
         time(&format!("skill cold {sample}"), &mut || {
-            let found = mt_doc::skill::discover_with_cache(
+            let found = mt_core::agent_artifacts::skill::discover_with_cache(
                 &root,
-                mt_doc::Discovery::everything(),
+                mt_core::Discovery::everything(),
                 &mut skill_cache,
             );
             format!("{} skills", found.len())
@@ -79,9 +82,9 @@ fn attribute_the_cost_of_opening_a_folder() {
     }
     for sample in 1..=5 {
         time(&format!("skill warm {sample}"), &mut || {
-            let found = mt_doc::skill::discover_with_cache(
+            let found = mt_core::agent_artifacts::skill::discover_with_cache(
                 &root,
-                mt_doc::Discovery::everything(),
+                mt_core::Discovery::everything(),
                 &mut skill_cache,
             );
             format!("{} skills", found.len())
@@ -89,13 +92,16 @@ fn attribute_the_cost_of_opening_a_folder() {
     }
 
     time("instruction::discover", &mut || {
-        format!("{} files", mt_doc::instruction::discover(&root).len())
+        format!(
+            "{} files",
+            mt_core::agent_artifacts::instruction::discover(&root).len()
+        )
     });
 
     time("instruction::discover_with (global)", &mut || {
         format!(
             "{} files",
-            mt_doc::instruction::discover_with(&root, true).len()
+            mt_core::agent_artifacts::instruction::discover_with(&root, true).len()
         )
     });
 }
@@ -109,7 +115,7 @@ fn read_dir_on_a_flat_directory() {
     // it can stay synchronous.
     let Some(root) = bench_dir() else { return };
     let start = Instant::now();
-    let nodes = mt_app::workspace::read_dir(&root).unwrap_or_default();
+    let nodes = mt_core::workspace::read_dir(&root).unwrap_or_default();
     eprintln!(
         "{:>10.0?}  flat read_dir  {} entries",
         start.elapsed(),

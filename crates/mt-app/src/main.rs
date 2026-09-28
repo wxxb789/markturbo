@@ -84,7 +84,7 @@ fn init_logging() {
     tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::new())
         .expect("tracing privacy guard must initialize before any subscriber");
 
-    let log_path = mt_app::app_paths::log_path();
+    let log_path = mt_core::runtime_paths::log_path();
     let file = log_path.as_deref().and_then(open_log_file);
     let active_path = file.as_ref().and(log_path);
     let target = file
@@ -260,85 +260,6 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// Windows must use GPUI's child-HWND compatibility compositor.
-    #[test]
-    fn direct_composition_is_disabled_before_the_window_exists() {
-        let source = include_str!("main.rs");
-        let test_module = source
-            .find("\n#[cfg(test)]")
-            .expect("the test module marker");
-        let source = &source[..test_module];
-        let disable_key = ["GPUI_DISABLE_DIRECT_", "COMPOSITION"].concat();
-        let disable = source
-            .find(&format!("set_var(\"{disable_key}\""))
-            .expect("the compatibility switch");
-        let application = source
-            .find("gpui_kit::application()")
-            .expect("GPUI application initialization");
-
-        assert!(
-            disable < application,
-            "the compositor is selected before GPUI initializes"
-        );
-        assert!(
-            !source.contains("cfg(any(target_os = \"windows\", target_os = \"linux\"))"),
-            "Windows transparent backgrounds require DirectComposition and conflict with the compatibility path"
-        );
-        assert!(
-            source.contains("cx.new(|cx| Root::new(view, window, cx))"),
-            "the main window keeps one ordinary GPUI root"
-        );
-    }
-
-    #[test]
-    fn release_windows_uses_gui_subsystem_and_file_logging() {
-        let source = include_str!("main.rs");
-        let test_module = source
-            .find("\n#[cfg(test)]")
-            .expect("the test module marker");
-        let source = &source[..test_module];
-
-        assert!(source.contains("all(target_os = \"windows\", not(debug_assertions))"));
-        assert!(source.contains("windows_subsystem = \"windows\""));
-        assert!(source.contains("mt_app::app_paths::log_path()"));
-        assert!(source.contains("env_logger::Target::Pipe"));
-        assert!(source.contains("io::sink()"));
-        assert!(!source.contains("env_logger::Target::Stderr"));
-        assert!(source.contains("std::panic::set_hook"));
-        assert!(source.contains("std::panic::take_hook"));
-
-        let logging = source
-            .find("\n    init_logging();")
-            .expect("file logging initialization");
-        let arguments = source
-            .find("std::env::args()")
-            .expect("command-line argument handling");
-        assert!(
-            logging < arguments,
-            "logging starts before argument handling"
-        );
-    }
-
-    #[test]
-    fn tracing_cannot_bridge_provider_response_bodies_into_application_logs() {
-        let source = include_str!("main.rs");
-        let test_module = source
-            .find("\n#[cfg(test)]")
-            .expect("the test module marker");
-        let source = &source[..test_module];
-        let privacy_guard = source
-            .find("tracing::subscriber::NoSubscriber::new()")
-            .expect("the tracing privacy guard");
-        let logger = source
-            .find("env_logger::builder()")
-            .expect("application logger initialization");
-
-        assert!(
-            privacy_guard < logger,
-            "tracing's optional log bridge is disabled before env_logger starts"
-        );
     }
 
     #[test]

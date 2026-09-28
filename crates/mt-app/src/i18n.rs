@@ -9,13 +9,12 @@
 //! gender, no date formatting — this app's interface is a few dozen labels, and
 //! the cost of a framework would exceed the strings it manages.
 
-use crate::{
-    model::{
-        EndpointIdentity, EndpointIdentityError, EndpointLocation, ModelOperation,
-        ModelRequestDisclosure, OutboundScopeKind, ProxyDisclosure, TransportEncryption,
-    },
-    settings::{AppSettings, Language},
+use crate::settings::AppSettings;
+use mt_core::model::{
+    EndpointIdentity, EndpointIdentityError, EndpointLocation, ModelOperation,
+    ModelRequestDisclosure, OutboundScopeKind, ProxyDisclosure, TransportEncryption,
 };
+use mt_core::settings::Language;
 
 /// Every string the interface shows.
 ///
@@ -217,6 +216,8 @@ pub enum Key {
     ModeWeb,
     ModeSplitNative,
     ModeSplitWeb,
+    WebPreviewFailed,
+    WebPreviewRetry,
     TrustThisDocument,
     Trusted,
     HtmlNeedsTrust,
@@ -959,6 +960,8 @@ fn english(key: Key) -> &'static str {
         Key::ModeWeb => "Web",
         Key::ModeSplitNative => "Split · Native",
         Key::ModeSplitWeb => "Split · Web",
+        Key::WebPreviewFailed => "The Web preview could not be opened.",
+        Key::WebPreviewRetry => "Retry Web preview",
         Key::TrustThisDocument => "Trust this document",
         Key::Trusted => "Trusted ✓",
         Key::HtmlNeedsTrust => {
@@ -1317,6 +1320,8 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::ModeWeb => "Web",
         Key::ModeSplitNative => "分栏 · 原生",
         Key::ModeSplitWeb => "分栏 · Web",
+        Key::WebPreviewFailed => "无法打开 Web 预览。",
+        Key::WebPreviewRetry => "重试 Web 预览",
         Key::TrustThisDocument => "信任此文档",
         Key::Trusted => "已信任 ✓",
         Key::HtmlNeedsTrust => {
@@ -1646,6 +1651,8 @@ mod tests {
         Key::ModeWeb,
         Key::ModeSplitNative,
         Key::ModeSplitWeb,
+        Key::WebPreviewFailed,
+        Key::WebPreviewRetry,
         Key::TrustThisDocument,
         Key::Trusted,
         Key::HtmlNeedsTrust,
@@ -1840,13 +1847,13 @@ mod tests {
 
     #[test]
     fn model_request_disclosure_is_complete_in_each_interface_language() {
-        use crate::model::{
+        use mt_core::model::{
             AgentSkillRequest, AgentSkillRequestEntry, OutboundScope, RevisionDisclosureDetails,
             RevisionRequestBinding,
         };
 
         let endpoint = EndpointIdentity::parse(
-            crate::model::Provider::OpenAiResponses,
+            mt_core::model::Provider::OpenAiResponses,
             Some("http://127.0.0.1:8080/custom/v1/"),
         )
         .unwrap();
@@ -1960,7 +1967,7 @@ mod tests {
                 .unwrap(),
             ],
             vec![
-                crate::model::AgentSkillOmission::new(
+                mt_core::model::AgentSkillOmission::new(
                     "references/private.md",
                     "excluded by policy",
                 )
@@ -1988,7 +1995,7 @@ mod tests {
     #[test]
     fn local_https_status_discloses_encryption_and_disabled_proxy_in_both_languages() {
         let endpoint = EndpointIdentity::parse(
-            crate::model::Provider::OpenAiChat,
+            mt_core::model::Provider::OpenAiChat,
             Some("https://127.0.0.1:8443/v1/"),
         )
         .unwrap();

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mt-doc", "crates/mt-app"]
+members = ["crates/mt-core", "crates/mt-app"]
 resolver = "2"
 
 [workspace.package]
@@ -9,7 +9,7 @@ publish = false
 license = "Apache-2.0"
 
 [workspace.dependencies]
-mt-doc = { path = "crates/mt-doc" }
+mt-core = { path = "crates/mt-core" }
 
 # Kit and its GPUI snapshot must resolve to one registry source. Kit does not
 # forward `stacker`: retain this direct dependency to enable deep-layout stack
@@ -105,7 +105,7 @@ markdown = "1.0"
 # five distro font paths, and reads a system CJK font it never frees: measured
 # 4.5MB -> 52.0MB resident on the first CJK glyph, retained for the process.
 #
-# Emitting the SVG here instead is ~250 lines in `renderer.rs` and deletes all
+# Emitting the SVG in `crates/mt-core/src/rendering/mod.rs` instead deletes all
 # three at the source. Measured after: 4.34MB baseline, 4.55MB after 1000 CJK
 # renders, zero stderr lines, no platform font path in the binary.
 ratex-parser = "=0.1.14"

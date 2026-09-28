@@ -13,15 +13,16 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
-use crate::credentials::{
-    CredentialError, CredentialErrorKind, CredentialVault, LegacyCredentialMigrationError,
-    remove_migrated_legacy_credential, secure_legacy_credential,
-};
+use crate::credentials::AppCredentialVault;
 use crate::i18n::{self, Key};
-use crate::model::{
+use crate::settings::AppSettings;
+use mt_core::credentials::{
+    CredentialError, CredentialErrorKind, LegacyCredentialMigration,
+    LegacyCredentialMigrationError, remove_migrated_legacy_credential, secure_legacy_credential,
+};
+use mt_core::model::{
     EndpointIdentity, EndpointIdentityError, Provider, endpoint_input_is_safe_to_persist,
 };
-use crate::settings::{self, AppSettings};
 
 use super::settings_page::{SettingsEvent, SettingsView, write};
 
@@ -205,7 +206,7 @@ impl ModelSettings {
                                     AppSettings::global(cx),
                                     this.model.model_base_url_draft.read(cx).value().as_ref(),
                                 )
-                                || !CredentialVault::global(cx).secure_store_supported()
+                                || !AppCredentialVault::global(cx).secure_store_supported()
                                 || !matches!(
                                     configured_endpoint(AppSettings::global(cx)),
                                     ConfiguredEndpoint::Ready(_)
@@ -282,7 +283,7 @@ impl ModelSettings {
             ) && !endpoint_draft_changed;
             let has_draft = !draft.read(cx).value().trim().is_empty();
             let busy = operation.is_some();
-            let secure_store_supported = CredentialVault::global(cx).secure_store_supported();
+            let secure_store_supported = AppCredentialVault::global(cx).secure_store_supported();
             let (status_key, status_error) = if endpoint_draft_changed {
                 (Key::SaveEndpointBeforeCredential, false)
             } else {
@@ -454,12 +455,12 @@ impl ModelSettings {
             self.set_credential_notice(Key::CredentialRequired, true, cx);
             return;
         }
-        if !CredentialVault::global(cx).secure_store_supported() {
+        if !AppCredentialVault::global(cx).secure_store_supported() {
             self.set_credential_notice(Key::SecureStoreUnavailable, true, cx);
             return;
         }
 
-        let vault = CredentialVault::global(cx).clone();
+        let vault = AppCredentialVault::global(cx).clone();
         self.credential_operation = Some(CredentialOperation::Store);
         self.credential_notice = None;
         cx.notify();
@@ -510,7 +511,7 @@ impl ModelSettings {
             return;
         };
         let value = self.credential_draft.read(cx).value().to_string();
-        match CredentialVault::global(cx).replace_session(target, value) {
+        match AppCredentialVault::global(cx).replace_session(target, value) {
             Ok(()) => {
                 self.clear_credential_draft(window, cx);
                 self.set_credential_notice(Key::CredentialSessionActive, false, cx);
@@ -547,7 +548,7 @@ impl ModelSettings {
             ],
             cx,
         );
-        let vault = CredentialVault::global(cx).clone();
+        let vault = AppCredentialVault::global(cx).clone();
         self.credential_operation = Some(CredentialOperation::Delete);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -615,11 +616,12 @@ impl ModelSettings {
             self.set_credential_notice(Key::ChooseProviderForCredential, true, cx);
             return;
         };
-        let Some(path) = settings::settings_path() else {
+        let Some(path) = mt_core::settings::settings_path() else {
             self.set_credential_notice(Key::SettingsPathUnavailable, true, cx);
             return;
         };
         let target = endpoint.credential_target().as_str().to_owned();
+        let legacy_settings = AppSettings::global(cx).clone();
         let title = i18n::t(Key::MigrateLegacyCredentialTitle, cx);
         let description = i18n::migrate_legacy_credential_description(&endpoint, cx);
         let answer = window.prompt(
@@ -632,8 +634,7 @@ impl ModelSettings {
             ],
             cx,
         );
-        let vault = CredentialVault::global(cx).clone();
-        let legacy_settings = AppSettings::global(cx).clone();
+        let vault = AppCredentialVault::global(cx).clone();
         self.credential_operation = Some(CredentialOperation::Migrate);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -656,15 +657,23 @@ impl ModelSettings {
                 }
                 return;
             }
+            let settings_for_secure_write = legacy_settings.clone();
+            let target_for_secure_write = target.clone();
             let result = cx
                 .background_spawn(async move {
-                    secure_legacy_credential(&legacy_settings, &vault, &target)
+                    secure_legacy_credential(
+                        &settings_for_secure_write,
+                        &vault,
+                        &target_for_secure_write,
+                    )
                 })
                 .await;
             let result = Arc::new(Mutex::new(Some(result)));
             loop {
                 let result = result.clone();
                 let path = path.clone();
+                let verified_settings = legacy_settings.clone();
+                let target = target.clone();
                 if crate::views::try_update_in(&this, cx, move |this, _, cx| {
                     let result = result
                         .lock()
@@ -673,23 +682,36 @@ impl ModelSettings {
                     let Some(result) = result else { return };
                     this.model.credential_operation = None;
                     match result {
-                        Ok(_) => {
-                            let mut latest = AppSettings::global(cx).clone();
-                            match remove_migrated_legacy_credential(&mut latest, &path) {
-                                Ok(()) => {
-                                    *AppSettings::global_mut(cx) = latest;
-                                    this.model.credential_notice = Some(CredentialNotice {
-                                        key: Key::LegacyCredentialMigrated,
-                                        error: false,
-                                    });
-                                }
-                                Err(error) => {
-                                    this.model.credential_notice = Some(CredentialNotice {
-                                        key: migration_error_key(&error),
-                                        error: true,
-                                    });
+                        Ok(LegacyCredentialMigration::Migrated) => {
+                            if current_credential_target(cx).as_deref() != Some(target.as_str()) {
+                                this.model.credential_notice = Some(CredentialNotice {
+                                    key: Key::CredentialMigrationSaveFailed,
+                                    error: true,
+                                });
+                            } else {
+                                match remove_migrated_legacy_credential(
+                                    &verified_settings,
+                                    &target,
+                                    &path,
+                                ) {
+                                    Ok(latest) => {
+                                        *AppSettings::global_mut(cx) = AppSettings::from(latest);
+                                        this.model.credential_notice = Some(CredentialNotice {
+                                            key: Key::LegacyCredentialMigrated,
+                                            error: false,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        this.model.credential_notice = Some(CredentialNotice {
+                                            key: migration_error_key(&error),
+                                            error: true,
+                                        });
+                                    }
                                 }
                             }
+                        }
+                        Ok(LegacyCredentialMigration::NotPresent) => {
+                            this.model.credential_notice = None;
                         }
                         Err(error) => {
                             this.model.credential_notice = Some(CredentialNotice {
@@ -733,7 +755,7 @@ impl ModelSettings {
             }
             ConfiguredEndpoint::Invalid(_) => CredentialPresence::InvalidEndpoint,
             ConfiguredEndpoint::Ready(endpoint) => {
-                let vault = CredentialVault::global(cx);
+                let vault = AppCredentialVault::global(cx);
                 if !vault.secure_store_supported() {
                     CredentialPresence::SecureStoreUnavailable
                 } else {
@@ -871,6 +893,7 @@ fn credential_error_key(error: &CredentialError) -> Key {
 fn migration_error_key(error: &LegacyCredentialMigrationError) -> Key {
     match error {
         LegacyCredentialMigrationError::SecureStore(error) => credential_error_key(error),
+        LegacyCredentialMigrationError::SettingsConflict => Key::CredentialMigrationSaveFailed,
         LegacyCredentialMigrationError::SettingsWrite(_) => Key::CredentialMigrationSaveFailed,
     }
 }

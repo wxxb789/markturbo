@@ -11,6 +11,216 @@ permissions:
   contents: read
 
 jobs:
+  macos-arm64-compatibility:
+    name: macOS arm64 compatibility
+    runs-on: macos-15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-macos-arm64
+
+      - name: Build the macOS arm64 executable
+        run: cargo build --release --locked -p mt-app --bin markturbo
+
+      - name: Stage and launch through the first frame
+        run: |
+          set -euo pipefail
+
+          machine="$(uname -m)"
+          printf 'Runner architecture: %s\n' "$machine"
+          if [[ "$machine" != arm64 ]]; then
+            echo "Expected an arm64 runner; got $machine" >&2
+            exit 1
+          fi
+
+          temp_dir="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/markturbo-arm64.XXXXXX")"
+          trap 'rm -rf "$temp_dir"' EXIT
+          staged_binary="$temp_dir/markturbo"
+          cp target/release/markturbo "$staged_binary"
+          chmod +x "$staged_binary"
+
+          architectures="$(lipo -archs "$staged_binary")"
+          printf 'Staged Mach-O architectures: %s\n' "$architectures"
+          if [[ " $architectures " != *" arm64 "* ]]; then
+            echo "Staged executable does not contain the arm64 Mach-O slice" >&2
+            exit 1
+          fi
+          # Apple silicon requires a valid signature even for a raw executable.
+          # Inspect the copied binary as-is; signing it here would hide a broken build.
+          codesign --verify --strict --verbose=2 "$staged_binary"
+          otool -L "$staged_binary"
+
+          MARKTURBO_STAGED_BINARY="$staged_binary" \
+            MARKTURBO_TRACE_DIR="$temp_dir" \
+            python3 - <<'PY'
+          import json
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          import uuid
+          from pathlib import Path
+
+          schema = "markturbo-startup-v1"
+          nonce = uuid.uuid4().hex
+          trace_path = Path(os.environ["MARKTURBO_TRACE_DIR"]) / "startup.jsonl"
+          stdout_path = trace_path.with_name("stdout.log")
+          stderr_path = trace_path.with_name("stderr.log")
+          environment = os.environ.copy()
+          environment["MARKTURBO_STARTUP_TRACE"] = str(trace_path)
+          environment["MARKTURBO_STARTUP_NONCE"] = nonce
+
+          def trace_has_first_frame(pid):
+              try:
+                  rows = trace_path.read_text(encoding="utf-8").splitlines(keepends=True)
+              except FileNotFoundError:
+                  return False
+              for index, line in enumerate(rows, start=1):
+                  if not line.endswith("\n"):
+                      continue
+                  try:
+                      row = json.loads(line)
+                  except json.JSONDecodeError as error:
+                      raise RuntimeError(f"invalid JSONL trace row {index}: {error}") from error
+                  if (
+                      isinstance(row, dict)
+                      and row.get("schema") == schema
+                      and row.get("nonce") == nonce
+                      and row.get("pid") == pid
+                      and row.get("event") == "first_frame_painted"
+                  ):
+                      return True
+              return False
+
+          def process_group_exists(pid):
+              try:
+                  os.killpg(pid, 0)
+              except ProcessLookupError:
+                  return False
+              return True
+
+          def stop_process_group(process):
+              try:
+                  os.killpg(process.pid, signal.SIGTERM)
+              except ProcessLookupError:
+                  pass
+              try:
+                  process.wait(timeout=5)
+              except subprocess.TimeoutExpired:
+                  try:
+                      os.killpg(process.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+                  process.wait(timeout=5)
+
+              cleanup_deadline = time.monotonic() + 5
+              while process_group_exists(process.pid) and time.monotonic() < cleanup_deadline:
+                  time.sleep(min(0.1, max(0.0, cleanup_deadline - time.monotonic())))
+              try:
+                  os.killpg(process.pid, signal.SIGKILL)
+              except ProcessLookupError:
+                  pass
+
+          def stop_on_signal(signum, _frame):
+              raise SystemExit(128 + signum)
+
+          signal.signal(signal.SIGINT, stop_on_signal)
+          signal.signal(signal.SIGTERM, stop_on_signal)
+
+          process = None
+          failure = None
+          try:
+              with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                  process = subprocess.Popen(
+                      [os.environ["MARKTURBO_STAGED_BINARY"]],
+                      env=environment,
+                      stdout=stdout,
+                      stderr=stderr,
+                      start_new_session=True,
+                  )
+                  try:
+                      deadline = time.monotonic() + 120
+                      while True:
+                          remaining = deadline - time.monotonic()
+                          if remaining <= 0:
+                              raise TimeoutError(
+                                  "no matching first_frame_painted event within 120 seconds"
+                              )
+                          exit_code = process.poll()
+                          if exit_code is not None:
+                              raise RuntimeError(
+                                  "process exited before first_frame_painted "
+                                  f"(exit code {exit_code})"
+                              )
+                          if trace_has_first_frame(process.pid):
+                              survival_deadline = time.monotonic() + 2
+                              while time.monotonic() < survival_deadline:
+                                  if process.poll() is not None:
+                                      raise RuntimeError(
+                                          "process exited within two seconds of first frame"
+                                      )
+                                  time.sleep(min(0.1, survival_deadline - time.monotonic()))
+                              if process.poll() is not None:
+                                  raise RuntimeError(
+                                      "process exited within two seconds of first frame"
+                                  )
+                              print(
+                                  "Observed markturbo-startup-v1 first_frame_painted "
+                                  "for the launched process and nonce; process survived two seconds."
+                              )
+                              break
+                          remaining = deadline - time.monotonic()
+                          time.sleep(min(0.2, max(0.0, remaining)))
+                  finally:
+                      stop_process_group(process)
+          except Exception as error:
+              failure = error
+
+          if failure is not None:
+              print(f"macOS arm64 launch check failed: {failure}", file=sys.stderr)
+              milestones = []
+              if process is not None and trace_path.exists():
+                  for line in trace_path.read_text(encoding="utf-8").splitlines():
+                      try:
+                          row = json.loads(line)
+                      except json.JSONDecodeError:
+                          continue
+                      if (
+                          isinstance(row, dict)
+                          and row.get("schema") == schema
+                          and row.get("nonce") == nonce
+                          and row.get("pid") == process.pid
+                          and row.get("event") in {
+                              "process_started", "initial_state_ready",
+                              "first_frame_painted", "first_input_handled",
+                          }
+                      ):
+                          milestones.append(row["event"])
+              print(f"Content-free startup milestones: {milestones}", file=sys.stderr)
+              for label, path in (("stdout", stdout_path), ("stderr", stderr_path)):
+                  if path.exists():
+                      output = path.read_text(encoding="utf-8", errors="replace")
+                      if output:
+                          print(f"--- app {label} ---", file=sys.stderr)
+                          print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
+              sys.exit(1)
+          PY
+
   quality:
     runs-on: ubuntu-latest
     defaults:

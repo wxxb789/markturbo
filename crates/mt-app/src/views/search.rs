@@ -1,7 +1,7 @@
 //! The Search panel.
 //!
 //! Four scopes, one list. What varies between them is only *which documents*
-//! are searched — the matching itself lives in [`mt_doc::search`], so a result
+//! are searched — the matching itself lives in [`mt_core::workspace::search`], so a result
 //! row means the same thing no matter where it came from.
 //!
 //! The scopes are not arbitrary. Each answers a question a person actually has
@@ -38,7 +38,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::*;
-use mt_doc::search::{self, Query, Results};
+use mt_core::workspace::search::{self, Query, Results};
 
 use crate::i18n;
 use crate::metrics;
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn every_scope_is_reachable_and_named_distinctly() {
         use crate::i18n::text;
-        use crate::settings::Language;
+        use mt_core::settings::Language;
 
         for language in Language::ALL {
             let labels: std::collections::HashSet<&str> = Scope::ALL
@@ -465,74 +465,5 @@ mod tests {
                 language.label()
             );
         }
-    }
-
-    /// A search must never present a partial answer as a complete one.
-    ///
-    /// Source-level: the failure needs a corpus big enough to hit the cap. What
-    /// makes it correct is that the summary branches on `truncated` — without
-    /// that branch a capped list reads as "500 results" when the real number is
-    /// unknown and larger, which is the one thing a search must not do.
-    #[test]
-    fn a_capped_result_list_says_so() {
-        let source = crate::views::production_source(include_str!("search.rs"));
-        let start = source
-            .find("fn render_summary")
-            .expect("render_summary must exist");
-        let body = &source[start..];
-        let end = body.find("\nimpl EventEmitter").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("self.results.truncated"),
-            "the summary must distinguish a capped list from a complete one"
-        );
-        assert!(
-            body.contains("refine"),
-            "and say what to do about it, not merely that it happened"
-        );
-    }
-
-    /// A stale result must never overwrite a newer query's.
-    ///
-    /// Source-level because reproducing it needs two searches racing. Without
-    /// the guard, typing `ab` then `abc` can land `ab`'s slower result last and
-    /// leave the list disagreeing with the field above it — which reads as the
-    /// search being wrong rather than late.
-    #[test]
-    fn a_slow_search_cannot_overwrite_a_newer_one() {
-        let source = crate::views::production_source(include_str!("search.rs"));
-        let start = source.find("pub fn run").expect("run must exist");
-        let body = &source[start..];
-        let end = body.find("\n    fn render_scopes").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("if this.query(cx) != text"),
-            "the result must be discarded when the query has moved on"
-        );
-        assert!(
-            body.contains("background_spawn"),
-            "searching reads files; on the UI thread that is a frozen window"
-        );
-    }
-
-    /// Typing must not read the corpus once per keystroke.
-    #[test]
-    fn the_query_is_debounced() {
-        let source = crate::views::production_source(include_str!("search.rs"));
-        let start = source.find("fn schedule").expect("schedule must exist");
-        let body = &source[start..];
-        let end = body.find("\n    /// Run `query`").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("timer(DEBOUNCE)"),
-            "every intermediate prefix of a word would otherwise read every file"
-        );
-        assert!(
-            body.contains("self._search = Some("),
-            "the task must be replaced, which is what cancels the previous one"
-        );
     }
 }

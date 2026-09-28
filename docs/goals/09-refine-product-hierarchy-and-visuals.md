@@ -36,10 +36,11 @@ users who need them.
   - `Native` → `Preview`;
   - `Web` → `Compatibility Preview`;
   - `Harness` → `Agent Context` or `Skills & Instructions`.
-- Keep every layout `PRODUCT.md` still requires, but progressively
-  disclose uncommon variants instead of making every technical mode compete for
-  first attention. Do not preserve a mode merely because it existed before the
-  product decision, and do not remove one the contract retained.
+- Preserve the native-preview and Web-compatibility capabilities retained by
+  `PRODUCT.md`, but progressively disclose uncommon layouts instead of making
+  every technical mode compete for first attention. Do not preserve a layout
+  merely because it existed before the product decision, or remove a capability
+  the contract retained.
 - Give the right-side surface meaningful contextual states for Review, Context,
   and document details; avoid reserving a large empty panel merely to preserve a
   toggle.

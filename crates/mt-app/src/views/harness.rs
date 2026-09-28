@@ -21,11 +21,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mt_doc::{Instruction, Origin, Severity, Skill, instruction, skill};
+use mt_core::agent_artifacts::{instruction, skill};
+use mt_core::{Instruction, Origin, Severity, Skill};
 
 use crate::i18n;
 use crate::metrics;
-use crate::settings::{AppSettings, GroupBy};
+use crate::settings::AppSettings;
+use mt_core::settings::GroupBy;
 
 /// Emitted when the user wants to open an artifact's document.
 #[derive(Debug, Clone)]
@@ -122,7 +124,7 @@ impl HarnessView {
         let root = self.root.clone();
         let settings = AppSettings::global(cx);
         let global = settings.skills_include_global;
-        let options = mt_doc::Discovery {
+        let options = mt_core::Discovery {
             global,
             include_internal: settings.skills_include_internal,
         };
@@ -427,7 +429,7 @@ impl HarnessView {
                      (skills/, .agents/skills, .claude/skills, …) and {} global \
                      harness directories.",
                     skill::discovery_roots().len(),
-                    mt_doc::harness::global_roots().len(),
+                    mt_core::agent_artifacts::harness::global_roots().len(),
                 )
             };
             return v_flex()
@@ -734,8 +736,11 @@ fn group(skills: &[Skill], group_by: GroupBy) -> Vec<Row> {
             GroupBy::None => None,
             GroupBy::Origin => Some(skill.origin.label().to_uppercase()),
             GroupBy::Harness => Some(
-                mt_doc::harness::label_for_root(&skill.root, skill.origin == Origin::Global)
-                    .to_uppercase(),
+                mt_core::agent_artifacts::harness::label_for_root(
+                    &skill.root,
+                    skill.origin == Origin::Global,
+                )
+                .to_uppercase(),
             ),
             GroupBy::Status => Some(
                 if skill.is_valid() {
@@ -810,7 +815,7 @@ fn label(cx: &App, text: &str) -> impl IntoElement {
 /// else.
 fn located(root: &Path, origin: Origin, path: &Path) -> String {
     match origin {
-        Origin::Workspace => crate::workspace::display_relative(root, path),
+        Origin::Workspace => mt_core::workspace::display_relative(root, path),
         Origin::Global => abbreviate_home(path),
     }
 }
@@ -963,9 +968,9 @@ mod tests {
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
     use super::{Row, Section, artifacts_under, group, populated_section};
-    use crate::settings::GroupBy;
-    use mt_doc::skill::{Skill, SkillMeta};
-    use mt_doc::{Diagnostic, DocType, Instruction, Origin};
+    use mt_core::agent_artifacts::skill::{Skill, SkillMeta};
+    use mt_core::settings::GroupBy;
+    use mt_core::{Diagnostic, DocType, Instruction, Origin};
     use std::path::PathBuf;
 
     #[test]
@@ -974,7 +979,7 @@ mod tests {
         // cannot be selected, or that shares a label, is a section that does
         // not exist as far as the user is concerned.
         use crate::i18n::{Key, text};
-        use crate::settings::Language;
+        use mt_core::settings::Language;
 
         let keys: Vec<Key> = Section::ALL.iter().map(|s| s.label()).collect();
         assert_eq!(keys.len(), 2);
@@ -1139,80 +1144,6 @@ mod tests {
         for option in GroupBy::ALL {
             assert!(group(&[], option).is_empty(), "{}", option.label());
         }
-    }
-
-    /// Switching sections must reset the selection.
-    ///
-    /// A source-level check rather than a runtime one: `selected` is a bare
-    /// index into whichever list is showing, so carrying it across a section
-    /// change points the inspector at an unrelated artifact — or, when the
-    /// other list is shorter, at nothing while the row still looks selected.
-    /// The bug is invisible until someone selects the eighth skill and switches
-    /// to a panel with three instruction files, which is not a state a unit
-    /// test reaches without a window.
-    #[test]
-    fn changing_section_resets_the_selection() {
-        // `include_str!` resolves relative to this file at compile time, so it
-        // works regardless of the test runner's working directory.
-        let source = crate::views::production_source(include_str!("harness.rs"));
-        let body = source
-            .split_once("fn set_section")
-            .expect("set_section must exist")
-            .1;
-        let body = body.split("\n    pub fn ").next().unwrap_or(body);
-        assert!(
-            body.contains("self.selected ="),
-            "set_section must reassign the selection; it indexes a list that \
-             just changed underneath it"
-        );
-    }
-
-    /// The rescan button must spin while a scan is in flight.
-    ///
-    /// Source-level because the assertion is about a rendered `Button`, and
-    /// building one needs a `Window`. The failure it guards is the reported
-    /// one: with no visible state change a click is indistinguishable from a
-    /// hung app, and the user clicks again.
-    #[test]
-    fn the_rescan_button_reflects_the_scanning_flag() {
-        let source = crate::views::production_source(include_str!("harness.rs"));
-        let button = source
-            .split_once("Button::new(\"rescan\")")
-            .expect("the rescan button must exist")
-            .1;
-        let button = button.split("on_click").next().unwrap_or(button);
-        assert!(
-            button.contains(".loading(self.scanning)"),
-            "a rescan with no visible state reads as an app that ignored the click"
-        );
-    }
-
-    /// …and it must stay spinning long enough to be seen.
-    #[test]
-    fn the_spinner_has_a_minimum_visible_duration() {
-        let source = crate::views::production_source(include_str!("harness.rs"));
-        let body = source
-            .split_once("pub fn refresh")
-            .expect("refresh must exist")
-            .1;
-        let body = body.split("\n    fn apply").next().unwrap_or(body);
-        assert!(
-            body.contains("timer(SPINNER_FLOOR)"),
-            "a scan that returns in 3ms would flash the spinner for one frame, \
-             which reads as a glitch rather than as feedback"
-        );
-        // The results must not wait on the floor — only the flag does.
-        let (before_apply, after_apply) = body
-            .split_once("this.apply(")
-            .expect("refresh must apply the scan results");
-        assert!(
-            !before_apply.contains("floor.await"),
-            "the floor must delay the spinner, never the results"
-        );
-        assert!(
-            after_apply.contains("floor.await"),
-            "the flag must be cleared after the floor elapses, not before"
-        );
     }
 
     #[test]

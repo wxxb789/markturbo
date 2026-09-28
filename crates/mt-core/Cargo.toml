@@ -1,0 +1,58 @@
+[package]
+name = "mt-core"
+description = "Headless markturbo workflows and document engine. No GPUI dependency."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "markturbo-goal06-evaluate"
+path = "src/bin/markturbo-goal06-evaluate.rs"
+required-features = ["model-transport"]
+
+[[bin]]
+name = "markturbo-goal07-evaluate"
+path = "src/bin/markturbo-goal07-evaluate.rs"
+
+[features]
+default = []
+model-transport = ["dep:genai", "dep:reqwest", "dep:rustls", "dep:tokio", "dep:smol"]
+test-support = []
+
+[dependencies]
+ab_glyph.workspace = true
+anyhow.workspace = true
+chardetng.workspace = true
+d2-little.workspace = true
+dirs.workspace = true
+encoding_rs.workspace = true
+log.workspace = true
+markdown.workspace = true
+mermaid-svg.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+ratex-font.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-types.workspace = true
+rust-embed = { workspace = true, features = ["include-exclude"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+url.workspace = true
+genai = { workspace = true, optional = true }
+# Match genai's pinned pure-Rust TLS provider when this feature is enabled.
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+smol = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true

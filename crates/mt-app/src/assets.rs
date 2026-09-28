@@ -32,16 +32,6 @@ struct Fonts;
 #[include = "icons/**/*.svg"]
 struct Icons;
 
-/// KaTeX faces used by the native math renderer.
-///
-/// These are separate from GPUI's fonts: they are parsed lazily when a math
-/// block is rendered, rather than registered with the UI font database.
-#[derive(rust_embed::RustEmbed)]
-#[folder = "../../fonts/katex"]
-#[include = "KaTeX_*.ttf"]
-#[exclude = "KaTeX_Caligraphic-Bold.ttf"]
-struct MathFonts;
-
 /// Distribution notices retained inside the single-file release artifact.
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../.."]
@@ -65,39 +55,6 @@ struct FontNotices;
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../sample"]
 struct Sample;
-
-/// KaTeX faces RaTeX's layout can ask for, and the embedded file each uses.
-///
-/// Mirrors `ratex-font-loader`'s own `FONT_MAP` and is the single inventory
-/// shared by the asset and renderer paths.
-pub(crate) const MATH_FONT_FILES: &[(ratex_font::FontId, &str)] = {
-    use ratex_font::FontId as F;
-    &[
-        (F::MainRegular, "KaTeX_Main-Regular.ttf"),
-        (F::MainBold, "KaTeX_Main-Bold.ttf"),
-        (F::MainItalic, "KaTeX_Main-Italic.ttf"),
-        (F::MainBoldItalic, "KaTeX_Main-BoldItalic.ttf"),
-        (F::MathItalic, "KaTeX_Math-Italic.ttf"),
-        (F::MathBoldItalic, "KaTeX_Math-BoldItalic.ttf"),
-        (F::AmsRegular, "KaTeX_AMS-Regular.ttf"),
-        (F::CaligraphicRegular, "KaTeX_Caligraphic-Regular.ttf"),
-        (F::FrakturRegular, "KaTeX_Fraktur-Regular.ttf"),
-        (F::FrakturBold, "KaTeX_Fraktur-Bold.ttf"),
-        (F::SansSerifRegular, "KaTeX_SansSerif-Regular.ttf"),
-        (F::SansSerifBold, "KaTeX_SansSerif-Bold.ttf"),
-        (F::SansSerifItalic, "KaTeX_SansSerif-Italic.ttf"),
-        (F::ScriptRegular, "KaTeX_Script-Regular.ttf"),
-        (F::TypewriterRegular, "KaTeX_Typewriter-Regular.ttf"),
-        (F::Size1Regular, "KaTeX_Size1-Regular.ttf"),
-        (F::Size2Regular, "KaTeX_Size2-Regular.ttf"),
-        (F::Size3Regular, "KaTeX_Size3-Regular.ttf"),
-        (F::Size4Regular, "KaTeX_Size4-Regular.ttf"),
-    ]
-};
-
-pub(crate) fn embedded_math_font(name: &str) -> Option<Cow<'static, [u8]>> {
-    MathFonts::get(name).map(|file| file.data)
-}
 
 fn embedded_license(path: &str) -> Option<Cow<'static, [u8]>> {
     match path {
@@ -176,19 +133,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("{path} is missing"));
             assert!(data.len() > 7_000, "{path} looks truncated");
             // TrueType magic, so a placeholder or an LFS pointer fails here.
-            assert_eq!(&data[..4], &[0x00, 0x01, 0x00, 0x00], "{path} is not a TTF");
-        }
-    }
-
-    #[test]
-    fn embeds_every_katex_face_used_by_the_native_renderer() {
-        let embedded: Vec<_> = MathFonts::iter()
-            .filter(|path| path.ends_with(".ttf"))
-            .collect();
-        assert_eq!(embedded.len(), MATH_FONT_FILES.len());
-        for (_, path) in MATH_FONT_FILES {
-            let data = embedded_math_font(path).unwrap_or_else(|| panic!("{path} is missing"));
-            assert!(data.len() > 7_000, "{path} looks truncated");
             assert_eq!(&data[..4], &[0x00, 0x01, 0x00, 0x00], "{path} is not a TTF");
         }
     }
