@@ -679,15 +679,21 @@ def goal04_tree_command(variant: Goal04BuildVariant) -> list[str]:
         "--locked",
         "--target",
         GOAL04_TARGET,
-        "-p",
-        "mt-app",
-        "--edges",
-        "normal",
-        "--prefix",
-        "none",
-        "--format",
-        "{p}|{f}",
     ]
+    if variant.artifact_kind == "test":
+        command.extend(
+            [
+                "-p",
+                "mt-core",
+                "--features",
+                "model-transport",
+            ]
+        )
+    else:
+        command.extend(["-p", "mt-app"])
+    command.extend(
+        ["--edges", "normal", "--prefix", "none", "--format", "{p}|{f}"]
+    )
     if variant.no_default_features:
         command.append("--no-default-features")
     return command
