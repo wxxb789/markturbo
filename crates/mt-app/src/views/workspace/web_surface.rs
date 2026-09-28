@@ -7,7 +7,8 @@
 
 use gpui_kit::*;
 
-use super::Workspace;
+use super::{DocumentView, Workspace};
+use mt_core::document::lifecycle::DocumentId;
 
 #[cfg(target_os = "macos")]
 use std::cell::Cell;
@@ -16,17 +17,33 @@ use std::num::NonZeroIsize;
 #[cfg(target_os = "macos")]
 use std::rc::Rc;
 #[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "windows")]
 use std::sync::{Arc, Mutex, mpsc};
 #[cfg(target_os = "windows")]
 use std::thread;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DocumentLease {
+    document_id: DocumentId,
+    tab: usize,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WebPayloadKey {
+    document_id: DocumentId,
     tab: usize,
     revision: u64,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl WebPayloadKey {
+    fn lease(self) -> DocumentLease {
+        DocumentLease {
+            document_id: self.document_id,
+            tab: self.tab,
+        }
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -63,6 +80,10 @@ pub(super) struct WebSurface {
     webview: Option<Entity<gpui_wry::WebView>>,
     #[cfg(target_os = "macos")]
     navigation_in_flight: Rc<Cell<bool>>,
+    #[cfg(target_os = "macos")]
+    webview_instance: Option<u64>,
+    #[cfg(target_os = "macos")]
+    next_webview_instance: u64,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     sync_pending: bool,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -72,11 +93,15 @@ pub(super) struct WebSurface {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     visible: bool,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    lent_tab: Option<usize>,
+    lent_document: Option<DocumentLease>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     loading: Option<Navigation>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     loaded: Option<Navigation>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    failed: Option<WebPayloadKey>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    retrying: Option<WebPayloadKey>,
 }
 
 impl WebSurface {
@@ -109,7 +134,59 @@ impl WebSurface {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn payload_update(&self, key: WebPayloadKey, html: &str) -> Option<String> {
-        (self.loading.is_none() && self.current != Some(key)).then(|| html.to_string())
+        let replacing_document = self.requires_surface_replacement(key);
+        (self.current != Some(key) && (self.loading.is_none() || replacing_document))
+            .then(|| html.to_string())
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn requires_surface_replacement(&self, key: WebPayloadKey) -> bool {
+        [
+            self.current,
+            self.loading.map(|navigation| navigation.key),
+            self.loaded.map(|navigation| navigation.key),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|current| current.lease() != key.lease())
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn abandon_for_document_change(&mut self, key: WebPayloadKey) -> Option<DocumentLease> {
+        let lent = self.lent_document.take();
+        self.current = None;
+        self.loading = None;
+        self.loaded = None;
+        self.visible = false;
+        if self
+            .pending_scroll
+            .is_some_and(|pending| pending.key.lease() != key.lease())
+        {
+            self.pending_scroll = None;
+        }
+        if self
+            .retrying
+            .is_some_and(|retrying| retrying.lease() != key.lease())
+        {
+            self.retrying = None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.webview_instance = None;
+        }
+        lent
+    }
+
+    #[cfg(target_os = "macos")]
+    fn next_webview_instance(&mut self) -> u64 {
+        self.next_webview_instance = self.next_webview_instance.wrapping_add(1);
+        self.webview_instance = Some(self.next_webview_instance);
+        self.next_webview_instance
+    }
+
+    #[cfg(target_os = "macos")]
+    fn accepts_page_event(&self, instance: u64) -> bool {
+        self.webview_instance == Some(instance) && self.loading.is_some()
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -139,7 +216,24 @@ impl WebSurface {
     fn finish_navigation(&mut self) -> Option<Navigation> {
         let navigation = self.loading.take()?;
         self.loaded = Some(navigation);
+        if self.retrying == Some(navigation.key) {
+            self.retrying = None;
+        }
         Some(navigation)
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn is_loading(&self, navigation: Navigation) -> bool {
+        self.loading == Some(navigation)
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn finish_navigation_for(&mut self, navigation: Navigation) -> Option<Navigation> {
+        if self.is_loading(navigation) {
+            self.finish_navigation()
+        } else {
+            None
+        }
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -153,6 +247,62 @@ impl WebSurface {
             return None;
         }
         self.pending_scroll.map(|pending| pending.fraction)
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn should_retry(&mut self, key: WebPayloadKey) -> bool {
+        if self.retrying.is_some_and(|retrying| retrying != key) {
+            self.retrying = None;
+        }
+        match self.failed {
+            Some(failed) if failed == key => false,
+            Some(_) => {
+                self.failed = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn retry_failed(&mut self, key: WebPayloadKey) -> bool {
+        if !self.failed.is_some_and(|failed| {
+            failed.document_id == key.document_id && failed.revision == key.revision
+        }) {
+            return false;
+        }
+        self.failed = None;
+        self.retrying = Some(key);
+        true
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn clear_failure_for_document(&mut self, document_id: DocumentId) {
+        if self
+            .failed
+            .is_some_and(|failed| failed.document_id == document_id)
+        {
+            self.failed = None;
+        }
+        if self
+            .retrying
+            .is_some_and(|retrying| retrying.document_id == document_id)
+        {
+            self.retrying = None;
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn fail_operation(&mut self, key: WebPayloadKey) -> bool {
+        self.webview = None;
+        self.current = None;
+        self.pending_scroll = None;
+        self.visible = false;
+        self.loading = None;
+        self.loaded = None;
+        self.failed = Some(key);
+        self.retrying = None;
+        self.lent_document.take().is_some()
     }
 }
 
@@ -176,7 +326,11 @@ impl Workspace {
                 return;
             };
             self.web.pending_scroll = Some(PendingScroll {
-                key: WebPayloadKey { tab, revision },
+                key: WebPayloadKey {
+                    document_id: document.id(),
+                    tab,
+                    revision,
+                },
                 fraction,
             });
             self.web_dirty(cx);
@@ -186,7 +340,7 @@ impl Workspace {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn webview_intent(&self, cx: &App) -> WebIntent {
+    fn webview_intent(&mut self, cx: &App) -> WebIntent {
         if self.settings_open {
             return WebIntent::Hide;
         }
@@ -198,9 +352,19 @@ impl Workspace {
         if !doc.layout().uses_webview() {
             return WebIntent::Hide;
         }
+        if doc.has_web_preview_failure() {
+            return WebIntent::Hide;
+        }
         match doc.web_payload() {
             Some((html, revision)) => {
-                let key = WebPayloadKey { tab, revision };
+                let key = WebPayloadKey {
+                    document_id: doc.id(),
+                    tab,
+                    revision,
+                };
+                if !self.web.should_retry(key) {
+                    return WebIntent::Unchanged;
+                }
                 WebIntent::Show {
                     key,
                     html: self.web.payload_update(key, html),
@@ -224,9 +388,18 @@ impl Workspace {
                     && let Some(webview) = &self.web.webview
                     && !hide_webview(webview, cx)
                 {
-                    self.webview_connection_lost("hiding", cx);
+                    window.focus(&self.focus_handle, cx);
+                    let failed_key = self
+                        .web
+                        .loading
+                        .map(|navigation| navigation.key)
+                        .or(self.web.current);
+                    if let Some(key) = failed_key {
+                        self.webview_operation_failed(key, window, cx);
+                        return;
+                    }
                 }
-                if self.web.lent_tab.take().is_some() {
+                if self.web.lent_document.take().is_some() {
                     self.lend_webview(None, None, cx);
                 }
                 self.web.pending_scroll = None;
@@ -241,30 +414,63 @@ impl Workspace {
             WebIntent::Show { key, html } => (key, html),
         };
 
+        if self.web.requires_surface_replacement(key) {
+            let was_visible = self.web.begin_hide();
+            #[cfg(target_os = "windows")]
+            if was_visible && !focus_native_window(window) {
+                log::debug!("failed to restore native focus before replacing Web preview");
+            }
+            if let Some(webview) = &self.web.webview {
+                let _ = hide_webview(webview, cx);
+            }
+            let previous_lease = self.web.abandon_for_document_change(key);
+            if previous_lease.is_some() {
+                self.lend_webview(None, None, cx);
+            }
+            self.web.webview = None;
+            #[cfg(target_os = "macos")]
+            {
+                self.web.navigation_in_flight = Rc::new(Cell::new(false));
+            }
+            if was_visible {
+                window.focus(&self.focus_handle, cx);
+            }
+        }
+
         let webview = match &self.web.webview {
             Some(webview) => webview.clone(),
             None => {
                 #[cfg(target_os = "windows")]
                 {
-                    self.start_windows_webview(window, cx);
+                    self.start_windows_webview(key, window, cx);
                     return;
                 }
                 #[cfg(target_os = "macos")]
                 {
                     let navigation_in_flight = Rc::new(Cell::new(false));
+                    let instance = self.web.next_webview_instance();
                     let (page_loaded, page_events) = smol::channel::unbounded();
-                    let Some(webview) =
-                        create_webview(window, navigation_in_flight.clone(), page_loaded, cx)
-                    else {
-                        return;
+                    let webview = match create_webview(
+                        window,
+                        navigation_in_flight.clone(),
+                        page_loaded,
+                        instance,
+                        cx,
+                    ) {
+                        Ok(webview) => webview,
+                        Err(_) => {
+                            self.webview_operation_failed(key, window, cx);
+                            return;
+                        }
                     };
+                    let _ = hide_webview(&webview, cx);
                     self.web.navigation_in_flight = navigation_in_flight;
                     self.web.webview = Some(webview.clone());
                     let this = cx.entity().downgrade();
                     cx.spawn(async move |_, cx| {
-                        while page_events.recv().await.is_ok() {
+                        while let Ok(event) = page_events.recv().await {
                             crate::views::try_update(&this, cx, |this, cx| {
-                                this.webview_page_loaded(cx);
+                                this.mac_webview_page_loaded(event.instance, cx);
                             });
                         }
                     })
@@ -274,37 +480,36 @@ impl Workspace {
             }
         };
 
-        if self.web.lent_tab != Some(key.tab) {
-            self.lend_webview(Some(key.tab), Some(webview.clone()), cx);
-            self.web.lent_tab = Some(key.tab);
+        if self.web.lent_document != Some(key.lease()) {
+            self.lend_webview(Some(key.lease()), Some(webview.clone()), cx);
+            self.web.lent_document = Some(key.lease());
         }
-        if !self.web.visible {
+
+        if let Some(html) = html {
+            let navigation = self.web.begin_navigation(key);
+            #[cfg(target_os = "macos")]
+            self.web.navigation_in_flight.set(true);
+            if !load_webview(&webview, crate::web::to_data_url(&html), navigation, cx) {
+                self.webview_operation_failed(key, window, cx);
+                return;
+            }
+        }
+
+        let safe_to_show = self
+            .web
+            .loaded
+            .is_some_and(|navigation| navigation.key.lease() == key.lease());
+        if safe_to_show && !self.web.visible {
             if !show_webview(&webview, cx) {
-                self.webview_connection_lost("showing", cx);
+                self.webview_operation_failed(key, window, cx);
                 return;
             }
             self.web.visible = true;
         }
 
-        if let Some(html) = html {
-            let navigation = self.web.begin_navigation(key);
-            #[cfg(target_os = "windows")]
-            let _ = navigation;
-            #[cfg(target_os = "macos")]
-            self.web.navigation_in_flight.set(true);
-            if !load_webview(&webview, crate::web::to_data_url(&html), cx) {
-                #[cfg(target_os = "macos")]
-                self.web.navigation_in_flight.set(false);
-                self.webview_connection_lost("navigating", cx);
-                return;
-            }
-            #[cfg(target_os = "macos")]
-            let _ = navigation;
-        }
-
         if let Some(fraction) = self.web.ready_scroll(key) {
             if !evaluate_webview(&webview, scroll_script(fraction), cx) {
-                self.webview_connection_lost("synchronizing scroll", cx);
+                self.webview_operation_failed(key, window, cx);
                 return;
             }
             self.web.pending_scroll = None;
@@ -312,45 +517,166 @@ impl Workspace {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn webview_connection_lost(&mut self, operation: &str, cx: &mut Context<Self>) {
-        self.web.webview = None;
-        self.web.current = None;
-        self.web.visible = false;
-        self.web.loading = None;
-        self.web.loaded = None;
+    fn webview_operation_failed(
+        &mut self,
+        key: WebPayloadKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_visible = self.web.begin_hide();
+        #[cfg(target_os = "windows")]
+        if was_visible && !focus_native_window(window) {
+            log::debug!("failed to restore native focus after Web preview failure");
+        }
+        if let Some(webview) = &self.web.webview {
+            let _ = hide_webview(webview, cx);
+        }
+        let was_lent = self.web.fail_operation(key);
+        #[cfg(target_os = "macos")]
+        self.web.navigation_in_flight.set(false);
         #[cfg(target_os = "macos")]
         {
-            self.web.navigation_in_flight = Rc::new(Cell::new(false));
+            self.web.webview_instance = None;
         }
-        #[cfg(target_os = "windows")]
-        {
-            self.web.starting = false;
-        }
-        if self.web.lent_tab.take().is_some() {
+        if was_lent {
             self.lend_webview(None, None, cx);
         }
-        self.set_status(
-            format!("Web preview worker disconnected while {operation}; restarting"),
-            cx,
-        );
-        self.web_dirty(cx);
+        if was_visible {
+            window.focus(&self.focus_handle, cx);
+        }
+        self.mark_web_preview_failed(key, cx);
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn webview_page_loaded(&mut self, cx: &mut Context<Self>) {
-        if self.web.finish_navigation().is_some() {
+    #[cfg(target_os = "windows")]
+    fn handle_webview_event(
+        &mut self,
+        worker_id: usize,
+        event: WorkerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .web
+            .webview
+            .as_ref()
+            .is_some_and(|worker| worker.identity() == worker_id)
+        {
+            return;
+        }
+        match event {
+            WorkerEvent::PageLoaded(navigation) => {
+                if let Some(navigation) = self.web.finish_navigation_for(navigation) {
+                    self.clear_web_preview_failure(navigation.key, cx);
+                    self.web_dirty(cx);
+                }
+            }
+            WorkerEvent::NavigationFailed(navigation) => {
+                if self.web.is_loading(navigation) {
+                    self.webview_operation_failed(navigation.key, window, cx);
+                    self.web_dirty(cx);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mac_webview_page_loaded(&mut self, instance: u64, cx: &mut Context<Self>) {
+        if self.web.accepts_page_event(instance)
+            && let Some(navigation) = self.web.finish_navigation()
+        {
+            self.clear_web_preview_failure(navigation.key, cx);
             self.web_dirty(cx);
         }
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn mark_web_preview_failed(&mut self, key: WebPayloadKey, cx: &mut Context<Self>) {
+        if let Some(document) = self
+            .document_views()
+            .into_iter()
+            .find(|document| document.read(cx).id() == key.document_id)
+        {
+            document.update(cx, |document, cx| {
+                document.mark_web_preview_failed(key.revision, cx);
+            });
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn clear_web_preview_failure(&mut self, key: WebPayloadKey, cx: &mut Context<Self>) {
+        if let Some(document) = self
+            .document_views()
+            .into_iter()
+            .find(|document| document.read(cx).id() == key.document_id)
+        {
+            document.update(cx, |document, cx| {
+                document.clear_web_preview_failure(key.revision, cx);
+            });
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub(super) fn retry_web_preview(
+        &mut self,
+        document: &Entity<DocumentView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_document) = self.active_document() else {
+            return;
+        };
+        let document_id = document.read(cx).id();
+        if active_document.read(cx).id() != document_id {
+            return;
+        }
+        let active_tab = self.tabs.active_index();
+        let revision = {
+            let active = document.read(cx);
+            if !active.layout().uses_webview() {
+                return;
+            }
+            active.web_payload().map(|(_, revision)| revision)
+        };
+        if let Some(revision) = revision {
+            self.web.retry_failed(WebPayloadKey {
+                document_id,
+                tab: active_tab,
+                revision,
+            });
+            self.web_dirty(cx);
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub(super) fn web_preview_layout_left(
+        &mut self,
+        document: &Entity<DocumentView>,
+        cx: &Context<Self>,
+    ) {
+        self.web.clear_failure_for_document(document.read(cx).id());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    pub(super) fn retry_web_preview(&mut self, _: &Entity<DocumentView>, _: &mut Context<Self>) {}
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    pub(super) fn web_preview_layout_left(&mut self, _: &Entity<DocumentView>, _: &Context<Self>) {}
+
     #[cfg(target_os = "windows")]
-    fn start_windows_webview(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn start_windows_webview(
+        &mut self,
+        key: WebPayloadKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.web.starting {
             return;
         }
-        let Some(startup) = WindowsWebView::start(window) else {
-            self.set_status("Cannot start the Web preview worker".into(), cx);
-            return;
+        let startup = match WindowsWebView::start(window) {
+            Ok(startup) => startup,
+            Err(_) => {
+                self.webview_operation_failed(key, window, cx);
+                return;
+            }
         };
         self.web.starting = true;
         let this = cx.entity().downgrade();
@@ -358,11 +684,11 @@ impl Workspace {
             let result = cx.background_spawn(async move { startup.wait() }).await;
             let ready = match result {
                 Ok(ready) => ready,
-                Err(error) => {
-                    crate::views::try_update(&this, cx, |this, cx| {
+                Err(_) => {
+                    crate::views::try_update_in(&this, cx, |this, window, cx| {
                         this.web.starting = false;
-                        this.web.current = None;
-                        this.set_status(format!("Cannot start Web preview: {error}"), cx);
+                        this.webview_operation_failed(key, window, cx);
+                        this.web_dirty(cx);
                     });
                     return;
                 }
@@ -376,53 +702,42 @@ impl Workspace {
             });
 
             while let Ok(event) = ready.events.recv().await {
-                crate::views::try_update(&this, cx, |this, cx| {
-                    this.handle_webview_event(worker_id, event, cx);
+                crate::views::try_update_in(&this, cx, |this, window, cx| {
+                    this.handle_webview_event(worker_id, event, window, cx);
                 });
             }
-            crate::views::try_update(&this, cx, |this, cx| {
-                if this
+            crate::views::try_update_in(&this, cx, |this, window, cx| {
+                let owns_worker = this
                     .web
                     .webview
                     .as_ref()
-                    .is_some_and(|worker| worker.identity() == worker_id)
-                {
-                    this.webview_connection_lost("waiting for page events", cx);
+                    .is_some_and(|worker| worker.identity() == worker_id);
+                if owns_worker {
+                    let failed_key = this
+                        .web
+                        .loading
+                        .map(|navigation| navigation.key)
+                        .or(this.web.current)
+                        .unwrap_or(key);
+                    this.webview_operation_failed(failed_key, window, cx);
+                    this.web_dirty(cx);
                 }
             });
         })
         .detach();
     }
 
-    #[cfg(target_os = "windows")]
-    fn handle_webview_event(
-        &mut self,
-        worker_id: usize,
-        event: WorkerEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if !self
-            .web
-            .webview
-            .as_ref()
-            .is_some_and(|worker| worker.identity() == worker_id)
-        {
-            return;
-        }
-        match event {
-            WorkerEvent::PageLoaded => self.webview_page_loaded(cx),
-        }
-    }
-
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn lend_webview(
         &mut self,
-        tab: Option<usize>,
+        lease: Option<DocumentLease>,
         webview: Option<PlatformWebView>,
         cx: &mut Context<Self>,
     ) {
         for (ix, doc) in self.document_views().into_iter().enumerate() {
-            let lent = (Some(ix) == tab).then(|| webview.clone()).flatten();
+            let owns_lease = lease
+                .is_some_and(|lease| lease.tab == ix && lease.document_id == doc.read(cx).id());
+            let lent = owns_lease.then(|| webview.clone()).flatten();
             doc.update(cx, |doc, cx| doc.set_webview(lent, cx));
         }
     }
@@ -434,24 +749,42 @@ type PlatformWebView = WindowsWebView;
 type PlatformWebView = Entity<gpui_wry::WebView>;
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacPageLoaded {
+    instance: u64,
+}
+
+#[cfg(target_os = "macos")]
 fn create_webview(
     window: &mut Window,
     navigation_in_flight: Rc<Cell<bool>>,
-    page_loaded: smol::channel::Sender<()>,
+    page_loaded: smol::channel::Sender<MacPageLoaded>,
+    instance: u64,
     cx: &mut App,
-) -> Option<Entity<gpui_wry::WebView>> {
+) -> Result<Entity<gpui_wry::WebView>, MacWebViewCreateError> {
     use raw_window_handle::HasWindowHandle as _;
 
-    let handle = window.window_handle().ok()?;
+    let handle = window
+        .window_handle()
+        .map_err(|_| MacWebViewCreateError::WindowHandle)?;
     let builder = wry::WebViewBuilder::new().with_on_page_load_handler(move |event, _url| {
         if matches!(event, wry::PageLoadEvent::Finished) && navigation_in_flight.replace(false) {
-            let _ = page_loaded.try_send(());
+            let _ = page_loaded.try_send(MacPageLoaded { instance });
         }
     });
     #[cfg(debug_assertions)]
     let builder = builder.with_devtools(true);
-    let webview = builder.build_as_child(&handle).ok()?;
-    Some(cx.new(|cx| gpui_wry::WebView::new(webview, window, cx)))
+    let webview = builder
+        .build_as_child(&handle)
+        .map_err(|_| MacWebViewCreateError::Build)?;
+    Ok(cx.new(|cx| gpui_wry::WebView::new(webview, window, cx)))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacWebViewCreateError {
+    WindowHandle,
+    Build,
 }
 
 #[cfg(target_os = "windows")]
@@ -495,19 +828,33 @@ fn show_webview(webview: &WindowsWebView, _: &mut App) -> bool {
 
 #[cfg(target_os = "macos")]
 fn show_webview(webview: &Entity<gpui_wry::WebView>, cx: &mut App) -> bool {
-    webview.update(cx, |webview, _| webview.show());
+    webview.update(cx, |webview, cx| {
+        webview.show();
+        cx.notify();
+    });
     true
 }
 
 #[cfg(target_os = "windows")]
-fn load_webview(webview: &WindowsWebView, url: String, _: &mut App) -> bool {
-    webview.send(WorkerCommand::LoadUrl(url)).is_ok()
+fn load_webview(
+    webview: &WindowsWebView,
+    url: String,
+    navigation: Navigation,
+    _: &mut App,
+) -> bool {
+    webview
+        .send(WorkerCommand::LoadUrl { url, navigation })
+        .is_ok()
 }
 
 #[cfg(target_os = "macos")]
-fn load_webview(webview: &Entity<gpui_wry::WebView>, url: String, cx: &mut App) -> bool {
-    webview.update(cx, |webview, _| webview.load_url(&url));
-    true
+fn load_webview(
+    webview: &Entity<gpui_wry::WebView>,
+    url: String,
+    _: Navigation,
+    cx: &mut App,
+) -> bool {
+    webview.update(cx, |webview, _| webview.raw().load_url(&url).is_ok())
 }
 
 #[cfg(target_os = "windows")]
@@ -518,9 +865,8 @@ fn evaluate_webview(webview: &WindowsWebView, script: String, _: &mut App) -> bo
 #[cfg(target_os = "macos")]
 fn evaluate_webview(webview: &Entity<gpui_wry::WebView>, script: String, cx: &mut App) -> bool {
     webview.update(cx, |webview, _| {
-        let _ = webview.raw().evaluate_script(&script);
-    });
-    true
+        webview.raw().evaluate_script(&script).is_ok()
+    })
 }
 
 fn scroll_script(fraction: f32) -> String {
@@ -574,7 +920,7 @@ fn clamp_bounds_to_client(
 enum WorkerCommand {
     Show,
     Hide,
-    LoadUrl(String),
+    LoadUrl { url: String, navigation: Navigation },
     Evaluate(String),
     Bounds(PhysicalBounds),
     Shutdown,
@@ -583,7 +929,8 @@ enum WorkerCommand {
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerEvent {
-    PageLoaded,
+    PageLoaded(Navigation),
+    NavigationFailed(Navigation),
 }
 
 #[cfg(target_os = "windows")]
@@ -683,15 +1030,14 @@ impl WindowsWebView {
         Arc::as_ptr(&self.0) as usize
     }
 
-    fn start(window: &Window) -> Option<WindowsWebViewStartup> {
+    fn start(window: &Window) -> Result<WindowsWebViewStartup, String> {
         use raw_window_handle::RawWindowHandle;
 
-        let parent = match raw_window_handle::HasWindowHandle::window_handle(window)
-            .ok()?
-            .as_raw()
-        {
+        let handle = raw_window_handle::HasWindowHandle::window_handle(window)
+            .map_err(|_| "the application window handle is unavailable".to_string())?;
+        let parent = match handle.as_raw() {
             RawWindowHandle::Win32(handle) => handle.hwnd.get(),
-            _ => return None,
+            _ => return Err("the application window is not a Win32 window".into()),
         };
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready) = mpsc::sync_channel(1);
@@ -699,8 +1045,8 @@ impl WindowsWebView {
         let worker = thread::Builder::new()
             .name("markturbo-webview-sta".into())
             .spawn(move || run_windows_webview(parent, rx, ready_tx, event_tx))
-            .ok()?;
-        Some(WindowsWebViewStartup {
+            .map_err(|_| "the Web preview worker could not be started".to_string())?;
+        Ok(WindowsWebViewStartup {
             tx,
             ready,
             events,
@@ -866,7 +1212,7 @@ fn run_windows_webview(
         TranslateMessage,
     };
 
-    let Some(data_dir) = crate::app_paths::webview_data_dir() else {
+    let Some(data_dir) = mt_core::runtime_paths::webview_data_dir() else {
         let _ = ready.send(Err(
             "cannot resolve the MarkTurbo WebView data directory".to_string()
         ));
@@ -891,14 +1237,17 @@ fn run_windows_webview(
     };
     let host = WebHost(host_hwnd);
     let page_events = events.clone();
-    let navigation_in_flight = Arc::new(AtomicBool::new(false));
+    let navigation_in_flight = Arc::new(Mutex::new(None::<Navigation>));
     let page_navigation_in_flight = navigation_in_flight.clone();
     let builder = wry::WebViewBuilder::new_with_web_context(&mut web_context)
         .with_on_page_load_handler(move |event, _url| {
             if matches!(event, wry::PageLoadEvent::Finished)
-                && page_navigation_in_flight.swap(false, Ordering::AcqRel)
+                && let Some(navigation) = page_navigation_in_flight
+                    .lock()
+                    .ok()
+                    .and_then(|mut navigation| navigation.take())
             {
-                let _ = page_events.try_send(WorkerEvent::PageLoaded);
+                let _ = page_events.try_send(WorkerEvent::PageLoaded(navigation));
             }
         });
     #[cfg(debug_assertions)]
@@ -935,7 +1284,14 @@ fn run_windows_webview(
             break;
         }
         if message.message == WORKER_WAKE_MESSAGE {
-            if !drain_worker_commands(&rx, parent, host_hwnd, &webview, &navigation_in_flight) {
+            if !drain_worker_commands(
+                &rx,
+                parent,
+                host_hwnd,
+                &webview,
+                &navigation_in_flight,
+                &events,
+            ) {
                 break;
             }
             continue;
@@ -1009,7 +1365,8 @@ fn drain_worker_commands(
     parent: windows::Win32::Foundation::HWND,
     host: windows::Win32::Foundation::HWND,
     webview: &wry::WebView,
-    navigation_in_flight: &AtomicBool,
+    navigation_in_flight: &Mutex<Option<Navigation>>,
+    events: &smol::channel::Sender<WorkerEvent>,
 ) -> bool {
     let mut latest_bounds = None;
     loop {
@@ -1017,7 +1374,14 @@ fn drain_worker_commands(
             Ok(WorkerCommand::Bounds(bounds)) => latest_bounds = Some(bounds),
             Ok(WorkerCommand::Shutdown) => return false,
             Ok(command) => {
-                if !apply_worker_command(command, parent, host, webview, navigation_in_flight) {
+                if !apply_worker_command(
+                    command,
+                    parent,
+                    host,
+                    webview,
+                    navigation_in_flight,
+                    events,
+                ) {
                     return false;
                 }
             }
@@ -1032,6 +1396,7 @@ fn drain_worker_commands(
             host,
             webview,
             navigation_in_flight,
+            events,
         )
     } else {
         true
@@ -1044,7 +1409,8 @@ fn apply_worker_command(
     parent: windows::Win32::Foundation::HWND,
     host: windows::Win32::Foundation::HWND,
     webview: &wry::WebView,
-    navigation_in_flight: &AtomicBool,
+    navigation_in_flight: &Mutex<Option<Navigation>>,
+    events: &smol::channel::Sender<WorkerEvent>,
 ) -> bool {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1059,11 +1425,17 @@ fn apply_worker_command(
         WorkerCommand::Hide => {
             let _ = unsafe { ShowWindow(host, SW_HIDE) };
         }
-        WorkerCommand::LoadUrl(url) => {
-            navigation_in_flight.store(true, Ordering::Release);
-            if let Err(error) = webview.load_url(&url) {
-                navigation_in_flight.store(false, Ordering::Release);
-                log::warn!("failed to load Web preview: {error}");
+        WorkerCommand::LoadUrl { url, navigation } => {
+            if let Ok(mut current) = navigation_in_flight.lock() {
+                *current = Some(navigation);
+            }
+            if webview.load_url(&url).is_err() {
+                if let Ok(mut current) = navigation_in_flight.lock()
+                    && *current == Some(navigation)
+                {
+                    *current = None;
+                }
+                let _ = events.try_send(WorkerEvent::NavigationFailed(navigation));
             }
         }
         WorkerCommand::Evaluate(script) => {
@@ -1110,6 +1482,8 @@ mod tests {
     use super::{Navigation, PendingScroll, WebPayloadKey, WebSurface};
     #[cfg(target_os = "windows")]
     use super::{PhysicalBounds, clamp_bounds_to_client};
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    use mt_core::document::lifecycle::DocumentId;
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -1166,18 +1540,19 @@ mod tests {
     #[test]
     fn unchanged_payload_avoids_an_html_clone() {
         let key = WebPayloadKey {
+            document_id: DocumentId::next(),
             tab: 3,
             revision: 9,
         };
         let surface = WebSurface {
             current: Some(key),
             visible: true,
-            lent_tab: Some(key.tab),
+            lent_document: Some(key.lease()),
             ..Default::default()
         };
 
         assert_eq!(surface.payload_update(key, "large html"), None);
-        assert_eq!(surface.lent_tab, Some(3));
+        assert_eq!(surface.lent_document, Some(key.lease()));
         assert!(surface.visible);
         assert_eq!(
             surface.payload_update(
@@ -1194,11 +1569,14 @@ mod tests {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     fn old_page_finish_cannot_consume_the_latest_scroll() {
+        let document_id = DocumentId::next();
         let old = WebPayloadKey {
+            document_id,
             tab: 1,
             revision: 4,
         };
         let new = WebPayloadKey {
+            document_id,
             tab: 1,
             revision: 5,
         };
@@ -1227,22 +1605,253 @@ mod tests {
         assert_eq!(surface.loaded, Some(Navigation { key: new }));
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
-    fn trusted_urls_are_loaded_verbatim() {
-        use super::WorkerCommand;
-
-        let url = "file:///C:/docs/index.html#/settings".to_string();
-        let command = WorkerCommand::LoadUrl(url.clone());
-        let WorkerCommand::LoadUrl(queued) = command else {
-            unreachable!()
+    fn failed_operation_stays_suppressed_until_a_real_retry_boundary() {
+        let key = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 2,
+            revision: 8,
         };
-        assert_eq!(queued, url);
+        let loaded = Navigation {
+            key: WebPayloadKey { revision: 7, ..key },
+        };
+        let mut surface = WebSurface {
+            current: Some(key),
+            visible: true,
+            lent_document: Some(key.lease()),
+            loading: Some(Navigation { key }),
+            loaded: Some(loaded),
+            pending_scroll: Some(PendingScroll { key, fraction: 0.5 }),
+            ..Default::default()
+        };
 
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        assert!(!source.contains("markturbo-navigation="));
-        assert!(source.contains("webview.load_url(&url)"));
-        assert!(source.contains("page_navigation_in_flight.swap(false, Ordering::AcqRel)"));
+        assert!(surface.fail_operation(key));
+        assert_eq!(surface.current, None);
+        assert!(!surface.visible);
+        assert_eq!(surface.lent_document, None);
+        assert_eq!(surface.loading, None);
+        assert_eq!(surface.loaded, None);
+        assert_eq!(surface.pending_scroll, None);
+        assert!(!surface.should_retry(key));
+
+        surface.begin_hide();
+        assert!(!surface.should_retry(key));
+        surface.clear_failure_for_document(key.document_id);
+        assert!(surface.should_retry(key));
+        assert_eq!(surface.failed, None);
+
+        surface.fail_operation(key);
+
+        let changed = WebPayloadKey { revision: 9, ..key };
+        assert!(surface.should_retry(changed));
+        assert_eq!(surface.failed, None);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn different_document_at_same_tab_and_revision_is_not_suppressed() {
+        let failed_key = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 2,
+            revision: 8,
+        };
+        let replacement_key = WebPayloadKey {
+            document_id: DocumentId::next(),
+            ..failed_key
+        };
+        let mut surface = WebSurface {
+            failed: Some(failed_key),
+            ..Default::default()
+        };
+
+        assert!(surface.should_retry(replacement_key));
+        assert_eq!(surface.failed, None);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn explicit_retry_clears_failure_and_records_the_requested_payload() {
+        let key = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 2,
+            revision: 8,
+        };
+        let mut surface = WebSurface {
+            failed: Some(key),
+            ..Default::default()
+        };
+
+        assert!(surface.retry_failed(key));
+        assert_eq!(surface.failed, None);
+        assert_eq!(surface.retrying, Some(key));
+        assert!(surface.should_retry(key));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn same_index_document_replacement_transfers_the_native_lease() {
+        let old = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 2,
+            revision: 4,
+        };
+        let replacement = WebPayloadKey {
+            document_id: DocumentId::next(),
+            ..old
+        };
+        let mut surface = WebSurface {
+            current: Some(old),
+            loaded: Some(Navigation { key: old }),
+            visible: true,
+            lent_document: Some(old.lease()),
+            ..Default::default()
+        };
+
+        assert_eq!(old.tab, replacement.tab);
+        assert_ne!(old.lease(), replacement.lease());
+        assert!(surface.requires_surface_replacement(replacement));
+        assert_eq!(
+            surface.payload_update(replacement, "replacement html"),
+            Some("replacement html".into())
+        );
+        assert_eq!(
+            surface.abandon_for_document_change(replacement),
+            Some(old.lease())
+        );
+        assert_eq!(surface.lent_document, None);
+        assert_eq!(surface.loaded, None);
+        assert!(!surface.visible);
+
+        surface.lent_document = Some(replacement.lease());
+        surface.begin_navigation(replacement);
+        assert_eq!(surface.loading, Some(Navigation { key: replacement }));
+        assert_eq!(surface.lent_document, Some(replacement.lease()));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn failed_document_is_unlent_and_another_tab_can_navigate() {
+        let failed = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 1,
+            revision: 7,
+        };
+        let other_tab = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 2,
+            revision: 1,
+        };
+        let mut surface = WebSurface {
+            current: Some(failed),
+            loading: Some(Navigation { key: failed }),
+            visible: true,
+            lent_document: Some(failed.lease()),
+            ..Default::default()
+        };
+
+        assert!(surface.fail_operation(failed));
+        assert_eq!(surface.failed, Some(failed));
+        assert_eq!(surface.current, None);
+        assert_eq!(surface.loading, None);
+        assert_eq!(surface.lent_document, None);
+        assert!(!surface.visible);
+        assert!(!surface.should_retry(failed));
+
+        assert!(surface.should_retry(other_tab));
+        surface.begin_navigation(other_tab);
+        assert_eq!(surface.loading, Some(Navigation { key: other_tab }));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn replacing_a_loading_document_does_not_wait_for_its_page_event() {
+        let old = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 3,
+            revision: 5,
+        };
+        let replacement = WebPayloadKey {
+            document_id: DocumentId::next(),
+            ..old
+        };
+        let mut surface = WebSurface {
+            lent_document: Some(old.lease()),
+            ..Default::default()
+        };
+        surface.begin_navigation(old);
+
+        assert!(surface.requires_surface_replacement(replacement));
+        assert_eq!(
+            surface.payload_update(replacement, "new document html"),
+            Some("new document html".into())
+        );
+        assert_eq!(
+            surface.abandon_for_document_change(replacement),
+            Some(old.lease())
+        );
+        surface.lent_document = Some(replacement.lease());
+        surface.begin_navigation(replacement);
+
+        assert_eq!(
+            surface.finish_navigation(),
+            Some(Navigation { key: replacement })
+        );
+        assert_eq!(surface.loaded, Some(Navigation { key: replacement }));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn stale_worker_navigation_event_cannot_finish_a_replacement_attempt() {
+        let old = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 3,
+            revision: 5,
+        };
+        let replacement = WebPayloadKey {
+            document_id: DocumentId::next(),
+            ..old
+        };
+        let old_navigation = Navigation { key: old };
+        let new_navigation = Navigation { key: replacement };
+        let mut surface = WebSurface::default();
+        surface.begin_navigation(old);
+        surface.abandon_for_document_change(replacement);
+        surface.begin_navigation(replacement);
+
+        assert!(!surface.is_loading(old_navigation));
+        assert_eq!(surface.finish_navigation_for(old_navigation), None);
+        assert_eq!(surface.loading, Some(new_navigation));
+        assert!(surface.is_loading(new_navigation));
+        assert_eq!(
+            surface.finish_navigation_for(new_navigation),
+            Some(new_navigation)
+        );
+        assert_eq!(surface.loaded, Some(new_navigation));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_mac_page_completion_is_rejected_after_document_replacement() {
+        let old = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 3,
+            revision: 5,
+        };
+        let replacement = WebPayloadKey {
+            document_id: DocumentId::next(),
+            ..old
+        };
+        let mut surface = WebSurface::default();
+        let old_instance = surface.next_webview_instance();
+        surface.begin_navigation(old);
+        let _ = surface.abandon_for_document_change(replacement);
+        let new_instance = surface.next_webview_instance();
+        surface.begin_navigation(replacement);
+
+        assert!(!surface.accepts_page_event(old_instance));
+        assert!(surface.accepts_page_event(new_instance));
+        assert_eq!(surface.loading, Some(Navigation { key: replacement }));
     }
 
     #[cfg(target_os = "windows")]
@@ -1260,208 +1869,5 @@ mod tests {
         }));
 
         assert!(webview.send(WorkerCommand::Show).is_err());
-    }
-
-    #[test]
-    fn a_disconnected_worker_is_cleared_reported_and_requeued() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        let start = source
-            .find("fn webview_connection_lost")
-            .expect("disconnect recovery");
-        let body = &source[start..];
-        let end = body
-            .find("\n    #[cfg(target_os = \"windows\")]\n    fn start_windows_webview")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(body.contains("self.web.webview = None"));
-        assert!(body.contains("self.web.current = None"));
-        assert!(body.contains("self.lend_webview(None, None, cx)"));
-        assert!(body.contains("self.set_status("));
-        assert!(body.contains("self.web_dirty(cx)"));
-    }
-
-    #[test]
-    fn render_does_not_touch_the_webview() {
-        let source = crate::views::production_source(include_str!("../workspace.rs"));
-        let render = source
-            .split_once("impl Render for Workspace")
-            .expect("the Render impl")
-            .1;
-        let body = render.split("\n/// Keybindings").next().unwrap_or(render);
-
-        for forbidden in ["sync_webview(", "WorkerCommand::", "create_webview("] {
-            assert!(!body.contains(forbidden));
-        }
-        assert!(!source.contains("fn sync_webview"));
-    }
-
-    #[test]
-    fn the_sync_is_deferred_coalesced_and_reached_fallibly() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        let start = source.find("fn mark_dirty").expect("mark_dirty must exist");
-        let body = &source[start..];
-        let end = body.find("\nimpl Workspace").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(body.contains("cx.defer("));
-        assert!(body.contains("if self.sync_pending") && body.contains("self.sync_pending = true"));
-        assert!(body.contains("cx.with_window(") && body.contains(".is_err()"));
-    }
-
-    #[test]
-    fn the_webview_is_lent_to_exactly_one_tab() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        let start = source
-            .find("fn lend_webview")
-            .expect("lend_webview must exist");
-        let body = &source[start..];
-        let end = body.find("\n    }").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(body.contains("(Some(ix) == tab)"));
-        assert!(body.contains("document_views()"));
-        let sync = source.find("fn sync_webview").expect("sync_webview");
-        let sync = &source[sync..start];
-        assert!(sync.contains("if self.web.lent_tab != Some(key.tab)"));
-    }
-
-    #[test]
-    fn windows_uses_one_worker_owned_child_webview() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-
-        assert!(source.contains("thread::Builder::new()"));
-        assert!(source.contains("COINIT_APARTMENTTHREADED"));
-        assert!(source.contains("WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS"));
-        assert!(source.contains("builder.build(&host)"));
-        assert!(source.contains("WorkerCommand::Bounds"));
-        assert!(source.contains("GetMessageW") && source.contains("PostThreadMessageW"));
-        assert!(source.contains("let mut latest_bounds = None"));
-        assert!(source.contains("with_on_page_load_handler"));
-        assert!(source.contains("WorkerEvent::PageLoaded"));
-        assert!(!source.contains("recv_timeout"));
-        for forbidden in ["WS_OVERLAPPEDWINDOW", "SetForegroundWindow", "open_window("] {
-            assert!(
-                !source.contains(forbidden),
-                "forbidden companion-window API: {forbidden}"
-            );
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_persists_webview_data_under_app_data() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-
-        assert!(source.contains("crate::app_paths::webview_data_dir()"));
-        assert!(source.contains("wry::WebContext::new(Some(data_dir))"));
-        assert!(source.contains("WebViewBuilder::new_with_web_context(&mut web_context)"));
-    }
-
-    #[test]
-    fn windows_publishes_only_a_ready_worker_and_never_joins_on_drop() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        let drop_start = source
-            .find("impl Drop for WorkerConnection")
-            .expect("connection drop");
-        let drop_body = &source[drop_start..];
-        let drop_end = drop_body.find("\n}").unwrap_or(drop_body.len());
-        let drop_body = &drop_body[..drop_end];
-
-        assert!(source.contains("ready.send(Ok(thread_id))"));
-        assert!(source.contains("background_spawn(async move { startup.wait() })"));
-        assert!(source.contains("this.web.webview = Some(worker)"));
-        assert!(!drop_body.contains("join("));
-        assert!(drop_body.contains("WorkerCommand::Shutdown"));
-    }
-
-    #[test]
-    fn hide_restores_focus_only_on_transition_and_navigation_waits_for_finish() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        let sync = source.find("fn sync_webview").expect("sync_webview");
-        let sync_body = &source[sync..];
-        let sync_end = sync_body
-            .find("\n    #[cfg(target_os = \"windows\")]\n    fn start_windows_webview")
-            .unwrap_or(sync_body.len());
-        let sync_body = &sync_body[..sync_end];
-        let apply = source
-            .find("fn apply_worker_command")
-            .map(|start| &source[start..])
-            .expect("worker command application");
-        let native_focus = source
-            .find("fn focus_native_window")
-            .map(|start| &source[start..])
-            .expect("native focus helper");
-        let native_focus_end = native_focus
-            .find("\n#[cfg(target_os = \"macos\")]\nfn hide_webview")
-            .unwrap_or(native_focus.len());
-        let native_focus = &native_focus[..native_focus_end];
-
-        assert!(sync_body.contains("let was_visible = self.web.begin_hide()"));
-        assert!(sync_body.contains("if was_visible"));
-        assert_eq!(sync_body.matches("focus_native_window(window)").count(), 1);
-        assert!(
-            sync_body.find("focus_native_window(window)")
-                < sync_body.find("hide_webview(webview, cx)")
-        );
-        assert!(sync_body.contains("window.focus(&self.focus_handle, cx)"));
-        assert!(sync_body.contains("self.web.begin_navigation(key)"));
-        assert!(sync_body.contains("self.web.ready_scroll(key)"));
-        assert!(native_focus.contains("SetFocus(Some(hwnd))"));
-        assert!(native_focus.contains("GetFocus() == hwnd"));
-        assert!(!apply.contains("focus_parent()") && !apply.contains("SetFocus("));
-    }
-
-    #[test]
-    fn macos_navigation_completion_is_event_driven() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        let sync = source.find("fn sync_webview").expect("sync_webview");
-        let sync_body = &source[sync..];
-        let sync_end = sync_body
-            .find("\n    #[cfg(any(target_os = \"windows\", target_os = \"macos\"))]\n    fn webview_connection_lost")
-            .expect("connection-loss handler");
-        let sync_body = &sync_body[..sync_end];
-        let create = source
-            .find("fn create_webview")
-            .map(|start| &source[start..])
-            .expect("macOS WebView creation");
-        let create_end = create
-            .find("\n#[cfg(target_os = \"windows\")]\nfn hide_webview")
-            .expect("Windows hide helper");
-        let create = &create[..create_end];
-
-        assert!(sync_body.contains("self.web.navigation_in_flight.set(true)"));
-        assert!(!sync_body.contains("self.web.finish_navigation()"));
-        assert!(create.contains("with_on_page_load_handler"));
-        assert!(create.contains("wry::PageLoadEvent::Finished"));
-        assert!(create.contains("navigation_in_flight.replace(false)"));
-        assert!(create.contains("page_loaded.try_send(())"));
-    }
-
-    #[test]
-    fn windows_prepaint_only_queues_bounds() {
-        let source = crate::views::production_source(include_str!("web_surface.rs"));
-        let start = source
-            .find("fn prepaint(")
-            .expect("the Windows element prepaint");
-        let body = &source[start..];
-        let end = body.find("\n    fn paint(").expect("the paint method");
-        let body = &body[..end];
-
-        assert!(body.contains("self.webview.set_bounds(bounds, window.scale_factor())"));
-        assert!(!body.contains("wry::") && !body.contains("evaluate_script"));
-    }
-
-    #[test]
-    fn companion_preview_ui_cannot_return() {
-        let i18n = crate::views::production_source(include_str!("../../i18n.rs"));
-        let document = crate::views::production_source(include_str!("../document.rs"));
-        let surface = crate::views::production_source(include_str!("web_surface.rs"));
-
-        for forbidden in ["WebPreviewWindow", "ShowWebPreview", "companion window"] {
-            assert!(!i18n.contains(forbidden));
-            assert!(!document.contains(forbidden));
-            assert!(!surface.contains(forbidden));
-        }
     }
 }

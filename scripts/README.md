@@ -19,7 +19,7 @@ uv run --project scripts scripts/mt.py check full
 ```
 
 - `fast`: whitespace validation and every explicit non-desktop tooling test.
-- `doc`: `fast`, Rust formatting and locked `mt-doc` tests in the optimized `ci`
+- `doc`: `fast`, Rust formatting and locked `mt-core` tests in the optimized `ci`
   profile; it does not compile the desktop app.
 - `ci`: `fast`, Rust formatting, locked Clippy and workspace tests in the
   optimized `ci` profile (no LTO, 16 codegen units).
@@ -158,7 +158,7 @@ $ownerDir = ".scratch\goal-07\owner-input"
 $nativeEvidence = ".scratch\goal-07\goal-07-native-acceptance-v1.json"
 $evidence = ".scratch\goal-07\revision-evaluation.json"
 
-cargo build --release --locked -p mt-app --bin markturbo-goal07-evaluate
+cargo build --release --locked -p mt-core --bin markturbo-goal07-evaluate
 $runnerSha = (Get-FileHash $runner -Algorithm SHA256).Hash.ToLowerInvariant()
 $captureArgs = Get-ChildItem $captureDir -Filter *.json | Sort-Object Name | ForEach-Object {
   "--input"; $_.FullName

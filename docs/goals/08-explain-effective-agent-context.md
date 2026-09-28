@@ -141,7 +141,7 @@ still gates full goal acceptance and public-quality delivery.
 - Unsupported harnesses are labeled inventory-only rather than appearing to have
   verified context support, and every supported result displays the harness
   profile/version and configuration assumptions under which it was resolved.
-- `mt-doc` or another headless domain boundary remains GPUI-free.
+- `mt-core` or another headless domain boundary remains GPUI-free.
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`, focused
   context tests, and `cargo test --release --workspace` pass; the pass count is
   recorded.

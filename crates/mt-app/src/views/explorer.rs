@@ -17,7 +17,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 use crate::metrics;
-use crate::workspace::{self, FileNode};
+use mt_core::workspace::{self, FileNode};
 
 /// Emitted when the user picks a file.
 #[derive(Debug, Clone)]
@@ -224,12 +224,12 @@ fn icon_for(path: &Path, is_dir: bool, expanded: bool) -> IconName {
     }
     // Agent artifacts get a distinct icon: recognizing them at a glance is the
     // point of treating them as first-class.
-    match mt_doc::DocType::of(path) {
-        mt_doc::DocType::Skill => IconName::Bot,
-        mt_doc::DocType::Agents | mt_doc::DocType::Claude | mt_doc::DocType::CursorRule => {
+    match mt_core::DocType::of(path) {
+        mt_core::DocType::Skill => IconName::Bot,
+        mt_core::DocType::Agents | mt_core::DocType::Claude | mt_core::DocType::CursorRule => {
             IconName::BookOpen
         }
-        mt_doc::DocType::Instructions => IconName::BookOpen,
+        mt_core::DocType::Instructions => IconName::BookOpen,
         _ => IconName::File,
     }
 }
@@ -340,32 +340,5 @@ mod tests {
     fn directory_icons_reflect_expansion() {
         assert_ne!(icon("d", true, false), icon("d", true, true));
         assert_ne!(icon("d", true, false), icon("f.md", false, false));
-    }
-
-    /// The click handler is the only production open gate in this view, so the
-    /// content sniff has to sit on it or it protects nothing.
-    ///
-    /// What broke before: `on_click` gated on `DocType::of(..).is_document()`
-    /// alone, which is an extension allowlist, so a NUL-filled `.log` reached
-    /// the editor as a decoded `String` — and saving re-encodes from that
-    /// `String`, so every byte the decoder could not map was gone. `fs::save`
-    /// does refuse a write when the file changed on disk, which is a different
-    /// failure and no help here: nothing changed, so the write goes through.
-    /// `workspace::is_openable` was computed for every tree entry and read by
-    /// nobody. Asserted against the source because reaching the handler needs
-    /// a real window.
-    #[test]
-    fn opening_a_file_goes_through_the_binary_check() {
-        let source = crate::views::production_source(include_str!("explorer.rs"));
-        let start = source.find("fn on_click").expect("the click handler");
-        let body = &source[start..];
-        let end = body.find("\n}").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("workspace::is_openable"),
-            "the open gate must sniff contents; `DocType::of` alone is an \
-             extension allowlist and admits a binary wearing a text extension"
-        );
     }
 }

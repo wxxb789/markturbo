@@ -5,10 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
-use mt_app::renderer::RendererRegistry;
 use mt_app::web::{self, Trust};
-use mt_app::{fs, workspace};
-use mt_doc::{DocType, Document, Severity};
+use mt_core::document::io as fs;
+use mt_core::rendering::RendererRegistry;
+use mt_core::workspace;
+use mt_core::{DocType, Document, Severity};
 
 fn sample() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -120,7 +121,7 @@ fn the_unregistered_technology_is_reported_as_such() {
 
 #[test]
 fn the_sample_skills_show_both_a_valid_and_an_invalid_case() {
-    let skills = mt_doc::skill::discover(&sample());
+    let skills = mt_core::agent_artifacts::skill::discover(&sample());
     let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"hello-diagrams"), "got {names:?}");
 
@@ -167,12 +168,12 @@ fn the_sample_skills_show_both_a_valid_and_an_invalid_case() {
 
 #[test]
 fn translation_preserves_what_the_readme_promises() {
-    use mt_doc::translate::Scope;
+    use mt_core::translate::Scope;
 
     let doc = open("README.md");
     let service = MarkingTranslator;
-    let service: &dyn mt_doc::translate::TranslationService = &service;
-    let out = mt_doc::translate::translate(&doc, &Scope::Document, "zh", service).unwrap();
+    let service: &dyn mt_core::translate::TranslationService = &service;
+    let out = mt_core::translate::translate(&doc, &Scope::Document, "zh", service).unwrap();
 
     // The README names exactly these as untouched. Verify each.
     assert!(
@@ -282,7 +283,7 @@ fn the_sample_uses_lf_endings_so_it_looks_the_same_everywhere() {
 /// in the product is a translation command that appears to work and does not.
 struct MarkingTranslator;
 
-impl mt_doc::translate::TranslationService for MarkingTranslator {
+impl mt_core::translate::TranslationService for MarkingTranslator {
     fn translate(&self, texts: &[String], target_lang: &str) -> anyhow::Result<Vec<String>> {
         Ok(texts
             .iter()

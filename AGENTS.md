@@ -7,6 +7,9 @@
   a term is unclear or changes; update it only when vocabulary changes.
 - Tooling/CI/dependencies: start with the affected script, manifest and tests.
   Do not load the entire product roadmap, corpus or historical reports.
+- Rust module/crate moves: use `.agents/skills/rust-quality/SKILL.md` to trace
+  ownership, affected callers and failure contracts before editing. Its pinned
+  upstream guidance does not override product behavior or measured evidence.
 - UI: use the relevant checked-in GPUI Skill guidance, but verify APIs in the
   source selected by Cargo.lock. Live upstream docs may describe a different
   version. Project product/architecture decisions govern over generic library
@@ -41,7 +44,7 @@ Use `uv run --locked --project scripts scripts/mt.py check <tier>`:
 | Tier | Use |
 | --- | --- |
 | `fast` | Docs/tooling: whitespace and non-desktop Python tests |
-| `doc` | Headless document changes: fast, formatting and optimized mt-doc tests |
+| `doc` | Headless core changes: fast, formatting and optimized mt-core tests |
 | `ci` | Settled Rust changes: fast, formatting, optimized Clippy/workspace tests |
 | `full` | Release artifacts: production-profile checks, build and privacy scan |
 
@@ -67,7 +70,7 @@ Performance claims require production-profile measurements; consult existing
 
 ## Invariants and delivery
 
-- `mt-doc` stays GPUI-free. Keep `panic = "unwind"` and the vendored RaTeX
+- `mt-core` stays GPUI-free. Keep `panic = "unwind"` and the vendored RaTeX
   allocation clamp. Content failures become diagnostics; preserve editable text.
 - Never mutate a WebView from render; mark `web_dirty` and defer the update.
 - Preserve consent, credential confidentiality and content-free native evidence.

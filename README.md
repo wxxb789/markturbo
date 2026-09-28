@@ -81,8 +81,8 @@ cargo release version alpha --workspace --execute --no-confirm
 Or build and run directly:
 
 ```sh
-cargo run --release -- sample    # opens the sample workspace
-cargo run --release -- /my/repo  # or any directory
+cargo run --release -p mt-app --bin markturbo -- sample    # opens the sample workspace
+cargo run --release -p mt-app --bin markturbo -- /my/repo  # or any directory
 ```
 
 The first build is long: GPUI is compiled from source. See
@@ -93,22 +93,22 @@ The first build is long: GPUI is compiled from source. See
 See [docs/architecture.md](docs/architecture.md). The short version:
 
 ```text
-Filesystem
-    │
-    ▼
-mt-doc  ── document engine, no GPUI dependency
-    │      source · blocks · outline · frontmatter · diagnostics · doc type
-    │
-    ├── mt-app::fs         load/save with conflict protection
-    ├── mt-app::renderer   block renderer registry (Mermaid, D2, PlantUML, math)
-    ├── mt-app::web        WebView compatibility path
-    └── mt-app::views      GPUI views
-            explorer · harness · search · document · settings_page
-            workspace + tabs / history / web_surface
+mt-core (headless, no GPUI)
+    document    source, blocks, outline, lossless file I/O and close rules
+    workspace   tree, search, watcher, tabs and history state
+    agent_artifacts   Skill/instruction discovery and frozen Review package
+    review + translate + model   validation, consent and optional transport
+    rendering   Mermaid, D2, PlantUML and embedded-font math
+    settings + credentials + recovery + runtime_paths
+         ▲
+         │
+mt-app (GPUI desktop shell)
+    views + web + theme + i18n + assets + startup
+    GPUI settings/credential globals, Welcome sample adapter and WebView
 ```
 
-`mt-doc` has no GPUI dependency, so the same model can later drive CLI tooling,
-MCP tools, or headless rendering without touching the UI.
+`mt-app` depends on `mt-core`, not vice versa. Core's provider transport is
+optional; the desktop enables it. Headless CLI tools use core without GPUI.
 
 ## Renderers
 
@@ -130,8 +130,8 @@ and add the fence language to `DiagramKind::from_lang`. No parser or view change
 
 ## Translation
 
-`TranslationService` is a trait in `mt-doc`; the client lives in `mt-app` and is
-built on [`genai`](https://crates.io/crates/genai). The document engine decides
+`TranslationService` and the optional provider client live in `mt-core`; the
+client uses [`genai`](https://crates.io/crates/genai). The document engine decides
 *what* is translatable — prose only, never code, URLs, link targets, frontmatter
 keys, diagram source, math, or block markup — and the provider only ever sees
 prose fragments.

@@ -2,7 +2,7 @@
 
 The fixtures are committed, so a fresh clone can run `cargo test` without
 running this first. Regenerate only when you want to change their shape — and
-note that the performance thresholds in crates/mt-doc/tests/performance.rs were
+note that the performance thresholds in crates/mt-core/tests/performance.rs were
 calibrated against the current output, so changing the generator means
 re-checking those numbers.
 
@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     write(OUT / "large-10k.md", make(10_000))
     write(OUT / "huge-100k.md", make(100_000))
     write(OUT / "diagram-heavy.md", make_diagram_heavy())
-    print("\nRe-check the thresholds in crates/mt-doc/tests/performance.rs.")
+    print("\nRe-check the thresholds in crates/mt-core/tests/performance.rs.")
     return 0
 
 

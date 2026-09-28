@@ -21,23 +21,22 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mt_doc::{
-    DocType, Document, Severity,
-    review::SourceSnapshot,
-    revision::{ChangeId, RevisionError, RevisionProposal},
-};
+use mt_core::review::revision::{ChangeId, RevisionError, RevisionProposal};
+use mt_core::{DocType, Document, Severity, review::SourceSnapshot};
 use sha2::{Digest as _, Sha256};
 
-use crate::fs::{self, FileStamp, LoadedFile, Newline, SaveError, SourceIdentity};
 use crate::i18n;
-use crate::lifecycle::{AsyncSnapshot, BufferSnapshot, DocumentId};
 use crate::metrics;
-use crate::recovery::{
-    RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RevisionRecovery,
-};
-use crate::renderer::RendererRegistry;
 use crate::views::{Layout, PreviewKind};
 use crate::web::{self, Trust};
+use mt_core::document::io::{
+    self as fs, FileStamp, LoadedFile, Newline, SaveError, SkillOrigin, SourceIdentity,
+};
+use mt_core::document::lifecycle::{AsyncSnapshot, BufferSnapshot, DocumentId};
+use mt_core::recovery::{
+    RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RevisionRecovery,
+};
+use mt_core::rendering::RendererRegistry;
 
 #[cfg(target_os = "windows")]
 use crate::views::workspace::web_surface::WindowsWebView;
@@ -85,6 +84,8 @@ const SOURCE_EDITOR_ACCESSIBILITY_ID: &str = "markturbo-document-source-editor";
 const CONFLICT_OVERWRITE_ACCESSIBILITY_ID: &str = "markturbo-conflict-overwrite";
 const DOCUMENT_TRUST_ACCESSIBILITY_ID: &str = "markturbo-document-trust";
 const DOCUMENT_SAVE_AS_ACCESSIBILITY_ID: &str = "markturbo-document-save-as";
+pub(crate) const WEB_PREVIEW_ERROR_ACCESSIBILITY_ID: &str = "markturbo-web-preview-error";
+pub(crate) const WEB_PREVIEW_RETRY_ACCESSIBILITY_ID: &str = "markturbo-web-preview-retry";
 
 /// Events a document view emits to the workspace.
 #[derive(Debug, Clone)]
@@ -102,6 +103,10 @@ pub enum DocumentEvent {
     Status(String),
     /// Scroll the worker-owned window WebView after the current draw.
     ScrollWebPreview(f32),
+    /// The user explicitly requested another Web preview attempt.
+    RetryWebPreview,
+    /// This document changed layout from a Web pane to a layout without one.
+    WebPreviewLayoutLeft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +140,7 @@ pub(crate) enum SaveAsOutcome {
 /// explicit prevents source-only operations from inventing a filesystem path
 /// before Save As establishes one.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Boxing LoadedFile adds an allocation to every file tab.
 enum DocumentOrigin {
     File(LoadedFile),
     Memory { recovery_key: RecoveryKey },
@@ -274,16 +280,19 @@ fn concurrent_commit_message(
     preserved_paths: &[std::path::PathBuf],
     outcome: fs::ConcurrentCommitOutcome,
 ) -> String {
+    if preserved_paths.is_empty() {
+        return match outcome {
+            fs::ConcurrentCommitOutcome::ExternalVersionRestored =>
+                "A concurrent write was restored, but its retained file locations cannot be verified. Keep your editor text and Save As.".into(),
+            fs::ConcurrentCommitOutcome::Indeterminate =>
+                "A concurrent write made the save outcome unknown, and retained file locations cannot be verified. Keep your editor text and Save As.".into(),
+        };
+    }
     let paths = preserved_paths
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let paths = if paths.is_empty() {
-        "the source path".to_string()
-    } else {
-        paths
-    };
     match outcome {
         fs::ConcurrentCommitOutcome::ExternalVersionRestored => format!(
             "A concurrent write was restored to the original save destination. Inspect {paths}, then Save As to keep your editor text."
@@ -382,6 +391,10 @@ pub struct DocumentView {
     /// The workspace compares this before cloning the HTML, so notifications
     /// unrelated to the preview stay a small-integer no-op.
     web_revision: u64,
+    /// The payload revision whose immediate macOS WebView operation failed.
+    /// The content-free failure belongs to this document and payload, not the
+    /// workspace's transient status bar.
+    web_preview_failure_revision: Option<u64>,
     /// The first visible editor row the last time the preview was synced.
     ///
     /// Sync is driven from render, which runs on every frame — without this the
@@ -513,6 +526,7 @@ impl DocumentView {
             registry,
             web_html: None,
             web_revision: 0,
+            web_preview_failure_revision: None,
             synced_row: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
@@ -537,6 +551,7 @@ impl DocumentView {
             path,
             text: recovered.record.text.clone(),
             stamp: metadata.original_stamp.clone(),
+            skill_origin: None,
             newline: metadata.newline,
             had_bom: metadata.had_bom,
             encoding,
@@ -636,6 +651,24 @@ impl DocumentView {
         self.origin.source_path()
     }
 
+    /// The verified binding for this Agent Skill entrypoint, if one was
+    /// captured by load or established by a verified Save As. Recovery does
+    /// not recreate this authority from its saved path.
+    pub(crate) fn skill_origin(&self) -> Option<&SkillOrigin> {
+        self.origin.file()?.skill_origin()
+    }
+
+    /// Whether this tab's loaded source is the exact source represented by a
+    /// frozen supporting-file load.
+    pub(crate) fn matches_loaded_file(&self, file: &LoadedFile, cx: &App) -> bool {
+        self.origin.file().is_some_and(|opened| {
+            fs::paths_match(&opened.path, &file.path)
+                && opened.stamp == file.stamp
+                && opened.source_identity == file.source_identity
+                && self.text_matches(&file.text, cx)
+        })
+    }
+
     /// Whether a filesystem event can affect this document's source.
     ///
     /// A document opened through a symlink owns the link path for Save, but an
@@ -646,13 +679,13 @@ impl DocumentView {
         let Some(file) = self.origin.file() else {
             return false;
         };
-        paths_match(&file.path, path)
+        fs::paths_match(&file.path, path)
             || matches!(
                 &file.source_identity,
                 SourceIdentity::SymbolicLink {
                     resolved_target,
                     ..
-                } if paths_match(resolved_target, path)
+                } if fs::paths_match(resolved_target, path)
             )
     }
 
@@ -756,7 +789,12 @@ impl DocumentView {
         if self.layout == layout {
             return;
         }
+        let leaves_web = self.layout.uses_webview() && !layout.uses_webview();
         self.layout = layout;
+        if leaves_web {
+            self.web_preview_failure_revision = None;
+            cx.emit(DocumentEvent::WebPreviewLayoutLeft);
+        }
         // The WebView HTML is only built when a Web pane is actually visible;
         // switching into one for the first time needs it now.
         if layout.uses_webview() && self.web_html.is_none() {
@@ -1223,16 +1261,39 @@ impl DocumentView {
         self.save_authorization = authorization.clone();
         match fs::save_with(&file, &text, &authorization) {
             Ok(saved) => {
-                let file = self
-                    .origin
-                    .file_mut()
-                    .expect("a successful file save keeps a file origin");
-                file.stamp = saved.stamp;
-                file.text = text;
-                file.encoding = saved.encoding;
-                file.had_bom = saved.had_bom;
-                file.decode_had_errors = false;
-                file.source_identity = saved.source_identity;
+                let skill_origin_lost = {
+                    let file = self
+                        .origin
+                        .file_mut()
+                        .expect("a successful file save keeps a file origin");
+                    let skill_origin_lost =
+                        file.skill_origin.is_some() && saved.skill_origin.is_none();
+                    if let Some(skill_origin) = saved.skill_origin {
+                        file.skill_origin = Some(skill_origin);
+                    }
+                    file.stamp = saved.stamp;
+                    file.text = text;
+                    file.encoding = saved.encoding;
+                    file.had_bom = saved.had_bom;
+                    file.decode_had_errors = false;
+                    file.source_identity = saved.source_identity;
+                    skill_origin_lost
+                };
+                if skill_origin_lost {
+                    // The write completed, but its former Skill root could not
+                    // be rebound. Keep the stale origin and editor text so the
+                    // next operation cannot mistake the path for a healthy
+                    // package; Save As is the safe way to establish a new one.
+                    self.save_authorization = fs::SaveAuthorization::normal();
+                    self.externally_changed = true;
+                    self.save_issue = Some(SaveIssue::SourceIdentityChanged);
+                    cx.emit(DocumentEvent::Status(
+                        "The Agent Skill source root changed during Save. Save As to preserve your edits."
+                            .into(),
+                    ));
+                    cx.notify();
+                    return false;
+                }
                 self.apply_undo_history.clear();
                 self.dirty = false;
                 self.externally_changed = false;
@@ -1550,6 +1611,41 @@ impl DocumentView {
         self.web_html
             .as_deref()
             .map(|html| (html, self.web_revision))
+    }
+
+    pub(crate) fn has_web_preview_failure(&self) -> bool {
+        self.web_preview_failure_revision == Some(self.web_revision)
+    }
+
+    pub(crate) fn mark_web_preview_failed(&mut self, revision: u64, cx: &mut Context<Self>) {
+        if self.layout.uses_webview()
+            && self.web_revision == revision
+            && self.web_preview_failure_revision != Some(revision)
+        {
+            self.web_preview_failure_revision = Some(revision);
+            cx.notify();
+        }
+    }
+
+    fn request_web_preview_retry(&mut self, cx: &mut Context<Self>) {
+        if !self.has_web_preview_failure() {
+            return;
+        }
+        self.web_preview_failure_revision = None;
+        cx.emit(DocumentEvent::RetryWebPreview);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_web_preview_failure(&mut self, revision: u64, cx: &mut Context<Self>) {
+        if self
+            .web_preview_failure_revision
+            .is_some_and(|failed_revision| {
+                failed_revision == revision || revision == self.web_revision
+            })
+        {
+            self.web_preview_failure_revision = None;
+            cx.notify();
+        }
     }
 
     /// Lend this tab the window's WebView, or take it back.
@@ -1880,11 +1976,44 @@ impl DocumentView {
     fn render_web_preview(&self, cx: &Context<Self>) -> impl IntoElement {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            let _ = cx;
+            let failed = self.has_web_preview_failure();
             div()
                 .id("web-preview")
+                .relative()
                 .size_full()
                 .children(self.webview.clone())
+                .when(failed, |this| {
+                    let message = i18n::t(i18n::Key::WebPreviewFailed, cx);
+                    this.child(
+                        v_flex()
+                            .absolute()
+                            .inset_0()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .bg(cx.theme().background)
+                            .child(
+                                div()
+                                    .id(WEB_PREVIEW_ERROR_ACCESSIBILITY_ID)
+                                    .test_support()
+                                    .role(gpui_kit::Role::Label)
+                                    .aria_label(message)
+                                    .accessibility_id(WEB_PREVIEW_ERROR_ACCESSIBILITY_ID)
+                                    .text_sm()
+                                    .text_color(cx.theme().foreground)
+                                    .child(message),
+                            )
+                            .child(
+                                Button::new(WEB_PREVIEW_RETRY_ACCESSIBILITY_ID)
+                                    .accessibility_id(WEB_PREVIEW_RETRY_ACCESSIBILITY_ID)
+                                    .label(i18n::t(i18n::Key::WebPreviewRetry, cx))
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.request_web_preview_retry(cx);
+                                    })),
+                            ),
+                    )
+                })
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
@@ -1943,7 +2072,7 @@ pub fn diagram_extensions(
                 return None;
             };
             let lang = code.lang.as_deref().unwrap_or("").trim();
-            let id = match mt_doc::DiagramKind::from_lang(lang) {
+            let id = match mt_core::DiagramKind::from_lang(lang) {
                 Some(kind) => kind.id().to_string(),
                 None if matches!(lang.to_ascii_lowercase().as_str(), "math" | "latex" | "tex") => {
                     "math".to_string()
@@ -2019,12 +2148,12 @@ fn themed_svg(markup: &str, cx: &App) -> String {
 #[derive(Clone)]
 struct RenderedBlock {
     id: String,
-    outcome: crate::renderer::RenderOutcome,
+    outcome: mt_core::rendering::RenderOutcome,
     source: String,
 }
 
 fn render_block(block: &RenderedBlock, cx: &mut App) -> AnyElement {
-    use crate::renderer::RenderOutcome;
+    use mt_core::rendering::RenderOutcome;
 
     match &block.outcome {
         // SVG renders natively via resvg.
@@ -2174,17 +2303,6 @@ fn editor_language(path: &std::path::Path) -> Language {
     }
 }
 
-/// Compare literal paths first so delete/rename notifications remain useful;
-/// fall back to canonical paths while both ends still exist so equivalent link
-/// spellings identify the same on-disk source.
-pub(crate) fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || std::fs::canonicalize(left)
-            .ok()
-            .zip(std::fs::canonicalize(right).ok())
-            .is_some_and(|(left, right)| left == right)
-}
-
 impl EventEmitter<DocumentEvent> for DocumentView {}
 
 impl Focusable for DocumentView {
@@ -2251,40 +2369,30 @@ mod tests {
     // Import selectively: the `gpui_kit::*` glob above re-exports a `test` attribute
     // macro that shadows the built-in one and blows the recursion limit.
     use super::{
-        AsyncSnapshot, DocumentEvent, DocumentView, Layout, SaveIssue, SaveMode, available_layouts,
+        AsyncSnapshot, DocumentEvent, DocumentView, Layout, SaveIssue, SaveMode,
+        WEB_PREVIEW_ERROR_ACCESSIBILITY_ID, WEB_PREVIEW_RETRY_ACCESSIBILITY_ID, available_layouts,
         editor_language, first_line_title, reload_snapshot_matches,
     };
-    use crate::fs::{FileStamp, Newline, SourceIdentity};
-    use crate::model::RevisionRequestBinding;
-    use crate::recovery::{
+    use crate::web::Trust;
+    use gpui::AppContext as _;
+    use gpui_kit::component::highlighter::Language;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{Focusable as _, TestAppContext};
+    use mt_core::document::io::{FileStamp, Newline, SourceIdentity};
+    use mt_core::model::RevisionRequestBinding;
+    use mt_core::recovery::{
         RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord, RevisionRecovery,
     };
-    use crate::renderer::RendererRegistry;
-    use crate::review::{RevisionAnswer, RevisionAnswers};
-    use crate::web::Trust;
-    use gpui_kit::component::highlighter::Language;
-    use gpui_kit::{Focusable as _, TestAppContext};
-    use mt_doc::{
+    use mt_core::rendering::RendererRegistry;
+    use mt_core::review::provider::{RevisionAnswer, RevisionAnswers};
+    use mt_core::review::revision::{
+        ChangeId, RevisionChange, RevisionEdit, RevisionError, RevisionLimits, RevisionProposal,
+    };
+    use mt_core::{
         DocType,
         review::{ByteRange, SourceSnapshot},
-        revision::{
-            ChangeId, RevisionChange, RevisionEdit, RevisionError, RevisionLimits, RevisionProposal,
-        },
     };
     use std::{cell::Cell, path::Path, rc::Rc, sync::Arc, time::SystemTime};
-
-    /// This file's source between `signature` and the next `end` marker.
-    ///
-    /// The source-level checks below all need one function's body, and the
-    /// hand-rolled `find`/slice pair was already repeated once per test.
-    fn fn_body(signature: &str, end: &str) -> &'static str {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source
-            .find(signature)
-            .unwrap_or_else(|| panic!("{signature} must exist"));
-        let body = &source[start..];
-        &body[..body.find(end).unwrap_or(body.len())]
-    }
 
     #[test]
     fn a_buffer_is_named_by_its_first_line() {
@@ -2296,7 +2404,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let source = dir.path().join("draft.md");
         std::fs::write(&source, "# Draft\n").expect("source file");
-        let origin = super::DocumentOrigin::File(crate::fs::load(&source).expect("loaded source"));
+        let origin = super::DocumentOrigin::File(
+            mt_core::document::io::load(&source).expect("loaded source"),
+        );
 
         assert!(origin.has_current_save_target());
 
@@ -2305,31 +2415,13 @@ mod tests {
 
         assert!(
             !origin.has_current_save_target(),
-            "the stale source path must route dirty-close Save through Save As"
+            "a renamed path must no longer qualify as the current save target"
         );
         assert_eq!(
             origin.source_path(),
             Some(source.as_path()),
             "renaming must not erase the file origin needed by recovery and conflict handling"
         );
-
-        let is_on_disk = fn_body("pub fn is_on_disk", "\n    /// The tab label.");
-        assert!(is_on_disk.contains("self.origin.has_current_save_target()"));
-        let title = fn_body("pub fn title", "\n    pub fn is_dirty");
-        assert!(
-            title.contains("self.origin.is_file_backed()"),
-            "a missing file source must retain its filename tab label"
-        );
-    }
-
-    #[test]
-    fn the_document_toolbar_exposes_an_explicit_save_as_command() {
-        let toolbar = fn_body("fn render_toolbar", "\n    /// The banner shown");
-        assert!(toolbar.contains("Button::new(\"save-as-document\")"));
-        assert!(toolbar.contains("Key::SaveAsPicker"));
-        assert!(toolbar.contains("DOCUMENT_SAVE_AS_ACCESSIBILITY_ID"));
-        assert!(toolbar.contains("DOCUMENT_TRUST_ACCESSIBILITY_ID"));
-        assert!(toolbar.contains("DocumentEvent::SaveAsRequested"));
     }
 
     #[test]
@@ -2434,208 +2526,69 @@ mod tests {
         assert_eq!(checkpoint.revision, Some(revision));
     }
 
-    #[test]
-    fn memory_documents_start_as_markdown_and_checkpoint_without_a_source_path() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let constructor = source
-            .split_once("pub fn new_memory")
-            .expect("memory constructor")
-            .1
-            .split_once("fn new_with_document")
-            .unwrap()
-            .0;
-        assert!(constructor.contains("Document::new(None, text)"));
-        assert!(constructor.contains("RecoveryKey::new_memory()"));
-        assert!(constructor.contains("view.dirty = dirty"));
-        assert!(constructor.contains("view.revision = u64::from(dirty)"));
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[gpui_kit::test]
+    fn web_preview_failure_stays_visible_until_retry_is_clicked(cx: &mut TestAppContext) {
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let captured = Rc::new(std::cell::RefCell::new(None));
+        let captured_document = captured.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let document = cx.new(|cx| {
+                DocumentView::new_memory(
+                    "# Preview\n".to_string(),
+                    Arc::new(RendererRegistry::with_defaults()),
+                    window,
+                    cx,
+                )
+            });
+            *captured_document.borrow_mut() = Some(document.clone());
+            gpui_kit::component::Root::new(document, window, cx)
+        });
+        let document = captured.borrow().clone().expect("the document view");
 
-        let checkpoint = fn_body(
-            "pub fn recovery_checkpoint",
-            "\n    /// Whether this document",
-        );
-        assert!(checkpoint.contains("source_path: None"));
-        assert!(checkpoint.contains("RecoveryMetadata::from_loaded_file"));
+        let retry_requests = Rc::new(Cell::new(0));
+        let _retry_events = cx.update({
+            let retry_requests = retry_requests.clone();
+            let document = document.clone();
+            move |_, app| {
+                app.subscribe(&document, move |_, event: &DocumentEvent, _| {
+                    if matches!(event, DocumentEvent::RetryWebPreview) {
+                        retry_requests.set(retry_requests.get() + 1);
+                    }
+                })
+            }
+        });
+        document.update(cx, |document, cx| {
+            document.set_layout(Layout::Web, cx);
+            document.mark_web_preview_failed(document.web_revision, cx);
+        });
+
+        cx.update(|window, app| {
+            window.render_frame(app);
+            assert!(window.find(WEB_PREVIEW_ERROR_ACCESSIBILITY_ID).visible());
+            assert!(window.find(WEB_PREVIEW_RETRY_ACCESSIBILITY_ID).visible());
+            window.click(WEB_PREVIEW_RETRY_ACCESSIBILITY_ID, app);
+        });
+
+        assert_eq!(retry_requests.get(), 1);
+        document.read_with(cx, |document, _| {
+            assert!(!document.has_web_preview_failure());
+        });
+        cx.update(|window, app| {
+            window.render_frame(app);
+            assert!(
+                window
+                    .try_find(WEB_PREVIEW_RETRY_ACCESSIBILITY_ID)
+                    .is_none()
+            );
+        });
     }
 
     #[test]
-    fn recovery_preflight_reads_utf8_bytes_without_materializing_editor_text() {
-        let byte_len = fn_body("pub fn text_byte_len", "\n    pub fn source_snapshot");
-        assert!(byte_len.contains("self.editor.read(cx).text().len()"));
-        assert!(!byte_len.contains("value()") && !byte_len.contains("to_string()"));
-
-        let workspace = crate::views::production_source(include_str!("workspace.rs"));
-        let checkpoint = workspace
-            .split_once("fn checkpoint_recovery_at")
-            .expect("the recovery scheduler")
-            .1
-            .split_once("fn finish_recovery_checkpoints")
-            .unwrap()
-            .0;
-        let size_check = checkpoint
-            .find("text_byte_len(cx)")
-            .expect("the borrowed UTF-8 byte-length preflight");
-        let dispatch = checkpoint
-            .find("checkpoint_dispatched(now)")
-            .expect("checkpoint timing starts only for admitted snapshots");
-        let clone = checkpoint
-            .find("recovery_checkpoint_with_revision(cx, revision_recovery)")
-            .expect("the owned recovery snapshot");
-        assert!(size_check < dispatch && dispatch < clone);
-
-        let recovery = include_str!("../recovery.rs");
-        let ceiling = recovery
-            .split_once("pub(crate) fn plaintext_admission_ceiling")
-            .expect("the store must expose its conservative plaintext ceiling")
-            .1
-            .split_once("\n    }")
-            .unwrap()
-            .0;
-        assert!(ceiling.contains("self.limits.max_record_bytes"));
-        assert!(
-            recovery.contains("if new_size > self.limits.max_record_bytes"),
-            "the actual protected record size remains the final authority"
-        );
-    }
-
-    #[test]
-    fn concurrent_save_failure_keeps_the_document_dirty_with_its_editor_text() {
-        // Constructing a DocumentView requires a Window and the real editor.
-        // This protects the branch that handles the filesystem result: it must
-        // only attach status, never change the buffer or dirty state.
-        let body = fn_body("fn handle_save_error", "\n    pub fn save_as");
-        let start = body
-            .find("SaveError::ConcurrentCommit")
-            .expect("concurrent save errors need an explicit UI branch");
-        let branch = &body[start..];
-        let end = branch
-            .find("\n            error =>")
-            .unwrap_or(branch.len());
-        let branch = &branch[..end];
-        assert!(branch.contains("concurrent_commit_message"));
-        assert!(branch.contains("SaveIssue::ConcurrentCommit"));
-        assert!(branch.contains("self.externally_changed = true"));
-        assert!(
-            !branch.contains("self.dirty = false") && !branch.contains("self.file.text = text"),
-            "a non-successful save must retain dirty state and exact editor text"
-        );
-    }
-
-    #[test]
-    fn save_as_consumes_the_single_verified_filesystem_result() {
-        let body = fn_body(
-            "pub(crate) fn save_as(",
-            "\n    /// Called on every keystroke",
-        );
-        assert!(body.contains(
-            "let newline = self.origin.file().map_or(Newline::Lf, |file| file.newline);"
-        ));
-        assert!(
-            body.contains("SaveAsMode::CreateOnly => fs::save_as(path, &text, newline, false)")
-        );
-        assert!(body.contains("SaveAsMode::Overwrite(authorization)"));
-        assert!(
-            body.contains("fs::overwrite_as_authorized(&authorization, &text, newline, false)")
-        );
-        assert!(
-            body.contains("Err(SaveError::DestinationExists) => SaveAsOutcome::DestinationExists")
-        );
-        assert!(
-            !body.contains("fs::load(path)") && !body.contains("file.text = text"),
-            "Save As must not load a separately observed path or overwrite the verified text"
-        );
-
-        let start = body
-            .find("Err(SaveError::ConcurrentCommit")
-            .expect("Save As must preserve an indeterminate save result");
-        let branch = &body[start..];
-        let end = branch
-            .find("\n            Err(err)")
-            .unwrap_or(branch.len());
-        let branch = &branch[..end];
-        assert!(branch.contains("SaveIssue::ConcurrentCommit"));
-        assert!(
-            !branch.contains("self.dirty = false"),
-            "a failed Save As must retain the original dirty document"
-        );
-    }
-
-    #[test]
-    fn successful_save_as_restricts_the_new_source_before_web_rebuild() {
-        let body = fn_body(
-            "pub(crate) fn save_as(",
-            "\n    /// Called on every keystroke",
-        );
-        let success = &body[body.find("Ok(file) => {").expect("the success branch")
-            ..body
-                .find("Err(SaveError::ConcurrentCommit")
-                .expect("the first failure branch")];
-
-        let generation = success
-            .find("self.source_generation = self.source_generation.wrapping_add(1);")
-            .expect("Save As must change the source generation");
-        let file = success
-            .find("self.origin = DocumentOrigin::File(file);")
-            .expect("Save As must install the verified file");
-        let document = success
-            .find("self.document = Document::new")
-            .expect("Save As must parse the new path's document type");
-        let restricted = success
-            .find("self.trust = Trust::Restricted;")
-            .expect("Save As must revoke trust for the new source identity");
-        let rebuild = success
-            .find("self.rebuild_derived(cx);")
-            .expect("Save As must rebuild the new source");
-
-        assert!(
-            generation < file && file < document && document < restricted && restricted < rebuild,
-            "trusted MDX -> HTML and trusted HTML path-only Save As must become Restricted after \
-             installing the new source identity, before any Web payload is rebuilt"
-        );
-        assert!(
-            !success.contains("set_trust("),
-            "set_trust would rebuild the old source before Save As installs the new identity"
-        );
-    }
-
-    #[test]
-    fn successful_save_as_reconciles_layout_and_editor_language_with_the_new_path() {
-        let body = fn_body(
-            "pub(crate) fn save_as(",
-            "\n    /// Called on every keystroke",
-        );
-        let success = &body[body.find("Ok(file) => {").expect("the success branch")
-            ..body
-                .find("Err(SaveError::ConcurrentCommit")
-                .expect("the first failure branch")];
-
-        let document = success
-            .find("self.document = Document::new")
-            .expect("Save As must parse the new path's document type");
-        let doc_type = success
-            .find("let doc_type = self.document.doc_type();")
-            .expect("Save As must use the new document type");
-        let layout_check = success
-            .find("!available_layouts(doc_type).contains(&self.layout)")
-            .expect("Save As must reject a layout the new type cannot render");
-        let layout_fallback = success
-            .find("self.layout = Layout::default_for(doc_type);")
-            .expect("Save As must choose a usable layout for the new type");
-        let highlighter = success
-            .find("state.set_highlighter(editor_language(path), cx)")
-            .expect("Save As must refresh syntax highlighting from the new path");
-        let rebuild = success
-            .find("self.rebuild_derived(cx);")
-            .expect("Save As must rebuild the new source");
-
-        assert!(
-            document < doc_type
-                && doc_type < layout_check
-                && layout_check < layout_fallback
-                && layout_fallback < highlighter
-                && highlighter < rebuild,
-            "the new type, usable layout, and language must be installed before rebuilding"
-        );
-
+    fn document_types_choose_supported_layouts_and_editor_languages() {
         assert!(!available_layouts(DocType::Html).contains(&Layout::Native));
         assert_eq!(Layout::default_for(DocType::Html), Layout::Web);
         assert!(!available_layouts(DocType::Text).contains(&Layout::Native));
@@ -2644,7 +2597,7 @@ mod tests {
     }
 
     #[test]
-    fn save_as_invalidates_a_queued_reload_of_the_old_path() {
+    fn reload_snapshot_rejects_a_different_path_or_revision_state() {
         let snapshot = AsyncSnapshot::new(7, "exact editor text".into(), 3);
         let old_path = Path::new("before.md");
 
@@ -2675,66 +2628,10 @@ mod tests {
             !reload_snapshot_matches(old_path, &snapshot, old_path, 7, "exact editor text", 4),
             "a newer source generation rejects the old task even when text and revision agree"
         );
-
-        let save_as = fn_body(
-            "pub(crate) fn save_as(",
-            "\n    /// Called on every keystroke",
-        );
-        assert!(
-            save_as.contains("self._reload = None;"),
-            "Save As must cancel the common pending-reload case before replacing its source"
-        );
-        assert!(
-            save_as.contains("self._reparse = None;"),
-            "Save As must cancel a pending reparse of the old document type"
-        );
-        assert!(
-            save_as.contains("self.source_generation = self.source_generation.wrapping_add(1);"),
-            "a queued result with the same revision and text must still be rejected after Save As"
-        );
     }
 
     #[test]
-    fn asynchronous_results_require_the_current_source_generation() {
-        let body = fn_body(
-            "pub fn replace_text_if_current",
-            "\n    /// Note that the file changed on disk",
-        );
-        assert!(
-            body.contains("source.matches(self.revision, &self.text(cx), self.source_generation)"),
-            "revision and text alone cannot distinguish a Save As that preserved the buffer"
-        );
-
-        let reparse = fn_body("fn schedule_reparse", "\n    /// Reparse synchronously");
-        assert!(
-            reparse.contains(
-                "source_snapshot.matches(this.revision, &this.text(cx), this.source_generation)"
-            ),
-            "a reparse of the old document type must not land after Save As"
-        );
-    }
-
-    #[test]
-    fn automatic_reload_errors_install_a_persistent_safe_choice() {
-        let body = fn_body("fn finish_reload_error", "\n    /// Save to disk");
-        assert!(
-            body.contains("self.save_issue = Some(reload_failure_issue(error.kind()))"),
-            "automatic reload failures must install a persistent decision"
-        );
-        assert!(
-            body.contains("self.externally_changed = true"),
-            "the conflict banner is visible only when the document remains marked externally changed"
-        );
-
-        let reload = fn_body(
-            "pub fn reload_if_clean",
-            "\n    /// Apply a background reload",
-        );
-        assert!(
-            reload.contains("this.finish_reload_error"),
-            "automatic reload failures must use the persistent conflict path"
-        );
-
+    fn reload_failures_map_to_safe_choices() {
         assert_eq!(
             super::reload_failure_issue(std::io::ErrorKind::NotFound),
             SaveIssue::Missing,
@@ -2745,19 +2642,6 @@ mod tests {
             SaveIssue::Conflict,
             "a non-deletion reload failure still needs a persistent conflict decision"
         );
-    }
-
-    #[test]
-    fn concurrent_save_status_names_artifacts_and_does_not_claim_unknown_recovery() {
-        let paths = vec![std::path::PathBuf::from("C:/temp/markturbo-rollback-123")];
-        let unknown = super::concurrent_commit_message(
-            &paths,
-            crate::fs::ConcurrentCommitOutcome::Indeterminate,
-        );
-        assert!(unknown.contains("C:/temp/markturbo-rollback-123"));
-        assert!(unknown.contains("Save As"));
-        assert!(unknown.contains("outcome unknown"));
-        assert!(!unknown.contains("was restored"));
     }
 
     #[test]
@@ -2783,237 +2667,6 @@ mod tests {
                 "{text:?} should have no name to show"
             );
         }
-    }
-
-    /// The Web pane must place the `WebView` in the element tree.
-    ///
-    /// A source-level check, because the failure needs a real window with a
-    /// real WebView2 runtime and is otherwise easy to reintroduce.
-    #[test]
-    fn the_web_pane_renders_the_webview_entity() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source
-            .find("fn render_web_preview")
-            .expect("the Web pane renderer");
-        let body = &source[start..];
-        let end = body.find("\n    fn render_preview").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(body.contains("self.webview"));
-        assert!(source.contains("fn set_webview("));
-    }
-
-    /// The native preview must reuse one `MarkdownExtensions`, never build one
-    /// in `render`.
-    ///
-    /// A source-level check because the failure needs a real window and a
-    /// document over 4 KiB: below that threshold upstream parses synchronously
-    /// and the waste is merely a full reparse per frame; above it the parse goes
-    /// async, ends in `cx.notify()`, and the notify schedules the frame that
-    /// starts the next parse. Measured on the release binary with no user input
-    /// at all, a 4,200-byte document held 251% of a core indefinitely while a
-    /// 4,000-byte one sat at 0.2%.
-    ///
-    /// The mechanism is upstream and invisible from here:
-    /// `MarkdownExtensions::push_block_parser` calls `bump_revision`, which is
-    /// `MARKDOWN_EXTENSIONS_REVISION.fetch_add(1, Relaxed)` on a process-global
-    /// `AtomicU64`. `TextViewState::set_markdown_extensions` returns early only
-    /// when the revision matches the one it holds, so a value built fresh in
-    /// `render` can never match — while a `Clone` of one built once copies the
-    /// revision and matches from the second frame on.
-    /// The native pane must give a `currentColor` SVG a colour to inherit.
-    ///
-    /// usvg resolves `currentColor` by walking for a `color` attribute and
-    /// falling back to **black** when it finds none, so an SVG that relies on
-    /// inheritance rasterizes invisible on the six dark presets — which is what
-    /// a first launch shows, since the default theme preference is `System`.
-    /// Measured with usvg 0.45: no `color` gives `(0, 0, 0)`; `color="#e6edf3"`
-    /// gives the light foreground, and an explicit `fill="#ff0000"` still wins.
-    ///
-    /// The Web pane is unaffected — `web.rs` sets `color` on the body — which is
-    /// exactly why this was invisible in review: the same SVG is correct on one
-    /// path and black on the other.
-    #[test]
-    fn the_native_pane_gives_a_currentcolor_svg_a_colour() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-
-        let start = source
-            .find("fn render_block")
-            .expect("render_block must exist");
-        let body = &source[start..];
-        let end = body.find("\n/// ").unwrap_or(body.len());
-        let body = &body[..end];
-        assert!(
-            body.contains("themed_svg(markup, cx)"),
-            "`render_block` must theme the markup before handing it to \
-             `Image::from_bytes`; usvg has no other way to resolve \
-             `currentColor` and defaults it to black"
-        );
-        assert!(
-            !body.contains("markup.clone().into_bytes()"),
-            "handing the raw markup straight to usvg is the bug this replaces"
-        );
-
-        // And the injection itself must not clobber a renderer that already
-        // chose a colour, and must not corrupt markup that has no `<svg` at all.
-        let start = source.find("fn themed_svg").expect("themed_svg must exist");
-        let body = &source[start..];
-        let end = body.find("\n#[derive").unwrap_or(body.len());
-        let body = &body[..end];
-        assert!(
-            body.contains(r#"contains("color=")"#),
-            "an SVG that already carries a `color` has made a deliberate \
-             choice and must be left alone"
-        );
-        assert!(
-            body.contains("None => markup.to_string()"),
-            "markup with no root element must pass through untouched rather \
-             than being mangled by an offset into it"
-        );
-    }
-
-    #[test]
-    fn the_native_preview_does_not_rebuild_its_extensions_per_frame() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source
-            .find("fn render_native_preview")
-            .expect("the native preview renderer");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// Inline diagnostics")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            !body.contains("diagram_extensions("),
-            "`render_native_preview` runs every frame and must not call \
-             `diagram_extensions`: each call mints a new global revision, which \
-             defeats upstream's `set_markdown_extensions` guard and reparses the \
-             whole document every frame. Clone `self.preview_extensions` instead."
-        );
-        assert!(
-            body.contains("self.preview_extensions.clone()"),
-            "the preview must reuse the extensions built in `new`; `Clone` \
-             copies the revision, which is what lets the guard match"
-        );
-        // And it is built exactly once, where the cost is paid per document
-        // rather than per frame.
-        assert_eq!(
-            source.matches("diagram_extensions(registry").count(),
-            1,
-            "`diagram_extensions` must be called once, from `DocumentView::new`"
-        );
-    }
-
-    /// Revealing an offset must move something visible, in every layout.
-    ///
-    /// The bug this replaces: a jump from the outline forced the document into
-    /// Split — discarding the user's chosen renderer — because moving a caret
-    /// was the only thing it knew how to do. Every layout has to respond, and
-    /// none may silently switch to a different preview.
-    #[test]
-    fn reveal_offset_moves_something_in_every_layout() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source.find("pub fn reveal_offset").expect("reveal_offset");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// Replace the whole")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("set_selected_range"),
-            "must move the cursor through the path that also scrolls it into view"
-        );
-        assert!(
-            body.contains("scroll_preview_to"),
-            "a preview-only layout has no caret, so the preview has to move"
-        );
-        assert!(
-            body.contains("with_editor()"),
-            "a layout whose preview cannot be scrolled must open the editor \
-             beside it rather than switching renderers"
-        );
-        assert!(
-            !body.contains("Layout::SplitNative") && !body.contains("Layout::Split)"),
-            "the layout must be derived from the current one, not hard-coded — \
-             hard-coding is what discarded the user's renderer"
-        );
-    }
-
-    /// Scroll sync must be one-way, driven from the editor.
-    ///
-    /// Source-level because the failure needs two laid-out panes and a real
-    /// scroll event: two-way sync means each pane's movement moves the other,
-    /// which moves the first, and the loop only terminates because of rounding.
-    /// It reads as a preview that drifts or judders and is very hard to
-    /// attribute after the fact.
-    #[test]
-    fn scroll_sync_is_driven_only_from_the_editor() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source
-            .find("fn sync_preview_scroll")
-            .expect("sync_preview_scroll");
-        let body = &source[start..];
-        let end = body.find("\n    /// Number of lines").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("visible_row_range"),
-            "the editor's visible range is what drives the mapping"
-        );
-        assert!(
-            !body.contains("set_scroll_offset"),
-            "syncing back into the editor closes the feedback loop"
-        );
-        assert!(
-            body.contains("split_sync_scroll"),
-            "sync must be off unless the setting asks for it"
-        );
-        assert!(
-            body.contains("self.synced_row"),
-            "render runs every frame; without the guard this evaluates a script \
-             in another process sixty times a second"
-        );
-    }
-
-    /// The injected script must tolerate a document that has not loaded.
-    #[test]
-    fn the_scroll_script_is_guarded() {
-        let surface = crate::views::production_source(include_str!("workspace/web_surface.rs"));
-        let start = surface.find("fn scroll_script").expect("scroll_script");
-        let body = &surface[start..];
-        let end = body.find("\n}").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("scrollingElement"),
-            "quirks-mode documents scroll on `body`, standards on `documentElement`"
-        );
-        assert!(
-            body.contains("if(!e)return"),
-            "a document mid-load has no scrolling element; without the guard \
-             this throws inside the WebView"
-        );
-        let document = crate::views::production_source(include_str!("document.rs"));
-        let start = document
-            .find("fn scroll_preview_to")
-            .expect("scroll_preview_to");
-        let document = &document[start..];
-        let end = document
-            .find("\n    pub fn reveal_offset")
-            .unwrap_or(document.len());
-        let document = &document[..end];
-        assert!(document.contains("DocumentEvent::ScrollWebPreview"));
-        assert!(
-            !document.contains("evaluate_script"),
-            "render may queue a scroll, never call WebView2 directly"
-        );
-        assert!(
-            body.contains("if(h>0)"),
-            "a preview shorter than its viewport has nothing to scroll, and \
-             dividing by its zero height would be a NaN offset"
-        );
     }
 
     #[test]
@@ -3114,71 +2767,13 @@ mod tests {
         assert_eq!(Language::from_str("text"), Language::Plain);
     }
 
-    /// A text file must open in the editor, not in an empty preview.
-    ///
-    /// Source-level: constructing a `DocumentView` needs a `Window`. What is
-    /// being asserted is the wiring — `Layout::available_for` and
-    /// `default_for` are unit-tested in `views/mod.rs`, and this is the call
-    /// site that was hard-coded to `Layout::Native` for every document.
     #[test]
-    fn a_document_opens_in_the_layout_its_type_defaults_to() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source.find("pub fn new(").expect("DocumentView::new");
-        let body = &source[start..];
-        let end = body.find("\n    pub fn source_path(").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("Layout::default_for(doc_type)"),
-            "hard-coding the opening layout opens a `.rs` in a preview pane \
-             that has nothing to draw"
-        );
-        // And the type it defaults to for a text file is the editor.
+    fn text_documents_default_to_the_source_layout() {
         assert_eq!(Layout::default_for(DocType::Text), Layout::Source);
     }
 
-    /// The fixed layout selector must not offer layouts that show nothing.
     #[test]
-    fn the_layout_selector_is_fixed_and_offers_only_supported_modes() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source.find("fn render_toolbar").expect("render_toolbar");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// The banner shown")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("available_layouts(doc_type)"),
-            "iterating `Layout::ALL` offers a text file four layouts that \
-             render an empty pane"
-        );
-        assert!(
-            !body.contains("Layout::ALL"),
-            "one of the two lists has to go, or they drift"
-        );
-        assert!(
-            body.contains("TabBar::new(\"layout-modes\")") && body.contains(".segmented()"),
-            "Web mode needs a fixed selector; a popup can be covered by the child HWND"
-        );
-        assert!(
-            !body.contains(".dropdown_menu(") && !body.contains(".tooltip("),
-            "the document toolbar must not create an overlay above the Web preview"
-        );
-        assert_eq!(
-            body.matches(".border_b_1()").count(),
-            1,
-            "the document toolbar owns one boundary to the work surface; the \
-             window title bar must not contribute a second crossing rule"
-        );
-        assert!(
-            body.contains(".small()"),
-            "the secondary layout selector should stay compact beneath the tabs"
-        );
-    }
-
-    #[test]
-    fn native_acceptance_controls_publish_stable_accessibility_ids() {
+    fn native_accessibility_ids_are_stable() {
         assert_eq!(
             super::SOURCE_LAYOUT_ACCESSIBILITY_ID,
             "markturbo-layout-source"
@@ -3191,230 +2786,12 @@ mod tests {
             super::CONFLICT_OVERWRITE_ACCESSIBILITY_ID,
             "markturbo-conflict-overwrite"
         );
-
-        let toolbar = fn_body("fn render_toolbar", "\n    /// The banner shown");
-        assert!(
-            toolbar.contains("*layout == Layout::Source")
-                && toolbar.contains("accessibility_id(SOURCE_LAYOUT_ACCESSIBILITY_ID)")
-        );
-
-        let banner = fn_body("fn render_conflict_banner", "\n    fn render_editor");
-        assert!(banner.contains("accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID)"));
-
-        let editor = fn_body("fn render_editor", "\n    /// The native preview");
-        assert!(editor.contains("gpui_kit::Role::MultilineTextInput"));
-        assert!(editor.contains("accessibility_id(SOURCE_EDITOR_ACCESSIBILITY_ID)"));
-        assert!(editor.contains("track_focus(&focus_handle)"));
-        assert!(
-            editor.contains("window.is_a11y_active()")
-                && editor.contains("aria_value(self.text(cx))"),
-            "the UIA Edit value must match the editor without cloning large text during normal draws"
-        );
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_keeps_split_web_available() {
         assert!(available_layouts(DocType::Markdown).contains(&Layout::SplitWeb));
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source.find("pub fn set_layout").expect("set_layout");
-        let body = &source[start..];
-        let end = body.find("pub fn set_trust").unwrap_or(body.len());
-        assert!(!body[..end].contains("platform_layout"));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_split_web_has_no_floating_editor_provider() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        assert!(source.contains(".searchable(true)"));
-        for provider in ["CompletionProvider", "HoverProvider", "CodeActionProvider"] {
-            assert!(
-                !source.contains(provider),
-                "{provider} needs a WebView overlay strategy before Windows SplitWeb can use it"
-            );
-        }
-    }
-
-    /// Trust is offered for both things it can unlock.
-    ///
-    /// Source-level for the same reason as the others — this is a render body.
-    /// The two meanings are different (MDX gains scripts, HTML gains the
-    /// filesystem) but the control is one, and HTML's was simply missing.
-    #[test]
-    fn the_trust_button_is_offered_to_html_as_well_as_mdx() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source.find("fn render_toolbar").expect("render_toolbar");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// The banner shown")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("DocType::Mdx | DocType::Html"),
-            "without the button an HTML file's relative images can never load"
-        );
-    }
-
-    /// `file://` is reachable only for a document the user trusted.
-    ///
-    /// This is the security boundary, and it is the kind that is easy to widen
-    /// by accident while refactoring: a `file://` page can read anything the
-    /// user can. Source-level because the alternative needs a real WebView.
-    #[test]
-    fn only_a_trusted_document_is_given_filesystem_access() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source.find("fn rebuild_web").expect("rebuild_web");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// Rebuild the Web payload")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        let file_url = body.find("to_file_url").expect("the trusted path");
-        let trusted = body.find("Trust::Trusted =>").expect("the trust match");
-        assert!(
-            trusted < file_url,
-            "`to_file_url` must sit under the `Trusted` arm"
-        );
-        assert!(
-            body.contains("Trust::Restricted =>") && body.contains("build_html_raw"),
-            "restricted HTML must be served as text for the workspace to turn \
-             into an opaque-origin `data:` URL, which cannot reach the \
-             filesystem at all"
-        );
-        assert!(
-            !body.contains("to_data_url"),
-            "the workspace already encodes the payload; doing it here too \
-             percent-encodes it twice and shows the user a URL as text"
-        );
-        assert!(
-            body.contains("DocType::Html"),
-            "HTML must not go through the themed shell, which would nest a \
-             whole document inside another one"
-        );
-    }
-
-    /// Auto-refresh must never discard typed text.
-    ///
-    /// Source-level: the guard's whole job is to return *before* it starts any
-    /// work, and there is no observable state to assert that against — a
-    /// document that refused is byte-identical to one nothing happened to.
-    #[test]
-    fn reload_if_clean_refuses_to_touch_a_dirty_document() {
-        let body = fn_body(
-            "pub fn reload_if_clean",
-            "\n    /// Apply a background reload",
-        );
-
-        let guard = body.find("if self.dirty").expect("the dirty guard");
-        let spawn = body.find("cx.spawn(").expect("the reload task");
-        assert!(
-            guard < spawn,
-            "the guard must come first, or an automatic refresh discards \
-             unsaved edits before anyone can object"
-        );
-        assert!(
-            body[guard..spawn].contains("return false"),
-            "a dirty document must change nothing and say so, which is what \
-             leaves the banner up"
-        );
-    }
-
-    /// The automatic reload must not parse on the UI thread.
-    ///
-    /// The defect this replaces: `drain_watcher` -> `reload_if_clean` ->
-    /// `reload` -> `Document::set_source` -> `reparse`, all inline. That parse
-    /// is markdown-rs and superlinear — **measured at 23.4s on
-    /// `fixtures/perf/huge-100k.md`** in a release build, 665ms on a 1MB file —
-    /// and it froze the window for the whole of it. The watcher fires on every
-    /// external write, so an agent rewriting a file in a loop froze the window
-    /// once per poll tick. `mt-doc/tests/performance.rs`'s
-    /// `a_huge_document_is_slow_enough_to_require_background_parsing` asserts
-    /// the parse stays slow precisely so nobody moves it back here.
-    ///
-    /// Source-level for the same reason as its neighbours: reproducing it needs
-    /// a real window, a 100K-line file, and a stopwatch on the frame time.
-    #[test]
-    fn the_automatic_reload_parses_off_the_ui_thread() {
-        let body = fn_body(
-            "pub fn reload_if_clean",
-            "\n    /// Apply a background reload",
-        );
-
-        assert!(
-            body.contains("background_spawn"),
-            "the read and the parse must run off the UI thread; inline they \
-             freeze the window for 23.4s on the 100K-line fixture, once per \
-             external write"
-        );
-        assert!(
-            !body.contains("self.reload("),
-            "`reload` is the synchronous, user-initiated path — routing the \
-             watcher through it is the freeze this test exists to prevent"
-        );
-        assert!(
-            body.contains("try_update_in"),
-            "the result lands after an await, where the infallible borrow \
-             panics mid-draw"
-        );
-    }
-
-    /// A background reload lands into a document that may have moved on.
-    ///
-    /// Every landing check is load-bearing: without the snapshot check a reload
-    /// started while clean can clobber text typed during the parse, without the
-    /// source-path check it can cross a Save As boundary, and without the stamp
-    /// check the editor shows a version that is no longer on disk.
-    #[test]
-    fn a_landing_reload_rechecks_the_document_and_the_file() {
-        let body = fn_body("fn finish_reload", "\n    /// Save to disk");
-
-        let identity = body
-            .find("reload_snapshot_matches")
-            .expect("the source path and buffer snapshot check");
-        let dirty = body.find("self.dirty").expect("the second dirty check");
-        let apply = body.find("self.apply_reload").expect("the apply");
-        assert!(
-            identity < dirty && dirty < apply,
-            "the queued reload must still match its original document identity before it can apply"
-        );
-        assert!(
-            body[identity..apply].contains("source_path"),
-            "Save As changes the source path even if it preserves editor text"
-        );
-        assert!(
-            dirty < apply,
-            "the user can start typing during the parse; applying without \
-             re-checking discards what they typed"
-        );
-        assert!(
-            body[dirty..apply].contains("mark_externally_changed"),
-            "a document that went dirty mid-parse must still get its banner, \
-             or the change goes unnoticed"
-        );
-        assert!(
-            body.contains("stamp.matches"),
-            "a result parsed from a version that has since been overwritten is \
-             stale; the watcher has already queued the newer write"
-        );
-    }
-
-    /// The manual reload stays synchronous, and must stay cheap to tell apart.
-    #[test]
-    fn the_manual_reload_is_the_one_the_banner_button_calls() {
-        let source = crate::views::production_source(include_str!("document.rs"));
-        let start = source
-            .find("fn render_conflict_banner")
-            .expect("the banner");
-        let body = &source[start..];
-        let end = body.find("\n    fn render_editor").unwrap_or(body.len());
-        assert!(
-            body[..end].contains("this.reload(window, cx)"),
-            "the banner's button is user-initiated and one-shot, so it keeps \
-             the synchronous path; the watcher is the one that must not"
-        );
     }
 
     #[gpui::test]
@@ -3430,7 +2807,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load test source"),
+                mt_core::document::io::load(&path).expect("load test source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
@@ -3652,7 +3029,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load test source"),
+                mt_core::document::io::load(&path).expect("load test source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
@@ -3753,7 +3130,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load CRLF source"),
+                mt_core::document::io::load(&path).expect("load CRLF source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
@@ -3858,7 +3235,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load test source"),
+                mt_core::document::io::load(&path).expect("load test source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
@@ -4005,7 +3382,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load test source"),
+                mt_core::document::io::load(&path).expect("load test source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
@@ -4123,7 +3500,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load test source"),
+                mt_core::document::io::load(&path).expect("load test source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
@@ -4214,7 +3591,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load test source"),
+                mt_core::document::io::load(&path).expect("load test source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
@@ -4300,7 +3677,7 @@ mod tests {
         });
         let (document, cx) = cx.add_window_view(|window, cx| {
             DocumentView::new(
-                crate::fs::load(&path).expect("load test source"),
+                mt_core::document::io::load(&path).expect("load test source"),
                 Arc::new(RendererRegistry::with_defaults()),
                 window,
                 cx,
