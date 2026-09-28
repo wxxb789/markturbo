@@ -616,9 +616,11 @@ def goal04_build_command(variant: Goal04BuildVariant) -> list[str]:
             "--target",
             GOAL04_TARGET,
             "-p",
-            "mt-app",
+            "mt-core",
             "--test",
             variant.target_name,
+            "--features",
+            "model-transport",
             "--no-run",
             "--message-format=json-render-diagnostics",
         ]
@@ -638,10 +640,10 @@ def goal04_behavior_verification_command(variant_name: str) -> list[str] | None:
         "--target",
         GOAL04_TARGET,
         "-p",
-        "mt-app",
+        "mt-core",
         "--lib",
         "--no-default-features",
-        "translate::ablation_tests::measurement_build_reports_the_removed_transport",
+        "translate::provider::ablation_tests::measurement_build_reports_the_removed_transport_after_preparation",
         "--",
         "--exact",
     ]
@@ -677,15 +679,21 @@ def goal04_tree_command(variant: Goal04BuildVariant) -> list[str]:
         "--locked",
         "--target",
         GOAL04_TARGET,
-        "-p",
-        "mt-app",
-        "--edges",
-        "normal",
-        "--prefix",
-        "none",
-        "--format",
-        "{p}|{f}",
     ]
+    if variant.artifact_kind == "test":
+        command.extend(
+            [
+                "-p",
+                "mt-core",
+                "--features",
+                "model-transport",
+            ]
+        )
+    else:
+        command.extend(["-p", "mt-app"])
+    command.extend(
+        ["--edges", "normal", "--prefix", "none", "--format", "{p}|{f}"]
+    )
     if variant.no_default_features:
         command.append("--no-default-features")
     return command

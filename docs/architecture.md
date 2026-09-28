@@ -5,57 +5,47 @@ requested by the [historical v0.1 product direction](history/v0.1-product-direct
 after inspecting upstream source rather than relying on assumptions. Current
 product scope is governed by the [Product Contract](../PRODUCT.md).
 
-## The one hard boundary
+## The hard boundary and workflow map
 
-`mt-doc` — the document engine — has **no GPUI dependency**. That is the only
-structural rule this codebase enforces strictly, because it is the one that
-determines whether the model can later be reused by CLI tooling, MCP tools,
-agent tools, headless rendering, or indexing.
+`mt-app` depends on `mt-core`, never the reverse. `mt-core` has **no GPUI or
+WebView dependency**; headless filesystem, Windows secure storage, rendering,
+and optional provider transport belong there even when platform-specific.
+`mt-app` owns window/entity lifetime, GPUI globals, theme and localized UI,
+WebView presentation, and embedded UI/sample assets. Its settings and credential
+globals adapt headless core data without duplicating persistence or consent
+policy. There is no `traits/`, `services/`, or dependency-injection layer.
 
-Everything else is a module in `mt-app`, split by what it owns rather than by
-layer. There is no `traits/`, no `services/`, no dependency-injection container.
+Modules follow the workflow a caller needs, not technical tiers:
 
 ```text
-Filesystem
-    │
-    ▼
-┌──────────────────────────────────────────┐
-│ mt-doc                                   │
-│   doctype    what kind of artifact       │
-│   frontmatter YAML header extraction     │
-│   doc        source + blocks + outline   │
-│   outline    headings + MDX structure    │
-│   block      renderer dispatch keys      │
-│   diagnostic problems, never panics      │
-│   skill      Agent Skills model          │
-│   harness    where skills live, per tool │
-│   instruction agent instruction files    │
-│   walk       which files are openable    │
-│   search     find across documents       │
-│   translate  what is translatable        │
-└────────────────────┬─────────────────────┘
-                     │
-     ┌───────────────┼───────────────┬──────────────┐
-     │               │               │              │
-  mt-app::fs   mt-app::renderer  mt-app::web   mt-app::views
-  load/save    diagram + math    WebView       GPUI
-  encoding     registry          + trust       ↓
-  conflicts                                    │
-                                               │
-     ┌─────────────────────────────────────────┤
-     │                                         │
-  workspace ────────────────────────────┐   panels
-  the wiring layer                      │   explorer · harness
-     ├── tabs         open set, preview │   search   · document
-     ├── history      back / forward    │   settings_page
-     └── web_surface  the OS child window
+mt-core (GPUI-free)
+  document/{doc,block,doctype,frontmatter,outline,io,lifecycle}
+              source, spans, lossless load/save, conflict and close decisions
+  workspace/{tree,walk,search,watcher,tabs,history}
+              folder discovery, external changes, navigation state
+  agent_artifacts/{skill,harness,instruction,package}
+              discovery and exact frozen Agent Skill Review inputs
+  review/{provider,revision} + translate/{provider} + model
+              validation, approved edits, frozen disclosure and transport
+  rendering   diagram/math registry and embedded KaTeX faces
+  credentials + settings + recovery + runtime_paths
+              secure storage, user configuration, encrypted checkpoints
+       ▲
+       │ mt-app depends on mt-core
+mt-app (GPUI)
+  views/{workspace,document,explorer,harness,search,settings_page}
+  views/workspace/{history,web_surface}   navigation controls and OS WebView
+  web + theme + i18n + assets + startup + main
+              HTML/WebView presentation, UI resources and application lifetime
 ```
 
-Each of those four under `workspace` was a cluster of fields inside it. They
-moved out because nothing else touched them — which is also what made their
-rules testable without a window. `tabs` is the clearest case: "closing a tab to
-the left must not switch documents" was a real defect, and it is now an
-assertion rather than something you find by clicking.
+`mt-core` uses no provider transport by default; `mt-app` enables its
+`model-transport` feature for the shipping build. CLI/evaluation tools can use
+the core without linking GPUI. `document`, `workspace`, and `agent_artifacts`
+expose the behavior their callers need through one-way interfaces; the GPUI
+views decide when to invoke them and render their results. In particular,
+`Tabs<T>` and `History` keep their state invariants in core, while tab elements
+and navigation buttons stay in app.
 
 ## Why these boundaries
 
@@ -81,9 +71,9 @@ explicitly not a goal, and Markdown never round-trips through the WebView.
 ### Renderer registry, not special cases
 
 `BlockRenderer` is looked up by `Block::renderer_id()`. Adding Graphviz means:
-implement the trait, register it, add the fence language to
-`DiagramKind::from_lang`. The Markdown parser, both renderers, and every view
-are untouched. `a_new_renderer_needs_no_core_changes` asserts exactly this.
+implement the trait in `mt_core::rendering`, register it, and add the fence
+language to `DiagramKind::from_lang`. The document parser and GPUI views stay
+untouched; the registry dispatch test exercises that interface.
 
 Availability is part of the trait, so a renderer needing an external binary
 reports its absence as an actionable install hint rather than a mysterious
@@ -117,8 +107,9 @@ the plan substantially.
 - `TabBar`, `h_resizable`, `TitleBar`, `ListItem`, theming.
 - `gpui-wry` — a WebView element (Windows and macOS).
 
-So `mt-app` is mostly wiring plus the four things upstream does not have:
-document semantics, diagram backends, filesystem safety, and translation.
+`mt-app` supplies the GPUI window, controls, WebView presentation, and
+UI-specific adapters. `mt-core` owns the document semantics, diagram backends,
+filesystem safety, Review/Revision and Translation operations behind those views.
 
 ### Pure-Rust renderers where they exist
 
@@ -219,8 +210,8 @@ The HTML row is the actual boundary, and it is deliberate: a trusted `.html` is
 loaded through `web::to_file_url` so its relative images and stylesheets
 resolve, which is the only reason a user would trust one. That gives it a real
 origin, read access to whatever the user can read, and whatever CSP the file
-itself carries — which may be none. `to_file_url`'s doc comment says so in those
-words, and `only_a_trusted_document_is_given_filesystem_access` pins it.
+itself carries — which may be none. `to_file_url` documents that exposure;
+source scans are not evidence of WebView runtime behavior.
 
 So the honest summary is not "content can never reach anything". It is: nothing
 reaches the filesystem or the network unless the user trusted that specific
@@ -262,10 +253,19 @@ The replacement output is staged in a randomly named sibling file, synced, and
 then installed with guarded `ReplaceFileW` handling on Windows. The backup is
 verified against the expected outgoing object before the replacement is
 accepted. If a race cannot be proved safe, the editor remains dirty and reports
-the preserved artifacts rather than silently treating the Save as successful.
+only verifiable retained artifact locations, or states that their locations are
+unavailable, rather than silently treating the Save as successful.
 Win32 is not compare-and-swap and the filesystem is not universal version
 history; the implementation detects and contains the races it can establish,
 rather than claiming an impossible guarantee for every concurrent actor.
+For origin-bound `SKILL.md` on Linux/macOS, replacement requires a supported
+atomic name exchange; the staged editor bytes and displaced entry survive
+until verification. Unsupported filesystems fail the Save rather than falling
+back to an unchecked overwrite. As with any POSIX rename, a separate process
+holding an old file descriptor can write to that inode *after* its last
+directory entry is removed; those later writes are not recoverable by pathname.
+This application does not claim universal version history for non-cooperating
+writers.
 
 Saving through a supported symbolic link preserves the link itself and updates
 its resolved target. The watcher maps changes observed on that resolved target
@@ -505,10 +505,10 @@ reason — the file is a user-facing artifact, not an internal cache.
 TOML over JSON because a settings file is something people edit: it takes
 comments, and it does not fail on a trailing comma. The format imposes one
 constraint on the code, which is worth knowing before adding a field: every
-scalar must be written before any table. `AppSettings` therefore keeps its
-ordinary scalar preferences first and the sole `[[recent-targets]]` array table
-last. `the_settings_document_serializes_recent_targets_last_and_reads_back`
-holds that ordering and round trip.
+scalar must be written before any table. `mt_core::settings::SettingsData`
+therefore keeps ordinary scalar preferences first and the sole
+`[[recent-targets]]` array table last. Its round-trip test covers that ordering;
+`mt_app::settings::AppSettings` is the GPUI Global adapter, not a second schema.
 
 The directory comes from `dirs` rather than four `cfg` branches. Windows and
 Linux land where they did; macOS moved from `~/.config/markturbo` to
@@ -582,6 +582,16 @@ which Linux UI dependencies enable and which would otherwise forward genai's raw
 response-body trace events under `RUST_LOG=trace`. Agent Skill packages cross a
 production adapter seam only as the frozen entries that produced the displayed path,
 byte-size, and inclusion-reason inventory.
+
+Agent Skill Review binds its package to the directory identity captured when
+`SKILL.md` was loaded, not to a pathname that an agent can retarget before
+consent. `mt_core::agent_artifacts::package` reads supporting files under that
+authenticated root, revalidates the same identity before use, and passes
+verified loaded bytes to the editor when navigating a finding. An unsaved
+`SKILL.md` uses the frozen editor snapshot for its entrypoint; recovery records
+without an original directory binding remain editable but cannot silently
+gain Agent Skill Review authority from their stored path. Save As establishes
+a new binding only after a verified write.
 
 A no-argument launch deliberately shows the Welcome state; `markturbo .` is the
 explicit terminal form for opening the current directory, and any other path
@@ -697,15 +707,16 @@ Two things bound it:
   same `OnceLock` that builds the client, immediately before `Client::builder()`
   — which is the only ordering that works, because reqwest panics during client
   construction rather than at request time when no provider is installed.
-- **No second runtime in the UI.** `genai` is async and this application has no
-  async runtime but GPUI's. `TranslationService` therefore stays **synchronous**:
+- **No second runtime in the UI.** `genai` is async, but provider transport is
+  in the optional `mt-core/model-transport` feature. `TranslationService`
+  remains **synchronous** at its document interface:
   one shared `tokio` runtime, built with `rt-multi-thread` and a single worker,
   is driven with `block_on` from the background task that already runs the
   translation. Multi-thread rather than current-thread is not a preference: a
   current-thread runtime is driven only by whichever thread calls `block_on`,
-  and GPUI hands each background task an arbitrary pool thread. `mt-doc` never
-  learns that `tokio` exists, which is the boundary that matters — see the hard
-  rule above.
+  and GPUI hands each background task an arbitrary pool thread. The app enables
+  this core feature for shipping, while a default core-only build has no model
+  transport dependency.
 
 [`genai`]: https://crates.io/crates/genai
 

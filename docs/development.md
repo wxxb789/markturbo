@@ -12,6 +12,8 @@ revision, not commands to rerun every time. CLAUDE.md links to AGENTS.md.
 2. Implement and run focused tests. Keep state transitions, source identity,
    parsing, patch validation and request construction independent of native UI
    where practical. Use deterministic provider fixtures without credentials.
+   For Rust ownership moves, follow `.agents/skills/rust-quality/SKILL.md` to
+   migrate callers and preserve failure semantics before running the gate.
 3. Review the diff once for unnecessary abstraction and duplicated validation.
    Remove machinery that provides no distinct correctness or product benefit.
 4. Run the applicable tier once on the settled change; let PR CI provide the
@@ -20,7 +22,7 @@ revision, not commands to rerun every time. CLAUDE.md links to AGENTS.md.
 | Change | Local default | Native verification |
 | --- | --- | --- |
 | Documentation or Python tooling | `check fast` | None unless native harness behavior changed |
-| `mt-doc` logic | `check doc` | None for domain behavior alone |
+| `mt-core` logic | `check doc` | None for headless domain behavior alone |
 | App logic, Rust dependency or build configuration | Focused tests, then `check ci` | Only affected native boundaries |
 | Layout, strings or ordinary controls | Relevant logic/i18n tests; inspect the changed state | Focused manual smoke when available; full Goal 09 matrix at the visual milestone |
 | Save/recovery, focus/IME, clipboard, WebView, consent or credentials | Deterministic regressions plus `check ci` | Affected Windows workflows before accepting that capability |
@@ -28,12 +30,15 @@ revision, not commands to rerun every time. CLAUDE.md links to AGENTS.md.
 
 `check fast` does not validate Rust. `check doc` does not validate `mt-app`.
 Neither `check ci` nor `check full` launches a GUI. Cross-platform CI tests
-compatibility; Windows 11 x64 remains the public-quality target.
+compatibility; the separate macOS arm64 PR job attempts a first-frame launch
+of a staged release executable, not native acceptance or an installable `.app`.
+Windows 11 x64 remains the public-quality target.
 
 Focused examples (replace the filter with the behavior being changed):
 
 ```sh
-cargo test --locked --profile ci -p mt-doc review
+cargo test --locked --profile ci -p mt-core review
+cargo test --locked --profile ci -p mt-core --features model-transport review::provider
 cargo test --locked --profile ci -p mt-app review
 uv run --locked --project scripts python -m unittest scripts.tests.test_checks
 ```

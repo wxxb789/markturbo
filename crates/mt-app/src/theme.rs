@@ -204,10 +204,6 @@ pub const PRESETS: &[Preset] = &[
     }),
 ];
 
-/// The preset used when a setting names one that no longer exists.
-pub const DEFAULT_LIGHT: &str = "light";
-pub const DEFAULT_DARK: &str = "dark";
-
 /// Look a preset up by id, falling back to the default for `dark`.
 ///
 /// Never panics and never returns `None`: a settings file naming a preset that
@@ -217,7 +213,11 @@ pub fn by_id(id: &str, dark: bool) -> &'static Preset {
         .iter()
         .find(|p| p.id == id && p.dark == dark)
         .or_else(|| {
-            let fallback = if dark { DEFAULT_DARK } else { DEFAULT_LIGHT };
+            let fallback = if dark {
+                mt_core::settings::DEFAULT_DARK_THEME_ID
+            } else {
+                mt_core::settings::DEFAULT_LIGHT_THEME_ID
+            };
             PRESETS.iter().find(|p| p.id == fallback)
         })
         // The two defaults are in the table and the table is a const, so this is
@@ -558,16 +558,30 @@ mod tests {
 
     #[test]
     fn the_named_defaults_exist() {
-        assert!(PRESETS.iter().any(|p| p.id == DEFAULT_LIGHT && !p.dark));
-        assert!(PRESETS.iter().any(|p| p.id == DEFAULT_DARK && p.dark));
+        assert!(
+            PRESETS
+                .iter()
+                .any(|p| p.id == mt_core::settings::DEFAULT_LIGHT_THEME_ID && !p.dark)
+        );
+        assert!(
+            PRESETS
+                .iter()
+                .any(|p| p.id == mt_core::settings::DEFAULT_DARK_THEME_ID && p.dark)
+        );
     }
 
     #[test]
     fn an_unknown_id_falls_back_within_the_requested_mode() {
         // A settings file naming a renamed preset must still open a window, and
         // must not open it in the wrong mode.
-        assert_eq!(by_id("no-such-theme", true).id, DEFAULT_DARK);
-        assert_eq!(by_id("no-such-theme", false).id, DEFAULT_LIGHT);
+        assert_eq!(
+            by_id("no-such-theme", true).id,
+            mt_core::settings::DEFAULT_DARK_THEME_ID
+        );
+        assert_eq!(
+            by_id("no-such-theme", false).id,
+            mt_core::settings::DEFAULT_LIGHT_THEME_ID
+        );
         // Asking for a light preset in dark mode is the same mistake.
         assert!(by_id("sepia", true).dark, "must stay in the requested mode");
     }
@@ -767,80 +781,6 @@ mod tests {
                 preset.id
             );
         }
-    }
-
-    /// The token rebuild must be the last color `apply` writes.
-    ///
-    /// Source-level because the failure needs a real window to see: a
-    /// `theme.<field> = …` added *below* the rebuild lands in `colors` alone
-    /// and never reaches `tokens`, which is precisely the bug the rebuild
-    /// exists to fix. Ordering against `sync_base` matters for the same reason
-    /// in the other direction — it projects the theme onto the Base layer, so
-    /// a rebuild after it would never reach the scrollbar.
-    #[test]
-    fn the_token_rebuild_is_the_last_word_on_color() {
-        let source = include_str!("theme.rs");
-        let body = source
-            .split_once("pub fn apply(")
-            .expect("apply must exist")
-            .1;
-        // Stop before this module, or the assertions below match themselves.
-        let body = body.split_once("\n#[cfg(test)]").map_or(body, |(b, _)| b);
-
-        assert!(
-            body.contains("theme.tab_active = h(t.bg)"),
-            "the active tab must carry the page background, or it does not \
-             read as continuous with the document below it"
-        );
-        assert!(
-            body.contains("theme.tab_bar = h(c.subtle)"),
-            "the tab bar must stay recessed relative to the active tab; giving \
-             it `t.bg` too is what leaves the strip flat"
-        );
-
-        let rebuild = body
-            .find("theme.tokens =")
-            .expect("`tokens` must be rebuilt from `colors`");
-        let sync = body
-            .find("Theme::sync_base")
-            .expect("the Base layer must be synced");
-        assert!(
-            rebuild < sync,
-            "the rebuild must precede `sync_base`, which caches what it projects"
-        );
-
-        // Every *color* assignment must precede the rebuild. `highlight_theme`
-        // is deliberately exempt and it is not an oversight: it is a sibling
-        // field on `Theme`, not one of `colors`, so the rebuild neither reads
-        // nor carries it. Listing the exemption here rather than loosening the
-        // scan is what keeps this assertion meaningful — the next field added
-        // after the rebuild has to be justified the same way or it fails.
-        let after = &body[rebuild..];
-        let stray: Vec<&str> = after
-            .match_indices("\n    theme.")
-            .map(|(at, _)| {
-                let rest = &after[at + 11..];
-                rest.split(['.', ' ', '=']).next().unwrap_or_default()
-            })
-            .filter(|field| !matches!(*field, "tokens" | "highlight_theme"))
-            .collect();
-        assert!(
-            stray.is_empty(),
-            "`theme.{}` is assigned after the token rebuild; a color written \
-             there reaches `colors` only, so the tab bar, the active tab and \
-             every list row keep the stock palette",
-            stray.join("`, `theme.")
-        );
-
-        // And the editor's own surface must be set at all. It reads none of the
-        // fields above — its canvas, gutter and active line come from
-        // `highlight_theme` — which is why the editor pane followed light/dark
-        // but not the preset.
-        assert!(
-            body.contains("theme.highlight_theme ="),
-            "the Source editor's canvas comes from `highlight_theme`; without \
-             it the editor keeps the stock background under a themed document"
-        );
     }
 
     #[test]

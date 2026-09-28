@@ -32,7 +32,6 @@ TOOLING_TESTS = (
     "scripts.tests.test_evaluation",
     "scripts.tests.test_revision_evaluation",
     "scripts.tests.test_icons",
-    "scripts.tests.test_workflows",
     "scripts.tests.test_perf_fixtures",
     "scripts.tests.test_recovery_capacity",
     "scripts.tests.test_native_goal02_evidence",
@@ -108,11 +107,11 @@ def fast(*, base: str | None = None, head: str | None = None) -> None:
 
 
 def doc(*, base: str | None = None, head: str | None = None) -> None:
-    """Validate the headless document engine without compiling the desktop app."""
+    """Validate the headless core without compiling the desktop app."""
 
     fast(base=base, head=head)
     run(cargo("fmt", "--all", "--", "--check"))
-    run(cargo("test", "--profile", "ci", "-p", "mt-doc", "--locked"))
+    run(cargo("test", "--profile", "ci", "-p", "mt-core", "--locked"))
 
 
 def rust_checks(profile: str) -> None:

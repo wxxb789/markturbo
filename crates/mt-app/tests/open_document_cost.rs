@@ -44,7 +44,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect(&path, out);
-        } else if mt_doc::DocType::of(&path).is_document() {
+        } else if mt_core::DocType::of(&path).is_document() {
             out.push(path);
         }
     }
@@ -71,7 +71,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 #[ignore = "must run in a process where nothing has rendered math yet"]
 fn first_formula_costs_little_more_than_the_rest() {
-    let registry = mt_app::renderer::RendererRegistry::with_defaults();
+    let registry = mt_core::rendering::RendererRegistry::with_defaults();
 
     let start = Instant::now();
     let first = registry.render("math", "a^2 + b^2 = c^2");
@@ -99,19 +99,19 @@ fn first_formula_costs_little_more_than_the_rest() {
 #[test]
 #[ignore = "a diagnostic over real documents, not a gate"]
 fn attribute_the_cost_of_opening_a_document() {
-    let registry = mt_app::renderer::RendererRegistry::with_defaults();
+    let registry = mt_core::rendering::RendererRegistry::with_defaults();
 
     println!("    load    parse   render    total  document");
 
     for path in documents() {
         let start = Instant::now();
-        let Ok(file) = mt_app::fs::load(&path) else {
+        let Ok(file) = mt_core::document::io::load(&path) else {
             continue;
         };
         let load = start.elapsed();
 
         let start = Instant::now();
-        let document = mt_doc::Document::new(Some(path.clone()), file.text.clone());
+        let document = mt_core::Document::new(Some(path.clone()), file.text.clone());
         let parse = start.elapsed();
 
         // What the native preview's background parse does per diagram fence.

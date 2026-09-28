@@ -12,10 +12,7 @@
 //! same here as it did before the split.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ffi::OsStr;
-use std::fs::{self as std_fs, File};
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -38,58 +35,57 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mt_doc::review::{
-    ArtifactLens, ByteRange, ClarificationPriority, FindingKind, MAX_SKILL_FILE_BYTES,
-    MAX_SKILL_PACKAGE_BYTES, ReviewDiagnostic, ReviewDiagnosticCode, ReviewModelOutput,
-    ReviewRequest as DocumentReviewRequest, ReviewStatus, SkillPackage, SkillPackageError,
-    SkillPackageFile, SkillPackageOmission, SourceAnchor, SourceLocation, SourceSnapshot,
-    StructuredText,
+use mt_core::agent_artifacts::package::{
+    FrozenSkillPackage, ReviewRequestBuildError, ReviewRequestBuildRequest,
+    ReviewRequestBuildResult, ReviewTarget, build_review_request, resolve_document_anchor_offset,
 };
-use mt_doc::revision::ChangeId;
-use mt_doc::translate::{Scope, TranslationRequest};
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
-
-use crate::fs;
-use crate::i18n;
-use crate::lifecycle::{
-    DestructiveAction, DestructiveRequest, DestructiveResolution, DirtyDecision, DocumentId,
-    DocumentLifecycle,
-};
-use crate::metrics;
-use crate::model::{ConsentCapability, ConsentDecision, RevisionRequestBinding};
-use crate::recovery::{
-    CancellableRecoveryCheckpointAttempt, CheckpointAttemptTiming, CheckpointBatchOutcome,
-    CheckpointSchedule, RecoveredRecord, RecoveryError, RecoveryKey, RecoveryMaintenance,
-    RecoveryRetirement, RecoveryRetirementBatch, RecoveryStore, RecoveryToken,
-    RetirementCompletion, RevisionRecovery,
-};
-use crate::renderer::RendererRegistry;
-use crate::review::{
+use mt_core::review::provider::{
     PreparedReview, REVIEW_REQUEST_TIMEOUT, ReviewError, ReviewLanguage, ReviewRequestError,
     ReviewTransportResult, RevisionAnswer, RevisionAnswers, RevisionError,
     RevisionQuestionCoverageStatus, RevisionTransportResult,
 };
+use mt_core::review::revision::ChangeId;
+use mt_core::review::{
+    ArtifactLens, ClarificationPriority, FindingKind, ReviewDiagnostic, ReviewDiagnosticCode,
+    ReviewModelOutput, ReviewRequest as DocumentReviewRequest, ReviewStatus, SkillPackage,
+    SourceAnchor, SourceLocation, SourceSnapshot, StructuredText,
+};
+use mt_core::translate::provider::PreparedTranslation;
+use mt_core::translate::{Scope, TranslationRequest};
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+
+use crate::i18n;
+use crate::metrics;
 use crate::startup::{AcknowledgeStartupInput, InitialStartupState, StartupEvent};
-use crate::translate::PreparedTranslation;
 use crate::views::document::{
-    DocumentEvent, DocumentView, PreparedRecovery, SaveAsMode, SaveAsOutcome, SaveMode, paths_match,
+    DocumentEvent, DocumentView, PreparedRecovery, SaveAsMode, SaveAsOutcome, SaveMode,
 };
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::harness::{HarnessEvent, HarnessView};
 use crate::views::search::{Corpus, SearchEvent, SearchView};
 use crate::views::settings_page::{SettingsEvent, SettingsView};
-use crate::views::tabs::{TabIdentity, Tabs};
-use crate::watcher::{Change, Watcher};
+use mt_core::document::io as fs;
+use mt_core::document::lifecycle::{
+    DestructiveAction, DestructiveRequest, DestructiveResolution, DirtyDecision, DocumentId,
+    DocumentLifecycle,
+};
+use mt_core::model::{ConsentCapability, ConsentDecision, RevisionRequestBinding};
+use mt_core::recovery::{
+    CancellableRecoveryCheckpointAttempt, CheckpointAttemptTiming, CheckpointBatchOutcome,
+    CheckpointSchedule, RecoveredRecord, RecoveryError, RecoveryKey, RecoveryMaintenance,
+    RecoveryRetirement, RecoveryRetirementBatch, RecoveryStore, RecoveryToken,
+    RetirementCompletion, RevisionRecovery,
+};
+use mt_core::rendering::RendererRegistry;
+use mt_core::workspace::tabs::{TabIdentity, Tabs};
+use mt_core::workspace::watcher::{Change, Watcher};
 
 mod history;
 pub(crate) mod web_surface;
 
-use self::history::History;
 use self::web_surface::WebSurface;
-
-const MAX_AGENT_SKILL_INVENTORY_ENTRIES: usize = 1_024;
-const MAX_AGENT_SKILL_DIRECTORY_DEPTH: usize = 32;
+use mt_core::workspace::History;
 
 actions!(
     markturbo,
@@ -157,17 +153,17 @@ fn should_show_welcome(initial: Option<&Path>, show_welcome_on_startup: bool) ->
     initial.is_none() && show_welcome_on_startup
 }
 
-fn recent_target_issue(target: &crate::settings::RecentTarget) -> Option<i18n::Key> {
+fn recent_target_issue(target: &mt_core::settings::RecentTarget) -> Option<i18n::Key> {
     if !target.path.exists() {
         return Some(i18n::Key::RecentMissing);
     }
     match target.kind {
-        crate::settings::RecentTargetKind::File
-            if target.path.is_file() && crate::workspace::is_openable(&target.path) =>
+        mt_core::settings::RecentTargetKind::File
+            if target.path.is_file() && mt_core::workspace::is_openable(&target.path) =>
         {
             None
         }
-        crate::settings::RecentTargetKind::Workspace if target.path.is_dir() => None,
+        mt_core::settings::RecentTargetKind::Workspace if target.path.is_dir() => None,
         _ => Some(i18n::Key::RecentUnavailable),
     }
 }
@@ -756,7 +752,7 @@ fn path_affects_harness(root: &Path, path: &Path) -> bool {
         .to_ascii_lowercase();
     let is_directory = path.is_dir() || relative.extension().is_none();
 
-    for root in mt_doc::skill::discovery_roots() {
+    for root in mt_core::agent_artifacts::skill::discovery_roots() {
         let root = root.to_ascii_lowercase();
         if root.starts_with(&format!("{relative_text}/")) || relative_text == root {
             return true;
@@ -774,7 +770,8 @@ fn path_affects_harness(root: &Path, path: &Path) -> bool {
         }
     }
 
-    let is_instruction = mt_doc::instruction::is_instruction(Path::new(&relative_text));
+    let is_instruction =
+        mt_core::agent_artifacts::instruction::is_instruction(Path::new(&relative_text));
     let affects_instruction_root = |within: &str| {
         let components: Vec<&str> = within.split('/').collect();
         let first = components.first().copied().unwrap_or_default();
@@ -784,7 +781,7 @@ fn path_affects_harness(root: &Path, path: &Path) -> bool {
             || (nested && components.len() <= 3 && is_instruction)
             || (nested && components.len() == 2 && is_directory)
     };
-    for root in mt_doc::instruction::project_roots()
+    for root in mt_core::agent_artifacts::instruction::project_roots()
         .iter()
         .filter(|root| !root.as_os_str().is_empty())
     {
@@ -838,7 +835,7 @@ pub struct Workspace {
     explorer: Option<Entity<Explorer>>,
     harness: Option<Entity<HarnessView>>,
     /// Global skill roots outlive the folder-specific Harness view.
-    skill_cache: Arc<Mutex<mt_doc::skill::DiscoveryCache>>,
+    skill_cache: Arc<Mutex<mt_core::agent_artifacts::skill::DiscoveryCache>>,
     search: Entity<SearchView>,
     /// The settings page, built once rather than per open.
     ///
@@ -866,17 +863,17 @@ pub struct Workspace {
     /// Original keys for documents opened before startup recovery is ready.
     /// Save As observes the new path even though an older checkpoint still
     /// belongs to the path that was open when startup began.
-    startup_recovery_keys: HashMap<crate::lifecycle::DocumentId, RecoveryKey>,
+    startup_recovery_keys: HashMap<mt_core::document::lifecycle::DocumentId, RecoveryKey>,
     /// The dirty source key that a successful Save As must retire. The document
     /// has its new file identity by the time it emits `DirtyChanged`.
-    save_as_recovery_keys: HashMap<crate::lifecycle::DocumentId, RecoveryKey>,
+    save_as_recovery_keys: HashMap<mt_core::document::lifecycle::DocumentId, RecoveryKey>,
     /// Explicit Save or Discard decisions that still need a durable marker.
     /// `None` keeps unknown-origin work fail-closed for every destructive action.
     pending_recovery_retirements: HashMap<RecoveryKey, Option<DocumentId>>,
     recovery_retirements: HashMap<RecoveryKey, RecoveryRetirement>,
     recovery_retirement_batches: HashMap<RecoveryKey, RecoveryRetirementBatch>,
     recovery_retirement_retries: HashSet<RecoveryKey>,
-    recovery_schedules: HashMap<crate::lifecycle::DocumentId, DocumentRecoveryState>,
+    recovery_schedules: HashMap<mt_core::document::lifecycle::DocumentId, DocumentRecoveryState>,
     /// Content identities paused until retirement resolves, scoped to a
     /// document incarnation so reopening the same path is not suppressed.
     recovery_retirement_suppressions:
@@ -884,7 +881,8 @@ pub struct Workspace {
     /// Exact source plus Revision binding used by the current recovery state.
     /// This is separate from the editor revision because answers can change
     /// while the document bytes stay untouched.
-    recovery_content_identities: HashMap<crate::lifecycle::DocumentId, RecoveryContentIdentity>,
+    recovery_content_identities:
+        HashMap<mt_core::document::lifecycle::DocumentId, RecoveryContentIdentity>,
     /// True while the one physical checkpoint batch owned by this workspace is running.
     recovery_checkpoint_worker_active: bool,
     recovery_warning: Option<String>,
@@ -1028,7 +1026,7 @@ struct DocumentTab {
 /// the missing surrounding context in the presentation.
 struct WorkspaceReviewResult {
     document_id: DocumentId,
-    source_snapshot: crate::lifecycle::AsyncSnapshot,
+    source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
     target: ReviewTarget,
     selection: Option<std::ops::Range<usize>>,
     lens: ArtifactLens,
@@ -1047,7 +1045,7 @@ struct WorkspaceReviewResult {
 /// `RevisionAnswers` rebuilt from `answer_states` at Run time.
 struct WorkspaceRevisionContext {
     document_id: DocumentId,
-    source_snapshot: crate::lifecycle::AsyncSnapshot,
+    source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
     request: DocumentReviewRequest,
     review_output: ReviewModelOutput,
     skill_package: Option<FrozenSkillPackage>,
@@ -1067,7 +1065,7 @@ struct WorkspaceRevisionContext {
 /// UI-owned metadata around one validated Revision provider result.
 struct WorkspaceRevisionResult {
     document_id: DocumentId,
-    source_snapshot: crate::lifecycle::AsyncSnapshot,
+    source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
     result: RevisionTransportResult,
     decisions: Vec<(ChangeId, bool)>,
     preview: String,
@@ -1148,124 +1146,7 @@ struct PendingReview {
     lens: ArtifactLens,
 }
 
-/// How a frozen Agent Skill package obtained its entrypoint content.
-///
-/// An unsaved editor change is an explicit UTF-8 source snapshot even when the
-/// on-disk file was opened through another encoding. A clean non-UTF-8 file is
-/// instead disclosed as metadata only, and remains bound to its raw identity.
-#[derive(Clone)]
-enum SkillEntrypointSource {
-    Disk,
-    EditorText(String),
-}
-
-/// One exact Agent Skill package snapshot. The editor snapshot owns `SKILL.md`;
-/// this additionally identifies every supporting regular file and the complete
-/// disclosed inventory, including omissions.
-#[derive(Clone)]
-struct FrozenSkillPackage {
-    root: PathBuf,
-    skill_entrypoint: SkillEntrypointSource,
-    skill_entrypoint_identity: Option<SkillSupportingFileIdentity>,
-    package: SkillPackage,
-    supporting_files: Vec<SkillSupportingFileIdentity>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct SkillSupportingFileIdentity {
-    path: String,
-    byte_size: u64,
-    digest: [u8; 32],
-    modified: Option<std::time::SystemTime>,
-    object_id: Option<fs::FileObjectId>,
-}
-
-struct ReadSkillSupportingFile {
-    bytes: Vec<u8>,
-    identity: SkillSupportingFileIdentity,
-}
-
-impl FrozenSkillPackage {
-    fn revalidate(&self) -> Result<(), ReviewRequestBuildError> {
-        let current = build_frozen_agent_skill_package_with_entrypoint(
-            &self.root,
-            self.skill_entrypoint.clone(),
-        )?;
-        if current.package == self.package
-            && current.skill_entrypoint_identity == self.skill_entrypoint_identity
-            && current.supporting_files == self.supporting_files
-        {
-            Ok(())
-        } else {
-            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
-        }
-    }
-
-    fn contains_supporting_path(&self, candidate: &Path) -> bool {
-        self.supporting_files.iter().any(|file| {
-            skill_package_path(&self.root, &file.path)
-                .is_ok_and(|path| paths_match(&path, candidate))
-        })
-    }
-
-    /// Resolve only an anchor already validated against this exact package.
-    /// The model supplies a relative name, never an executable path or action.
-    fn resolve_anchor(&self, anchor: &SourceAnchor) -> Option<(PathBuf, usize)> {
-        let (path, location) = match anchor {
-            SourceAnchor::AgentSkillFile { path, location } => (path.as_str(), Some(*location)),
-            SourceAnchor::Document { .. } | SourceAnchor::DocumentWide => return None,
-        };
-        let file = self.package.files().iter().find(|file| file.path == path)?;
-        let offset = match location {
-            None => 0,
-            Some(location) => match &file.payload {
-                mt_doc::review::SkillFilePayload::Utf8 { content } => {
-                    let raw_offset = review_location_offset(location, content)?;
-                    skill_editor_offset(content, raw_offset)?
-                }
-                mt_doc::review::SkillFilePayload::RawBinary { .. } => {
-                    let SourceLocation::ByteRange { start, .. } = location else {
-                        return None;
-                    };
-                    usize::try_from(start).ok()?
-                }
-                mt_doc::review::SkillFilePayload::Binary { .. } => return None,
-            },
-        };
-        skill_package_path(&self.root, path)
-            .ok()
-            .map(|path| (path, offset))
-    }
-}
-
-/// `fs::load` removes a UTF-8 BOM and normalizes CRLF to LF for the editor.
-/// Map an anchor in the frozen on-disk UTF-8 source to that loaded buffer.
-fn skill_editor_offset(source: &str, raw_offset: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
-    if raw_offset > bytes.len() || !source.is_char_boundary(raw_offset) {
-        return None;
-    }
-    let bom_length = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) && raw_offset >= 3 {
-        3
-    } else {
-        0
-    };
-    let removed_cr = bytes
-        .iter()
-        .enumerate()
-        .take(raw_offset)
-        .filter(|(index, byte)| **byte == b'\r' && bytes.get(index + 1) == Some(&b'\n'))
-        .count();
-    raw_offset.checked_sub(bom_length + removed_cr)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewTarget {
-    Document,
-    Selection,
-}
-
-fn revision_change_ids(proposal: &mt_doc::revision::RevisionProposal) -> Vec<ChangeId> {
+fn revision_change_ids(proposal: &mt_core::review::revision::RevisionProposal) -> Vec<ChangeId> {
     proposal
         .hunks()
         .iter()
@@ -1312,7 +1193,7 @@ fn revision_apply_identity_matches(
 
 fn revision_question_accessibility_id(
     index: usize,
-    question: &mt_doc::review::ClarificationQuestion,
+    question: &mt_core::review::ClarificationQuestion,
 ) -> String {
     format!(
         "markturbo-revision-question-{}",
@@ -1322,7 +1203,7 @@ fn revision_question_accessibility_id(
 
 fn revision_question_binding_id(
     index: usize,
-    question: &mt_doc::review::ClarificationQuestion,
+    question: &mt_core::review::ClarificationQuestion,
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(b"markturbo-revision-question-v1\0");
@@ -1484,35 +1365,6 @@ fn push_review_text_list(
     );
 }
 
-fn review_anchor_offset(anchor: &SourceAnchor, source: &str) -> Option<usize> {
-    match anchor {
-        SourceAnchor::Document { location } => review_location_offset(*location, source),
-        // A document-wide finding intentionally does not claim a line. Opening
-        // the document at its beginning still gives it a deterministic target.
-        SourceAnchor::DocumentWide => Some(0),
-        SourceAnchor::AgentSkillFile { .. } => None,
-    }
-}
-
-fn review_location_offset(location: SourceLocation, source: &str) -> Option<usize> {
-    match location {
-        SourceLocation::ByteRange { start, .. } => usize::try_from(start).ok(),
-        SourceLocation::LineRange { start, .. } => {
-            let line = usize::try_from(start).ok()?;
-            if line == 0 {
-                return None;
-            }
-            if line == 1 {
-                return Some(0);
-            }
-            source
-                .match_indices('\n')
-                .nth(line - 2)
-                .map(|(offset, _)| offset + 1)
-        }
-    }
-}
-
 fn review_anchor_label(anchor: &SourceAnchor, cx: &Context<Workspace>) -> String {
     match anchor {
         SourceAnchor::DocumentWide => i18n::t(i18n::Key::ReviewDocumentWide, cx).to_string(),
@@ -1531,60 +1383,12 @@ fn review_location_label(location: SourceLocation) -> String {
     }
 }
 
-#[derive(Debug)]
-enum ReviewRequestBuildError {
-    AgentSkillRootUnavailable,
-    AgentSkillEntrypointUnavailable,
-    AgentSkillSelectionUnsupported,
-    AgentSkillPathIsNotUtf8,
-    AgentSkillReadFailed,
-    AgentSkillSourceChanged,
-    AgentSkillFileTooLarge { byte_size: u64 },
-    AgentSkillPackageTooLarge { byte_size: u64 },
-    InvalidAgentSkillPackage(SkillPackageError),
-    InvalidSelection,
-    InvalidRequest(mt_doc::review::ReviewValidationError),
-}
-
-impl std::fmt::Display for ReviewRequestBuildError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AgentSkillRootUnavailable => {
-                formatter.write_str("Agent Skill directory is unavailable")
-            }
-            Self::AgentSkillEntrypointUnavailable => {
-                formatter.write_str("Agent Skill entrypoint is unavailable")
-            }
-            Self::AgentSkillSelectionUnsupported => {
-                formatter.write_str("Agent Skill Review cannot use a selection")
-            }
-            Self::AgentSkillPathIsNotUtf8 => {
-                formatter.write_str("Agent Skill path is not valid UTF-8")
-            }
-            Self::AgentSkillReadFailed => {
-                formatter.write_str("Agent Skill source could not be read")
-            }
-            Self::AgentSkillSourceChanged => {
-                formatter.write_str("Agent Skill source changed while preparing Review")
-            }
-            Self::AgentSkillFileTooLarge { byte_size } => write!(
-                formatter,
-                "Agent Skill file is {byte_size} bytes, above the {MAX_SKILL_FILE_BYTES}-byte source limit"
-            ),
-            Self::AgentSkillPackageTooLarge { byte_size } => write!(
-                formatter,
-                "Agent Skill package is {byte_size} bytes, above the {MAX_SKILL_PACKAGE_BYTES}-byte source limit"
-            ),
-            Self::InvalidAgentSkillPackage(error) => error.fmt(formatter),
-            Self::InvalidSelection => formatter.write_str("selection is outside the frozen source"),
-            Self::InvalidRequest(error) => error.fmt(formatter),
-        }
-    }
-}
-
 fn review_request_build_status_key(error: &ReviewRequestBuildError) -> i18n::Key {
     match error {
         ReviewRequestBuildError::AgentSkillRootUnavailable => {
+            i18n::Key::ReviewSkillPackageUnavailable
+        }
+        ReviewRequestBuildError::AgentSkillSourceUnavailable => {
             i18n::Key::ReviewSkillPackageUnavailable
         }
         ReviewRequestBuildError::AgentSkillEntrypointUnavailable => {
@@ -1606,582 +1410,6 @@ fn review_request_build_status_key(error: &ReviewRequestBuildError) -> i18n::Key
         | ReviewRequestBuildError::InvalidSelection
         | ReviewRequestBuildError::InvalidRequest(_) => i18n::Key::ReviewFailed,
     }
-}
-
-fn is_skill_entrypoint(path: &Path) -> bool {
-    path.file_name() == Some(OsStr::new("SKILL.md"))
-}
-
-struct BuiltDocumentReviewRequest {
-    request: DocumentReviewRequest,
-    skill_package: Option<FrozenSkillPackage>,
-}
-
-fn build_document_review_request_with_identity(
-    target: ReviewTarget,
-    lens: ArtifactLens,
-    source_path: Option<&Path>,
-    full_text: &str,
-    selection: Option<&std::ops::Range<usize>>,
-    snapshot: SourceSnapshot,
-    skill_entrypoint_is_dirty: bool,
-) -> Result<BuiltDocumentReviewRequest, ReviewRequestBuildError> {
-    match target {
-        ReviewTarget::Selection
-            if lens == ArtifactLens::AgentSkill && source_path.is_some_and(is_skill_entrypoint) =>
-        {
-            Err(ReviewRequestBuildError::AgentSkillSelectionUnsupported)
-        }
-        ReviewTarget::Document
-            if lens == ArtifactLens::AgentSkill && source_path.is_some_and(is_skill_entrypoint) =>
-        {
-            let root = source_path
-                .and_then(Path::parent)
-                .ok_or(ReviewRequestBuildError::AgentSkillRootUnavailable)?;
-            let skill_package = build_frozen_agent_skill_package_with_dirty_entrypoint(
-                root,
-                full_text,
-                skill_entrypoint_is_dirty,
-            )?;
-            let request =
-                DocumentReviewRequest::agent_skill(skill_package.package.clone(), snapshot)
-                    .map_err(ReviewRequestBuildError::InvalidRequest)?;
-            Ok(BuiltDocumentReviewRequest {
-                request,
-                skill_package: Some(skill_package),
-            })
-        }
-        _ if lens == ArtifactLens::AgentSkill => {
-            Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable)
-        }
-        ReviewTarget::Document => {
-            let request = DocumentReviewRequest::document(lens, full_text, snapshot)
-                .map_err(ReviewRequestBuildError::InvalidRequest)?;
-            Ok(BuiltDocumentReviewRequest {
-                request,
-                skill_package: None,
-            })
-        }
-        ReviewTarget::Selection => {
-            let range = selection.ok_or(ReviewRequestBuildError::InvalidSelection)?;
-            if range.is_empty() || full_text.get(range.clone()).is_none() {
-                return Err(ReviewRequestBuildError::InvalidSelection);
-            }
-            let absolute_range = ByteRange::new(range.start as u64, range.end as u64)
-                .map_err(ReviewRequestBuildError::InvalidRequest)?;
-            let request =
-                DocumentReviewRequest::selection(lens, full_text, absolute_range, snapshot)
-                    .map_err(ReviewRequestBuildError::InvalidRequest)?;
-            Ok(BuiltDocumentReviewRequest {
-                request,
-                skill_package: None,
-            })
-        }
-    }
-}
-
-fn build_frozen_agent_skill_package_with_dirty_entrypoint(
-    root: &Path,
-    skill_entrypoint_text: &str,
-    skill_entrypoint_is_dirty: bool,
-) -> Result<FrozenSkillPackage, ReviewRequestBuildError> {
-    let entrypoint = if skill_entrypoint_is_dirty {
-        SkillEntrypointSource::EditorText(skill_entrypoint_text.to_owned())
-    } else {
-        SkillEntrypointSource::Disk
-    };
-    build_frozen_agent_skill_package_with_entrypoint(root, entrypoint)
-}
-
-fn build_frozen_agent_skill_package_with_entrypoint(
-    root: &Path,
-    requested_entrypoint: SkillEntrypointSource,
-) -> Result<FrozenSkillPackage, ReviewRequestBuildError> {
-    let root_metadata = std_fs::symlink_metadata(root)
-        .map_err(|_| ReviewRequestBuildError::AgentSkillRootUnavailable)?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err(ReviewRequestBuildError::AgentSkillRootUnavailable);
-    }
-
-    let mut paths = Vec::new();
-    let mut omissions = Vec::new();
-    let mut held_directories = Vec::new();
-    collect_agent_skill_paths(
-        root,
-        root,
-        &mut paths,
-        &mut omissions,
-        &mut held_directories,
-        0,
-        matches!(&requested_entrypoint, SkillEntrypointSource::EditorText(_)),
-    )?;
-    paths.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-
-    let mut files = Vec::with_capacity(paths.len());
-    let mut supporting_files = Vec::with_capacity(paths.len().saturating_sub(1));
-    let mut skill_entrypoint = None;
-    let mut skill_entrypoint_identity = None;
-    let mut total_byte_size = 0_u64;
-    let mut found_entrypoint = false;
-    for relative_path in paths {
-        let (file, byte_size) = if relative_path == "SKILL.md" {
-            found_entrypoint = true;
-            match &requested_entrypoint {
-                SkillEntrypointSource::EditorText(text) => {
-                    skill_entrypoint = Some(SkillEntrypointSource::EditorText(text.clone()));
-                    let byte_size = text.len() as u64;
-                    if byte_size > MAX_SKILL_FILE_BYTES {
-                        return Err(ReviewRequestBuildError::AgentSkillFileTooLarge { byte_size });
-                    }
-                    let file = SkillPackageFile::text(&relative_path, text, "skill entrypoint")
-                        .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?;
-                    (file, byte_size)
-                }
-                SkillEntrypointSource::Disk => {
-                    let source = read_regular_skill_supporting_file(root, &relative_path)?;
-                    skill_entrypoint = Some(SkillEntrypointSource::Disk);
-                    let byte_size = source.identity.byte_size;
-                    let file = skill_package_file_from_disk_bytes(
-                        &relative_path,
-                        &source.bytes,
-                        "skill entrypoint",
-                    )?;
-                    skill_entrypoint_identity = Some(source.identity);
-                    (file, byte_size)
-                }
-            }
-        } else {
-            let source = read_regular_skill_supporting_file(root, &relative_path)?;
-            supporting_files.push(source.identity);
-            let byte_size = source.bytes.len() as u64;
-            let file = skill_package_file_from_disk_bytes(
-                &relative_path,
-                &source.bytes,
-                "supporting file",
-            )?;
-            (file, byte_size)
-        };
-        total_byte_size = total_byte_size.checked_add(byte_size).ok_or(
-            ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                byte_size: u64::MAX,
-            },
-        )?;
-        if total_byte_size > MAX_SKILL_PACKAGE_BYTES {
-            return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                byte_size: total_byte_size,
-            });
-        }
-
-        files.push(file);
-    }
-    if matches!(&requested_entrypoint, SkillEntrypointSource::EditorText(_)) && !found_entrypoint {
-        // A dirty editor snapshot is authoritative for `SKILL.md`. The disk
-        // entrypoint may have been deleted, replaced by a link, become
-        // unreadable, or exceed the source limit while the user is editing;
-        // none of those states should prevent reviewing the valid in-memory
-        // snapshot. Remove only the corresponding disk omission, retaining
-        // every other inventory omission and its partial-result semantics.
-        let had_entrypoint_omission = omissions.iter().any(|omission| omission.path == "SKILL.md");
-        omissions.retain(|omission| omission.path != "SKILL.md");
-        if !had_entrypoint_omission
-            && files.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES
-        {
-            return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                byte_size: u64::MAX,
-            });
-        }
-        let SkillEntrypointSource::EditorText(text) = &requested_entrypoint else {
-            unreachable!("the dirty entrypoint guard above establishes EditorText");
-        };
-        let byte_size = text.len() as u64;
-        if byte_size > MAX_SKILL_FILE_BYTES {
-            return Err(ReviewRequestBuildError::AgentSkillFileTooLarge { byte_size });
-        }
-        let file = SkillPackageFile::text("SKILL.md", text, "skill entrypoint")
-            .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?;
-        total_byte_size = total_byte_size.checked_add(byte_size).ok_or(
-            ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                byte_size: u64::MAX,
-            },
-        )?;
-        if total_byte_size > MAX_SKILL_PACKAGE_BYTES {
-            return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                byte_size: total_byte_size,
-            });
-        }
-        files.push(file);
-        skill_entrypoint = Some(SkillEntrypointSource::EditorText(text.clone()));
-        found_entrypoint = true;
-    }
-    if !found_entrypoint {
-        return Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable);
-    }
-    let skill_entrypoint = skill_entrypoint.expect("found Agent Skill entrypoint has a source");
-    let package = SkillPackage::new(files, omissions)
-        .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?;
-    Ok(FrozenSkillPackage {
-        root: root.to_path_buf(),
-        skill_entrypoint,
-        skill_entrypoint_identity,
-        package,
-        supporting_files,
-    })
-}
-
-fn skill_package_file_from_disk_bytes(
-    relative_path: &str,
-    bytes: &[u8],
-    inclusion_reason: &str,
-) -> Result<SkillPackageFile, ReviewRequestBuildError> {
-    let byte_size = bytes.len() as u64;
-    let file = if mt_doc::walk::bytes_look_binary(bytes) {
-        SkillPackageFile::binary_metadata(
-            relative_path,
-            byte_size,
-            sha256_hex(bytes),
-            inclusion_reason,
-        )
-    } else if let Ok(text) = std::str::from_utf8(bytes) {
-        SkillPackageFile::text(relative_path, text, inclusion_reason)
-    } else {
-        SkillPackageFile::binary_metadata(
-            relative_path,
-            byte_size,
-            sha256_hex(bytes),
-            inclusion_reason,
-        )
-    };
-    file.map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)
-}
-
-fn collect_agent_skill_paths(
-    root: &Path,
-    directory: &Path,
-    paths: &mut Vec<String>,
-    omissions: &mut Vec<SkillPackageOmission>,
-    held_directories: &mut Vec<File>,
-    depth: usize,
-    allow_dirty_entrypoint: bool,
-) -> Result<(), ReviewRequestBuildError> {
-    if depth > MAX_AGENT_SKILL_DIRECTORY_DEPTH
-        || paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES
-    {
-        return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
-            byte_size: u64::MAX,
-        });
-    }
-    if let Some(handle) = hold_regular_skill_directory(directory)? {
-        held_directories.push(handle);
-    }
-    let entries =
-        std_fs::read_dir(directory).map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    for entry in entries {
-        let entry = entry.map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-        let path = entry.path();
-        let relative_path = normalized_skill_relative_path(root, &path)?;
-        let metadata = match std_fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) if allow_dirty_entrypoint && relative_path == "SKILL.md" => continue,
-            Err(_) => return Err(ReviewRequestBuildError::AgentSkillReadFailed),
-        };
-        if metadata.file_type().is_symlink() {
-            if paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES {
-                return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                    byte_size: u64::MAX,
-                });
-            }
-            omissions.push(
-                SkillPackageOmission::symlink(relative_path, "symbolic link omitted")
-                    .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?,
-            );
-        } else if metadata.is_dir() {
-            collect_agent_skill_paths(
-                root,
-                &path,
-                paths,
-                omissions,
-                held_directories,
-                depth.saturating_add(1),
-                allow_dirty_entrypoint,
-            )?;
-        } else if metadata.is_file() {
-            if paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES {
-                return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                    byte_size: u64::MAX,
-                });
-            }
-            paths.push(relative_path);
-        } else {
-            if paths.len().saturating_add(omissions.len()) >= MAX_AGENT_SKILL_INVENTORY_ENTRIES {
-                return Err(ReviewRequestBuildError::AgentSkillPackageTooLarge {
-                    byte_size: u64::MAX,
-                });
-            }
-            omissions.push(
-                SkillPackageOmission::new(relative_path, "non-regular file omitted", false)
-                    .map_err(ReviewRequestBuildError::InvalidAgentSkillPackage)?,
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Keep directories open with delete/write sharing denied on Windows while a
-/// package snapshot is assembled. Together with no-follow file opens, this
-/// prevents a checked directory from being swapped to a symlink before a child
-/// is read. Other targets use descriptor-relative no-follow opens below.
-#[cfg(windows)]
-fn hold_regular_skill_directory(path: &Path) -> Result<Option<File>, ReviewRequestBuildError> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ,
-    };
-
-    let file = std_fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ.0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)
-        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
-    }
-    Ok(Some(file))
-}
-
-#[cfg(not(windows))]
-fn hold_regular_skill_directory(path: &Path) -> Result<Option<File>, ReviewRequestBuildError> {
-    let metadata = std_fs::symlink_metadata(path)
-        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
-    }
-    Ok(None)
-}
-
-fn read_regular_skill_supporting_file(
-    root: &Path,
-    relative_path: &str,
-) -> Result<ReadSkillSupportingFile, ReviewRequestBuildError> {
-    let mut file = open_regular_skill_file(root, relative_path)
-        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    let before = file
-        .metadata()
-        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if !opened_skill_file_is_regular(&before) {
-        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
-    }
-    if before.len() > MAX_SKILL_FILE_BYTES {
-        return Err(ReviewRequestBuildError::AgentSkillFileTooLarge {
-            byte_size: before.len(),
-        });
-    }
-    let object_id =
-        fs::file_object_id(&file).map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.by_ref()
-        .take(MAX_SKILL_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if bytes.len() as u64 > MAX_SKILL_FILE_BYTES {
-        return Err(ReviewRequestBuildError::AgentSkillFileTooLarge {
-            byte_size: bytes.len() as u64,
-        });
-    }
-    let after = file
-        .metadata()
-        .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if !opened_skill_file_is_regular(&after) || after.len() != bytes.len() as u64 {
-        return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
-    }
-    Ok(ReadSkillSupportingFile {
-        identity: SkillSupportingFileIdentity {
-            path: relative_path.to_owned(),
-            byte_size: after.len(),
-            digest: Sha256::digest(&bytes).into(),
-            modified: after.modified().ok(),
-            object_id,
-        },
-        bytes,
-    })
-}
-
-#[cfg(windows)]
-fn open_regular_skill_file(root: &Path, relative_path: &str) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
-
-    std_fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ.0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(skill_package_path(root, relative_path).map_err(invalid_skill_path_error)?)
-}
-
-#[cfg(target_os = "linux")]
-const UNIX_O_NOFOLLOW: i32 = 0o400000;
-
-// Darwin's `<fcntl.h>` value. Keep this target-specific rather than falling
-// back to a metadata check: a metadata check cannot close the link-swap race.
-#[cfg(target_os = "macos")]
-const UNIX_O_NOFOLLOW: i32 = 0x100;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn open_regular_skill_file(root: &Path, relative_path: &str) -> std::io::Result<File> {
-    open_regular_skill_file_at(root, relative_path, UNIX_O_NOFOLLOW)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn open_regular_skill_file(_: &Path, _: &str) -> std::io::Result<File> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "no descriptor-relative no-follow skill file open is available on this target",
-    ))
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn open_regular_skill_file_at(
-    root: &Path,
-    relative_path: &str,
-    no_follow: i32,
-) -> std::io::Result<File> {
-    use std::ffi::{CString, c_char, c_int};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    unsafe extern "C" {
-        fn openat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
-    }
-
-    let components =
-        validated_skill_relative_components(relative_path).map_err(invalid_skill_path_error)?;
-    let mut directory = std_fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(no_follow)
-        .open(root)?;
-    if !directory.metadata()?.is_dir() {
-        return Err(std::io::Error::other("Agent Skill root is not a directory"));
-    }
-    for (index, component) in components.iter().enumerate() {
-        let component = CString::new(*component)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
-        // SAFETY: `directory` owns the live directory descriptor; `component`
-        // is a NUL-terminated component with no separators; `openat` returns a
-        // newly owned descriptor only on a non-negative result.
-        let descriptor = unsafe { openat(directory.as_raw_fd(), component.as_ptr(), no_follow) };
-        if descriptor < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `openat` returned a new owned descriptor above.
-        let next = unsafe { File::from_raw_fd(descriptor) };
-        if index + 1 == components.len() {
-            return Ok(next);
-        }
-        if !next.metadata()?.is_dir() {
-            return Err(std::io::Error::other(
-                "Agent Skill path component is not a directory",
-            ));
-        }
-        directory = next;
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        "Agent Skill supporting path is empty",
-    ))
-}
-
-#[cfg(not(any(windows, unix)))]
-fn open_regular_skill_file(_: &Path, _: &str) -> std::io::Result<File> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "no no-follow skill file open is available on this target",
-    ))
-}
-
-#[cfg(windows)]
-fn opened_skill_file_is_regular(metadata: &std_fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
-}
-
-#[cfg(not(windows))]
-fn opened_skill_file_is_regular(metadata: &std_fs::Metadata) -> bool {
-    metadata.is_file() && !metadata.file_type().is_symlink()
-}
-
-fn skill_package_path(
-    root: &Path,
-    relative_path: &str,
-) -> Result<PathBuf, ReviewRequestBuildError> {
-    let mut path = root.to_path_buf();
-    for component in validated_skill_relative_components(relative_path)? {
-        path.push(component);
-    }
-    Ok(path)
-}
-
-fn validated_skill_relative_components(
-    relative_path: &str,
-) -> Result<Vec<&str>, ReviewRequestBuildError> {
-    let components = relative_path.split('/').collect::<Vec<_>>();
-    if components.is_empty()
-        || components
-            .iter()
-            .any(|component| component.is_empty() || matches!(*component, "." | ".."))
-    {
-        return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
-    }
-    // On Unix, backslash is a legal filename byte. `mt-doc` normalizes it to
-    // `/` at the package boundary, though, so accepting it here would make
-    // the path we discovered differ from the path we later reopen.
-    #[cfg(unix)]
-    if components.iter().any(|component| component.contains('\\')) {
-        return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
-    }
-    Ok(components)
-}
-
-fn invalid_skill_path_error(error: ReviewRequestBuildError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-}
-
-fn normalized_skill_relative_path(
-    root: &Path,
-    path: &Path,
-) -> Result<String, ReviewRequestBuildError> {
-    let relative_path = path
-        .strip_prefix(root)
-        .map_err(|_| ReviewRequestBuildError::AgentSkillPathIsNotUtf8)?;
-    let mut components = Vec::new();
-    for component in relative_path.components() {
-        let Component::Normal(component) = component else {
-            return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
-        };
-        components.push(
-            component
-                .to_str()
-                .ok_or(ReviewRequestBuildError::AgentSkillPathIsNotUtf8)?,
-        );
-    }
-    if components.is_empty() {
-        return Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8);
-    }
-    let normalized = components.join("/");
-    validated_skill_relative_components(&normalized)?;
-    Ok(normalized)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -2522,7 +1750,9 @@ impl Workspace {
             root: None,
             explorer: None,
             harness: None,
-            skill_cache: Arc::new(Mutex::new(mt_doc::skill::DiscoveryCache::default())),
+            skill_cache: Arc::new(Mutex::new(
+                mt_core::agent_artifacts::skill::DiscoveryCache::default(),
+            )),
             search: cx.new(|cx| SearchView::new(window, cx)),
             settings: cx.new(|cx| SettingsView::new(window, cx)),
             side_panel: SidePanel::Files,
@@ -2673,12 +1903,12 @@ impl Workspace {
         this._subscriptions
             .push(window.observe_window_appearance(move |window, cx| {
                 if crate::settings::AppSettings::global(cx).theme
-                    != crate::settings::ThemePreference::System
+                    != mt_core::settings::ThemePreference::System
                 {
                     return;
                 }
                 crate::settings::apply_theme(
-                    crate::settings::ThemePreference::System,
+                    mt_core::settings::ThemePreference::System,
                     Some(window),
                     cx,
                 );
@@ -2833,11 +2063,20 @@ impl Workspace {
             return true;
         }
 
-        // Replace the outgoing preview rather than accumulating tabs. Its edits
-        // are the one thing that must not be discarded silently, so a dirty
-        // preview is kept and simply stops being one.
-        if preview
-            && let Some(current) = self.tabs.take_preview()
+        self.retire_outgoing_preview(preview, cx);
+
+        let opened = self.open_file_inner(path.clone(), window, cx);
+        self.tabs.set_preview((preview && opened).then_some(path));
+        cx.notify();
+        opened
+    }
+
+    /// Replace an outgoing preview without discarding unsaved work.
+    fn retire_outgoing_preview(&mut self, preview: bool, cx: &mut Context<Self>) {
+        if !preview {
+            return;
+        }
+        if let Some(current) = self.tabs.take_preview()
             && let Some(ix) = self.tabs.index_of(&current)
         {
             let preserve = self.tabs.get(ix).is_some_and(|tab| {
@@ -2852,17 +2091,10 @@ impl Workspace {
                     || self.is_undurable_recovery_retirement(&key)
                     || self.revision_has_authored_answers_for_document(document_id, cx)
             });
-            if preserve {
-                // Keep it: promoting beats losing unsaved work.
-            } else {
+            if !preserve {
                 self.close_tab_unchecked(ix, cx);
             }
         }
-
-        let opened = self.open_file_inner(path.clone(), window, cx);
-        self.tabs.set_preview((preview && opened).then_some(path));
-        cx.notify();
-        opened
     }
 
     /// Focus the tab showing `path`, if it is open.
@@ -2905,6 +2137,75 @@ impl Workspace {
         true
     }
 
+    /// Show the exact verified bytes of a frozen supporting file as a preview.
+    /// A path-matching tab is reused only when its clean source still matches
+    /// the verified load; an old clean buffer is not safe to present as an
+    /// anchor into this package snapshot.
+    fn open_frozen_supporting_file(
+        &mut self,
+        package: &FrozenSkillPackage,
+        path: PathBuf,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = package.load_frozen_supporting_file(&path) else {
+            self.mark_review_skill_package_stale(cx);
+            return;
+        };
+        let loaded_path = file.path.clone();
+        let existing = self.tabs.iter().enumerate().find_map(|(ix, tab)| {
+            let path = tab.path()?;
+            fs::paths_match(path, &loaded_path).then(|| (ix, path.to_path_buf()))
+        });
+
+        let shown_path = if let Some((ix, existing_path)) = existing {
+            let Some(document) = self.document_at(ix).cloned() else {
+                return;
+            };
+            let (is_dirty, matches_frozen_file) = {
+                let document = document.read(cx);
+                (document.is_dirty(), document.matches_loaded_file(&file, cx))
+            };
+            if is_dirty {
+                self.mark_review_skill_package_stale(cx);
+                return;
+            }
+            if !matches_frozen_file {
+                self.set_status(i18n::t(i18n::Key::ReviewStale, cx).into(), cx);
+                return;
+            }
+
+            // This exact identity was found in the tab set and its contents
+            // were checked above, so the ordinary open path only focuses it;
+            // it cannot fall through to a pathname read.
+            if !self.open_file_as(existing_path.clone(), true, window, cx) {
+                return;
+            }
+            existing_path
+        } else {
+            self.retire_outgoing_preview(true, cx);
+            self.settings_open = false;
+            let registry = self.registry.clone();
+            let view = cx.new(|cx| DocumentView::new(file, registry, window, cx));
+            self.insert_document(loaded_path.clone(), view, window, cx);
+            self.tabs.set_preview(Some(loaded_path.clone()));
+            cx.notify();
+            loaded_path
+        };
+
+        let Some(document) = self.active_document().cloned() else {
+            return;
+        };
+        if document.read(cx).source_path() != Some(shown_path.as_path()) {
+            return;
+        }
+        self.record_visit(shown_path, offset);
+        document.update(cx, |document, cx| {
+            document.reveal_offset(offset, window, cx)
+        });
+    }
+
     /// Create a Markdown buffer before it has a filesystem path.
     pub fn new_memory(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
@@ -2944,7 +2245,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !path.is_file() || !crate::workspace::is_openable(&path) {
+        if !path.is_file() || !mt_core::workspace::is_openable(&path) {
             self.set_status(format!("Cannot open {}", path.display()), cx);
             return false;
         }
@@ -2961,17 +2262,17 @@ impl Workspace {
     }
 
     fn record_recent_file(&self, path: PathBuf, cx: &mut Context<Self>) {
-        self.record_recent_target(path, crate::settings::RecentTargetKind::File, cx);
+        self.record_recent_target(path, mt_core::settings::RecentTargetKind::File, cx);
     }
 
     fn record_recent_workspace(&self, path: PathBuf, cx: &mut Context<Self>) {
-        self.record_recent_target(path, crate::settings::RecentTargetKind::Workspace, cx);
+        self.record_recent_target(path, mt_core::settings::RecentTargetKind::Workspace, cx);
     }
 
     fn record_recent_target(
         &self,
         path: PathBuf,
-        kind: crate::settings::RecentTargetKind,
+        kind: mt_core::settings::RecentTargetKind,
         cx: &mut Context<Self>,
     ) {
         let display_name = path
@@ -2980,7 +2281,7 @@ impl Workspace {
             .filter(|name| !name.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let target = crate::settings::RecentTarget::new(path, kind, display_name);
+        let target = mt_core::settings::RecentTarget::new(path, kind, display_name);
         if crate::settings::AppSettings::global(cx)
             .recent_targets
             .first()
@@ -3026,7 +2327,7 @@ impl Workspace {
 
     fn welcome_recent_target_issue(
         &self,
-        target: &crate::settings::RecentTarget,
+        target: &mt_core::settings::RecentTarget,
     ) -> Option<i18n::Key> {
         self.welcome_recent_issues
             .get(&target.path)
@@ -3146,6 +2447,10 @@ impl Workspace {
                     DocumentEvent::ScrollWebPreview(fraction) => {
                         this.queue_web_scroll(*fraction, cx)
                     }
+                    DocumentEvent::RetryWebPreview => this.retry_web_preview(document, cx),
+                    DocumentEvent::WebPreviewLayoutLeft => {
+                        this.web_preview_layout_left(document, cx)
+                    }
                 },
             ),
             // A document notifies on mode change, trust change, and after a
@@ -3181,7 +2486,7 @@ impl Workspace {
     fn restore_prepared_recovery(
         &mut self,
         documents: Vec<PreparedRecovery>,
-        startup_targets: Option<&HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)>>,
+        startup_targets: Option<&HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (usize, usize) {
@@ -3289,7 +2594,7 @@ impl Workspace {
     fn start_startup_recovery<F>(
         &mut self,
         load_startup_recovery: F,
-        startup_targets: HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)>,
+        startup_targets: HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) where
@@ -3329,7 +2634,7 @@ impl Workspace {
     fn startup_recovery_targets(
         &self,
         cx: &App,
-    ) -> HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)> {
+    ) -> HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)> {
         self.tabs
             .iter()
             .filter_map(|tab| {
@@ -3388,7 +2693,7 @@ impl Workspace {
     fn restore_startup_recovery(
         &mut self,
         mut startup: StartupRecovery,
-        startup_targets: HashMap<PathBuf, (crate::lifecycle::DocumentId, u64)>,
+        startup_targets: HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3588,7 +2893,11 @@ impl Workspace {
             .collect()
     }
 
-    fn document_index(&self, id: crate::lifecycle::DocumentId, cx: &App) -> Option<usize> {
+    fn document_index(
+        &self,
+        id: mt_core::document::lifecycle::DocumentId,
+        cx: &App,
+    ) -> Option<usize> {
         self.tabs
             .iter()
             .position(|tab| tab.payload.view.read(cx).id() == id)
@@ -3596,7 +2905,7 @@ impl Workspace {
 
     fn document_by_id(
         &self,
-        id: crate::lifecycle::DocumentId,
+        id: mt_core::document::lifecycle::DocumentId,
         cx: &App,
     ) -> Option<Entity<DocumentView>> {
         self.document_index(id, cx)
@@ -3875,7 +3184,11 @@ impl Workspace {
         }
     }
 
-    fn save_as_snapshot_is_current(&self, id: crate::lifecycle::DocumentId, cx: &App) -> bool {
+    fn save_as_snapshot_is_current(
+        &self,
+        id: mt_core::document::lifecycle::DocumentId,
+        cx: &App,
+    ) -> bool {
         match self.pending_destructive.as_ref() {
             None => true,
             Some(request) => {
@@ -3885,7 +3198,7 @@ impl Workspace {
         }
     }
 
-    fn cancel_pending_destructive_save_as(&mut self, id: crate::lifecycle::DocumentId) {
+    fn cancel_pending_destructive_save_as(&mut self, id: mt_core::document::lifecycle::DocumentId) {
         if self
             .pending_destructive
             .as_ref()
@@ -3898,8 +3211,8 @@ impl Workspace {
 
     fn complete_pending_destructive_save_as(
         &mut self,
-        id: crate::lifecycle::DocumentId,
-        saved_snapshot: crate::lifecycle::BufferSnapshot,
+        id: mt_core::document::lifecycle::DocumentId,
+        saved_snapshot: mt_core::document::lifecycle::BufferSnapshot,
         recovery_key: RecoveryKey,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -4566,7 +3879,7 @@ impl Workspace {
     /// Remove one document's deadline before invalidating checkpoint work.
     fn remove_recovery_schedule(
         &mut self,
-        id: crate::lifecycle::DocumentId,
+        id: mt_core::document::lifecycle::DocumentId,
         cx: &mut Context<Self>,
     ) -> Option<RecoveryKey> {
         let key = self.recovery_schedules.remove(&id).map(|state| {
@@ -4945,7 +4258,7 @@ impl Workspace {
 
     fn retire_document_recovery(
         &mut self,
-        id: crate::lifecycle::DocumentId,
+        id: mt_core::document::lifecycle::DocumentId,
         fallback_key: Option<RecoveryKey>,
         cx: &mut Context<Self>,
     ) -> Option<RecoveryKey> {
@@ -5414,7 +4727,7 @@ impl Workspace {
     fn finish_recovery_checkpoints(
         &mut self,
         results: Vec<(
-            crate::lifecycle::DocumentId,
+            mt_core::document::lifecycle::DocumentId,
             RecoveryAttempt,
             CheckpointBatchOutcome,
         )>,
@@ -5570,7 +4883,7 @@ impl Workspace {
             review.skill_package.as_ref().is_some_and(|package| {
                 changes
                     .iter()
-                    .any(|change| change.path().starts_with(&package.root))
+                    .any(|change| package.path_affects_root(change.path()))
             })
         });
         if review_supporting_source_changed && let Some(review) = &mut self.review_result {
@@ -5584,7 +4897,7 @@ impl Workspace {
             .is_some_and(|package| {
                 changes
                     .iter()
-                    .any(|change| change.path().starts_with(&package.root))
+                    .any(|change| package.path_affects_root(change.path()))
             });
         if revision_supporting_source_changed && let Some(context) = &mut self.revision_context {
             context.supporting_sources_current = false;
@@ -5727,7 +5040,7 @@ impl Workspace {
 
     fn prompt_save_as(
         &mut self,
-        id: crate::lifecycle::DocumentId,
+        id: mt_core::document::lifecycle::DocumentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5736,7 +5049,7 @@ impl Workspace {
 
     fn prompt_destructive_save_as(
         &mut self,
-        id: crate::lifecycle::DocumentId,
+        id: mt_core::document::lifecycle::DocumentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5846,7 +5159,7 @@ impl Workspace {
     #[cfg(test)]
     fn finish_save_as_selection(
         &mut self,
-        id: crate::lifecycle::DocumentId,
+        id: mt_core::document::lifecycle::DocumentId,
         path: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -6009,7 +5322,7 @@ impl Workspace {
             existing != ix
                 && tab
                     .path()
-                    .is_some_and(|candidate| paths_match(candidate, &path))
+                    .is_some_and(|candidate| fs::paths_match(candidate, &path))
         }) {
             self.cancel_save_as_request(id, ticket);
             self.set_status(i18n::save_as_path_already_open_message(&path, cx), cx);
@@ -6178,7 +5491,7 @@ impl Workspace {
                 self.open_target(path.clone(), true, window, cx);
                 opened += 1;
                 break;
-            } else if crate::workspace::is_openable(path) {
+            } else if mt_core::workspace::is_openable(path) {
                 opened += usize::from(self.open_target(path.clone(), true, window, cx));
             } else {
                 skipped.push(
@@ -6453,7 +5766,7 @@ impl Workspace {
         &mut self,
         document_id: DocumentId,
         recovery_key: RecoveryKey,
-        source_snapshot: crate::lifecycle::AsyncSnapshot,
+        source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
         request: DocumentReviewRequest,
         review_output: ReviewModelOutput,
         skill_package: Option<FrozenSkillPackage>,
@@ -7300,11 +6613,11 @@ impl Workspace {
             }
         };
         let language = match crate::settings::AppSettings::global(cx).language {
-            crate::settings::Language::English => ReviewLanguage::English,
-            crate::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
+            mt_core::settings::Language::English => ReviewLanguage::English,
+            mt_core::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
         };
         let settings = crate::settings::AppSettings::global(cx).clone();
-        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let vault = crate::credentials::AppCredentialVault::global(cx).clone();
         let prepared = match PreparedReview::from_settings(&settings, &vault) {
             Ok(prepared) => {
                 match prepared.bind_revision_request(request, review_output, answers, language) {
@@ -7427,7 +6740,7 @@ impl Workspace {
                                 prepared.execute_with(
                                     authorization,
                                     &cancel_for_request,
-                                    crate::review::REVISION_REQUEST_TIMEOUT,
+                                    mt_core::review::provider::REVISION_REQUEST_TIMEOUT,
                                 )
                             })
                             .await;
@@ -7721,13 +7034,13 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     fn start_review_after_preparation(
         &mut self,
-        built_request: Result<BuiltDocumentReviewRequest, ReviewRequestBuildError>,
+        built_request: Result<ReviewRequestBuildResult, ReviewRequestBuildError>,
         target: ReviewTarget,
         document_id: DocumentId,
         lens: ArtifactLens,
         language: ReviewLanguage,
         selection: Option<std::ops::Range<usize>>,
-        source_snapshot: crate::lifecycle::AsyncSnapshot,
+        source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
         doc: WeakEntity<DocumentView>,
         generation: u64,
         cancelled: Arc<AtomicBool>,
@@ -7773,13 +7086,12 @@ impl Workspace {
                 return;
             }
         };
-        let partial = built_request
-            .request
+        let (request, skill_package) = built_request.into_parts();
+        let partial = request
             .source
             .package()
             .is_some_and(SkillPackage::is_partial);
-        let frozen_request = built_request.request.clone();
-        let skill_package = built_request.skill_package;
+        let frozen_request = request.clone();
         if let Some(skill_package) = &skill_package
             && self.has_dirty_skill_supporting_document(skill_package, cx)
         {
@@ -7798,9 +7110,9 @@ impl Workspace {
         }
 
         let settings = crate::settings::AppSettings::global(cx).clone();
-        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let vault = crate::credentials::AppCredentialVault::global(cx).clone();
         let prepared = match PreparedReview::from_settings(&settings, &vault) {
-            Ok(prepared) => match prepared.bind_document_request(built_request.request, language) {
+            Ok(prepared) => match prepared.bind_document_request(request, language) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     self.reviewing = false;
@@ -8240,12 +7552,13 @@ impl Workspace {
         let Some(doc) = self.active_document().cloned() else {
             return;
         };
-        let (document_id, source_path, skill_entrypoint_is_dirty) = {
+        let (document_id, source_path, skill_entrypoint_is_dirty, skill_origin) = {
             let document = doc.read(cx);
             (
                 document.id(),
                 document.source_path().map(Path::to_path_buf),
                 document.is_dirty(),
+                document.skill_origin().cloned(),
             )
         };
         if self.revision_has_authored_answers_for_document(document_id, cx) {
@@ -8305,8 +7618,8 @@ impl Workspace {
         };
 
         let language = match crate::settings::AppSettings::global(cx).language {
-            crate::settings::Language::English => ReviewLanguage::English,
-            crate::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
+            mt_core::settings::Language::English => ReviewLanguage::English,
+            mt_core::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
         };
         let document_snapshot =
             SourceSnapshot::new(doc.read(cx).revision(), source_snapshot.source_generation());
@@ -8327,18 +7640,22 @@ impl Workspace {
         let source_path_for_prepare = source_path.clone();
         let full_text_for_prepare = full_text.clone();
         let selection_for_prepare = selection.clone();
+        let skill_origin_for_prepare = skill_origin;
         let selection_for_result = selection.clone();
         cx.spawn_in(window, async move |this, cx| {
             let built_request = cx
                 .background_spawn(async move {
-                    build_document_review_request_with_identity(
-                        target,
-                        lens,
-                        source_path_for_prepare.as_deref(),
-                        &full_text_for_prepare,
-                        selection_for_prepare.as_ref(),
-                        document_snapshot,
-                        skill_entrypoint_is_dirty,
+                    build_review_request(
+                        ReviewRequestBuildRequest::new(
+                            target,
+                            lens,
+                            source_path_for_prepare.as_deref(),
+                            &full_text_for_prepare,
+                            selection_for_prepare.as_ref(),
+                            document_snapshot,
+                            skill_entrypoint_is_dirty,
+                        )
+                        .with_skill_origin(skill_origin_for_prepare.as_ref()),
                     )
                 })
                 .await;
@@ -8497,7 +7814,7 @@ impl Workspace {
             return;
         }
         let settings = crate::settings::AppSettings::global(cx).clone();
-        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let vault = crate::credentials::AppCredentialVault::global(cx).clone();
         let prepared = match PreparedTranslation::from_settings(&settings, &vault) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -8569,7 +7886,7 @@ impl Workspace {
         let source_snapshot = doc.read(cx).async_snapshot(cx);
         let text = source_snapshot.text().to_owned();
         let doc_type = doc.read(cx).document().doc_type();
-        let source = mt_doc::Document::with_type(doc_type, text);
+        let source = mt_core::Document::with_type(doc_type, text);
         let request = TranslationRequest::prepare(&source, &scope);
         if request.inputs().is_empty() {
             self.set_status("No translatable text in the selected scope".into(), cx);
@@ -8577,7 +7894,7 @@ impl Workspace {
         }
 
         let settings = crate::settings::AppSettings::global(cx).clone();
-        let vault = crate::credentials::CredentialVault::global(cx).clone();
+        let vault = crate::credentials::AppCredentialVault::global(cx).clone();
         let prepared = match PreparedTranslation::from_settings(&settings, &vault) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -9848,7 +9165,7 @@ impl Workspace {
                     self.root
                         .as_deref()
                         .filter(|root| path.starts_with(root))
-                        .map(|root| crate::workspace::display_relative(root, path))
+                        .map(|root| mt_core::workspace::display_relative(root, path))
                         .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"))
                 },
             );
@@ -10173,7 +9490,8 @@ impl Workspace {
             return;
         }
 
-        if let Some(offset) = review_anchor_offset(anchor, review.source_snapshot.text()) {
+        if let Some(offset) = resolve_document_anchor_offset(anchor, review.source_snapshot.text())
+        {
             self.reveal_offset(offset, window, cx);
             return;
         }
@@ -10184,25 +9502,37 @@ impl Workspace {
         if self.has_dirty_skill_supporting_document(&skill_package, cx)
             || skill_package.revalidate().is_err()
         {
-            if let Some(review) = &mut self.review_result {
-                review.supporting_sources_current = false;
-                review.result.result.status = ReviewStatus::Stale;
-            }
-            self.set_status(i18n::t(i18n::Key::ReviewStale, cx).into(), cx);
-            cx.notify();
+            self.mark_review_skill_package_stale(cx);
             return;
         }
         let Some((path, offset)) = skill_package.resolve_anchor(anchor) else {
             return;
         };
-        self.reveal_in(path, offset, window, cx);
+        let is_skill_entrypoint_anchor =
+            matches!(anchor, SourceAnchor::AgentSkillFile { path, .. } if path == "SKILL.md");
+        let editor_only_entrypoint_anchor =
+            skill_package.entrypoint_is_editor_text() && is_skill_entrypoint_anchor;
+        if editor_only_entrypoint_anchor {
+            // The active document and this result were checked against the same
+            // immutable snapshot above. In particular, editor-only SKILL.md
+            // anchors must reveal that dirty buffer rather than reopening the
+            // entrypoint through its canonical pathname.
+            self.reveal_offset(offset, window, cx);
+            return;
+        }
+        if is_skill_entrypoint_anchor {
+            // A disk-backed SKILL.md is also the active source document whose
+            // identity and text snapshot were verified above. Keep navigation
+            // on that tab rather than reopening the frozen package pathname.
+            self.reveal_offset(offset, window, cx);
+            return;
+        }
+        self.open_frozen_supporting_file(&skill_package, path, offset, window, cx);
     }
 
-    /// Open `path` (as a preview) and put the cursor at `offset`.
-    ///
-    /// The search-result path. A preview open because scanning a result list is
-    /// exactly the browsing a preview tab exists for; a double click in the
-    /// tree or an edit still promotes it.
+    /// Open a search result as a preview and put the cursor at its offset.
+    /// Search results are ordinary workspace paths; Agent Skill anchors use
+    /// the frozen-package path above instead.
     fn reveal_in(
         &mut self,
         path: PathBuf,
@@ -10211,16 +9541,25 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.open_file_as(path.clone(), true, window, cx);
-        let Some(doc) = self.active_document().cloned() else {
+        let Some(document) = self.active_document().cloned() else {
             return;
         };
-        // Guard against the open having failed — landing the cursor in whatever
-        // tab happened to be active would be worse than doing nothing.
-        if doc.read(cx).source_path() != Some(path.as_path()) {
+        if document.read(cx).source_path() != Some(path.as_path()) {
             return;
         }
         self.record_visit(path, offset);
-        doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
+        document.update(cx, |document, cx| {
+            document.reveal_offset(offset, window, cx)
+        });
+    }
+
+    fn mark_review_skill_package_stale(&mut self, cx: &mut Context<Self>) {
+        if let Some(review) = &mut self.review_result {
+            review.supporting_sources_current = false;
+            review.result.result.status = ReviewStatus::Stale;
+        }
+        self.set_status(i18n::t(i18n::Key::ReviewStale, cx).into(), cx);
+        cx.notify();
     }
 
     /// Show the Search panel and put the caret in its field.
@@ -10635,8 +9974,8 @@ impl Workspace {
                                         "markturbo-welcome-recent-status-{identity}"
                                     ));
                                     let icon = match target.kind {
-                                        crate::settings::RecentTargetKind::File => IconName::File,
-                                        crate::settings::RecentTargetKind::Workspace => {
+                                        mt_core::settings::RecentTargetKind::File => IconName::File,
+                                        mt_core::settings::RecentTargetKind::Workspace => {
                                             IconName::Folder
                                         }
                                     };
@@ -11574,7 +10913,7 @@ impl Render for Workspace {
 
 /// Keybindings for the workspace's actions.
 pub fn init(cx: &mut App) {
-    crate::credentials::CredentialVault::init(cx);
+    crate::credentials::AppCredentialVault::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewDocument, None),
         KeyBinding::new("ctrl-n", NewDocument, None),
@@ -11647,40 +10986,39 @@ mod tests {
     // limit.
     use super::{
         DestructiveAction, DestructiveRequest, DestructiveResolution, DetailsContent,
-        DirtyDecision, DocumentRecoveryState, RecoveryAttempt, RecoveryContentIdentity,
-        RetirementCompletion, ReviewRequestBuildError, ReviewTarget, SaveAsMode, SaveAsOutcome,
-        SaveMode, SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace, WorkspaceResizeEdge,
-        checkpoint_batch_status, clamped_dragged_panel_width, current_checkpoint_write_completed,
-        current_checkpoint_write_completed_for_identity, details_content,
-        document_details_status_key, elide_tab_label, hex_bytes, next_review_lens,
+        DirtyDecision, DocumentRecoveryState, DocumentView, RecoveryAttempt,
+        RecoveryContentIdentity, RetirementCompletion, ReviewRequestBuildError, ReviewTarget,
+        SaveAsMode, SaveAsOutcome, SaveMode, SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace,
+        WorkspaceResizeEdge, checkpoint_batch_status, clamped_dragged_panel_width,
+        current_checkpoint_write_completed, current_checkpoint_write_completed_for_identity,
+        details_content, document_details_status_key, elide_tab_label, hex_bytes, next_review_lens,
         path_affects_harness, prepare_recovery_records, resolved_workspace_panel_widths,
-        review_anchor_offset, revision_answer_is_incorporated, revision_apply_identity_matches,
-        startup_recovery_status,
+        revision_answer_is_incorporated, revision_apply_identity_matches, startup_recovery_status,
     };
-    use crate::fs::{FileStamp, Newline, SourceIdentity};
     use crate::i18n;
-    use crate::model::RevisionRequestBinding;
-    use crate::recovery::{
-        CheckpointBatchOutcome, CheckpointOutcome, CheckpointSchedule, RecoveredRecord,
-        RecoveryCheckpoint, RecoveryError, RecoveryIssue, RecoveryKey, RecoveryLimits,
-        RecoveryMaintenance, RecoveryMetadata, RecoveryProtector, RecoveryRecord, RecoveryScan,
-        RecoveryStore, RecoveryToken, RevisionRecovery,
-    };
-    use crate::review::{
-        RevisionAnswer, RevisionAnswers, RevisionQuestionCoverageStatus, decode_revision_capture,
-    };
     use crate::views::Layout;
-    use crate::watcher::Change;
     use crate::web::{self, Trust};
     use gpui_kit::{
         AppContext as _, ClipboardItem, Context, Entity, Focusable as _, Modifiers, MouseButton,
         TestAppContext, VisualTestContext, Window, point, px,
     };
-    use mt_doc::review::{
-        ArtifactLens, ByteRange, ClarificationPriority, ClarificationQuestion, ReviewModelOutput,
-        ReviewSections, SourceAnchor, SourceLocation, SourceSnapshot,
+    use mt_core::document::io::{FileStamp, Newline, SourceIdentity};
+    use mt_core::model::RevisionRequestBinding;
+    use mt_core::recovery::{
+        CheckpointBatchOutcome, CheckpointOutcome, CheckpointSchedule, RecoveredRecord,
+        RecoveryCheckpoint, RecoveryError, RecoveryIssue, RecoveryKey, RecoveryLimits,
+        RecoveryMaintenance, RecoveryMetadata, RecoveryProtector, RecoveryRecord, RecoveryScan,
+        RecoveryStore, RecoveryToken, RevisionRecovery,
     };
-    use mt_doc::revision::ChangeId;
+    use mt_core::review::provider::{
+        RevisionAnswer, RevisionAnswers, RevisionQuestionCoverageStatus, decode_revision_capture,
+    };
+    use mt_core::review::revision::ChangeId;
+    use mt_core::review::{
+        ArtifactLens, ClarificationPriority, ClarificationQuestion, ReviewDiagnosticCode,
+        ReviewModelOutput, ReviewSections, SourceAnchor, SourceLocation, SourceSnapshot,
+    };
+    use mt_core::workspace::watcher::Change;
 
     fn build_document_review_request(
         target: ReviewTarget,
@@ -11689,8 +11027,8 @@ mod tests {
         full_text: &str,
         selection: Option<&std::ops::Range<usize>>,
         snapshot: SourceSnapshot,
-    ) -> Result<mt_doc::review::ReviewRequest, ReviewRequestBuildError> {
-        super::build_document_review_request_with_identity(
+    ) -> Result<mt_core::review::ReviewRequest, ReviewRequestBuildError> {
+        super::build_review_request(super::ReviewRequestBuildRequest::new(
             target,
             lens,
             source_path,
@@ -11698,8 +11036,96 @@ mod tests {
             selection,
             snapshot,
             false,
-        )
-        .map(|built| built.request)
+        ))
+        .map(|built| built.into_parts().0)
+    }
+
+    fn install_frozen_skill_review(
+        workspace: &Entity<Workspace>,
+        relative_path: &str,
+        location: SourceLocation,
+        cx: &mut VisualTestContext,
+    ) -> SourceAnchor {
+        let anchor = SourceAnchor::agent_skill_file(relative_path, location).unwrap();
+        workspace.update(cx, |workspace, cx| {
+            let document = workspace.active_document().unwrap().clone();
+            let (document_id, source_path, text, is_dirty, source_snapshot, origin, source) = {
+                let document = document.read(cx);
+                let source_snapshot = document.async_snapshot(cx);
+                let source =
+                    SourceSnapshot::new(document.revision(), source_snapshot.source_generation());
+                (
+                    document.id(),
+                    document.source_path().map(Path::to_path_buf),
+                    document.text(cx),
+                    document.is_dirty(),
+                    source_snapshot,
+                    document.skill_origin().cloned(),
+                    source,
+                )
+            };
+            let origin = origin.expect("Skill Review fixture must use an actual loaded origin");
+            let (request, skill_package) = super::build_review_request(
+                super::ReviewRequestBuildRequest::new(
+                    ReviewTarget::Document,
+                    ArtifactLens::AgentSkill,
+                    source_path.as_deref(),
+                    &text,
+                    None,
+                    source,
+                    is_dirty,
+                )
+                .with_skill_origin(Some(&origin)),
+            )
+            .unwrap()
+            .into_parts();
+            let skill_package = skill_package.expect("Skill Review freezes its inventory");
+            let output = ReviewModelOutput {
+                schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
+                scope: request.scope,
+                understood_intent: ReviewSections {
+                    stated_goal: "navigate the frozen source".into(),
+                    relevant_context: Vec::new(),
+                    constraints: Vec::new(),
+                    non_goals: Vec::new(),
+                    expected_deliverable: "a source anchor".into(),
+                    success_evidence: Vec::new(),
+                    inferred_assumptions: Vec::new(),
+                    unresolved_decisions: Vec::new(),
+                },
+                findings: vec![mt_core::review::Finding::inference(
+                    "Inspect this source location",
+                    anchor.clone(),
+                )],
+                clarification_questions: Vec::new(),
+            };
+            let result = mt_core::review::ReviewResult::ready(&request, output)
+                .expect("test anchor belongs to the frozen package");
+            let partial = request
+                .source
+                .package()
+                .is_some_and(mt_core::review::SkillPackage::is_partial);
+            workspace.review_result = Some(super::WorkspaceReviewResult {
+                document_id,
+                source_snapshot,
+                target: ReviewTarget::Document,
+                selection: None,
+                lens: ArtifactLens::AgentSkill,
+                partial,
+                skill_package: Some(skill_package),
+                supporting_sources_current: true,
+                result: mt_core::review::provider::ReviewTransportResult {
+                    result,
+                    metadata: mt_core::review::provider::ReviewMetadata::from_response(
+                        mt_core::model::Provider::OpenAiResponses,
+                        "test-model",
+                        "test-model",
+                    )
+                    .unwrap(),
+                },
+            });
+        });
+        anchor
     }
 
     fn open_test_workspace(
@@ -11852,7 +11278,7 @@ mod tests {
 
     #[cfg(feature = "model-transport")]
     fn configure_test_translation(cx: &mut VisualTestContext, base_url: &str) {
-        use crate::model::{EndpointIdentity, Provider};
+        use mt_core::model::{EndpointIdentity, Provider};
 
         let endpoint = EndpointIdentity::parse(Provider::OpenAiChat, Some(base_url)).unwrap();
         cx.update(|_, app| {
@@ -11862,7 +11288,7 @@ mod tests {
                 settings.model_base_url = base_url.into();
                 settings.translate_to = "fr".into();
             });
-            crate::credentials::CredentialVault::global(app)
+            crate::credentials::AppCredentialVault::global(app)
                 .replace_session(
                     endpoint.credential_target().to_string(),
                     "synthetic-workspace-credential".into(),
@@ -11916,7 +11342,7 @@ mod tests {
     }
 
     fn write_recovery_checkpoint(store: &RecoveryStore, path: &Path, text: &str) {
-        let loaded = crate::fs::load(path).unwrap();
+        let loaded = mt_core::document::io::load(path).unwrap();
         let checkpoint = RecoveryCheckpoint {
             key: RecoveryKey::for_path(path),
             text: text.to_string(),
@@ -12581,7 +12007,7 @@ mod tests {
                 .first()
                 .expect("the sample recent target");
             assert_eq!(recent.path, sample);
-            assert_eq!(recent.kind, crate::settings::RecentTargetKind::Workspace);
+            assert_eq!(recent.kind, mt_core::settings::RecentTargetKind::Workspace);
         });
     }
 
@@ -12620,9 +12046,9 @@ mod tests {
         let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
         cx.update(|window, app| {
             crate::settings::AppSettings::update(app, |settings| {
-                settings.record_recent_target(crate::settings::RecentTarget::new(
+                settings.record_recent_target(mt_core::settings::RecentTarget::new(
                     missing.clone(),
-                    crate::settings::RecentTargetKind::File,
+                    mt_core::settings::RecentTargetKind::File,
                     "missing.md",
                 ));
             });
@@ -12644,41 +12070,24 @@ mod tests {
     #[test]
     fn recent_target_validation_distinguishes_missing_and_mismatched_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let directory = crate::settings::RecentTarget::new(
+        let directory = mt_core::settings::RecentTarget::new(
             dir.path(),
-            crate::settings::RecentTargetKind::File,
+            mt_core::settings::RecentTargetKind::File,
             "directory",
         );
         assert_eq!(
             super::recent_target_issue(&directory),
             Some(i18n::Key::RecentUnavailable)
         );
-        let missing = crate::settings::RecentTarget::new(
+        let missing = mt_core::settings::RecentTarget::new(
             dir.path().join("missing.md"),
-            crate::settings::RecentTargetKind::File,
+            mt_core::settings::RecentTargetKind::File,
             "missing.md",
         );
         assert_eq!(
             super::recent_target_issue(&missing),
             Some(i18n::Key::RecentMissing)
         );
-    }
-
-    #[test]
-    fn stale_recent_button_reports_the_accesskit_disabled_state() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let welcome = source
-            .split_once("fn render_welcome")
-            .expect("Welcome renderer")
-            .1
-            .split_once("fn render_status_bar")
-            .expect("end of Welcome renderer")
-            .0;
-
-        assert!(welcome.contains("BaseButton::new(open_id)"));
-        assert!(welcome.contains(".disabled(true)"));
-        assert!(welcome.contains(".a11y_synthetic_children("));
-        assert!(welcome.contains("builder.parent_node().set_disabled()"));
     }
 
     #[gpui_kit::test]
@@ -12690,9 +12099,9 @@ mod tests {
         let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
         cx.update(|window, app| {
             crate::settings::AppSettings::update(app, |settings| {
-                settings.record_recent_target(crate::settings::RecentTarget::new(
+                settings.record_recent_target(mt_core::settings::RecentTarget::new(
                     path.clone(),
-                    crate::settings::RecentTargetKind::File,
+                    mt_core::settings::RecentTargetKind::File,
                     "recent.md",
                 ));
             });
@@ -12762,42 +12171,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn window_close_drains_input_then_reenters_the_native_close_path() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let request = source
-            .split_once("fn request_window_close")
-            .expect("window close request")
-            .1
-            .split_once("fn close_window_after_input_drain")
-            .expect("end of window close request")
-            .0;
-        assert!(request.contains("if self.window_close_ready"));
-        assert!(request.contains("return true;"));
-
-        let close = source
-            .split_once("fn close_window_after_input_drain")
-            .expect("window close helper")
-            .1
-            .split_once("fn request_workspace_replace")
-            .expect("end of window close helper")
-            .0;
-        assert!(close.contains("window.disable_focus(cx)"));
-        assert_eq!(close.matches("window.on_next_frame").count(), 2);
-        assert!(close.contains("workspace.window_close_ready = true"));
-        assert!(close.contains("Self::post_native_window_close(window)"));
-
-        let native = source
-            .split_once("fn post_native_window_close")
-            .expect("native close helper")
-            .1
-            .split_once("fn request_workspace_replace")
-            .expect("end of native close helper")
-            .0;
-        assert!(native.contains("PostMessageW"));
-        assert!(native.contains("WM_CLOSE"));
-    }
-
     #[gpui_kit::test]
     fn disabled_welcome_starts_future_no_argument_workspaces_with_a_new_buffer(
         cx: &mut TestAppContext,
@@ -12811,186 +12184,6 @@ mod tests {
             assert_eq!(document.text(app), "");
             assert!(!document.is_dirty());
         });
-    }
-
-    #[test]
-    fn welcome_openers_keep_picker_cancel_and_drag_drop_on_one_target_path() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let file = source
-            .split_once("fn on_open_file")
-            .expect("file picker")
-            .1
-            .split_once("fn on_open_folder")
-            .unwrap()
-            .0;
-        assert!(file.contains("files: true"));
-        assert!(file.contains("directories: false"));
-        assert!(file.contains("else {\n                return;"));
-        assert!(file.contains("this.open_target(path, true, window, cx);"));
-        let folder = source
-            .split_once("fn on_open_folder")
-            .expect("folder picker")
-            .1
-            .split_once("fn on_save")
-            .unwrap()
-            .0;
-        assert!(folder.contains("files: false"));
-        assert!(folder.contains("directories: true"));
-        assert!(folder.contains("else {\n                return;"));
-        assert!(folder.contains("this.open_target(path, true, window, cx);"));
-        let drop = source
-            .split_once("fn on_drop_paths")
-            .expect("drop handler")
-            .1
-            .split_once("/// The path of whichever")
-            .unwrap()
-            .0;
-        assert!(drop.contains("self.open_target(path.clone(), true, window, cx)"));
-        assert!(source.contains("fn open_bundled_sample"));
-        assert!(source.contains("crate::app_paths::bundled_sample_dir()"));
-    }
-
-    #[test]
-    fn welcome_controls_have_stable_windows_uia_ids() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        for id in [
-            "markturbo-welcome-new",
-            "markturbo-welcome-paste",
-            "markturbo-welcome-open-file",
-            "markturbo-welcome-open-folder",
-            "markturbo-welcome-open-sample",
-            "markturbo-welcome-dont-show-again",
-        ] {
-            assert!(source.contains(id), "missing {id}");
-        }
-        assert!(source.contains(".accessibility_id("));
-        assert!(source.contains("markturbo-welcome-recent-status-"));
-        assert!(source.contains(".role(gpui_kit::Role::Label)"));
-        assert!(source.contains(".aria_value(label)"));
-        let welcome = source
-            .split_once("fn render_welcome")
-            .expect("welcome renderer")
-            .1
-            .split_once("fn render_web_path_controls")
-            .unwrap()
-            .0;
-        assert!(welcome.contains("RecoveryKey::for_path(&target.path)"));
-        assert!(
-            welcome.contains(".overflow_y_scroll()"),
-            "ten recent entries must remain reachable at the minimum window height"
-        );
-        assert!(
-            !welcome.contains("recents.into_iter().enumerate()"),
-            "recent control identity must follow the path, not its MRU index"
-        );
-    }
-
-    #[test]
-    fn welcome_render_uses_cached_filesystem_availability() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let welcome = source
-            .split_once("fn render_welcome")
-            .expect("welcome renderer")
-            .1
-            .split_once("fn render_web_path_controls")
-            .unwrap()
-            .0;
-
-        assert!(welcome.contains("self.welcome_sample_available"));
-        assert!(welcome.contains("self.welcome_recent_target_issue(&target)"));
-        assert!(
-            !welcome.contains("crate::app_paths::bundled_sample_dir()")
-                && !welcome.contains("let issue = recent_target_issue(&target);"),
-            "Welcome rendering must not synchronously probe the filesystem"
-        );
-    }
-
-    #[test]
-    fn welcome_refresh_uses_the_nonmaterializing_sample_probe() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let refresh = source
-            .split_once("fn refresh_welcome_availability")
-            .expect("Welcome refresh")
-            .1
-            .split_once("fn welcome_recent_target_issue")
-            .unwrap()
-            .0;
-        let open = source
-            .split_once("fn open_bundled_sample")
-            .expect("sample opener")
-            .1
-            .split_once("fn dont_show_welcome_again")
-            .unwrap()
-            .0;
-
-        assert!(refresh.contains("crate::app_paths::bundled_sample_available()"));
-        assert!(!refresh.contains("bundled_sample_dir()"));
-        assert!(open.contains("self.open_bundled_sample_result("));
-        assert!(open.contains("crate::app_paths::bundled_sample_dir()"));
-    }
-
-    #[test]
-    fn welcome_and_save_as_copy_names_the_target_and_follow_up_choice() {
-        let workspace = crate::views::production_source(include_str!("workspace.rs"));
-        let welcome = workspace
-            .split_once("fn render_welcome")
-            .expect("welcome renderer")
-            .1
-            .split_once("fn render_web_path_controls")
-            .unwrap()
-            .0;
-        assert!(welcome.contains("Key::OpenFilePicker"));
-        assert!(welcome.contains("Key::OpenFolderPicker"));
-        assert!(welcome.contains("i18n::open_recent_target_label"));
-        assert!(welcome.contains("i18n::remove_recent_target_label"));
-        assert!(welcome.contains(".tooltip(path_text.clone())"));
-
-        let overwrite = workspace
-            .split_once("fn prompt_save_as_overwrite")
-            .expect("overwrite prompt")
-            .1
-            .split_once("fn finish_save_as")
-            .unwrap()
-            .0;
-        assert!(overwrite.contains("i18n::replace_file_title"));
-        assert!(overwrite.contains("i18n::replace_file_description"));
-        assert!(!overwrite.contains("\"Replace existing file?\""));
-
-        let finish = workspace
-            .split_once("fn finish_save_as")
-            .expect("Save As completion")
-            .1
-            .split_once("fn on_close_tab")
-            .unwrap()
-            .0;
-        assert!(finish.contains("i18n::save_as_snapshot_changed_message"));
-        assert!(finish.contains("i18n::save_as_path_already_open_message"));
-
-        let document = crate::views::production_source(include_str!("document.rs"));
-        assert!(document.contains("Key::SaveAsPicker"));
-    }
-
-    #[test]
-    fn welcome_hides_document_only_title_commands() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let left = source
-            .split_once("fn render_left_toggle_overlay")
-            .expect("left title control")
-            .1
-            .split_once("fn render_title_commands_overlay")
-            .unwrap()
-            .0;
-        assert!(left.contains(".when(!self.show_welcome"));
-
-        let commands = source
-            .split_once("fn render_title_commands")
-            .expect("title commands")
-            .1
-            .split_once("fn render_left_toggle_overlay")
-            .unwrap()
-            .0;
-        assert!(commands.contains(".when(!self.show_welcome"));
-        assert!(commands.contains("i18n::Key::Settings"));
     }
 
     #[gpui_kit::test]
@@ -13028,9 +12221,9 @@ mod tests {
         cx.update(|window, app| {
             crate::settings::AppSettings::update(app, |settings| {
                 for path in &targets {
-                    settings.record_recent_target(crate::settings::RecentTarget::new(
+                    settings.record_recent_target(mt_core::settings::RecentTarget::new(
                         path.clone(),
-                        crate::settings::RecentTargetKind::File,
+                        mt_core::settings::RecentTargetKind::File,
                         path.file_name().unwrap().to_string_lossy(),
                     ));
                 }
@@ -13472,7 +12665,7 @@ mod tests {
                 .first()
                 .expect("dropped folder is recent");
             assert_eq!(recent.path.as_path(), folder.path());
-            assert_eq!(recent.kind, crate::settings::RecentTargetKind::Workspace);
+            assert_eq!(recent.kind, mt_core::settings::RecentTargetKind::Workspace);
         });
 
         cx.update(|window, app| {
@@ -13494,11 +12687,11 @@ mod tests {
             );
             let recents = &crate::settings::AppSettings::global(app).recent_targets;
             assert_eq!(recents[0].path, document_path);
-            assert_eq!(recents[0].kind, crate::settings::RecentTargetKind::File);
+            assert_eq!(recents[0].kind, mt_core::settings::RecentTargetKind::File);
             assert_eq!(recents[1].path, folder.path());
             assert_eq!(
                 recents[1].kind,
-                crate::settings::RecentTargetKind::Workspace
+                mt_core::settings::RecentTargetKind::Workspace
             );
         });
     }
@@ -14373,7 +13566,7 @@ mod tests {
     #[cfg(feature = "model-transport")]
     #[gpui_kit::test]
     fn opening_and_scanning_with_model_configured_sends_no_request(cx: &mut TestAppContext) {
-        use crate::model::{EndpointIdentity, Provider};
+        use mt_core::model::{EndpointIdentity, Provider};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -14393,7 +13586,7 @@ mod tests {
                 settings.model_base_url = base_url;
             });
             super::init(app);
-            crate::credentials::CredentialVault::global(app)
+            crate::credentials::AppCredentialVault::global(app)
                 .replace_session(
                     endpoint.credential_target().to_string(),
                     "synthetic-local-only-credential".into(),
@@ -14602,7 +13795,7 @@ mod tests {
         assert!(!applied);
         document.read_with(cx, |document, app| {
             assert_eq!(document.source_path(), Some(saved_as.as_path()));
-            assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
+            assert_eq!(document.document().doc_type(), mt_core::DocType::Html);
             assert_eq!(document.text(app), text);
         });
         assert_eq!(fs::read_to_string(saved_as).unwrap(), text);
@@ -14633,7 +13826,7 @@ mod tests {
 
         document.read_with(cx, |document, _| {
             assert_eq!(document.source_path(), Some(saved_as.as_path()));
-            assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
+            assert_eq!(document.document().doc_type(), mt_core::DocType::Html);
             assert_eq!(document.trust(), Trust::Restricted);
             let payload = document.web_html().expect("the rebuilt HTML payload");
             assert!(!payload.starts_with("file://"));
@@ -14670,7 +13863,7 @@ mod tests {
 
         document.read_with(cx, |document, _| {
             assert_eq!(document.source_path(), Some(saved_as.as_path()));
-            assert_eq!(document.document().doc_type(), mt_doc::DocType::Html);
+            assert_eq!(document.document().doc_type(), mt_core::DocType::Html);
             assert_eq!(document.trust(), Trust::Restricted);
             let payload = document.web_html().expect("the rebuilt HTML payload");
             assert!(!payload.starts_with("file://"));
@@ -14740,7 +13933,7 @@ mod tests {
 
         document.read_with(cx, |document, app| {
             assert_eq!(document.source_path(), Some(saved_as.as_path()));
-            assert_eq!(document.document().doc_type(), mt_doc::DocType::Markdown);
+            assert_eq!(document.document().doc_type(), mt_core::DocType::Markdown);
             assert_eq!(document.layout(), Layout::Web);
             assert_eq!(document.trust(), Trust::Restricted);
             assert_eq!(document.text(app), text);
@@ -16486,7 +15679,7 @@ mod tests {
         let worker_key = checkpoint.key.clone();
         let worker = std::thread::spawn(move || {
             worker_store.checkpoint_batch_if_current_cancellable(
-                [crate::recovery::CancellableRecoveryCheckpointAttempt {
+                [mt_core::recovery::CancellableRecoveryCheckpointAttempt {
                     checkpoint: &worker_checkpoint,
                     token: &worker_attempt.token,
                     cancelled: worker_attempt.cancelled.as_ref(),
@@ -17117,7 +16310,9 @@ mod tests {
         let incoming = RecoveryCheckpoint {
             key: RecoveryKey::for_path(&incoming_path),
             text: "incoming recovery text\n".into(),
-            metadata: RecoveryMetadata::from_loaded_file(&crate::fs::load(&incoming_path).unwrap()),
+            metadata: RecoveryMetadata::from_loaded_file(
+                &mt_core::document::io::load(&incoming_path).unwrap(),
+            ),
             revision: None,
         };
         let token = store.current_token(&incoming.key);
@@ -17538,7 +16733,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("restored-refresh.md");
         fs::write(&path, "disk\n").unwrap();
-        let loaded = crate::fs::load(&path).unwrap();
+        let loaded = mt_core::document::io::load(&path).unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
@@ -17604,7 +16799,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("changed-source.md");
         fs::write(&path, "original disk\n").unwrap();
-        let loaded = crate::fs::load(&path).unwrap();
+        let loaded = mt_core::document::io::load(&path).unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
@@ -18162,7 +17357,7 @@ mod tests {
             ClarificationPriority::Critical,
         );
         let output = ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope: request.scope,
             understood_intent: ReviewSections {
                 stated_goal: "update the text".into(),
@@ -18194,7 +17389,7 @@ mod tests {
         assert_eq!(store.recover().unwrap().records.len(), 1);
         let question_id = super::revision_question_binding_id(0, &question);
         let raw_response = serde_json::json!({
-            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
                 "rationale": "Apply the requested wording",
                 "edits": [{
@@ -18340,7 +17535,7 @@ mod tests {
             ClarificationPriority::Critical,
         );
         let output = ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope: request.scope,
             understood_intent: ReviewSections {
                 stated_goal: "update the text".into(),
@@ -18372,7 +17567,7 @@ mod tests {
         assert_eq!(store.recover().unwrap().records.len(), 1);
         let question_id = super::revision_question_binding_id(0, &question);
         let raw_response = serde_json::json!({
-            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
                 "rationale": "Apply the requested wording",
                 "edits": [{
@@ -18519,7 +17714,7 @@ mod tests {
             ClarificationPriority::Critical,
         );
         let output = ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope: request.scope,
             understood_intent: ReviewSections {
                 stated_goal: "update the text".into(),
@@ -18550,7 +17745,7 @@ mod tests {
             .unwrap();
         let question_id = super::revision_question_binding_id(0, &question);
         let raw_response = serde_json::json!({
-            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
                 "rationale": "Apply the requested wording",
                 "edits": [{
@@ -18608,7 +17803,7 @@ mod tests {
     fn add_secondary_memory_tab(
         workspace: &Entity<Workspace>,
         cx: &mut VisualTestContext,
-    ) -> crate::lifecycle::DocumentId {
+    ) -> mt_core::document::lifecycle::DocumentId {
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.new_memory("other tab\n".to_owned(), window, cx);
@@ -18984,7 +18179,7 @@ mod tests {
             ClarificationPriority::Critical,
         );
         let output = ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope: request.scope,
             understood_intent: ReviewSections {
                 stated_goal: "update the text".into(),
@@ -19003,7 +18198,7 @@ mod tests {
         let answers = RevisionAnswers::new(answer_states.clone()).unwrap();
         let question_id = super::revision_question_binding_id(0, &question);
         let raw_response = serde_json::json!({
-            "schema_version": crate::review::REVISION_SCHEMA_VERSION,
+            "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
                 "rationale": "Apply the requested wording",
                 "edits": [{
@@ -19036,11 +18231,11 @@ mod tests {
                     partial: false,
                     skill_package: None,
                     supporting_sources_current: true,
-                    result: crate::review::ReviewTransportResult {
-                        result: mt_doc::review::ReviewResult::ready(&request, output.clone())
+                    result: mt_core::review::provider::ReviewTransportResult {
+                        result: mt_core::review::ReviewResult::ready(&request, output.clone())
                             .unwrap(),
-                        metadata: crate::review::ReviewMetadata::from_response(
-                            crate::model::Provider::OpenAiResponses,
+                        metadata: mt_core::review::provider::ReviewMetadata::from_response(
+                            mt_core::model::Provider::OpenAiResponses,
                             "test-model",
                             "test-model",
                         )
@@ -19159,10 +18354,10 @@ mod tests {
             SourceSnapshot::new(revision, source_snapshot.source_generation()),
         )
         .unwrap();
-        let output = mt_doc::review::ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+        let output = mt_core::review::ReviewModelOutput {
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope: request.scope,
-            understood_intent: mt_doc::review::ReviewSections {
+            understood_intent: mt_core::review::ReviewSections {
                 stated_goal: "preserve the document intent".into(),
                 relevant_context: Vec::new(),
                 constraints: Vec::new(),
@@ -19173,9 +18368,9 @@ mod tests {
                 unresolved_decisions: Vec::new(),
             },
             findings: Vec::new(),
-            clarification_questions: vec![mt_doc::review::ClarificationQuestion::new(
+            clarification_questions: vec![mt_core::review::ClarificationQuestion::new(
                 "What must remain unchanged?",
-                mt_doc::review::ClarificationPriority::High,
+                mt_core::review::ClarificationPriority::High,
             )],
         };
         let recovery = super::build_revision_recovery(
@@ -19415,10 +18610,10 @@ mod tests {
             SourceSnapshot::new(second_revision, second_snapshot.source_generation()),
         )
         .unwrap();
-        let output_for = |scope| mt_doc::review::ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+        let output_for = |scope| mt_core::review::ReviewModelOutput {
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope,
-            understood_intent: mt_doc::review::ReviewSections {
+            understood_intent: mt_core::review::ReviewSections {
                 stated_goal: "preserve the document intent".into(),
                 relevant_context: Vec::new(),
                 constraints: Vec::new(),
@@ -19429,9 +18624,9 @@ mod tests {
                 unresolved_decisions: Vec::new(),
             },
             findings: Vec::new(),
-            clarification_questions: vec![mt_doc::review::ClarificationQuestion::new(
+            clarification_questions: vec![mt_core::review::ClarificationQuestion::new(
                 "What must remain unchanged?",
-                mt_doc::review::ClarificationPriority::High,
+                mt_core::review::ClarificationPriority::High,
             )],
         };
         let first_output = output_for(first_request.scope);
@@ -19533,7 +18728,7 @@ mod tests {
             ClarificationPriority::Critical,
         );
         let output = ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope: request.scope,
             understood_intent: ReviewSections {
                 stated_goal: "preserve the requested behavior".into(),
@@ -19581,7 +18776,10 @@ mod tests {
         cx.run_until_parked();
 
         workspace.update(cx, |workspace, cx| {
-            workspace.on_revision_provider_failure(crate::review::RevisionError::RequestFailed, cx);
+            workspace.on_revision_provider_failure(
+                mt_core::review::provider::RevisionError::RequestFailed,
+                cx,
+            );
         });
 
         workspace.read_with(cx, |workspace, app| {
@@ -20388,7 +19586,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.txt");
         fs::write(&path, b"\xFF\xFEh\x00i\x00\r\x00\n\x00").unwrap();
-        let loaded = crate::fs::load(&path).unwrap();
+        let loaded = mt_core::document::io::load(&path).unwrap();
         let metadata = RecoveryMetadata::from_loaded_file(&loaded);
         let original_stamp = metadata.original_stamp.clone();
         let recovered_text = "recovered 中文 \u{1f680}\n";
@@ -20437,7 +19635,10 @@ mod tests {
             let checkpoint = document.recovery_checkpoint(app);
             assert_eq!(checkpoint.metadata.encoding_name, "UTF-16LE");
             assert!(checkpoint.metadata.had_bom);
-            assert_eq!(checkpoint.metadata.newline, crate::fs::Newline::Crlf);
+            assert_eq!(
+                checkpoint.metadata.newline,
+                mt_core::document::io::Newline::Crlf
+            );
             assert_eq!(checkpoint.metadata.original_stamp, original_stamp);
         });
     }
@@ -20704,183 +19905,11 @@ mod tests {
         assert_eq!(after, before + crate::metrics::gap_group());
     }
 
-    /// Windows UI Automation maps Splitter to a read-only RangeValue provider
-    /// in the pinned accesskit_consumer, so the equivalent Slider role is a
-    /// compatibility contract rather than a presentational choice.
-    #[test]
-    fn windows_exposes_panel_resize_as_a_writable_range_control() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let resize = source
-            .split_once("fn render_panel_resize_handle")
-            .expect("render_panel_resize_handle")
-            .1;
-        let resize = resize
-            .split("\n    fn render_title_commands")
-            .next()
-            .unwrap_or(resize);
-
-        assert!(resize.contains("if cfg!(target_os = \"windows\")"));
-        assert!(resize.contains("gpui_kit::Role::Slider"));
-        assert!(resize.contains("gpui_kit::accesskit::Orientation::Horizontal"));
-        assert!(resize.contains("gpui_kit::Role::Splitter"));
-        assert!(resize.contains("gpui_kit::accesskit::Orientation::Vertical"));
-        assert!(resize.contains("gpui_kit::accesskit::Action::SetValue"));
-        assert!(resize.contains("gpui_kit::accesskit::ActionData::NumericValue(value)"));
-    }
-
     #[test]
     fn short_names_are_left_alone() {
         for name in ["a.md", "README.md", "architecture.md"] {
             assert_eq!(elide_tab_label(name), name);
         }
-    }
-
-    /// Tab overlays belong to the tab's own hitbox, never a prefix wrapper.
-    #[test]
-    fn tab_affordances_cover_the_tab() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source.find("fn render_tabs").expect("render_tabs");
-        let body = &source[start..];
-        let end = body
-            .find("\n    fn render_web_path_controls")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-        let gate = body
-            .find(".when(!web_active && path.is_some(), |tab|")
-            .expect("the file-only Web-active overlay gate");
-        let end = body[gate..]
-            .find("// A preview tab")
-            .map(|end| gate + end)
-            .unwrap_or(body.len());
-        let affordance = &body[gate..end];
-
-        assert!(affordance.contains(".tooltip(") && affordance.contains(".context_menu("));
-        assert!(
-            affordance.contains("path.is_some()"),
-            "memory documents have no filesystem path, so they must not offer file-path controls"
-        );
-        assert!(affordance.contains("tab.child("));
-        assert!(affordance.contains(".absolute()") && affordance.contains(".inset_0()"));
-        assert!(!body.contains(".prefix("));
-        assert!(body.contains(".aria_label(aria_label)"));
-        assert!(
-            body.contains(".when(!web_active, |this|") && body.contains("UnsavedChanges"),
-            "the dirty marker tooltip needs its own Web-active gate"
-        );
-        assert_eq!(
-            super::TAB_CLOSE_ACCESSIBILITY_ID,
-            "markturbo-document-tab-close"
-        );
-        assert!(body.contains("self.tabs.len() == 1 && self.tabs.active_index() == ix"));
-        assert_eq!(
-            body.matches("accessibility_id(TAB_CLOSE_ACCESSIBILITY_ID)")
-                .count(),
-            2,
-            "both the dirty marker and clean close button need the same active-document UIA id"
-        );
-        assert!(body.contains(".role(gpui_kit::Role::Button)"));
-    }
-
-    #[test]
-    fn web_mode_keeps_fixed_chrome_and_side_panels() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let title = source
-            .find("fn render_title_commands")
-            .expect("title chrome renderers");
-        let title_body = &source[title..];
-        let title_end = title_body
-            .find("\n    fn render_status_bar")
-            .unwrap_or(title_body.len());
-        let title_body = &title_body[..title_end];
-        let path = source
-            .find("fn render_web_path_controls")
-            .expect("fixed Web commands");
-        let path_end = source[path..]
-            .find("\n    fn render_panel_resize_handle")
-            .map(|end| path + end)
-            .unwrap_or(title);
-        let path_body = &source[path..path_end];
-        let status = source
-            .find("fn render_status_bar")
-            .expect("render_status_bar");
-        let status_body = &source[status..];
-        let status_end = status_body
-            .find("\n}\n\nfn empty_hint")
-            .unwrap_or(status_body.len());
-        let status_body = &status_body[..status_end];
-        let render = source
-            .find("impl Render for Workspace")
-            .map(|start| &source[start..])
-            .expect("workspace render");
-
-        assert!(!title_body.contains("let navigator = if web_active"));
-        assert!(title_body.contains("self.render_navigator(!web_active, cx).into_any_element()"));
-        assert!(!path_body.contains(".tooltip(") && !path_body.contains(".context_menu("));
-        assert!(title_body.contains("render_left_toggle(tooltips, cx)"));
-        assert!(title_body.contains("render_right_toggle(tooltips, cx)"));
-        assert!(!title_body.contains(".when(!self.left_panel_open"));
-        assert!(!title_body.contains(".when(!self.right_panel_open"));
-        assert!(!title_body.contains("web_active && !self.right_panel_open"));
-        assert!(title_body.contains("IconName::FolderOpen"));
-        assert!(title_body.contains("IconName::Globe"));
-        assert!(!title_body.contains(".label(i18n::t(i18n::Key::OpenFolder"));
-        assert!(!title_body.contains(".label(i18n::t(i18n::Key::Translate"));
-        for key in ["OpenFolderPicker", "Translate", "Settings"] {
-            assert!(
-                title_body.contains(&format!("i18n::t(i18n::Key::{key}, cx)")),
-                "the {key} icon-only command must pass its localized name to \
-                 the shared accessible chrome button"
-            );
-        }
-        assert!(
-            !title_body.contains(".xsmall()"),
-            "title-bar commands must keep the repository's 24px pointer target"
-        );
-        assert!(status_body.contains(".when(web_active, |button|"));
-        assert!(status_body.contains("button.label(auto_refresh_label)"));
-        assert!(status_body.contains(".when(!web_active, |button| button.tooltip("));
-        assert!(render.contains("let right_panel = (!self.show_welcome)"));
-        let side_panel = &render[render.find("let side_panel").expect("side panel")..];
-        let side_panel = &side_panel[..side_panel
-            .find("let panel_widths")
-            .unwrap_or(side_panel.len())];
-        assert!(side_panel.contains("left_panel_visible") && side_panel.contains(".then("));
-        assert!(!side_panel.contains("web_active"));
-        assert!(
-            render.contains(".child(self.render_status_bar(cx))"),
-            "the fixed status bar remains below the child HWND for command feedback"
-        );
-    }
-
-    #[test]
-    fn web_mode_keeps_side_panel_actions_available() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        for (signature, next) in [
-            ("fn on_toggle_left_panel", "fn on_toggle_right_panel"),
-            ("fn on_toggle_right_panel", "/// Open files dropped"),
-            ("fn on_focus_search", "/// The documents the current search"),
-        ] {
-            let start = source
-                .find(signature)
-                .unwrap_or_else(|| panic!("{signature}"));
-            let body = &source[start..];
-            let end = body.find(next).unwrap_or(body.len());
-            let body = &body[..end];
-            assert!(!body.contains("if self.web_active(cx)"));
-        }
-    }
-
-    #[test]
-    fn unrelated_tree_changes_do_not_rescan_harness() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source.find("fn drain_watcher").expect("drain_watcher");
-        let body = &source[start..];
-        let end = body.find("// --- Actions").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(!body.contains("tree_changed || harness_changed"));
-        assert!(body.contains("change.path().starts_with(watcher_root)"));
-        assert!(body.contains("harness.has_artifact_under(change.path())"));
     }
 
     #[test]
@@ -20979,603 +20008,6 @@ mod tests {
         assert!(out.ends_with('…'), "got {out}");
     }
 
-    /// A preview tab must be replaced, not accumulated.
-    ///
-    /// Source-level: the behavior needs a window and a real click sequence, but
-    /// what makes it work is that `open_file_as` takes the outgoing preview and
-    /// closes it. Someone simplifying that away gets forty tabs back.
-    ///
-    /// The *slot's* own rules — closing the preview tab empties it, closing a
-    /// different one leaves it — are plain data and are tested for real in
-    /// [`crate::views::tabs`].
-    #[test]
-    fn opening_a_preview_replaces_the_previous_one() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("pub fn open_file_as")
-            .expect("open_file_as must exist");
-        let body = &source[start..];
-        let end = body.find("\n    /// Focus the tab").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("take_preview()"),
-            "the outgoing preview must be taken, or previews accumulate"
-        );
-        assert!(
-            body.contains("close_tab"),
-            "and closed, or the slot is only forgotten rather than freed"
-        );
-        assert!(
-            body.contains("is_dirty"),
-            "a preview with unsaved edits must be kept, not silently discarded"
-        );
-    }
-
-    /// Per-document subscriptions must die with their tab.
-    ///
-    /// Source-level because the leak is invisible to any assertion: the
-    /// subscriptions stayed alive and simply fired against a document nobody
-    /// could see. What prevents it is that they are *owned by the tab* rather
-    /// than pushed onto a workspace-wide `Vec` that only ever grows.
-    #[test]
-    fn a_closed_tab_takes_its_subscriptions_with_it() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn open_file_inner")
-            .expect("open_file_inner must exist");
-        let body = &source[start..];
-        let end = body.find("\n    fn close_tab").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            !body.contains("_subscriptions.push"),
-            "a per-document subscription must not go into the workspace-wide \
-             list: that list is never pruned, so closing the tab left two \
-             subscriptions to a released document alive for the session"
-        );
-        assert!(
-            body.contains("DocumentTab {"),
-            "they belong to the tab, which drops them when it closes"
-        );
-    }
-
-    /// A status message must not be cleared by the previous message's timer.
-    ///
-    /// Source-level: the failure needs six seconds of wall clock and two
-    /// messages, which is not a test worth having. What prevents it is the
-    /// generation check plus a single timer slot — a detached task per message
-    /// meant every one of them cleared the bar unconditionally when it fired,
-    /// so the second message vanished on the first one's schedule.
-    #[test]
-    fn a_status_message_outlives_the_one_before_it() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source.find("fn set_status").expect("set_status must exist");
-        let body = &source[start..];
-        let end = body
-            .find("\n    fn remove_recovery_schedule")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            !body.contains(".detach()"),
-            "the timer must be held in a slot, so a new message cancels the \
-             old one's timer rather than leaving it to fire"
-        );
-        assert!(
-            body.contains("status_generation == generation"),
-            "and the timer must check it is still clearing its own message"
-        );
-    }
-
-    ///
-    /// Source-level: a real drop needs a window and an OS drag. What makes the
-    /// feature work rather than appear to is that a directory becomes the
-    /// workspace, a document opens, and anything else is *reported* — a drop
-    /// that silently does nothing reads as a broken window.
-    #[test]
-    fn dropping_paths_handles_all_three_cases() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn on_drop_paths")
-            .expect("on_drop_paths must exist");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// The path of whichever tab")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("is_dir()"),
-            "a folder must open as a workspace"
-        );
-        assert!(
-            body.contains("is_openable("),
-            "a dropped file must go through the same gate the file tree uses. \
-             `DocType::of(..).is_document()` is not that gate: it judges the \
-             extension alone, so a NUL-filled `.log` passes, is decoded into \
-             the editor's `String`, and the first Ctrl+S re-encodes from that \
-             `String` — dropping every byte the decoder could not map. The \
-             conflict check in `fs::save` guards a different failure: nothing \
-             changed on disk, so that write is authorized"
-        );
-        assert!(
-            body.contains("set_status"),
-            "an unopenable drop must say so rather than doing nothing visible"
-        );
-        assert!(
-            source.contains("fn open_file_target") && source.contains("self.root.is_none()"),
-            "a bare file drop should adopt its parent as the workspace"
-        );
-    }
-
-    /// The title bar must leave somewhere to grab the window.
-    ///
-    /// Source-level because reproducing it needs a real `WM_NCHITTEST` against
-    /// a laid-out bar. What broke: the tab strip was wrapped in a `flex_1` div
-    /// carrying `stop_propagation`, so the wrapper covered the whole bar and
-    /// killed *both* drag paths — GPUI's, because `TitleBar`'s own
-    /// `on_mouse_down` never saw a stopped event, and Windows', because
-    /// `handle_nc_mouse_down_msg` returns `Some(0)` for a handled press and
-    /// `DefWindowProc` never receives the `HTCAPTION`. The window simply stopped
-    /// moving, with nothing in the log.
-    #[test]
-    fn the_title_bar_keeps_a_drag_handle() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn render_title_commands")
-            .expect("title chrome renderers must exist");
-        let body = &source[start..];
-        let end = body
-            .find("\n    fn render_status_bar")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        // Every press-claiming region must be sized to its own content. The
-        // count is not the invariant — the bar legitimately grew a third claim
-        // when the navigator arrived — what matters is that no claim sits on a
-        // box that grows to fill the bar, because that box is the drag handle.
-        //
-        // Checked by walking backwards from each handler to the `h_flex()` or
-        // `div()` that opens its element, rather than by matching indentation:
-        // `cargo fmt` rewrites whitespace, and an assertion pinned to it
-        // silently becomes an assertion about nothing.
-        let claims: Vec<usize> = body
-            .match_indices("cx.stop_propagation()")
-            .map(|(at, _)| at)
-            .collect();
-        assert!(
-            claims.len() >= 2,
-            "the buttons must claim their presses back, or they do nothing \
-             inside a WindowControlArea::Drag region"
-        );
-        for at in claims {
-            let opener = body[..at]
-                .rfind("h_flex()")
-                .into_iter()
-                .chain(body[..at].rfind("div()"))
-                .max()
-                .expect("every handler is on some element");
-            let element = &body[opener..at];
-            assert!(
-                !element.contains(".flex_1()"),
-                "a press-claiming region sits on a flex_1 box, which covers the \
-                 whole bar and kills both drag paths: GPUI's, because \
-                 `TitleBar`'s own `on_mouse_down` never sees a stopped event, \
-                 and Windows', because `handle_nc_mouse_down_msg` returns \
-                 `Some(0)` for a handled press so `DefWindowProc` never gets \
-                 the `HTCAPTION`.\nOffending element: {element}"
-            );
-        }
-
-        assert!(
-            body.contains("div().flex_1().min_w_0().h_full()"),
-            "the bar needs a handler-free filler, or every pixel beside the \
-             tabs is claimed and the window cannot be dragged"
-        );
-
-        // And the tab strip itself must shrink to its content rather than
-        // claiming the width.
-        let start = source.find("fn render_tabs").expect("render_tabs");
-        let tabs = &source[start..];
-        let end = tabs.find("\n    fn render_welcome").unwrap_or(tabs.len());
-        let tabs = &tabs[..end];
-        assert!(
-            !tabs.contains(".w_full()"),
-            "a full-width tab strip leaves no slack in the title bar to drag"
-        );
-    }
-
-    /// The title and body rows resolve their tracks from one owned width model,
-    /// not from a previous frame's measured layout.
-    ///
-    /// Source-level because the regression is architectural: two sibling trees
-    /// can agree in a static window and still diverge after maximize/restore.
-    /// The Windows reproduction measured both edges at x=371 on launch; after
-    /// one restore the title edge stayed at x=371 while the body edge moved to
-    /// x=409. Explicitly assigning the same width to both rows makes that state
-    /// impossible while preserving row-major accessibility order.
-    #[test]
-    fn workspace_rows_share_one_owned_width_model() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let region = source
-            .split_once("fn workspace_region")
-            .map(|(_, body)| body)
-            .expect("workspace_region must own shared row geometry");
-        let region = region.split("\nfn ").next().unwrap_or(region);
-        assert!(region.contains(".child(content)"));
-        assert!(region.contains("this.w(width).flex_none()"));
-
-        let render = source
-            .split_once("impl Render for Workspace")
-            .map(|(_, body)| body)
-            .expect("the Workspace Render impl");
-        let render = render.split("\n/// Keybindings").next().unwrap_or(render);
-        for (id, width) in [
-            ("left-title-region", "Some(panel_widths.left)"),
-            ("document-title-region", "None"),
-            ("right-title-region", "Some(panel_widths.right)"),
-            ("left-workspace-column", "Some(panel_widths.left)"),
-            ("document-workspace-column", "None"),
-            ("right-workspace-column", "Some(panel_widths.right)"),
-        ] {
-            let id_at = render
-                .find(&format!("\"{id}\""))
-                .unwrap_or_else(|| panic!("missing {id}"));
-            let call_at = render[..id_at]
-                .rfind("workspace_region(")
-                .unwrap_or_else(|| panic!("{id} is not built by workspace_region"));
-            let call = &render[call_at..(id_at + 100).min(render.len())];
-            assert!(
-                id_at - call_at < 80 && call.contains(width),
-                "{id} must use the shared {width} track"
-            );
-        }
-        assert!(
-            !render.contains("h_resizable(\"workspace-split\")"),
-            "the outer Workspace split cannot remain a second geometry owner"
-        );
-    }
-
-    /// Platform title-bar behavior sits behind a title row whose tracks share
-    /// the body row's resolved widths.
-    ///
-    /// Source-level: this is pure layout, invisible to any runtime assertion.
-    /// What it guards is the arrangement itself — a title bar drawn across the
-    /// panels makes them read as content parked underneath it, where this reads
-    /// as the main view extending sideways, which is the whole point.
-    #[test]
-    fn platform_title_bar_sits_behind_the_owned_title_row() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let render = source
-            .split_once("impl Render for Workspace")
-            .expect("the Render impl")
-            .1;
-        let body = render.split("\n/// Keybindings").next().unwrap_or(render);
-
-        assert!(
-            body.contains("let title_regions = h_flex()")
-                && body.contains("let body_regions = h_flex()"),
-            "title and body need explicit rows over the same three tracks"
-        );
-        assert!(
-            body.contains("let title_bar_backdrop = self.render_title_bar_backdrop(cx)"),
-            "the platform TitleBar must remain present for native controls and dragging"
-        );
-        assert!(
-            body.contains("Some(panel_widths.left)") && body.contains("Some(panel_widths.right)"),
-            "the user-owned widths must size the complete left and right columns"
-        );
-        assert!(
-            body.contains("left_resize_handle")
-                && body.contains("WorkspaceResizeEdge::Left")
-                && body.contains("WorkspaceResizeEdge::Right"),
-            "both panel boundaries need one visible, draggable owner"
-        );
-        let title = body
-            .split_once("let workspace_title = div()")
-            .expect("the workspace title row")
-            .1;
-        let title = title.split("let body_regions").next().unwrap_or(title);
-        let backdrop = title
-            .find(".child(title_bar_backdrop)")
-            .expect("the platform title-bar backdrop");
-        let regions = title
-            .find(".child(title_regions)")
-            .expect("the owned title regions");
-        assert!(
-            backdrop < regions,
-            "application chrome must paint over the platform backdrop while leaving \
-             its native controls and drag regions active"
-        );
-        let backdrop_renderer = source
-            .split_once("fn render_title_bar_backdrop")
-            .expect("render_title_bar_backdrop")
-            .1;
-        let backdrop_renderer = backdrop_renderer
-            .split("\n    fn render_left_title_bar")
-            .next()
-            .unwrap_or(backdrop_renderer);
-        assert!(
-            backdrop_renderer.contains("TitleBar::new()")
-                && backdrop_renderer.contains(".border_b_0()"),
-            "the active document tab cannot connect to its content while the \
-             platform backdrop paints another full-width bottom rule"
-        );
-        assert!(
-            !source.contains("workspace_split_state")
-                && !source.contains("details_split_state")
-                && !source.contains("left_chrome_width"),
-            "no second geometry cache may reconstruct the shared column boundaries"
-        );
-        assert!(
-            body.contains("native_window_controls_width(window)")
-                && body.contains("render_right_title_bar(controls_width, cx)"),
-            "application commands must stay immediately before native controls"
-        );
-        assert!(
-            body.contains("self.layout_width.unwrap_or(window.viewport_size().width)")
-                && body.contains("this.layout_width = Some(width)"),
-            "panel budgeting must use the width Root actually assigned, including Linux CSD"
-        );
-
-        assert!(
-            body.contains("left_panel_visible.then(||") && body.contains("left-title-region"),
-            "the left panel must be omittable, not merely narrow"
-        );
-        assert!(
-            body.contains("right_panel_visible.then(||") && body.contains("right-title-region"),
-            "the right panel must be omittable"
-        );
-    }
-
-    /// Panel toggles stay in one global overlay instead of moving between
-    /// columns as panels open and close.
-    ///
-    /// Source-level: pure layout, invisible to any runtime assertion. Two things
-    /// are guarded. The sides — put together, a control's position contradicts
-    /// what it opens, and the user reads the icon instead of recognizing the
-    /// side. And the handoff — a toggle rendered in both places at once is two
-    /// buttons with the same element id, and one rendered in neither leaves an
-    /// open panel with no way to close it.
-    #[test]
-    fn panel_toggles_and_global_commands_stay_in_the_title_bar() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let commands = source
-            .split_once("fn render_title_commands")
-            .expect("render_title_commands")
-            .1;
-        let commands = commands
-            .split("\n    /// Platform title-bar behavior")
-            .next()
-            .unwrap_or(commands);
-        let open = commands
-            .find("\"open-folder\",")
-            .expect("the open-folder command");
-        let translate = commands
-            .find("\"translate\",")
-            .expect("the translate command");
-        let right = commands
-            .find("render_right_toggle")
-            .expect("the right panel toggle");
-        let settings = commands.find("\"settings\",").expect("the settings button");
-        assert!(
-            open < translate && translate < right && right < settings,
-            "global commands need one stable order before native window controls"
-        );
-
-        let document = source
-            .split_once("fn render_document_title_controls")
-            .expect("render_document_title_controls")
-            .1;
-        let document = document
-            .split("\n    fn render_right_title_bar")
-            .next()
-            .unwrap_or(document);
-        let left_reservation = document
-            .find("metrics::title_bar_leading_inset()")
-            .expect("space reserved for the fixed left toggle");
-        let navigator = document
-            .find(".child(navigator)")
-            .expect("the document navigator");
-        let tabs = document
-            .find("self.render_tabs(cx)")
-            .expect("the tab strip");
-        assert!(left_reservation < navigator && navigator < tabs);
-
-        let render = source
-            .split_once("impl Render for Workspace")
-            .expect("the Workspace Render impl")
-            .1;
-        assert!(render.contains("!self.left_panel_open"));
-        assert!(render.contains("side_panel") && render.contains("left_title_bar"));
-        assert!(render.contains("render_left_toggle_overlay(!web_active, cx)"));
-        assert!(render.contains("render_title_commands_overlay("));
-        assert_eq!(source.matches("self.render_left_toggle(").count(), 1);
-        assert_eq!(source.matches("self.render_title_commands(").count(), 1);
-        for (renderer, toggle) in [
-            ("fn render_side_panel", "render_left_toggle"),
-            ("fn render_right_panel", "render_right_toggle"),
-        ] {
-            let start = source
-                .find(renderer)
-                .unwrap_or_else(|| panic!("{renderer}"));
-            let body = &source[start..];
-            let end = body.find("\n    /// ").unwrap_or(body.len());
-            assert!(
-                !body[..end].contains(toggle),
-                "{renderer} must not duplicate the global `{toggle}` control"
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_structure_follows_the_visual_and_accessibility_order() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        assert!(
-            !source.contains("TAB_GROUP_") && !source.contains(".tab_group()"),
-            "visual structure should establish keyboard order without a second ordering model"
-        );
-
-        let region = source
-            .split_once("fn workspace_region")
-            .expect("workspace_region must own row geometry")
-            .1;
-        let region = region.split("\nfn ").next().unwrap_or(region);
-        assert!(
-            region.contains(".when_some(width, |this, width| this.w(width).flex_none())")
-                && region.contains(".when(width.is_none(), |this| this.flex_1())"),
-            "both workspace rows must resolve their tracks through one helper"
-        );
-
-        let render = source
-            .split_once("impl Render for Workspace")
-            .expect("the Workspace Render impl")
-            .1;
-        let render = render.split("\n/// Keybindings").next().unwrap_or(render);
-        for region in [
-            "left-title-region",
-            "document-title-region",
-            "right-title-region",
-            "left-workspace-column",
-            "document-workspace-column",
-            "right-workspace-column",
-        ] {
-            assert!(
-                render.contains(&format!("\"{region}\"")),
-                "missing shared workspace region {region}"
-            );
-        }
-
-        let frame = render
-            .split_once("let workspace_frame = v_flex()")
-            .expect("a row-major workspace frame")
-            .1;
-        let title = frame
-            .find(".child(workspace_title)")
-            .expect("the title row");
-        let body = frame.find(".child(workspace_body)").expect("the body row");
-        assert!(
-            title < body,
-            "title controls must precede body content in paint, Tab, and AccessKit order"
-        );
-
-        let title = render
-            .split_once("let workspace_title = div()")
-            .expect("the stable title layer")
-            .1;
-        let title = title.split("let workspace_body").next().unwrap_or(title);
-        let backdrop = title
-            .find(".child(title_bar_backdrop)")
-            .expect("the platform title bar");
-        let backgrounds = title
-            .find(".child(title_regions)")
-            .expect("the title backgrounds");
-        let leading = title
-            .find(".child(left_toggle_overlay)")
-            .expect("the leading title control");
-        let document = title
-            .find(".child(document_title_controls)")
-            .expect("the document title controls");
-        let trailing = title
-            .find(".child(title_commands_overlay)")
-            .expect("the trailing title controls");
-        assert!(
-            backdrop < backgrounds
-                && backgrounds < leading
-                && leading < document
-                && document < trailing,
-            "title controls need one stable left-to-right semantic and paint order"
-        );
-    }
-
-    #[test]
-    fn the_left_panel_uses_vertical_sidebar_navigation() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn render_side_panel")
-            .expect("render_side_panel");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// Document outline")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(body.contains("SidebarNavigationButton::new("));
-        assert!(body.contains("i18n::t(panel.label(), cx)"));
-        assert!(body.contains(".selected(panel == self.side_panel)"));
-        assert!(body.contains("panel.icon()"));
-        assert!(
-            body.contains(".py_2()") && !body.contains(".p_2()"),
-            "the navigation row owns the same horizontal inset as root file rows"
-        );
-        assert!(!body.contains("TabBar::new(\"side-panel\")"));
-
-        let component = source
-            .split_once("impl RenderOnce for SidebarNavigationButton")
-            .expect("SidebarNavigationButton renderer")
-            .1;
-        let component = component
-            .split("\nfn path_affects_harness")
-            .next()
-            .unwrap_or(component);
-        assert!(component.contains("BaseToggle::new(self.id)"));
-        assert!(component.contains(".accessibility_label(self.label)"));
-        assert!(component.contains(".justify_start()"));
-        assert!(component.contains(".px(metrics::row_pad())"));
-    }
-
-    #[test]
-    fn harness_updates_rebuild_the_details_panel_and_web_bounds() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source.find("pub fn open_folder").expect("open_folder");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// Open `path` as a document")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        let observer = body.find("cx.observe(&harness").expect("Harness observer");
-        let observer = &body[observer..];
-        assert!(observer.contains("this.web_dirty(cx)"));
-        assert!(observer.contains("cx.notify()"));
-    }
-
-    #[test]
-    fn details_panel_is_always_available_and_includes_document_details() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn render_right_panel")
-            .expect("render_right_panel");
-        let body = &source[start..];
-        let end = body.find("\n    /// The left panel").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(!source.contains("fn right_panel_available"));
-        assert!(body.contains("render_document_details(cx)"));
-
-        let toggle = source
-            .split_once("fn render_right_toggle")
-            .expect("render_right_toggle")
-            .1;
-        let toggle = toggle
-            .split("\n    fn render_tabs")
-            .next()
-            .unwrap_or(toggle);
-        assert!(!toggle.contains(".disabled("));
-        assert!(toggle.contains(".pressed(self.right_panel_open)"));
-
-        let action = source
-            .split_once("fn on_toggle_right_panel")
-            .expect("right panel action")
-            .1;
-        let action = action
-            .split("\n    /// Open files dropped")
-            .next()
-            .unwrap_or(action);
-        assert!(!action.contains("right_panel_available"));
-    }
-
     #[test]
     fn document_details_status_prioritizes_external_changes() {
         assert_eq!(
@@ -21600,520 +20032,6 @@ mod tests {
         );
     }
 
-    /// Nothing in this file may reach the App through the infallible windowed
-    /// borrow.
-    ///
-    /// Source-level because the failure only reproduces when the platform
-    /// re-enters the window procedure mid-draw. `update_in` bottoms out in
-    /// `AppCell::borrow_mut`, which panics on that re-entrant borrow; every
-    /// caller here runs after an `await`, so every caller here can land in one.
-    /// `try_update_in` takes the same borrow through `try_borrow_mut` and skips
-    /// the frame instead. The literal in the log is `RefCell already borrowed`.
-    ///
-    /// Checked over the whole file rather than per spawn body: there is no
-    /// legitimate `update_in` here, and matching async block extents textually
-    /// is how a source check quietly stops asserting anything.
-    #[test]
-    fn no_async_task_updates_through_the_infallible_borrow() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        // Only the code, not this test's own description of it.
-        let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
-
-        assert!(
-            !code.contains(".update_in("),
-            "an update goes through the infallible windowed borrow, which \
-             panics when it lands mid-draw. Use `crate::views::try_update_in`."
-        );
-        assert!(
-            code.matches("try_update_in(&this").count() >= 8
-                && code.contains("fn prompt_save_as_overwrite"),
-            "the folder picker, destructive prompt, Save As picker and Replace \
-             confirmation, translation, startup recovery, retirement completion, \
-             and cleanup continuation all land after an await and need the \
-             fallible path"
-        );
-        assert!(
-            code.contains("try_update(&this, cx, |this, cx| this.drain_watcher(cx))"),
-            "the watcher poll lands after an await too; it needs no `Window`, \
-             so it takes the windowless fallible path"
-        );
-    }
-
-    #[test]
-    fn save_as_has_an_explicit_workspace_action_and_keybinding() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
-        for action in ["NewDocument", "OpenFile", "OpenFolder"] {
-            assert!(
-                code.contains(&format!("{action},")),
-                "missing {action} action"
-            );
-        }
-        assert!(code.contains("KeyBinding::new(\"ctrl-n\", NewDocument, None)"));
-        assert!(code.contains("KeyBinding::new(\"ctrl-o\", OpenFile, None)"));
-        assert!(code.contains("KeyBinding::new(\"ctrl-alt-o\", OpenFolder, None)"));
-        assert!(
-            !code.contains("KeyBinding::new(\"ctrl-o\", OpenFolder, None)"),
-            "Ctrl+O must open a file, not only a workspace folder"
-        );
-        assert!(code.contains("SaveAs,"));
-        assert!(code.contains(".on_action(cx.listener(Self::on_save_as))"));
-        assert!(code.contains("KeyBinding::new(\"cmd-shift-s\", SaveAs, None)"));
-        assert!(code.contains("KeyBinding::new(\"ctrl-shift-s\", SaveAs, None)"));
-    }
-
-    /// Auto-refresh must never discard typed text.
-    ///
-    /// Source-level: reproducing it needs a window, a real editor and a file
-    /// changing underneath it. What makes it safe rather than merely working is
-    /// that a document refusing to reload — which is what a dirty one does —
-    /// still gets flagged, so the conflict banner appears instead. Someone
-    /// simplifying the `if !reloaded` away silently loses the banner on exactly
-    /// the documents that need it.
-    #[test]
-    fn auto_refresh_never_reloads_a_document_with_unsaved_edits() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn drain_watcher")
-            .expect("drain_watcher must exist");
-        let body = &source[start..];
-        let end = body.find("\n    // --- Actions").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("watch_auto_reload"),
-            "reloading must be opt-in, not the default"
-        );
-        assert!(
-            body.contains("reload_if_clean"),
-            "the reload must go through the guard that refuses a dirty document"
-        );
-        assert!(
-            body.contains("if !reloaded") && body.contains("mark_externally_changed"),
-            "a document that refused to reload must still be flagged, or the \
-             conflict banner never appears and the change goes unnoticed"
-        );
-        assert!(
-            body.contains("let documents = self.document_views()"),
-            "one watcher batch must capture the open document set once"
-        );
-        assert!(
-            body.contains(".any(|change| document.watches_path(change.path()))"),
-            "each document must inspect the whole batch before one reload or conflict update"
-        );
-        assert_eq!(
-            body.matches("doc.update(cx, |doc, cx| doc.reload_if_clean(cx))")
-                .count(),
-            1,
-            "one watcher batch must start at most one reload per affected document"
-        );
-        assert_eq!(
-            body.matches("doc.update(cx, |doc, cx| doc.mark_externally_changed(cx))")
-                .count(),
-            1,
-            "one watcher batch must mark each affected document at most once"
-        );
-    }
-
-    /// A translation in flight must show it and refuse a second request.
-    ///
-    /// Source-level: the failure needs a real network round-trip. Two requests
-    /// over the same text race to overwrite the editor with two different
-    /// answers, and the flag is only half the guard — the keybindings bypass
-    /// the button entirely, and a flag left set by the error path is a
-    /// permanently dead button.
-    #[test]
-    fn a_translation_in_flight_blocks_a_second_one() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        // Only the code: this test names the literals it looks for, and would
-        // otherwise count itself.
-        let code = &source[..source.find("\n#[cfg(test)]").unwrap_or(source.len())];
-        let start = code.find("fn translate(").expect("translate must exist");
-        let body = &code[start..];
-        let end = body.find("\n    // --- Rendering").unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("self.translating = true"),
-            "the flag must be set before the spawn, or the second click lands \
-             before the task starts"
-        );
-        assert!(
-            body.contains("this.translating = false"),
-            "and cleared when the result arrives"
-        );
-        // Cleared once, above the match on the result, rather than per arm —
-        // which is what keeps the error path from leaving a dead button.
-        let cleared = body.find("this.translating = false").expect("the clear");
-        let matched = body.find("match result").expect("the result match");
-        assert!(
-            cleared < matched,
-            "the flag must be cleared for both outcomes; an error path that \
-             leaves it set is a permanently dead button"
-        );
-
-        // The button goes inert, and so do the keybindings that bypass it.
-        assert!(
-            code.contains(".loading(self.translating)"),
-            "the Translate button must show the request and go inert"
-        );
-        // Every translate action guards, whatever their number. Pinning the
-        // count instead — it was 3 — meant that adding a fourth scope failed a
-        // test with nothing to say about the new scope, while a fourth action
-        // that forgot its guard could pass as long as some other one had gained
-        // a second.
-        let mut actions = 0;
-        for (at, _) in code.match_indices("fn on_translate_") {
-            let body = &code[at..];
-            let end = body.find("\n    fn ").unwrap_or(body.len());
-            let name: String = body
-                .chars()
-                .skip("fn ".len())
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            assert!(
-                body[..end].contains("if self.translating {"),
-                "{name} must return early while a request is in flight, or a \
-                 keybinding starts a second one the inert button cannot"
-            );
-            actions += 1;
-        }
-        assert!(actions >= 3, "and the loop above must not be vacuous");
-        assert!(
-            body.contains("async_snapshot") && body.contains("replace_text_if_current"),
-            "a translation result must carry and re-check the exact editor and source identity it read"
-        );
-        assert!(
-            !body.contains("doc.replace_text(translation.text"),
-            "the async result must not bypass the source-snapshot gate"
-        );
-    }
-
-    #[test]
-    fn every_close_surface_uses_the_destructive_interlock() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        assert!(source.contains("fn request_destructive("));
-        assert!(source.contains("window.on_window_should_close"));
-
-        let action = source
-            .split_once("fn on_close_tab")
-            .expect("the keyboard action")
-            .1
-            .split_once("fn on_open_settings")
-            .unwrap()
-            .0;
-        assert!(action.contains("request_close_tab"));
-
-        let tabs = source
-            .split_once("fn render_tabs")
-            .expect("the tab bar")
-            .1
-            .split_once("fn render_web_path_controls")
-            .unwrap()
-            .0;
-        assert!(
-            tabs.matches("request_close_tab").count() >= 2,
-            "both the dirty dot and clean close button must use the same interlock"
-        );
-
-        let title_bar = source
-            .split_once("fn render_title_bar_backdrop")
-            .expect("the Linux title bar")
-            .1
-            .split_once("fn render_left_title_bar")
-            .unwrap()
-            .0;
-        assert!(title_bar.contains("on_close_window"));
-        assert!(title_bar.contains("request_window_close"));
-    }
-
-    #[test]
-    fn recovery_is_restored_checkpointed_off_thread_and_cleared_intentionally() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        assert!(source.contains("RecoveryStore::open()"));
-        assert!(source.contains("store.recover()"));
-        assert!(source.contains("restore_startup_recovery("));
-
-        let constructor = source
-            .split_once("pub fn new(")
-            .expect("the workspace constructor")
-            .1
-            .split_once("pub fn open_folder")
-            .unwrap()
-            .0;
-        assert!(constructor.contains("start_startup_recovery("));
-        assert!(!constructor.contains("let (recovery, recovery_scan"));
-        assert!(
-            constructor.find("this.open_target(").unwrap()
-                < constructor.find("start_startup_recovery(").unwrap(),
-            "the requested file must open before startup recovery begins"
-        );
-
-        let startup_completion = source
-            .split_once("fn restore_startup_recovery")
-            .expect("the startup recovery completion path")
-            .1
-            .split_once("fn flush_pending_recovery_retirements")
-            .unwrap()
-            .0;
-        let pending_cleared = startup_completion
-            .find("self.startup_recovery_pending = false")
-            .expect("startup pending must clear");
-        let applied = startup_completion
-            .find("self.restore_prepared_recovery")
-            .expect("startup records must be applied");
-        let finished = startup_completion
-            .find("log::debug!(\"recovery startup finished\")")
-            .expect("the content-free startup completion signal");
-        let first_return = startup_completion
-            .find("return;")
-            .expect("the unavailable-store branch");
-        assert!(pending_cleared < applied && applied < finished && finished < first_return);
-        assert_eq!(
-            startup_completion
-                .matches("log::debug!(\"recovery startup finished\")")
-                .count(),
-            1,
-            "success, no-record, and error results share one completion signal"
-        );
-
-        let checkpoint = source
-            .split_once("fn checkpoint_recovery")
-            .expect("the recovery scheduler")
-            .1
-            .split_once("fn finish_recovery_checkpoints")
-            .unwrap()
-            .0;
-        assert!(checkpoint.contains("background_spawn"));
-        assert!(checkpoint.contains("recovery_checkpoint_with_revision(cx, revision_recovery)"));
-        assert!(checkpoint.contains("checkpoint_batch_if_current"));
-        assert!(checkpoint.contains("CancellableRecoveryCheckpointAttempt"));
-        assert!(checkpoint.contains("recovery_checkpoint_worker_active"));
-        assert!(checkpoint.contains("store_returned_at = background_executor.now()"));
-        assert!(
-            checkpoint.contains("checkpoint_dispatched(now)"),
-            "the durable deadline must be anchored when the editor snapshot is dispatched"
-        );
-        assert!(
-            checkpoint.contains("durable_complete_by"),
-            "an in-flight checkpoint must keep its absolute durable deadline observable"
-        );
-
-        let completion = source
-            .split_once("fn finish_recovery_checkpoints")
-            .expect("the recovery completion path")
-            .1
-            .split_once("fn drain_watcher")
-            .unwrap()
-            .0;
-        assert!(completion.contains("checkpoint_written"));
-        assert!(completion.contains("checkpoint_superseded"));
-        assert!(completion.contains("checkpoint_failed"));
-        assert!(completion.contains("current_checkpoint_write_completed("));
-        assert!(completion.contains("state.revision"));
-        assert!(completion.contains("attempt.revision"));
-        assert!(
-            completion.contains("CheckpointBatchOutcome::Written if written_revision_is_current")
-        );
-        assert!(completion.contains("log::debug!(\"recovery checkpoint written\")"));
-
-        assert!(source.contains("this.retire_document_recovery(id, Some(key), cx);"));
-        assert!(
-            source.contains("matches!(decision, DirtyDecision::Save | DirtyDecision::Discard)")
-        );
-        assert!(source.contains("begin_retirement"));
-        assert!(source.contains("complete_retirement"));
-    }
-
-    #[test]
-    fn recovery_activation_registers_created_and_repaired_dirty_schedules() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let arm = source
-            .split_once("fn arm_document_recovery_at")
-            .expect("the document recovery armer")
-            .1
-            .split_once("fn schedule_recovery_timer")
-            .unwrap()
-            .0;
-        assert!(arm.contains("Entry::Vacant"));
-        assert!(
-            arm.matches("activate_and_current_token(&key)").count() >= 2,
-            "both an initial schedule and a repaired key must register as active"
-        );
-
-        let checkpoint = source
-            .split_once("fn checkpoint_recovery_at")
-            .expect("the recovery scheduler")
-            .1
-            .split_once("fn finish_recovery_checkpoints")
-            .unwrap()
-            .0;
-        assert!(checkpoint.contains(".or_insert_with(||"));
-        assert!(
-            checkpoint
-                .matches("activate_and_current_token(&key)")
-                .count()
-                >= 2,
-            "a missing schedule and a repaired key in the fallback must register as active"
-        );
-    }
-
-    /// Search must never search a stale copy of an open document, and must
-    /// never walk the filesystem on the UI thread.
-    ///
-    /// Source-level: reproducing either needs a window, an editor and a real
-    /// vault. Both failures are real and were measured — walking the 6,642-file
-    /// vault takes 2.4s, which as a UI-thread cost is a frozen window on every
-    /// settled keystroke; and reading an open tab from disk misses everything
-    /// typed since the last save.
-    #[test]
-    fn the_search_corpus_is_cheap_to_build_and_prefers_editor_text() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let start = source
-            .find("fn search_corpus")
-            .expect("search_corpus must exist");
-        let body = &source[start..];
-        let end = body
-            .find("\n    /// Paths of every open tab")
-            .unwrap_or(body.len());
-        let body = &body[..end];
-
-        assert!(
-            body.contains("corpus.open.push"),
-            "open tabs must contribute their editor text"
-        );
-        assert!(
-            !body.contains("document_paths("),
-            "walking a directory here runs on the UI thread — measured at 2.4s \
-             on a 6,642-document vault. Hand the directory over in \
-             `Corpus::roots` and let the background task walk it."
-        );
-        assert!(
-            body.contains("corpus.roots"),
-            "directories must be passed unwalked"
-        );
-        assert!(
-            body.contains("!open.contains(p)"),
-            "files already contributed as editor text must be filtered out, or \
-             every match in an open document is reported twice"
-        );
-        assert!(
-            body.contains("skills().iter().map(|s| s.dir.clone())"),
-            "the Harness scope must cover a skill's whole directory, not only \
-             its SKILL.md — references and scripts are part of the skill"
-        );
-    }
-
-    #[test]
-    fn review_is_read_only_and_snapshot_guarded() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let review = source
-            .split_once("fn start_review_after_preparation(")
-            .expect("Review preparation continuation must exist")
-            .1
-            .split_once("fn set_review_diagnostic")
-            .expect("Review error mapping must follow the request path")
-            .0;
-        assert!(review.contains("async_snapshot"));
-        assert!(review.contains("build_document_review_request"));
-        assert!(source.contains("DocumentReviewRequest::agent_skill"));
-        assert!(review.contains("prepared.authorize"));
-        assert!(review.contains("execute_with"));
-        assert!(review.contains("ReviewDocumentChanged"));
-        assert!(review.contains("review_result = Some"));
-        assert!(review.contains("has_dirty_skill_supporting_document"));
-        assert!(!review.contains(".replace_text("));
-        assert!(!review.contains("set_source("));
-    }
-
-    #[test]
-    fn review_panel_exposes_lens_before_explicit_send_and_current_result_state() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let command = source
-            .split_once("fn on_review_document")
-            .expect("Review document command must exist")
-            .1
-            .split_once("fn on_review_selection")
-            .unwrap()
-            .0;
-        assert!(command.contains("self.open_review_panel(ReviewTarget::Document, cx)"));
-        assert!(!command.contains("self.review("));
-
-        let panel = source
-            .split_once("fn render_review_panel")
-            .expect("Review panel must exist")
-            .1;
-        let lens = panel
-            .find("i18n::Key::ReviewLens")
-            .expect("lens control must be visible");
-        let run = panel
-            .find("Button::new(\"run-review\")")
-            .expect("Review must require an explicit Run control");
-        assert!(lens < run);
-        assert!(panel[run..].contains("this.review(target, window, cx)"));
-        let result = panel
-            .find("REVIEW_RESULT_ACCESSIBILITY_ID")
-            .expect("current Review result must have a stable UIA id");
-        let stale_guard = panel[..result]
-            .rfind("if !stale")
-            .expect("stale results must not present the success UIA state");
-        assert!(stale_guard < result);
-    }
-
-    #[test]
-    fn review_failures_persist_and_skill_watcher_marks_results_stale_immediately() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let diagnostic = source
-            .split_once("fn set_review_diagnostic")
-            .expect("Review diagnostic setter must exist")
-            .1
-            .split_once("fn review_build_diagnostic")
-            .unwrap()
-            .0;
-        assert!(diagnostic.contains("self.review_diagnostic = Some"));
-        assert!(diagnostic.contains("self.review_panel_open = true"));
-
-        let error_map = source
-            .split_once("fn review_error_diagnostic")
-            .expect("Review error map must exist")
-            .1
-            .split_once("fn visible_review_lens")
-            .unwrap()
-            .0;
-        for key in [
-            "ReviewNoProvider",
-            "ReviewMissingCredential",
-            "ReviewTimeout",
-            "ReviewOversized",
-        ] {
-            assert!(
-                error_map.contains(key),
-                "missing localized Review state: {key}"
-            );
-        }
-        assert!(error_map.contains("ReviewError::ResponseTooLarge"));
-
-        let watcher = source
-            .split_once("let review_supporting_source_changed")
-            .expect("watcher must track frozen Agent Skill sources")
-            .1
-            .split_once("let tree_changed")
-            .unwrap()
-            .0;
-        assert!(watcher.contains("change.path().starts_with(&package.root)"));
-        assert!(watcher.contains("review.supporting_sources_current = false"));
-        assert!(watcher.contains("context.supporting_sources_current = false"));
-
-        let commit_guard = source
-            .split_once("fn revision_result_is_current_for_commit")
-            .expect("Revision commit guard must exist")
-            .1
-            .split_once("fn set_revision_diagnostic")
-            .unwrap()
-            .0;
-        assert!(commit_guard.contains("package.revalidate().is_ok()"));
-    }
-
     #[gpui::test]
     fn revision_skill_supporting_changes_remain_stale_after_save(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
@@ -22129,27 +20047,39 @@ mod tests {
                 workspace.open_file(support.clone(), window, cx);
             });
         });
-        let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
-            let document = workspace.document_at(0).unwrap().read(app);
-            (
-                document.id(),
-                document.async_snapshot(app),
-                document.revision(),
+        let (document_id, source_snapshot, revision, skill_origin) =
+            workspace.read_with(cx, |workspace, app| {
+                let document = workspace.document_at(0).unwrap().read(app);
+                (
+                    document.id(),
+                    document.async_snapshot(app),
+                    document.revision(),
+                    document
+                        .skill_origin()
+                        .expect("the opened Skill entrypoint has verified provenance")
+                        .clone(),
+                )
+            });
+        let (request, package) = super::build_review_request(
+            super::ReviewRequestBuildRequest::new(
+                ReviewTarget::Document,
+                ArtifactLens::AgentSkill,
+                Some(&skill),
+                "# Skill\n",
+                None,
+                SourceSnapshot::new(revision, source_snapshot.source_generation()),
+                false,
             )
-        });
-        let request = build_document_review_request(
-            ReviewTarget::Document,
-            ArtifactLens::AgentSkill,
-            Some(&skill),
-            "# Skill\n",
-            None,
-            SourceSnapshot::new(revision, source_snapshot.source_generation()),
+            .with_skill_origin(Some(&skill_origin)),
         )
-        .unwrap();
-        let output = mt_doc::review::ReviewModelOutput {
-            schema_version: mt_doc::review::REVIEW_SCHEMA_VERSION.to_owned(),
+        .unwrap()
+        .into_parts();
+        let package = package.expect("Agent Skill Review owns its frozen package");
+        assert!(package.path_affects_root(&package.root().join("references/new-guide.md")));
+        let output = mt_core::review::ReviewModelOutput {
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
             scope: request.scope,
-            understood_intent: mt_doc::review::ReviewSections {
+            understood_intent: mt_core::review::ReviewSections {
                 stated_goal: "preserve the skill".into(),
                 relevant_context: Vec::new(),
                 constraints: Vec::new(),
@@ -22162,12 +20092,6 @@ mod tests {
             findings: Vec::new(),
             clarification_questions: Vec::new(),
         };
-        let package = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "# Skill\n",
-            false,
-        )
-        .unwrap();
         workspace.update(cx, |workspace, _| {
             workspace.revision_context = Some(super::WorkspaceRevisionContext {
                 document_id,
@@ -22191,6 +20115,53 @@ mod tests {
                 &[Change::Modified(support.clone())],
                 cx,
             );
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace
+                    .revision_context
+                    .as_ref()
+                    .unwrap()
+                    .supporting_sources_current
+            );
+        });
+
+        let new_support = support_dir.join("new-guide.md");
+        fs::write(&new_support, "new support\n").unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .revision_context
+                .as_mut()
+                .unwrap()
+                .supporting_sources_current = true;
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(
+                directory.path(),
+                &[Change::Created(new_support.clone())],
+                cx,
+            );
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace
+                    .revision_context
+                    .as_ref()
+                    .unwrap()
+                    .supporting_sources_current
+            );
+        });
+
+        fs::remove_file(&new_support).unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .revision_context
+                .as_mut()
+                .unwrap()
+                .supporting_sources_current = true;
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_watcher_changes(directory.path(), &[Change::Removed(new_support)], cx);
         });
         workspace.read_with(cx, |workspace, _| {
             assert!(
@@ -22237,786 +20208,400 @@ mod tests {
         });
     }
 
-    #[test]
-    fn skill_document_review_uses_a_frozen_package_with_deterministic_inventory() {
+    #[gpui_kit::test]
+    fn stable_skill_review_uses_its_verified_loaded_origin(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, "disk entrypoint").unwrap();
-        fs::create_dir(directory.path().join("references")).unwrap();
-        fs::write(
-            directory.path().join("references").join("guide.md"),
-            "guide",
-        )
-        .unwrap();
-        fs::create_dir(directory.path().join("assets")).unwrap();
-        fs::write(
-            directory.path().join("assets").join("blob.bin"),
-            [0xff, 0x00],
-        )
-        .unwrap();
+        fs::write(&skill, "# Stable skill\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, skill.clone());
 
-        let request = build_document_review_request(
-            ReviewTarget::Document,
-            ArtifactLens::AgentSkill,
-            Some(&skill),
-            "frozen entrypoint",
-            None,
-            SourceSnapshot::new(4, 9),
-        )
-        .unwrap();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let document_id = workspace.active_document().unwrap().read(cx).id();
+                workspace
+                    .review_lens_overrides
+                    .insert(document_id, ArtifactLens::AgentSkill);
+                workspace.review(ReviewTarget::Document, window, cx);
+            });
+        });
+        cx.run_until_parked();
 
-        assert!(matches!(
-            request.scope,
-            mt_doc::review::ReviewScope::AgentSkillPackage
-        ));
-        let package = request.source.package().unwrap();
-        assert_eq!(
-            package
-                .files()
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            ["SKILL.md", "assets/blob.bin", "references/guide.md"]
-        );
-        assert!(matches!(
-            &package.files()[0].payload,
-            mt_doc::review::SkillFilePayload::Utf8 { content } if content == "disk entrypoint"
-        ));
-        assert!(package.files()[1].is_binary_metadata_only());
-    }
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.active_document().unwrap().read(app);
+            assert!(document.skill_origin().is_some());
+            assert_eq!(document.source_path(), Some(skill.as_path()));
+            assert_eq!(document.text(app), "# Stable skill\n");
+            assert!(!document.is_dirty());
 
-    #[test]
-    fn clean_skill_entrypoint_preserves_raw_bytes_and_identity() {
-        let directory = tempfile::tempdir().unwrap();
-        let skill = directory.path().join("SKILL.md");
-        let raw = b"\xef\xbb\xbf# Skill\r\n";
-        fs::write(&skill, raw).unwrap();
-
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "# Skill\n",
-            false,
-        )
-        .unwrap();
-        let entrypoint = &frozen.package.files()[0];
-        assert!(matches!(
-            &entrypoint.payload,
-            mt_doc::review::SkillFilePayload::Utf8 { content } if content.as_bytes() == raw
-        ));
-        assert_eq!(
-            frozen
-                .skill_entrypoint_identity
+            let diagnostic = workspace
+                .review_diagnostic
                 .as_ref()
-                .map(|identity| identity.byte_size),
-            Some(raw.len() as u64)
-        );
-
-        fs::write(&skill, "# Skill\n").unwrap();
-        assert!(matches!(
-            frozen.revalidate(),
-            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
-        ));
-    }
-
-    #[test]
-    fn valid_utf8_binary_supporting_file_is_metadata_only() {
-        let directory = tempfile::tempdir().unwrap();
-        let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, "entrypoint").unwrap();
-        fs::write(directory.path().join("asset.bin"), b"valid\0utf8").unwrap();
-
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "entrypoint",
-            false,
-        )
-        .unwrap();
-        let asset = frozen
-            .package
-            .files()
-            .iter()
-            .find(|file| file.path == "asset.bin")
-            .unwrap();
-        assert!(asset.is_binary_metadata_only());
-        assert_eq!(asset.raw_bytes(), None);
-    }
-
-    #[test]
-    fn selection_review_of_skill_entrypoint_is_not_reported_as_missing() {
-        let directory = tempfile::tempdir().unwrap();
-        let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, "entrypoint").unwrap();
-
-        let error = build_document_review_request(
-            ReviewTarget::Selection,
-            ArtifactLens::AgentSkill,
-            Some(&skill),
-            "entrypoint",
-            Some(&(0..5)),
-            SourceSnapshot::default(),
-        )
-        .unwrap_err();
-        assert!(!matches!(
-            error,
-            ReviewRequestBuildError::AgentSkillEntrypointUnavailable
-        ));
-    }
-
-    #[test]
-    fn non_utf8_skill_entrypoint_uses_raw_metadata_and_revalidates_the_raw_source() {
-        let directory = tempfile::tempdir().unwrap();
-        let skill = directory.path().join("SKILL.md");
-        let original = [0xff, 0x81, 0x40];
-        fs::write(&skill, original).unwrap();
-
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "decoded entrypoint",
-            false,
-        )
-        .unwrap();
-        let entrypoint = &frozen.package.files()[0];
-        assert_eq!(entrypoint.path, "SKILL.md");
-        assert_eq!(entrypoint.byte_size, original.len() as u64);
-        assert!(matches!(
-            &entrypoint.payload,
-            mt_doc::review::SkillFilePayload::Binary { sha256 }
-                if sha256 == &super::sha256_hex(&original)
-        ));
-
-        fs::write(&skill, [0xff, 0x81, 0x41]).unwrap();
-        assert!(matches!(
-            frozen.revalidate(),
-            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
-        ));
-    }
-
-    #[test]
-    fn dirty_non_utf8_skill_entrypoint_sends_explicit_unsaved_utf8_text() {
-        let directory = tempfile::tempdir().unwrap();
-        let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, [0xff, 0x81, 0x40]).unwrap();
-
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "unsaved UTF-8 text",
-            true,
-        )
-        .unwrap();
-        let entrypoint = &frozen.package.files()[0];
-        assert!(matches!(
-            &entrypoint.payload,
-            mt_doc::review::SkillFilePayload::Utf8 { content } if content == "unsaved UTF-8 text"
-        ));
-        assert_eq!(entrypoint.byte_size, "unsaved UTF-8 text".len() as u64);
-        fs::write(&skill, [0xff, 0x81, 0x41]).unwrap();
-        assert!(
-            frozen.revalidate().is_ok(),
-            "the frozen editor snapshot must not be recategorized from disk while the document remains unchanged"
-        );
-    }
-
-    #[test]
-    fn dirty_skill_entrypoint_ignores_deleted_or_oversized_disk_entrypoint() {
-        let directory = tempfile::tempdir().unwrap();
-        let skill = directory.path().join("SKILL.md");
-        fs::write(
-            &skill,
-            vec![b'x'; (mt_doc::review::MAX_SKILL_FILE_BYTES + 1) as usize],
-        )
-        .unwrap();
-
-        for remove_disk_entrypoint in [false, true] {
-            if remove_disk_entrypoint {
-                fs::remove_file(&skill).unwrap();
-            }
-            let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-                directory.path(),
-                "unsaved entrypoint",
-                true,
-            )
-            .unwrap();
+                .expect("request preparation reaches the unavailable-provider result");
+            assert_eq!(diagnostic.lens, ArtifactLens::AgentSkill);
             assert!(matches!(
-                &frozen.package.files()[0].payload,
-                mt_doc::review::SkillFilePayload::Utf8 { content }
-                    if content == "unsaved entrypoint"
+                diagnostic.diagnostic.code,
+                ReviewDiagnosticCode::NoProvider | ReviewDiagnosticCode::Unavailable
             ));
-            assert!(
-                frozen
-                    .package
-                    .omissions()
-                    .iter()
-                    .all(|omission| omission.path != "SKILL.md")
+            assert!(!workspace.reviewing);
+        });
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui_kit::test]
+    fn substituted_skill_root_is_rejected_before_consent(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let skill_root = directory.path().join("skill");
+        let displaced_root = directory.path().join("displaced-skill");
+        fs::create_dir(&skill_root).unwrap();
+        let skill = skill_root.join("SKILL.md");
+        fs::write(&skill, "# Original skill\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, skill.clone());
+
+        fs::rename(&skill_root, &displaced_root).unwrap();
+        fs::create_dir(&skill_root).unwrap();
+        fs::write(&skill, "# Substitute skill\n").unwrap();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let document_id = workspace.active_document().unwrap().read(cx).id();
+                workspace
+                    .review_lens_overrides
+                    .insert(document_id, ArtifactLens::AgentSkill);
+                workspace.review(ReviewTarget::Document, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.active_document().unwrap().read(app);
+            assert_eq!(document.text(app), "# Original skill\n");
+            assert!(!document.is_dirty());
+
+            let diagnostic = workspace
+                .review_diagnostic
+                .as_ref()
+                .expect("a substituted root fails during request preparation");
+            assert_eq!(diagnostic.lens, ArtifactLens::AgentSkill);
+            assert_eq!(
+                diagnostic.diagnostic.code,
+                ReviewDiagnosticCode::InvalidRequest
             );
-        }
+            assert_eq!(
+                diagnostic.diagnostic.message.as_str(),
+                i18n::t(i18n::Key::ReviewSkillPackageChanged, app)
+            );
+            assert!(!workspace.reviewing);
+        });
+        assert!(!cx.has_pending_prompt());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn dirty_skill_entrypoint_replaces_a_symlinked_disk_entrypoint() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("outside.md");
-        let skill = directory.path().join("SKILL.md");
-        fs::write(&target, "disk target").unwrap();
-        symlink(&target, &skill).unwrap();
-
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "unsaved entrypoint",
-            true,
-        )
-        .unwrap();
-        assert!(matches!(
-            &frozen.package.files()[0].payload,
-            mt_doc::review::SkillFilePayload::Utf8 { content }
-                if content == "unsaved entrypoint"
-        ));
-        assert!(
-            frozen
-                .package
-                .omissions()
-                .iter()
-                .all(|omission| omission.path != "SKILL.md")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_skill_inventory_rejects_a_backslash_path_component() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("SKILL.md"), "entrypoint").unwrap();
-        fs::write(directory.path().join(r"support\name.md"), "supporting").unwrap();
-
-        assert!(matches!(
-            super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-                directory.path(),
-                "entrypoint",
-                false,
-            ),
-            Err(ReviewRequestBuildError::AgentSkillPathIsNotUtf8)
-        ));
-    }
-
-    #[test]
-    fn frozen_skill_package_rejects_changed_supporting_sources_before_send() {
+    #[gpui_kit::test]
+    fn recovered_skill_without_origin_remains_editable_and_save_as_works(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let skill = directory.path().join("SKILL.md");
-        let guide = directory.path().join("guide.md");
-        fs::write(&skill, "entrypoint").unwrap();
-        fs::write(&guide, "original supporting source").unwrap();
+        let save_as = directory.path().join("recovered-copy.md");
+        fs::write(&skill, "# Disk skill\n").unwrap();
+        let recovered_text = "# Recovered skill text\n";
+        let recovered = RecoveredRecord {
+            record: RecoveryRecord {
+                key: RecoveryKey::for_path(&skill),
+                text: recovered_text.to_owned(),
+                metadata: RecoveryMetadata {
+                    source_path: Some(skill.clone()),
+                    encoding_name: "UTF-8".to_owned(),
+                    had_bom: false,
+                    newline: Newline::Lf,
+                    original_stamp: FileStamp::of(&skill).unwrap(),
+                    source_identity: SourceIdentity::Regular,
+                    decode_had_errors: false,
+                },
+                checkpointed_at: SystemTime::now(),
+                revision: None,
+            },
+            source_conflicted: false,
+        };
+        let prepared = DocumentView::prepare_recovery(recovered).unwrap();
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let document = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let registry = workspace.registry.clone();
+                let document =
+                    cx.new(|cx| DocumentView::from_recovery(prepared, registry, window, cx));
+                workspace.insert_document(skill.clone(), document.clone(), window, cx);
+                let document_id = document.read(cx).id();
+                workspace
+                    .review_lens_overrides
+                    .insert(document_id, ArtifactLens::AgentSkill);
+                workspace.review(ReviewTarget::Document, window, cx);
+                document
+            })
+        });
+        cx.run_until_parked();
 
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "entrypoint",
-            false,
-        )
-        .unwrap();
-        fs::write(&guide, "changed supporting source").unwrap();
+        document.read_with(cx, |document, app| {
+            assert!(document.skill_origin().is_none());
+            assert_eq!(document.text(app), recovered_text);
+            assert!(document.is_dirty());
+        });
+        workspace.read_with(cx, |workspace, app| {
+            let diagnostic = workspace
+                .review_diagnostic
+                .as_ref()
+                .expect("recovered Skill Review must fail closed");
+            assert_eq!(
+                diagnostic.diagnostic.code,
+                ReviewDiagnosticCode::InvalidRequest
+            );
+            assert_eq!(
+                diagnostic.diagnostic.message.as_str(),
+                i18n::t(i18n::Key::ReviewSkillPackageUnavailable, app)
+            );
+            assert!(!workspace.reviewing);
+        });
+        assert!(!cx.has_pending_prompt());
 
-        assert!(matches!(
-            frozen.revalidate(),
-            Err(ReviewRequestBuildError::AgentSkillSourceChanged)
-        ));
+        let document_id = document.read_with(cx, |document, _| document.id());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(
+                    document_id,
+                    save_as.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(fs::read(&save_as).unwrap(), recovered_text.as_bytes());
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.tabs.active().and_then(|tab| tab.path()),
+                Some(save_as.as_path())
+            );
+        });
+        document.read_with(cx, |document, app| {
+            assert_eq!(document.source_path(), Some(save_as.as_path()));
+            assert_eq!(document.text(app), recovered_text);
+            assert!(!document.is_dirty());
+        });
     }
 
-    #[test]
-    fn skill_package_size_limits_abort_before_a_request_is_built() {
+    #[gpui_kit::test]
+    fn dirty_skill_entrypoint_anchor_keeps_the_matching_editor_tab(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, "entrypoint").unwrap();
-        fs::write(
-            directory.path().join("oversize.md"),
-            vec![b'x'; (mt_doc::review::MAX_SKILL_FILE_BYTES + 1) as usize],
-        )
-        .unwrap();
-
-        assert!(matches!(
-            build_document_review_request(
-                ReviewTarget::Document,
-                ArtifactLens::AgentSkill,
-                Some(&skill),
-                "entrypoint",
-                None,
-                SourceSnapshot::default(),
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(&skill, "# Disk entrypoint\n").unwrap();
+        let lexical_skill = nested.join("..").join("SKILL.md");
+        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let document = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.open_file(lexical_skill.clone(), window, cx));
+                workspace.active_document().unwrap().clone()
+            })
+        });
+        let editor_text = "# Dirty editor-only entrypoint\n";
+        cx.update(|window, app| {
+            document.update(app, |document, cx| {
+                document.replace_text(editor_text.to_owned(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let anchor_start = editor_text.find("editor-only").unwrap();
+        let anchor = install_frozen_skill_review(
+            &workspace,
+            "SKILL.md",
+            SourceLocation::bytes(
+                anchor_start as u64,
+                (anchor_start + "editor-only".len()) as u64,
             ),
-            Err(ReviewRequestBuildError::AgentSkillFileTooLarge { .. })
-        ));
+            cx,
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .review_result
+                    .as_ref()
+                    .unwrap()
+                    .skill_package
+                    .as_ref()
+                    .unwrap()
+                    .entrypoint_is_editor_text()
+            );
+        });
+
+        // The editor-only package is independent of the current disk entrypoint.
+        fs::write(&skill, "# Replaced on disk\n").unwrap();
+        let document_id = document.read_with(cx, |document, _| document.id());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.reveal_review_anchor(&anchor, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 1);
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), document_id);
+            assert_eq!(active.source_path(), Some(lexical_skill.as_path()));
+            assert_eq!(active.text(app), editor_text);
+            assert!(active.is_dirty());
+            assert_eq!(active.cursor(app), anchor_start);
+        });
     }
 
-    #[test]
-    fn supporting_file_reader_rejects_an_oversize_file_before_allocating_its_length() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(
-            directory.path().join("oversize.md"),
-            vec![b'x'; (mt_doc::review::MAX_SKILL_FILE_BYTES + 1) as usize],
-        )
-        .unwrap();
-
-        assert!(matches!(
-            super::read_regular_skill_supporting_file(directory.path(), "oversize.md"),
-            Err(ReviewRequestBuildError::AgentSkillFileTooLarge { byte_size })
-                if byte_size == mt_doc::review::MAX_SKILL_FILE_BYTES + 1
-        ));
-    }
-
-    #[test]
-    fn agent_skill_lens_requires_a_whole_skill_entrypoint_document() {
-        let directory = tempfile::tempdir().unwrap();
-        let not_a_skill = directory.path().join("prompt.md");
-        fs::write(&not_a_skill, "prompt").unwrap();
-
-        assert!(matches!(
-            build_document_review_request(
-                ReviewTarget::Document,
-                ArtifactLens::AgentSkill,
-                Some(&not_a_skill),
-                "prompt",
-                None,
-                SourceSnapshot::default(),
-            ),
-            Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable)
-        ));
-        assert!(matches!(
-            build_document_review_request(
-                ReviewTarget::Selection,
-                ArtifactLens::AgentSkill,
-                Some(&not_a_skill),
-                "0123456789",
-                Some(&(0..5)),
-                SourceSnapshot::default(),
-            ),
-            Err(ReviewRequestBuildError::AgentSkillEntrypointUnavailable)
-        ));
-    }
-
-    #[test]
-    fn skill_package_aggregate_limit_aborts_before_a_request_is_built() {
+    #[gpui_kit::test]
+    fn skill_anchor_opens_a_supporting_file_from_the_frozen_snapshot(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, "entrypoint").unwrap();
-        for index in 0..9 {
-            fs::write(
-                directory.path().join(format!("support-{index}.md")),
-                vec![b'x'; mt_doc::review::MAX_SKILL_FILE_BYTES as usize],
-            )
-            .unwrap();
-        }
-
-        assert!(matches!(
-            build_document_review_request(
-                ReviewTarget::Document,
-                ArtifactLens::AgentSkill,
-                Some(&skill),
-                "entrypoint",
-                None,
-                SourceSnapshot::default(),
+        let support = directory.path().join("references").join("guide.md");
+        fs::create_dir_all(support.parent().unwrap()).unwrap();
+        fs::write(&skill, "# Skill\n").unwrap();
+        let support_text = "# Frozen supporting bytes\n";
+        fs::write(&support, support_text).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, skill);
+        let anchor_start = support_text.find("supporting").unwrap();
+        let anchor = install_frozen_skill_review(
+            &workspace,
+            "references/guide.md",
+            SourceLocation::bytes(
+                anchor_start as u64,
+                (anchor_start + "supporting".len()) as u64,
             ),
-            Err(ReviewRequestBuildError::AgentSkillPackageTooLarge { .. })
-        ));
+            cx,
+        );
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.reveal_review_anchor(&anchor, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let active = workspace.active_document().unwrap().read(app);
+            assert!(
+                active
+                    .source_path()
+                    .is_some_and(|path| mt_core::document::io::paths_match(path, &support))
+            );
+            assert_eq!(active.text(app), support_text);
+            assert_eq!(active.cursor(app), anchor_start);
+            assert!(!active.is_dirty());
+            assert!(
+                workspace
+                    .tabs
+                    .preview()
+                    .is_some_and(|path| mt_core::document::io::paths_match(path, &support))
+            );
+        });
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn symbolic_links_are_disclosed_as_omissions_without_being_followed() {
-        use std::os::unix::fs::symlink;
-
+    #[gpui_kit::test]
+    fn skill_anchor_refuses_an_existing_clean_tab_with_other_bytes(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, "entrypoint").unwrap();
-        let external = tempfile::tempdir().unwrap();
-        fs::write(external.path().join("secret.md"), "must not be read").unwrap();
-        symlink(
-            external.path().join("secret.md"),
-            directory.path().join("linked.md"),
-        )
-        .unwrap();
-
-        let request = build_document_review_request(
-            ReviewTarget::Document,
-            ArtifactLens::AgentSkill,
-            Some(&skill),
-            "entrypoint",
-            None,
-            SourceSnapshot::default(),
-        )
-        .unwrap();
-        let package = request.source.package().unwrap();
-        assert!(package.files().iter().all(|file| file.path != "linked.md"));
-        assert_eq!(package.omissions().len(), 1);
-        assert_eq!(package.omissions()[0].path, "linked.md");
-        assert!(package.omissions()[0].symlink);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supporting_file_reader_refuses_a_symlink_target() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
-        let target = external.path().join("secret.md");
-        fs::write(&target, "must not be read").unwrap();
-        symlink(&target, directory.path().join("linked.md")).unwrap();
-
-        assert!(matches!(
-            super::read_regular_skill_supporting_file(directory.path(), "linked.md"),
-            Err(ReviewRequestBuildError::AgentSkillReadFailed)
-                | Err(ReviewRequestBuildError::AgentSkillSourceChanged)
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn supporting_file_reader_refuses_a_symlink_target() {
-        let directory = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
-        let target = external.path().join("secret.md");
-        let link = directory.path().join("linked.md");
-        fs::write(&target, "must not be read").unwrap();
-        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
-            eprintln!("skipping symlink no-follow test: {error}");
-            return;
-        }
-
-        assert!(matches!(
-            super::read_regular_skill_supporting_file(directory.path(), "linked.md"),
-            Err(ReviewRequestBuildError::AgentSkillReadFailed)
-                | Err(ReviewRequestBuildError::AgentSkillSourceChanged)
-        ));
-    }
-
-    #[test]
-    fn selection_review_preserves_full_document_coordinates_for_anchor_navigation() {
-        let selection = 10..20;
-        let request = build_document_review_request(
-            ReviewTarget::Selection,
-            ArtifactLens::Prompt,
-            None,
-            "0123456789abcdefghij",
-            Some(&selection),
-            SourceSnapshot::default(),
-        )
-        .unwrap();
-        assert_eq!(request.outbound_text(), Some("abcdefghij"));
-        assert!(matches!(
-            request.scope,
-            mt_doc::review::ReviewScope::Selection { range, .. }
-                if range == ByteRange::new(10, 20).unwrap()
-        ));
-
-        let anchor = SourceAnchor::document(SourceLocation::bytes(13, 18));
-        assert_eq!(
-            review_anchor_offset(&anchor, "0123456789abcdefghij"),
-            Some(13)
+        let support = directory.path().join("references").join("guide.md");
+        fs::create_dir_all(support.parent().unwrap()).unwrap();
+        fs::write(&skill, "# Skill\n").unwrap();
+        fs::write(&support, "# Old open-tab bytes\n").unwrap();
+        let (workspace, cx) = open_test_workspace(cx, skill.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.open_file(support.clone(), window, cx));
+                assert!(workspace.open_file(skill.clone(), window, cx));
+            });
+        });
+        let support_text = "# Current frozen bytes\n";
+        fs::write(&support, support_text).unwrap();
+        let anchor_start = support_text.find("frozen").unwrap();
+        let anchor = install_frozen_skill_review(
+            &workspace,
+            "references/guide.md",
+            SourceLocation::bytes(anchor_start as u64, (anchor_start + "frozen".len()) as u64),
+            cx,
         );
-        assert_eq!(
-            review_anchor_offset(
-                &SourceAnchor::document(SourceLocation::lines(2, 2)),
-                "first\nsecond\n",
-            ),
-            Some(6)
-        );
-        assert_eq!(
-            review_anchor_offset(&SourceAnchor::DocumentWide, "whole document"),
-            Some(0)
-        );
+        let skill_document_id = workspace.read_with(cx, |workspace, app| {
+            workspace.active_document().unwrap().read(app).id()
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.reveal_review_anchor(&anchor, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), skill_document_id);
+            assert_eq!(active.source_path(), Some(skill.as_path()));
+            let old_support = workspace
+                .document_at(1)
+                .expect("the original support tab remains open")
+                .read(app);
+            assert_eq!(old_support.text(app), "# Old open-tab bytes\n");
+            assert_eq!(
+                workspace.status.as_deref(),
+                Some(i18n::t(i18n::Key::ReviewStale, app))
+            );
+        });
     }
 
-    #[test]
-    fn empty_selection_review_is_rejected_before_provider_resolution() {
-        assert!(matches!(
-            build_document_review_request(
-                ReviewTarget::Selection,
-                ArtifactLens::Prompt,
-                None,
-                "source",
-                Some(&(0..0)),
-                SourceSnapshot::default(),
-            ),
-            Err(ReviewRequestBuildError::InvalidSelection)
-        ));
-    }
-
-    #[test]
-    fn frozen_package_anchor_navigation_only_resolves_listed_relative_files() {
+    #[gpui_kit::test]
+    fn skill_anchor_preserves_a_dirty_supporting_tab_and_marks_review_stale(
+        cx: &mut TestAppContext,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let skill = directory.path().join("SKILL.md");
-        fs::write(&skill, "entrypoint").unwrap();
-        fs::create_dir(directory.path().join("references")).unwrap();
-        let guide = directory.path().join("references").join("guide.md");
-        fs::write(&guide, "first\nsecond\n").unwrap();
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "entrypoint",
-            false,
-        )
-        .unwrap();
-
-        let anchor =
-            SourceAnchor::agent_skill_file("references/guide.md", SourceLocation::lines(2, 2))
-                .unwrap();
-        assert_eq!(frozen.resolve_anchor(&anchor), Some((guide, 6)));
-        assert_eq!(
-            frozen.resolve_anchor(
-                &SourceAnchor::agent_skill_file(
-                    "references/guide.md",
-                    SourceLocation::bytes(6, 12),
-                )
-                .unwrap(),
+        let support = directory.path().join("references").join("guide.md");
+        fs::create_dir_all(support.parent().unwrap()).unwrap();
+        fs::write(&skill, "# Skill\n").unwrap();
+        let disk_support = "# Disk supporting text\n";
+        fs::write(&support, disk_support).unwrap();
+        let (workspace, cx) = open_test_workspace(cx, skill.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.open_file(support.clone(), window, cx));
+                assert!(workspace.open_file(skill.clone(), window, cx));
+            });
+        });
+        let dirty_support = "# Unsaved supporting edit\n";
+        replace_document(&workspace, 1, dirty_support, cx);
+        let anchor_start = disk_support.find("supporting").unwrap();
+        let anchor = install_frozen_skill_review(
+            &workspace,
+            "references/guide.md",
+            SourceLocation::bytes(
+                anchor_start as u64,
+                (anchor_start + "supporting".len()) as u64,
             ),
-            Some((directory.path().join("references").join("guide.md"), 6))
+            cx,
         );
-        assert_eq!(
-            frozen.resolve_anchor(
-                &SourceAnchor::agent_skill_file("SKILL.md", SourceLocation::bytes(0, 0)).unwrap(),
-            ),
-            Some((skill, 0))
-        );
-        assert!(
-            frozen
-                .resolve_anchor(&SourceAnchor::AgentSkillFile {
-                    path: "../outside.md".into(),
-                    location: SourceLocation::bytes(0, 1),
-                })
-                .is_none()
-        );
-    }
+        let skill_document_id = workspace.read_with(cx, |workspace, app| {
+            workspace.active_document().unwrap().read(app).id()
+        });
 
-    #[test]
-    fn frozen_package_anchor_navigation_maps_bom_and_crlf_to_editor_offsets() {
-        let directory = tempfile::tempdir().unwrap();
-        let skill = directory.path().join("SKILL.md");
-        let guide = directory.path().join("guide.md");
-        fs::write(&skill, "entrypoint").unwrap();
-        fs::write(
-            &guide,
-            [&b"\xef\xbb\xbf"[..], &b"first\r\nsecond\r\n"[..]].concat(),
-        )
-        .unwrap();
-        let frozen = super::build_frozen_agent_skill_package_with_dirty_entrypoint(
-            directory.path(),
-            "entrypoint",
-            false,
-        )
-        .unwrap();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.reveal_review_anchor(&anchor, window, cx);
+            });
+        });
 
-        assert_eq!(
-            frozen.resolve_anchor(
-                &SourceAnchor::agent_skill_file("guide.md", SourceLocation::bytes(10, 16)).unwrap(),
-            ),
-            Some((guide.clone(), 6))
-        );
-        assert_eq!(
-            frozen.resolve_anchor(
-                &SourceAnchor::agent_skill_file("guide.md", SourceLocation::lines(2, 2)).unwrap(),
-            ),
-            Some((guide, 6))
-        );
-    }
-
-    #[test]
-    fn supporting_buffer_edits_invalidate_agent_skill_reviews_before_navigation() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let edited = source
-            .split_once("DocumentEvent::Edited =>")
-            .expect("document edits must be observed")
-            .1
-            .split_once("DocumentEvent::DirtyChanged =>")
-            .unwrap()
-            .0;
-        assert!(edited.contains("mark_review_stale_for_document"));
-        let review = source
-            .split_once("fn start_review_after_preparation(")
-            .expect("Review preparation continuation must exist")
-            .1
-            .split_once("fn set_review_diagnostic")
-            .unwrap()
-            .0;
-        assert!(
-            review
-                .matches("has_dirty_skill_supporting_document")
-                .count()
-                >= 3
-        );
-    }
-
-    #[test]
-    fn ordinary_review_edits_retain_semantic_stale_state() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        assert!(source.contains("review.result.result.status = ReviewStatus::Stale"));
-        let panel = source
-            .split_once("fn render_review_panel")
-            .expect("Review panel must exist")
-            .1;
-        assert!(panel.contains("review.result.result.status.is_stale()"));
-        assert!(panel.contains("document.async_snapshot(cx) != review.source_snapshot"));
-    }
-
-    #[test]
-    fn skill_package_preparation_runs_before_consent_on_the_background_executor() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let review = source
-            .split_once("fn review(")
-            .expect("Review entry point must exist")
-            .1
-            .split_once("fn set_review_diagnostic")
-            .unwrap()
-            .0;
-        let background = review
-            .find("background_spawn")
-            .expect("Review preparation must use the background executor");
-        let preparation = review
-            .find("build_document_review_request_with_identity")
-            .expect("Review preparation must freeze the request before consent");
-        let consent = source
-            .split_once("fn start_review_after_preparation(")
-            .expect("Review preparation continuation must exist")
-            .1
-            .find("window.prompt")
-            .expect("consent must be presented after preparation");
-        assert!(background < preparation);
-        assert!(consent > 0);
-    }
-
-    #[test]
-    fn no_follow_reader_keeps_macos_and_linux_on_the_same_safe_open_path() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        assert!(
-            source.contains("#[cfg(target_os = \"macos\")]")
-                && source.contains("const UNIX_O_NOFOLLOW: i32 = 0x100;")
-        );
-        assert!(
-            source.contains("#[cfg(target_os = \"linux\")]")
-                && source.contains("const UNIX_O_NOFOLLOW: i32 = 0o400000;")
-        );
-        assert!(source.contains("#[cfg(any(target_os = \"linux\", target_os = \"macos\"))]"));
-        assert!(
-            source.contains("open_regular_skill_file_at(root, relative_path, UNIX_O_NOFOLLOW)")
-        );
-    }
-
-    #[test]
-    fn package_anchor_navigation_revalidates_before_opening_a_frozen_inventory_path() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let navigation = source
-            .split_once("fn reveal_review_anchor")
-            .expect("Review anchors must have a navigation path")
-            .1
-            .split_once("/// Open `path` (as a preview)")
-            .expect("ordinary preview navigation follows Review navigation")
-            .0;
-        let revalidate = navigation
-            .find("skill_package.revalidate()")
-            .expect("package anchors must revalidate their frozen source");
-        let reveal = navigation
-            .find("self.reveal_in(path, offset, window, cx)")
-            .expect("valid package anchors must open their source file");
-        assert!(revalidate < reveal);
-        assert!(navigation.contains("skill_package.resolve_anchor(anchor)"));
-    }
-
-    #[test]
-    fn dismissing_review_invalidates_pending_completion() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let dismiss = source
-            .split_once("fn dismiss_review")
-            .expect("dismissal must have its own invalidation path")
-            .1
-            .split_once("/// Run a read-only Review")
-            .expect("Review starts after dismissal")
-            .0;
-        assert!(dismiss.contains("cancelled.store(true, Ordering::Release)"));
-        assert!(dismiss.contains("review_generation"));
-        assert!(dismiss.contains("review_panel_open = false"));
-        assert!(dismiss.contains("review_result = None"));
-    }
-
-    #[test]
-    fn cancelling_review_binds_diagnostic_to_the_frozen_request() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let cancel = source
-            .split_once("fn on_cancel_review")
-            .expect("Review cancellation must exist")
-            .1
-            .split_once("fn open_review_panel")
-            .unwrap()
-            .0;
-        assert!(!cancel.contains("active_document()"));
-        assert!(cancel.contains("pending.document_id"));
-        assert!(cancel.contains("pending.lens"));
-        assert!(cancel.contains("self.set_status"));
-    }
-
-    #[test]
-    fn review_revalidates_skill_sources_before_authorization_and_on_completion() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let review = source
-            .split_once("fn start_review_after_preparation(")
-            .expect("Review preparation continuation must exist")
-            .1
-            .split_once("fn set_review_diagnostic")
-            .expect("Review error mapping must follow the request path")
-            .0;
-        let revalidation = review
-            .find("package_for_revalidation")
-            .expect("Agent Skill sources must be revalidated after consent");
-        let authorization = review
-            .find("prepared.authorize")
-            .expect("Review must still authorize the request");
-        let execute = review
-            .find("prepared.execute_with")
-            .expect("Review transport must execute the frozen request");
-        assert!(
-            revalidation < authorization,
-            "a changed supporting source must stop transport before authorization"
-        );
-        assert!(
-            authorization < execute,
-            "authorization must precede transport"
-        );
-        assert!(
-            review[..execute].rfind("background_spawn").is_some(),
-            "transport must stay on the background executor"
-        );
-        let completion_revalidation = review
-            .find("package_for_completion_revalidation")
-            .expect("completion must revalidate Agent Skill sources");
-        assert!(
-            review[completion_revalidation..].contains("background_spawn"),
-            "completion revalidation must stay on the background executor"
-        );
-        assert!(review.contains("supporting_sources_current"));
-        assert!(review.contains("self.review_result = None"));
-    }
-
-    #[test]
-    fn review_completion_cannot_replace_another_documents_authored_revision_context() {
-        let source = crate::views::production_source(include_str!("workspace.rs"));
-        let review = source
-            .split_once("fn start_review_after_preparation(")
-            .expect("Review preparation continuation must exist")
-            .1
-            .split_once("fn set_review_diagnostic")
-            .expect("Review error mapping must follow the request path")
-            .0;
-        let guard = review
-            .find("revision_context_has_authored_answers_for_other_document")
-            .expect("Review completion must preserve another document's authored answers");
-        let replace = review
-            .find("this.review_result = Some")
-            .expect("Review completion must publish its result");
-        assert!(guard < replace);
-
-        let install = source
-            .split_once("fn install_revision_context")
-            .expect("Revision context installer must exist")
-            .1
-            .split_once("fn on_revision_answer_input")
-            .unwrap()
-            .0;
-        assert!(install.contains("self.cancel_pending_revision(cx)"));
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert_eq!(
+                workspace.active_document().unwrap().read(app).id(),
+                skill_document_id
+            );
+            let support_document = workspace.document_at(1).unwrap().read(app);
+            assert_eq!(support_document.text(app), dirty_support);
+            assert!(support_document.is_dirty());
+            let review = workspace.review_result.as_ref().unwrap();
+            assert!(!review.supporting_sources_current);
+            assert!(review.result.result.status.is_stale());
+        });
     }
 
     #[test]

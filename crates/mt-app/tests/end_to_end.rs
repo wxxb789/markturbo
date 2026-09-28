@@ -6,10 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use mt_app::renderer::RendererRegistry;
 use mt_app::web::{self, Trust};
-use mt_app::{fs, workspace};
-use mt_doc::{DocType, Document};
+use mt_core::document::io as fs;
+use mt_core::rendering::RendererRegistry;
+use mt_core::workspace;
+use mt_core::{DocType, Document};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -257,7 +258,7 @@ fn the_fixture_tree_is_browsable() {
 
 #[test]
 fn skills_are_discovered_and_their_entry_documents_open() {
-    let skills = mt_doc::skill::discover(&fixtures().join("skills"));
+    let skills = mt_core::agent_artifacts::skill::discover(&fixtures().join("skills"));
     assert!(skills.len() >= 5, "found {}", skills.len());
 
     for skill in &skills {
@@ -271,7 +272,7 @@ fn skills_are_discovered_and_their_entry_documents_open() {
 
 #[test]
 fn a_valid_skill_renders_its_body() {
-    let skills = mt_doc::skill::discover(&fixtures().join("skills"));
+    let skills = mt_core::agent_artifacts::skill::discover(&fixtures().join("skills"));
     let valid = skills
         .iter()
         .find(|s| s.is_valid() && !s.support_dirs.is_empty())

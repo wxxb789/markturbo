@@ -1,40 +1,23 @@
 //! markturbo: a native GPUI workspace for Markdown as the interface between
 //! humans and AI agents.
 //!
-//! Layering:
+//! The desktop depends on `mt-core`; headless workflows never depend on GPUI.
 //!
 //! ```text
-//! mt-doc     document engine — no GPUI, reusable headless
-//!   ↓
-//! assets     icons + the fonts GPUI's SVG renderer needs
-//! settings   user preferences, persisted as JSON
-//! metrics    layout scale — insets, row heights, gaps
-//! i18n       interface strings, en-US and zh-CN
-//! theme      preset palettes, driving GPUI and the Web preview alike
-//! fs         load/save with conflict protection
-//! workspace  directory tree
-//! renderer   block renderer registry (diagrams, math)
-//! web        WebView compatibility path
-//!   ↓
-//! views      GPUI views
+//! mt-core    document, workspace, Agent Skills, Review/Translation,
+//!            file safety, recovery, settings, credentials, rendering
+//!     ↑
+//! mt-app     main/startup + GPUI views, web and theme presentation,
+//!            i18n, embedded UI/sample assets, settings/credential globals
 //! ```
 
 pub mod app_paths;
 pub mod assets;
 pub mod credentials;
-pub mod fs;
 pub mod i18n;
-pub mod lifecycle;
 pub mod metrics;
-pub mod model;
-pub mod recovery;
-pub mod renderer;
-pub mod review;
 pub mod settings;
 pub mod startup;
 pub mod theme;
-pub mod translate;
 pub mod views;
-pub mod watcher;
 pub mod web;
-pub mod workspace;

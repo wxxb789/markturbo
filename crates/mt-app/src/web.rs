@@ -16,9 +16,9 @@
 
 use std::path::Path;
 
-use mt_doc::{Block, BlockKind, Document};
+use mt_core::{Block, BlockKind, Document};
 
-use crate::renderer::{RenderOutcome, RendererRegistry};
+use mt_core::rendering::{RenderOutcome, RendererRegistry};
 
 /// How much the WebView is allowed to execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub fn build_html_themed(
     preset: Option<&crate::theme::Preset>,
 ) -> String {
     let body = match doc.doc_type() {
-        mt_doc::DocType::Mdx => render_mdx_body(doc, registry, trust),
+        mt_core::DocType::Mdx => render_mdx_body(doc, registry, trust),
         _ => render_markdown_body(doc, registry),
     };
 
@@ -147,7 +147,7 @@ fn trust_banner(doc: &Document, trust: Trust) -> String {
     }
     match doc.doc_type() {
         // Only MDX can execute anything, so only MDX needs the scripting warning.
-        mt_doc::DocType::Mdx => "<div class=\"mt-banner\">This MDX document is not trusted. Components are shown as placeholders and no code runs. Use <b>Trust this document</b> to enable full rendering.</div>".to_string(),
+        mt_core::DocType::Mdx => "<div class=\"mt-banner\">This MDX document is not trusted. Components are shown as placeholders and no code runs. Use <b>Trust this document</b> to enable full rendering.</div>".to_string(),
         // HTML executes nothing here; what Trust buys it is filesystem access,
         // so the warning is about the missing images and stylesheets rather
         // than about code.
@@ -160,13 +160,13 @@ fn trust_banner(doc: &Document, trust: Trust) -> String {
         // fixed by callers outside this crate, so there is no `App` here to
         // read the setting from — the same limitation the MDX banner above has
         // always had.
-        mt_doc::DocType::Html => format!(
+        mt_core::DocType::Html => format!(
             "<div style=\"background:rgba(240,173,78,.18);border:1px solid rgba(240,173,78,.6);\
              border-radius:8px;padding:10px 14px;margin:0 0 1.5em;font-size:.92em;\
              font-family:system-ui,sans-serif\">{}</div>",
             crate::i18n::text(
                 crate::i18n::Key::HtmlNeedsTrust,
-                crate::settings::Language::default()
+                mt_core::settings::Language::default()
             )
         ),
         _ => String::new(),
@@ -247,7 +247,7 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
         run.clear();
         return;
     }
-    let options = mt_doc::doc::parse_options(doc.doc_type());
+    let options = mt_core::document::doc::parse_options(doc.doc_type());
     match markdown::to_html_with_options(
         run,
         &markdown::Options {
@@ -313,11 +313,13 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry, trust: Trust) ->
     out
 }
 
-fn mdx_placeholder(kind: mt_doc::block::MdxKind, source: &str, _trust: Trust) -> String {
+fn mdx_placeholder(kind: mt_core::document::block::MdxKind, source: &str, _trust: Trust) -> String {
     let label = match kind {
-        mt_doc::block::MdxKind::JsxElement => mt_doc::outline::jsx_tag_name(source)
-            .map(|n| format!("&lt;{n} /&gt;"))
-            .unwrap_or_else(|| "JSX".into()),
+        mt_core::document::block::MdxKind::JsxElement => {
+            mt_core::document::outline::jsx_tag_name(source)
+                .map(|n| format!("&lt;{n} /&gt;"))
+                .unwrap_or_else(|| "JSX".into())
+        }
         other => other.label().to_string(),
     };
     format!(
@@ -482,7 +484,7 @@ img, svg { max-width: 100%; }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mt_doc::DocType;
+    use mt_core::DocType;
 
     fn registry() -> RendererRegistry {
         RendererRegistry::with_defaults()
