@@ -229,6 +229,175 @@ def valid_evidence() -> dict:
     return evidence
 
 
+def _trust_contract_comment_decoy() -> str:
+    return """\
+        /* Historical implementation excerpt; this code is intentionally inert.
+        let revoke_trust = self.trust == Trust::Trusted
+            && matches!(self.document.doc_type(),
+                DocType::Html | DocType::Mdx)
+            && current_text != final_text;
+        if revoke_trust {
+            self.trust = Trust::Restricted;
+            self.preview.trust_changed(Trust::Restricted);
+        }
+        self.replace_text(final_text, window, cx);
+        */
+"""
+
+
+def _write_goal07_source_fixture(
+    root: Path,
+    *,
+    trust_body: str | None = None,
+    active_preview: bool = False,
+    test_only_trust_markers: bool = False,
+    test_only_preview_markers: bool = False,
+) -> None:
+    """Write the small Rust-source surface consumed by Goal07's checkers."""
+    views = root / "crates" / "mt-app" / "src" / "views"
+    workspace = views / "workspace.rs"
+    review = views / "workspace" / "review.rs"
+    document = views / "document.rs"
+    preview = views / "document" / "preview.rs"
+    for path in (workspace, review, document, preview):
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    workspace_symbols = (
+        ("REVIEW_RUN_ACCESSIBILITY_ID", HARNESS.REVIEW_RUN_ACCESSIBILITY_ID),
+        ("REVIEW_RESULT_ACCESSIBILITY_ID", HARNESS.REVIEW_RESULT_ACCESSIBILITY_ID),
+        ("REVISION_RUN_ACCESSIBILITY_ID", HARNESS.REVISION_RUN_ACCESSIBILITY_ID),
+        ("REVISION_STALE_ACCESSIBILITY_ID", HARNESS.REVISION_STALE_ACCESSIBILITY_ID),
+        (
+            "REVISION_ACCEPT_ALL_ACCESSIBILITY_ID",
+            HARNESS.REVISION_ACCEPT_ALL_ACCESSIBILITY_ID,
+        ),
+        (
+            "REVISION_REJECT_ALL_ACCESSIBILITY_ID",
+            HARNESS.REVISION_REJECT_ALL_ACCESSIBILITY_ID,
+        ),
+        ("REVISION_APPLY_ACCESSIBILITY_ID", HARNESS.REVISION_APPLY_ACCESSIBILITY_ID),
+        ("REVISION_COPY_ACCESSIBILITY_ID", HARNESS.REVISION_COPY_ACCESSIBILITY_ID),
+    )
+    workspace.write_text(
+        "\n".join(
+            f'const {symbol}: &str = "{value}";'
+            for symbol, value in workspace_symbols
+        )
+        + "\nDocumentEvent::Conflict\n",
+        encoding="utf-8",
+    )
+
+    if trust_body is None:
+        trust_body = """\
+        let revoke_trust = self.trust == Trust::Trusted
+            && matches!(self.document.doc_type(),
+                DocType::Html | DocType::Mdx)
+            && current_text != final_text;
+        if revoke_trust {
+            self.trust = Trust::Restricted;
+            self.preview.trust_changed(Trust::Restricted);
+        }
+        self.replace_text(final_text, window, cx);
+"""
+    document_source = f'''\
+Button::new("trust");
+accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID);
+const TRUST_ID: &str = "{HARNESS.TRUST_AUTOMATION_ID}";
+accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID);
+const CONFLICT_OVERWRITE_ID: &str = "{HARNESS.CONFLICT_OVERWRITE_ACCESSIBILITY_ID}";
+pub fn apply_approved_revision() {{
+{trust_body}}}
+'''
+    if test_only_trust_markers:
+        document_source += f'''\
+#[cfg(test)]
+mod tests {{
+    const TRUST_MARKER_DECOY: &str = {json.dumps(_trust_contract_comment_decoy())};
+}}
+'''
+    document.write_text(document_source, encoding="utf-8")
+
+    preview_region = f'''\
+.id("revision-preview")
+.role(gpui::Role::Group)
+.accessibility_id("{HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID}")
+.id("revision-preview-source")
+.role(gpui::Role::Label)
+.aria_value(preview.clone())
+.accessibility_id("{HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}")
+'''
+    if active_preview:
+        preview_region += ".child(WebSurface::new(preview.clone()))\n"
+    preview_region += ".child(preview)\n.into_any_element()\n"
+
+    review_symbols = tuple(symbol for symbol, _value in workspace_symbols)
+    review_accessibility = "\n".join(
+        f"accessibility_id({symbol});" for symbol in review_symbols
+    )
+    review_values = "\n".join(
+        f'const REVIEW_UIA_VALUE_{index}: &str = "{value}";'
+        for index, value in enumerate(
+            (
+                HARNESS.REVISION_RESULT_ACCESSIBILITY_ID,
+                HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID,
+                HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
+                HARNESS.REVISION_QUESTION_PREFIX,
+                HARNESS.REVISION_CHANGE_PREFIX,
+            )
+        )
+    )
+    review_source = f'''\
+{review_accessibility}
+{review_values}
+'''
+    if not test_only_preview_markers:
+        review_source += preview_region
+    else:
+        review_source += (
+            "// Preview IDs are also used by test fixtures: "
+            f"{HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID} "
+            f"{HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}\n"
+        )
+    review_source += f'''\
+.id("revision-stale")
+accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)
+.role(gpui::Role::Label)
+.aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))
+.into_any_element()
+Button::new("revision-apply")
+accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)
+.disabled(revision_stale)
+this.apply_revision(window, cx)
+Button::new("revision-save")
+'''
+    if test_only_preview_markers:
+        review_source += f'''\
+#[cfg(test)]
+mod tests {{
+    fn preview_marker_decoy() {{
+{preview_region}    }}
+}}
+'''
+    review.write_text(review_source, encoding="utf-8")
+
+    (views / "document").mkdir(parents=True, exist_ok=True)
+    preview.write_text(
+        """\
+pub(super) fn trust_changed() {
+    self.rebuild_web(document, source_path, trust, cx);
+}
+fn rebuild_web() {
+    self.web_revision = self.web_revision.wrapping_add(1);
+    self.web_html = Some(match trust {
+        Trust::Restricted => web::build_html_raw(document, trust),
+        _ => web::build_html_themed(document, trust),
+    });
+}
+""",
+        encoding="utf-8",
+    )
+
+
 def loopback_request(operation: str) -> dict[str, object]:
     source = HARNESS.EDITOR_SOURCE_TEXT
     source_bytes = source.encode("utf-8")
@@ -722,6 +891,102 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
         self.assertEqual(evidence["transport"]["request_count"], 0)
         HARNESS.complete_evidence(evidence, "BLOCKED")
         HARNESS.validate_evidence(evidence)
+
+
+class SourceContractFixtureTests(unittest.TestCase):
+    def source_failure(
+        self,
+        *,
+        trust_body: str | None = None,
+        active_preview: bool = False,
+        test_only_trust_markers: bool = False,
+        test_only_preview_markers: bool = False,
+    ) -> str | None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_goal07_source_fixture(
+                root,
+                trust_body=trust_body,
+                active_preview=active_preview,
+                test_only_trust_markers=test_only_trust_markers,
+                test_only_preview_markers=test_only_preview_markers,
+            )
+            with mock.patch.object(HARNESS, "REPO", root):
+                return HARNESS.source_contract_failure()
+
+    def test_safe_source_fixture_passes_all_goal07_source_checkers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_goal07_source_fixture(root)
+            with mock.patch.object(HARNESS, "REPO", root):
+                self.assertIsNone(HARNESS.source_contract_failure())
+                self.assertTrue(HARNESS.trust_apply_source_contract_ok())
+                self.assertTrue(HARNESS.preview_inert_source_contract_ok())
+
+    def test_source_contract_rejects_replace_before_trust_revocation(self) -> None:
+        wrong_order = """\
+        self.replace_text(final_text, window, cx);
+        let revoke_trust = self.trust == Trust::Trusted
+            && matches!(self.document.doc_type(),
+                DocType::Html | DocType::Mdx)
+            && current_text != final_text;
+        if revoke_trust {
+            self.trust = Trust::Restricted;
+            self.preview.trust_changed(Trust::Restricted);
+        }
+"""
+        self.assertEqual(
+            self.source_failure(trust_body=wrong_order),
+            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
+        )
+
+    def test_source_contract_rejects_active_revision_preview(self) -> None:
+        self.assertEqual(
+            self.source_failure(active_preview=True),
+            "REVISION_PREVIEW_INERT_CONTRACT_MISSING",
+        )
+
+    def test_source_contract_ignores_trust_markers_only_in_test_module(self) -> None:
+        self.assertEqual(
+            self.source_failure(
+                trust_body="",
+                test_only_trust_markers=True,
+            ),
+            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
+        )
+
+    def test_source_contract_ignores_preview_markers_only_in_test_module(self) -> None:
+        self.assertEqual(
+            self.source_failure(test_only_preview_markers=True),
+            "REVISION_PREVIEW_INERT_CONTRACT_MISSING",
+        )
+
+    def test_source_contract_rejects_review_values_only_in_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_goal07_source_fixture(root)
+            review = root / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+            source = review.read_text(encoding="utf-8")
+            value = HARNESS.REVISION_RESULT_ACCESSIBILITY_ID
+            source = source.replace(
+                f'const REVIEW_UIA_VALUE_0: &str = "{value}";',
+                f'// Removed result ID: {value}',
+                1,
+            )
+            review.write_text(source, encoding="utf-8")
+
+            with mock.patch.object(HARNESS, "REPO", root):
+                self.assertEqual(
+                    HARNESS.source_contract_failure(),
+                    "REVISION_UIA_CONTRACT_MISSING",
+                )
+
+    def test_source_contract_rejects_comment_only_trust_markers(self) -> None:
+        comment_decoy = f"\n{_trust_contract_comment_decoy()}\n"
+        self.assertEqual(
+            self.source_failure(trust_body=comment_decoy),
+            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
+        )
 
 
 class SourceAndCliTests(unittest.TestCase):

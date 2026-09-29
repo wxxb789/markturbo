@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .goal03 import Goal03Harness as ClipboardNativeHarness
+from .source_contract import rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -1650,21 +1651,26 @@ def production_source(path: Path) -> str:
 
 
 def _rust_function_body(source: str, signature: str) -> str | None:
-    start = source.find(signature)
+    views = rust_source_views(source)
+    if views is None:
+        return None
+    code_only, _ = views
+
+    start = code_only.find(signature)
     if start < 0:
         return None
-    opening = source.find("{", start + len(signature))
+    opening = code_only.find("{", start + len(signature))
     if opening < 0:
         return None
 
     depth = 0
-    for index in range(opening, len(source)):
-        if source[index] == "{":
+    for index in range(opening, len(code_only)):
+        if code_only[index] == "{":
             depth += 1
-        elif source[index] == "}":
+        elif code_only[index] == "}":
             depth -= 1
             if depth == 0:
-                return source[opening + 1 : index]
+                return code_only[opening + 1 : index]
     return None
 
 
@@ -1726,13 +1732,18 @@ def preview_inert_source_contract_ok() -> bool:
     review = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
-    start = review.find('.id("revision-preview")')
+    views = rust_source_views(review)
+    if views is None:
+        return False
+    _, comment_free = views
+
+    start = comment_free.find('.id("revision-preview")')
     if start < 0:
         return False
-    end = review.find(".into_any_element()", start)
+    end = comment_free.find(".into_any_element()", start)
     if end < 0:
         return False
-    body = review[start:end]
+    body = comment_free[start:end]
     required = (
         ".role(gpui::Role::Group)",
         f'.accessibility_id("{REVISION_PREVIEW_ACCESSIBILITY_ID}")',
@@ -1798,6 +1809,10 @@ def source_contract_failure() -> str | None:
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
     document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
+    review_views = rust_source_views(review)
+    if review_views is None:
+        return "REVISION_UIA_CONTRACT_MISSING"
+    _, review_comment_free = review_views
     for symbol, value in (
         ("REVIEW_RUN_ACCESSIBILITY_ID", REVIEW_RUN_ACCESSIBILITY_ID),
         ("REVIEW_RESULT_ACCESSIBILITY_ID", REVIEW_RESULT_ACCESSIBILITY_ID),
@@ -1810,7 +1825,7 @@ def source_contract_failure() -> str | None:
     ):
         if f'const {symbol}: &str = "{value}";' not in workspace:
             return "REVISION_UIA_CONTRACT_MISSING"
-        if f"accessibility_id({symbol})" not in review:
+        if f"accessibility_id({symbol})" not in review_comment_free:
             return "REVISION_SOURCE_CONTRACT_MISSING"
 
     for value in (
@@ -1820,7 +1835,7 @@ def source_contract_failure() -> str | None:
         REVISION_QUESTION_PREFIX,
         REVISION_CHANGE_PREFIX,
     ):
-        if value not in review:
+        if value not in review_comment_free:
             return "REVISION_UIA_CONTRACT_MISSING"
 
     if (

@@ -444,3 +444,190 @@ class HarnessContractTests(unittest.TestCase):
         self.assertIn("use crate::test_support::TestDependency;", production)
         self.assertIn("after_test_import", production)
         self.assertNotIn("mod tests", production)
+
+
+class SourceContractTests(unittest.TestCase):
+    WORKSPACE_SOURCE = (
+        'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n'
+        'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n'
+        'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n'
+        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n'
+        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n'
+    )
+    REVIEW_SOURCE = (
+        "fn review_controls(diagnostic: Diagnostic, cx: &Context) {\n"
+        "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n"
+        "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n"
+        "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n"
+        "    diagnostic_control.role(gpui_kit::Role::Label);\n"
+        "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n"
+        "    let _ = ReviewError::MissingCredential;\n"
+        "    let _ = i18n::Key::ReviewMissingCredential;\n"
+        "    let _ = PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx));\n"
+        "    let _ = i18n::Key::ReviewReady;\n"
+        "}\n"
+    )
+    TEST_MODULE = "\n#[cfg(test)]\nmod tests {\n    // test-only contract decoy\n}\n"
+
+    @staticmethod
+    def source_contract_failure(workspace: str, review: str) -> str | None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            views = repo / "crates" / "mt-app" / "src" / "views"
+            review_dir = views / "workspace"
+            review_dir.mkdir(parents=True)
+            (views / "workspace.rs").write_text(workspace, encoding="utf-8")
+            (review_dir / "review.rs").write_text(review, encoding="utf-8")
+
+            with mock.patch.object(HARNESS, "REPO", repo):
+                return HARNESS.source_contract_failure()
+
+    def test_complete_temporary_workspace_and_review_sources_satisfy_contract(self) -> None:
+        self.assertIsNone(
+            self.source_contract_failure(self.WORKSPACE_SOURCE, self.REVIEW_SOURCE)
+        )
+
+    def test_each_missing_workspace_accessibility_id_returns_uia_contract_failure(
+        self,
+    ) -> None:
+        for contract in (
+            'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n',
+            'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n',
+            'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n',
+        ):
+            with self.subTest(contract=contract):
+                workspace = self.WORKSPACE_SOURCE.replace(contract, "", 1)
+                self.assertEqual(
+                    self.source_contract_failure(workspace, self.REVIEW_SOURCE),
+                    "REVIEW_UIA_CONTRACT_MISSING",
+                )
+
+    def test_each_missing_review_control_returns_source_contract_failure(self) -> None:
+        for contract in (
+            "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n",
+            "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n",
+            "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n",
+        ):
+            with self.subTest(contract=contract):
+                review = self.REVIEW_SOURCE.replace(contract, "", 1)
+                self.assertEqual(
+                    self.source_contract_failure(self.WORKSPACE_SOURCE, review),
+                    "REVIEW_SOURCE_CONTRACT_MISSING",
+                )
+
+    def test_each_missing_review_shortcut_returns_source_contract_failure(self) -> None:
+        for contract in (
+            'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n',
+            'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n',
+        ):
+            with self.subTest(contract=contract):
+                workspace = self.WORKSPACE_SOURCE.replace(contract, "", 1)
+                self.assertEqual(
+                    self.source_contract_failure(workspace, self.REVIEW_SOURCE),
+                    "REVIEW_SOURCE_CONTRACT_MISSING",
+                )
+
+    def test_missing_diagnostic_aria_value_returns_source_contract_failure(self) -> None:
+        review = self.REVIEW_SOURCE.replace(
+            "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
+            "",
+            1,
+        )
+
+        self.assertEqual(
+            self.source_contract_failure(self.WORKSPACE_SOURCE, review),
+            "REVIEW_SOURCE_CONTRACT_MISSING",
+        )
+
+    def test_cfg_test_decoys_do_not_supply_missing_production_contracts(self) -> None:
+        cases = (
+            (
+                "workspace run ID",
+                "workspace",
+                'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n',
+                "REVIEW_UIA_CONTRACT_MISSING",
+            ),
+            (
+                "workspace diagnostic ID",
+                "workspace",
+                'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n',
+                "REVIEW_UIA_CONTRACT_MISSING",
+            ),
+            (
+                "workspace result ID",
+                "workspace",
+                'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n',
+                "REVIEW_UIA_CONTRACT_MISSING",
+            ),
+            (
+                "document shortcut",
+                "workspace",
+                'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n',
+                "REVIEW_SOURCE_CONTRACT_MISSING",
+            ),
+            (
+                "selection shortcut",
+                "workspace",
+                'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n',
+                "REVIEW_SOURCE_CONTRACT_MISSING",
+            ),
+            (
+                "run control",
+                "review",
+                "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n",
+                "REVIEW_SOURCE_CONTRACT_MISSING",
+            ),
+            (
+                "diagnostic control",
+                "review",
+                "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n",
+                "REVIEW_SOURCE_CONTRACT_MISSING",
+            ),
+            (
+                "result control",
+                "review",
+                "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n",
+                "REVIEW_SOURCE_CONTRACT_MISSING",
+            ),
+            (
+                "diagnostic aria value",
+                "review",
+                "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
+                "REVIEW_SOURCE_CONTRACT_MISSING",
+            ),
+        )
+
+        for name, source_file, contract, failure in cases:
+            workspace, review = self.WORKSPACE_SOURCE, self.REVIEW_SOURCE
+            source = workspace if source_file == "workspace" else review
+            decoy = contract.strip()
+            source = source.replace(contract, "", 1) + self.TEST_MODULE.replace(
+                "// test-only contract decoy", decoy
+            )
+            if source_file == "workspace":
+                workspace = source
+            else:
+                review = source
+            with self.subTest(contract=name):
+                self.assertEqual(self.source_contract_failure(workspace, review), failure)
+
+    def test_comment_or_string_decoys_do_not_preserve_removed_diagnostic_exposure(
+        self,
+    ) -> None:
+        decoys = (
+            "// .aria_value(diagnostic.diagnostic.message.as_str())\n",
+            'const REMOVED_DIAGNOSTIC_EXPOSURE: &str = '
+            '".aria_value(diagnostic.diagnostic.message.as_str())";\n',
+        )
+
+        for decoy in decoys:
+            with self.subTest(decoy=decoy):
+                review = self.REVIEW_SOURCE.replace(
+                    "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
+                    "",
+                    1,
+                ) + decoy
+                self.assertEqual(
+                    self.source_contract_failure(self.WORKSPACE_SOURCE, review),
+                    "REVIEW_SOURCE_CONTRACT_MISSING",
+                )

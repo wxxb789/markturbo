@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .source_contract import rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -422,18 +423,25 @@ def source_contract_failure() -> str | None:
     review = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
+    workspace_views = rust_source_views(workspace)
+    review_views = rust_source_views(review)
+    if workspace_views is None or review_views is None:
+        return "REVIEW_SOURCE_CONTRACT_MISSING"
+    _, workspace_comment_free = workspace_views
+    review_code, _ = review_views
+
     for value in (
         REVIEW_RUN_ACCESSIBILITY_ID,
         REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID,
         REVIEW_RESULT_ACCESSIBILITY_ID,
     ):
-        if value not in workspace:
+        if value not in workspace_comment_free:
             return "REVIEW_UIA_CONTRACT_MISSING"
     for contract in (
         'KeyBinding::new("ctrl-shift-r", ReviewDocument, None)',
         'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None)',
     ):
-        if contract not in workspace:
+        if contract not in workspace_comment_free:
             return "REVIEW_SOURCE_CONTRACT_MISSING"
     for contract in (
         "accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)",
@@ -446,7 +454,7 @@ def source_contract_failure() -> str | None:
         "PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx))",
         "i18n::Key::ReviewReady",
     ):
-        if contract not in review:
+        if contract not in review_code:
             return "REVIEW_SOURCE_CONTRACT_MISSING"
     return None
 

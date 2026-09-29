@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .source_contract import rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -501,6 +502,16 @@ def source_contract_failure() -> str | None:
     document = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "document.rs"
     )
+    workspace_views = rust_source_views(workspace)
+    if workspace_views is None:
+        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
+    workspace_code, workspace_comment_free = workspace_views
+
+    document_views = rust_source_views(document)
+    if document_views is None:
+        return "SAVE_AS_SOURCE_CONTRACT_MISSING"
+    document_code, document_comment_free = document_views
+
     for value in (
         WELCOME_NEW_AUTOMATION_ID,
         WELCOME_PASTE_AUTOMATION_ID,
@@ -509,13 +520,13 @@ def source_contract_failure() -> str | None:
         WELCOME_OPEN_SAMPLE_AUTOMATION_ID,
         WELCOME_DONT_SHOW_AUTOMATION_ID,
     ):
-        if value not in workspace:
+        if value not in workspace_comment_free:
             return "WELCOME_UIA_CONTRACT_MISSING"
-    if DOCUMENT_SAVE_AS_AUTOMATION_ID not in document:
+    if DOCUMENT_SAVE_AS_AUTOMATION_ID not in document_comment_free:
         return "SAVE_AS_UIA_CONTRACT_MISSING"
-    if "initial.is_none() && show_welcome_on_startup" not in workspace:
+    if "initial.is_none() && show_welcome_on_startup" not in workspace_code:
         return "NO_ARGUMENT_WELCOME_CONTRACT_MISSING"
-    if "fn dont_show_welcome_again" not in workspace:
+    if "fn dont_show_welcome_again" not in workspace_code:
         return "DONT_SHOW_WELCOME_CONTRACT_MISSING"
     for contract in (
         "fn on_paste_into_new",
@@ -525,9 +536,9 @@ def source_contract_failure() -> str | None:
         "fn prompt_save_as_overwrite",
         "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
     ):
-        if contract not in workspace:
+        if contract not in workspace_code:
             return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    if "DocumentEvent::SaveAsRequested" not in document:
+    if "DocumentEvent::SaveAsRequested" not in document_code:
         return "SAVE_AS_SOURCE_CONTRACT_MISSING"
     return None
 

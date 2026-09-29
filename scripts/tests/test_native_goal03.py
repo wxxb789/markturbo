@@ -646,6 +646,151 @@ class ParserAndIsolationTests(unittest.TestCase):
             BUILD_LAUNCH_SPEC(Path("markturbo.exe"), None, Path("data"), Path("config"), Path("workspace"), Path("stderr.log"))
 
 
+class SourceContractFixtureTests(unittest.TestCase):
+    WORKSPACE_SOURCE = '''#[cfg(test)]
+use crate::test_support::WorkspaceFixture;
+
+const WELCOME_AUTOMATION_IDS: &[&str] = &[
+    "markturbo-welcome-new",
+    "markturbo-welcome-paste",
+    "markturbo-welcome-open-file",
+    "markturbo-welcome-open-folder",
+    "markturbo-welcome-open-sample",
+    "markturbo-welcome-dont-show-again",
+];
+
+fn show_welcome(initial: Option<()>, show_welcome_on_startup: bool) {
+    if initial.is_none() && show_welcome_on_startup {}
+}
+
+fn dont_show_welcome_again() {}
+fn on_paste_into_new() { cx.read_from_clipboard(); }
+fn open_bundled_sample() {}
+fn record_recent_target() {}
+fn prompt_save_as_overwrite() {
+    PromptButton::ok(i18n::t(i18n::Key::Replace, cx));
+}
+
+#[cfg(test)]
+mod tests {
+    const SOURCE_MARKER_DECOYS: &[&str] = &[
+        "markturbo-welcome-new",
+        "markturbo-welcome-paste",
+        "markturbo-welcome-open-file",
+        "markturbo-welcome-open-folder",
+        "markturbo-welcome-open-sample",
+        "markturbo-welcome-dont-show-again",
+        "initial.is_none() && show_welcome_on_startup",
+        "fn dont_show_welcome_again",
+        "fn on_paste_into_new",
+        "cx.read_from_clipboard()",
+        "fn open_bundled_sample",
+        "fn record_recent_target",
+        "fn prompt_save_as_overwrite",
+        "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
+    ];
+}
+'''
+    DOCUMENT_SOURCE = '''#[cfg(test)]
+use crate::test_support::DocumentFixture;
+
+const SAVE_AS_AUTOMATION_ID: &str = "markturbo-document-save-as";
+fn dispatch_save_as() { DocumentEvent::SaveAsRequested; }
+
+#[cfg(test)]
+mod tests {
+    const SOURCE_MARKER_DECOYS: &[&str] = &[
+        "markturbo-document-save-as",
+        "DocumentEvent::SaveAsRequested",
+    ];
+}
+'''
+
+    @staticmethod
+    def write_repository(root: Path, workspace: str, document: str) -> None:
+        workspace_path = root / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
+        document_path = root / "crates" / "mt-app" / "src" / "views" / "document.rs"
+        workspace_path.parent.mkdir(parents=True, exist_ok=True)
+        document_path.parent.mkdir(parents=True, exist_ok=True)
+        workspace_path.write_text(workspace, encoding="utf-8")
+        document_path.write_text(document, encoding="utf-8")
+
+    @classmethod
+    def source_failure(cls, root: Path, workspace: str, document: str) -> str | None:
+        cls.write_repository(root, workspace, document)
+        with mock.patch.object(HARNESS, "REPO", root):
+            return HARNESS.source_contract_failure()
+
+    def test_complete_temporary_repository_satisfies_source_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertIsNone(
+                self.source_failure(
+                    Path(temporary), self.WORKSPACE_SOURCE, self.DOCUMENT_SOURCE
+                )
+            )
+
+    def test_missing_production_markers_fail_with_their_contract_codes(self) -> None:
+        workspace_markers = (
+            ("markturbo-welcome-new", "WELCOME_UIA_CONTRACT_MISSING"),
+            ("markturbo-welcome-paste", "WELCOME_UIA_CONTRACT_MISSING"),
+            ("markturbo-welcome-open-file", "WELCOME_UIA_CONTRACT_MISSING"),
+            ("markturbo-welcome-open-folder", "WELCOME_UIA_CONTRACT_MISSING"),
+            ("markturbo-welcome-open-sample", "WELCOME_UIA_CONTRACT_MISSING"),
+            ("markturbo-welcome-dont-show-again", "WELCOME_UIA_CONTRACT_MISSING"),
+            (
+                "initial.is_none() && show_welcome_on_startup",
+                "NO_ARGUMENT_WELCOME_CONTRACT_MISSING",
+            ),
+            ("fn dont_show_welcome_again", "DONT_SHOW_WELCOME_CONTRACT_MISSING"),
+            ("fn on_paste_into_new", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("cx.read_from_clipboard()", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("fn open_bundled_sample", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("fn record_recent_target", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("fn prompt_save_as_overwrite", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            (
+                "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
+                "FIRST_USE_SOURCE_CONTRACT_MISSING",
+            ),
+        )
+        for marker, expected_code in workspace_markers:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
+                workspace = self.WORKSPACE_SOURCE.replace(marker, "", 1)
+                self.assertEqual(
+                    self.source_failure(
+                        Path(temporary), workspace, self.DOCUMENT_SOURCE
+                    ),
+                    expected_code,
+                )
+
+        document_markers = (
+            ("markturbo-document-save-as", "SAVE_AS_UIA_CONTRACT_MISSING"),
+            ("DocumentEvent::SaveAsRequested", "SAVE_AS_SOURCE_CONTRACT_MISSING"),
+        )
+        for marker, expected_code in document_markers:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
+                document = self.DOCUMENT_SOURCE.replace(marker, "", 1)
+                self.assertEqual(
+                    self.source_failure(
+                        Path(temporary), self.WORKSPACE_SOURCE, document
+                    ),
+                    expected_code,
+                )
+
+    def test_production_comment_cannot_replace_removed_first_use_action(self) -> None:
+        workspace = self.WORKSPACE_SOURCE.replace(
+            "cx.read_from_clipboard();",
+            "// Removed action marker: cx.read_from_clipboard().",
+            1,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(
+                self.source_failure(
+                    Path(temporary), workspace, self.DOCUMENT_SOURCE
+                ),
+                "FIRST_USE_SOURCE_CONTRACT_MISSING",
+            )
+
+
 class RuntimeAndSourceContractTests(unittest.TestCase):
     def test_stale_recent_native_check_proves_visible_and_inert_behavior(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
