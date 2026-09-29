@@ -2113,7 +2113,7 @@ mod tests {
     use gpui::AppContext as _;
     use gpui_kit::component::highlighter::Language;
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{Focusable as _, TestAppContext};
+    use gpui_kit::{Entity, Focusable as _, TestAppContext, VisualTestContext};
     use mt_core::document::io::{FileStamp, Newline, SourceIdentity};
     use mt_core::model::RevisionRequestBinding;
     use mt_core::recovery::{
@@ -2129,6 +2129,24 @@ mod tests {
         review::{ByteRange, SourceSnapshot},
     };
     use std::{cell::Cell, path::Path, rc::Rc, sync::Arc, time::SystemTime};
+
+    fn open_file_document<'cx>(
+        cx: &'cx mut TestAppContext,
+        path: &Path,
+    ) -> (Entity<DocumentView>, &'cx mut VisualTestContext) {
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        cx.add_window_view(|window, cx| {
+            DocumentView::new(
+                mt_core::document::io::load(path).expect("load test source"),
+                Arc::new(RendererRegistry::with_defaults()),
+                window,
+                cx,
+            )
+        })
+    }
 
     #[test]
     fn a_buffer_is_named_by_its_first_line() {
@@ -2537,18 +2555,7 @@ mod tests {
         let original = "one\nmiddle\nthree\n";
         std::fs::write(&path, original).expect("test source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load test source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
 
         let edited_events = Rc::new(Cell::new(0));
         let dirty_events = Rc::new(Cell::new(0));
@@ -2759,18 +2766,7 @@ mod tests {
         let manual = "export const answer = \"manual\";\n\n# Prompt\n";
         std::fs::write(&path, original).expect("test source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load test source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
         document.update(cx, |document, cx| {
             assert_eq!(document.document().doc_type(), DocType::Mdx);
             document.set_trust(Trust::Trusted, cx);
@@ -2860,18 +2856,7 @@ mod tests {
         let disk_original = original.replace('\n', "\r\n");
         std::fs::write(&path, disk_original.as_bytes()).expect("CRLF source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load CRLF source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
         document.read_with(cx, |document, app| {
             assert_eq!(document.text(app), original);
             assert!(!document.is_dirty());
@@ -2965,18 +2950,7 @@ mod tests {
         let first_text = "one\nmiddle\nthree\n";
         std::fs::write(&path, first_text).expect("test source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load test source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
 
         let edited_events = Rc::new(Cell::new(0));
         let dirty_events = Rc::new(Cell::new(0));
@@ -3112,18 +3086,7 @@ mod tests {
         let dirty_text = "one\nmiddle\nthree changed\n";
         std::fs::write(&path, disk_text).expect("test source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load test source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
         cx.update(|window, app| {
             document.update(app, |document, cx| {
                 document.replace_text(dirty_text.to_owned(), window, cx);
@@ -3230,18 +3193,7 @@ mod tests {
         let manual = "manual divergence\n";
         std::fs::write(&path, original).expect("test source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load test source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
 
         let snapshot = SourceSnapshot::new(0, 0);
         let start = original.find("one").unwrap() as u64;
@@ -3321,18 +3273,7 @@ mod tests {
         let original = "<!doctype html><html><body><script>window.before=1</script></body></html>";
         std::fs::write(&path, original).expect("test source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load test source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
         document.update(cx, |document, cx| {
             document.set_trust(Trust::Trusted, cx);
         });
@@ -3407,18 +3348,7 @@ mod tests {
         let original = "export const answer = \"old\";\n\n# Prompt\n";
         std::fs::write(&path, original).expect("test source");
 
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-        });
-        let (document, cx) = cx.add_window_view(|window, cx| {
-            DocumentView::new(
-                mt_core::document::io::load(&path).expect("load test source"),
-                Arc::new(RendererRegistry::with_defaults()),
-                window,
-                cx,
-            )
-        });
+        let (document, cx) = open_file_document(cx, &path);
         document.update(cx, |document, cx| {
             assert_eq!(document.document().doc_type(), DocType::Mdx);
             document.set_trust(Trust::Trusted, cx);

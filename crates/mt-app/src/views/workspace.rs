@@ -8,19 +8,19 @@
 //! Cohesive state lives in submodules where it has its own owner: `history`
 //! holds navigation data and controls, `recovery` owns the app recovery flow,
 //! `review` owns the Review → Revision workflow, and `web_surface` owns the OS
-//! child window and re-entrancy rules. The view modules add methods to
-//! `Workspace`, so existing wiring reads the same while those responsibilities
-//! stay together.
+//! child window and re-entrancy rules. `welcome` owns first-use presentation
+//! and recent-target availability. The view modules add methods to `Workspace`,
+//! so existing wiring reads the same while those responsibilities stay together.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::base::{Button as BaseButton, GlobalState, Toggle as BaseToggle};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
-    StyledExt as _, TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, StyledExt as _,
+    TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::ListItem,
@@ -60,6 +60,7 @@ mod history;
 mod recovery;
 mod review;
 pub(crate) mod web_surface;
+mod welcome;
 
 #[cfg(test)]
 use self::recovery::{
@@ -78,6 +79,7 @@ use self::review::{
     revision_apply_identity_matches,
 };
 use self::web_surface::WebSurface;
+use self::welcome::WelcomeState;
 #[cfg(test)]
 use mt_core::agent_artifacts::package::{
     ReviewRequestBuildError, ReviewRequestBuildRequest, ReviewTarget, build_review_request,
@@ -119,12 +121,6 @@ actions!(
 /// failure this bounds — the full path is a hover away.
 const TAB_LABEL_MAX: usize = 22;
 const TAB_CLOSE_ACCESSIBILITY_ID: &str = "markturbo-document-tab-close";
-const WELCOME_NEW_ACCESSIBILITY_ID: &str = "markturbo-welcome-new";
-const WELCOME_PASTE_ACCESSIBILITY_ID: &str = "markturbo-welcome-paste";
-const WELCOME_OPEN_FILE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-file";
-const WELCOME_OPEN_FOLDER_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-folder";
-const WELCOME_OPEN_SAMPLE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-sample";
-const WELCOME_DONT_SHOW_ACCESSIBILITY_ID: &str = "markturbo-welcome-dont-show-again";
 const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";
 const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";
 const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";
@@ -144,27 +140,6 @@ const REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
     "markturbo-revision-copy-recovered-answers";
 const REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
     "markturbo-revision-discard-recovered-answers";
-const WELCOME_KEY_CONTEXT: &str = "Welcome";
-
-fn should_show_welcome(initial: Option<&Path>, show_welcome_on_startup: bool) -> bool {
-    initial.is_none() && show_welcome_on_startup
-}
-
-fn recent_target_issue(target: &mt_core::settings::RecentTarget) -> Option<i18n::Key> {
-    if !target.path.exists() {
-        return Some(i18n::Key::RecentMissing);
-    }
-    match target.kind {
-        mt_core::settings::RecentTargetKind::File
-            if target.path.is_file() && mt_core::workspace::is_openable(&target.path) =>
-        {
-            None
-        }
-        mt_core::settings::RecentTargetKind::Workspace if target.path.is_dir() => None,
-        _ => Some(i18n::Key::RecentUnavailable),
-    }
-}
-
 /// Shorten `name` to [`TAB_LABEL_MAX`], keeping the extension.
 ///
 /// The extension is what distinguishes `notes.md` from `notes.mdx`, so eliding
@@ -818,16 +793,10 @@ fn document_details_status_key(is_externally_changed: bool, is_dirty: bool) -> i
 
 pub struct Workspace {
     focus_handle: FocusHandle,
-    welcome_scroll: ScrollHandle,
+    /// Retained scroll and entry-time availability for the Welcome surface.
+    welcome: WelcomeState,
     /// The deliberate first-run surface, available only for a no-argument start.
     show_welcome: bool,
-    /// Filesystem availability captured when the Welcome surface is entered.
-    ///
-    /// Rendering may occur many times while a window is resized or animated.
-    /// Recent-target and sample probes belong at that state boundary instead of
-    /// synchronously touching the filesystem from `render_welcome`.
-    welcome_recent_issues: HashMap<PathBuf, Option<i18n::Key>>,
-    welcome_sample_available: bool,
     root: Option<PathBuf>,
     explorer: Option<Entity<Explorer>>,
     harness: Option<Entity<HarnessView>>,
@@ -1023,13 +992,11 @@ impl Workspace {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
-            welcome_scroll: ScrollHandle::new(),
-            show_welcome: should_show_welcome(
+            welcome: WelcomeState::default(),
+            show_welcome: welcome::should_show_welcome(
                 initial.as_deref(),
                 crate::settings::AppSettings::global(cx).show_welcome_on_startup,
             ),
-            welcome_recent_issues: HashMap::new(),
-            welcome_sample_available: false,
             root: None,
             explorer: None,
             harness: None,
@@ -1513,111 +1480,6 @@ impl Workspace {
             self.record_recent_file(path, cx);
         }
         opened
-    }
-
-    fn record_recent_file(&self, path: PathBuf, cx: &mut Context<Self>) {
-        self.record_recent_target(path, mt_core::settings::RecentTargetKind::File, cx);
-    }
-
-    fn record_recent_workspace(&self, path: PathBuf, cx: &mut Context<Self>) {
-        self.record_recent_target(path, mt_core::settings::RecentTargetKind::Workspace, cx);
-    }
-
-    fn record_recent_target(
-        &self,
-        path: PathBuf,
-        kind: mt_core::settings::RecentTargetKind,
-        cx: &mut Context<Self>,
-    ) {
-        let display_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let target = mt_core::settings::RecentTarget::new(path, kind, display_name);
-        if crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .first()
-            == Some(&target)
-        {
-            return;
-        }
-        crate::settings::AppSettings::update(cx, move |settings| {
-            settings.record_recent_target(target);
-        });
-    }
-
-    fn open_recent_target(
-        &mut self,
-        path: &Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let target = crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .iter()
-            .find(|target| target.path == path)
-            .cloned();
-        let Some(target) = target else { return false };
-        if recent_target_issue(&target).is_some() {
-            return false;
-        }
-        self.open_target(target.path, true, window, cx)
-    }
-
-    /// Refresh Welcome-only filesystem state once when the surface is entered.
-    ///
-    /// Opening an item always repeats this check, because the cache is only a
-    /// presentation hint and must never authorize an operation on stale data.
-    fn refresh_welcome_availability(&mut self, cx: &App) {
-        self.welcome_recent_issues = crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .iter()
-            .map(|target| (target.path.clone(), recent_target_issue(target)))
-            .collect();
-        self.welcome_sample_available = crate::app_paths::bundled_sample_available();
-    }
-
-    fn welcome_recent_target_issue(
-        &self,
-        target: &mt_core::settings::RecentTarget,
-    ) -> Option<i18n::Key> {
-        self.welcome_recent_issues
-            .get(&target.path)
-            .copied()
-            .flatten()
-    }
-
-    fn remove_recent_target(&mut self, path: &Path, cx: &mut Context<Self>) {
-        crate::settings::AppSettings::update(cx, |settings| {
-            settings.remove_recent_target(path);
-        });
-    }
-
-    fn open_bundled_sample(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_bundled_sample_result(crate::app_paths::bundled_sample_dir(), window, cx);
-    }
-
-    fn open_bundled_sample_result(
-        &mut self,
-        sample: std::io::Result<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match sample {
-            Ok(path) => {
-                self.open_target(path, true, window, cx);
-            }
-            Err(_) => self.set_status(i18n::t(i18n::Key::BundledSampleUnavailable, cx).into(), cx),
-        }
-    }
-
-    fn dont_show_welcome_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        crate::settings::AppSettings::update(cx, |settings| {
-            settings.show_welcome_on_startup = false;
-        });
-        self.new_memory(String::new(), window, cx);
     }
 
     fn insert_document(
@@ -4242,268 +4104,6 @@ impl Workspace {
             }))
     }
 
-    fn render_welcome(&self, cx: &Context<Self>) -> AnyElement {
-        let recents = crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .clone();
-        let sample_available = self.welcome_sample_available;
-
-        v_flex()
-            .id("welcome")
-            .role(gpui_kit::Role::Group)
-            .aria_label(i18n::t(i18n::Key::WelcomeTitle, cx))
-            .size_full()
-            .min_h_0()
-            .items_center()
-            .overflow_y_scroll()
-            .track_scroll(&self.welcome_scroll)
-            .px_6()
-            .py_8()
-            .child(
-                v_flex()
-                    .w(px(560.))
-                    .max_w_full()
-                    .flex_shrink_0()
-                    .gap_3()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(Icon::new(IconName::BookOpen).large())
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_lg()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(i18n::t(i18n::Key::WelcomeTitle, cx)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(i18n::t(i18n::Key::WelcomeSubtitle, cx)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("welcome-new")
-                                    .icon(IconName::Plus)
-                                    .label(i18n::t(i18n::Key::NewDocument, cx))
-                                    .accessibility_id(WELCOME_NEW_ACCESSIBILITY_ID)
-                                    .primary()
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_new_document(&NewDocument, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-paste")
-                                    .icon(IconName::Copy)
-                                    .label(i18n::t(i18n::Key::Paste, cx))
-                                    .accessibility_id(WELCOME_PASTE_ACCESSIBILITY_ID)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_paste_into_new(&PasteIntoNew, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-open-file")
-                                    .icon(IconName::File)
-                                    .label(i18n::t(i18n::Key::OpenFilePicker, cx))
-                                    .accessibility_id(WELCOME_OPEN_FILE_ACCESSIBILITY_ID)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_open_file(&OpenFile, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-open-folder")
-                                    .icon(IconName::FolderOpen)
-                                    .label(i18n::t(i18n::Key::OpenFolderPicker, cx))
-                                    .accessibility_id(WELCOME_OPEN_FOLDER_ACCESSIBILITY_ID)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_open_folder(&OpenFolder, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-open-sample")
-                                    .icon(IconName::BookOpen)
-                                    .label(i18n::t(i18n::Key::OpenBundledSample, cx))
-                                    .accessibility_id(WELCOME_OPEN_SAMPLE_ACCESSIBILITY_ID)
-                                    .disabled(!sample_available)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_bundled_sample(window, cx);
-                                    })),
-                            ),
-                    )
-                    .when(!recents.is_empty(), |this| {
-                        this.child(
-                            v_flex()
-                                .mt_4()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(i18n::t(i18n::Key::Recent, cx)),
-                                )
-                                .children(recents.into_iter().map(|target| {
-                                    let issue = self.welcome_recent_target_issue(&target);
-                                    let path_text = target.path.to_string_lossy().into_owned();
-                                    let label = if target.display_name.is_empty() {
-                                        path_text.clone()
-                                    } else {
-                                        target
-                                            .path
-                                            .parent()
-                                            .map(|parent| {
-                                                format!(
-                                                    "{}  {}",
-                                                    target.display_name,
-                                                    parent.display()
-                                                )
-                                            })
-                                            .unwrap_or_else(|| target.display_name.clone())
-                                    };
-                                    let open_label =
-                                        i18n::open_recent_target_label(&target.path, cx);
-                                    let remove_label =
-                                        i18n::remove_recent_target_label(&target.path, cx);
-                                    let identity =
-                                        RecoveryKey::for_path(&target.path).as_str().to_owned();
-                                    let path = target.path.clone();
-                                    let remove_path = path.clone();
-                                    let open_id =
-                                        SharedString::from(format!("welcome-recent-{identity}"));
-                                    let open_accessibility_id = SharedString::from(format!(
-                                        "markturbo-welcome-recent-{identity}"
-                                    ));
-                                    let remove_id = SharedString::from(format!(
-                                        "welcome-recent-remove-{identity}"
-                                    ));
-                                    let status_id = SharedString::from(format!(
-                                        "markturbo-welcome-recent-status-{identity}"
-                                    ));
-                                    let icon = match target.kind {
-                                        mt_core::settings::RecentTargetKind::File => IconName::File,
-                                        mt_core::settings::RecentTargetKind::Workspace => {
-                                            IconName::Folder
-                                        }
-                                    };
-                                    let open_button = if issue.is_some() {
-                                        BaseButton::new(open_id)
-                                            .role(gpui_kit::Role::Button)
-                                            .disabled(true)
-                                            .accessibility_label(open_label)
-                                            .accessibility_id(open_accessibility_id)
-                                            .a11y_synthetic_children(|builder| {
-                                                builder.parent_node().set_disabled();
-                                            })
-                                            .styles(|styles| {
-                                                styles.disabled(|style| {
-                                                    style
-                                                        .bg(cx
-                                                            .theme()
-                                                            .input_background()
-                                                            .opacity(0.5))
-                                                        .border_color(cx.theme().input.opacity(0.5))
-                                                        .text_color(
-                                                            cx.theme()
-                                                                .muted_foreground
-                                                                .opacity(0.5),
-                                                        )
-                                                        .shadow_none()
-                                                })
-                                            })
-                                            .flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .h_8()
-                                            .px_2p5()
-                                            .gap_2()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(cx.theme().radius)
-                                            .border_1()
-                                            .child(Icon::new(icon).small())
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .truncate()
-                                                    .child(label.clone()),
-                                            )
-                                            .into_any_element()
-                                    } else {
-                                        Button::new(open_id)
-                                            .icon(icon)
-                                            .label(label.clone())
-                                            .accessibility_label(open_label)
-                                            .tooltip(path_text.clone())
-                                            .accessibility_id(open_accessibility_id)
-                                            .flex_1()
-                                            .min_w_0()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_recent_target(&path, window, cx);
-                                            }))
-                                            .into_any_element()
-                                    };
-                                    h_flex()
-                                        .w_full()
-                                        .gap_1()
-                                        .items_center()
-                                        .child(open_button)
-                                        .when_some(issue, move |this, issue| {
-                                            let label = i18n::t(issue, cx);
-                                            this.child(
-                                                div()
-                                                    .id(status_id.clone())
-                                                    .role(gpui_kit::Role::Label)
-                                                    .aria_value(label)
-                                                    .accessibility_id(status_id)
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(label),
-                                            )
-                                        })
-                                        .child(
-                                            Button::new(remove_id)
-                                                .icon(IconName::Close)
-                                                .accessibility_label(remove_label)
-                                                .accessibility_id(SharedString::from(format!(
-                                                    "markturbo-welcome-recent-remove-{identity}"
-                                                )))
-                                                .small()
-                                                .ghost()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.remove_recent_target(&remove_path, cx);
-                                                })),
-                                        )
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("welcome-dont-show-again")
-                            .label(i18n::t(i18n::Key::DontShowWelcomeAgain, cx))
-                            .accessibility_id(WELCOME_DONT_SHOW_ACCESSIBILITY_ID)
-                            .text()
-                            .w_full()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dont_show_welcome_again(window, cx);
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
     fn render_web_path_controls(&self, cx: &Context<Self>) -> Option<AnyElement> {
         if !self.web_active(cx) {
             return None;
@@ -5277,7 +4877,7 @@ impl Render for Workspace {
             .aria_label("markturbo workspace")
             .track_focus(&self.focus_handle)
             .key_context(if self.show_welcome && !self.settings_open {
-                WELCOME_KEY_CONTEXT
+                welcome::WELCOME_KEY_CONTEXT
             } else {
                 "Workspace"
             })
@@ -5335,8 +4935,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewDocument, None),
         KeyBinding::new("ctrl-n", NewDocument, None),
-        KeyBinding::new("cmd-v", PasteIntoNew, Some(WELCOME_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-v", PasteIntoNew, Some(WELCOME_KEY_CONTEXT)),
+        KeyBinding::new("cmd-v", PasteIntoNew, Some(welcome::WELCOME_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteIntoNew, Some(welcome::WELCOME_KEY_CONTEXT)),
         KeyBinding::new("cmd-o", OpenFile, None),
         KeyBinding::new("ctrl-o", OpenFile, None),
         KeyBinding::new("cmd-shift-o", OpenFolder, None),
@@ -5385,6 +4985,8 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    mod welcome;
+
     use std::{
         cell::RefCell,
         collections::{HashMap, HashSet},
@@ -5562,19 +5164,32 @@ mod tests {
         cx: &mut TestAppContext,
         initial: Option<PathBuf>,
     ) -> (Entity<Workspace>, &mut VisualTestContext) {
-        let (workspace, cx) =
-            open_test_workspace_with_startup_recovery(cx, initial, StartupRecovery::default);
-        cx.run_until_parked();
         let recovery_root = tempfile::tempdir().unwrap();
         let recovery = RecoveryStore::new_at(
             recovery_root.path().join("store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, initial, recovery);
+        workspace.update(cx, |workspace, _| {
+            workspace._test_recovery_root = Some(recovery_root);
+        });
+        (workspace, cx)
+    }
+
+    fn open_test_workspace_with_recovery_store(
+        cx: &mut TestAppContext,
+        initial: Option<PathBuf>,
+        recovery: RecoveryStore,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        // Preserve the settled empty-startup path; store-owning tests inject
+        // their store once that arbitration has completed.
+        let (workspace, cx) =
+            open_test_workspace_with_startup_recovery(cx, initial, StartupRecovery::default);
+        cx.run_until_parked();
         workspace.update(cx, |workspace, _| {
             workspace.recovery_flow.startup_recovery_pending = false;
             workspace.recovery_flow.recovery = Some(recovery);
-            workspace._test_recovery_root = Some(recovery_root);
         });
         (workspace, cx)
     }
@@ -5803,9 +5418,6 @@ mod tests {
             })
             .expect("the ordinary source tab");
         live.update(cx, |document, _| document.rotate_recovery_key());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
 
         let scan = store.recover().unwrap();
         cx.update(|window, app| {
@@ -6243,391 +5855,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn welcome_visibility_requires_a_no_argument_launch_and_the_saved_preference() {
-        assert!(super::should_show_welcome(None, true));
-        assert!(!super::should_show_welcome(
-            Some(Path::new("workspace")),
-            true
-        ));
-        assert!(!super::should_show_welcome(None, false));
-    }
-
-    #[gpui_kit::test]
-    fn no_argument_workspace_starts_on_the_welcome_state(cx: &mut TestAppContext) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.show_welcome);
-            assert!(workspace.tabs.is_empty());
-            assert!(workspace.root.is_none());
-        });
-    }
-
-    // Exercise rendered controls and native GPUI event dispatch, not handlers.
-    // This guards the first-use path without requiring a foreground desktop.
-    #[gpui_kit::test]
-    fn kit_welcome_new_click_opens_one_editable_document(cx: &mut TestAppContext) {
-        use gpui_kit::test::TestWindowExt as _;
-
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            window.render_frame(app);
-            assert!(window.find("welcome-new").visible());
-            window.click("welcome-new", app);
-        });
-        cx.run_until_parked();
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.source_path(), None);
-            assert_eq!(document.text(app), "");
-            assert!(!document.is_dirty());
-        });
-        cx.update(|window, app| {
-            window.render_frame(app);
-            assert!(window.try_find("welcome-new").is_none());
-            window.click("source", app);
-            assert_eq!(window.find("source").focused(), Some(true));
-            window.input("# Headless edit", app);
-        });
-        cx.run_until_parked();
-        workspace.read_with(cx, |workspace, app| {
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.text(app), "# Headless edit");
-            assert!(document.is_dirty());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn explicit_path_bypasses_welcome_and_records_its_file_target(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("opened.md");
-        fs::write(&path, "# Opened\n").unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.root.as_deref(), path.parent());
-            assert_eq!(
-                crate::settings::AppSettings::global(app)
-                    .recent_targets
-                    .first()
-                    .map(|target| target.path.as_path()),
-                Some(path.as_path())
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn paste_creates_an_exact_dirty_memory_document(cx: &mut TestAppContext) {
-        let text = "# \u{7cbe}\u{8d34} \u{1f680}\nexact clipboard text\n";
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            app.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-            workspace.update(app, |workspace, cx| {
-                workspace.on_paste_into_new(&super::PasteIntoNew, window, cx);
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.text(app), text);
-            assert!(document.is_dirty());
-            assert_eq!(document.layout(), Layout::Source);
-        });
-    }
-
-    #[gpui_kit::test]
-    fn unavailable_welcome_clipboard_preserves_the_surface_and_reports_the_reason(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.on_paste_into_new(&super::PasteIntoNew, window, cx);
-            });
-        });
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert_eq!(
-                workspace.status.as_deref(),
-                Some(i18n::t(i18n::Key::ClipboardTextUnavailable, app))
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn welcome_ctrl_v_pastes_into_a_new_document(cx: &mut TestAppContext) {
-        let text = "# Clipboard shortcut\nexact \u{4e2d}\u{6587} \u{1f680}\n";
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-
-        cx.simulate_keystrokes("ctrl-v");
-        cx.run_until_parked();
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.text(app), text);
-            assert!(document.is_dirty());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn welcome_paste_shortcut_is_inactive_while_settings_is_visible(cx: &mut TestAppContext) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            app.write_to_clipboard(ClipboardItem::new_string("settings input".to_string()));
-            workspace.update(app, |workspace, cx| {
-                workspace.on_open_settings(&super::OpenSettings, window, cx);
-            });
-        });
-
-        cx.simulate_keystrokes("ctrl-v");
-        cx.run_until_parked();
-
-        workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.settings_open);
-            assert!(workspace.show_welcome);
-            assert!(workspace.tabs.is_empty());
-        });
-    }
-
-    #[cfg(target_os = "windows")]
-    #[gpui_kit::test]
-    fn failed_file_open_keeps_welcome_root_tabs_and_focus_unchanged(cx: &mut TestAppContext) {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("locked.md");
-        fs::write(&path, "locked\n").unwrap();
-        let _lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(&path)
-            .unwrap();
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        let opened = cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.open_file_target(path.clone(), window, cx)
-            })
-        });
-
-        assert!(!opened);
-        cx.update(|window, app| {
-            let workspace = workspace.read(app);
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert!(workspace.focus_handle.is_focused(window));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn cancelling_file_and_folder_pickers_preserves_the_welcome_state_and_focus(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.on_open_file(&super::OpenFile, window, cx);
-            });
-        });
-        assert!(cx.did_prompt_for_paths());
-        cx.simulate_path_prompt_response(|options| {
-            assert!(options.files);
-            assert!(!options.directories);
-            None
-        });
-        cx.run_until_parked();
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.on_open_folder(&super::OpenFolder, window, cx);
-            });
-        });
-        assert!(cx.did_prompt_for_paths());
-        cx.simulate_path_prompt_response(|options| {
-            assert!(!options.files);
-            assert!(options.directories);
-            None
-        });
-        cx.run_until_parked();
-
-        cx.update(|window, app| {
-            let workspace = workspace.read(app);
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert!(workspace.status.is_none());
-            assert!(workspace.focus_handle.is_focused(window));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn bundled_sample_opens_from_welcome_and_becomes_the_recent_workspace(cx: &mut TestAppContext) {
-        let sample = crate::app_paths::bundled_sample_dir().expect("the debug sample");
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.open_bundled_sample(window, cx);
-            });
-        });
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.root.as_deref(), Some(sample.as_path()));
-            let recent = crate::settings::AppSettings::global(app)
-                .recent_targets
-                .first()
-                .expect("the sample recent target");
-            assert_eq!(recent.path, sample);
-            assert_eq!(recent.kind, mt_core::settings::RecentTargetKind::Workspace);
-        });
-    }
-
-    #[gpui_kit::test]
-    fn unavailable_bundled_sample_keeps_welcome_visible_and_reports_status(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.open_bundled_sample_result(
-                    Err(std::io::Error::other("test materialization failure")),
-                    window,
-                    cx,
-                );
-            });
-        });
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert_eq!(
-                workspace.status.as_deref(),
-                Some(i18n::t(i18n::Key::BundledSampleUnavailable, app))
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn missing_recent_target_is_disabled_and_removable_without_opening_anything(
-        cx: &mut TestAppContext,
-    ) {
-        let missing = PathBuf::from("Q:/definitely/not/here/markturbo-missing.md");
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            crate::settings::AppSettings::update(app, |settings| {
-                settings.record_recent_target(mt_core::settings::RecentTarget::new(
-                    missing.clone(),
-                    mt_core::settings::RecentTargetKind::File,
-                    "missing.md",
-                ));
-            });
-            workspace.update(app, |workspace, cx| {
-                assert!(!workspace.open_recent_target(&missing, window, cx));
-                workspace.remove_recent_target(&missing, cx);
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert!(workspace.tabs.is_empty());
-            assert!(
-                crate::settings::AppSettings::global(app)
-                    .recent_targets
-                    .is_empty()
-            );
-        });
-    }
-
-    #[test]
-    fn recent_target_validation_distinguishes_missing_and_mismatched_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let directory = mt_core::settings::RecentTarget::new(
-            dir.path(),
-            mt_core::settings::RecentTargetKind::File,
-            "directory",
-        );
-        assert_eq!(
-            super::recent_target_issue(&directory),
-            Some(i18n::Key::RecentUnavailable)
-        );
-        let missing = mt_core::settings::RecentTarget::new(
-            dir.path().join("missing.md"),
-            mt_core::settings::RecentTargetKind::File,
-            "missing.md",
-        );
-        assert_eq!(
-            super::recent_target_issue(&missing),
-            Some(i18n::Key::RecentMissing)
-        );
-    }
-
-    #[gpui_kit::test]
-    fn valid_recent_file_reopens_through_the_shared_target_path(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recent.md");
-        let text = "# Recent \u{4e2d}\u{6587} \u{1f680}\nexact text\n";
-        fs::write(&path, text).unwrap();
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            crate::settings::AppSettings::update(app, |settings| {
-                settings.record_recent_target(mt_core::settings::RecentTarget::new(
-                    path.clone(),
-                    mt_core::settings::RecentTargetKind::File,
-                    "recent.md",
-                ));
-            });
-            workspace.update(app, |workspace, cx| {
-                assert!(workspace.open_recent_target(&path, window, cx));
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert_eq!(workspace.root.as_deref(), path.parent());
-            assert_eq!(workspace.tabs.len(), 1);
-            assert_eq!(workspace.document_at(0).unwrap().read(app).text(app), text);
-            assert_eq!(
-                crate::settings::AppSettings::global(app)
-                    .recent_targets
-                    .first()
-                    .map(|target| target.path.as_path()),
-                Some(path.as_path())
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn dont_show_welcome_again_persists_and_starts_an_empty_memory_document(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.dont_show_welcome_again(window, cx);
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert!(!crate::settings::AppSettings::global(app).show_welcome_on_startup);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.source_path(), None);
-            assert_eq!(document.text(app), "");
-            assert!(!document.is_dirty());
-        });
-    }
-
     #[gpui_kit::test]
     fn clean_window_close_defers_teardown_until_the_focused_input_handler_can_drain(
         cx: &mut TestAppContext,
@@ -6654,99 +5881,6 @@ mod tests {
                 assert!(workspace.request_window_close(window, cx));
             });
         });
-    }
-
-    #[gpui_kit::test]
-    fn disabled_welcome_starts_future_no_argument_workspaces_with_a_new_buffer(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, false);
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.source_path(), None);
-            assert_eq!(document.text(app), "");
-            assert!(!document.is_dirty());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn ten_recent_targets_scroll_into_view_at_the_minimum_window_size(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut targets = Vec::new();
-        for ix in 0..10 {
-            let path = dir.path().join(format!(
-                "{ix:02}-a-very-long-recent-document-name-for-layout-\u{4e2d}\u{6587}.md"
-            ));
-            if ix < 8 {
-                fs::write(&path, format!("# Recent {ix}\n")).unwrap();
-            }
-            targets.push(path);
-        }
-
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-            super::init(app);
-        });
-        let captured = Rc::new(RefCell::new(None));
-        let window = cx.open_window(gpui_kit::size(px(720.), px(480.)), {
-            let captured = captured.clone();
-            move |window, app| {
-                let workspace = app.new(|cx| {
-                    Workspace::new_with_startup_recovery(None, StartupRecovery::default, window, cx)
-                });
-                *captured.borrow_mut() = Some(workspace.clone());
-                gpui_kit::component::Root::new(workspace, window, app)
-            }
-        });
-        let mut cx = VisualTestContext::from_window(window.into(), cx);
-        let workspace = captured.borrow().clone().expect("the Workspace entity");
-        cx.update(|window, app| {
-            crate::settings::AppSettings::update(app, |settings| {
-                for path in &targets {
-                    settings.record_recent_target(mt_core::settings::RecentTarget::new(
-                        path.clone(),
-                        mt_core::settings::RecentTargetKind::File,
-                        path.file_name().unwrap().to_string_lossy(),
-                    ));
-                }
-            });
-            let handle = workspace.read(app).focus_handle(app);
-            window.focus(&handle, app);
-            window.draw(app).clear(app);
-        });
-        cx.run_until_parked();
-        cx.update(|window, app| window.draw(app).clear(app));
-
-        let (before, max, bounds) = workspace.read_with(&cx, |workspace, _| {
-            (
-                workspace.welcome_scroll.offset(),
-                workspace.welcome_scroll.max_offset(),
-                workspace.welcome_scroll.bounds(),
-            )
-        });
-        assert!(
-            max.y > px(0.),
-            "ten recent targets must overflow vertically"
-        );
-        assert!(bounds.top() >= crate::metrics::title_bar());
-        assert!(bounds.bottom() <= px(480.) - crate::metrics::status_bar());
-
-        cx.simulate_event(gpui_kit::ScrollWheelEvent {
-            position: point(px(360.), px(240.)),
-            delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-2_000.))),
-            ..Default::default()
-        });
-        cx.update(|window, app| window.draw(app).clear(app));
-
-        let after = workspace.read_with(&cx, |workspace, _| workspace.welcome_scroll.offset());
-        assert!(
-            after.y < before.y,
-            "the welcome page must respond to scrolling"
-        );
-        assert_eq!(after.y, -max.y, "the full recent list must be reachable");
     }
 
     #[gpui_kit::test]
@@ -7238,11 +6372,7 @@ mod tests {
         .unwrap();
         let key = write_memory_recovery_checkpoint(&store, "# Recovered prompt\n");
         let scan = store.recover().unwrap();
-        let (workspace, cx) = open_test_workspace_with(cx, None);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store)
-        });
-
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store);
         let restored = cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 restore_recovery_for_test(workspace, scan, window, cx)
@@ -7850,10 +6980,9 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace.recovery_flow.recovery = Some(store.clone());
                 workspace.open_file_as(first.clone(), true, window, cx);
             });
         });
@@ -8697,20 +7826,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn discard_keeps_the_tab_open_when_recovery_retirement_fails(cx: &mut TestAppContext) {
+    fn save_retries_a_failed_durable_recovery_retirement(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("discard-retirement-failure.md");
+        let path = dir.path().join("save-retirement-retry.md");
         fs::write(&path, "disk\n").unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-        let edited = "discard only after durable retirement\n";
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let edited = "saved before retirement retry\n";
         replace_document(&workspace, 0, edited, cx);
         write_recovery_checkpoint(&store, &path, "older checkpoint\n");
         let now = cx.background_executor.now();
@@ -8782,10 +7909,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "discarded after rename\n", cx);
         let checkpoint = workspace.read_with(cx, |workspace, app| {
             workspace
@@ -8814,20 +7939,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn save_retries_a_failed_durable_recovery_retirement(cx: &mut TestAppContext) {
+    fn discard_keeps_the_tab_open_when_recovery_retirement_fails(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("save-retirement-retry.md");
+        let path = dir.path().join("discard-retirement-failure.md");
         fs::write(&path, "disk\n").unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-        let edited = "saved before retirement retry\n";
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let edited = "discard only after durable retirement\n";
         replace_document(&workspace, 0, edited, cx);
         let checkpoint = workspace.read_with(cx, |workspace, app| {
             workspace
@@ -8896,10 +8019,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -9457,20 +8578,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn second_save_replaces_a_stale_ui_retirement_owner(cx: &mut TestAppContext) {
+    fn matched_old_completion_replays_a_queued_save_retirement(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("second-save-stale-owner.md");
+        let path = dir.path().join("queued-save-replay.md");
         fs::write(&path, "disk\n").unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-        write_recovery_checkpoint(&store, &path, "first saved checkpoint\n");
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        write_recovery_checkpoint(&store, &path, "queued checkpoint\n");
         let key = RecoveryKey::for_path(&path);
         let old = store.begin_retirement(&key).unwrap();
         workspace.update(cx, |workspace, _| {
@@ -9519,20 +8638,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn matched_old_completion_replays_a_queued_save_retirement(cx: &mut TestAppContext) {
+    fn second_save_replaces_a_stale_ui_retirement_owner(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queued-save-replay.md");
+        let path = dir.path().join("second-save-stale-owner.md");
         fs::write(&path, "disk\n").unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-        write_recovery_checkpoint(&store, &path, "queued checkpoint\n");
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        write_recovery_checkpoint(&store, &path, "first saved checkpoint\n");
         let key = RecoveryKey::for_path(&path);
         let old = store.begin_retirement(&key).unwrap();
         workspace.update(cx, |workspace, _| {
@@ -9594,10 +8711,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let document = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
             .unwrap();
@@ -9642,10 +8757,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "discard after takeover\n", cx);
         let (id, checkpoint) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
@@ -9703,10 +8816,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "keep open through replay retry\n", cx);
         let (id, checkpoint) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
@@ -9790,10 +8901,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let retired_text = "retirement removes this checkpoint\n";
         replace_document(&workspace, 0, retired_text, cx);
         let (id, checkpoint, retired_identity) = workspace.read_with(cx, |workspace, app| {
@@ -9895,10 +9004,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "old document revision one\n", cx);
         let (old_id, checkpoint, retired_identity) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
@@ -10011,10 +9118,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let text = "dirty source remains open\n";
         replace_document(&workspace, 0, text, cx);
         let (id, checkpoint, binding) = workspace.read_with(cx, |workspace, app| {
@@ -10170,10 +9275,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -10300,11 +9403,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "saved text\n", cx);
         let saved_checkpoint = workspace.read_with(cx, |workspace, app| {
             workspace
@@ -10359,11 +9459,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         for decision in ["Save", "Discard"] {
             if workspace.read_with(cx, |workspace, _| workspace.tabs.is_empty()) {
                 cx.update(|window, app| {
@@ -10437,11 +9534,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store);
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store);
         replace_document(&workspace, 0, "save me\n", cx);
         let generation_before_save = workspace.read_with(cx, |workspace, _| {
             assert_eq!(workspace.recovery_flow.recovery_schedules.len(), 1);
@@ -10490,7 +9584,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let (id, key) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (document.id(), document.recovery_key())
@@ -10513,7 +9608,6 @@ mod tests {
         let deadline = schedule.next_deadline();
 
         workspace.update(cx, |workspace, cx| {
-            workspace.recovery_flow.recovery = Some(store);
             workspace.recovery_flow.recovery_schedules.insert(
                 id,
                 super::DocumentRecoveryState {
@@ -10558,10 +9652,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first_path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first_path), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second_path, window, cx);
@@ -10647,10 +9739,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "first snapshot\n", cx);
 
         let now = cx.background_executor.now();
@@ -10739,10 +9829,8 @@ mod tests {
         )
         .unwrap();
         let batches_before = store.checkpoint_batch_count_for_test();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let document = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
             .unwrap();
@@ -11011,10 +10099,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let latest = "latest while stale worker is stuck\n";
         replace_document(&workspace, 0, latest, cx);
 
@@ -11100,10 +10186,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "protected late\n", cx);
 
         let now = cx.background_executor.now();
@@ -11233,10 +10317,8 @@ mod tests {
             recovery_limits(max_record_bytes),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
 
         replace_document(
             &workspace,
@@ -11287,11 +10369,8 @@ mod tests {
             recovery_limits(max_record_bytes),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "below the plaintext ceiling\n", cx);
         cx.background_executor.advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
@@ -11324,11 +10403,8 @@ mod tests {
         let protector = Arc::new(CountingRecoveryProtector::new(CountingProtection::FailOnce));
         let store =
             RecoveryStore::new_at(dir.path().join("recovery-store"), protector.clone()).unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let text = "retry this exact revision 中文 \u{1f680}\n";
         replace_document(&workspace, 0, text, cx);
         let revision = workspace.read_with(cx, |workspace, app| {
@@ -11368,10 +10444,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "current revision\n", cx);
 
         let now = cx.background_executor.now();
@@ -11410,7 +10484,6 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         workspace.update(cx, |workspace, cx| {
-            workspace.recovery_flow.recovery = Some(store);
             workspace.recovery_flow.recovery_schedules.insert(
                 id,
                 DocumentRecoveryState {
@@ -11481,10 +10554,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("the transaction must reserve its eviction victim");
 
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let edited = "edited during eviction reservation\n";
         replace_document(&workspace, 0, edited, cx);
         let immediate_warning = workspace.read_with(cx, |workspace, _| {
@@ -11535,11 +10606,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let first = "first checkpoint\n";
         replace_document(&workspace, 0, first, cx);
         cx.background_executor.advance_clock(Duration::from_secs(2));
@@ -11584,10 +10652,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -11634,11 +10700,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let edited = "checkpoint 中文 \u{1f680}\n";
         replace_document(&workspace, 0, edited, cx);
         let started = Instant::now();
@@ -11660,10 +10723,8 @@ mod tests {
         assert_eq!(scan.records.len(), 1, "the two-second deadline dispatched");
         assert_eq!(scan.records[0].record.text, edited);
 
-        let (restored_workspace, cx) = open_test_workspace_with(cx, None);
-        restored_workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (restored_workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, None, store.clone());
         let restored = cx.update(|window, app| {
             restored_workspace.update(app, |workspace, cx| {
                 restore_recovery_for_test(workspace, scan, window, cx)
@@ -11978,15 +11039,13 @@ mod tests {
         .unwrap();
         write_recovery_checkpoint(&store, &path, "recovered source\n");
 
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let live_document = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
             .unwrap();
         live_document.update(cx, |document, _| {
             document.rotate_recovery_key();
-        });
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
         });
         let scan = store.recover().unwrap();
         cx.update(|window, app| {
@@ -12074,7 +11133,8 @@ mod tests {
         .unwrap();
         write_recovery_checkpoint(&store, &path, recovered_text);
 
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let ordinary = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
             .unwrap();
@@ -12098,9 +11158,6 @@ mod tests {
                     _ => None,
                 })
                 .unwrap()
-        });
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
         });
         let recovered_key = RecoveryKey::for_path(&path);
         let scan = store.recover().unwrap();
@@ -12260,7 +11317,8 @@ mod tests {
         .unwrap();
         write_recovery_checkpoint(&store, &path, recovered_text);
 
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(control_path.clone(), window, cx);
@@ -12384,7 +11442,8 @@ mod tests {
         )
         .unwrap();
         write_recovery_checkpoint(&store, &path, recovered_text);
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let (recovered_id, _) = restore_open_file_checkpoint(&workspace, &path, &store, cx);
 
         let mut recovered_results = Results::default();
@@ -12543,10 +11602,7 @@ mod tests {
             }],
             issues: Vec::new(),
         };
-        let (workspace, cx) = open_test_workspace_with(cx, None);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store.clone());
         let restored_at = cx.background_executor.now();
 
         let restored = cx.update(|window, app| {
@@ -13091,14 +12147,12 @@ mod tests {
             )
             .unwrap();
 
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let original_file = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
             .unwrap();
         original_file.update(cx, |document, _| document.rotate_recovery_key());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
         let scan = store.recover().unwrap();
         let recovered_document_id = cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
@@ -13219,10 +12273,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "dirty source survives copy\n", cx);
         let key = workspace.read_with(cx, |workspace, app| {
             workspace.document_at(0).unwrap().read(app).recovery_key()
@@ -13281,10 +12333,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (
@@ -13466,10 +12516,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (
@@ -13653,9 +12701,6 @@ mod tests {
         store: &RecoveryStore,
         cx: &mut VisualTestContext,
     ) -> (super::DocumentId, RecoveryKey) {
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
         let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (
@@ -13793,7 +12838,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, source.clone());
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(source.clone()), store.clone());
         let (document_id, _) =
             prepare_reject_all_revision_for_save_as(&workspace, Some(&source), &store, cx);
         let other_document_id = add_secondary_memory_tab(&workspace, cx);
@@ -13859,7 +12905,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (picker_workspace, cx) = open_test_workspace(cx, picker_source.clone());
+        let (picker_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(picker_source.clone()),
+            picker_store.clone(),
+        );
         let (picker_document_id, picker_recovery_key) = prepare_reject_all_revision_for_save_as(
             &picker_workspace,
             Some(&picker_source),
@@ -13947,7 +12997,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (replace_workspace, cx) = open_test_workspace(cx, replace_source.clone());
+        let (replace_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(replace_source.clone()),
+            replace_store.clone(),
+        );
         let (replace_document_id, replace_recovery_key) = prepare_reject_all_revision_for_save_as(
             &replace_workspace,
             Some(&replace_source),
@@ -14040,7 +13094,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (pathless_workspace, cx) = open_test_workspace_with(cx, None);
+        let (pathless_workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, None, pathless_store.clone());
         let created_pathless_document_id = cx.update(|window, app| {
             pathless_workspace.update(app, |workspace, cx| {
                 workspace.new_memory("old\n".to_owned(), window, cx);
@@ -14112,7 +13167,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (picker_switch_workspace, cx) = open_test_workspace(cx, picker_switch_source.clone());
+        let (picker_switch_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(picker_switch_source.clone()),
+            picker_switch_store.clone(),
+        );
         let (picker_switch_document_id, _) = prepare_reject_all_revision_for_save_as(
             &picker_switch_workspace,
             Some(&picker_switch_source),
@@ -14167,7 +13226,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (replace_switch_workspace, cx) = open_test_workspace(cx, replace_switch_source.clone());
+        let (replace_switch_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(replace_switch_source.clone()),
+            replace_switch_store.clone(),
+        );
         let (replace_switch_document_id, _) = prepare_reject_all_revision_for_save_as(
             &replace_switch_workspace,
             Some(&replace_switch_source),
@@ -14403,10 +13466,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let (document, document_id, recovery_key, revision, source_snapshot) =
             workspace.read_with(cx, |workspace, app| {
                 let document = workspace.document_at(0).unwrap();
@@ -15091,10 +14152,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -15211,10 +14270,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -15294,10 +14351,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -15430,10 +14485,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -15524,10 +14577,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -15850,16 +14901,12 @@ mod tests {
             }],
             issues: Vec::new(),
         };
-        let (workspace, cx) = open_test_workspace_with(cx, None);
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery_flow.recovery = Some(store);
-        });
-
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store);
         let restored = cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 restore_recovery_for_test(workspace, scan, window, cx)
