@@ -2237,31 +2237,21 @@ def _print_json(value: Mapping[str, object]) -> None:
 
 
 def _add_external_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--eligibility-registry", "--registry", dest="eligibility_registry", type=Path)
+    parser.add_argument("--eligibility-registry", dest="eligibility_registry", type=Path)
     parser.add_argument("--approved-registry-sha256")
-    parser.add_argument("--machine-receipt", "--machine", dest="machine_receipt", type=Path)
+    parser.add_argument("--machine-receipt", dest="machine_receipt", type=Path)
     parser.add_argument("--approved-machine-receipt-sha256")
     parser.add_argument(
         "--approved-runner-executable-sha256",
-        "--approved-machine-executable-sha256",
         dest="approved_runner_executable_sha256",
     )
-    parser.add_argument(
-        "--native-evidence",
-        "--native-acceptance",
-        "--native-pass-evidence",
-        dest="native_evidence",
-        type=Path,
-    )
+    parser.add_argument("--native-evidence", dest="native_evidence", type=Path)
     parser.add_argument(
         "--approved-native-evidence-sha256",
-        "--approved-native-evidence-raw-sha256",
-        "--native-evidence-sha256",
         dest="approved_native_evidence_sha256",
     )
     parser.add_argument(
         "--approved-native-executable-sha256",
-        "--native-executable-sha256",
         dest="approved_native_executable_sha256",
     )
 
@@ -2272,12 +2262,20 @@ def parser() -> argparse.ArgumentParser:
     verify = subcommands.add_parser("verify-manifest", help="Verify the immutable Goal 01 corpus manifest.")
     verify.add_argument("--root", type=Path, default=REPO, help=argparse.SUPPRESS)
     verify.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    scaffold = subcommands.add_parser("scaffold", aliases=["init"], help="Write a fail-closed owner-input scaffold.")
+    scaffold = subcommands.add_parser(
+        "scaffold",
+        allow_abbrev=False,
+        help="Write a fail-closed owner-input scaffold.",
+    )
     scaffold.add_argument("--root", type=Path, default=REPO, help=argparse.SUPPRESS)
     scaffold.add_argument("--evidence", type=Path)
     scaffold.add_argument("--created-at", help=argparse.SUPPRESS)
     _add_external_args(scaffold)
-    record = subcommands.add_parser("record", aliases=["run"], help="Record owner-local revision judgments.")
+    record = subcommands.add_parser(
+        "record",
+        allow_abbrev=False,
+        help="Record owner-local revision judgments.",
+    )
     record.add_argument("--root", type=Path, default=REPO, help=argparse.SUPPRESS)
     record.add_argument("--owner-input-dir", type=Path)
     record.add_argument("--evidence", type=Path)
@@ -2310,15 +2308,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if namespace.command == "verify-manifest":
             _print_json(verification.evidence())
             return 0
-        if namespace.command in {"scaffold", "init"}:
+        if namespace.command == "scaffold":
             registry = machine = native = None
             if namespace.eligibility_registry is not None:
                 registry, machine, native = _load_external_inputs(namespace, verification)
             evidence = scaffold_evidence(verification, registry=registry, machine_receipt=machine, native_acceptance=native, approved_registry_sha256=namespace.approved_registry_sha256, approved_machine_receipt_sha256=namespace.approved_machine_receipt_sha256, approved_runner_executable_sha256=namespace.approved_runner_executable_sha256, approved_native_evidence_sha256=namespace.approved_native_evidence_sha256, approved_native_executable_sha256=namespace.approved_native_executable_sha256, created_at=namespace.created_at)
             _write_or_print(evidence, output=namespace.evidence, root=namespace.root)
             return 0
-        if namespace.command not in {"record", "run"}:
-            raise RevisionEvaluationError("unknown revision evaluation command")
         if namespace.owner_input_dir is None:
             evidence = scaffold_evidence(verification, created_at=namespace.created_at, reason="owner_local_revision_inputs_required")
             _write_or_print(evidence, output=namespace.evidence, root=namespace.root)

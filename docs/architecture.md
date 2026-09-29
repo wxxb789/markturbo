@@ -112,7 +112,7 @@ useful only when removing it would spread a real rule back across its callers.
 
 | Source before | Responsibility after | Why this seam, or why keep it together |
 | --- | --- | --- |
-| `views/workspace.rs`: open tabs, Review/Revision, recovery, lifecycle, presentation | `Workspace` keeps tabs, document events, shared Save As picker and destructive decision; `workspace/review.rs` owns Review through Approved Revision, `workspace/recovery.rs` owns startup/checkpoint/retirement and close continuation | A user action can now be traced through frozen request, consent, stale completion, decision and presentation in Review, or through protected edit, exact ticket and close in Recovery. Moving only helpers or tests would leave those invariants split across callbacks. |
+| `views/workspace.rs`: open tabs, first-use Welcome, Review/Revision, recovery, lifecycle, presentation | `Workspace` keeps tabs, document events, target routing, shared Save As picker and destructive decision; `workspace/welcome.rs` owns Welcome presentation, entry-time availability and recent-target interaction; `workspace/review.rs` owns Review through Approved Revision, `workspace/recovery.rs` owns startup/checkpoint/retirement and close continuation | A user action can now be traced through Welcome availability and rechecked target opening, frozen Review request through explicit Apply, or the protected Recovery edit through exact durable retirement. Moving only helpers or tests would leave those rules split across callbacks. |
 | `views/document.rs`: editor, source lifetime, save, native/Web projection | `DocumentView` keeps source/edit/Save and approved Apply; `document/preview.rs` owns derived preview cache, failure and refresh transitions | Rebuilding the Web payload and retaining its failed revision vary independently of the source identity; a preview never authorizes an edit or source reload. |
 | `document/io.rs`: load/identity, encoding, Save/Save As, platform commit | `io.rs` retains load, source/Skill origin, authorization, encoding and staging; private `io/commit.rs` owns the shared guarded transaction through verification/rollback | Both Save and Save As require the same final race checks and platform-specific commit; splitting the source identity contract itself would create a second authority. |
 | `agent_artifacts/package.rs`: frozen package and authenticated directory acquisition | `package.rs` keeps scope, omission disclosure and anchors; private `package/source.rs` owns origin-bound enumeration and byte reads | No caller can safely reconstruct a Skill root from a path. Deleting acquisition would spread no-follow/identity checks across package construction and navigation. |
@@ -124,6 +124,45 @@ useful only when removing it would spread a real rule back across its callers.
 | `bin/markturbo-goal07-evaluate.rs`: offline Review/Revision capture evaluation | Retain the single capture-to-content-free-receipt command | Input path safety, source/proposal binding and receipt creation are one evaluation contract, not reusable UI workflows. |
 | `translate/provider.rs`, `views/model_settings.rs`, `views/web.rs`, `bin/markturbo-goal06-evaluate.rs`: Translation transport, credential settings UI, trusted Web projection and owner-operated corpus evaluation respectively | Retain their separate owners | Translation freezes endpoint/credential and consent for one operation; the settings view adapts secure vault state without owning policy; Web rendering applies one trust/CSP contract; the evaluator binds a fixed corpus to explicit send authorization. Splitting these smaller seams would make their callers reassemble privacy or source-identity rules. |
 | `views/workspace/web_surface.rs`, `agent_artifacts/skill.rs`, `credentials.rs`, `rendering/mod.rs`: OS WebView lease, Skill discovery, vault transaction and renderer registry respectively | Retain their existing owners | Each has one shared state/identity or registry invariant; splitting its platform helpers would make callers reconstruct that invariant. These near-threshold sources were checked as well as the larger files. |
+
+### Tooling, native acceptance, and test ownership
+
+`scripts/mt.py` is the one command entry point. `markturbo_tools/cli.py`
+dispatches canonical subcommands; `checks.py` owns the explicit portable test
+list and validation tiers. Native acceptance is never found by test discovery:
+`native/runtime.py` owns Windows preflight, UIA lookup, hash-bound case lifecycle,
+strict process close, and bounded artifact byte search. Goal 02/03/06/07 modules
+retain their distinct scenario, privacy, evidence, and failure policies. Goal 07's
+`native/goal07_provider.py` owns only the deterministic loopback request/response
+protocol; its per-run request count is derived from recorded case observations,
+not a process-global evidence object. Merging goal policies into runtime would
+obscure which user operation and consent boundary each case proves.
+
+Other large Python sources keep separate owners: `evaluation.py` records Goal 06
+owner judgments; `revision_evaluation.py` binds Goal 07 registry, machine and
+native receipts to owner judgments; `goal04.py` owns build/evidence policy; and
+`probe.py` owns Windows measurement and process observations. Their output
+contracts and failure paths differ. Only the reused A-B-B-A sample order lives
+in `metrics.py`; a second Goal 04 forwarding scheduler is unnecessary. Icon
+generation, performance fixture generation, recovery capacity measurement and
+privacy scanning remain separate utilities because they do not share that
+policy. Shell scripts shipped inside sample/Skill fixtures are artifact content,
+not an alternative development harness; CI/release workflow commands remain
+specific to their jobs.
+
+Tests follow their owner rather than one common runner: core unit tests stay
+beside GPUI-free invariants; Workspace Welcome headless interaction tests live
+in `workspace/tests/welcome.rs` and reuse the Workspace fixtures; DocumentView
+Apply/undo tests share file-backed setup but retain separate source, trust and
+failure assertions. App/core integration tests retain real fixture and
+discovery coverage, while machine-dependent cost diagnostics stay ignored.
+Python fake-UIA/provider tests in `scripts/tests/` prove harness selection,
+ordering, privacy and evidence contracts, not the shipped GUI. GPUI Kit tests
+prove rendered element events and app state but not the OS clipboard, native
+dialogs, IME, WebView2 or DPAPI. Only full native runs on an eligible Windows
+desktop with the final executable hash establish those OS boundaries. Source
+preflight for Goal 03 checks both the Workspace shell and its production Welcome
+module; spelling or source scans alone cannot replace UI observations.
 
 ## Why these boundaries
 

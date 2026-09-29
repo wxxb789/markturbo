@@ -36,6 +36,7 @@ from .runtime import (
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
+    artifact_contains,
     complete_evidence as complete_evidence_envelope,
     finite_nonnegative,
     key_input,
@@ -52,7 +53,6 @@ from .runtime import (
     validate_process_context,
     wait_until,
     write_durable,
-    run_native_acceptance,
 )
 
 
@@ -459,19 +459,6 @@ def source_contract_failure() -> str | None:
     return None
 
 
-def artifact_contains(path: Path, patterns: tuple[bytes, ...]) -> bytes | None:
-    overlap = max(len(pattern) for pattern in patterns) - 1
-    tail = b""
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            value = tail + chunk
-            for pattern in patterns:
-                if pattern in value:
-                    return pattern
-            tail = value[-overlap:] if overlap else b""
-    return None
-
-
 def scan_case_artifacts(case_root: Path, ephemeral_credential: str | None = None) -> dict[str, Any]:
     try:
         roots = (case_root / "data", case_root / "config")
@@ -586,10 +573,6 @@ class Goal06Harness(BaseNativeHarness):
             inputs.append(key_input(VK_MENU, True))
         inputs.extend([key_input(VK_SHIFT, True), key_input(VK_CONTROL, True)])
         self.win32.send_inputs(inputs)
-
-    def close_app(self, app: Any) -> None:
-        self.win32.post_close(app.hwnd)
-        self.wait_process_exit(app)
 
     def run_review(self, app: Any) -> None:
         button = self.find_control(
@@ -729,12 +712,6 @@ def native_run_plan(configured_provider: bool = False) -> NativeRunPlan:
             lambda: harness.scenario(CASE_DOCUMENT),
             lambda: harness.scenario(CASE_SELECTION),
         ),
-    )
-
-
-def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
-    return run_native_acceptance(
-        args, native_run_plan(getattr(args, "configured_provider", False))
     )
 
 

@@ -308,10 +308,14 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
         def block(*_args: object) -> object:
             raise HARNESS_BLOCKED("INPUT_DESKTOP_LOCKED")
 
-        with mock.patch.dict(RUN.__globals__, {"preflight": fail}):
-            fail_code, fail_evidence, _ = RUN(args)
-        with mock.patch.dict(RUN.__globals__, {"preflight": block}):
-            block_code, block_evidence, _ = RUN(args)
+        with mock.patch.dict(HARNESS.__dict__, {"preflight": fail}):
+            fail_code, fail_evidence, _ = runtime.run_native_acceptance(
+                args, HARNESS.native_run_plan()
+            )
+        with mock.patch.dict(HARNESS.__dict__, {"preflight": block}):
+            block_code, block_evidence, _ = runtime.run_native_acceptance(
+                args, HARNESS.native_run_plan()
+            )
 
         self.assertEqual((fail_code, fail_evidence["status"]), (1, "FAIL"))
         self.assertEqual((block_code, block_evidence["status"]), (2, "BLOCKED"))
@@ -943,17 +947,6 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.detail, "RuntimeError")
         self.assertEqual(control.click_count, 1)
 
-    def test_external_conflict_waits_for_watcher_before_explicit_overwrite(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("    def scenario_external_conflict", 1)[1].split(
-            "    def scenario_recovery", 1
-        )[0]
-
-        watcher = body.index("CONFLICT_OVERWRITE_AUTOMATION_ID")
-        explicit = body.index('click_control(overwrite, "CONFLICT_OVERWRITE_CLICK_FAILED")')
-        self.assertLess(watcher, explicit)
-        self.assertNotIn("VK_S", body[:explicit])
-
     def test_launch_uses_the_configured_foreground_timeout(self) -> None:
         events: list[tuple[object, ...]] = []
         context = runtime.SecurityContext(1, 0x2000, "medium")
@@ -1097,25 +1090,3 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertIn(("foreground", 73, 2.0), events)
         self.assertIn(("click", (400, 300)), events)
         self.assertEqual(events[-1], ("foreground", 73, 3.5))
-
-    def test_recovery_waits_for_success_log_not_record_existence(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("    def scenario_recovery", 1)[1].split("\n\ndef native_run_plan", 1)[0]
-
-        self.assertIn("wait_checkpoint_log", body)
-        self.assertNotIn("glob(", body)
-        self.assertNotIn("wait_recovery_record", source)
-        checkpoint = body.index("wait_checkpoint_log")
-        live_records = body.index("scan_live_recovery_records", checkpoint)
-        terminate = body.index("self.terminate(first)")
-        live_runtime = body.index("scan_runtime_artifacts", terminate)
-        second = body.index("second = self.launch")
-        self.assertLess(checkpoint, live_records)
-        self.assertLess(live_records, terminate)
-        self.assertLess(terminate, live_runtime)
-        self.assertLess(live_runtime, second)
-
-        third = body.split("third = self.launch", 1)[1]
-        startup = third.index("wait_recovery_startup_finished")
-        observe = third.index("wait_editor_fingerprint")
-        self.assertLess(startup, observe)

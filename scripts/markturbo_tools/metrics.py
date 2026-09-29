@@ -6,6 +6,10 @@ import math
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
+
+
+T = TypeVar("T")
 
 
 def nearest_rank_percentile(values: list[float], quantile: float) -> float:
@@ -38,19 +42,17 @@ class AbbaComparison:
     percentages: tuple[float, ...]
 
 
-def measure_abba(
+def measure_abba_samples(
     rounds: int,
-    measure_a: Callable[[], float],
-    measure_b: Callable[[], float],
-) -> AbbaComparison:
-    """Measure two variants in A-B-B-A order to reduce drift bias."""
+    measure_a: Callable[[], T],
+    measure_b: Callable[[], T],
+) -> tuple[tuple[T, ...], tuple[T, ...]]:
+    """Collect samples by variant in strict A-B-B-A order."""
     if rounds < 1:
         raise ValueError("rounds must be at least 1")
 
-    samples_a: list[float] = []
-    samples_b: list[float] = []
-    paired_a: list[float] = []
-    paired_b: list[float] = []
+    samples_a: list[T] = []
+    samples_b: list[T] = []
     for _ in range(rounds):
         a_first = measure_a()
         b_first = measure_b()
@@ -58,8 +60,21 @@ def measure_abba(
         a_second = measure_a()
         samples_a.extend((a_first, a_second))
         samples_b.extend((b_first, b_second))
-        paired_a.append(statistics.fmean((a_first, a_second)))
-        paired_b.append(statistics.fmean((b_first, b_second)))
+    return tuple(samples_a), tuple(samples_b)
+
+
+def measure_abba(
+    rounds: int,
+    measure_a: Callable[[], float],
+    measure_b: Callable[[], float],
+) -> AbbaComparison:
+    """Measure two variants in A-B-B-A order to reduce drift bias."""
+    paired_a: list[float] = []
+    paired_b: list[float] = []
+    samples_a, samples_b = measure_abba_samples(rounds, measure_a, measure_b)
+    for index in range(0, len(samples_a), 2):
+        paired_a.append(statistics.fmean(samples_a[index : index + 2]))
+        paired_b.append(statistics.fmean(samples_b[index : index + 2]))
 
     deltas = [b - a for a, b in zip(paired_a, paired_b, strict=True)]
     try:

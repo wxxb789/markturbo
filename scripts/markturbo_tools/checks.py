@@ -41,6 +41,7 @@ TOOLING_TESTS = (
     "scripts.tests.test_native_goal03",
     "scripts.tests.test_native_goal06",
     "scripts.tests.test_native_goal07",
+    "scripts.tests.test_native_goal07_provider",
     "scripts.tests.test_native_source_contract",
     "scripts.tests.test_probe",
 )

@@ -45,7 +45,6 @@ from .runtime import (
     validate_process_context,
     wait_until,
     write_durable,
-    run_native_acceptance,
 )
 
 REPO = Path(__file__).resolve().parents[3]
@@ -977,10 +976,6 @@ def native_run_plan() -> NativeRunPlan:
             harness.scenario_recovery,
         ),
     )
-
-
-def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
-    return run_native_acceptance(args, native_run_plan())
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

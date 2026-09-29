@@ -18,7 +18,6 @@ UTILITY_COMMANDS = {
     "probe": "scripts.markturbo_tools.probe",
     "capacity": "scripts.markturbo_tools.recovery_capacity",
     "evaluation": "scripts.markturbo_tools.evaluation",
-    "evaluate": "scripts.markturbo_tools.evaluation",
     "revision-evaluation": "scripts.markturbo_tools.revision_evaluation",
 }
 ACCEPTANCE_GOALS = {

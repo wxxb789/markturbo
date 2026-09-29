@@ -17,12 +17,10 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import TypeVar
 
 from .metrics import inclusive_p95, nearest_rank_percentile
 
@@ -266,27 +264,6 @@ def trace_milestones(
         f"{name}_ms": (events[name].counter - start_counter) / frequency * 1000
         for name in STARTUP_TRACE_EVENTS
     }
-
-
-T = TypeVar("T")
-
-
-def measure_startup_abba(
-    rounds: int,
-    measure_a: Callable[[], T],
-    measure_b: Callable[[], T],
-) -> tuple[tuple[T, ...], tuple[T, ...]]:
-    """Collect structured samples in strict A-B-B-A order."""
-    if rounds < 1:
-        raise ValueError("rounds must be at least 1")
-    samples_a: list[T] = []
-    samples_b: list[T] = []
-    for _ in range(rounds):
-        samples_a.append(measure_a())
-        samples_b.append(measure_b())
-        samples_b.append(measure_b())
-        samples_a.append(measure_a())
-    return tuple(samples_a), tuple(samples_b)
 
 
 def quiet_gate_failures(

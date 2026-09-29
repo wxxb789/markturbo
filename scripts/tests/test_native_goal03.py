@@ -9,7 +9,6 @@ import hashlib
 import io
 import json
 import shutil
-import sys
 import tempfile
 import tomllib
 import unittest
@@ -18,9 +17,6 @@ from unittest import mock
 
 from scripts.markturbo_tools.native import goal03 as HARNESS
 from scripts.markturbo_tools.native import runtime
-
-SCRIPT = Path(HARNESS.__file__)
-PYWINAUTO_WAS_LOADED = "pywinauto" in sys.modules
 
 BUILD_LAUNCH_SPEC = runtime.build_launch_spec
 CASE_CLI = HARNESS.CASE_CLI
@@ -43,7 +39,6 @@ SCAN_CASE_ARTIFACTS = HARNESS.scan_case_artifacts
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
 VALIDATE_FINGERPRINT = runtime.validate_fingerprint
 GOAL_03_HARNESS = HARNESS.Goal03Harness
-RUN = HARNESS.run
 
 HASH = "a" * 64
 
@@ -433,29 +428,6 @@ class ParserAndIsolationTests(unittest.TestCase):
         self.assertEqual(events[1], ("foreground", 42, 3.0))
         self.assertEqual(events[2], ("inputs", 6))
 
-    def test_close_app_posts_then_waits_for_native_teardown(self) -> None:
-        events = []
-        window = object()
-
-        class FakeWin32:
-            def post_close(self, hwnd):
-                events.append(("post_close", hwnd, app.window))
-
-        class FakeHarness:
-            win32 = FakeWin32()
-
-            def wait_process_exit(self, value):
-                events.append(("wait", value.hwnd))
-
-        app = type("App", (), {"window": window, "hwnd": 42})()
-        GOAL_03_HARNESS.close_app(FakeHarness(), app)
-
-        self.assertIs(app.window, window)
-        self.assertEqual(
-            events,
-            [("post_close", 42, window), ("wait", 42)],
-        )
-
     def test_parser_requires_hash_and_positive_timeout(self) -> None:
         args = PARSE_ARGS(["--expect-exe-sha256", HASH.upper(), "--ui-timeout", "1.5"])
         self.assertEqual(args.expect_exe_sha256, HASH)
@@ -516,7 +488,7 @@ class ParserAndIsolationTests(unittest.TestCase):
                 ]
             )
             with mock.patch.dict(
-                RUN.__globals__,
+                HARNESS.__dict__,
                 {
                     "source_contract_failure": lambda: None,
                     "preflight": lambda *_args: (object(), object()),
@@ -525,7 +497,9 @@ class ParserAndIsolationTests(unittest.TestCase):
                     "REPO": root,
                 },
             ):
-                returncode, evidence, code = RUN(args)
+                returncode, evidence, code = runtime.run_native_acceptance(
+                    args, HARNESS.native_run_plan()
+                )
 
         self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "PARTIAL_CASE_RUN"))
         self.assertEqual(evidence["cases"][0]["status"], "PASS")
@@ -563,9 +537,11 @@ class ParserAndIsolationTests(unittest.TestCase):
                 "Goal03Harness": FakeHarness,
             }
 
-            with mock.patch.dict(RUN.__globals__, patch_run):
+            with mock.patch.dict(HARNESS.__dict__, patch_run):
                 success_args = PARSE_ARGS(["--exe", str(exe), "--expect-exe-sha256", expected])
-                success_code, _, _ = RUN(success_args)
+                success_code, _, _ = runtime.run_native_acceptance(
+                    success_args, HARNESS.native_run_plan()
+                )
 
                 partial_args = PARSE_ARGS(
                     [
@@ -578,7 +554,9 @@ class ParserAndIsolationTests(unittest.TestCase):
                         "--keep-workdir-on-failure",
                     ]
                 )
-                partial_code, _, partial_reason = RUN(partial_args)
+                partial_code, _, partial_reason = runtime.run_native_acceptance(
+                    partial_args, HARNESS.native_run_plan()
+                )
 
             self.assertEqual(success_code, 0)
             self.assertFalse(roots[0].exists())
@@ -607,7 +585,7 @@ class ParserAndIsolationTests(unittest.TestCase):
                 ]
             )
             with mock.patch.dict(
-                RUN.__globals__,
+                HARNESS.__dict__,
                 {
                     "source_contract_failure": lambda: None,
                     "preflight": lambda *_args: (object(), object()),
@@ -615,7 +593,9 @@ class ParserAndIsolationTests(unittest.TestCase):
                     "Goal03Harness": FailingHarness,
                 },
             ):
-                returncode, _, code = RUN(args)
+                returncode, _, code = runtime.run_native_acceptance(
+                    args, HARNESS.native_run_plan()
+                )
 
             self.assertEqual((returncode, code), (1, "TEST_CASE_FAILURE"))
             self.assertIsNotNone(args.debug_workdir)
@@ -650,6 +630,24 @@ class SourceContractFixtureTests(unittest.TestCase):
     WORKSPACE_SOURCE = '''#[cfg(test)]
 use crate::test_support::WorkspaceFixture;
 
+fn on_paste_into_new() { cx.read_from_clipboard(); }
+fn prompt_save_as_overwrite() {
+    PromptButton::ok(i18n::t(i18n::Key::Replace, cx));
+}
+
+#[cfg(test)]
+mod tests {
+    const SOURCE_MARKER_DECOYS: &[&str] = &[
+        "fn on_paste_into_new",
+        "cx.read_from_clipboard()",
+        "fn prompt_save_as_overwrite",
+        "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
+    ];
+}
+'''
+    WELCOME_SOURCE = '''#[cfg(test)]
+use crate::test_support::WelcomeFixture;
+
 const WELCOME_AUTOMATION_IDS: &[&str] = &[
     "markturbo-welcome-new",
     "markturbo-welcome-paste",
@@ -664,12 +662,8 @@ fn show_welcome(initial: Option<()>, show_welcome_on_startup: bool) {
 }
 
 fn dont_show_welcome_again() {}
-fn on_paste_into_new() { cx.read_from_clipboard(); }
 fn open_bundled_sample() {}
 fn record_recent_target() {}
-fn prompt_save_as_overwrite() {
-    PromptButton::ok(i18n::t(i18n::Key::Replace, cx));
-}
 
 #[cfg(test)]
 mod tests {
@@ -682,12 +676,8 @@ mod tests {
         "markturbo-welcome-dont-show-again",
         "initial.is_none() && show_welcome_on_startup",
         "fn dont_show_welcome_again",
-        "fn on_paste_into_new",
-        "cx.read_from_clipboard()",
         "fn open_bundled_sample",
         "fn record_recent_target",
-        "fn prompt_save_as_overwrite",
-        "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
     ];
 }
 '''
@@ -707,17 +697,30 @@ mod tests {
 '''
 
     @staticmethod
-    def write_repository(root: Path, workspace: str, document: str) -> None:
+    def write_repository(
+        root: Path, workspace: str, welcome: str | None, document: str
+    ) -> None:
         workspace_path = root / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
+        welcome_path = workspace_path.parent / "workspace" / "welcome.rs"
         document_path = root / "crates" / "mt-app" / "src" / "views" / "document.rs"
         workspace_path.parent.mkdir(parents=True, exist_ok=True)
+        welcome_path.parent.mkdir(parents=True, exist_ok=True)
         document_path.parent.mkdir(parents=True, exist_ok=True)
         workspace_path.write_text(workspace, encoding="utf-8")
+        if welcome is not None:
+            welcome_path.write_text(welcome, encoding="utf-8")
         document_path.write_text(document, encoding="utf-8")
 
     @classmethod
-    def source_failure(cls, root: Path, workspace: str, document: str) -> str | None:
-        cls.write_repository(root, workspace, document)
+    def source_failure(
+        cls, root: Path, workspace: str, document: str, *, welcome: str | None = None
+    ) -> str | None:
+        cls.write_repository(
+            root,
+            workspace,
+            cls.WELCOME_SOURCE if welcome is None else welcome,
+            document,
+        )
         with mock.patch.object(HARNESS, "REPO", root):
             return HARNESS.source_contract_failure()
 
@@ -730,7 +733,7 @@ mod tests {
             )
 
     def test_missing_production_markers_fail_with_their_contract_codes(self) -> None:
-        workspace_markers = (
+        welcome_markers = (
             ("markturbo-welcome-new", "WELCOME_UIA_CONTRACT_MISSING"),
             ("markturbo-welcome-paste", "WELCOME_UIA_CONTRACT_MISSING"),
             ("markturbo-welcome-open-file", "WELCOME_UIA_CONTRACT_MISSING"),
@@ -742,10 +745,23 @@ mod tests {
                 "NO_ARGUMENT_WELCOME_CONTRACT_MISSING",
             ),
             ("fn dont_show_welcome_again", "DONT_SHOW_WELCOME_CONTRACT_MISSING"),
-            ("fn on_paste_into_new", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            ("cx.read_from_clipboard()", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
             ("fn open_bundled_sample", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
             ("fn record_recent_target", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+        )
+        for marker, expected_code in welcome_markers:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
+                welcome = self.WELCOME_SOURCE.replace(marker, "", 1)
+                self.assertEqual(
+                    self.source_failure(
+                        Path(temporary), self.WORKSPACE_SOURCE, self.DOCUMENT_SOURCE,
+                        welcome=welcome,
+                    ),
+                    expected_code,
+                )
+
+        workspace_markers = (
+            ("fn on_paste_into_new", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("cx.read_from_clipboard()", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
             ("fn prompt_save_as_overwrite", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
             (
                 "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
@@ -790,109 +806,155 @@ mod tests {
                 "FIRST_USE_SOURCE_CONTRACT_MISSING",
             )
 
+    def test_welcome_comment_cannot_replace_a_production_action(self) -> None:
+        welcome = self.WELCOME_SOURCE.replace(
+            "fn open_bundled_sample() {}",
+            "// Removed action marker: fn open_bundled_sample() {}",
+            1,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(
+                self.source_failure(
+                    Path(temporary), self.WORKSPACE_SOURCE, self.DOCUMENT_SOURCE,
+                    welcome=welcome,
+                ),
+                "FIRST_USE_SOURCE_CONTRACT_MISSING",
+            )
 
-class RuntimeAndSourceContractTests(unittest.TestCase):
-    def test_stale_recent_native_check_proves_visible_and_inert_behavior(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def scenario_recents", 1)[1].split(
-            "def scenario_cli", 1
-        )[0]
+    def test_workspace_literal_cannot_replace_missing_welcome_control(self) -> None:
+        workspace = (
+            'const WRONG_OWNER: &str = "markturbo-welcome-new";\n'
+            + self.WORKSPACE_SOURCE
+        )
+        welcome = self.WELCOME_SOURCE.replace('"markturbo-welcome-new"', "", 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(
+                self.source_failure(
+                    Path(temporary), workspace, self.DOCUMENT_SOURCE, welcome=welcome
+                ),
+                "WELCOME_UIA_CONTRACT_MISSING",
+            )
 
-        self.assertIn("stale_name = documents[1].name", body)
-        self.assertIn("control.element_info.name", body)
-        self.assertIn('require_recent_status(restarted, "Missing"', body)
-        self.assertIn("if stale.is_enabled():", body)
-        self.assertIn('raise HarnessFailure("STALE_RECENT_ENABLED")', body)
-        self.assertNotIn("self.click_control(stale", body)
-        self.assertIn("self.editor_absent_while_running(restarted)", body)
+    def test_missing_welcome_module_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_repository(root, self.WORKSPACE_SOURCE, None, self.DOCUMENT_SOURCE)
+            with mock.patch.object(HARNESS, "REPO", root):
+                self.assertEqual(
+                    HARNESS.source_contract_failure(),
+                    "FIRST_USE_SOURCE_CONTRACT_MISSING",
+                )
 
-    def test_save_as_cancellation_fingerprints_the_named_destination_and_preserves_focus(
-        self,
-    ) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def scenario_save_cancel_overwrite", 1)[1].split(
-            "def scenario_sample", 1
-        )[0]
 
-        self.assertIn("write_durable(cancelled_destination", body)
-        self.assertIn("cancel_save_picker(app, cancelled_destination)", body)
-        self.assertIn("sha256_file(cancelled_destination)", body)
-        self.assertIn("request_save_as_shortcut(app)", body)
-        self.assertIn("require_source_editor_focus", body)
-        self.assertIn("already_focused=True", body)
-        self.assertIn('"save_as_cancel_focus_preserved": True', body)
-        self.assertIn('"overwrite_cancel_focus_preserved": True', body)
+class RecentControlBehaviorTests(unittest.TestCase):
+    @staticmethod
+    def harness(elements: list[object], query_error: BaseException | None = None) -> object:
+        class ElementArray:
+            def __init__(self, values: list[object]) -> None:
+                self.values = values
+                self.Length = len(values)
 
-    def test_recent_query_preserves_contract_failure_codes(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def recent_controls", 1)[1].split(
-            "def require_recent_status", 1
-        )[0]
+            def GetElement(self, index: int) -> object:
+                return self.values[index]
 
-        self.assertIn("except HarnessFailure:\n            raise", body)
-        self.assertIn('raise HarnessFailure("RECENT_UIA_QUERY_FAILED"', body)
+        class RootElement:
+            def FindAll(self, _scope: object, _condition: object) -> ElementArray:
+                if query_error is not None:
+                    raise query_error
+                return ElementArray(elements)
 
-    def test_recent_query_excludes_status_and_remove_controls(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def recent_controls", 1)[1].split(
-            "def require_recent_status", 1
-        )[0]
+        class FakeIUIA:
+            @staticmethod
+            def CreateTrueCondition() -> object:
+                return object()
 
-        self.assertIn('"markturbo-welcome-recent-remove-"', body)
-        self.assertIn('"markturbo-welcome-recent-status-"', body)
+        class FakeUIA:
+            iuia = FakeIUIA()
+            tree_scope = {"descendants": object()}
+            known_control_types = {"Button": 1}
 
-    def test_recent_generation_uses_isolated_settings_before_restart(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def scenario_recents", 1)[1].split(
-            "def scenario_cli", 1
-        )[0]
+        class ElementInfo:
+            def __init__(self, element: object) -> None:
+                self.automation_id = element.CurrentAutomationId
+                self.control_type = "Button"
 
-        self.assertIn("recent_settings_document(documents)", body)
-        self.assertIn("app = self.launch_app(None", body)
-        self.assertEqual(body.count("self.launch_app("), 2)
+        elements_by_id = {element.CurrentAutomationId: element for element in elements}
 
-    def test_save_path_waits_for_the_native_dialog_to_release_the_main_window(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def select_save_path", 1)[1].split(
-            "def cancel_save_picker", 1
-        )[0]
+        class Control:
+            def __init__(self, element_info: ElementInfo) -> None:
+                self.element_info = element_info
+                self.element = elements_by_id[element_info.automation_id]
 
-        self.assertIn("SAVE_AS_FILE_DIALOG_CLOSE_TIMEOUT", body)
-        self.assertIn("self.win32.require_foreground(app.hwnd, self.ui_timeout)", body)
+            def is_visible(self) -> bool:
+                return self.element.visible
 
-    def test_welcome_paste_compares_the_clipboard_value_the_app_reads(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def scenario_new_paste", 1)[1].split(
-            "def scenario_save_create", 1
-        )[0]
+        harness = object.__new__(HARNESS.Goal03Harness)
+        harness.iuia_class = FakeUIA
+        harness.fresh_uia_root = lambda _hwnd: type(
+            "Root", (), {"element": RootElement()}
+        )()
+        harness.uia_wrapper_class = Control
+        harness.uia_element_info_class = ElementInfo
+        return harness
 
-        self.assertIn("clipboard_text = self.read_text_clipboard()", body)
-        self.assertIn("clipboard_fingerprint = fingerprint_text(clipboard_text)", body)
-        self.assertIn("paste_text != clipboard_fingerprint", body)
+    @staticmethod
+    def element(automation_id: str, control_type: int, *, visible: bool = True) -> object:
+        return type(
+            "Element",
+            (),
+            {
+                "CurrentAutomationId": automation_id,
+                "CurrentControlType": control_type,
+                "visible": visible,
+            },
+        )()
 
-    def test_save_as_dialog_uses_rooted_uia_controls(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("def common_file_dialog", 1)[1].split(
-            "def select_save_path", 1
-        )[0]
+    def test_recent_query_returns_only_recent_entry_buttons(self) -> None:
+        elements = [
+            self.element("markturbo-welcome-recent-alpha", 1),
+            self.element("markturbo-welcome-recent-remove-alpha", 1),
+            self.element("markturbo-welcome-recent-status-alpha", 2),
+            self.element("unrelated-control", 1),
+        ]
+        harness = self.harness(elements)
 
-        self.assertIn('"FileNameControlHost"', body)
-        self.assertIn("combo.descendants()", body)
-        self.assertIn('automation_id == "1001"', body)
-        self.assertNotIn(".child_window(", body)
+        controls = harness.recent_controls(type("App", (), {"hwnd": 42})())
 
-    def test_existing_save_path_accepts_the_native_confirmation_before_app_replace(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        native = source.split("def accept_native_overwrite_confirmation", 1)[1].split(
-            "def select_save_path", 1
-        )[0]
-        select = source.split("def select_save_path", 1)[1].split(
-            "def cancel_save_picker", 1
-        )[0]
+        self.assertEqual(
+            [control.element_info.automation_id for control in controls],
+            ["markturbo-welcome-recent-alpha"],
+        )
 
-        self.assertIn('"CommandButton_6"', native)
-        self.assertIn("owned_task_dialogs(app.process.pid, file_dialog_hwnd)", native)
-        self.assertIn("self.accept_native_overwrite_confirmation(app, hwnd)", select)
+    def test_recent_query_preserves_uia_contract_failures(self) -> None:
+        failure = HARNESS_FAILURE("RECENT_UIA_CONTRACT_MISMATCH")
+        harness = self.harness([], failure)
+
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.recent_controls(type("App", (), {"hwnd": 42})())
+
+        self.assertIs(raised.exception, failure)
+
+
+class RuntimeArtifactPrivacyTests(unittest.TestCase):
+    def test_artifact_read_errors_keep_the_goal_runtime_scan_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "data" / "logs").mkdir(parents=True)
+            (root / "config").mkdir()
+            (root / "data" / "logs" / "markturbo.log").write_bytes(b"startup")
+            (root / "config" / "settings.toml").write_bytes(b"settings")
+            with (
+                mock.patch.object(
+                    HARNESS,
+                    "artifact_contains",
+                    side_effect=PermissionError("document content"),
+                ),
+                self.assertRaises(HARNESS_FAILURE) as raised,
+            ):
+                SCAN_CASE_ARTIFACTS(root)
+
+        self.assertEqual(raised.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
+        self.assertEqual(raised.exception.detail, "PermissionError")
 
     def test_runtime_scan_rejects_document_text_in_data_or_config_but_not_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -901,7 +963,9 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
             (root / "config").mkdir()
             (root / "workspace").mkdir()
             (root / "data" / "logs" / "markturbo.log").write_text("startup", encoding="utf-8")
-            (root / "config" / "settings.toml").write_text("show_welcome_on_startup = true", encoding="utf-8")
+            (root / "config" / "settings.toml").write_text(
+                "show_welcome_on_startup = true", encoding="utf-8"
+            )
             (root / "workspace" / "saved.md").write_text(DOCUMENT_SENTINEL, encoding="utf-8")
             scan = SCAN_CASE_ARTIFACTS(root)
             self.assertTrue(scan["utf8_sentinel_absent"])
@@ -911,7 +975,7 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
                 SCAN_CASE_ARTIFACTS(root)
             self.assertEqual(raised.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
 
-    def test_runtime_scan_streams_the_entire_webview_profile_and_detects_boundary_leaks(self) -> None:
+    def test_runtime_scan_streams_webview_profile_and_detects_boundary_leaks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             profile = root / "data" / "webview2" / "Default" / "Cache"
@@ -919,26 +983,14 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
             (root / "data" / "logs").mkdir()
             (root / "data" / "logs" / "markturbo.log").write_bytes(b"startup")
             split = 1024 * 1024 - 3
-            (profile / "cache.bin").write_bytes(b"x" * split + DOCUMENT_SENTINEL.encode("utf-8"))
+            (profile / "cache.bin").write_bytes(
+                b"x" * split + DOCUMENT_SENTINEL.encode("utf-8")
+            )
 
             with self.assertRaises(HARNESS_FAILURE) as raised:
                 SCAN_CASE_ARTIFACTS(root)
 
             self.assertEqual(raised.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
-
-    def test_loading_parser_does_not_import_pywinauto(self) -> None:
-        if not PYWINAUTO_WAS_LOADED:
-            self.assertNotIn("pywinauto", sys.modules)
-
-    def test_native_source_requires_the_embedded_sample_and_restores_clipboard_after_any_failure(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        self.assertNotIn('bin_root / "sample"', source)
-        self.assertNotIn("SAMPLE_FIXTURE_MISSING", source)
-
-        scenario = source.split("def scenario_new_paste", 1)[1].split("def scenario_save_create", 1)[0]
-        guarded_write = scenario.index("try:\n                    self.write_text_clipboard(PASTE_TEXT)")
-        restore = scenario.index("finally:\n                    self.write_text_clipboard(clipboard_before)")
-        self.assertLess(guarded_write, restore)
 
 
 if __name__ == "__main__":

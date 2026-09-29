@@ -46,12 +46,14 @@ native UI acceptance cannot enter a test run through discovery. The runtime
 probe is Windows-only, but its geometry unit test and the other tooling tests
 validate portable input, source contracts, or fixture behavior without a desktop.
 
-A-B-B-A scheduling, arithmetic, and paired execution-path tests are local-only
-and are not part of `fast`, `ci`, or `full`:
+A-B-B-A scheduling, arithmetic, and paired sample tests are in the explicit
+`test_probe` suite and run with `fast`, `ci`, and `full`. Actual Windows process
+measurements remain explicit `probe` commands; the portable test uses synthetic
+callbacks and does not report a performance result.
 
-```sh
-uv run --project scripts python -m unittest scripts.tests.local_probe_abba
-```
+Goal 07's deterministic loopback protocol tests run in the explicit
+`test_native_goal07_provider` suite. The fake-UIA tests exercise harness logic
+without a desktop; they do not replace native acceptance.
 
 ## Commands
 
@@ -321,6 +323,15 @@ OS/session/integrity metadata needed to validate the run.
 The native command exit status is part of that contract: `0` is `PASS`, `1` is
 `FAIL`, and `2` is `BLOCKED`. Any unexpected child-process exit is reported as
 `FAIL` by the CLI.
+
+`native/runtime.py` owns hash-bound case execution, shared UIA/process
+primitives and bounded privacy byte search. Each goal module retains its own
+cases, artifact scan policy and evidence validation; Goal 07's private
+`native/goal07_provider.py` owns its synthetic Responses loopback protocol.
+The Goal 07 transport count is derived per run from recorded case observations,
+not from module-global state. Goal 03 preflight checks both the Workspace shell
+and its Welcome production module; source checks are structural safeguards, not
+proof that the shipped executable exposed those controls.
 
 ## Scratch data
 

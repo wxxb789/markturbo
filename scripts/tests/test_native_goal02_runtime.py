@@ -3,6 +3,26 @@
 from ._native_goal02_support import *
 
 
+class ArtifactContainsTests(unittest.TestCase):
+    def test_finds_a_pattern_split_across_the_read_chunk_boundary(self) -> None:
+        pattern = b"cross-boundary"
+        payload = b"x" * (1024 * 1024 - 5) + pattern
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "artifact.bin"
+            path.write_bytes(payload)
+
+            self.assertEqual(runtime.artifact_contains(path, (pattern,)), pattern)
+
+    def test_pattern_tuple_order_wins_over_file_position(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "artifact.bin"
+            path.write_bytes(b"second pattern appears before first")
+
+            self.assertEqual(
+                runtime.artifact_contains(path, (b"first", b"second")), b"first"
+            )
+
+
 class RuntimeEvidenceTests(unittest.TestCase):
     def test_log_marker_wait_reads_only_bytes_appended_after_the_offset(self) -> None:
         marker = b"DEBUG recovery checkpoint written\n"

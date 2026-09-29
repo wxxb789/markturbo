@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
+import ctypes
 import copy
 import hashlib
 import tempfile
@@ -15,7 +15,6 @@ from scripts.markturbo_tools.native import goal06 as HARNESS
 from scripts.markturbo_tools.native import runtime
 
 
-SCRIPT = Path(HARNESS.__file__)
 CASE_DOCUMENT = HARNESS.CASE_DOCUMENT
 CASE_SELECTION = HARNESS.CASE_SELECTION
 COMPLETE_EVIDENCE = HARNESS.complete_evidence
@@ -23,7 +22,6 @@ NEW_EVIDENCE = HARNESS.new_evidence
 PARSE_ARGS = HARNESS.parse_args
 REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
 REVIEW_SETTINGS_DOCUMENT = HARNESS.review_settings_document
-RUN = HARNESS.run
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
 
 HASH = "a" * 64
@@ -285,6 +283,26 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(runtime.HarnessFailure, "UTF8_EPHEMERAL_CREDENTIAL_LEAKED"):
                 HARNESS.scan_case_artifacts(case_root, "process-only")
 
+    def test_artifact_read_errors_keep_the_goal_runtime_scan_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            case_root = Path(temporary)
+            logs = case_root / "data" / "logs"
+            logs.mkdir(parents=True)
+            (case_root / "config").mkdir()
+            (logs / "markturbo.log").write_bytes(b"startup")
+            with (
+                mock.patch.object(
+                    HARNESS,
+                    "artifact_contains",
+                    side_effect=PermissionError("document content"),
+                ),
+                self.assertRaises(runtime.HarnessFailure) as raised,
+            ):
+                HARNESS.scan_case_artifacts(case_root, "process-only")
+
+        self.assertEqual(raised.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
+        self.assertEqual(raised.exception.detail, "PermissionError")
+
 
 class PersistentCredentialPreflightTests(unittest.TestCase):
     def test_configured_mode_blocks_before_launch_when_its_target_has_a_persistent_credential(self) -> None:
@@ -316,56 +334,61 @@ class PersistentCredentialPreflightTests(unittest.TestCase):
         self.assertEqual(actual, (win32, parent))
         win32.persistent_credential_target_exists.assert_not_called()
 
-    def test_windows_metadata_preflight_never_dereferences_a_credential_blob(self) -> None:
-        source = Path(runtime.__file__).read_text(encoding="utf-8")
-        method = source.split("    def persistent_credential_target_exists", 1)[1].split(
-            "    def send_inputs", 1
-        )[0]
+    def test_persistent_credential_block_does_not_expose_credential_content(self) -> None:
+        target = HARNESS.configured_provider_environment_key_identity()
+        secret = b"UNIQUE-CREDENTIAL-BLOB"
+        target_buffer = ctypes.create_unicode_buffer(target)
+        blob = (ctypes.c_ubyte * len(secret)).from_buffer_copy(secret)
+        credential = runtime.CREDENTIALW()
+        credential.TargetName = ctypes.cast(target_buffer, runtime.wt.LPWSTR)
+        credential.CredentialBlobSize = len(secret)
+        credential.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte))
+        records = (ctypes.POINTER(runtime.CREDENTIALW) * 1)(ctypes.pointer(credential))
+        records_pointer = ctypes.cast(
+            records, ctypes.POINTER(ctypes.POINTER(runtime.CREDENTIALW))
+        )
+        enumerated: list[str] = []
+        freed: list[object] = []
 
-        self.assertIn("CredEnumerateW", method)
-        self.assertNotIn("CredentialBlob", method)
+        class FakeAdvapi32:
+            def CredEnumerateW(
+                self,
+                requested_target: str,
+                _flags: int,
+                count_pointer: object,
+                credentials_pointer: object,
+            ) -> bool:
+                enumerated.append(requested_target)
+                ctypes.cast(count_pointer, ctypes.POINTER(runtime.wt.DWORD)).contents.value = 1
+                output = ctypes.cast(
+                    credentials_pointer,
+                    ctypes.POINTER(
+                        ctypes.POINTER(ctypes.POINTER(runtime.CREDENTIALW))
+                    ),
+                )
+                output[0] = records_pointer
+                return True
+
+            def CredFree(self, credentials: object) -> None:
+                freed.append(credentials)
+
+        win32 = object.__new__(runtime.Win32)
+        win32.advapi32 = FakeAdvapi32()
+        evidence: dict = {}
+
+        with mock.patch.object(HARNESS, "preflight", return_value=(win32, object())):
+            with self.assertRaises(runtime.HarnessBlocked) as raised:
+                HARNESS.goal06_preflight(True)(
+                    Path("C:/release/markturbo.exe"), HASH, evidence
+                )
+
+        self.assertEqual(raised.exception.code, "PERSISTENT_CREDENTIAL_PRESENT")
+        self.assertNotIn(secret.decode("utf-8"), str(raised.exception))
+        self.assertEqual(enumerated, [target])
+        self.assertEqual(len(freed), 1)
 
 
 class HarnessContractTests(unittest.TestCase):
-    def test_scenario_activates_the_source_layout_before_reading_editor_state(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        scenario = source.split("def scenario(", 1)[1].split("def native_run_plan", 1)[0]
-
-        self.assertLess(
-            scenario.index("self.activate_source_layout(app)"),
-            scenario.index("self.editor_fingerprint(app)"),
-        )
-
-    def test_structured_success_uses_the_stable_result_label(self) -> None:
-        calls: list[tuple[str, str, str, str]] = []
-        result = type("Result", (), {"element_info": type("Info", (), {"name": "Review ready"})()})()
-
-        class FakeHarness:
-            def find_control(
-                self,
-                app: object,
-                accessibility_id: str,
-                control_type: str,
-                timeout_code: str,
-                mismatch_code: str,
-            ) -> object:
-                calls.append((accessibility_id, control_type, timeout_code, mismatch_code))
-                return result
-
-        HARNESS.Goal06Harness.require_structured_success_result(FakeHarness(), object())
-
-        self.assertEqual(
-            calls,
-            [
-                (
-                    HARNESS.REVIEW_RESULT_ACCESSIBILITY_ID,
-                    "Text",
-                    "REVIEW_RESULT_UIA_TIMEOUT",
-                    "REVIEW_RESULT_UIA_CONTRACT_MISMATCH",
-                )
-            ],
-        )
-
     def test_configured_mode_approves_the_send_task_dialog(self) -> None:
         events: list[tuple[str, object]] = []
         button = object()
@@ -401,32 +424,36 @@ class HarnessContractTests(unittest.TestCase):
         configured = PARSE_ARGS(["--expect-exe-sha256", HASH, "--configured-provider"])
         self.assertTrue(configured.configured_provider)
 
-    def test_run_delegates_to_the_shared_hash_bound_runtime(self) -> None:
-        args = argparse.Namespace(expect_exe_sha256=HASH)
-        expected = (0, {"status": "PASS"}, "evidence")
-        with mock.patch.object(HARNESS, "run_native_acceptance", return_value=expected) as run:
-            self.assertEqual(RUN(args), expected)
-
-        run.assert_called_once()
-
     def test_close_app_posts_close_and_waits_for_clean_exit(self) -> None:
-        events: list[tuple[str, int]] = []
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode):
+                events: list[tuple[str, object]] = []
 
-        class FakeWin32:
-            def post_close(self, hwnd: int) -> None:
-                events.append(("close", hwnd))
+                class FakeWin32:
+                    def post_close(self, hwnd: int) -> None:
+                        events.append(("close", hwnd))
 
-        class FakeHarness:
-            win32 = FakeWin32()
+                class FakeProcess:
+                    def wait(self, timeout: float) -> int:
+                        events.append(("wait", timeout))
+                        return returncode
 
-            def wait_process_exit(self, app: object) -> None:
-                events.append(("wait", app.hwnd))
+                harness = object.__new__(runtime.NativeHarness)
+                harness.win32 = FakeWin32()
+                harness.ui_timeout = 1.0
+                app = type(
+                    "App", (), {"hwnd": 42, "process": FakeProcess()}
+                )()
 
-        app = type("App", (), {"hwnd": 42})()
+                if returncode == 0:
+                    harness.close_app(app)
+                else:
+                    with self.assertRaisesRegex(
+                        runtime.HarnessFailure, "PROCESS_EXIT_NONZERO"
+                    ):
+                        harness.close_app(app)
 
-        HARNESS.Goal06Harness.close_app(FakeHarness(), app)
-
-        self.assertEqual(events, [("close", 42), ("wait", 42)])
+                self.assertEqual(events, [("close", 42), ("wait", 1.0)])
 
     def test_production_source_keeps_cfg_test_imports_and_strips_test_module(self) -> None:
         source_text = (

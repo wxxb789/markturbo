@@ -202,6 +202,7 @@ class NativeRunPlan:
     harness_factory: Callable[..., "NativeHarness"]
     scenarios: Callable[["NativeHarness"], tuple[Callable[[], dict[str, Any]], ...]]
     source_contract: Callable[[], str | None] | None = None
+    finalize_evidence: Callable[[dict[str, Any]], None] | None = None
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -303,6 +304,20 @@ def sha256_file(path: Path) -> Fingerprint:
             byte_count += len(chunk)
             digest.update(chunk)
     return Fingerprint(byte_count, digest.hexdigest())
+
+
+def artifact_contains(path: Path, patterns: tuple[bytes, ...]) -> bytes | None:
+    """Find a sensitive byte sequence while keeping only a chunk boundary tail."""
+    overlap = max(len(pattern) for pattern in patterns) - 1
+    tail = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            value = tail + chunk
+            for pattern in patterns:
+                if pattern in value:
+                    return pattern
+            tail = value[-overlap:] if overlap else b""
+    return None
 
 
 def normalize_expected_hash(value: str) -> str:
@@ -1421,6 +1436,10 @@ class NativeHarness:
         if returncode != 0:
             raise HarnessFailure("PROCESS_EXIT_NONZERO")
 
+    def close_app(self, app: RunningApp) -> None:
+        self.win32.post_close(app.hwnd)
+        self.wait_process_exit(app)
+
     def reap(self, app: RunningApp) -> None:
         if app.process.poll() is None:
             try:
@@ -1515,6 +1534,7 @@ def _complete_early(
     code: str,
     *,
     blocked: bool,
+    finalize_evidence: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[int, dict[str, Any], str]:
     mark_remaining_cases(
         evidence,
@@ -1522,6 +1542,8 @@ def _complete_early(
         "BLOCKED" if blocked else "NOT_RUN",
         code,
     )
+    if finalize_evidence is not None:
+        finalize_evidence(evidence)
     complete_evidence(evidence, _completion_status(returncode), required_case_ids)
     return returncode, evidence, code
 
@@ -1560,7 +1582,14 @@ def run_native_acceptance(
     if plan.source_contract is not None:
         try:
             if code := plan.source_contract():
-                return _complete_early(evidence, plan.required_case_ids, 1, code, blocked=False)
+                return _complete_early(
+                    evidence,
+                    plan.required_case_ids,
+                    1,
+                    code,
+                    blocked=False,
+                    finalize_evidence=plan.finalize_evidence,
+                )
         except Exception as error:
             return _complete_early(
                 evidence,
@@ -1568,6 +1597,7 @@ def run_native_acceptance(
                 1,
                 f"PREFLIGHT_{safe_exception_name(error).upper()}",
                 blocked=False,
+                finalize_evidence=plan.finalize_evidence,
             )
 
     try:
@@ -1575,9 +1605,23 @@ def run_native_acceptance(
         win32, parent_context = plan.preflight(exe, args.expect_exe_sha256, evidence)
         ui_types = plan.ui_types_loader()
     except HarnessBlocked as error:
-        return _complete_early(evidence, plan.required_case_ids, 2, error.code, blocked=True)
+        return _complete_early(
+            evidence,
+            plan.required_case_ids,
+            2,
+            error.code,
+            blocked=True,
+            finalize_evidence=plan.finalize_evidence,
+        )
     except HarnessFailure as error:
-        return _complete_early(evidence, plan.required_case_ids, 1, error.code, blocked=False)
+        return _complete_early(
+            evidence,
+            plan.required_case_ids,
+            1,
+            error.code,
+            blocked=False,
+            finalize_evidence=plan.finalize_evidence,
+        )
     except Exception as error:
         return _complete_early(
             evidence,
@@ -1585,6 +1629,7 @@ def run_native_acceptance(
             1,
             f"PREFLIGHT_{safe_exception_name(error).upper()}",
             blocked=False,
+            finalize_evidence=plan.finalize_evidence,
         )
 
     try:
@@ -1596,6 +1641,7 @@ def run_native_acceptance(
             1,
             f"ISOLATION_{safe_exception_name(error).upper()}",
             blocked=False,
+            finalize_evidence=plan.finalize_evidence,
         )
 
     selected_index = (
@@ -1735,6 +1781,8 @@ def run_native_acceptance(
                 if root.exists():
                     args.debug_workdir = root
 
+    if plan.finalize_evidence is not None:
+        plan.finalize_evidence(evidence)
     complete_evidence(evidence, _completion_status(returncode), plan.required_case_ids)
     return returncode, evidence, code
 
@@ -1777,6 +1825,7 @@ __all__ = [
     "RunningApp",
     "SecurityContext",
     "Win32",
+    "artifact_contains",
     "build_launch_spec",
     "complete_evidence",
     "executable_hash_failure",
