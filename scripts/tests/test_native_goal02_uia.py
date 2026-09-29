@@ -637,13 +637,22 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         factory = FreshRootFactory([hidden, disabled, ready])
         harness = native_harness(factory)
 
-        control = harness.find_control(
-            running_app(),
-            SOURCE_EDITOR_AUTOMATION_ID,
-            "Edit",
-            "SOURCE_EDITOR_UIA_TIMEOUT",
-            "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
-        )
+        elapsed = [0.0]
+
+        def advance(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        with (
+            mock.patch.object(runtime.time, "perf_counter", side_effect=lambda: elapsed[0]),
+            mock.patch.object(runtime.time, "sleep", side_effect=advance),
+        ):
+            control = harness.find_control(
+                running_app(),
+                SOURCE_EDITOR_AUTOMATION_ID,
+                "Edit",
+                "SOURCE_EDITOR_UIA_TIMEOUT",
+                "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
+            )
 
         self.assertIs(control, factory.wrappers[-1])
         self.assertEqual(factory.calls, 3)
