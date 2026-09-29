@@ -4,6 +4,9 @@
 //! edits, debounced, and the parse result is what every pane reads — one
 //! document model driving both rendering paths.
 
+mod preview;
+use preview::DocumentPreview;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +19,7 @@ use gpui_kit::component::{
     input::{Editor, EditorState, InputEvent, TabSize},
     resizable::{h_resizable, resizable_panel},
     tab::{Tab, TabBar},
-    text::{TextView, TextViewState, TextViewStyle},
+    text::TextView,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -28,7 +31,7 @@ use sha2::{Digest as _, Sha256};
 use crate::i18n;
 use crate::metrics;
 use crate::views::{Layout, PreviewKind};
-use crate::web::{self, Trust};
+use crate::web::Trust;
 use mt_core::document::io::{
     self as fs, FileStamp, LoadedFile, Newline, SaveError, SkillOrigin, SourceIdentity,
 };
@@ -72,12 +75,6 @@ fn available_layouts(doc_type: DocType) -> &'static [Layout] {
 /// Reparsing per keystroke is what makes a 100K-line document unusable; this is
 /// short enough to feel live and long enough to coalesce typing.
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(180);
-
-/// Documents above this size skip live preview refresh while typing.
-///
-/// The preview still updates when the user pauses; what this avoids is
-/// re-rendering a megabyte of Markdown on a background task every 180ms.
-const LIVE_PREVIEW_LIMIT: usize = 512 * 1024;
 
 const SOURCE_LAYOUT_ACCESSIBILITY_ID: &str = "markturbo-layout-source";
 const SOURCE_EDITOR_ACCESSIBILITY_ID: &str = "markturbo-document-source-editor";
@@ -251,6 +248,7 @@ struct ApplyUndoMarker {
 pub(crate) struct PreparedRecovery {
     origin: DocumentOrigin,
     document: Document,
+    recovery_key: Option<RecoveryKey>,
     source_conflicted: bool,
     revision: Option<RevisionRecovery>,
     source_dirty: bool,
@@ -262,7 +260,23 @@ impl PreparedRecovery {
     }
 
     pub(crate) fn recovery_key(&self) -> RecoveryKey {
-        self.origin.recovery_key()
+        self.recovery_key
+            .clone()
+            .unwrap_or_else(|| self.origin.recovery_key())
+    }
+
+    /// Recheck a prepared file checkpoint against the already-loaded live
+    /// source without rereading the filesystem from the UI startup callback.
+    pub(crate) fn mark_conflicted_if_source_changed(&mut self, current: &DocumentView) {
+        let (Some(recovered), Some(current)) = (self.origin.file(), current.origin.file()) else {
+            return;
+        };
+        if recovered.path == current.path
+            && (recovered.stamp != current.stamp
+                || recovered.source_identity != current.source_identity)
+        {
+            self.source_conflicted = true;
+        }
     }
 
     /// Move the answer-only revision state to the workspace owner.
@@ -332,30 +346,14 @@ pub struct DocumentView {
     focus_handle: FocusHandle,
     /// Explicitly either a file-backed source or a pathless memory buffer.
     origin: DocumentOrigin,
+    /// Opaque recovery identity for a recovered file or a new Save As
+    /// incarnation whose path may already have an independent checkpoint.
+    recovery_key_override: Option<RecoveryKey>,
     /// Parsed view of the editor's current text.
     document: Document,
     editor: Entity<EditorState>,
-    /// Native preview state. Rebuilt from `document` on reparse.
-    preview: Entity<TextViewState>,
-    /// The diagram/math block extensions handed to the preview's `TextView`.
-    ///
-    /// Built once and cloned per frame, never rebuilt in `render`. Upstream
-    /// stamps every `MarkdownExtensions` with a process-global revision on
-    /// construction (`markdown_ext.rs`, an `AtomicU64::fetch_add` inside
-    /// `push_block_parser`), and `TextViewState::set_markdown_extensions`
-    /// short-circuits only when the revision it already holds matches. A fresh
-    /// one per frame therefore never matches: every frame reparsed the whole
-    /// document and re-ran the registry over every fence.
-    ///
-    /// Above upstream's 4 KiB `MAX_SYNC_FULL_REPLACE_BYTES` the reparse goes
-    /// async and ends with a `cx.notify()`, which redraws, which reparses —
-    /// a self-sustaining loop. Measured on the release binary with no user
-    /// input, a 4,200-byte document burned 251% of a core indefinitely while a
-    /// 4,000-byte one sat at 0.2%.
-    ///
-    /// `Clone` copies the revision rather than minting a new one, which is what
-    /// makes the guard match from the second frame onwards.
-    preview_extensions: gpui_kit::component::text::MarkdownExtensions,
+    /// Derived native/Web rendering state; never an authority for editor text.
+    preview: DocumentPreview,
     layout: Layout,
     trust: Trust,
     dirty: bool,
@@ -377,30 +375,6 @@ pub struct DocumentView {
     /// changes. This lets two banner decisions compose without authorizing a
     /// new buffer or a later external version.
     save_authorization: fs::SaveAuthorization,
-    registry: Arc<RendererRegistry>,
-    /// Cached WebView payload, rebuilt on reparse. Held here rather than in the
-    /// WebView so switching modes does not re-render.
-    ///
-    /// Usually HTML, which the workspace turns into a `data:` URL. A trusted
-    /// HTML file instead holds the `file://` URL itself — `to_data_url` passes
-    /// one through — because loading that file from disk is the only way its
-    /// relative images and stylesheets can resolve.
-    web_html: Option<String>,
-    /// Changes only when `web_html` changes or is invalidated.
-    ///
-    /// The workspace compares this before cloning the HTML, so notifications
-    /// unrelated to the preview stay a small-integer no-op.
-    web_revision: u64,
-    /// The payload revision whose immediate macOS WebView operation failed.
-    /// The content-free failure belongs to this document and payload, not the
-    /// workspace's transient status bar.
-    web_preview_failure_revision: Option<u64>,
-    /// The first visible editor row the last time the preview was synced.
-    ///
-    /// Sync is driven from render, which runs on every frame — without this the
-    /// preview would be told to scroll to where it already is, sixty times a
-    /// second, and each of those is a script evaluation in another process.
-    synced_row: Option<usize>,
     /// The window's single WebView, lent to this tab while it is active.
     ///
     /// It has to be *in this element tree* rather than merely alive: the OS
@@ -489,7 +463,7 @@ impl DocumentView {
                 .default_value(text.clone())
         });
 
-        let preview = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+        let preview = DocumentPreview::new(&text, registry, cx);
 
         let subscriptions = vec![cx.subscribe_in(
             &editor,
@@ -510,10 +484,10 @@ impl DocumentView {
             id: DocumentId::next(),
             focus_handle: cx.focus_handle(),
             origin,
+            recovery_key_override: None,
             document,
             editor,
             preview,
-            preview_extensions: diagram_extensions(registry.clone()),
             layout,
             trust: Trust::Restricted,
             dirty: false,
@@ -523,11 +497,6 @@ impl DocumentView {
             externally_changed: false,
             save_issue: None,
             save_authorization: fs::SaveAuthorization::normal(),
-            registry,
-            web_html: None,
-            web_revision: 0,
-            web_preview_failure_revision: None,
-            synced_row: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             webview: None,
             _reparse: None,
@@ -566,16 +535,21 @@ impl DocumentView {
             origin.source_path().map(Path::to_path_buf),
             recovered.record.text.clone(),
         );
+        let source_conflicted = recovered.source_conflicted;
+        let source_dirty = recovered
+            .record
+            .revision
+            .as_ref()
+            .is_none_or(RevisionRecovery::source_dirty);
+        let revision = recovered.record.revision.clone();
+        let recovery_key = origin.is_file_backed().then_some(recovered.record.key);
         Ok(PreparedRecovery {
             origin,
             document,
-            source_conflicted: recovered.source_conflicted,
-            source_dirty: recovered
-                .record
-                .revision
-                .as_ref()
-                .is_none_or(RevisionRecovery::source_dirty),
-            revision: recovered.record.revision.clone(),
+            recovery_key,
+            source_conflicted,
+            source_dirty,
+            revision,
         })
     }
 
@@ -588,11 +562,13 @@ impl DocumentView {
         let PreparedRecovery {
             origin,
             document,
+            recovery_key,
             source_conflicted,
             source_dirty,
             ..
         } = prepared;
         let mut document = Self::new_with_document(origin, document, registry, window, cx);
+        document.recovery_key_override = recovery_key;
         document.dirty = source_dirty;
         document.revision = u64::from(source_dirty);
         document.externally_changed = source_conflicted;
@@ -602,11 +578,19 @@ impl DocumentView {
         document
     }
 
-    pub(crate) fn can_accept_startup_recovery(&self, expected: Option<(DocumentId, u64)>) -> bool {
+    pub(crate) fn can_accept_startup_recovery(
+        &self,
+        expected: Option<(DocumentId, u64, u64)>,
+    ) -> bool {
         !self.dirty
-            && expected.map_or(self.revision == 0, |(expected_id, expected_revision)| {
-                self.id == expected_id && self.revision == expected_revision
-            })
+            && expected.map_or(
+                self.revision == 0 && self.source_generation == 0,
+                |(expected_id, expected_revision, expected_source_generation)| {
+                    self.id == expected_id
+                        && self.revision == expected_revision
+                        && self.source_generation == expected_source_generation
+                },
+            )
     }
 
     pub(crate) fn apply_startup_recovery(
@@ -618,6 +602,7 @@ impl DocumentView {
         let PreparedRecovery {
             origin,
             document,
+            recovery_key,
             source_conflicted,
             source_dirty,
             ..
@@ -628,6 +613,7 @@ impl DocumentView {
         self._reload = None;
         self.apply_undo_history.clear();
         self.origin = origin;
+        self.recovery_key_override = recovery_key;
         self.editor.update(cx, |state, cx| {
             state.set_value(text.clone(), window, cx);
         });
@@ -637,9 +623,7 @@ impl DocumentView {
         self.save_issue = source_conflicted.then_some(SaveIssue::Conflict);
         self.save_authorization = fs::SaveAuthorization::normal();
         self.document = document;
-        self.preview.update(cx, |state, cx| {
-            state.set_text(&text, cx);
-        });
+        self.preview.set_native_text(&text, cx);
         self.refresh_web(cx);
         if source_dirty {
             cx.emit(DocumentEvent::DirtyChanged);
@@ -698,7 +682,15 @@ impl DocumentView {
     }
 
     pub fn recovery_key(&self) -> RecoveryKey {
-        self.origin.recovery_key()
+        self.recovery_key_override
+            .clone()
+            .unwrap_or_else(|| self.origin.recovery_key())
+    }
+
+    pub(crate) fn rotate_recovery_key(&mut self) -> RecoveryKey {
+        let key = RecoveryKey::new_memory();
+        self.recovery_key_override = Some(key.clone());
+        key
     }
 
     pub fn recovery_checkpoint(&self, cx: &App) -> RecoveryCheckpoint {
@@ -792,13 +784,15 @@ impl DocumentView {
         let leaves_web = self.layout.uses_webview() && !layout.uses_webview();
         self.layout = layout;
         if leaves_web {
-            self.web_preview_failure_revision = None;
+            self.preview.clear_web_failure();
             cx.emit(DocumentEvent::WebPreviewLayoutLeft);
         }
         // The WebView HTML is only built when a Web pane is actually visible;
         // switching into one for the first time needs it now.
-        if layout.uses_webview() && self.web_html.is_none() {
-            self.rebuild_web(cx);
+        if layout.uses_webview() && self.preview.web_html().is_none() {
+            let source_path = self.origin.source_path();
+            self.preview
+                .ensure_web(&self.document, source_path, self.trust, cx);
         }
         cx.notify();
     }
@@ -808,7 +802,9 @@ impl DocumentView {
             return;
         }
         self.trust = trust;
-        self.rebuild_web(cx);
+        let source_path = self.origin.source_path();
+        self.preview
+            .trust_changed(&self.document, source_path, trust, cx);
         cx.notify();
     }
 
@@ -884,10 +880,9 @@ impl DocumentView {
             return;
         };
         let row = visible.start;
-        if self.synced_row == Some(row) {
+        if !self.preview.mark_synced_row(row) {
             return;
         }
-        self.synced_row = Some(row);
 
         let total = self.line_count(cx);
         // A document short enough to fit needs no sync, and would divide by a
@@ -958,7 +953,7 @@ impl DocumentView {
         if preview_only || sync_split {
             // The render-driven sync would otherwise see the same first visible
             // row it last recorded and skip the update.
-            self.synced_row = None;
+            self.preview.reset_synced_row();
             self.scroll_preview_to(fraction.clamp(0., 1.), cx);
         }
         cx.notify();
@@ -1032,7 +1027,9 @@ impl DocumentView {
 
         if revoke_trust {
             self.trust = Trust::Restricted;
-            self.rebuild_web(cx);
+            let source_path = self.origin.source_path();
+            self.preview
+                .trust_changed(&self.document, source_path, Trust::Restricted, cx);
             cx.notify();
         }
         self.replace_text(final_text, window, cx);
@@ -1101,9 +1098,7 @@ impl DocumentView {
         self.save_issue = None;
         self.save_authorization = fs::SaveAuthorization::normal();
         self.document = document;
-        self.preview.update(cx, |state, cx| {
-            state.set_text(&text, cx);
-        });
+        self.preview.set_native_text(&text, cx);
         self.refresh_web(cx);
         cx.emit(DocumentEvent::DirtyChanged);
         cx.emit(DocumentEvent::Status("Reloaded from disk".into()));
@@ -1388,6 +1383,7 @@ impl DocumentView {
                 self._reparse = None;
                 self.source_generation = self.source_generation.wrapping_add(1);
                 self.apply_undo_history.clear();
+                self.recovery_key_override = Some(RecoveryKey::new_memory());
                 self.origin = DocumentOrigin::File(file);
                 self.document = Document::new(Some(path.to_path_buf()), text);
                 let doc_type = self.document.doc_type();
@@ -1499,8 +1495,7 @@ impl DocumentView {
 
         // The native preview is driven by `TextViewState`, which does its own
         // background parsing, so it can update immediately.
-        self.preview
-            .update(cx, |state, cx| state.set_text(&text, cx));
+        self.preview.set_native_text(&text, cx);
 
         self._reparse = Some(cx.spawn(async move |this, cx| {
             let parsed = cx
@@ -1528,122 +1523,57 @@ impl DocumentView {
     fn rebuild_derived(&mut self, cx: &mut Context<Self>) {
         let text = self.text(cx);
         self.document.set_source(text.clone());
-        self.preview.update(cx, |state, cx| {
-            state.set_text(&text, cx);
-        });
+        self.preview.set_native_text(&text, cx);
         self.refresh_web(cx);
     }
 
     /// Rebuild or invalidate the WebView payload, depending on visibility.
     fn refresh_web(&mut self, cx: &mut Context<Self>) {
-        // Only build HTML when a Web pane is actually visible; doing it for a
-        // hidden pane is pure waste.
-        if self.layout.uses_webview() {
-            self.rebuild_web(cx);
-        } else {
-            // Invalidate so switching to Web later rebuilds rather than showing
-            // a stale render.
-            if self.web_html.take().is_some() {
-                self.web_revision = self.web_revision.wrapping_add(1);
-            }
-        }
-    }
-
-    fn rebuild_web(&mut self, cx: &mut Context<Self>) {
-        self.web_revision = self.web_revision.wrapping_add(1);
-        if self.document.source().len() > LIVE_PREVIEW_LIMIT {
-            self.web_html = Some(oversize_notice(self.document.source().len()));
-            return;
-        }
-        if self.document.doc_type() == DocType::Html {
-            // **The sandbox boundary.** A `file://` document has a real origin,
-            // so `<img src="logo.png">` and `<link rel=stylesheet>` resolve
-            // against the file's own directory — and so does everything else
-            // the user can read. That is why it is gated behind an explicit
-            // Trust action, exactly as MDX script execution is.
-            //
-            // Restricted stores the file's own text instead, which the
-            // workspace encodes as a `data:` URL like every other document:
-            // that origin is opaque and cannot reach the filesystem at all.
-            // Encoding it here as well would percent-encode the payload twice.
-            //
-            // A revision still reloads this URL after an edit, but `file://`
-            // shows what is on disk rather than the unsaved editor buffer. A
-            // truly live trusted preview would need a temporary-file protocol,
-            // not a different cache key.
-            self.web_html = Some(match self.trust {
-                Trust::Trusted => self
-                    .source_path()
-                    .map(web::to_file_url)
-                    .unwrap_or_else(|| web::build_html_raw(&self.document, Trust::Restricted)),
-                Trust::Restricted => web::build_html_raw(&self.document, self.trust),
-            });
-            return;
-        }
-        // Paint the preview with the app's own preset rather than letting the
-        // browser follow the OS: otherwise an explicit Nord shows a generic dark
-        // preview next to Nord-colored chrome.
-        let preset = crate::settings::active_preset(cx);
-        self.web_html = Some(web::build_html_themed(
-            &self.document,
-            &self.registry,
-            self.trust,
-            Some(preset),
-        ));
+        let visible = self.layout.uses_webview();
+        let source_path = self.origin.source_path();
+        self.preview
+            .refresh_web(&self.document, source_path, self.trust, visible, cx);
     }
 
     /// Rebuild the Web payload after something outside this view changed how it
     /// should look — today, the theme.
     pub fn theme_changed(&mut self, cx: &mut Context<Self>) {
-        if self.web_html.is_some() {
-            self.rebuild_web(cx);
-        }
+        let source_path = self.origin.source_path();
+        self.preview
+            .theme_changed(&self.document, source_path, self.trust, cx);
         cx.notify();
     }
 
     /// The HTML — or, for a trusted HTML file, the `file://` URL — currently
     /// destined for the WebView.
     pub fn web_html(&self) -> Option<&str> {
-        self.web_html.as_deref()
+        self.preview.web_html()
     }
 
     pub(crate) fn web_payload(&self) -> Option<(&str, u64)> {
-        self.web_html
-            .as_deref()
-            .map(|html| (html, self.web_revision))
+        self.preview.web_payload()
     }
 
     pub(crate) fn has_web_preview_failure(&self) -> bool {
-        self.web_preview_failure_revision == Some(self.web_revision)
+        self.preview.has_web_failure()
     }
 
     pub(crate) fn mark_web_preview_failed(&mut self, revision: u64, cx: &mut Context<Self>) {
-        if self.layout.uses_webview()
-            && self.web_revision == revision
-            && self.web_preview_failure_revision != Some(revision)
-        {
-            self.web_preview_failure_revision = Some(revision);
+        if self.layout.uses_webview() && self.preview.mark_web_failed(revision) {
             cx.notify();
         }
     }
 
     fn request_web_preview_retry(&mut self, cx: &mut Context<Self>) {
-        if !self.has_web_preview_failure() {
+        if !self.preview.request_web_retry() {
             return;
         }
-        self.web_preview_failure_revision = None;
         cx.emit(DocumentEvent::RetryWebPreview);
         cx.notify();
     }
 
     pub(crate) fn clear_web_preview_failure(&mut self, revision: u64, cx: &mut Context<Self>) {
-        if self
-            .web_preview_failure_revision
-            .is_some_and(|failed_revision| {
-                failed_revision == revision || revision == self.web_revision
-            })
-        {
-            self.web_preview_failure_revision = None;
+        if self.preview.clear_web_failure_for(revision) {
             cx.notify();
         }
     }
@@ -1918,14 +1848,13 @@ impl DocumentView {
             .size_full()
             .children(diagnostics)
             .child(
-                TextView::new(&self.preview)
-                    .style(preview_style(cx))
+                TextView::new(self.preview.native_state())
+                    .style(preview::native_style(cx))
                     .selectable(true)
                     .scrollable(true)
-                    // Cloned, never rebuilt: a fresh `MarkdownExtensions` here
-                    // carries a new revision and defeats upstream's guard, which
-                    // reparses the whole document every frame. See the field.
-                    .markdown_extensions(self.preview_extensions.clone())
+                    // Clone the same extensions revision each frame; rebuilding
+                    // it here would force upstream to reparse on every draw.
+                    .markdown_extensions(self.preview.native_extensions().clone())
                     .flex_1()
                     .p_5(),
             )
@@ -2053,199 +1982,6 @@ impl DocumentView {
             self.render_native_preview(cx).into_any_element()
         }
     }
-}
-
-/// Markdown extensions that render diagram and math fences through the
-/// registry.
-///
-/// One parser + one renderer handles every registered technology, so adding
-/// Graphviz means adding a `DiagramKind` — not editing this function.
-pub fn diagram_extensions(
-    registry: Arc<RendererRegistry>,
-) -> gpui_kit::component::text::MarkdownExtensions {
-    use gpui_kit::component::text::{MarkdownExtensions, MarkdownNode, markdown_ast};
-
-    let parse_registry = registry.clone();
-    MarkdownExtensions::default()
-        .block_parser(move |node, _cx| {
-            let markdown_ast::Node::Code(code) = node else {
-                return None;
-            };
-            let lang = code.lang.as_deref().unwrap_or("").trim();
-            let id = match mt_core::DiagramKind::from_lang(lang) {
-                Some(kind) => kind.id().to_string(),
-                None if matches!(lang.to_ascii_lowercase().as_str(), "math" | "latex" | "tex") => {
-                    "math".to_string()
-                }
-                None => return None,
-            };
-            // Rendering happens here, on the background parse task, so a
-            // shell-out never blocks the UI thread.
-            let outcome = parse_registry.render(&id, &code.value);
-            Some(
-                MarkdownNode::new(
-                    "mt-block",
-                    RenderedBlock {
-                        id,
-                        outcome,
-                        source: code.value.clone(),
-                    },
-                )
-                .markdown(format!("```{lang}\n{}\n```", code.value)),
-            )
-        })
-        .block_renderer("mt-block", move |node, _window, cx| {
-            let Some(block) = node.data::<RenderedBlock>() else {
-                return div().into_any_element();
-            };
-            render_block(block, cx)
-        })
-}
-
-/// A block after the registry has had a go at it.
-/// Give a rendered SVG the theme's foreground colour.
-///
-/// Renderers emit `fill="currentColor"` so one cached SVG can serve twelve
-/// themes and follow the OS light/dark switch. That works in the Web pane
-/// because `web.rs` sets `color` on the body — but the native pane hands the
-/// markup to `Image::from_bytes(ImageFormat::Svg, …)`, which rasterizes through
-/// usvg, and usvg resolves `currentColor` by walking for a `color` attribute and
-/// **falling back to black** when it finds none (`parser/style.rs`). Measured:
-/// an SVG with no `color` rasterizes to `(0, 0, 0)` and is invisible on the six
-/// dark presets, which is what a first launch shows, since the default theme
-/// preference is `System`.
-///
-/// gpui's `svg()` element tints through `style.text.color`, but `img()` — the
-/// element that can display arbitrary SVG markup — has no colour handling at
-/// all, so the colour has to be in the document.
-///
-/// Injected here rather than at render time on purpose: the renderer cache is
-/// keyed on `(id, source)` with no theme in it, so baking a colour into the
-/// cached string would serve the previous theme's colour after a switch. This
-/// runs per frame on an already-rendered string and costs one `replacen`.
-fn themed_svg(markup: &str, cx: &App) -> String {
-    let fg = cx.theme().foreground.to_rgb();
-    let ch = |c: f32| (c.clamp(0., 1.) * 255.).round() as u8;
-    let color = format!("#{:02x}{:02x}{:02x}", ch(fg.r), ch(fg.g), ch(fg.b));
-    // Only the root element, and only when it does not already say: a renderer
-    // that sets its own `color` has made a deliberate choice.
-    match markup.find("<svg") {
-        Some(_) if markup[..markup.find('>').unwrap_or(markup.len())].contains("color=") => {
-            markup.to_string()
-        }
-        Some(start) => {
-            let insert = start + "<svg".len();
-            format!(
-                "{} color=\"{color}\"{}",
-                &markup[..insert],
-                &markup[insert..]
-            )
-        }
-        None => markup.to_string(),
-    }
-}
-
-#[derive(Clone)]
-struct RenderedBlock {
-    id: String,
-    outcome: mt_core::rendering::RenderOutcome,
-    source: String,
-}
-
-fn render_block(block: &RenderedBlock, cx: &mut App) -> AnyElement {
-    use mt_core::rendering::RenderOutcome;
-
-    match &block.outcome {
-        // SVG renders natively via resvg.
-        RenderOutcome::Svg(markup) if markup.contains("<svg") => div()
-            .w_full()
-            .flex()
-            .justify_center()
-            .py_2()
-            .child(
-                img(Arc::new(Image::from_bytes(
-                    ImageFormat::Svg,
-                    themed_svg(markup, cx).into_bytes(),
-                )))
-                .object_fit(ObjectFit::Contain)
-                .max_w_full(),
-            )
-            .into_any_element(),
-        // MathML: resvg cannot draw it, so show the formula source in a math
-        // style rather than an empty box. The Web pane renders it properly.
-        RenderOutcome::Svg(_) => div()
-            .w_full()
-            .flex()
-            .justify_center()
-            .py_2()
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().secondary)
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .child(block.source.trim().to_string()),
-            )
-            .into_any_element(),
-        // Failure: the diagnostic plus the untouched source, never a crash and
-        // never lost content.
-        RenderOutcome::Failed(diag) => v_flex()
-            .w_full()
-            .my_2()
-            .gap_1()
-            .p_3()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().danger.opacity(0.6))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(cx.theme().danger)
-                    .child(format!("{} rendering failed", block.id))
-                    .when_some(diag.line, |this, line| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("line {line}")),
-                        )
-                    }),
-            )
-            .child(div().text_xs().child(diag.message.clone()))
-            .child(
-                div()
-                    .mt_1()
-                    .p_2()
-                    .w_full()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().secondary)
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_xs()
-                    .child(block.source.clone()),
-            )
-            .into_any_element(),
-    }
-}
-
-fn preview_style(_cx: &App) -> TextViewStyle {
-    // Tables scroll horizontally rather than wrapping: a wide table in an
-    // agent instruction file is common and wrapping makes it unreadable.
-    let mut table = StyleRefinement::default();
-    table.overflow.x = Some(Overflow::Scroll);
-    TextViewStyle::default().table(table)
-}
-
-fn oversize_notice(len: usize) -> String {
-    format!(
-        "<!doctype html><html><body style=\"font-family:system-ui;padding:2rem\">\
-         <h3>Web preview paused</h3>\
-         <p>This document is {} MB. Rendering it through the WebView on every edit \
-         would block the UI. Native preview and the editor remain fully live.</p>\
-         </body></html>",
-        len / (1024 * 1024)
-    )
 }
 
 /// A tab label derived from a buffer's first line.
@@ -2563,7 +2299,7 @@ mod tests {
         });
         document.update(cx, |document, cx| {
             document.set_layout(Layout::Web, cx);
-            document.mark_web_preview_failed(document.web_revision, cx);
+            document.mark_web_preview_failed(document.preview.web_revision(), cx);
         });
 
         cx.update(|window, app| {

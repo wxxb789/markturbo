@@ -192,6 +192,7 @@ pub enum Key {
 
     // Tabs
     Untitled,
+    RecoveredSnapshot,
     UnsavedChanges,
     NavigateBack,
     NavigateForward,
@@ -938,6 +939,7 @@ fn english(key: Key) -> &'static str {
         Key::NoMatches => "No matches.",
 
         Key::Untitled => "Untitled",
+        Key::RecoveredSnapshot => "Recovered snapshot",
         Key::UnsavedChanges => "Unsaved changes",
         Key::NavigateBack => "Back",
         Key::NavigateForward => "Forward",
@@ -1298,6 +1300,7 @@ fn chinese(key: Key) -> Option<&'static str> {
         Key::NoMatches => "没有匹配项。",
 
         Key::Untitled => "未命名",
+        Key::RecoveredSnapshot => "已恢复快照",
         Key::UnsavedChanges => "有未保存的更改",
         Key::NavigateBack => "后退",
         Key::NavigateForward => "前进",
@@ -1631,6 +1634,7 @@ mod tests {
         Key::TypeToSearch,
         Key::NoMatches,
         Key::Untitled,
+        Key::RecoveredSnapshot,
         Key::UnsavedChanges,
         Key::NavigateBack,
         Key::NavigateForward,
