@@ -10,9 +10,20 @@
 //! particular machine.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use mt_core::{DocType, Document};
+
+// The test runner executes these in parallel. Concurrent 100K-line parses
+// charge CPU contention to the wall-clock bounds rather than to the parser.
+static TIMING_LOCK: Mutex<()> = Mutex::new(());
+
+fn isolated_timing() -> MutexGuard<'static, ()> {
+    TIMING_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -41,6 +52,7 @@ fn time<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 
 #[test]
 fn parses_a_10k_line_document_quickly() {
+    let _timing = isolated_timing();
     let source = read("large-10k.md");
     assert!(source.lines().count() >= 9_000, "fixture is too small");
 
@@ -55,6 +67,7 @@ fn parses_a_10k_line_document_quickly() {
 
 #[test]
 fn parses_a_100k_line_document_in_bounded_time() {
+    let _timing = isolated_timing();
     let source = read("huge-100k.md");
     assert!(source.lines().count() >= 90_000, "fixture is too small");
 
@@ -70,6 +83,7 @@ fn parses_a_100k_line_document_in_bounded_time() {
 
 #[test]
 fn the_engine_adds_no_superlinear_overhead_over_the_parser() {
+    let _timing = isolated_timing();
     // markdown-rs itself is superlinear in the *number of blocks*: measured on
     // this fixture family, 10x the input costs roughly 70x the time, and that
     // holds with the parser's own default constructs, so it is upstream and not
@@ -123,6 +137,7 @@ fn the_engine_adds_no_superlinear_overhead_over_the_parser() {
 /// window for seconds on every edit.
 #[test]
 fn a_huge_document_is_slow_enough_to_require_background_parsing() {
+    let _timing = isolated_timing();
     let source = read("huge-100k.md");
     let (_, elapsed) = time(|| Document::with_type(DocType::Markdown, source));
     assert!(
@@ -134,6 +149,7 @@ fn a_huge_document_is_slow_enough_to_require_background_parsing() {
 
 #[test]
 fn repeated_edits_do_not_accumulate_cost() {
+    let _timing = isolated_timing();
     // Simulates typing: each keystroke replaces the source and reparses. The
     // Nth edit must not be slower than the first, or the editor degrades as a
     // session goes on.
@@ -160,6 +176,7 @@ fn repeated_edits_do_not_accumulate_cost() {
 
 #[test]
 fn setting_identical_source_is_free() {
+    let _timing = isolated_timing();
     // The editor emits Change events that may not alter text; reparsing then
     // is pure waste on a large document.
     let source = read("huge-100k.md");
@@ -174,6 +191,7 @@ fn setting_identical_source_is_free() {
 
 #[test]
 fn diagram_heavy_document_parses_without_rendering() {
+    let _timing = isolated_timing();
     // Parsing must classify diagram blocks without invoking any renderer:
     // rendering is the view layer's job, on a background task. If parsing
     // rendered, opening this file would take seconds.
@@ -193,6 +211,7 @@ fn diagram_heavy_document_parses_without_rendering() {
 
 #[test]
 fn outline_and_block_lookup_are_cheap_on_a_huge_document() {
+    let _timing = isolated_timing();
     let source = read("huge-100k.md");
     let doc = Document::with_type(DocType::Markdown, source);
 

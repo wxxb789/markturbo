@@ -48,6 +48,9 @@ off LTO and uses 16 codegen units. This avoids paying distribution-size link
 costs on every PR and keeps timing-sensitive tests optimized. It is not an
 artifact-size or runtime-performance baseline. `check full` runs production
 release validation directly, without first rebuilding a second test profile.
+The `mt-core` performance integration tests serialize their timing cases within
+the test binary so concurrent 100K-line parses cannot consume each other's
+wall-clock allowance; their 45-second bound remains unchanged.
 No measured speedup is claimed until comparable CI timings are available.
 The release privacy scan takes its executable path from Cargo's build artifact
 messages, including custom target directories and target triples; it never falls
