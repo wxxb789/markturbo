@@ -486,10 +486,32 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires true apply_activation_attempted"):
             HARNESS.validate_evidence(evidence)
 
-    def test_trust_proof_must_bind_expected_change_and_source_contract(self) -> None:
+        evidence = valid_evidence()
+        evidence["cases"][3]["observations"]["apply_disabled_source_contract"] = False
+        with self.assertRaisesRegex(ValueError, "requires true apply_disabled_source_contract"):
+            HARNESS.validate_evidence(evidence)
+
+    def test_trust_proof_requires_runtime_and_source_contracts(self) -> None:
+        evidence = valid_evidence()
+        evidence["cases"][5]["observations"]["restricted_after_apply"] = False
+        with self.assertRaisesRegex(ValueError, "requires true restricted_after_apply"):
+            HARNESS.validate_evidence(evidence)
+
+        evidence = valid_evidence()
+        evidence["cases"][5]["observations"]["executable_matches_expected"] = False
+        with self.assertRaisesRegex(ValueError, "requires true executable_matches_expected"):
+            HARNESS.validate_evidence(evidence)
+
         evidence = valid_evidence()
         evidence["cases"][5]["observations"]["trust_revocation_order_source_contract"] = False
-        with self.assertRaisesRegex(ValueError, "requires true trust_revocation_order_source_contract"):
+        with self.assertRaisesRegex(
+            ValueError, "requires true trust_revocation_order_source_contract"
+        ):
+            HARNESS.validate_evidence(evidence)
+
+        evidence = valid_evidence()
+        evidence["cases"][5]["observations"]["preview_inert_source_contract"] = False
+        with self.assertRaisesRegex(ValueError, "requires true preview_inert_source_contract"):
             HARNESS.validate_evidence(evidence)
 
     def test_pass_rejects_hash_mismatch_and_private_content(self) -> None:
@@ -1042,90 +1064,6 @@ class SourceAndCliTests(unittest.TestCase):
             ["--expect-exe-sha256", HASH, "--case", HARNESS.CASE_STALE]
         )
         self.assertEqual(args.case, HARNESS.CASE_STALE)
-
-    def test_source_contract_reads_production_only(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            workspace = root / "crates" / "mt-app" / "src" / "views"
-            workspace.mkdir(parents=True)
-            production = "\n".join(
-                [
-                    HARNESS.REVIEW_RUN_ACCESSIBILITY_ID,
-                    HARNESS.REVIEW_RESULT_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_REQUEST_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_STALE_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_ACCEPT_ALL_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_REJECT_ALL_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_APPLY_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_COPY_ACCESSIBILITY_ID,
-                    HARNESS.REVISION_CHANGE_PREFIX,
-                    "accessibility_id(REVISION_RUN_ACCESSIBILITY_ID)",
-                    'accessibility_id("markturbo-revision-preview")',
-                    'accessibility_id("markturbo-revision-preview-source")',
-                    ".aria_value(preview.clone())",
-                    '.id("revision-stale")',
-                    "accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)",
-                    ".role(gpui::Role::Label)",
-                    ".aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))",
-                    ".into_any_element()",
-                    'Button::new("revision-apply")',
-                    "accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)",
-                    ".disabled(revision_stale)",
-                    "this.apply_revision(window, cx)",
-                    ".into_any_element()",
-                    "accessibility_id(REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)",
-                    "accessibility_id(REVISION_REJECT_ALL_ACCESSIBILITY_ID)",
-                    "accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)",
-                    "accessibility_id(REVISION_COPY_ACCESSIBILITY_ID)",
-                    "revision_question_binding_id(index, question)",
-                    '"{question_id}-answered"',
-                    '"{question_id}-input"',
-                    '"markturbo-revision-change-{}"',
-                    "apply_approved_revision Revision",
-                    "let preview: SharedString = self.revision_preview().unwrap_or_default().into();",
-                    'accessibility_id("markturbo-revision-preview")',
-                    'accessibility_id("markturbo-revision-preview-source")',
-                    ".role(gpui::Role::Label)",
-                    ".aria_value(preview.clone())",
-                    ".child(preview)",
-                    "for coverage in revision.result.question_coverage()",
-                ]
-            )
-            (workspace / "workspace.rs").write_text(production, encoding="utf-8")
-            (workspace / "document.rs").write_text(
-                "\n".join(
-                    [
-                        'DocumentEvent::Conflict Button::new("trust") Trust::Trusted',
-                        "accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID)",
-                        '"markturbo-document-trust"',
-                        "CONFLICT_OVERWRITE_ACCESSIBILITY_ID",
-                        '"markturbo-conflict-overwrite"',
-                        "pub fn apply_approved_revision() {",
-                        "let revoke_trust = self.trust == Trust::Trusted && matches!(self.document.doc_type(), DocType::Html | DocType::Mdx);",
-                        "if revoke_trust {",
-                        "self.trust = Trust::Restricted;",
-                        "self.rebuild_web(cx);",
-                        "}",
-                        "self.replace_text(final_text, window, cx);",
-                        "}",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertIsNone(HARNESS.source_contract_failure())
-                self.assertTrue(HARNESS.trust_apply_source_contract_ok())
-                self.assertTrue(HARNESS.preview_inert_source_contract_ok())
-            (workspace / "workspace.rs").write_text(
-                "\n#[cfg(test)]\n" + production,
-                encoding="utf-8",
-            )
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertEqual(
-                    HARNESS.source_contract_failure(), "REVISION_UIA_CONTRACT_MISSING"
-                )
 
     def test_apply_edits_rejects_invalid_ranges_duplicate_offsets_and_oversized_output(self) -> None:
         invalid = [

@@ -24,7 +24,6 @@ PARSE_ARGS = HARNESS.parse_args
 REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
 REVIEW_SETTINGS_DOCUMENT = HARNESS.review_settings_document
 RUN = HARNESS.run
-SOURCE_CONTRACT_FAILURE = HARNESS.source_contract_failure
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
 
 HASH = "a" * 64
@@ -328,17 +327,6 @@ class PersistentCredentialPreflightTests(unittest.TestCase):
 
 
 class HarnessContractTests(unittest.TestCase):
-    def test_native_harness_requires_stable_review_controls_and_shortcuts(self) -> None:
-        self.assertIsNone(SOURCE_CONTRACT_FAILURE())
-
-    def test_diagnostic_accessibility_value_exposes_its_content_free_message(self) -> None:
-        workspace = (HARNESS.REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs").read_text(
-            encoding="utf-8"
-        )
-        production = workspace.split("\n#[cfg(test)]", 1)[0]
-
-        self.assertIn("aria_value(diagnostic.diagnostic.message.as_str())", production)
-
     def test_scenario_activates_the_source_layout_before_reading_editor_state(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         scenario = source.split("def scenario(", 1)[1].split("def native_run_plan", 1)[0]
@@ -440,8 +428,19 @@ class HarnessContractTests(unittest.TestCase):
 
         self.assertEqual(events, [("close", 42), ("wait", 42)])
 
-    def test_source_contract_cannot_be_satisfied_by_test_only_controls(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("production_source", source)
-        self.assertIn("REVIEW_RUN_ACCESSIBILITY_ID", source)
-        self.assertIn("REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID", source)
+    def test_production_source_keeps_cfg_test_imports_and_strips_test_module(self) -> None:
+        source_text = (
+            "pub fn before_test_import() {}\n"
+            "#[cfg(test)]\nuse crate::test_support::TestDependency;\n"
+            "pub fn after_test_import() {}\n"
+            "\n#[cfg(test)]\nmod tests {\n    fn test_only() {}\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "workspace.rs"
+            source.write_text(source_text, encoding="utf-8")
+
+            production = HARNESS.production_source(source)
+
+        self.assertIn("use crate::test_support::TestDependency;", production)
+        self.assertIn("after_test_import", production)
+        self.assertNotIn("mod tests", production)

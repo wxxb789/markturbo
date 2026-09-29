@@ -487,7 +487,11 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
 
 
 def production_source(path: Path) -> str:
-    return path.read_text(encoding="utf-8").split("\n#[cfg(test)]", 1)[0]
+    source = path.read_text(encoding="utf-8")
+    test_module = source.rfind("\n#[cfg(test)]\nmod tests {")
+    if test_module != -1:
+        return source[:test_module]
+    return source
 
 
 def source_contract_failure() -> str | None:

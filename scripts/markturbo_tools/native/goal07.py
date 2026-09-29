@@ -321,10 +321,10 @@ ALLOWED_OBSERVATION_KEYS = {
     "integrity",
     "editor_after_undo",
     "stale_visible",
-    "preview_inert_source_contract",
     "apply_control_observed",
     "apply_accessibility_reported_enabled",
     "editor_after_activation_attempt",
+    "preview_inert_source_contract",
     "trust_revocation_order_source_contract",
     "executable_expected",
     "executable_matches_expected",
@@ -1645,25 +1645,43 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
 
 
 def production_source(path: Path) -> str:
-    return path.read_text(encoding="utf-8").split("\n#[cfg(test)]", 1)[0]
+    source = path.read_text(encoding="utf-8")
+    return source.split("\n#[cfg(test)]\nmod tests", 1)[0]
+
+
+def _rust_function_body(source: str, signature: str) -> str | None:
+    start = source.find(signature)
+    if start < 0:
+        return None
+    opening = source.find("{", start + len(signature))
+    if opening < 0:
+        return None
+
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1 : index]
+    return None
 
 
 def trust_apply_source_contract_ok() -> bool:
-    """Check the production ordering that makes trusted Apply fail closed."""
+    """Check the production trust revocation boundary before source replacement."""
     document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
-    start = document.find("pub fn apply_approved_revision")
-    if start < 0:
+    body = _rust_function_body(document, "pub fn apply_approved_revision(")
+    if body is None:
         return False
-    end = document.find("\n    ///", start + 1)
-    body = document[start:] if end < 0 else document[start:end]
     markers = (
-        "let revoke_trust =",
         "self.trust == Trust::Trusted",
         "matches!(self.document.doc_type(),",
         "DocType::Html | DocType::Mdx",
-        "if revoke_trust {",
+        "current_text != final_text",
         "self.trust = Trust::Restricted;",
-        "self.rebuild_web(cx);",
+        "self.preview",
+        ".trust_changed(",
         "self.replace_text(final_text, window, cx);",
     )
     if any(marker not in body for marker in markers):
@@ -1671,48 +1689,77 @@ def trust_apply_source_contract_ok() -> bool:
     revoke = body.find("let revoke_trust =")
     branch = body.find("if revoke_trust {")
     trust = body.find("self.trust = Trust::Restricted;")
-    rebuild = body.find("self.rebuild_web(cx);", trust)
-    replace = body.find("self.replace_text(final_text, window, cx);", rebuild)
-    return (
+    preview_state = body.find("self.preview", trust)
+    preview = body.find(".trust_changed(", preview_state)
+    preview_trust = body.find("Trust::Restricted", preview)
+    replace = body.find("self.replace_text(final_text, window, cx);", preview_trust)
+    ordered = (
         revoke >= 0
         and branch > revoke
         and trust > branch
-        and rebuild > trust
-        and replace > rebuild
+        and preview_state > trust
+        and preview > trust
+        and preview_trust > preview
+        and replace > preview_trust
+    )
+    if not ordered:
+        return False
+
+    preview_source = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "document" / "preview.rs"
+    )
+    trust_changed = _rust_function_body(preview_source, "pub(super) fn trust_changed(")
+    rebuild_web = _rust_function_body(preview_source, "fn rebuild_web(")
+    return (
+        trust_changed is not None
+        and "self.rebuild_web(document, source_path, trust, cx);" in trust_changed
+        and rebuild_web is not None
+        and "self.web_revision = self.web_revision.wrapping_add(1);" in rebuild_web
+        and "self.web_html = Some(" in rebuild_web
+        and "Trust::Restricted => web::build_html_raw(document, trust)" in rebuild_web
+        and "web::build_html_themed(" in rebuild_web
     )
 
 
 def preview_inert_source_contract_ok() -> bool:
-    """Check that the approved preview is rendered as inert GPUI text."""
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
-    start = workspace.find("self.revision_preview().unwrap_or_default()")
+    """Guard the Revision preview's stable, inert GPUI text surface."""
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
+    start = review.find('.id("revision-preview")')
     if start < 0:
         return False
-    end = workspace.find("for coverage in revision.result.question_coverage()", start)
-    body = workspace[start:] if end < 0 else workspace[start:end]
+    end = review.find(".into_any_element()", start)
+    if end < 0:
+        return False
+    body = review[start:end]
     required = (
-        'accessibility_id("markturbo-revision-preview")',
-        'accessibility_id("markturbo-revision-preview-source")',
+        ".role(gpui::Role::Group)",
+        f'.accessibility_id("{REVISION_PREVIEW_ACCESSIBILITY_ID}")',
+        '.id("revision-preview-source")',
         ".role(gpui::Role::Label)",
         ".aria_value(preview.clone())",
+        f'.accessibility_id("{REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}")',
         ".child(preview)",
     )
-    forbidden = ("WebSurface", "WebView", "rebuild_web", "render_html", "set_html")
+    forbidden = ("WebSurface", "WebView", "render_html", "set_html", "web_payload")
     return all(marker in body for marker in required) and not any(
         marker in body for marker in forbidden
     )
 
 
 def stale_accessibility_source_contract_ok() -> bool:
-    """Check that the stale warning is exposed as an inert UIA text node."""
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
-    start = workspace.find('.id("revision-stale")')
+    """Guard the stale warning's stable, inert UIA text node."""
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
+    start = review.find('.id("revision-stale")')
     if start < 0:
         return False
-    end = workspace.find(".into_any_element()", start)
+    end = review.find(".into_any_element()", start)
     if end < 0:
         return False
-    body = workspace[start:end]
+    body = review[start:end]
     return all(
         marker in body
         for marker in (
@@ -1724,15 +1771,17 @@ def stale_accessibility_source_contract_ok() -> bool:
 
 
 def stale_apply_source_contract_ok() -> bool:
-    """Check that the stale state disables the rendered Apply command."""
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
-    start = workspace.find('Button::new("revision-apply")')
+    """Guard that stale state disables the rendered Revision Apply command."""
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
+    start = review.find('Button::new("revision-apply")')
     if start < 0:
         return False
-    end = workspace.find(".into_any_element()", start)
+    end = review.find('Button::new("revision-save")', start)
     if end < 0:
         return False
-    body = workspace[start:end]
+    body = review[start:end]
     return all(
         marker in body
         for marker in (
@@ -1745,51 +1794,44 @@ def stale_apply_source_contract_ok() -> bool:
 
 def source_contract_failure() -> str | None:
     workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
     document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
+    for symbol, value in (
+        ("REVIEW_RUN_ACCESSIBILITY_ID", REVIEW_RUN_ACCESSIBILITY_ID),
+        ("REVIEW_RESULT_ACCESSIBILITY_ID", REVIEW_RESULT_ACCESSIBILITY_ID),
+        ("REVISION_RUN_ACCESSIBILITY_ID", REVISION_RUN_ACCESSIBILITY_ID),
+        ("REVISION_STALE_ACCESSIBILITY_ID", REVISION_STALE_ACCESSIBILITY_ID),
+        ("REVISION_ACCEPT_ALL_ACCESSIBILITY_ID", REVISION_ACCEPT_ALL_ACCESSIBILITY_ID),
+        ("REVISION_REJECT_ALL_ACCESSIBILITY_ID", REVISION_REJECT_ALL_ACCESSIBILITY_ID),
+        ("REVISION_APPLY_ACCESSIBILITY_ID", REVISION_APPLY_ACCESSIBILITY_ID),
+        ("REVISION_COPY_ACCESSIBILITY_ID", REVISION_COPY_ACCESSIBILITY_ID),
+    ):
+        if f'const {symbol}: &str = "{value}";' not in workspace:
+            return "REVISION_UIA_CONTRACT_MISSING"
+        if f"accessibility_id({symbol})" not in review:
+            return "REVISION_SOURCE_CONTRACT_MISSING"
+
     for value in (
-        REVIEW_RUN_ACCESSIBILITY_ID,
-        REVIEW_RESULT_ACCESSIBILITY_ID,
-        REVISION_REQUEST_ACCESSIBILITY_ID,
+        REVISION_RESULT_ACCESSIBILITY_ID,
         REVISION_PREVIEW_ACCESSIBILITY_ID,
         REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
-        REVISION_STALE_ACCESSIBILITY_ID,
-        REVISION_ACCEPT_ALL_ACCESSIBILITY_ID,
-        REVISION_REJECT_ALL_ACCESSIBILITY_ID,
-        REVISION_APPLY_ACCESSIBILITY_ID,
-        REVISION_COPY_ACCESSIBILITY_ID,
+        REVISION_QUESTION_PREFIX,
         REVISION_CHANGE_PREFIX,
     ):
-        if value not in workspace:
+        if value not in review:
             return "REVISION_UIA_CONTRACT_MISSING"
-    for contract in (
-        "accessibility_id(REVISION_RUN_ACCESSIBILITY_ID)",
-        'accessibility_id("markturbo-revision-preview")',
-        'accessibility_id("markturbo-revision-preview-source")',
-        "accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_REJECT_ALL_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_COPY_ACCESSIBILITY_ID)",
-        "revision_question_binding_id(index, question)",
-        '"{question_id}-answered"',
-        '"{question_id}-input"',
-        '"markturbo-revision-change-{}"',
-        "apply_approved_revision",
-        "Revision",
+
+    if (
+        "DocumentEvent::Conflict" not in workspace
+        or 'Button::new("trust")' not in document
+        or "accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID)" not in document
+        or TRUST_AUTOMATION_ID not in document
+        or "accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID)" not in document
+        or CONFLICT_OVERWRITE_ACCESSIBILITY_ID not in document
     ):
-        if contract not in workspace:
-            return "REVISION_SOURCE_CONTRACT_MISSING"
-    for contract in (
-        "DocumentEvent::Conflict",
-        'Button::new("trust")',
-        "accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID)",
-        '"markturbo-document-trust"',
-        "Trust::Trusted",
-        "CONFLICT_OVERWRITE_ACCESSIBILITY_ID",
-        '"markturbo-conflict-overwrite"',
-    ):
-        if contract not in document and contract not in workspace:
-            return "REVISION_BOUNDARY_CONTRACT_MISSING"
+        return "REVISION_BOUNDARY_CONTRACT_MISSING"
     if not trust_apply_source_contract_ok():
         return "REVISION_TRUST_SOURCE_CONTRACT_MISSING"
     if not preview_inert_source_contract_ok():

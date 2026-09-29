@@ -409,11 +409,19 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
 
 
 def production_source(path: Path) -> str:
-    return path.read_text(encoding="utf-8").split("\n#[cfg(test)]", 1)[0]
+    source = path.read_text(encoding="utf-8")
+    test_module = "\n#[cfg(test)]\nmod tests {"
+    boundary = source.rfind(test_module)
+    return source if boundary < 0 else source[:boundary]
 
 
 def source_contract_failure() -> str | None:
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
+    workspace = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
+    )
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
     for value in (
         REVIEW_RUN_ACCESSIBILITY_ID,
         REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID,
@@ -422,18 +430,23 @@ def source_contract_failure() -> str | None:
         if value not in workspace:
             return "REVIEW_UIA_CONTRACT_MISSING"
     for contract in (
+        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None)',
+        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None)',
+    ):
+        if contract not in workspace:
+            return "REVIEW_SOURCE_CONTRACT_MISSING"
+    for contract in (
         "accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)",
         "accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID)",
         "accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID)",
         "gpui_kit::Role::Label",
-        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None)',
-        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None)',
+        ".aria_value(diagnostic.diagnostic.message.as_str())",
         "ReviewError::MissingCredential",
         "i18n::Key::ReviewMissingCredential",
         "PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx))",
         "i18n::Key::ReviewReady",
     ):
-        if contract not in workspace:
+        if contract not in review:
             return "REVIEW_SOURCE_CONTRACT_MISSING"
     return None
 

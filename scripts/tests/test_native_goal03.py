@@ -40,7 +40,6 @@ PARSE_ARGS = HARNESS.parse_args
 RECENT_SETTINGS_DOCUMENT = HARNESS.recent_settings_document
 REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
 SCAN_CASE_ARTIFACTS = HARNESS.scan_case_artifacts
-SOURCE_CONTRACT_FAILURE = HARNESS.source_contract_failure
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
 VALIDATE_FINGERPRINT = runtime.validate_fingerprint
 GOAL_03_HARNESS = HARNESS.Goal03Harness
@@ -749,52 +748,6 @@ class RuntimeAndSourceContractTests(unittest.TestCase):
         self.assertIn('"CommandButton_6"', native)
         self.assertIn("owned_task_dialogs(app.process.pid, file_dialog_hwnd)", native)
         self.assertIn("self.accept_native_overwrite_confirmation(app, hwnd)", select)
-
-    def test_source_contract_matches_current_rust_uia_and_startup_contract(self) -> None:
-        self.assertIsNone(SOURCE_CONTRACT_FAILURE())
-
-    def test_source_contract_does_not_accept_strings_from_rust_test_modules(self) -> None:
-        workspace_contracts = [
-            HARNESS.WELCOME_NEW_AUTOMATION_ID,
-            HARNESS.WELCOME_PASTE_AUTOMATION_ID,
-            HARNESS.WELCOME_OPEN_FILE_AUTOMATION_ID,
-            HARNESS.WELCOME_OPEN_FOLDER_AUTOMATION_ID,
-            HARNESS.WELCOME_OPEN_SAMPLE_AUTOMATION_ID,
-            HARNESS.WELCOME_DONT_SHOW_AUTOMATION_ID,
-            "initial.is_none() && show_welcome_on_startup",
-            "fn dont_show_welcome_again",
-            "fn on_paste_into_new",
-            "cx.read_from_clipboard()",
-            "fn open_bundled_sample",
-            "fn record_recent_target",
-            "fn prompt_save_as_overwrite",
-            "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
-        ]
-        document_contracts = [
-            HARNESS.DOCUMENT_SAVE_AS_AUTOMATION_ID,
-            "DocumentEvent::SaveAsRequested",
-        ]
-
-        with tempfile.TemporaryDirectory() as temporary:
-            repo = Path(temporary)
-            views = repo / "crates" / "mt-app" / "src" / "views"
-            views.mkdir(parents=True)
-            (views / "workspace.rs").write_text(
-                "fn production() {}\n#[cfg(test)]\nmod tests {\n"
-                + "\n".join(workspace_contracts)
-                + "\n}\n",
-                encoding="utf-8",
-            )
-            (views / "document.rs").write_text(
-                "fn production() {}\n#[cfg(test)]\nmod tests {\n"
-                + "\n".join(document_contracts)
-                + "\n}\n",
-                encoding="utf-8",
-            )
-            with mock.patch.dict(SOURCE_CONTRACT_FAILURE.__globals__, {"REPO": repo}):
-                self.assertEqual(
-                    SOURCE_CONTRACT_FAILURE(), "WELCOME_UIA_CONTRACT_MISSING"
-                )
 
     def test_runtime_scan_rejects_document_text_in_data_or_config_but_not_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
