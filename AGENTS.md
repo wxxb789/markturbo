@@ -22,6 +22,11 @@ immutable evaluation snapshots and existing evidence. CLAUDE.md shares this file
 
 ## Work to a bounded result
 
+For non-trivial goals, use available subagents and multi-agent capabilities to
+run independent, bounded workstreams in parallel wherever safe. Assign disjoint
+write ownership, integrate the results, and verify the combined behavior; do
+not serialize independent work merely for convenience.
+
 Identify the behavior, smallest useful change, affected invariant and verification
 command before editing; a brief task/PR note is enough. Prefer an existing module
 and public library capability over a new layer. Do not add a goal file, harness,
