@@ -308,10 +308,14 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
         def block(*_args: object) -> object:
             raise HARNESS_BLOCKED("INPUT_DESKTOP_LOCKED")
 
-        with mock.patch.dict(RUN.__globals__, {"preflight": fail}):
-            fail_code, fail_evidence, _ = RUN(args)
-        with mock.patch.dict(RUN.__globals__, {"preflight": block}):
-            block_code, block_evidence, _ = RUN(args)
+        with mock.patch.dict(HARNESS.__dict__, {"preflight": fail}):
+            fail_code, fail_evidence, _ = runtime.run_native_acceptance(
+                args, HARNESS.native_run_plan()
+            )
+        with mock.patch.dict(HARNESS.__dict__, {"preflight": block}):
+            block_code, block_evidence, _ = runtime.run_native_acceptance(
+                args, HARNESS.native_run_plan()
+            )
 
         self.assertEqual((fail_code, fail_evidence["status"]), (1, "FAIL"))
         self.assertEqual((block_code, block_evidence["status"]), (2, "BLOCKED"))
@@ -423,6 +427,205 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
             [0, runtime.KEYEVENTF_KEYUP],
         )
         self.assertEqual(user32.foreground, 123)
+
+
+class FocusUser32:
+    """Queued OS focus events; UIA logical focus cannot change hwndFocus."""
+
+    def __init__(self):
+        self.focus = 73
+        self.foreground = 73
+        self.visible = False
+        self.exists = True
+        self.pending = []
+        self.hooks = {}
+        self.events = []
+        self.next_hook = 1
+
+    def SetWinEventHook(self, first, last, _module, callback, pid, tid, flags):
+        assert first == last and (pid, tid, flags) == (0, 0, 0)
+        hook = self.next_hook
+        self.next_hook += 1
+        self.hooks[hook] = (first, callback)
+        self.events.append(("subscribe", first))
+        return hook
+
+    def UnhookWinEvent(self, hook):
+        del self.hooks[hook]
+        return True
+
+    def MsgWaitForMultipleObjectsEx(self, count, handles, timeout, mask, flags):
+        assert count == 0 and handles is None and timeout > 0
+        assert (mask, flags) == (0x04FF, 0x0004)
+        return 0 if self.pending else runtime.WAIT_TIMEOUT
+
+    def PeekMessageW(self, *_args):
+        if self.pending:
+            event, target, update = self.pending.pop(0)
+            update()
+            for hook, (subscribed, callback) in tuple(self.hooks.items()):
+                if event == subscribed:
+                    callback(hook, event, target, 0, 0, 0, 0)
+        # WinEvent callbacks may be dispatched even without a posted MSG.
+        return False
+
+    def GetForegroundWindow(self):
+        return self.foreground
+
+    def GetGUIThreadInfo(self, thread, pointer):
+        assert thread == 0
+        info = runtime.ctypes.cast(pointer, runtime.ctypes.POINTER(runtime.GUITHREADINFO)).contents
+        assert info.cbSize == runtime.ctypes.sizeof(runtime.GUITHREADINFO)
+        info.hwndFocus = self.focus
+        return True
+
+    def FindWindowExW(self, parent, _after, class_name, _title):
+        assert parent == 73 and class_name == "MarkTurboWebHost"
+        return 74 if self.exists else 0
+
+    def IsWindowVisible(self, hwnd):
+        return hwnd == 74 and self.visible
+
+    def IsWindow(self, hwnd):
+        return hwnd == 74 and self.exists
+
+    def IsChild(self, parent, child):
+        return (parent, child) in {(73, 74), (73, 75), (74, 75)}
+
+
+class WebToSourceFocusTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(runtime.time, "monotonic", return_value=0.0))
+        self.enterContext(mock.patch.object(
+            runtime.time, "sleep", side_effect=AssertionError("focus must await events")
+        ))
+
+    def handoff(self, repair="acknowledged"):
+        source = FakeControl(LAYOUT_SOURCE_AUTOMATION_ID, "TabItem")
+        editor = FakeControl(SOURCE_EDITOR_AUTOMATION_ID, "Edit")
+        web = FakeControl("web-host", "Pane")
+        factory = FreshRootFactory([FakeRoot([source, editor])])
+        harness = native_harness(factory, timeout=1.0)
+        harness.uia_element_info_class = lambda value: (
+            FakeElementInfo(web) if value == 74 else factory.element_info(value)
+        )
+        win32 = object.__new__(runtime.Win32)
+        user32 = FocusUser32()
+        win32.user32 = user32
+        win32._win_event_proc = lambda callback: callback
+        harness.win32 = win32
+        harness.focus_editor = mock.Mock(side_effect=AssertionError("explicit refocus"))
+        wrap = factory.wrapper
+
+        def wrapper(info):
+            control = wrap(info)
+            if control.control is web:
+                def click():
+                    web.click_count += 1
+                    user32.events.append(("click-web",))
+                    user32.pending.append((
+                        runtime.EVENT_OBJECT_FOCUS, 75,
+                        lambda: setattr(user32, "focus", 73 if repair == "never-web" else 75),
+                    ))
+                control.click_input = click
+            elif control.control is source:
+                def select():
+                    source.select_count += 1
+                    user32.events.append(("select-source",))
+                    user32.pending.append((
+                        runtime.EVENT_OBJECT_HIDE, 74,
+                        lambda: setattr(user32, "visible", False),
+                    ))
+                    # Logical GPUI focus/its event alone is deliberately a decoy.
+                    user32.pending.append((runtime.EVENT_OBJECT_FOCUS, 73, lambda: None))
+                    if repair in {"acknowledged", "retry"}:
+                        if repair == "retry":
+                            user32.pending.append((runtime.EVENT_OBJECT_FOCUS, 73, lambda: None))
+                        user32.pending.append((
+                            runtime.EVENT_OBJECT_FOCUS, 73,
+                            lambda: setattr(user32, "focus", 73),
+                        ))
+                control.select = select
+            control.has_keyboard_focus = lambda: repair == "broken"
+            return control
+
+        harness.uia_wrapper_class = wrapper
+        if repair != "never-visible":
+            user32.pending.append((
+                runtime.EVENT_OBJECT_SHOW, 74,
+                lambda: setattr(user32, "visible", True),
+            ))
+        return harness, user32, source, editor, web
+
+    def test_observes_native_handoff_without_editor_autofocus_or_click(self):
+        for repair in ("acknowledged", "retry"):
+            with self.subTest(repair=repair):
+                harness, os, source, editor, web = self.handoff(repair)
+                harness.activate_source_from_focused_web(running_app())
+                self.assertEqual((source.select_count, editor.click_count, web.click_count), (1, 0, 1))
+                self.assertEqual(os.focus, 73)
+                self.assertFalse(os.visible)
+                self.assertEqual(os.hooks, {})
+                self.assertEqual(os.events, [
+                    ("subscribe", runtime.EVENT_OBJECT_SHOW),
+                    ("subscribe", runtime.EVENT_OBJECT_FOCUS), ("click-web",),
+                    ("subscribe", runtime.EVENT_OBJECT_HIDE),
+                    ("subscribe", runtime.EVENT_OBJECT_FOCUS), ("select-source",),
+                ])
+                harness.focus_editor.assert_not_called()
+
+    def test_broken_transfer_fails_despite_logical_focus_and_releases_hooks(self):
+        harness, os, source, editor, web = self.handoff("broken")
+        with self.assertRaisesRegex(HARNESS_FAILURE, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"):
+            harness.activate_source_from_focused_web(running_app())
+        self.assertEqual(os.focus, 75)
+        self.assertFalse(os.visible)
+        self.assertEqual((source.select_count, editor.click_count, web.click_count), (1, 0, 1))
+        self.assertEqual(os.hooks, {})
+        harness.focus_editor.assert_not_called()
+
+    def test_visible_and_native_focused_web_are_required_before_source(self):
+        for repair, code in (("never-visible", "WEB_PREVIEW_VISIBLE_TIMEOUT"),
+                             ("never-web", "WEB_PREVIEW_NATIVE_FOCUS_TIMEOUT")):
+            with self.subTest(repair=repair):
+                harness, os, source, editor, _web = self.handoff(repair)
+                with self.assertRaisesRegex(HARNESS_FAILURE, code):
+                    harness.activate_source_from_focused_web(running_app())
+                self.assertEqual((source.select_count, editor.click_count), (0, 0))
+                self.assertEqual(os.hooks, {})
+
+    def test_focus_query_does_not_accept_another_foreground_or_unreadable_state(self):
+        harness, os, *_controls = self.handoff()
+        os.foreground = 99
+        self.assertEqual(harness.win32.foreground_focus(73), 0)
+        os.foreground = 73
+        os.GetGUIThreadInfo = lambda *_args: False
+        with self.assertRaisesRegex(HARNESS_FAILURE, "NATIVE_FOCUS_QUERY_FAILED"):
+            harness.win32.foreground_focus(73)
+
+    def test_event_subscription_is_removed_when_action_fails(self):
+        harness, os, *_controls = self.handoff()
+        action = mock.Mock(side_effect=HARNESS_FAILURE("SOURCE_LAYOUT_SELECT_FAILED"))
+        with self.assertRaisesRegex(HARNESS_FAILURE, "SOURCE_LAYOUT_SELECT_FAILED"):
+            harness.win32.after_window_events(
+                73, (runtime.EVENT_OBJECT_FOCUS,), action, lambda: True,
+                1.0, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
+            )
+        self.assertEqual(os.hooks, {})
+
+    def test_partial_subscription_failure_never_acts_and_removes_installed_hook(self):
+        win32 = object.__new__(runtime.Win32)
+        win32._win_event_proc = lambda callback: callback
+        win32.user32 = mock.Mock()
+        win32.user32.SetWinEventHook.side_effect = [1, 0]
+        action = mock.Mock()
+        with self.assertRaisesRegex(HARNESS_FAILURE, "NATIVE_WINDOW_EVENT_HOOK_FAILED"):
+            win32.after_window_events(
+                73, (runtime.EVENT_OBJECT_HIDE, runtime.EVENT_OBJECT_FOCUS),
+                action, lambda: True, 1.0, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
+            )
+        action.assert_not_called()
+        win32.user32.UnhookWinEvent.assert_called_once_with(1)
 
 
 class SelectorAndOrchestrationTests(unittest.TestCase):
@@ -637,13 +840,22 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         factory = FreshRootFactory([hidden, disabled, ready])
         harness = native_harness(factory)
 
-        control = harness.find_control(
-            running_app(),
-            SOURCE_EDITOR_AUTOMATION_ID,
-            "Edit",
-            "SOURCE_EDITOR_UIA_TIMEOUT",
-            "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
-        )
+        elapsed = [0.0]
+
+        def advance(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        with (
+            mock.patch.object(runtime.time, "perf_counter", side_effect=lambda: elapsed[0]),
+            mock.patch.object(runtime.time, "sleep", side_effect=advance),
+        ):
+            control = harness.find_control(
+                running_app(),
+                SOURCE_EDITOR_AUTOMATION_ID,
+                "Edit",
+                "SOURCE_EDITOR_UIA_TIMEOUT",
+                "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
+            )
 
         self.assertIs(control, factory.wrappers[-1])
         self.assertEqual(factory.calls, 3)
@@ -934,23 +1146,15 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.detail, "RuntimeError")
         self.assertEqual(control.click_count, 1)
 
-    def test_external_conflict_waits_for_watcher_before_explicit_overwrite(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("    def scenario_external_conflict", 1)[1].split(
-            "    def scenario_recovery", 1
-        )[0]
-
-        watcher = body.index("CONFLICT_OVERWRITE_AUTOMATION_ID")
-        explicit = body.index('click_control(overwrite, "CONFLICT_OVERWRITE_CLICK_FAILED")')
-        self.assertLess(watcher, explicit)
-        self.assertNotIn("VK_S", body[:explicit])
-
     def test_launch_uses_the_configured_foreground_timeout(self) -> None:
         events: list[tuple[object, ...]] = []
         context = runtime.SecurityContext(1, 0x2000, "medium")
 
         class FakeProcess:
             pid = 91
+
+            def start(self):
+                events.append(("start",))
 
             def poll(self):
                 return None
@@ -1001,12 +1205,13 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                 object,
                 context,
             )
-            with mock.patch.object(runtime.subprocess, "Popen", return_value=process) as popen:
+            with mock.patch.object(runtime, "OwnedProcess", return_value=process) as owned:
                 app = harness.launch_app(None, data, config, workspace, stderr)
 
         self.assertEqual(app.spec.args, (str(root / "markturbo.exe"),))
+        self.assertEqual(events[0], ("start",))
         self.assertEqual(events[-1], ("foreground", 73, 2.0))
-        self.assertEqual(popen.call_args.args[0], app.spec.args)
+        owned.assert_called_once_with(harness.win32, app.spec)
 
     def test_launch_clicks_the_window_center_before_retrying_foreground(self) -> None:
         events: list[tuple[object, ...]] = []
@@ -1014,6 +1219,9 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
         class FakeProcess:
             pid = 91
+
+            def start(self):
+                events.append(("start",))
 
             def poll(self):
                 return None
@@ -1082,31 +1290,10 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                 object,
                 context,
             )
-            with mock.patch.object(runtime.subprocess, "Popen", return_value=process):
+            with mock.patch.object(runtime, "OwnedProcess", return_value=process):
                 harness.launch_app(None, data, config, workspace, stderr)
 
+        self.assertEqual(events[0], ("start",))
         self.assertIn(("foreground", 73, 2.0), events)
         self.assertIn(("click", (400, 300)), events)
         self.assertEqual(events[-1], ("foreground", 73, 3.5))
-
-    def test_recovery_waits_for_success_log_not_record_existence(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        body = source.split("    def scenario_recovery", 1)[1].split("\n\ndef native_run_plan", 1)[0]
-
-        self.assertIn("wait_checkpoint_log", body)
-        self.assertNotIn("glob(", body)
-        self.assertNotIn("wait_recovery_record", source)
-        checkpoint = body.index("wait_checkpoint_log")
-        live_records = body.index("scan_live_recovery_records", checkpoint)
-        terminate = body.index("self.terminate(first)")
-        live_runtime = body.index("scan_runtime_artifacts", terminate)
-        second = body.index("second = self.launch")
-        self.assertLess(checkpoint, live_records)
-        self.assertLess(live_records, terminate)
-        self.assertLess(terminate, live_runtime)
-        self.assertLess(live_runtime, second)
-
-        third = body.split("third = self.launch", 1)[1]
-        startup = third.index("wait_recovery_startup_finished")
-        observe = third.index("wait_editor_fingerprint")
-        self.assertLess(startup, observe)

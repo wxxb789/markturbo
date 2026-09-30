@@ -12,7 +12,7 @@
 //!
 //! [`to_file_url`] is the one documented way out of that sandbox, and it is
 //! reachable only for an HTML file the user explicitly trusted — see
-//! `DocumentView::rebuild_web`.
+//! `DocumentView`'s trust transition and `DocumentPreview::trust_changed`.
 
 use std::path::Path;
 

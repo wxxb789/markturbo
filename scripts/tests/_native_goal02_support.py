@@ -9,7 +9,6 @@ import io
 import json
 import shutil
 import struct
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,9 +16,6 @@ from unittest import mock
 
 from scripts.markturbo_tools.native import goal02 as HARNESS
 from scripts.markturbo_tools.native import runtime
-
-SCRIPT = Path(HARNESS.__file__)
-PYWINAUTO_WAS_LOADED = "pywinauto" in sys.modules
 
 BUILD_CLI_COMMAND = HARNESS.build_cli_command
 BUILD_LAUNCH_SPEC = runtime.build_launch_spec
@@ -40,7 +36,6 @@ PARSE_ARGS = HARNESS.parse_args
 PARSE_OUTCOME_LINE = runtime.parse_outcome_line
 PLATFORM_PREFLIGHT_FAILURE = runtime.platform_preflight_failure
 REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
-RUN = HARNESS.run
 RUNTIME_ARTIFACT_SCAN = HARNESS.scan_runtime_artifacts
 LIVE_RECOVERY_SCAN = HARNESS.scan_live_recovery_records
 LAUNCH_FAILURE_CODE = runtime.launch_failure_code

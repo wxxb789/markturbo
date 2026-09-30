@@ -884,6 +884,152 @@ class StartupCommandTests(unittest.TestCase):
             probe.cmd_startup(args)
 
 
+class AbbaMeasurementTests(unittest.TestCase):
+    def test_shared_scheduler_keeps_structured_samples_separated_in_abba_order(self) -> None:
+        order: list[str] = []
+
+        def sample(label: str):
+            def measure() -> str:
+                order.append(label)
+                return f"{label}-{len(order)}"
+
+            return measure
+
+        samples_a, samples_b = metrics.measure_abba_samples(2, sample("A"), sample("B"))
+
+        self.assertEqual(order, ["A", "B", "B", "A", "A", "B", "B", "A"])
+        self.assertEqual(samples_a, ("A-1", "A-4", "A-5", "A-8"))
+        self.assertEqual(samples_b, ("B-2", "B-3", "B-6", "B-7"))
+
+    def test_metrics_keeps_paired_statistics_for_abba_samples(self) -> None:
+        a_samples = iter((10.0, 14.0))
+        b_samples = iter((20.0, 22.0))
+        order: list[str] = []
+
+        def measure_a() -> float:
+            order.append("A")
+            return next(a_samples)
+
+        def measure_b() -> float:
+            order.append("B")
+            return next(b_samples)
+
+        comparison = metrics.measure_abba(1, measure_a, measure_b)
+
+        self.assertEqual(order, ["A", "B", "B", "A"])
+        self.assertEqual(comparison.samples_a, (10.0, 14.0))
+        self.assertEqual(comparison.samples_b, (20.0, 22.0))
+        self.assertEqual(comparison.paired_a, (12.0,))
+        self.assertEqual(comparison.paired_b, (21.0,))
+        self.assertEqual(comparison.deltas, (9.0,))
+        self.assertEqual(comparison.percentages, (75.0,))
+
+    def test_structured_comparison_uses_adjacent_pairs_and_pair_medians(self) -> None:
+        samples_a = tuple(
+            fixture_startup_sample("welcome", base=base)
+            for base in (10.0, 14.0, 100.0, 104.0, 1000.0, 1004.0)
+        )
+        samples_b = tuple(
+            fixture_startup_sample("welcome", base=base)
+            for base in (20.0, 22.0, 90.0, 92.0, 1100.0, 1104.0)
+        )
+
+        comparison = goal04.milestone_comparison(samples_a, samples_b)
+
+        self.assertEqual(
+            comparison["process_created_ms"],
+            {
+                "paired_a": [12.0, 102.0, 1002.0],
+                "paired_b": [21.0, 91.0, 1102.0],
+                "b_minus_a": [9.0, -11.0, 100.0],
+                "b_minus_a_percent": [
+                    75.0,
+                    -11.0 / 102.0 * 100,
+                    100.0 / 1002.0 * 100,
+                ],
+                "median_b_minus_a": 9.0,
+                "median_b_minus_a_percent": 100.0 / 1002.0 * 100,
+            },
+        )
+
+    def test_each_caller_retains_its_pair_mean_overflow_behavior(self) -> None:
+        with self.assertRaisesRegex(OverflowError, "intermediate overflow"):
+            metrics.measure_abba(1, lambda: 1e308, lambda: 1e308)
+
+        samples = (
+            fixture_startup_sample("welcome", base=1e308),
+            fixture_startup_sample("welcome", base=1e308),
+        )
+        comparison = goal04.milestone_comparison(samples, samples)
+        self.assertEqual(comparison["process_created_ms"]["paired_a"], [float("inf")])
+
+    def test_metrics_rejects_a_zero_paired_baseline(self) -> None:
+        with self.assertRaisesRegex(ValueError, "baseline samples must be non-zero"):
+            metrics.measure_abba(1, lambda: 0.0, lambda: 1.0)
+
+
+class StartupProfileContractTests(unittest.TestCase):
+    def profile_calls(self, cache_state: str) -> list[tuple[str, Path | None]]:
+        from scripts.markturbo_tools.native import runtime as native_runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            exe_a = Path(directory) / "a.exe"
+            exe_b = Path(directory) / "b.exe"
+            exe_a.write_bytes(b"")
+            exe_b.write_bytes(b"")
+            calls: list[tuple[str, Path | None]] = []
+
+            def fake_measure(
+                exe: Path,
+                target: str | None,
+                timeout: float,
+                *,
+                win32: object,
+                parent_context: object,
+                idle_settle: float,
+                profile_root: Path | None = None,
+            ) -> probe.StartupSample:
+                calls.append((exe.name, profile_root))
+                return fixture_startup_sample("welcome")
+
+            with (
+                mock.patch.object(
+                    native_runtime,
+                    "sha256_file",
+                    return_value=mock.Mock(sha256="hash"),
+                ),
+                mock.patch.object(
+                    native_runtime,
+                    "preflight",
+                    side_effect=lambda *args, **kwargs: (object(), object()),
+                ),
+                mock.patch.object(probe, "startup_milestones_once", side_effect=fake_measure),
+                mock.patch.object(probe, "summarize_startup_milestones"),
+                mock.patch.object(probe, "milestone_comparison", return_value={}),
+            ):
+                args = StartupCommandTests.args(exe_a, exe_b, cache_state)
+                probe.cmd_startup_milestones(args, [exe_a, exe_b])
+
+        return calls
+
+    def test_warm_mode_reuses_distinct_profile_roots_per_variant(self) -> None:
+        calls = self.profile_calls("warm")
+
+        a_roots = [profile_root for name, profile_root in calls if name == "a.exe"]
+        b_roots = [profile_root for name, profile_root in calls if name == "b.exe"]
+        self.assertEqual(len(a_roots), 5)
+        self.assertEqual(len(b_roots), 5)
+        self.assertTrue(all(root == a_roots[0] for root in a_roots))
+        self.assertTrue(all(root == b_roots[0] for root in b_roots))
+        self.assertIsNotNone(a_roots[0])
+        self.assertIsNotNone(b_roots[0])
+        self.assertNotEqual(a_roots[0], b_roots[0])
+
+    def test_fresh_profile_mode_passes_no_profile_root(self) -> None:
+        roots = [profile_root for _, profile_root in self.profile_calls("fresh-profile")]
+        self.assertEqual(roots, [None] * 10)
+
+
 class ProcessCleanupTests(unittest.TestCase):
     def test_kill_and_wait_converts_timeout_to_runtime_error(self) -> None:
         process = mock.Mock()

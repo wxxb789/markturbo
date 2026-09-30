@@ -5,27 +5,24 @@
 //! and the commands (open folder, save, translate). Individual views stay
 //! narrow; this is where they are wired together.
 //!
-//! Two clusters live in submodules because neither belongs to the wiring.
-//! `history` is plain data plus the two buttons that read it; `web_surface`
-//! is the OS child window and the re-entrancy rules for touching it. Both add
-//! their methods to `Workspace` from there, so `self.web_dirty(cx)` reads the
-//! same here as it did before the split.
+//! Cohesive state lives in submodules where it has its own owner: `history`
+//! holds navigation data and controls, `recovery` owns the app recovery flow,
+//! `review` owns the Review → Revision workflow, and `web_surface` owns the OS
+//! child window and re-entrancy rules. `welcome` owns first-use presentation
+//! and recent-target availability. The view modules add methods to `Workspace`,
+//! so existing wiring reads the same while those responsibilities stay together.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui_kit::base::{Button as BaseButton, GlobalState, Toggle as BaseToggle};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
-    StyledExt as _, TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, StyledExt as _,
+    TITLE_BAR_HEIGHT as COMPONENT_TITLE_BAR_HEIGHT, ThemeStyled as _, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
     list::ListItem,
     menu::ContextMenuExt as _,
     spinner::Spinner,
@@ -35,56 +32,58 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mt_core::agent_artifacts::package::{
-    FrozenSkillPackage, ReviewRequestBuildError, ReviewRequestBuildRequest,
-    ReviewRequestBuildResult, ReviewTarget, build_review_request, resolve_document_anchor_offset,
-};
-use mt_core::review::provider::{
-    PreparedReview, REVIEW_REQUEST_TIMEOUT, ReviewError, ReviewLanguage, ReviewRequestError,
-    ReviewTransportResult, RevisionAnswer, RevisionAnswers, RevisionError,
-    RevisionQuestionCoverageStatus, RevisionTransportResult,
-};
-use mt_core::review::revision::ChangeId;
-use mt_core::review::{
-    ArtifactLens, ClarificationPriority, FindingKind, ReviewDiagnostic, ReviewDiagnosticCode,
-    ReviewModelOutput, ReviewRequest as DocumentReviewRequest, ReviewStatus, SkillPackage,
-    SourceAnchor, SourceLocation, SourceSnapshot, StructuredText,
-};
+use mt_core::agent_artifacts::package::FrozenSkillPackage;
 use mt_core::translate::provider::PreparedTranslation;
 use mt_core::translate::{Scope, TranslationRequest};
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 use crate::i18n;
 use crate::metrics;
 use crate::startup::{AcknowledgeStartupInput, InitialStartupState, StartupEvent};
-use crate::views::document::{
-    DocumentEvent, DocumentView, PreparedRecovery, SaveAsMode, SaveAsOutcome, SaveMode,
-};
+use crate::views::document::{DocumentEvent, DocumentView, SaveAsMode, SaveAsOutcome, SaveMode};
 use crate::views::explorer::{Explorer, ExplorerEvent};
 use crate::views::harness::{HarnessEvent, HarnessView};
-use crate::views::search::{Corpus, SearchEvent, SearchView};
+use crate::views::search::{Corpus, OpenSnapshot, SearchEvent, SearchView};
 use crate::views::settings_page::{SettingsEvent, SettingsView};
 use mt_core::document::io as fs;
 use mt_core::document::lifecycle::{
     DestructiveAction, DestructiveRequest, DestructiveResolution, DirtyDecision, DocumentId,
     DocumentLifecycle,
 };
-use mt_core::model::{ConsentCapability, ConsentDecision, RevisionRequestBinding};
-use mt_core::recovery::{
-    CancellableRecoveryCheckpointAttempt, CheckpointAttemptTiming, CheckpointBatchOutcome,
-    CheckpointSchedule, RecoveredRecord, RecoveryError, RecoveryKey, RecoveryMaintenance,
-    RecoveryRetirement, RecoveryRetirementBatch, RecoveryStore, RecoveryToken,
-    RetirementCompletion, RevisionRecovery,
-};
+use mt_core::model::{ConsentCapability, ConsentDecision};
+use mt_core::recovery::{RecoveryKey, RevisionRecovery};
 use mt_core::rendering::RendererRegistry;
+use mt_core::workspace::search::SearchTarget;
 use mt_core::workspace::tabs::{TabIdentity, Tabs};
 use mt_core::workspace::watcher::{Change, Watcher};
 
 mod history;
+mod recovery;
+mod review;
 pub(crate) mod web_surface;
+mod welcome;
 
+#[cfg(test)]
+use self::recovery::{
+    DocumentRecoveryState, RecoveryAttempt, RecoveryContentIdentity, checkpoint_batch_status,
+    current_checkpoint_write_completed_for_identity, prepare_recovery_records,
+    startup_recovery_status,
+};
+use self::recovery::{RecoveryFlow, StartupRecovery};
+use self::review::{
+    ReviewFlow, RevisionSaveAsApproval, RevisionSaveOutcome, export_recovered_revision_answers,
+};
+#[cfg(test)]
+use self::review::{
+    WorkspaceReviewResult, WorkspaceRevisionContext, WorkspaceRevisionResult,
+    build_revision_recovery, next_review_lens, revision_answer_is_incorporated,
+    revision_apply_identity_matches,
+};
 use self::web_surface::WebSurface;
+use self::welcome::WelcomeState;
+#[cfg(test)]
+use mt_core::agent_artifacts::package::{
+    ReviewRequestBuildError, ReviewRequestBuildRequest, ReviewTarget, build_review_request,
+};
 use mt_core::workspace::History;
 
 actions!(
@@ -122,12 +121,6 @@ actions!(
 /// failure this bounds — the full path is a hover away.
 const TAB_LABEL_MAX: usize = 22;
 const TAB_CLOSE_ACCESSIBILITY_ID: &str = "markturbo-document-tab-close";
-const WELCOME_NEW_ACCESSIBILITY_ID: &str = "markturbo-welcome-new";
-const WELCOME_PASTE_ACCESSIBILITY_ID: &str = "markturbo-welcome-paste";
-const WELCOME_OPEN_FILE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-file";
-const WELCOME_OPEN_FOLDER_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-folder";
-const WELCOME_OPEN_SAMPLE_ACCESSIBILITY_ID: &str = "markturbo-welcome-open-sample";
-const WELCOME_DONT_SHOW_ACCESSIBILITY_ID: &str = "markturbo-welcome-dont-show-again";
 const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";
 const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";
 const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";
@@ -142,32 +135,12 @@ const REVISION_SAVE_ACCESSIBILITY_ID: &str = "markturbo-revision-save";
 const REVISION_SAVE_AS_ACCESSIBILITY_ID: &str = "markturbo-revision-save-as";
 const REVISION_STALE_ACCESSIBILITY_ID: &str = "markturbo-revision-stale";
 const REVISION_RESULT_DISMISS_ACCESSIBILITY_ID: &str = "markturbo-revision-result-dismiss";
+const REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID: &str = "markturbo-revision-discard-answers";
 const REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str = "markturbo-revision-recovered-answers";
 const REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
     "markturbo-revision-copy-recovered-answers";
 const REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
     "markturbo-revision-discard-recovered-answers";
-const WELCOME_KEY_CONTEXT: &str = "Welcome";
-
-fn should_show_welcome(initial: Option<&Path>, show_welcome_on_startup: bool) -> bool {
-    initial.is_none() && show_welcome_on_startup
-}
-
-fn recent_target_issue(target: &mt_core::settings::RecentTarget) -> Option<i18n::Key> {
-    if !target.path.exists() {
-        return Some(i18n::Key::RecentMissing);
-    }
-    match target.kind {
-        mt_core::settings::RecentTargetKind::File
-            if target.path.is_file() && mt_core::workspace::is_openable(&target.path) =>
-        {
-            None
-        }
-        mt_core::settings::RecentTargetKind::Workspace if target.path.is_dir() => None,
-        _ => Some(i18n::Key::RecentUnavailable),
-    }
-}
-
 /// Shorten `name` to [`TAB_LABEL_MAX`], keeping the extension.
 ///
 /// The extension is what distinguishes `notes.md` from `notes.mdx`, so eliding
@@ -821,16 +794,10 @@ fn document_details_status_key(is_externally_changed: bool, is_dirty: bool) -> i
 
 pub struct Workspace {
     focus_handle: FocusHandle,
-    welcome_scroll: ScrollHandle,
+    /// Retained scroll and entry-time availability for the Welcome surface.
+    welcome: WelcomeState,
     /// The deliberate first-run surface, available only for a no-argument start.
     show_welcome: bool,
-    /// Filesystem availability captured when the Welcome surface is entered.
-    ///
-    /// Rendering may occur many times while a window is resized or animated.
-    /// Recent-target and sample probes belong at that state boundary instead of
-    /// synchronously touching the filesystem from `render_welcome`.
-    welcome_recent_issues: HashMap<PathBuf, Option<i18n::Key>>,
-    welcome_sample_available: bool,
     root: Option<PathBuf>,
     explorer: Option<Entity<Explorer>>,
     harness: Option<Entity<HarnessView>>,
@@ -857,35 +824,8 @@ pub struct Workspace {
     history: History,
     registry: Arc<RendererRegistry>,
     watcher: Option<Watcher>,
-    recovery: Option<RecoveryStore>,
-    /// True until the startup recovery scan either completes or fails.
-    startup_recovery_pending: bool,
-    /// Original keys for documents opened before startup recovery is ready.
-    /// Save As observes the new path even though an older checkpoint still
-    /// belongs to the path that was open when startup began.
-    startup_recovery_keys: HashMap<mt_core::document::lifecycle::DocumentId, RecoveryKey>,
-    /// The dirty source key that a successful Save As must retire. The document
-    /// has its new file identity by the time it emits `DirtyChanged`.
-    save_as_recovery_keys: HashMap<mt_core::document::lifecycle::DocumentId, RecoveryKey>,
-    /// Explicit Save or Discard decisions that still need a durable marker.
-    /// `None` keeps unknown-origin work fail-closed for every destructive action.
-    pending_recovery_retirements: HashMap<RecoveryKey, Option<DocumentId>>,
-    recovery_retirements: HashMap<RecoveryKey, RecoveryRetirement>,
-    recovery_retirement_batches: HashMap<RecoveryKey, RecoveryRetirementBatch>,
-    recovery_retirement_retries: HashSet<RecoveryKey>,
-    recovery_schedules: HashMap<mt_core::document::lifecycle::DocumentId, DocumentRecoveryState>,
-    /// Content identities paused until retirement resolves, scoped to a
-    /// document incarnation so reopening the same path is not suppressed.
-    recovery_retirement_suppressions:
-        HashMap<RecoveryKey, HashMap<DocumentId, RecoveryContentIdentity>>,
-    /// Exact source plus Revision binding used by the current recovery state.
-    /// This is separate from the editor revision because answers can change
-    /// while the document bytes stay untouched.
-    recovery_content_identities:
-        HashMap<mt_core::document::lifecycle::DocumentId, RecoveryContentIdentity>,
-    /// True while the one physical checkpoint batch owned by this workspace is running.
-    recovery_checkpoint_worker_active: bool,
-    recovery_warning: Option<String>,
+    /// One owner for startup arbitration, checkpoint timing, and retirement durability.
+    recovery_flow: RecoveryFlow,
     status: Option<String>,
     /// Bumped by every [`Workspace::set_status`], so a timer can tell whether
     /// the message it was started for is still the one on screen.
@@ -895,12 +835,6 @@ pub struct Workspace {
     /// One slot rather than a detached task per message: replacing it cancels
     /// the previous timer, which is the other half of the generation check.
     _status_timer: Option<Task<()>>,
-    /// One wake-up for the earliest dirty-buffer checkpoint deadline.
-    _recovery_timer: Option<Task<()>>,
-    /// Bumped whenever the single recovery wake-up is replaced or cancelled.
-    /// A task can wake while it is being dropped, so its generation is also
-    /// checked before it is allowed to dispatch background checkpoint work.
-    recovery_timer_generation: u64,
     /// The window's single WebView and what it is showing.
     ///
     /// One field rather than three, and no `#[cfg]` here: the platform split
@@ -932,54 +866,14 @@ pub struct Workspace {
     /// second request would overwrite the editor twice with two different
     /// answers to the same text.
     translating: bool,
-    /// True while a read-only Review request is waiting for consent or a
-    /// provider response. Review never shares this flag with Translation: a
-    /// user may inspect intent while a document translation is idle, but two
-    /// Review requests over one snapshot must not race to replace the result.
-    reviewing: bool,
-    /// Explicit lens corrections belong to their document, not the most
-    /// recently active tab.
-    review_lens_overrides: HashMap<DocumentId, ArtifactLens>,
-    /// The last validated Review result, retained after an edit as stale
-    /// inspection rather than being presented as a description of new text.
-    review_result: Option<WorkspaceReviewResult>,
-    /// A content-free Review diagnostic is retained in the panel so local
-    /// configuration and provider failures remain inspectable after status
-    /// messages expire.
-    review_diagnostic: Option<WorkspaceReviewDiagnostic>,
-    /// A user-selected target awaiting an explicit in-panel Run command. This
-    /// leaves the inferred lens visible and correctable before consent.
-    review_target: Option<ReviewTarget>,
-    review_target_document_id: Option<DocumentId>,
-    pending_review: Option<PendingReview>,
-    review_generation: u64,
-    review_panel_open: bool,
-    /// Frozen Review context and the user's answer drafts for Goal 07. The
-    /// request and output remain bound to the exact Review source snapshot so
-    /// retry cannot silently apply answers to another document revision.
-    revision_context: Option<WorkspaceRevisionContext>,
-    /// The validated Revision proposal currently shown in the panel.
-    revision_result: Option<WorkspaceRevisionResult>,
-    revision_diagnostic: Option<String>,
-    revision_running: bool,
-    revision_generation: u64,
-    pending_revision: Option<PendingRevision>,
-    revision_answer_subscriptions: Vec<Subscription>,
-    /// Recovery may restore answers before the corresponding Review result is
-    /// available. Keep only typed bindings/answers until each result lands.
-    recovered_revision_records: HashMap<RecoveryKey, RevisionRecovery>,
-    /// Preserve the recovery key that owns a document's answer-only state when
-    /// Save As changes the document's current source key.
-    recovered_revision_documents: HashMap<DocumentId, RecoveryKey>,
-    /// Answer records hidden only after durable retirement starts; a failed
-    /// completion restores them before the error is surfaced.
-    pending_revision_recoveries: HashMap<RecoveryKey, (DocumentId, RevisionRecovery)>,
+    /// The Review → Approved Revision workflow has one app-side state owner.
+    /// Its typed answer observations cross into the RecoveryFlow without
+    /// duplicating answer state.
+    review_flow: ReviewFlow,
     /// Present while Save / Discard / Cancel is resolving a destructive action.
     pending_destructive: Option<DestructiveRequest>,
     /// Invalidates path-picker and Replace callbacks from superseded requests.
     save_as_request_generation: u64,
-    /// Distinguishes a later explicit Apply, including a reject-all no-op.
-    revision_approval_epoch: u64,
     /// The active ticket and its origin-specific write authorization.
     pending_save_as: Option<PendingSaveAsRequest>,
     /// True after close is authorized and while the focused platform input
@@ -1017,73 +911,11 @@ struct DocumentTab {
     _subscriptions: [Subscription; 2],
 }
 
-/// UI-owned metadata around an immutable provider result.
-///
-/// The provider result contains only validated, inert structured data. The
-/// workspace adds the document identity and exact editor snapshot needed to
-/// decide whether it is still current. Selection anchors remain in their
-/// canonical document coordinates, while the selected range only explains
-/// the missing surrounding context in the presentation.
-struct WorkspaceReviewResult {
-    document_id: DocumentId,
-    source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
-    target: ReviewTarget,
-    selection: Option<std::ops::Range<usize>>,
-    lens: ArtifactLens,
-    partial: bool,
-    /// The non-entrypoint sources that were frozen into an Agent Skill
-    /// request. Their identities are rechecked before transport and when a
-    /// result lands, so output can never be presented as current after a
-    /// supporting source has changed.
-    skill_package: Option<FrozenSkillPackage>,
-    supporting_sources_current: bool,
-    result: ReviewTransportResult,
-}
-
-/// The immutable inputs needed to retry a Goal 07 Revision request. Input
-/// entities are UI state only; the provider boundary receives the typed
-/// `RevisionAnswers` rebuilt from `answer_states` at Run time.
-struct WorkspaceRevisionContext {
-    document_id: DocumentId,
-    source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
-    request: DocumentReviewRequest,
-    review_output: ReviewModelOutput,
-    skill_package: Option<FrozenSkillPackage>,
-    supporting_sources_current: bool,
-    applied: bool,
-    /// Identity of the exact approved preview that was applied. A boolean
-    /// alone is insufficient because the user may change decisions afterward.
-    applied_preview: Option<String>,
-    applied_decisions: Option<Vec<(ChangeId, bool)>>,
-    /// Copy/export resolves answer recovery without pretending the document
-    /// source was applied or saved.
-    answers_exported: bool,
-    answer_states: Vec<RevisionAnswer>,
-    answer_inputs: Vec<Entity<InputState>>,
-}
-
-/// UI-owned metadata around one validated Revision provider result.
-struct WorkspaceRevisionResult {
-    document_id: DocumentId,
-    source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
-    result: RevisionTransportResult,
-    decisions: Vec<(ChangeId, bool)>,
-    preview: String,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SaveAsRequestOrigin {
     Normal,
     Destructive,
     Revision,
-}
-
-/// Compact identity of the explicit Apply authorized for a Revision Save As.
-#[derive(Clone, Copy)]
-struct RevisionSaveAsApproval {
-    source_stamp: (u64, u64),
-    revision_generation: u64,
-    approval_epoch: u64,
 }
 
 /// The sole Save As request allowed to consume an asynchronous picker answer.
@@ -1095,533 +927,13 @@ struct PendingSaveAsRequest {
     revision_approval: Option<RevisionSaveAsApproval>,
 }
 
-/// Immutable identity of one in-flight Revision. Like Review cancellation,
-/// this is bound to the originating document rather than the active tab.
-struct PendingRevision {
-    cancelled: Arc<AtomicBool>,
-    document_id: DocumentId,
-}
-
-#[derive(Serialize)]
-struct WorkspaceRevisionAnswerRecord {
-    question_index: usize,
-    question_id: String,
-    state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    answer: Option<String>,
-}
-
-#[derive(Serialize)]
-struct WorkspaceRevisionRecoveryExport {
-    source_sha256: String,
-    source_revision: u64,
-    source_generation: u64,
-    artifact_lens_sha256: String,
-    review_context_sha256: String,
-    answers_sha256: String,
-    answers: Vec<WorkspaceRevisionExportAnswer>,
-}
-
-#[derive(Serialize)]
-struct WorkspaceRevisionExportAnswer {
-    question_index: usize,
-    state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    answer: Option<String>,
-}
-
-/// UI ownership for a Review diagnostic. It is intentionally separate from a
-/// validated provider result so a failure cannot be mistaken for Review output.
-struct WorkspaceReviewDiagnostic {
-    document_id: DocumentId,
-    lens: ArtifactLens,
-    diagnostic: ReviewDiagnostic,
-}
-
-/// Immutable identity of one in-flight Review. Cancellation can occur after
-/// focus moves to another tab, so its diagnostic must not use active-tab state.
-struct PendingReview {
-    cancelled: Arc<AtomicBool>,
-    document_id: DocumentId,
-    lens: ArtifactLens,
-}
-
-fn revision_change_ids(proposal: &mt_core::review::revision::RevisionProposal) -> Vec<ChangeId> {
-    proposal
-        .hunks()
-        .iter()
-        .map(|hunk| hunk.change_id())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn revision_answer_is_incorporated(
-    answer: &RevisionAnswer,
-    coverage: Option<&RevisionQuestionCoverageStatus>,
-    decisions: &[(ChangeId, bool)],
-) -> bool {
-    match answer {
-        RevisionAnswer::Unanswered => true,
-        RevisionAnswer::IntentionallyUnspecified => matches!(
-            coverage,
-            Some(RevisionQuestionCoverageStatus::IntentionallyOmitted { .. })
-        ),
-        RevisionAnswer::Answered(_) => {
-            let Some(RevisionQuestionCoverageStatus::Represented { change_ids }) = coverage else {
-                return false;
-            };
-            !change_ids.is_empty()
-                && change_ids.iter().all(|change_id| {
-                    decisions
-                        .iter()
-                        .find(|(candidate, _)| candidate == change_id)
-                        .is_some_and(|(_, accepted)| *accepted)
-                })
-        }
-    }
-}
-
-fn revision_apply_identity_matches(
-    applied_preview: Option<&str>,
-    applied_decisions: Option<&[(ChangeId, bool)]>,
-    current_preview: &str,
-    current_decisions: &[(ChangeId, bool)],
-) -> bool {
-    applied_preview == Some(current_preview) && applied_decisions == Some(current_decisions)
-}
-
-fn revision_question_accessibility_id(
-    index: usize,
-    question: &mt_core::review::ClarificationQuestion,
-) -> String {
-    format!(
-        "markturbo-revision-question-{}",
-        revision_question_binding_id(index, question)
-    )
-}
-
-fn revision_question_binding_id(
-    index: usize,
-    question: &mt_core::review::ClarificationQuestion,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"markturbo-revision-question-v1\0");
-    digest.update((index as u64).to_be_bytes());
-    digest.update(question.question.as_str().as_bytes());
-    digest.update([match question.priority {
-        ClarificationPriority::Critical => 0,
-        ClarificationPriority::High => 1,
-        ClarificationPriority::Medium => 2,
-        ClarificationPriority::Low => 3,
-    }]);
-    if let Some(impact) = &question.impact {
-        digest.update([1]);
-        digest.update(impact.as_str().as_bytes());
-    } else {
-        digest.update([0]);
-    }
-    format!("{:x}", digest.finalize())
-}
-
-fn build_revision_recovery(
-    request: &DocumentReviewRequest,
-    review_output: &ReviewModelOutput,
-    answer_states: &[RevisionAnswer],
-) -> Option<RevisionRecovery> {
-    let answers = RevisionAnswers::for_recovery(answer_states.to_vec()).ok()?;
-    let answer_records = review_output
-        .clarification_questions
-        .iter()
-        .enumerate()
-        .zip(answer_states.iter())
-        .map(
-            |((question_index, question), answer)| WorkspaceRevisionAnswerRecord {
-                question_index,
-                question_id: revision_question_binding_id(question_index, question),
-                state: match answer {
-                    RevisionAnswer::Unanswered => "unanswered".to_owned(),
-                    RevisionAnswer::IntentionallyUnspecified => {
-                        "intentionally_unspecified".to_owned()
-                    }
-                    RevisionAnswer::Answered(_) => "answered".to_owned(),
-                },
-                answer: match answer {
-                    RevisionAnswer::Answered(value) => Some(value.clone()),
-                    RevisionAnswer::Unanswered | RevisionAnswer::IntentionallyUnspecified => None,
-                },
-            },
-        )
-        .collect::<Vec<_>>();
-    let lens_bytes = serde_json::to_vec(&request.lens).ok()?;
-    let review_bytes = serde_json::to_vec(review_output).ok()?;
-    let answer_bytes = serde_json::to_vec(&answer_records).ok()?;
-    let digest = |bytes: &[u8]| {
-        let mut output = [0_u8; 32];
-        output.copy_from_slice(&Sha256::digest(bytes));
-        output
-    };
-    Some(RevisionRecovery::new(
-        RevisionRequestBinding::new(
-            digest(&request.outbound_bytes()),
-            request.snapshot.revision,
-            request.snapshot.source_generation,
-            digest(&lens_bytes),
-            digest(&review_bytes),
-            digest(&answer_bytes),
-        ),
-        answers,
-    ))
-}
-
-fn review_lens_key(lens: ArtifactLens) -> i18n::Key {
-    match lens {
-        ArtifactLens::Prompt => i18n::Key::ReviewLensPrompt,
-        ArtifactLens::Specification | ArtifactLens::Plan => i18n::Key::ReviewLensSpecification,
-        ArtifactLens::AgentInstructions => i18n::Key::ReviewLensAgentInstructions,
-        ArtifactLens::AgentSkill => i18n::Key::ReviewLensAgentSkill,
-    }
-}
-
-fn review_lens_choice_is_selected(choice: ArtifactLens, visible: ArtifactLens) -> bool {
-    choice == visible || (choice == ArtifactLens::Specification && visible == ArtifactLens::Plan)
-}
-
-fn clarification_priority_label(
-    priority: ClarificationPriority,
-    cx: &Context<Workspace>,
-) -> SharedString {
-    match priority {
-        ClarificationPriority::Critical => i18n::t(i18n::Key::ReviewPriorityCritical, cx).into(),
-        ClarificationPriority::High => i18n::t(i18n::Key::ReviewPriorityHigh, cx).into(),
-        ClarificationPriority::Medium => i18n::t(i18n::Key::ReviewPriorityMedium, cx).into(),
-        ClarificationPriority::Low => i18n::t(i18n::Key::ReviewPriorityLow, cx).into(),
-    }
-}
-
-// Kept as an executable specification for the lens-cycle unit test below.
-#[allow(dead_code)]
-fn next_review_lens(lens: ArtifactLens) -> ArtifactLens {
-    match lens {
-        ArtifactLens::Prompt => ArtifactLens::Specification,
-        ArtifactLens::Specification => ArtifactLens::Plan,
-        ArtifactLens::Plan => ArtifactLens::AgentInstructions,
-        ArtifactLens::AgentInstructions => ArtifactLens::AgentSkill,
-        ArtifactLens::AgentSkill => ArtifactLens::Prompt,
-    }
-}
-
-fn push_review_text_section(
-    content: &mut Vec<AnyElement>,
-    label: impl Into<SharedString>,
-    text: &str,
-    cx: &Context<Workspace>,
-) {
-    content.push(
-        v_flex()
-            .gap(metrics::gap())
-            .child(
-                div()
-                    .text_xs()
-                    .font_medium()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label.into()),
-            )
-            // Deliberately use a plain GPUI text child. Model prose is inert
-            // structured data and must never pass through Markdown/HTML/MDX.
-            .child(div().text_sm().child(text.to_owned()))
-            .into_any_element(),
-    );
-}
-
-fn push_review_text_list(
-    content: &mut Vec<AnyElement>,
-    label: impl Into<SharedString>,
-    values: &[StructuredText],
-    cx: &Context<Workspace>,
-) {
-    if values.is_empty() {
-        return;
-    }
-    let label: SharedString = label.into();
-    let rows = values.iter().enumerate().map(|(ix, value)| {
-        ListItem::new(SharedString::from(format!("review-text-{ix}-{label}")))
-            .w_full()
-            .child(div().text_sm().child(value.as_str().to_owned()))
-            .into_any_element()
-    });
-    content.push(
-        v_flex()
-            .gap(metrics::gap())
-            .child(
-                div()
-                    .text_xs()
-                    .font_medium()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label.clone()),
-            )
-            .children(rows)
-            .into_any_element(),
-    );
-}
-
-fn review_anchor_label(anchor: &SourceAnchor, cx: &Context<Workspace>) -> String {
-    match anchor {
-        SourceAnchor::DocumentWide => i18n::t(i18n::Key::ReviewDocumentWide, cx).to_string(),
-        SourceAnchor::Document { location } => review_location_label(*location),
-        SourceAnchor::AgentSkillFile { path, location } => {
-            format!("{path}:{}", review_location_label(*location))
-        }
-    }
-}
-
-fn review_location_label(location: SourceLocation) -> String {
-    match location {
-        SourceLocation::ByteRange { start, end } | SourceLocation::LineRange { start, end } => {
-            format!("{start}..{end}")
-        }
-    }
-}
-
-fn review_request_build_status_key(error: &ReviewRequestBuildError) -> i18n::Key {
-    match error {
-        ReviewRequestBuildError::AgentSkillRootUnavailable => {
-            i18n::Key::ReviewSkillPackageUnavailable
-        }
-        ReviewRequestBuildError::AgentSkillSourceUnavailable => {
-            i18n::Key::ReviewSkillPackageUnavailable
-        }
-        ReviewRequestBuildError::AgentSkillEntrypointUnavailable => {
-            i18n::Key::ReviewSkillPackageEntrypointMissing
-        }
-        ReviewRequestBuildError::AgentSkillSelectionUnsupported => {
-            i18n::Key::ReviewSkillPackageSelectionUnsupported
-        }
-        ReviewRequestBuildError::AgentSkillPathIsNotUtf8 => {
-            i18n::Key::ReviewSkillPackageNonUtf8Path
-        }
-        ReviewRequestBuildError::AgentSkillReadFailed => i18n::Key::ReviewSkillPackageReadFailed,
-        ReviewRequestBuildError::AgentSkillSourceChanged => i18n::Key::ReviewSkillPackageChanged,
-        ReviewRequestBuildError::AgentSkillFileTooLarge { .. }
-        | ReviewRequestBuildError::AgentSkillPackageTooLarge { .. } => {
-            i18n::Key::ReviewSkillPackageOversized
-        }
-        ReviewRequestBuildError::InvalidAgentSkillPackage(_)
-        | ReviewRequestBuildError::InvalidSelection
-        | ReviewRequestBuildError::InvalidRequest(_) => i18n::Key::ReviewFailed,
-    }
-}
-
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-struct DocumentRecoveryState {
-    key: RecoveryKey,
-    revision: u64,
-    content_identity: RecoveryContentIdentity,
-    suppressed_oversized_revision: Option<RecoveryContentIdentity>,
-    token: Option<RecoveryToken>,
-    schedule: CheckpointSchedule,
-    in_flight: Option<RecoveryAttempt>,
-    /// The current due boundary has already cancelled or warned while the
-    /// physical workspace worker remains occupied.
-    deadline_reported: bool,
-    protection_warning: bool,
-}
-
-#[derive(Debug, Clone)]
-struct RecoveryAttempt {
-    token: RecoveryToken,
-    revision: u64,
-    content_identity: RecoveryContentIdentity,
-    timing: CheckpointAttemptTiming,
-    cancelled: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RecoveryContentIdentity {
-    revision: u64,
-    revision_binding: Option<RevisionRequestBinding>,
-}
-
-impl RecoveryContentIdentity {
-    fn for_revision(revision: u64) -> Self {
-        Self {
-            revision,
-            revision_binding: None,
-        }
-    }
-
-    fn from_revision_recovery(revision: u64, revision_recovery: Option<&RevisionRecovery>) -> Self {
-        Self {
-            revision,
-            revision_binding: revision_recovery.map(|recovery| *recovery.binding()),
-        }
-    }
-}
-
-impl RecoveryAttempt {
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-}
-
-impl PartialEq for RecoveryAttempt {
-    fn eq(&self, other: &Self) -> bool {
-        self.token == other.token
-            && self.revision == other.revision
-            && self.content_identity == other.content_identity
-            && self.timing == other.timing
-            && Arc::ptr_eq(&self.cancelled, &other.cancelled)
-    }
-}
-
-impl Eq for RecoveryAttempt {}
-
-fn cancel_recovery_attempt(state: &mut DocumentRecoveryState) {
-    let Some(attempt) = state.in_flight.as_ref() else {
-        return;
-    };
-    attempt.cancel();
-}
-
-fn current_checkpoint_write_completed(
-    attempt_is_current: bool,
-    state_revision: u64,
-    attempt_revision: u64,
-    outcome: &CheckpointBatchOutcome,
-) -> bool {
-    attempt_is_current
-        && state_revision == attempt_revision
-        && matches!(outcome, CheckpointBatchOutcome::Written)
-}
-
-fn current_checkpoint_write_completed_for_identity(
-    attempt_is_current: bool,
-    state_identity: RecoveryContentIdentity,
-    attempt_identity: RecoveryContentIdentity,
-    outcome: &CheckpointBatchOutcome,
-) -> bool {
-    attempt_is_current
-        && state_identity == attempt_identity
-        && matches!(outcome, CheckpointBatchOutcome::Written)
-}
-
-#[derive(Default)]
-struct StartupRecovery {
-    recovery: Option<RecoveryStore>,
-    documents: Vec<PreparedRecovery>,
-    recovery_issue_count: usize,
-    recovery_error: Option<String>,
 }
 
 struct PendingStartupDestructive {
     request: DestructiveRequest,
     keys: Vec<(RecoveryKey, Option<DocumentId>)>,
-}
-
-fn insert_scoped_recovery_key(
-    keys: &mut HashMap<RecoveryKey, Option<DocumentId>>,
-    key: RecoveryKey,
-    document_id: Option<DocumentId>,
-) -> Option<DocumentId> {
-    *keys
-        .entry(key)
-        .and_modify(|current| {
-            if *current != document_id {
-                *current = None;
-            }
-        })
-        .or_insert(document_id)
-}
-
-fn prepare_recovery_records(records: Vec<RecoveredRecord>) -> (Vec<PreparedRecovery>, usize) {
-    let mut documents = Vec::with_capacity(records.len());
-    let mut skipped = 0;
-    for recovered in records {
-        match DocumentView::prepare_recovery(recovered) {
-            Ok(document) => documents.push(document),
-            Err(_) => skipped += 1,
-        }
-    }
-    (documents, skipped)
-}
-
-/// Open, verify, and parse recovery data without making it a prerequisite for editing.
-fn startup_recovery() -> StartupRecovery {
-    #[cfg(not(test))]
-    {
-        match RecoveryStore::open() {
-            Ok((store, maintenance)) => match store.recover() {
-                Ok(scan) => {
-                    let scan_issues = scan.issues.len();
-                    let (documents, preparation_issues) = prepare_recovery_records(scan.records);
-                    StartupRecovery {
-                        recovery: Some(store),
-                        documents,
-                        recovery_issue_count: maintenance.issues.len()
-                            + scan_issues
-                            + preparation_issues,
-                        recovery_error: None,
-                    }
-                }
-                Err(error) => StartupRecovery {
-                    recovery: Some(store),
-                    recovery_issue_count: maintenance.issues.len(),
-                    recovery_error: Some(error.to_string()),
-                    ..StartupRecovery::default()
-                },
-            },
-            Err(error) => StartupRecovery {
-                recovery_error: Some(error.to_string()),
-                ..StartupRecovery::default()
-            },
-        }
-    }
-    #[cfg(test)]
-    {
-        // Tests install an explicit reversible protector when they need durable
-        // records; opening production DPAPI storage would make test state leak
-        // across runs and hide which records a test owns.
-        StartupRecovery::default()
-    }
-}
-
-fn startup_recovery_status(
-    restored: usize,
-    skipped: usize,
-    recovery_error: Option<&str>,
-) -> Option<String> {
-    let summary = (restored > 0 || skipped > 0).then(|| {
-        format!(
-            "Restored {restored} recovery checkpoint(s); skipped {skipped} unavailable or invalid record(s)."
-        )
-    });
-    match (recovery_error, summary) {
-        (Some(error), Some(summary)) => {
-            Some(format!("{error}. Editing remains available. {summary}"))
-        }
-        (Some(error), None) => Some(format!("{error}. Editing remains available.")),
-        (None, Some(summary)) => Some(summary),
-        (None, None) => None,
-    }
-}
-
-fn checkpoint_batch_status(maintenance_issues: usize, last_error: Option<&str>) -> Option<String> {
-    let maintenance = (maintenance_issues > 0).then(|| {
-        format!(
-            "Recovery skipped {maintenance_issues} malformed, oversized, expired, or unreadable record(s)."
-        )
-    });
-    match (last_error, maintenance) {
-        (Some(error), Some(maintenance)) => Some(format!(
-            "{error}. Editing and source files are unchanged. {maintenance}"
-        )),
-        (Some(error), None) => Some(format!("{error}. Editing and source files are unchanged.")),
-        (None, Some(maintenance)) => Some(maintenance),
-        (None, None) => None,
-    }
 }
 
 impl Workspace {
@@ -1647,71 +959,12 @@ impl Workspace {
                     .is_some_and(|path| package.contains_supporting_path(path))
         })
     }
-
-    fn mark_review_stale_for_document(
-        &mut self,
-        document: &Entity<DocumentView>,
-        cx: &mut Context<Self>,
-    ) {
-        let (document_id, source_path, source_snapshot, is_dirty) = {
-            let document = document.read(cx);
-            (
-                document.id(),
-                document.source_path().map(Path::to_path_buf),
-                document.async_snapshot(cx),
-                document.is_dirty(),
-            )
-        };
-        let mut changed = false;
-        if let Some(review) = &mut self.review_result {
-            // A Review over this document is no longer current as soon as the
-            // editor emits its authoritative edit event. Keep the semantic
-            // stale status in the document-domain result as well as the UI
-            // metadata so consumers cannot mistake the output for current.
-            if review.document_id == document_id && review.source_snapshot != source_snapshot {
-                review.result.result.status = ReviewStatus::Stale;
-                changed = true;
-            }
-
-            // Supporting files are not editor sources of the entrypoint
-            // snapshot, so their dirty transition needs its own invalidation
-            // bit. A dirty buffer is deliberately enough; the background
-            // watcher handles clean on-disk changes.
-            if is_dirty
-                && source_path.as_deref().is_some_and(|source_path| {
-                    review
-                        .skill_package
-                        .as_ref()
-                        .is_some_and(|package| package.contains_supporting_path(source_path))
-                })
-            {
-                review.supporting_sources_current = false;
-                review.result.result.status = ReviewStatus::Stale;
-                changed = true;
-            }
-        }
-        if is_dirty
-            && source_path.as_deref().is_some_and(|source_path| {
-                self.revision_context
-                    .as_ref()
-                    .and_then(|context| context.skill_package.as_ref())
-                    .is_some_and(|package| package.contains_supporting_path(source_path))
-            })
-            && let Some(context) = &mut self.revision_context
-        {
-            context.supporting_sources_current = false;
-            changed = true;
-        }
-        if changed {
-            cx.notify();
-        }
-    }
 }
 
 impl Workspace {
     /// Create the workspace, opening `initial` if given.
     pub fn new(initial: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_with_startup_recovery(initial, startup_recovery, window, cx)
+        Self::new_with_startup_recovery(initial, recovery::startup_recovery, window, cx)
     }
 
     fn new_with_startup_recovery<F>(
@@ -1740,13 +993,11 @@ impl Workspace {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
-            welcome_scroll: ScrollHandle::new(),
-            show_welcome: should_show_welcome(
+            welcome: WelcomeState::default(),
+            show_welcome: welcome::should_show_welcome(
                 initial.as_deref(),
                 crate::settings::AppSettings::global(cx).show_welcome_on_startup,
             ),
-            welcome_recent_issues: HashMap::new(),
-            welcome_sample_available: false,
             root: None,
             explorer: None,
             harness: None,
@@ -1760,24 +1011,10 @@ impl Workspace {
             history: History::default(),
             registry: Arc::new(RendererRegistry::with_defaults()),
             watcher: None,
-            recovery: None,
-            startup_recovery_pending: true,
-            startup_recovery_keys: HashMap::new(),
-            save_as_recovery_keys: HashMap::new(),
-            pending_recovery_retirements: HashMap::new(),
-            recovery_retirements: HashMap::new(),
-            recovery_retirement_batches: HashMap::new(),
-            recovery_retirement_retries: HashSet::new(),
-            recovery_schedules: HashMap::new(),
-            recovery_retirement_suppressions: HashMap::new(),
-            recovery_content_identities: HashMap::new(),
-            recovery_checkpoint_worker_active: false,
-            recovery_warning: None,
+            recovery_flow: RecoveryFlow::new(),
             status: None,
             status_generation: 0,
             _status_timer: None,
-            _recovery_timer: None,
-            recovery_timer_generation: 0,
             settings_open: false,
             preferred_left_panel_width: metrics::SIDE_PANEL.resolve(viewport),
             preferred_right_panel_width: metrics::RIGHT_PANEL.resolve(viewport),
@@ -1786,28 +1023,9 @@ impl Workspace {
             left_panel_open: true,
             right_panel_open: true,
             translating: false,
-            reviewing: false,
-            review_lens_overrides: HashMap::new(),
-            review_result: None,
-            review_diagnostic: None,
-            review_target: None,
-            review_target_document_id: None,
-            pending_review: None,
-            review_generation: 0,
-            review_panel_open: false,
-            revision_context: None,
-            revision_result: None,
-            revision_diagnostic: None,
-            revision_running: false,
-            revision_generation: 0,
-            pending_revision: None,
-            revision_answer_subscriptions: Vec::new(),
-            recovered_revision_records: HashMap::new(),
-            recovered_revision_documents: HashMap::new(),
-            pending_revision_recoveries: HashMap::new(),
+            review_flow: ReviewFlow::default(),
             pending_destructive: None,
             save_as_request_generation: 0,
-            revision_approval_epoch: 0,
             pending_save_as: None,
             window_close_pending: false,
             window_close_ready: false,
@@ -1845,9 +1063,16 @@ impl Workspace {
                     let corpus = this.search_corpus(cx);
                     this.search.update(cx, |search, cx| search.run(corpus, cx));
                 }
-                SearchEvent::Reveal { path, offset } => {
-                    this.reveal_in(path.clone(), *offset, window, cx);
-                }
+                SearchEvent::Reveal {
+                    path,
+                    target,
+                    offset,
+                } => match target {
+                    SearchTarget::File => this.reveal_in(path.clone(), *offset, window, cx),
+                    SearchTarget::OpenDocument(id) => {
+                        this.reveal_open_document(*id, path, *offset, window, cx)
+                    }
+                },
             },
         ));
         // The page writes the setting; what it cannot do is repaint the rest of
@@ -1931,10 +1156,7 @@ impl Workspace {
         } else if !this.show_welcome {
             this.new_memory(String::new(), window, cx);
         }
-        let startup_targets = this.startup_recovery_targets(cx);
-        cx.defer_in(window, move |this, window, cx| {
-            this.start_startup_recovery(load_startup_recovery, startup_targets, window, cx);
-        });
+        this.defer_startup_recovery(load_startup_recovery, window, cx);
         crate::startup::record(StartupEvent::InitialStateReady(if this.show_welcome {
             InitialStartupState::Welcome
         } else {
@@ -2063,10 +1285,11 @@ impl Workspace {
             return true;
         }
 
-        self.retire_outgoing_preview(preview, cx);
-
         let opened = self.open_file_inner(path.clone(), window, cx);
-        self.tabs.set_preview((preview && opened).then_some(path));
+        if opened {
+            self.retire_outgoing_preview(preview, cx);
+            self.tabs.set_preview(preview.then_some(path));
+        }
         cx.notify();
         opened
     }
@@ -2083,8 +1306,7 @@ impl Workspace {
                 let document = tab.payload.view.read(cx);
                 let document_id = document.id();
                 let key = self
-                    .startup_recovery_keys
-                    .get(&document_id)
+                    .startup_recovery_key(document_id)
                     .cloned()
                     .unwrap_or_else(|| document.recovery_key());
                 document.is_dirty()
@@ -2261,111 +1483,6 @@ impl Workspace {
         opened
     }
 
-    fn record_recent_file(&self, path: PathBuf, cx: &mut Context<Self>) {
-        self.record_recent_target(path, mt_core::settings::RecentTargetKind::File, cx);
-    }
-
-    fn record_recent_workspace(&self, path: PathBuf, cx: &mut Context<Self>) {
-        self.record_recent_target(path, mt_core::settings::RecentTargetKind::Workspace, cx);
-    }
-
-    fn record_recent_target(
-        &self,
-        path: PathBuf,
-        kind: mt_core::settings::RecentTargetKind,
-        cx: &mut Context<Self>,
-    ) {
-        let display_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let target = mt_core::settings::RecentTarget::new(path, kind, display_name);
-        if crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .first()
-            == Some(&target)
-        {
-            return;
-        }
-        crate::settings::AppSettings::update(cx, move |settings| {
-            settings.record_recent_target(target);
-        });
-    }
-
-    fn open_recent_target(
-        &mut self,
-        path: &Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let target = crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .iter()
-            .find(|target| target.path == path)
-            .cloned();
-        let Some(target) = target else { return false };
-        if recent_target_issue(&target).is_some() {
-            return false;
-        }
-        self.open_target(target.path, true, window, cx)
-    }
-
-    /// Refresh Welcome-only filesystem state once when the surface is entered.
-    ///
-    /// Opening an item always repeats this check, because the cache is only a
-    /// presentation hint and must never authorize an operation on stale data.
-    fn refresh_welcome_availability(&mut self, cx: &App) {
-        self.welcome_recent_issues = crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .iter()
-            .map(|target| (target.path.clone(), recent_target_issue(target)))
-            .collect();
-        self.welcome_sample_available = crate::app_paths::bundled_sample_available();
-    }
-
-    fn welcome_recent_target_issue(
-        &self,
-        target: &mt_core::settings::RecentTarget,
-    ) -> Option<i18n::Key> {
-        self.welcome_recent_issues
-            .get(&target.path)
-            .copied()
-            .flatten()
-    }
-
-    fn remove_recent_target(&mut self, path: &Path, cx: &mut Context<Self>) {
-        crate::settings::AppSettings::update(cx, |settings| {
-            settings.remove_recent_target(path);
-        });
-    }
-
-    fn open_bundled_sample(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_bundled_sample_result(crate::app_paths::bundled_sample_dir(), window, cx);
-    }
-
-    fn open_bundled_sample_result(
-        &mut self,
-        sample: std::io::Result<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match sample {
-            Ok(path) => {
-                self.open_target(path, true, window, cx);
-            }
-            Err(_) => self.set_status(i18n::t(i18n::Key::BundledSampleUnavailable, cx).into(), cx),
-        }
-    }
-
-    fn dont_show_welcome_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        crate::settings::AppSettings::update(cx, |settings| {
-            settings.show_welcome_on_startup = false;
-        });
-        self.new_memory(String::new(), window, cx);
-    }
-
     fn insert_document(
         &mut self,
         path: PathBuf,
@@ -2402,12 +1519,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.show_welcome = false;
-        if self.startup_recovery_pending {
-            let document = view.read(cx);
-            self.startup_recovery_keys
-                .entry(document.id())
-                .or_insert_with(|| document.recovery_key());
+        if arm_dirty_recovery && matches!(&identity, TabIdentity::File(_)) {
+            self.isolate_reopened_file_recovery(&view, cx);
         }
+        self.remember_startup_recovery_key(&view, cx);
         // Both subscriptions ride with the tab, so closing it drops them.
         let subscriptions = [
             cx.subscribe_in(
@@ -2426,9 +1541,7 @@ impl Workspace {
                     DocumentEvent::Edited => {
                         this.mark_review_stale_for_document(document, cx);
                         this.refresh_revision_applied_state(document, cx);
-                        let key = document.read(cx).recovery_key();
-                        this.pending_recovery_retirements.remove(&key);
-                        this.arm_document_recovery(document, cx);
+                        this.note_document_edited(document, cx);
                     }
                     DocumentEvent::DirtyChanged => {
                         this.mark_review_stale_for_document(document, cx);
@@ -2437,10 +1550,7 @@ impl Workspace {
                             && !this.revision_has_authored_answers_for_document(id, cx)
                         {
                             let current_key = document.read(cx).recovery_key();
-                            let startup_key = this.startup_recovery_keys.remove(&id);
-                            let save_as_key = this.save_as_recovery_keys.remove(&id);
-                            let key = save_as_key.or(startup_key).unwrap_or(current_key);
-                            this.retire_document_recovery(id, Some(key), cx);
+                            this.retire_clean_document_recovery(id, current_key, cx);
                         }
                         cx.notify();
                     }
@@ -2481,402 +1591,6 @@ impl Workspace {
         self.sync_document_watches(cx);
         self.web_dirty(cx);
         cx.notify();
-    }
-
-    fn restore_prepared_recovery(
-        &mut self,
-        documents: Vec<PreparedRecovery>,
-        startup_targets: Option<&HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (usize, usize) {
-        let mut restored = 0;
-        let mut skipped = 0;
-        for mut prepared in documents {
-            let source_path = prepared.source_path().map(Path::to_path_buf);
-            let recovery_key = prepared.recovery_key();
-            let revision_recovery = prepared.take_revision_recovery();
-            if let Some(ref path) = source_path
-                && let Some(ix) = self.tabs.index_of(path)
-            {
-                let Some(startup_targets) = startup_targets else {
-                    skipped += 1;
-                    continue;
-                };
-                let expected = startup_targets.get(path).copied();
-
-                let document = self
-                    .document_at(ix)
-                    .cloned()
-                    .expect("an indexed recovery path must have a document");
-                let applied = document.update(cx, |document, cx| {
-                    if !document.can_accept_startup_recovery(expected) {
-                        return false;
-                    }
-                    document.apply_startup_recovery(prepared, window, cx);
-                    true
-                });
-                if applied {
-                    self.register_restored_recovery(&document, cx);
-                    restored += 1;
-                } else {
-                    skipped += 1;
-                }
-                if let Some(revision_recovery) = revision_recovery {
-                    self.recovered_revision_records
-                        .insert(recovery_key.clone(), revision_recovery);
-                    self.recovered_revision_documents
-                        .insert(document.read(cx).id(), recovery_key);
-                }
-                continue;
-            }
-
-            let registry = self.registry.clone();
-            let view = cx.new(|cx| DocumentView::from_recovery(prepared, registry, window, cx));
-            if let Some(path) = source_path {
-                self.insert_document_with_recovery(
-                    TabIdentity::File(path),
-                    view.clone(),
-                    false,
-                    window,
-                    cx,
-                );
-            } else {
-                self.insert_memory_document(view.clone(), false, window, cx);
-            }
-            self.register_restored_recovery(&view, cx);
-            if let Some(revision_recovery) = revision_recovery {
-                self.recovered_revision_records
-                    .insert(recovery_key.clone(), revision_recovery);
-                self.recovered_revision_documents
-                    .insert(view.read(cx).id(), recovery_key);
-            }
-            restored += 1;
-        }
-        (restored, skipped)
-    }
-
-    fn register_restored_recovery(
-        &mut self,
-        document: &Entity<DocumentView>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(store) = self.recovery.clone() else {
-            return;
-        };
-        let (id, key, revision) = {
-            let document = document.read(cx);
-            (document.id(), document.recovery_key(), document.revision())
-        };
-        let (token, protection_warning) = store.activate_and_current_token(&key);
-        let mut schedule = CheckpointSchedule::default();
-        schedule.mark_durable_baseline(cx.background_executor().now());
-        self.recovery_schedules.insert(
-            id,
-            DocumentRecoveryState {
-                key,
-                revision,
-                content_identity: RecoveryContentIdentity::for_revision(revision),
-                suppressed_oversized_revision: None,
-                token: Some(token),
-                schedule,
-                in_flight: None,
-                deadline_reported: false,
-                protection_warning,
-            },
-        );
-        self.recovery_content_identities
-            .insert(id, RecoveryContentIdentity::for_revision(revision));
-        self.schedule_recovery_timer(cx);
-        self.refresh_recovery_warning(cx);
-    }
-
-    fn start_startup_recovery<F>(
-        &mut self,
-        load_startup_recovery: F,
-        startup_targets: HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) where
-        F: FnOnce() -> StartupRecovery + Send + 'static,
-    {
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let startup = cx
-                .background_spawn(async move { load_startup_recovery() })
-                .await;
-            let startup = Arc::new(Mutex::new(Some((startup, startup_targets))));
-            loop {
-                let startup = startup.clone();
-                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                    let startup = startup
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    if let Some((startup, startup_targets)) = startup {
-                        this.restore_startup_recovery(startup, startup_targets, window, cx);
-                    }
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        });
-        self._tasks.push(task);
-    }
-
-    fn startup_recovery_targets(
-        &self,
-        cx: &App,
-    ) -> HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| {
-                let document = tab.payload.view.read(cx);
-                tab.path()
-                    .map(|path| (path.to_path_buf(), (document.id(), document.revision())))
-            })
-            .collect()
-    }
-
-    fn resume_recovery_destructive(
-        &mut self,
-        mut pending: PendingStartupDestructive,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match pending.request.revalidate(&self.lifecycle_documents(cx)) {
-            DestructiveResolution::Prompt(_) => {
-                self.release_recovery_retirement_suppressions(
-                    pending.keys.iter().map(|(key, _)| key),
-                    cx,
-                );
-                self.rearm_dirty_recovery(cx);
-                self.pending_destructive_recovery.extend(pending.keys);
-                self.pending_destructive = Some(pending.request);
-                self.prompt_destructive(window, cx);
-            }
-            DestructiveResolution::Proceed(action) => {
-                if self.destructive_action_has_revision_answers(&action, cx) {
-                    self.release_recovery_retirement_suppressions(
-                        pending.keys.iter().map(|(key, _)| key),
-                        cx,
-                    );
-                    self.rearm_dirty_recovery(cx);
-                    self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
-                    return;
-                }
-                self.perform_after_discard_retirement(
-                    pending.request,
-                    action,
-                    pending.keys,
-                    window,
-                    cx,
-                );
-            }
-            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
-                self.release_recovery_retirement_suppressions(
-                    pending.keys.iter().map(|(key, _)| key),
-                    cx,
-                );
-                self.rearm_dirty_recovery(cx);
-            }
-        }
-    }
-
-    fn restore_startup_recovery(
-        &mut self,
-        mut startup: StartupRecovery,
-        startup_targets: HashMap<PathBuf, (mt_core::document::lifecycle::DocumentId, u64)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        startup.documents.retain(|document| {
-            !self
-                .pending_recovery_retirements
-                .contains_key(&document.recovery_key())
-        });
-        self.recovery = startup.recovery.take();
-        self.startup_recovery_pending = false;
-        self.startup_recovery_keys.clear();
-        let pending_startup_destructive = self.pending_startup_destructive.take();
-        let (restored, restore_skipped) =
-            self.restore_prepared_recovery(startup.documents, Some(&startup_targets), window, cx);
-        if let Some(status) = startup_recovery_status(
-            restored,
-            startup.recovery_issue_count + restore_skipped,
-            startup.recovery_error.as_deref(),
-        ) {
-            self.set_status(status, cx);
-        }
-        debug_assert!(!self.startup_recovery_pending);
-        log::debug!("recovery startup finished");
-        if self.recovery.is_none() {
-            if pending_startup_destructive.is_some()
-                || !self.pending_recovery_retirements.is_empty()
-            {
-                self.set_status(
-                    "Recovery storage is unavailable, so its checkpoint could not be cleared. The document remains open."
-                        .into(),
-                    cx,
-                );
-            }
-            return;
-        }
-
-        if let Some(pending) = pending_startup_destructive {
-            self.resume_recovery_destructive(pending, window, cx);
-        } else {
-            self.flush_pending_recovery_retirements(cx);
-        }
-        let dirty_documents: Vec<_> = self
-            .document_views()
-            .into_iter()
-            .filter(|document| {
-                let document = document.read(cx);
-                let key = document.recovery_key();
-                document.is_dirty()
-                    && !self.pending_recovery_retirements.contains_key(&key)
-                    && !self.recovery_retirements.contains_key(&key)
-                    && !self.recovery_retirement_batches.contains_key(&key)
-                    && self
-                        .recovery_schedules
-                        .get(&document.id())
-                        .is_none_or(|state| state.token.is_none())
-            })
-            .collect();
-        for document in dirty_documents {
-            self.arm_document_recovery(&document, cx);
-        }
-    }
-
-    fn flush_pending_recovery_retirements(&mut self, cx: &mut Context<Self>) {
-        let pending: Vec<_> = self
-            .pending_recovery_retirements
-            .iter()
-            .map(|(key, document_id)| (key.clone(), *document_id))
-            .collect();
-        for (key, document_id) in pending {
-            self.invalidate_recovery(&key, document_id, cx);
-        }
-    }
-
-    fn pending_recovery_keys(
-        &self,
-        action: &DestructiveAction,
-    ) -> Vec<(RecoveryKey, Option<DocumentId>)> {
-        self.pending_recovery_retirements
-            .iter()
-            .filter_map(|(key, document_id)| match action {
-                DestructiveAction::CloseTab(id) => (document_id.is_none()
-                    || *document_id == Some(*id))
-                .then(|| (key.clone(), *document_id)),
-                DestructiveAction::CloseWindow | DestructiveAction::ReplaceWorkspace(_) => {
-                    Some((key.clone(), *document_id))
-                }
-            })
-            .collect()
-    }
-
-    fn is_undurable_recovery_retirement(&self, key: &RecoveryKey) -> bool {
-        self.pending_recovery_retirements.contains_key(key)
-    }
-
-    fn recovery_content_retirement_suppressed(
-        &self,
-        key: &RecoveryKey,
-        document_id: DocumentId,
-        content_identity: RecoveryContentIdentity,
-    ) -> bool {
-        self.recovery_retirement_suppressions
-            .get(key)
-            .and_then(|documents| documents.get(&document_id))
-            == Some(&content_identity)
-    }
-
-    fn destructive_retirement_waits_for_key(&self, key: &RecoveryKey) -> bool {
-        self.pending_startup_destructive
-            .as_ref()
-            .is_some_and(|pending| {
-                pending
-                    .keys
-                    .iter()
-                    .any(|(pending_key, _)| pending_key == key)
-            })
-    }
-
-    fn recovery_content_identity_for_retirement(
-        &self,
-        key: &RecoveryKey,
-        document_id: Option<DocumentId>,
-        cx: &App,
-    ) -> Option<(DocumentId, RecoveryContentIdentity)> {
-        if let Some(document_id) = document_id {
-            if let Some(document) = self.document_by_id(document_id, cx) {
-                let document = document.read(cx);
-                if document.recovery_key() == *key {
-                    let revision = document.revision();
-                    let revision_recovery = self.revision_recovery_for_document(document_id, key);
-                    return Some((
-                        document_id,
-                        RecoveryContentIdentity::from_revision_recovery(
-                            revision,
-                            revision_recovery.as_ref(),
-                        ),
-                    ));
-                }
-            }
-            if let Some(state) = self
-                .recovery_schedules
-                .get(&document_id)
-                .filter(|state| state.key == *key)
-            {
-                return Some((document_id, state.content_identity));
-            }
-            return None;
-        }
-        if let Some((document_id, state)) = self
-            .recovery_schedules
-            .iter()
-            .find(|(_, state)| state.key == *key)
-        {
-            return Some((*document_id, state.content_identity));
-        }
-        self.tabs.iter().find_map(|tab| {
-            let document = tab.payload.view.read(cx);
-            if document.recovery_key() != *key {
-                return None;
-            }
-            let document_id = document.id();
-            let revision_recovery = self.revision_recovery_for_document(document_id, key);
-            Some((
-                document_id,
-                RecoveryContentIdentity::from_revision_recovery(
-                    document.revision(),
-                    revision_recovery.as_ref(),
-                ),
-            ))
-        })
-    }
-
-    fn release_recovery_retirement_suppressions<'a>(
-        &mut self,
-        keys: impl IntoIterator<Item = &'a RecoveryKey>,
-        cx: &mut Context<Self>,
-    ) {
-        let mut changed = false;
-        for key in keys {
-            changed |= self.recovery_retirement_suppressions.remove(key).is_some();
-        }
-        if changed {
-            self.schedule_recovery_timer(cx);
-        }
     }
 
     fn lifecycle_documents(&self, cx: &App) -> Vec<DocumentLifecycle> {
@@ -2932,7 +1646,7 @@ impl Workspace {
                 self.revision_has_authored_answers_for_document(*id, cx)
             }
             DestructiveAction::CloseWindow | DestructiveAction::ReplaceWorkspace(_) => {
-                self.revision_has_authored_answers()
+                self.review_flow.revision_has_authored_answers()
             }
         }
     }
@@ -3262,361 +1976,6 @@ impl Workspace {
         }
     }
 
-    fn perform_after_discard_retirement(
-        &mut self,
-        request: DestructiveRequest,
-        action: DestructiveAction,
-        mut scoped_keys: Vec<(RecoveryKey, Option<DocumentId>)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        scoped_keys.extend(self.pending_recovery_keys(&action));
-        let mut merged = HashMap::new();
-        for (key, document_id) in scoped_keys {
-            insert_scoped_recovery_key(&mut merged, key, document_id);
-        }
-        let scoped_keys: Vec<_> = merged.into_iter().collect();
-        let keys: Vec<_> = scoped_keys.iter().map(|(key, _)| key.clone()).collect();
-        if keys.iter().any(|key| {
-            self.pending_recovery_retirements.contains_key(key)
-                && (self.recovery_retirements.contains_key(key)
-                    || self.recovery_retirement_batches.contains_key(key))
-        }) {
-            self.schedule_destructive_retirement_continuation(
-                PendingStartupDestructive {
-                    request,
-                    keys: scoped_keys,
-                },
-                window,
-                cx,
-            );
-            return;
-        }
-        let dirty_keys: HashSet<_> = self
-            .document_views()
-            .into_iter()
-            .filter_map(|document| {
-                let document = document.read(cx);
-                document.is_dirty().then(|| document.recovery_key())
-            })
-            .collect();
-        if keys.iter().any(|key| {
-            dirty_keys.contains(key)
-                && (self.recovery_retirements.contains_key(key)
-                    || self.recovery_retirement_batches.contains_key(key))
-        }) {
-            self.schedule_destructive_retirement_continuation(
-                PendingStartupDestructive {
-                    request,
-                    keys: scoped_keys,
-                },
-                window,
-                cx,
-            );
-            return;
-        }
-        let scoped_keys: Vec<_> = scoped_keys
-            .into_iter()
-            .filter(|(key, _)| {
-                !self.recovery_retirements.contains_key(key)
-                    && !self.recovery_retirement_batches.contains_key(key)
-            })
-            .collect();
-        let keys: Vec<_> = scoped_keys.iter().map(|(key, _)| key.clone()).collect();
-        if keys
-            .iter()
-            .any(|key| self.recovery_retirement_retries.contains(key))
-        {
-            self.schedule_destructive_retirement_continuation(
-                PendingStartupDestructive {
-                    request,
-                    keys: scoped_keys,
-                },
-                window,
-                cx,
-            );
-            return;
-        }
-        if keys.is_empty() {
-            self.perform_destructive(action, window, cx);
-            return;
-        }
-        let Some(store) = self.recovery.clone() else {
-            for (key, document_id) in &scoped_keys {
-                insert_scoped_recovery_key(
-                    &mut self.pending_recovery_retirements,
-                    key.clone(),
-                    *document_id,
-                );
-                self.remove_recovery_state_for_key(key, cx);
-            }
-            if self.startup_recovery_pending {
-                self.pending_startup_destructive = Some(PendingStartupDestructive {
-                    request,
-                    keys: scoped_keys,
-                });
-                self.set_status(
-                    "Waiting for recovery storage to clear its checkpoint. The document remains open."
-                        .into(),
-                    cx,
-                );
-            } else {
-                self.set_status(
-                    "Recovery storage is unavailable, so its checkpoint could not be cleared. The document remains open."
-                        .into(),
-                    cx,
-                );
-            }
-            return;
-        };
-
-        for (key, document_id) in &scoped_keys {
-            insert_scoped_recovery_key(
-                &mut self.pending_recovery_retirements,
-                key.clone(),
-                *document_id,
-            );
-        }
-        let now = cx.background_executor().now();
-        for key in &keys {
-            self.cancel_recovery_attempts_for_key(key, now);
-        }
-        let batch = match store.begin_retirements(keys.iter().cloned()) {
-            Ok(batch) => batch,
-            Err(error) => {
-                self.rearm_dirty_recovery(cx);
-                self.set_status(
-                    format!(
-                        "Could not clear the recovery checkpoint: {error}. The document remains open."
-                    ),
-                    cx,
-                );
-                return;
-            }
-        };
-        for key in &keys {
-            self.pending_recovery_retirements.remove(key);
-            self.recovery_retirement_batches
-                .insert(key.clone(), batch.clone());
-        }
-        // The marker is durable now; pause only the current content identity.
-        for (key, document_id) in &scoped_keys {
-            if let Some((document_id, content_identity)) =
-                self.recovery_content_identity_for_retirement(key, *document_id, cx)
-            {
-                self.recovery_retirement_suppressions
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(document_id, content_identity);
-            }
-        }
-        self.pending_destructive = Some(request);
-        self.schedule_recovery_timer(cx);
-        self.refresh_recovery_warning(cx);
-
-        cx.spawn_in(window, async move |this, cx| {
-            let completed_batch = batch.clone();
-            let completed = cx
-                .background_spawn(async move {
-                    let result = store.complete_retirements(batch.clone());
-                    if result.is_err() {
-                        store.abandon_retirements(&batch);
-                    }
-                    result
-                })
-                .await;
-            let completed = Arc::new(Mutex::new(Some((scoped_keys, completed_batch, completed))));
-            loop {
-                let completed_for_update = completed.clone();
-                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                    let completed = completed_for_update
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    if let Some(completed) = completed {
-                        let (scoped_keys, batch, result) = completed;
-                        this.finish_discard_retirements(scoped_keys, batch, result, window, cx);
-                    }
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn schedule_destructive_retirement_continuation(
-        &mut self,
-        pending: PendingStartupDestructive,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_startup_destructive = Some(pending);
-        self.set_status(
-            "Waiting for recovery checkpoint cleanup before continuing. The document remains open."
-                .into(),
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            loop {
-                if crate::views::try_update_in(&this, cx, |this, window, cx| {
-                    if let Some(pending) = this.pending_startup_destructive.take() {
-                        this.resume_recovery_destructive(pending, window, cx);
-                    }
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn finish_discard_retirements(
-        &mut self,
-        scoped_keys: Vec<(RecoveryKey, Option<DocumentId>)>,
-        batch: RecoveryRetirementBatch,
-        result: Result<RetirementCompletion, RecoveryError>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let keys: Vec<_> = scoped_keys.iter().map(|(key, _)| key.clone()).collect();
-        if keys
-            .iter()
-            .any(|key| self.recovery_retirement_batches.get(key) != Some(&batch))
-        {
-            if let Some(request) = self.pending_destructive.take() {
-                self.resume_recovery_destructive(
-                    PendingStartupDestructive {
-                        request,
-                        keys: scoped_keys,
-                    },
-                    window,
-                    cx,
-                );
-            }
-            return;
-        }
-        let Some(mut request) = self.pending_destructive.take() else {
-            self.release_recovery_retirement_suppressions(keys.iter(), cx);
-            self.rearm_dirty_recovery(cx);
-            return;
-        };
-
-        let mut wait_for_replayed_retirement = false;
-        let cleanup_error = match result {
-            Ok(RetirementCompletion::Retired { .. }) => {
-                self.finish_recovery_retirement_batch(&keys, &batch, cx);
-                wait_for_replayed_retirement = keys
-                    .iter()
-                    .any(|key| self.pending_recovery_retirements.contains_key(key));
-                None
-            }
-            Ok(RetirementCompletion::CleanupPending { error }) => {
-                self.schedule_recovery_retirement_batch_retry(keys.clone(), batch.clone(), cx);
-                Some(format!(
-                    "Recovery checkpoint was cleared, but cleanup remains pending: {error}"
-                ))
-            }
-            Err(error) => {
-                self.finish_recovery_retirement_batch(&keys, &batch, cx);
-                let mut suppression_changed = false;
-                for key in &keys {
-                    if !self.recovery_retirements.contains_key(key)
-                        && !self.recovery_retirement_batches.contains_key(key)
-                    {
-                        suppression_changed |=
-                            self.recovery_retirement_suppressions.remove(key).is_some();
-                    }
-                }
-                if suppression_changed {
-                    self.schedule_recovery_timer(cx);
-                }
-                self.rearm_dirty_recovery(cx);
-                self.set_status(
-                    format!(
-                        "Could not clear the recovery checkpoint: {error}. The document remains open."
-                    ),
-                    cx,
-                );
-                return;
-            }
-        };
-        if wait_for_replayed_retirement {
-            self.schedule_destructive_retirement_continuation(
-                PendingStartupDestructive {
-                    request,
-                    keys: scoped_keys,
-                },
-                window,
-                cx,
-            );
-            return;
-        }
-
-        match request.revalidate(&self.lifecycle_documents(cx)) {
-            DestructiveResolution::Prompt(_) => {
-                self.release_recovery_retirement_suppressions(keys.iter(), cx);
-                self.rearm_dirty_recovery(cx);
-                self.pending_destructive_recovery.extend(scoped_keys);
-                self.pending_destructive = Some(request);
-                self.prompt_destructive(window, cx);
-            }
-            DestructiveResolution::Proceed(action) => {
-                if self.destructive_action_has_revision_answers(&action, cx) {
-                    self.release_recovery_retirement_suppressions(keys.iter(), cx);
-                    self.rearm_dirty_recovery(cx);
-                    self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
-                    return;
-                }
-                for (key, _) in scoped_keys {
-                    self.remove_recovery_state_for_key(&key, cx);
-                }
-                if let Some(error) = cleanup_error {
-                    self.set_status(error, cx);
-                }
-                self.perform_destructive(action, window, cx);
-            }
-            DestructiveResolution::Cancelled | DestructiveResolution::SaveFailed(_) => {
-                self.release_recovery_retirement_suppressions(keys.iter(), cx);
-                self.rearm_dirty_recovery(cx);
-            }
-        }
-    }
-
-    fn rearm_dirty_recovery(&mut self, cx: &mut Context<Self>) {
-        let dirty: Vec<_> = self
-            .document_views()
-            .into_iter()
-            .filter(|document| {
-                let (document_id, dirty) = {
-                    let document = document.read(cx);
-                    (document.id(), document.is_dirty())
-                };
-                dirty || self.revision_has_authored_answers_for_document(document_id, cx)
-            })
-            .collect();
-        for document in dirty {
-            self.arm_document_recovery(&document, cx);
-        }
-    }
-
     fn perform_destructive(
         &mut self,
         action: DestructiveAction,
@@ -3663,8 +2022,8 @@ impl Workspace {
             self.retire_document_recovery(id, None, cx);
             self.cancel_pending_review_for_document(id, cx);
             self.cancel_pending_revision_for_document(id, cx);
-            self.review_lens_overrides.remove(&id);
-            self.recovered_revision_documents.remove(&id);
+            self.review_flow.remove_document_lens_override(id);
+            self.review_flow.remove_recovered_revision_document(id);
         }
         let Some((closed, _dropped)) = self.tabs.close(ix) else {
             return;
@@ -3861,999 +2220,6 @@ impl Workspace {
         }));
     }
 
-    fn refresh_recovery_warning(&mut self, cx: &mut Context<Self>) {
-        let warning = self
-            .recovery_schedules
-            .values()
-            .any(|state| state.protection_warning)
-            .then(|| {
-                "Recovery protection is unavailable for at least one dirty document. Editing and source files are unchanged."
-                    .to_string()
-            });
-        if self.recovery_warning != warning {
-            self.recovery_warning = warning;
-            cx.notify();
-        }
-    }
-
-    /// Remove one document's deadline before invalidating checkpoint work.
-    fn remove_recovery_schedule(
-        &mut self,
-        id: mt_core::document::lifecycle::DocumentId,
-        cx: &mut Context<Self>,
-    ) -> Option<RecoveryKey> {
-        let key = self.recovery_schedules.remove(&id).map(|state| {
-            if let Some(attempt) = &state.in_flight {
-                attempt.cancel();
-            }
-            state.key
-        });
-        self.recovery_content_identities.remove(&id);
-        self.schedule_recovery_timer(cx);
-        self.refresh_recovery_warning(cx);
-        key
-    }
-
-    /// Invalidate in-flight checkpoint capabilities before deleting durable data.
-    fn invalidate_recovery(
-        &mut self,
-        key: &RecoveryKey,
-        document_id: Option<DocumentId>,
-        cx: &mut Context<Self>,
-    ) {
-        let document_id = insert_scoped_recovery_key(
-            &mut self.pending_recovery_retirements,
-            key.clone(),
-            document_id,
-        );
-        let content_identity = self.recovery_content_identity_for_retirement(key, document_id, cx);
-        let had_owner = self.recovery_retirements.contains_key(key)
-            || self.recovery_retirement_batches.contains_key(key);
-        let Some(store) = self.recovery.clone() else {
-            return;
-        };
-        let ticket = match store.begin_retirement(key) {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                self.set_status(
-                    format!("Could not clear the recovery checkpoint: {error}"),
-                    cx,
-                );
-                if !had_owner {
-                    self.rearm_dirty_recovery(cx);
-                    self.schedule_recovery_retirement_retry(key.clone(), cx);
-                }
-                return;
-            }
-        };
-        self.pending_recovery_retirements.remove(key);
-        let stale_batch = self.recovery_retirement_batches.get(key).cloned();
-        let stale_batch_keys: Vec<_> = stale_batch
-            .as_ref()
-            .map(|batch| {
-                self.recovery_retirement_batches
-                    .iter()
-                    .filter(|(_, current)| *current == batch)
-                    .map(|(key, _)| key.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for stale_key in &stale_batch_keys {
-            self.recovery_retirement_batches.remove(stale_key);
-            self.recovery_retirement_retries.remove(stale_key);
-        }
-        self.recovery_retirements
-            .insert(key.clone(), ticket.clone());
-        // `begin_retirement` has published the non-restorable marker.
-        if let Some((document_id, content_identity)) = content_identity {
-            self.recovery_retirement_suppressions
-                .entry(key.clone())
-                .or_default()
-                .insert(document_id, content_identity);
-        }
-        self.schedule_recovery_timer(cx);
-        self.spawn_recovery_retirement_completion(
-            key.clone(),
-            ticket,
-            document_id,
-            Duration::ZERO,
-            cx,
-        );
-        for stale_key in stale_batch_keys {
-            if stale_key != *key
-                && let Some(&document_id) = self.pending_recovery_retirements.get(&stale_key)
-            {
-                self.invalidate_recovery(&stale_key, document_id, cx);
-            }
-        }
-    }
-
-    fn spawn_recovery_retirement_completion(
-        &mut self,
-        key: RecoveryKey,
-        ticket: RecoveryRetirement,
-        document_id: Option<DocumentId>,
-        delay: Duration,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(store) = self.recovery.clone() else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            if !delay.is_zero() {
-                cx.background_executor().timer(delay).await;
-            }
-            let completed_ticket = ticket.clone();
-            let result = cx
-                .background_spawn(async move {
-                    let result = store.complete_retirement(ticket.clone());
-                    if result.is_err() {
-                        store.abandon_retirement(&ticket);
-                    }
-                    result
-                })
-                .await;
-            let result = Arc::new(Mutex::new(Some(result)));
-            loop {
-                let key = key.clone();
-                let ticket = completed_ticket.clone();
-                let result_for_update = result.clone();
-                if crate::views::try_update(&this, cx, move |this, cx| {
-                    if this.recovery_retirements.get(&key) != Some(&ticket) {
-                        return;
-                    }
-                    let result = result_for_update
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    if let Some(result) = result {
-                        this.finish_recovery_retirement(key, ticket, document_id, result, cx);
-                    }
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn finish_recovery_retirement(
-        &mut self,
-        key: RecoveryKey,
-        ticket: RecoveryRetirement,
-        document_id: Option<DocumentId>,
-        result: Result<RetirementCompletion, RecoveryError>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.recovery_retirements.get(&key) != Some(&ticket) {
-            return;
-        }
-        self.recovery_retirement_retries.remove(&key);
-        let pending_revision_recovery = self.pending_revision_recoveries.remove(&key);
-        match result {
-            Ok(RetirementCompletion::Retired { .. }) => {
-                self.recovery_retirements.remove(&key);
-                if let Some(&document_id) = self.pending_recovery_retirements.get(&key) {
-                    self.invalidate_recovery(&key, document_id, cx);
-                } else if !self.destructive_retirement_waits_for_key(&key) {
-                    // A replay ticket may finish before its destructive walk resumes.
-                    self.release_recovery_retirement_suppressions(std::iter::once(&key), cx);
-                    self.rearm_dirty_recovery(cx);
-                }
-            }
-            Ok(RetirementCompletion::CleanupPending { error }) => {
-                self.set_status(
-                    format!(
-                        "Recovery checkpoint was cleared, but cleanup remains pending: {error}"
-                    ),
-                    cx,
-                );
-                self.schedule_recovery_retirement_completion_retry(key, ticket, document_id, cx);
-            }
-            Err(error) => {
-                self.recovery_retirements.remove(&key);
-                if let Some((document_id, recovery)) = pending_revision_recovery {
-                    self.recovered_revision_records
-                        .insert(key.clone(), recovery);
-                    self.recovered_revision_documents
-                        .insert(document_id, key.clone());
-                    self.rearm_dirty_recovery(cx);
-                }
-                insert_scoped_recovery_key(
-                    &mut self.pending_recovery_retirements,
-                    key.clone(),
-                    document_id,
-                );
-                self.set_status(
-                    format!("Could not clear the recovery checkpoint: {error}"),
-                    cx,
-                );
-                self.schedule_recovery_retirement_retry(key, cx);
-            }
-        }
-    }
-
-    fn schedule_recovery_retirement_completion_retry(
-        &mut self,
-        key: RecoveryKey,
-        ticket: RecoveryRetirement,
-        document_id: Option<DocumentId>,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.recovery_retirement_retries.insert(key.clone()) {
-            return;
-        }
-        self.spawn_recovery_retirement_completion(
-            key,
-            ticket,
-            document_id,
-            Duration::from_secs(1),
-            cx,
-        );
-    }
-
-    fn finish_recovery_retirement_batch(
-        &mut self,
-        keys: &[RecoveryKey],
-        batch: &RecoveryRetirementBatch,
-        cx: &mut Context<Self>,
-    ) {
-        if keys
-            .iter()
-            .any(|key| self.recovery_retirement_batches.get(key) != Some(batch))
-        {
-            return;
-        }
-        for key in keys {
-            self.recovery_retirement_batches.remove(key);
-            self.recovery_retirement_retries.remove(key);
-        }
-        let queued: Vec<_> = keys
-            .iter()
-            .filter_map(|key| {
-                self.pending_recovery_retirements
-                    .get(key)
-                    .map(|document_id| (key.clone(), *document_id))
-            })
-            .collect();
-        for (key, document_id) in queued {
-            self.invalidate_recovery(&key, document_id, cx);
-        }
-    }
-
-    fn schedule_recovery_retirement_batch_retry(
-        &mut self,
-        keys: Vec<RecoveryKey>,
-        batch: RecoveryRetirementBatch,
-        cx: &mut Context<Self>,
-    ) {
-        if keys.is_empty()
-            || keys
-                .iter()
-                .any(|key| self.recovery_retirement_retries.contains(key))
-        {
-            return;
-        }
-        let Some(store) = self.recovery.clone() else {
-            return;
-        };
-        self.recovery_retirement_retries
-            .extend(keys.iter().cloned());
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(1))
-                .await;
-            let completed_batch = batch.clone();
-            let result = cx
-                .background_spawn(async move {
-                    let result = store.complete_retirements(batch.clone());
-                    if result.is_err() {
-                        store.abandon_retirements(&batch);
-                    }
-                    result
-                })
-                .await;
-            let completed = Arc::new(Mutex::new(Some((keys, completed_batch, result))));
-            loop {
-                let completed_for_update = completed.clone();
-                if crate::views::try_update(&this, cx, move |this, cx| {
-                    let completed = completed_for_update
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    if let Some((keys, batch, result)) = completed {
-                        if keys.iter().any(|key| {
-                            this.recovery_retirement_batches.get(key) != Some(&batch)
-                        }) {
-                            return;
-                        }
-                        for key in &keys {
-                            this.recovery_retirement_retries.remove(key);
-                        }
-                        match result {
-                            Ok(RetirementCompletion::Retired { .. }) => {
-                                this.finish_recovery_retirement_batch(&keys, &batch, cx);
-                            }
-                            Ok(RetirementCompletion::CleanupPending { error }) => {
-                                this.set_status(
-                                    format!(
-                                        "Recovery checkpoint was cleared, but cleanup remains pending: {error}"
-                                    ),
-                                    cx,
-                                );
-                                this.schedule_recovery_retirement_batch_retry(keys, batch, cx);
-                            }
-                            Err(error) => {
-                                this.finish_recovery_retirement_batch(&keys, &batch, cx);
-                                this.rearm_dirty_recovery(cx);
-                                this.set_status(
-                                    format!(
-                                        "Could not finish recovery checkpoint cleanup: {error}"
-                                    ),
-                                    cx,
-                                );
-                            }
-                        }
-                    }
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn schedule_recovery_retirement_retry(&mut self, key: RecoveryKey, cx: &mut Context<Self>) {
-        if !self.recovery_retirement_retries.insert(key.clone()) {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            loop {
-                let key = key.clone();
-                if crate::views::try_update(&this, cx, move |this, cx| {
-                    let pending = this.pending_recovery_retirements.get(&key).copied();
-                    let owned = this.recovery_retirements.contains_key(&key)
-                        || this.recovery_retirement_batches.contains_key(&key);
-                    if owned {
-                        return;
-                    }
-                    this.recovery_retirement_retries.remove(&key);
-                    if let Some(document_id) = pending {
-                        this.invalidate_recovery(&key, document_id, cx);
-                    } else {
-                        this.release_recovery_retirement_suppressions(std::iter::once(&key), cx);
-                    }
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn retire_document_recovery(
-        &mut self,
-        id: mt_core::document::lifecycle::DocumentId,
-        fallback_key: Option<RecoveryKey>,
-        cx: &mut Context<Self>,
-    ) -> Option<RecoveryKey> {
-        let key = self.remove_recovery_schedule(id, cx).or(fallback_key);
-        if let Some(key) = &key {
-            self.invalidate_recovery(key, Some(id), cx);
-        }
-        key
-    }
-
-    fn cancel_recovery_attempts_for_key(&mut self, key: &RecoveryKey, now: Instant) {
-        for state in self
-            .recovery_schedules
-            .values_mut()
-            .filter(|state| state.key == *key)
-        {
-            if let Some(attempt) = state.in_flight.take() {
-                attempt.cancel();
-                if now >= attempt.timing.durable_complete_by {
-                    state
-                        .schedule
-                        .checkpoint_deadline_missed(attempt.timing, now);
-                    state.protection_warning = true;
-                } else {
-                    state.schedule.checkpoint_cancelled(attempt.timing, now);
-                }
-            }
-            state.token = None;
-        }
-    }
-
-    fn remove_recovery_state_for_key(&mut self, key: &RecoveryKey, cx: &mut Context<Self>) {
-        self.recovery_schedules.retain(|_, state| {
-            if state.key == *key {
-                if let Some(attempt) = &state.in_flight {
-                    attempt.cancel();
-                }
-                false
-            } else {
-                true
-            }
-        });
-        self.recovery_retirement_suppressions.remove(key);
-        self.recovery_content_identities
-            .retain(|id, _| self.recovery_schedules.contains_key(id));
-        self.schedule_recovery_timer(cx);
-        self.refresh_recovery_warning(cx);
-    }
-
-    fn arm_document_recovery(&mut self, document: &Entity<DocumentView>, cx: &mut Context<Self>) {
-        self.arm_document_recovery_at(document, cx.background_executor().now(), cx);
-    }
-
-    fn arm_document_recovery_at(
-        &mut self,
-        document: &Entity<DocumentView>,
-        now: Instant,
-        cx: &mut Context<Self>,
-    ) {
-        let store = self.recovery.clone();
-        let (id, revision, key) = {
-            let document = document.read(cx);
-            (document.id(), document.revision(), document.recovery_key())
-        };
-        let revision_recovery = self.revision_recovery_for_document(id, &key);
-        let content_identity =
-            RecoveryContentIdentity::from_revision_recovery(revision, revision_recovery.as_ref());
-        self.recovery_content_identities
-            .insert(id, content_identity);
-        let replaced_key = self.recovery_schedules.get_mut(&id).and_then(|state| {
-            (state.key != key).then(|| {
-                cancel_recovery_attempt(state);
-                state.key.clone()
-            })
-        });
-        if let Some(previous_key) = replaced_key {
-            self.invalidate_recovery(&previous_key, Some(id), cx);
-        }
-        if self.recovery_content_retirement_suppressed(&key, id, content_identity) {
-            self.remove_recovery_schedule(id, cx);
-            return;
-        }
-        match self.recovery_schedules.entry(id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let mut schedule = CheckpointSchedule::default();
-                schedule.mark_dirty(now);
-                let (token, protection_warning) = store.as_ref().map_or((None, false), |store| {
-                    let (token, deferred) = store.activate_and_current_token(&key);
-                    (Some(token), deferred)
-                });
-                entry.insert(DocumentRecoveryState {
-                    key,
-                    revision,
-                    content_identity,
-                    suppressed_oversized_revision: None,
-                    token,
-                    schedule,
-                    in_flight: None,
-                    deadline_reported: false,
-                    protection_warning,
-                });
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let state = entry.get_mut();
-                if state.key != key {
-                    cancel_recovery_attempt(state);
-                    state.key = key.clone();
-                    let (token, protection_warning) =
-                        store.as_ref().map_or((None, false), |store| {
-                            let (token, deferred) = store.activate_and_current_token(&key);
-                            (Some(token), deferred)
-                        });
-                    state.token = token;
-                    state.schedule = CheckpointSchedule::default();
-                    state.in_flight = None;
-                    state.deadline_reported = false;
-                    state.content_identity = content_identity;
-                    state.suppressed_oversized_revision = None;
-                    state.protection_warning = protection_warning;
-                } else if state.content_identity != content_identity {
-                    cancel_recovery_attempt(state);
-                    if state.suppressed_oversized_revision.take().is_some() {
-                        state.schedule = CheckpointSchedule::default();
-                    }
-                    state.content_identity = content_identity;
-                }
-                if state.token.is_none()
-                    && let Some(store) = &store
-                {
-                    let (token, protection_deferred) = store.activate_and_current_token(&key);
-                    state.token = Some(token);
-                    state.protection_warning |= protection_deferred;
-                }
-                state.revision = revision;
-                state.schedule.mark_dirty(now);
-            }
-        }
-        self.schedule_recovery_timer(cx);
-        self.refresh_recovery_warning(cx);
-    }
-
-    fn schedule_recovery_timer(&mut self, cx: &mut Context<Self>) {
-        self.recovery_timer_generation = self.recovery_timer_generation.wrapping_add(1);
-        let generation = self.recovery_timer_generation;
-        // Dropping the previous task is the primary cancellation mechanism;
-        // `generation` also protects the narrow race where it wakes first.
-        self._recovery_timer = None;
-        let recovery_available = self.recovery.is_some();
-        let worker_active = self.recovery_checkpoint_worker_active;
-        let now = cx.background_executor().now();
-        let Some(deadline) = self
-            .recovery_schedules
-            .iter()
-            .filter_map(|(id, state)| match &state.in_flight {
-                _ if self.recovery_content_retirement_suppressed(
-                    &state.key,
-                    *id,
-                    state.content_identity,
-                ) =>
-                {
-                    None
-                }
-                _ if state.suppressed_oversized_revision.is_some_and(|identity| {
-                    self.recovery_content_identities.get(id).copied() == Some(identity)
-                }) =>
-                {
-                    None
-                }
-                Some(attempt) if !state.deadline_reported => {
-                    Some(attempt.timing.durable_complete_by)
-                }
-                Some(_) => None,
-                None if worker_active && state.deadline_reported => None,
-                None if recovery_available || !state.protection_warning => {
-                    state.schedule.next_deadline()
-                }
-                None => None,
-            })
-            .min()
-        else {
-            return;
-        };
-        let delay = deadline.saturating_duration_since(now);
-        self._recovery_timer = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(delay).await;
-            loop {
-                if crate::views::try_update(&this, cx, |this, cx| {
-                    if this.recovery_timer_generation != generation {
-                        return;
-                    }
-                    this._recovery_timer = None;
-                    this.checkpoint_recovery(cx);
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        }));
-    }
-
-    fn checkpoint_recovery(&mut self, cx: &mut Context<Self>) {
-        self.checkpoint_recovery_at(cx.background_executor().now(), cx);
-    }
-
-    fn checkpoint_recovery_at(&mut self, now: Instant, cx: &mut Context<Self>) {
-        let Some(store) = self.recovery.clone() else {
-            let suppressions = &self.recovery_retirement_suppressions;
-            for (id, state) in self.recovery_schedules.iter_mut() {
-                if suppressions
-                    .get(&state.key)
-                    .and_then(|documents| documents.get(id))
-                    == Some(&state.content_identity)
-                {
-                    continue;
-                }
-                if state.in_flight.is_none() && state.schedule.is_due(now) {
-                    state.protection_warning = true;
-                }
-            }
-            self.refresh_recovery_warning(cx);
-            self.schedule_recovery_timer(cx);
-            return;
-        };
-        let documents = self.document_views();
-        let worker_active = self.recovery_checkpoint_worker_active;
-        let mut open_ids = HashSet::new();
-        let mut active_keys = HashSet::new();
-        let mut due = Vec::new();
-        let mut preflight_error = None;
-
-        for document in documents {
-            let (id, dirty, revision, key, text_byte_len) = {
-                let document = document.read(cx);
-                (
-                    document.id(),
-                    document.is_dirty(),
-                    document.revision(),
-                    document.recovery_key(),
-                    document.text_byte_len(cx),
-                )
-            };
-            open_ids.insert(id);
-            let answer_dirty = self.revision_has_authored_answers_for_document(id, cx);
-            if !dirty && !answer_dirty {
-                if let Some(state) = self.recovery_schedules.remove(&id) {
-                    self.invalidate_recovery(&state.key, Some(id), cx);
-                }
-                self.recovery_content_identities.remove(&id);
-                continue;
-            }
-            active_keys.insert(key.clone());
-            let revision_recovery = self.revision_recovery_for_document(id, &key);
-            let content_identity = RecoveryContentIdentity::from_revision_recovery(
-                revision,
-                revision_recovery.as_ref(),
-            );
-            self.recovery_content_identities
-                .insert(id, content_identity);
-
-            if self.recovery_content_retirement_suppressed(&key, id, content_identity) {
-                if let Some(mut state) = self.recovery_schedules.remove(&id) {
-                    if let Some(attempt) = state.in_flight.take() {
-                        attempt.cancel();
-                    }
-                    if state.key != key {
-                        self.invalidate_recovery(&state.key, Some(id), cx);
-                    }
-                }
-                self.recovery_content_identities.remove(&id);
-                continue;
-            }
-
-            let replaced_key = self.recovery_schedules.get_mut(&id).and_then(|state| {
-                (state.key != key).then(|| {
-                    if let Some(attempt) = &state.in_flight {
-                        attempt.cancel();
-                    }
-                    state.key.clone()
-                })
-            });
-            if let Some(previous_key) = replaced_key {
-                self.invalidate_recovery(&previous_key, Some(id), cx);
-            }
-            let state = self.recovery_schedules.entry(id).or_insert_with(|| {
-                let mut schedule = CheckpointSchedule::default();
-                schedule.mark_dirty(now);
-                let (token, protection_warning) = store.activate_and_current_token(&key);
-                DocumentRecoveryState {
-                    key: key.clone(),
-                    revision,
-                    content_identity,
-                    suppressed_oversized_revision: None,
-                    token: Some(token),
-                    schedule,
-                    in_flight: None,
-                    deadline_reported: false,
-                    protection_warning,
-                }
-            });
-            if state.key != key {
-                cancel_recovery_attempt(state);
-                state.key = key.clone();
-                state.revision = revision;
-                state.content_identity = content_identity;
-                let (token, protection_warning) = store.activate_and_current_token(&key);
-                state.token = Some(token);
-                state.schedule = CheckpointSchedule::default();
-                state.schedule.mark_dirty(now);
-                state.in_flight = None;
-                state.deadline_reported = false;
-                state.suppressed_oversized_revision = None;
-                state.protection_warning = protection_warning;
-            } else if state.content_identity != content_identity {
-                cancel_recovery_attempt(state);
-                state.revision = revision;
-                if state.suppressed_oversized_revision.take().is_some() {
-                    state.schedule = CheckpointSchedule::default();
-                }
-                state.content_identity = content_identity;
-                state.schedule.mark_dirty(now);
-            }
-            if let Some(attempt) = state.in_flight.as_ref()
-                && now >= attempt.timing.durable_complete_by
-                && !state.deadline_reported
-            {
-                let timing = attempt.timing;
-                attempt.cancel();
-                state.schedule.checkpoint_deadline_missed(timing, now);
-                state.deadline_reported = true;
-                state.protection_warning = true;
-            }
-            if state.in_flight.is_none() && state.schedule.is_due(now) {
-                if state.suppressed_oversized_revision == Some(content_identity) {
-                    continue;
-                }
-                if worker_active {
-                    state.deadline_reported = true;
-                    state.protection_warning = true;
-                    continue;
-                }
-                let plaintext_ceiling = store.plaintext_admission_ceiling();
-                if text_byte_len as u64 > plaintext_ceiling {
-                    state.suppressed_oversized_revision = Some(content_identity);
-                    state.protection_warning = true;
-                    preflight_error = Some(
-                        RecoveryError::OversizedCheckpoint {
-                            bytes: text_byte_len as u64,
-                            limit: plaintext_ceiling,
-                        }
-                        .to_string(),
-                    );
-                    continue;
-                }
-                // Capture the generation immediately before dispatch. A later
-                // Save or Discard invalidates it before deleting the record.
-                state.token = Some(store.current_token(&state.key));
-                let timing = state
-                    .schedule
-                    .checkpoint_dispatched(now)
-                    .expect("a due dirty recovery schedule must produce attempt timing");
-                let attempt = RecoveryAttempt {
-                    token: state
-                        .token
-                        .clone()
-                        .expect("a ready recovery store must provide a checkpoint token"),
-                    revision,
-                    content_identity,
-                    timing,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                };
-                state.in_flight = Some(attempt.clone());
-                state.deadline_reported = false;
-                due.push((
-                    id,
-                    attempt,
-                    document
-                        .read(cx)
-                        .recovery_checkpoint_with_revision(cx, revision_recovery),
-                ));
-            }
-        }
-        self.recovery_schedules
-            .retain(|id, _| open_ids.contains(id));
-        self.recovery_content_identities
-            .retain(|id, _| open_ids.contains(id));
-        self.refresh_recovery_warning(cx);
-        if let Some(error) = preflight_error {
-            self.set_status(
-                checkpoint_batch_status(0, Some(&error))
-                    .expect("a checkpoint error must produce visible status"),
-                cx,
-            );
-        }
-        if due.is_empty() {
-            self.schedule_recovery_timer(cx);
-            return;
-        }
-
-        debug_assert!(!self.recovery_checkpoint_worker_active);
-        self.recovery_checkpoint_worker_active = true;
-        self.schedule_recovery_timer(cx);
-
-        cx.spawn(async move |this, cx| {
-            let background_executor = cx.background_executor().clone();
-            let batch = cx
-                .background_spawn(async move {
-                    let batch = store.checkpoint_batch_if_current_cancellable(
-                        due.iter().map(|(_, attempt, checkpoint)| {
-                            CancellableRecoveryCheckpointAttempt {
-                                checkpoint,
-                                token: &attempt.token,
-                                cancelled: attempt.cancelled.as_ref(),
-                            }
-                        }),
-                        &active_keys,
-                    );
-                    let store_returned_at = background_executor.now();
-                    let results = due
-                        .into_iter()
-                        .zip(batch.outcomes)
-                        .map(|((id, attempt, _), outcome)| (id, attempt, outcome))
-                        .collect::<Vec<_>>();
-                    (results, batch.maintenance, store_returned_at)
-                })
-                .await;
-
-            let batch = Arc::new(Mutex::new(Some(batch)));
-            loop {
-                let batch = batch.clone();
-                if crate::views::try_update(&this, cx, move |this, cx| {
-                    let batch = batch
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take();
-                    if let Some((results, maintenance, store_returned_at)) = batch {
-                        this.finish_recovery_checkpoints(
-                            results,
-                            maintenance,
-                            store_returned_at,
-                            cx,
-                        );
-                    }
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn finish_recovery_checkpoints(
-        &mut self,
-        results: Vec<(
-            mt_core::document::lifecycle::DocumentId,
-            RecoveryAttempt,
-            CheckpointBatchOutcome,
-        )>,
-        maintenance: RecoveryMaintenance,
-        store_returned_at: Instant,
-        cx: &mut Context<Self>,
-    ) {
-        let now = cx.background_executor().now();
-        let worker_released = std::mem::take(&mut self.recovery_checkpoint_worker_active);
-        let maintenance_issues = maintenance.issues.len();
-        let mut last_error = None;
-        for (id, attempt, outcome) in results {
-            let attempt_is_current = self
-                .recovery_schedules
-                .get(&id)
-                .is_some_and(|state| state.in_flight.as_ref() == Some(&attempt));
-            let written_revision_is_current =
-                self.recovery_schedules.get(&id).is_some_and(|state| {
-                    current_checkpoint_write_completed(
-                        attempt_is_current,
-                        state.revision,
-                        attempt.revision,
-                        &outcome,
-                    ) && current_checkpoint_write_completed_for_identity(
-                        attempt_is_current,
-                        state.content_identity,
-                        attempt.content_identity,
-                        &outcome,
-                    )
-                });
-            if let Some(state) = self.recovery_schedules.get_mut(&id)
-                && attempt_is_current
-            {
-                let current = state
-                    .in_flight
-                    .take()
-                    .expect("the current recovery attempt must still be in flight");
-                let deadline_reported = std::mem::take(&mut state.deadline_reported);
-                let content_identity_is_current =
-                    state.content_identity == current.content_identity;
-                let oversized_revision_is_current = content_identity_is_current
-                    && matches!(
-                        &outcome,
-                        CheckpointBatchOutcome::Failed(RecoveryError::OversizedCheckpoint { .. })
-                    );
-                if oversized_revision_is_current {
-                    state.suppressed_oversized_revision = Some(current.content_identity);
-                    state.protection_warning = true;
-                } else if store_returned_at > current.timing.durable_complete_by {
-                    if !deadline_reported {
-                        state
-                            .schedule
-                            .checkpoint_deadline_missed(current.timing, store_returned_at);
-                    }
-                    state.protection_warning = true;
-                } else {
-                    match &outcome {
-                        CheckpointBatchOutcome::Written if content_identity_is_current => {
-                            if deadline_reported
-                                && state.content_identity == current.content_identity
-                            {
-                                state
-                                    .schedule
-                                    .mark_durable_baseline(current.timing.snapshot_at);
-                            } else if !deadline_reported {
-                                state.schedule.checkpoint_written(current.timing);
-                            }
-                            if state.content_identity == current.content_identity {
-                                state.protection_warning = false;
-                            }
-                        }
-                        CheckpointBatchOutcome::Written => {
-                            if !deadline_reported {
-                                state
-                                    .schedule
-                                    .checkpoint_cancelled(current.timing, store_returned_at);
-                            }
-                        }
-                        CheckpointBatchOutcome::Superseded if !deadline_reported => {
-                            if current.cancelled.load(Ordering::Acquire) {
-                                state
-                                    .schedule
-                                    .checkpoint_cancelled(current.timing, store_returned_at);
-                            } else {
-                                state.schedule.checkpoint_superseded(current.timing);
-                            }
-                        }
-                        CheckpointBatchOutcome::Failed(_) | CheckpointBatchOutcome::Deferred
-                            if !deadline_reported =>
-                        {
-                            state
-                                .schedule
-                                .checkpoint_failed(current.timing, store_returned_at);
-                            state.protection_warning = true;
-                        }
-                        CheckpointBatchOutcome::Superseded
-                        | CheckpointBatchOutcome::Failed(_)
-                        | CheckpointBatchOutcome::Deferred => {}
-                    }
-                }
-            }
-            match outcome {
-                CheckpointBatchOutcome::Written if written_revision_is_current => {
-                    log::debug!("recovery checkpoint written")
-                }
-                CheckpointBatchOutcome::Failed(error) if attempt_is_current => {
-                    last_error = Some(error.to_string())
-                }
-                CheckpointBatchOutcome::Written
-                | CheckpointBatchOutcome::Superseded
-                | CheckpointBatchOutcome::Deferred
-                | CheckpointBatchOutcome::Failed(_) => {}
-            }
-        }
-
-        if let Some(status) = checkpoint_batch_status(maintenance_issues, last_error.as_deref()) {
-            self.set_status(status, cx);
-        }
-        self.refresh_recovery_warning(cx);
-        if worker_released {
-            self.checkpoint_recovery_at(now, cx);
-        } else {
-            self.schedule_recovery_timer(cx);
-        }
-    }
-
     /// Apply pending filesystem changes.
     fn drain_watcher(&mut self, cx: &mut Context<Self>) {
         let Some(watcher) = &self.watcher else { return };
@@ -4879,29 +2245,7 @@ impl Workspace {
         // owns every supporting package path. A watcher signal under that root
         // makes the frozen result stale immediately, without rereading files
         // from render or risking a current-looking result after an edit.
-        let review_supporting_source_changed = self.review_result.as_ref().is_some_and(|review| {
-            review.skill_package.as_ref().is_some_and(|package| {
-                changes
-                    .iter()
-                    .any(|change| package.path_affects_root(change.path()))
-            })
-        });
-        if review_supporting_source_changed && let Some(review) = &mut self.review_result {
-            review.supporting_sources_current = false;
-            review.result.result.status = ReviewStatus::Stale;
-        }
-        let revision_supporting_source_changed = self
-            .revision_context
-            .as_ref()
-            .and_then(|context| context.skill_package.as_ref())
-            .is_some_and(|package| {
-                changes
-                    .iter()
-                    .any(|change| package.path_affects_root(change.path()))
-            });
-        if revision_supporting_source_changed && let Some(context) = &mut self.revision_context {
-            context.supporting_sources_current = false;
-        }
+        self.review_flow.observe_supporting_source_changes(changes);
 
         let tree_changed = changes
             .iter()
@@ -4928,7 +2272,7 @@ impl Workspace {
         // run on a background task, because markdown-rs is superlinear and this
         // fires on every external write. A document that goes dirty while that
         // parse runs is flagged by the task itself when the result lands.
-        let auto_reload = !self.startup_recovery_pending
+        let auto_reload = !self.is_startup_recovery_pending()
             && crate::settings::AppSettings::global(cx).watch_auto_reload;
         // Cloned: `self.documents` cannot stay borrowed across the `&mut cx`
         // that leasing each entity takes. Coalescing matching events avoids
@@ -5329,11 +2673,13 @@ impl Workspace {
             return;
         }
         let document = self.document_at(ix).cloned().expect("index was found");
-        let (old_path, old_recovery_key, saved_snapshot) = {
+        let (old_path, old_recovery_key, source_was_dirty, source_was_conflicted, saved_snapshot) = {
             let document = document.read(cx);
             (
                 document.source_path().map(Path::to_path_buf),
                 document.recovery_key(),
+                document.is_dirty(),
+                document.is_externally_changed(),
                 (request.origin == SaveAsRequestOrigin::Destructive)
                     .then(|| document.source_snapshot(cx)),
             )
@@ -5348,8 +2694,13 @@ impl Workspace {
             self.reject_stale_revision_save_as(request, cx);
             return;
         }
-        self.save_as_recovery_keys
-            .insert(id, old_recovery_key.clone());
+        if !self.should_preserve_unreconciled_startup_recovery(
+            id,
+            source_was_dirty,
+            source_was_conflicted,
+        ) {
+            self.remember_save_as_recovery_key(id, old_recovery_key.clone());
+        }
         match document.update(cx, |document, cx| document.save_as(&path, mode, cx)) {
             SaveAsOutcome::Saved => {
                 self.clear_save_as_request(id, ticket);
@@ -5382,11 +2733,11 @@ impl Workspace {
                 cx.notify();
             }
             SaveAsOutcome::DestinationExists if create_only => {
-                self.save_as_recovery_keys.remove(&id);
+                self.forget_save_as_recovery_key(id);
                 self.prompt_save_as_overwrite(id, ticket, path, window, cx);
             }
             SaveAsOutcome::DestinationExists | SaveAsOutcome::Failed => {
-                self.save_as_recovery_keys.remove(&id);
+                self.forget_save_as_recovery_key(id);
                 self.cancel_save_as_request(id, ticket);
             }
         }
@@ -5400,16 +2751,16 @@ impl Workspace {
         let Some(approval) = request.revision_approval else {
             return false;
         };
-        if request.origin != SaveAsRequestOrigin::Revision
-            || self.revision_generation != approval.revision_generation
-            || self.revision_approval_epoch != approval.approval_epoch
-        {
+        if request.origin != SaveAsRequestOrigin::Revision {
             return false;
         }
         let Some(document) = self.document_by_id(request.document_id, cx) else {
             return false;
         };
         document.read(cx).source_stamp() == approval.source_stamp
+            && self
+                .review_flow
+                .revision_save_as_approval_is_current(request.document_id, approval)
             && self.revision_applied_state_is_current_for_document(request.document_id, cx)
     }
 
@@ -5420,16 +2771,10 @@ impl Workspace {
     ) {
         self.clear_save_as_request(request.document_id, request.ticket);
         if let Some(approval) = request.revision_approval
-            && self.revision_generation == approval.revision_generation
-            && self.revision_approval_epoch == approval.approval_epoch
             && self
-                .revision_context
-                .as_ref()
-                .is_some_and(|context| context.document_id == request.document_id)
+                .review_flow
+                .reject_stale_revision_save_as(request.document_id, approval)
         {
-            if let Some(context) = &mut self.revision_context {
-                Self::clear_revision_applied_state(context);
-            }
             self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
         }
     }
@@ -5515,10 +2860,19 @@ impl Workspace {
     /// real — it drops the recorded index when the menu closes and when the tab
     /// list changes, so a stale index can never answer here.
     fn menu_target(&self, cx: &App) -> Option<PathBuf> {
-        let _ = cx;
-        self.tabs
-            .menu_target()
-            .and_then(|tab| tab.path().map(Path::to_path_buf))
+        self.tabs.menu_target().and_then(|tab| {
+            tab.path().map(Path::to_path_buf).or_else(|| {
+                matches!(&tab.identity, TabIdentity::Recovered(_))
+                    .then(|| {
+                        tab.payload
+                            .view
+                            .read(cx)
+                            .source_path()
+                            .map(Path::to_path_buf)
+                    })
+                    .flatten()
+            })
+        })
     }
 
     fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
@@ -5612,575 +2966,20 @@ impl Workspace {
         self.translate(Scope::Block(cursor), window, cx);
     }
 
-    fn on_review_document(&mut self, _: &ReviewDocument, _: &mut Window, cx: &mut Context<Self>) {
-        if self.reviewing {
-            return;
-        }
-        self.open_review_panel(ReviewTarget::Document, cx);
-    }
-
-    fn on_review_selection(&mut self, _: &ReviewSelection, _: &mut Window, cx: &mut Context<Self>) {
-        if self.reviewing {
-            return;
-        }
-        self.open_review_panel(ReviewTarget::Selection, cx);
-    }
-
-    fn on_cancel_review(&mut self, _: &CancelReview, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_review.take() else {
-            return;
-        };
-        pending.cancelled.store(true, Ordering::Release);
-        self.review_generation = self.review_generation.wrapping_add(1);
-        self.reviewing = false;
-        self.set_review_diagnostic(
-            pending.document_id,
-            pending.lens,
-            ReviewDiagnostic::new(
-                ReviewDiagnosticCode::Cancelled,
-                i18n::t(i18n::Key::ReviewCancelled, cx).to_string(),
-            ),
-            cx,
-        );
-        self.set_status(i18n::t(i18n::Key::ReviewCancelled, cx).into(), cx);
-    }
-
-    fn cancel_pending_review_for_document(
-        &mut self,
-        document_id: DocumentId,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .pending_review
-            .as_ref()
-            .is_none_or(|pending| pending.document_id != document_id)
-        {
-            return;
-        }
-        let pending = self
-            .pending_review
-            .take()
-            .expect("matching Review is pending");
-        pending.cancelled.store(true, Ordering::Release);
-        self.review_generation = self.review_generation.wrapping_add(1);
-        self.reviewing = false;
-        if self.review_target_document_id == Some(document_id) {
-            self.review_target = None;
-            self.review_target_document_id = None;
-        }
-        self.review_panel_open = false;
-        self.set_status(i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(), cx);
-        cx.notify();
-    }
-
-    fn cancel_pending_revision_for_document(
-        &mut self,
-        document_id: DocumentId,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .pending_revision
-            .as_ref()
-            .is_none_or(|pending| pending.document_id != document_id)
-        {
-            return;
-        }
-        if let Some(pending) = self.pending_revision.take() {
-            pending.cancelled.store(true, Ordering::Release);
-        }
-        self.revision_generation = self.revision_generation.wrapping_add(1);
-        self.revision_running = false;
-        cx.notify();
-    }
-
-    fn cancel_pending_revision(&mut self, cx: &mut Context<Self>) {
-        if let Some(pending) = self.pending_revision.take() {
-            pending.cancelled.store(true, Ordering::Release);
-            self.revision_generation = self.revision_generation.wrapping_add(1);
-            self.revision_running = false;
-            cx.notify();
-        }
-    }
-
-    /// Make the inferred lens observable and correctable before any outbound
-    /// consent is requested. The actual request begins only from the Review
-    /// panel's explicit Run command.
-    fn open_review_panel(&mut self, target: ReviewTarget, cx: &mut Context<Self>) {
-        let Some(document) = self.active_document() else {
-            return;
-        };
-        let document_id = document.read(cx).id();
-        if self.revision_context_has_authored_answers_for_other_document(document_id) {
-            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
-            return;
-        }
-        if self.revision_has_authored_answers_for_document(document_id, cx) {
-            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
-            self.review_target = Some(target);
-            self.review_target_document_id = Some(document_id);
-            self.review_panel_open = true;
-            self.right_panel_open = true;
-            cx.notify();
-            return;
-        }
-        self.review_result = None;
-        self.review_diagnostic = None;
-        self.review_target = Some(target);
-        self.review_target_document_id = Some(document_id);
-        self.review_panel_open = true;
-        self.right_panel_open = true;
-        cx.notify();
-    }
-
-    /// Forget a Review panel and invalidate every pending completion before it
-    /// can make the panel visible again.
-    fn dismiss_review(&mut self, cx: &mut Context<Self>) {
-        let authored_for_active_document = self
-            .active_document()
-            .map(|document| document.read(cx).id())
-            .is_some_and(|document_id| {
-                self.revision_has_authored_answers_for_document(document_id, cx)
-            });
-        if authored_for_active_document {
-            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
-            self.review_panel_open = true;
-            self.right_panel_open = true;
-            cx.notify();
-            return;
-        }
-        if let Some(pending) = self.pending_review.take() {
-            pending.cancelled.store(true, Ordering::Release);
-        }
-        self.review_generation = self.review_generation.wrapping_add(1);
-        self.reviewing = false;
-        self.review_panel_open = false;
-        self.review_result = None;
-        self.review_diagnostic = None;
-        self.review_target = None;
-        self.review_target_document_id = None;
-        cx.notify();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn install_revision_context(
-        &mut self,
-        document_id: DocumentId,
-        recovery_key: RecoveryKey,
-        source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
-        request: DocumentReviewRequest,
-        review_output: ReviewModelOutput,
-        skill_package: Option<FrozenSkillPackage>,
-        supporting_sources_current: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.cancel_pending_revision(cx);
-        // A newly installed Review context cannot inherit an older Save As
-        // approval, even when it belongs to the same document and text.
-        self.revision_generation = self.revision_generation.wrapping_add(1);
-        self.revision_answer_subscriptions.clear();
-        let mut answer_inputs = Vec::with_capacity(review_output.clarification_questions.len());
-        for _ in 0..review_output.clarification_questions.len() {
-            answer_inputs.push(cx.new(|cx| InputState::new(window, cx)));
-        }
-        let mut answer_states = (0..answer_inputs.len())
-            .map(|_| RevisionAnswer::unanswered())
-            .collect::<Vec<_>>();
-        let recovered_key = self
-            .recovered_revision_record_for_document(document_id, &recovery_key)
-            .map(|(key, _)| key);
-        if let Some(recovered_key) = recovered_key
-            && let Some(recovery) = self.recovered_revision_records.remove(&recovered_key)
-        {
-            let source_digest = Sha256::digest(request.outbound_bytes());
-            let binding = recovery.binding();
-            let source_matches = binding.source_sha256().as_slice() == source_digest.as_slice();
-            let binding_matches = source_matches
-                && recovery.answers().len() == answer_states.len()
-                && build_revision_recovery(&request, &review_output, recovery.answers().as_slice())
-                    .is_some_and(|expected| {
-                        let expected = expected.binding();
-                        expected.source_sha256() == binding.source_sha256()
-                            && expected.artifact_lens_digest() == binding.artifact_lens_digest()
-                            && expected.review_context_digest() == binding.review_context_digest()
-                            && expected.answers_digest() == binding.answers_digest()
-                    });
-            if binding_matches {
-                answer_states = recovery.answers().as_slice().to_vec();
-                if self
-                    .recovered_revision_documents
-                    .get(&document_id)
-                    .is_some_and(|key| *key == recovered_key)
-                {
-                    self.recovered_revision_documents.remove(&document_id);
-                }
-            } else {
-                // Keep a mismatched record quarantined rather than binding its
-                // answers to a newer source snapshot.
-                self.recovered_revision_records
-                    .insert(recovered_key.clone(), recovery);
-                self.recovered_revision_documents
-                    .insert(document_id, recovered_key);
-            }
-        }
-
-        // Restore the visible editor value before subscribing to Change. The
-        // typed answer state is the recovery authority, while InputState is
-        // only its editable UI projection.
-        for (input, state) in answer_inputs.iter().zip(answer_states.iter()) {
-            if let RevisionAnswer::Answered(value) = state {
-                input.update(cx, |input, cx| {
-                    input.set_value(value.clone(), window, cx);
-                });
-            }
-        }
-        for (index, input) in answer_inputs.iter().enumerate() {
-            let subscription = cx.subscribe_in(
-                input,
-                window,
-                move |this: &mut Self, _, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.on_revision_answer_input(index, cx);
-                    }
-                },
-            );
-            self.revision_answer_subscriptions.push(subscription);
-        }
-        self.revision_context = Some(WorkspaceRevisionContext {
-            document_id,
-            source_snapshot,
-            request,
-            review_output,
-            skill_package,
-            supporting_sources_current,
-            applied: false,
-            applied_preview: None,
-            applied_decisions: None,
-            answers_exported: false,
-            answer_states,
-            answer_inputs,
-        });
-        self.revision_result = None;
-        self.revision_diagnostic = None;
-        self.revision_running = false;
-        cx.notify();
-    }
-
-    fn on_revision_answer_input(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.revision_running || self.revision_result.is_some() {
-            return;
-        }
-        let value = self
-            .revision_context
-            .as_ref()
-            .and_then(|context| context.answer_inputs.get(index))
-            .map(|input| input.read(cx).value().to_string());
-        let Some(value) = value else {
-            return;
-        };
-        let Some(context) = &mut self.revision_context else {
-            return;
-        };
-        if matches!(
-            context.answer_states.get(index),
-            Some(RevisionAnswer::Answered(_))
-        ) {
-            context.answer_states[index] = RevisionAnswer::answered(value);
-            Self::clear_revision_applied_state(context);
-            context.answers_exported = false;
-            self.revision_result = None;
-            self.revision_diagnostic = None;
-            if let Some(document) = self.active_document().cloned() {
-                self.arm_document_recovery(&document, cx);
-            }
-            cx.notify();
-        }
-    }
-
-    fn set_revision_answer_state(
-        &mut self,
-        index: usize,
-        state: RevisionAnswer,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.revision_running || self.revision_result.is_some() {
-            return;
-        }
-        let Some(context) = &mut self.revision_context else {
-            return;
-        };
-        if index >= context.answer_states.len() {
-            return;
-        }
-        let should_focus = matches!(state, RevisionAnswer::Answered(_));
-        context.answer_states[index] = state;
-        Self::clear_revision_applied_state(context);
-        context.answers_exported = false;
-        self.revision_result = None;
-        self.revision_diagnostic = None;
-        if should_focus && let Some(input) = context.answer_inputs.get(index) {
-            input.update(cx, |input, cx| input.focus(window, cx));
-        }
-        if let Some(document) = self.active_document().cloned() {
-            self.arm_document_recovery(&document, cx);
-        }
-        cx.notify();
-    }
-
-    fn revision_answers(&self) -> Result<RevisionAnswers, RevisionError> {
-        let Some(context) = &self.revision_context else {
-            return Err(RevisionError::InvalidRequest);
-        };
-        RevisionAnswers::new(context.answer_states.clone())
-            .map_err(|_| RevisionError::InvalidAnswers)
-    }
-
-    fn revision_recovery_for_document(
-        &self,
-        document_id: DocumentId,
-        recovery_key: &RecoveryKey,
-    ) -> Option<RevisionRecovery> {
-        if let Some(context) = self.revision_context.as_ref().filter(|context| {
-            context.document_id == document_id
-                && !context.answers_exported
-                && context
-                    .answer_states
-                    .iter()
-                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
-        }) {
-            return build_revision_recovery(
-                &context.request,
-                &context.review_output,
-                &context.answer_states,
-            );
-        }
-        self.recovered_revision_record_for_document(document_id, recovery_key)
-            .map(|(_, recovery)| recovery)
-    }
-
-    fn revision_context_is_current(&self, cx: &Context<Self>) -> bool {
-        let Some(context) = &self.revision_context else {
-            return false;
-        };
-        let source_current = self.active_document().is_some_and(|document| {
-            let document = document.read(cx);
-            document.id() == context.document_id
-                && document.async_snapshot(cx) == context.source_snapshot
-        });
-        source_current
-            && context.supporting_sources_current
-            && context.skill_package.as_ref().is_none_or(|package| {
-                !self.has_dirty_skill_supporting_document(package, cx)
-                    && package.revalidate().is_ok()
-            })
-    }
-
-    fn revision_result_is_current(
-        &self,
-        revision: &WorkspaceRevisionResult,
-        cx: &Context<Self>,
-    ) -> bool {
-        let source_current = self.active_document().is_some_and(|document| {
-            let document = document.read(cx);
-            document.id() == revision.document_id
-                && document.async_snapshot(cx) == revision.source_snapshot
-        });
-        let package_current = self
-            .revision_context
-            .as_ref()
-            .filter(|context| context.document_id == revision.document_id)
-            .is_none_or(|context| {
-                context.supporting_sources_current
-                    && context.skill_package.as_ref().is_none_or(|package| {
-                        !self.has_dirty_skill_supporting_document(package, cx)
-                    })
-            });
-        source_current && package_current
-    }
-
-    fn revision_result_is_current_for_commit(&mut self, cx: &Context<Self>) -> bool {
-        let current = self
-            .revision_result
-            .as_ref()
-            .is_some_and(|revision| self.revision_result_is_current(revision, cx));
-        if !current {
-            return false;
-        }
-        let package_current = self
-            .revision_context
-            .as_ref()
-            .and_then(|context| context.skill_package.as_ref())
-            .is_none_or(|package| package.revalidate().is_ok());
-        if !package_current && let Some(context) = &mut self.revision_context {
-            context.supporting_sources_current = false;
-        }
-        package_current
-    }
-
-    fn set_revision_diagnostic(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.revision_diagnostic = Some(message.into());
-        self.revision_running = false;
-        self.pending_revision = None;
-        cx.notify();
-    }
-
-    fn on_revision_provider_failure(&mut self, error: RevisionError, cx: &mut Context<Self>) {
-        self.set_revision_diagnostic(
-            format!(
-                "{}: {error}",
-                i18n::t(i18n::Key::RevisionProviderFailed, cx)
-            ),
-            cx,
-        );
-    }
-
-    fn on_cancel_revision(&mut self, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_revision.take() else {
-            return;
-        };
-        pending.cancelled.store(true, Ordering::Release);
-        self.revision_generation = self.revision_generation.wrapping_add(1);
-        self.revision_running = false;
-        self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionCancelledAnswersRetained, cx), cx);
-    }
-
-    fn dismiss_revision(&mut self, cx: &mut Context<Self>) {
-        if let Some(pending) = self.pending_revision.take() {
-            pending.cancelled.store(true, Ordering::Release);
-        }
-        self.revision_generation = self.revision_generation.wrapping_add(1);
-        self.revision_running = false;
-        self.revision_result = None;
-        self.revision_diagnostic = None;
-        // Deliberately retain `revision_context`: dismissing a provider result
-        // must not discard user-authored answers before an explicit discard.
-        cx.notify();
-    }
-
-    fn revision_has_authored_answers(&self) -> bool {
-        self.revision_context_has_authored_answers()
-            || self.recovered_revision_records.values().any(|recovery| {
-                recovery
-                    .answers()
-                    .as_slice()
-                    .iter()
-                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
-            })
-    }
-
-    fn revision_context_has_authored_answers(&self) -> bool {
-        self.revision_context.as_ref().is_some_and(|context| {
-            context
-                .answer_states
-                .iter()
-                .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
-                && !context.answers_exported
-        })
-    }
-
-    fn revision_context_has_authored_answers_for_other_document(
-        &self,
-        document_id: DocumentId,
-    ) -> bool {
-        self.revision_context.as_ref().is_some_and(|context| {
-            context.document_id != document_id
-                && context
-                    .answer_states
-                    .iter()
-                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
-                && !context.answers_exported
-        })
-    }
-
     fn recovered_revision_answers_for_active_document(
         &self,
         cx: &App,
     ) -> Option<(RecoveryKey, RevisionRecovery)> {
         let document = self.active_document()?.read(cx);
-        self.recovered_revision_record_for_document(document.id(), &document.recovery_key())
-    }
-
-    fn recovered_revision_record_for_document(
-        &self,
-        document_id: DocumentId,
-        current_key: &RecoveryKey,
-    ) -> Option<(RecoveryKey, RevisionRecovery)> {
-        let key = if self.recovered_revision_records.contains_key(current_key) {
-            current_key.clone()
-        } else {
-            self.recovered_revision_documents.get(&document_id)?.clone()
-        };
-        self.recovered_revision_records
-            .get(&key)
-            .cloned()
-            .map(|recovery| (key, recovery))
-    }
-
-    fn remove_recovered_revision_record(&mut self, key: &RecoveryKey) {
-        self.recovered_revision_records.remove(key);
-        self.recovered_revision_documents
-            .retain(|_, candidate| candidate != key);
-    }
-
-    fn begin_revision_recovery_retirement(
-        &mut self,
-        document_id: DocumentId,
-        key: RecoveryKey,
-        recovery: RevisionRecovery,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.retire_document_recovery(document_id, Some(key.clone()), cx);
-        let durable_start = self.recovery_retirements.contains_key(&key)
-            || self.recovery_retirement_batches.contains_key(&key);
-        if durable_start {
-            self.remove_recovered_revision_record(&key);
-            // This retires quarantined answers, not the current editor or its live answers.
-            self.release_recovery_retirement_suppressions(std::iter::once(&key), cx);
-            self.pending_revision_recoveries
-                .insert(key, (document_id, recovery));
-        }
-        durable_start
+        self.review_flow
+            .recovered_revision_answers_for_active_document(document.id(), &document.recovery_key())
     }
 
     fn copy_recovered_revision_answers(&mut self, cx: &mut Context<Self>) {
         let Some((key, recovery)) = self.recovered_revision_answers_for_active_document(cx) else {
             return;
         };
-        let answers = recovery
-            .answers()
-            .as_slice()
-            .iter()
-            .enumerate()
-            .map(|(question_index, answer)| match answer {
-                RevisionAnswer::Unanswered => WorkspaceRevisionExportAnswer {
-                    question_index,
-                    state: "unanswered".to_owned(),
-                    answer: None,
-                },
-                RevisionAnswer::IntentionallyUnspecified => WorkspaceRevisionExportAnswer {
-                    question_index,
-                    state: "intentionally_unspecified".to_owned(),
-                    answer: None,
-                },
-                RevisionAnswer::Answered(value) => WorkspaceRevisionExportAnswer {
-                    question_index,
-                    state: "answered".to_owned(),
-                    answer: Some(value.clone()),
-                },
-            })
-            .collect::<Vec<_>>();
-        let binding = recovery.binding();
-        let payload = WorkspaceRevisionRecoveryExport {
-            source_sha256: hex_bytes(binding.source_sha256()),
-            source_revision: binding.source_revision(),
-            source_generation: binding.source_generation(),
-            artifact_lens_sha256: hex_bytes(binding.artifact_lens_digest()),
-            review_context_sha256: hex_bytes(binding.review_context_digest()),
-            answers_sha256: hex_bytes(binding.answers_digest()),
-            answers,
-        };
-        let Ok(text) = serde_json::to_string_pretty(&payload) else {
+        let Ok(text) = export_recovered_revision_answers(&recovery) else {
             return;
         };
         let Some(document) = self.active_document().cloned() else {
@@ -6229,65 +3028,8 @@ impl Workspace {
         self.set_status(i18n::t(i18n::Key::RevisionAnswersDiscarded, cx).into(), cx);
     }
 
-    fn revision_answers_incorporated(&self) -> bool {
-        let Some(context) = &self.revision_context else {
-            return false;
-        };
-        let Some(revision) = self
-            .revision_result
-            .as_ref()
-            .filter(|revision| revision.document_id == context.document_id)
-        else {
-            return false;
-        };
-        context
-            .answer_states
-            .iter()
-            .enumerate()
-            .all(|(index, answer)| {
-                let status = revision
-                    .result
-                    .question_coverage()
-                    .iter()
-                    .find(|coverage| coverage.question_index() == index)
-                    .map(|coverage| coverage.status());
-                revision_answer_is_incorporated(answer, status, &revision.decisions)
-            })
-    }
-
-    fn revision_has_authored_answers_for_document(
-        &self,
-        document_id: DocumentId,
-        cx: &App,
-    ) -> bool {
-        let context_has_answers = self.revision_context.as_ref().is_some_and(|context| {
-            context.document_id == document_id
-                && context
-                    .answer_states
-                    .iter()
-                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
-                && !context.answers_exported
-        });
-        if context_has_answers {
-            return true;
-        }
-        let Some(document) = self.document_by_id(document_id, cx) else {
-            return false;
-        };
-        let document = document.read(cx);
-        self.recovered_revision_record_for_document(document.id(), &document.recovery_key())
-            .map(|(_, recovery)| recovery)
-            .is_some_and(|recovery| {
-                recovery
-                    .answers()
-                    .as_slice()
-                    .iter()
-                    .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
-            })
-    }
-
     fn discard_revision_answers(&mut self, cx: &mut Context<Self>) {
-        if self.revision_context.is_none()
+        if !self.review_flow.has_revision_context()
             && self
                 .recovered_revision_answers_for_active_document(cx)
                 .is_some()
@@ -6302,18 +3044,12 @@ impl Workspace {
             (document.id(), document.recovery_key(), document.is_dirty())
         });
         if let Some((id, key, _)) = &document_state
-            && self.revision_context.as_ref().is_some_and(|context| {
-                context.document_id == *id
-                    && context
-                        .answer_states
-                        .iter()
-                        .any(|answer| !matches!(answer, RevisionAnswer::Unanswered))
-                    && !context.answers_exported
-            })
+            && self
+                .review_flow
+                .revision_context_has_authored_answers_for_document(*id)
         {
             self.retire_document_recovery(*id, Some(key.clone()), cx);
-            retirement_started = self.recovery_retirements.contains_key(key)
-                || self.recovery_retirement_batches.contains_key(key);
+            retirement_started = self.has_durable_recovery_retirement(key);
             if !retirement_started {
                 self.set_status(
                     i18n::t(i18n::Key::RevisionRecoveryRetirementFailed, cx).into(),
@@ -6322,15 +3058,7 @@ impl Workspace {
                 return;
             }
         }
-        if let Some(pending) = self.pending_revision.take() {
-            pending.cancelled.store(true, Ordering::Release);
-        }
-        self.revision_generation = self.revision_generation.wrapping_add(1);
-        self.revision_running = false;
-        self.revision_result = None;
-        self.revision_context = None;
-        self.revision_answer_subscriptions.clear();
-        self.revision_diagnostic = None;
+        self.review_flow.clear_revision_answers();
         if let Some(document) = document
             && let Some((id, key, dirty)) = document_state
         {
@@ -6345,596 +3073,29 @@ impl Workspace {
     }
 
     fn clear_revision_after_save(&mut self, document_id: DocumentId, cx: &mut Context<Self>) {
-        let applied = self
-            .revision_context
-            .as_ref()
-            .is_some_and(|context| context.document_id == document_id && context.applied);
-        if !applied {
-            return;
-        }
-        if !self.revision_answers_incorporated() {
-            if let Some(document) = self.document_by_id(document_id, cx) {
-                self.arm_document_recovery(&document, cx);
-            }
-            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
-            return;
-        }
-
-        {
-            self.revision_result = None;
-            self.revision_context = None;
-            self.revision_answer_subscriptions.clear();
-            self.revision_diagnostic = None;
-            if let Some(document) = self.document_by_id(document_id, cx) {
-                let current_key = document.read(cx).recovery_key();
-                let startup_key = self.startup_recovery_keys.remove(&document_id);
-                let save_as_key = self.save_as_recovery_keys.remove(&document_id);
-                let key = save_as_key.or(startup_key).unwrap_or(current_key);
-                self.retire_document_recovery(document_id, Some(key), cx);
-            }
-            cx.notify();
-        }
-    }
-
-    fn refresh_revision_applied_state(
-        &mut self,
-        document: &Entity<DocumentView>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(context) = self
-            .revision_context
-            .as_ref()
-            .filter(|context| context.applied)
-        else {
-            return;
-        };
-        let document_id = context.document_id;
-        let applied_preview = context.applied_preview.as_deref();
-        let applied_decisions = context.applied_decisions.as_ref();
-        let still_applied = self.revision_result.as_ref().is_some_and(|revision| {
-            applied_preview == Some(revision.preview.as_str())
-                && applied_decisions == Some(&revision.decisions)
-                && revision.document_id == document_id
-                && {
-                    let document = document.read(cx);
-                    document.id() == document_id && document.text(cx) == revision.preview
+        match self.review_flow.clear_revision_after_save(document_id) {
+            RevisionSaveOutcome::NotApplied => return,
+            RevisionSaveOutcome::AnswersRetained => {
+                if let Some(document) = self.document_by_id(document_id, cx) {
+                    self.arm_document_recovery(&document, cx);
                 }
-        });
-        if !still_applied
-            && let Some(context) = &mut self.revision_context
-            && context.document_id == document_id
-        {
-            Self::clear_revision_applied_state(context);
-            cx.notify();
-        }
-    }
-
-    fn clear_revision_applied_state(context: &mut WorkspaceRevisionContext) {
-        context.applied = false;
-        context.applied_preview = None;
-        context.applied_decisions = None;
-    }
-
-    fn mark_revision_applied(
-        context: &mut WorkspaceRevisionContext,
-        preview: &str,
-        decisions: &[(ChangeId, bool)],
-    ) {
-        context.applied = true;
-        context.applied_preview = Some(preview.to_owned());
-        context.applied_decisions = Some(decisions.to_vec());
-    }
-
-    fn revision_applied_state_is_current_for_render(&self, cx: &Context<Self>) -> bool {
-        let Some(context) = self
-            .revision_context
-            .as_ref()
-            .filter(|context| context.applied && context.supporting_sources_current)
-        else {
-            return false;
-        };
-        let Some(revision) = self
-            .revision_result
-            .as_ref()
-            .filter(|revision| revision.document_id == context.document_id)
-        else {
-            return false;
-        };
-        let Some(document) = self.active_document() else {
-            return false;
-        };
-        let document = document.read(cx);
-        // Document edits clear this cached state; Save revalidates the exact text.
-        document.id() == context.document_id
-            && revision_apply_identity_matches(
-                context.applied_preview.as_deref(),
-                context.applied_decisions.as_deref(),
-                &revision.preview,
-                &revision.decisions,
-            )
-    }
-
-    /// Interactive Revision actions are scoped to the currently active tab.
-    fn revision_applied_state_is_current_for_commit(&mut self, cx: &Context<Self>) -> bool {
-        let Some(document_id) = self
-            .active_document()
-            .map(|document| document.read(cx).id())
-        else {
-            return false;
-        };
-        self.revision_applied_state_is_current_for_document(document_id, cx)
-    }
-
-    /// Async Save As continuations stay bound to their captured tab if focus moves.
-    fn revision_applied_state_is_current_for_document(
-        &mut self,
-        document_id: DocumentId,
-        cx: &Context<Self>,
-    ) -> bool {
-        let Some(context) = self
-            .revision_context
-            .as_ref()
-            .filter(|context| context.applied && context.document_id == document_id)
-        else {
-            return false;
-        };
-        let Some(revision) = self
-            .revision_result
-            .as_ref()
-            .filter(|revision| revision.document_id == context.document_id)
-        else {
-            return false;
-        };
-        let Some(document) = self.document_by_id(document_id, cx) else {
-            return false;
-        };
-        if document.read(cx).id() != context.document_id
-            || !document.read(cx).text_matches(&revision.preview, cx)
-            || !revision_apply_identity_matches(
-                context.applied_preview.as_deref(),
-                context.applied_decisions.as_deref(),
-                &revision.preview,
-                &revision.decisions,
-            )
-        {
-            return false;
-        }
-        let package_current = context.supporting_sources_current
-            && context.skill_package.as_ref().is_none_or(|package| {
-                !self.has_dirty_skill_supporting_document(package, cx)
-                    && package.revalidate().is_ok()
-            });
-        if !package_current && let Some(context) = &mut self.revision_context {
-            context.supporting_sources_current = false;
-        }
-        package_current
-    }
-
-    fn set_revision_decision(
-        &mut self,
-        change_id: ChangeId,
-        accepted: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let changed = {
-            let Some(revision) = &mut self.revision_result else {
+                self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
                 return;
-            };
-            if let Some((_, decision)) = revision
-                .decisions
-                .iter_mut()
-                .find(|(id, _)| *id == change_id)
-            {
-                if *decision == accepted {
-                    false
-                } else {
-                    *decision = accepted;
-                    true
-                }
-            } else {
-                revision.decisions.push((change_id, accepted));
-                true
             }
-        };
-        if !changed {
-            return;
+            RevisionSaveOutcome::Cleared => {}
         }
-        if let Some(revision) = &mut self.revision_result
-            && let Ok(preview) = revision.result.proposal().compose(&revision.decisions)
-        {
-            revision.preview = preview;
-        }
-        if let Some(context) = &mut self.revision_context {
-            Self::clear_revision_applied_state(context);
-            context.answers_exported = false;
+        if let Some(document) = self.document_by_id(document_id, cx) {
+            let current_key = document.read(cx).recovery_key();
+            let key = self.take_recovery_key_for_retirement(document_id, current_key);
+            self.retire_document_recovery(document_id, Some(key), cx);
         }
         cx.notify();
-    }
-
-    fn set_all_revision_decisions(&mut self, accepted: bool, cx: &mut Context<Self>) {
-        let changed = {
-            let Some(revision) = &mut self.revision_result else {
-                return;
-            };
-            let decisions = revision_change_ids(revision.result.proposal())
-                .into_iter()
-                .map(|change_id| (change_id, accepted))
-                .collect::<Vec<_>>();
-            if revision.decisions == decisions {
-                false
-            } else {
-                revision.decisions = decisions;
-                true
-            }
-        };
-        if !changed {
-            return;
-        }
-        if let Some(revision) = &mut self.revision_result
-            && let Ok(preview) = revision.result.proposal().compose(&revision.decisions)
-        {
-            revision.preview = preview;
-        }
-        if let Some(context) = &mut self.revision_context {
-            Self::clear_revision_applied_state(context);
-            context.answers_exported = false;
-        }
-        cx.notify();
-    }
-
-    fn revision_preview(&self) -> Option<String> {
-        self.revision_result
-            .as_ref()
-            .map(|revision| revision.preview.clone())
-    }
-
-    fn start_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.revision_running {
-            return;
-        }
-        let Some(context) = &self.revision_context else {
-            return;
-        };
-        let document_id = context.document_id;
-        let request = context.request.clone();
-        let review_output = context.review_output.clone();
-        let source_snapshot = context.source_snapshot.clone();
-        let skill_package = context.skill_package.clone();
-        let supporting_sources_current = context.supporting_sources_current;
-        if !self.revision_context_is_current(cx) {
-            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionSourceChanged, cx), cx);
-            return;
-        }
-        let answers = match self.revision_answers() {
-            Ok(answers) => answers,
-            Err(error) => {
-                self.set_revision_diagnostic(error.to_string(), cx);
-                return;
-            }
-        };
-        let language = match crate::settings::AppSettings::global(cx).language {
-            mt_core::settings::Language::English => ReviewLanguage::English,
-            mt_core::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
-        };
-        let settings = crate::settings::AppSettings::global(cx).clone();
-        let vault = crate::credentials::AppCredentialVault::global(cx).clone();
-        let prepared = match PreparedReview::from_settings(&settings, &vault) {
-            Ok(prepared) => {
-                match prepared.bind_revision_request(request, review_output, answers, language) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        self.set_revision_diagnostic(
-                            format!(
-                                "{}: {error}",
-                                i18n::t(i18n::Key::RevisionPreparationFailed, cx)
-                            ),
-                            cx,
-                        );
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                self.set_revision_diagnostic(
-                    format!(
-                        "{}: {error}",
-                        i18n::t(i18n::Key::RevisionPreparationFailed, cx)
-                    ),
-                    cx,
-                );
-                return;
-            }
-        };
-
-        let prompt_description = i18n::model_request_disclosure(prepared.disclosure(), cx);
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            i18n::t(i18n::Key::RevisionConsentTitle, cx),
-            Some(&prompt_description),
-            &[
-                PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx)),
-                PromptButton::cancel(i18n::t(i18n::Key::Cancel, cx)),
-            ],
-            cx,
-        );
-        let pending = Arc::new(Mutex::new(Some(prepared)));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let generation = self.revision_generation.wrapping_add(1);
-        self.revision_generation = generation;
-        self.pending_revision = Some(PendingRevision {
-            cancelled: cancelled.clone(),
-            document_id,
-        });
-        self.revision_running = true;
-        self.revision_result = None;
-        self.revision_diagnostic = None;
-        self.set_status(i18n::t(i18n::Key::RevisionWaitingForConsent, cx).into(), cx);
-
-        let doc = self
-            .active_document()
-            .cloned()
-            .map(|document| document.downgrade());
-        let cancelled_for_request = cancelled.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let approved = answer.await.unwrap_or(1) == 0;
-            let pending = pending.clone();
-            loop {
-                let pending = pending.clone();
-                let cancelled = cancelled_for_request.clone();
-                let doc = doc.clone();
-                let source_snapshot = source_snapshot.clone();
-                let skill_package = skill_package.clone();
-                let supporting_sources_current = supporting_sources_current;
-                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                    let Some(prepared) = pending
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                    else {
-                        return;
-                    };
-                    if this.revision_generation != generation || cancelled.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if !approved {
-                        this.revision_running = false;
-                        this.pending_revision = None;
-                        this.set_revision_diagnostic(
-                            i18n::t(i18n::Key::RevisionConsentCancelledAnswersRetained, cx),
-                            cx,
-                        );
-                        return;
-                    }
-                    if !this.revision_context_is_current(cx) {
-                        this.set_revision_diagnostic(
-                            i18n::t(i18n::Key::RevisionScopeChangedDuringConsent, cx),
-                            cx,
-                        );
-                        return;
-                    }
-                    let mut consent = ConsentCapability::from_decision(
-                        prepared.disclosure(),
-                        ConsentDecision::Approve,
-                    );
-                    let authorization = match prepared.authorize(&mut consent) {
-                        Ok(authorization) => authorization,
-                        Err(error) => {
-                            this.set_revision_diagnostic(
-                                format!(
-                                    "{}: {error}",
-                                    i18n::t(i18n::Key::RevisionAuthorizationFailed, cx)
-                                ),
-                                cx,
-                            );
-                            return;
-                        }
-                    };
-                    this.set_status(i18n::t(i18n::Key::RevisionRunning, cx).into(), cx);
-                    let cancel_for_request = cancelled.clone();
-                    let doc = doc.clone();
-                    let skill_package = skill_package.clone();
-                    let supporting_sources_current = supporting_sources_current;
-                    cx.spawn_in(window, async move |this, cx| {
-                        let result = cx
-                            .background_spawn(async move {
-                                prepared.execute_with(
-                                    authorization,
-                                    &cancel_for_request,
-                                    mt_core::review::provider::REVISION_REQUEST_TIMEOUT,
-                                )
-                            })
-                            .await;
-                        let result = Arc::new(Mutex::new(Some(result)));
-                        loop {
-                            let result = result.clone();
-                            let doc = doc.clone();
-                            let source_snapshot = source_snapshot.clone();
-                            let skill_package = skill_package.clone();
-                            let supporting_sources_current = supporting_sources_current;
-                            if crate::views::try_update_in(&this, cx, move |this, _, cx| {
-                                let Some(result) = result
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .take()
-                                else {
-                                    return;
-                                };
-                                if this.revision_generation != generation {
-                                    return;
-                                }
-                                this.revision_running = false;
-                                this.pending_revision = None;
-                                match result {
-                                    Ok(result) => {
-                                        let Some(document) =
-                                            doc.as_ref().and_then(WeakEntity::upgrade)
-                                        else {
-                                            this.set_revision_diagnostic(
-                                                i18n::t(i18n::Key::RevisionDocumentClosed, cx),
-                                                cx,
-                                            );
-                                            return;
-                                        };
-                                        let supporting_sources_current = supporting_sources_current
-                                            && skill_package.as_ref().is_none_or(|package| {
-                                                !this.has_dirty_skill_supporting_document(
-                                                    package, cx,
-                                                ) && package.revalidate().is_ok()
-                                            });
-                                        let stale = document.read(cx).async_snapshot(cx)
-                                            != source_snapshot
-                                            || !supporting_sources_current;
-                                        if let Some(context) = &mut this.revision_context {
-                                            context.supporting_sources_current =
-                                                supporting_sources_current;
-                                        }
-                                        let decisions = revision_change_ids(result.proposal())
-                                            .into_iter()
-                                            .map(|change_id| (change_id, false))
-                                            .collect::<Vec<_>>();
-                                        let preview = result
-                                            .proposal()
-                                            .compose(&decisions)
-                                            .expect("a validated reject-all preview must compose");
-                                        this.revision_result = Some(WorkspaceRevisionResult {
-                                            document_id,
-                                            source_snapshot: source_snapshot.clone(),
-                                            result,
-                                            decisions,
-                                            preview,
-                                        });
-                                        this.revision_diagnostic = stale.then(|| {
-                                            i18n::t(i18n::Key::RevisionStale, cx).to_owned()
-                                        });
-                                        this.set_status(
-                                            i18n::t(
-                                                if stale {
-                                                    i18n::Key::RevisionReadyStale
-                                                } else {
-                                                    i18n::Key::RevisionReady
-                                                },
-                                                cx,
-                                            )
-                                            .into(),
-                                            cx,
-                                        );
-                                    }
-                                    Err(error) => {
-                                        this.on_revision_provider_failure(error.error(), cx);
-                                    }
-                                }
-                            })
-                            .is_some()
-                            {
-                                break;
-                            }
-                            if this.upgrade().is_none() {
-                                break;
-                            }
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1))
-                                .await;
-                        }
-                    })
-                    .detach();
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn apply_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.revision_result.is_none() {
-            return false;
-        }
-        if !self.revision_result_is_current_for_commit(cx) {
-            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
-            return false;
-        }
-        let revision = self
-            .revision_result
-            .as_ref()
-            .expect("a current Revision result must remain installed");
-        let Some(document) = self.active_document().cloned() else {
-            return false;
-        };
-        let proposal = revision.result.proposal().clone();
-        let decisions = revision.decisions.clone();
-        let preview = revision.preview.clone();
-        match document.update(cx, |document, cx| {
-            document.apply_approved_revision(&proposal, &decisions, window, cx)
-        }) {
-            Ok(true) => {
-                // Keep the stale proposal and answer context inspectable until
-                // an explicit Save/Discard boundary completes. This is what
-                // lets Save, Save As cancellation, and conflict prompts retain
-                // the user's answers rather than silently retiring them.
-                if let Some(context) = &mut self.revision_context {
-                    Self::mark_revision_applied(context, &preview, &decisions);
-                }
-                self.revision_approval_epoch = self.revision_approval_epoch.wrapping_add(1);
-                self.revision_diagnostic = None;
-                self.set_status(i18n::t(i18n::Key::RevisionApplied, cx).into(), cx);
-                true
-            }
-            Ok(false) => {
-                if let Some(context) = &mut self.revision_context {
-                    // A current reject-all or empty proposal is already the
-                    // document's exact text. Treat it as an approved no-op so
-                    // Save and Save As still cross the normal safe boundary.
-                    Self::mark_revision_applied(context, &preview, &decisions);
-                }
-                self.revision_approval_epoch = self.revision_approval_epoch.wrapping_add(1);
-                self.set_status(i18n::t(i18n::Key::RevisionNoApprovedChanges, cx).into(), cx);
-                false
-            }
-            Err(error) => {
-                if let Some(context) = &mut self.revision_context {
-                    Self::clear_revision_applied_state(context);
-                }
-                self.set_revision_diagnostic(
-                    format!("{}: {error}", i18n::t(i18n::Key::RevisionApplyFailed, cx)),
-                    cx,
-                );
-                false
-            }
-        }
-    }
-
-    fn copy_revision(&mut self, cx: &mut Context<Self>) {
-        let applied_preview_current = self.revision_applied_state_is_current_for_commit(cx);
-        if !applied_preview_current && !self.revision_result_is_current_for_commit(cx) {
-            self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
-            return;
-        }
-        let Some(text) = self.revision_preview() else {
-            return;
-        };
-        let answers_incorporated = self.revision_answers_incorporated();
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        if let Some(context) = &mut self.revision_context {
-            // Copy exports only the approved artifact. Retire answer recovery
-            // only when every authored answer is present in that exact output.
-            context.answers_exported = answers_incorporated;
-        }
-        self.checkpoint_recovery_at(cx.background_executor().now(), cx);
-        self.set_status(i18n::t(i18n::Key::RevisionCopied, cx).into(), cx);
     }
 
     fn save_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(document_id) = self
-            .revision_context
-            .as_ref()
+            .review_flow
+            .revision_context()
             .map(|context| context.document_id)
         else {
             return;
@@ -6946,11 +3107,7 @@ impl Workspace {
             self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
             return;
         }
-        if !self
-            .revision_context
-            .as_ref()
-            .is_some_and(|context| context.applied)
-        {
+        if !self.review_flow.revision_is_applied(document_id) {
             return;
         }
         if self.revision_applied_state_is_current_for_commit(cx) {
@@ -6966,16 +3123,14 @@ impl Workspace {
             }
             return;
         }
-        if let Some(context) = &mut self.revision_context {
-            Self::clear_revision_applied_state(context);
-        }
+        self.review_flow.clear_revision_applied_state();
         self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
     }
 
     fn save_as_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(document_id) = self
-            .revision_context
-            .as_ref()
+            .review_flow
+            .revision_context()
             .map(|context| context.document_id)
         else {
             return;
@@ -6987,20 +3142,14 @@ impl Workspace {
             self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
             return;
         }
-        if !self
-            .revision_context
-            .as_ref()
-            .is_some_and(|context| context.applied)
-        {
+        if !self.review_flow.revision_is_applied(document_id) {
             return;
         }
         if self.revision_applied_state_is_current_for_commit(cx) {
             self.start_revision_save_as_picker(document_id, window, cx);
             return;
         }
-        if let Some(context) = &mut self.revision_context {
-            Self::clear_revision_applied_state(context);
-        }
+        self.review_flow.clear_revision_applied_state();
         self.set_revision_diagnostic(i18n::t(i18n::Key::RevisionStale, cx), cx);
     }
 
@@ -7013,11 +3162,9 @@ impl Workspace {
         let Some(document) = self.document_by_id(document_id, cx) else {
             return;
         };
-        let approval = RevisionSaveAsApproval {
-            source_stamp: document.read(cx).source_stamp(),
-            revision_generation: self.revision_generation,
-            approval_epoch: self.revision_approval_epoch,
-        };
+        let approval = self
+            .review_flow
+            .revision_save_as_approval(document.read(cx).source_stamp());
         self.start_save_as_picker(
             document_id,
             SaveAsRequestOrigin::Revision,
@@ -7025,788 +3172,6 @@ impl Workspace {
             window,
             cx,
         );
-    }
-
-    /// Continue Review after the potentially expensive Agent Skill inventory
-    /// has been frozen on the background executor. This method runs on the UI
-    /// thread: it owns document checks, consent presentation, and all UI state
-    /// mutations. The provider request remains bound to the frozen inventory.
-    #[allow(clippy::too_many_arguments)]
-    fn start_review_after_preparation(
-        &mut self,
-        built_request: Result<ReviewRequestBuildResult, ReviewRequestBuildError>,
-        target: ReviewTarget,
-        document_id: DocumentId,
-        lens: ArtifactLens,
-        language: ReviewLanguage,
-        selection: Option<std::ops::Range<usize>>,
-        source_snapshot: mt_core::document::lifecycle::AsyncSnapshot,
-        doc: WeakEntity<DocumentView>,
-        generation: u64,
-        cancelled: Arc<AtomicBool>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.review_generation != generation || cancelled.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(document) = doc.upgrade() else {
-            self.reviewing = false;
-            self.pending_review = None;
-            self.set_status(i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(), cx);
-            return;
-        };
-        if document.read(cx).async_snapshot(cx) != source_snapshot {
-            self.reviewing = false;
-            self.pending_review = None;
-            self.set_review_diagnostic(
-                document_id,
-                lens,
-                ReviewDiagnostic::new(
-                    ReviewDiagnosticCode::InvalidRequest,
-                    i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string(),
-                ),
-                cx,
-            );
-            return;
-        }
-
-        let built_request = match built_request {
-            Ok(request) => request,
-            Err(error) => {
-                log::debug!("Review request preparation failed: {error}");
-                self.reviewing = false;
-                self.pending_review = None;
-                self.set_review_diagnostic(
-                    document_id,
-                    lens,
-                    self.review_build_diagnostic(&error, cx),
-                    cx,
-                );
-                return;
-            }
-        };
-        let (request, skill_package) = built_request.into_parts();
-        let partial = request
-            .source
-            .package()
-            .is_some_and(SkillPackage::is_partial);
-        let frozen_request = request.clone();
-        if let Some(skill_package) = &skill_package
-            && self.has_dirty_skill_supporting_document(skill_package, cx)
-        {
-            self.reviewing = false;
-            self.pending_review = None;
-            self.set_review_diagnostic(
-                document_id,
-                lens,
-                ReviewDiagnostic::new(
-                    ReviewDiagnosticCode::InvalidRequest,
-                    i18n::t(i18n::Key::ReviewSkillPackageChanged, cx).to_string(),
-                ),
-                cx,
-            );
-            return;
-        }
-
-        let settings = crate::settings::AppSettings::global(cx).clone();
-        let vault = crate::credentials::AppCredentialVault::global(cx).clone();
-        let prepared = match PreparedReview::from_settings(&settings, &vault) {
-            Ok(prepared) => match prepared.bind_document_request(request, language) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    self.reviewing = false;
-                    self.pending_review = None;
-                    self.set_review_diagnostic(
-                        document_id,
-                        lens,
-                        self.review_error_diagnostic(&error, cx),
-                        cx,
-                    );
-                    return;
-                }
-            },
-            Err(error) => {
-                self.reviewing = false;
-                self.pending_review = None;
-                self.set_review_diagnostic(
-                    document_id,
-                    lens,
-                    self.review_error_diagnostic(&error, cx),
-                    cx,
-                );
-                return;
-            }
-        };
-        let prompt_description = i18n::model_request_disclosure(prepared.disclosure(), cx);
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            i18n::t(i18n::Key::ModelRequestConsentTitle, cx),
-            Some(&prompt_description),
-            &[
-                PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx)),
-                PromptButton::cancel(i18n::t(i18n::Key::Cancel, cx)),
-            ],
-            cx,
-        );
-
-        let pending = Arc::new(Mutex::new(Some(prepared)));
-        let selection_for_result = selection.clone();
-        let request_for_result = frozen_request.clone();
-        let lens_for_result = lens;
-        let skill_package_for_result = skill_package.clone();
-        let cancelled_for_request = cancelled.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let approved = answer.await.unwrap_or(1) == 0;
-            let pending = pending.clone();
-
-            loop {
-                let pending = pending.clone();
-                let doc = doc.clone();
-                let source_snapshot = source_snapshot.clone();
-                let cancelled = cancelled_for_request.clone();
-                let selection = selection_for_result.clone();
-                let partial = partial;
-                let request_for_result = request_for_result.clone();
-                let skill_package = skill_package_for_result.clone();
-                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                    let Some(prepared) = pending
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                    else {
-                        return;
-                    };
-
-                    if this.review_generation != generation || cancelled.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if !approved {
-                        this.reviewing = false;
-                        this.pending_review = None;
-                        this.set_review_diagnostic(
-                            document_id,
-                            lens_for_result,
-                            ReviewDiagnostic::new(
-                                ReviewDiagnosticCode::Cancelled,
-                                i18n::t(i18n::Key::ReviewCancelled, cx).to_string(),
-                            ),
-                            cx,
-                        );
-                        return;
-                    }
-
-                    let Some(document) = doc.upgrade() else {
-                        this.reviewing = false;
-                        this.pending_review = None;
-                        this.set_status(i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(), cx);
-                        return;
-                    };
-                    if document.read(cx).async_snapshot(cx) != source_snapshot {
-                        this.reviewing = false;
-                        this.pending_review = None;
-                        this.set_review_diagnostic(
-                            document_id,
-                            lens_for_result,
-                            ReviewDiagnostic::new(
-                                ReviewDiagnosticCode::InvalidRequest,
-                                i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string(),
-                            ),
-                            cx,
-                        );
-                        return;
-                    }
-                    if let Some(skill_package) = &skill_package
-                        && this.has_dirty_skill_supporting_document(skill_package, cx)
-                    {
-                        this.reviewing = false;
-                        this.pending_review = None;
-                        this.set_review_diagnostic(
-                            document_id,
-                            lens_for_result,
-                            ReviewDiagnostic::new(
-                                ReviewDiagnosticCode::InvalidRequest,
-                                i18n::t(i18n::Key::ReviewSkillPackageChanged, cx).to_string(),
-                            ),
-                            cx,
-                        );
-                        return;
-                    }
-
-                    // Revalidation belongs before authorization. The frozen
-                    // package is checked on a background executor, then the UI
-                    // rechecks generation, document snapshot, and dirty
-                    // supporting buffers before creating the authorization.
-                    let pending = Arc::new(Mutex::new(Some(prepared)));
-                    let package_for_revalidation = skill_package.clone();
-                    let cancelled_for_revalidation = cancelled.clone();
-                    cx.spawn_in(window, async move |this, cx| {
-                        let revalidation = cx
-                            .background_spawn(async move {
-                                package_for_revalidation
-                                    .map_or(Ok(()), |package| package.revalidate())
-                            })
-                            .await;
-                        let revalidation = Arc::new(Mutex::new(Some(revalidation)));
-                        loop {
-                            let revalidation = revalidation.clone();
-                            let pending = pending.clone();
-                            let doc = doc.clone();
-                            let source_snapshot = source_snapshot.clone();
-                            let selection = selection.clone();
-                            let partial = partial;
-                            let request_for_result = request_for_result.clone();
-                            let request_for_result_for_update = request_for_result.clone();
-                            let skill_package = skill_package.clone();
-                            let cancelled = cancelled_for_revalidation.clone();
-                            if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                                let Some(revalidation) = revalidation
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .take()
-                                else {
-                                    return;
-                                };
-                                let Some(prepared) = pending
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .take()
-                                else {
-                                    return;
-                                };
-                                if this.review_generation != generation
-                                    || cancelled.load(Ordering::Acquire)
-                                {
-                                    return;
-                                }
-                                let Some(document) = doc.upgrade() else {
-                                    this.reviewing = false;
-                                    this.pending_review = None;
-                                    this.set_status(
-                                        i18n::t(i18n::Key::ReviewDocumentClosed, cx).into(),
-                                        cx,
-                                    );
-                                    return;
-                                };
-                                if document.read(cx).async_snapshot(cx) != source_snapshot {
-                                    this.reviewing = false;
-                                    this.pending_review = None;
-                                    this.set_review_diagnostic(
-                                        document_id,
-                                        lens_for_result,
-                                        ReviewDiagnostic::new(
-                                            ReviewDiagnosticCode::InvalidRequest,
-                                            i18n::t(i18n::Key::ReviewDocumentChanged, cx)
-                                                .to_string(),
-                                        ),
-                                        cx,
-                                    );
-                                    return;
-                                }
-                                if let Some(skill_package) = &skill_package
-                                    && this.has_dirty_skill_supporting_document(skill_package, cx)
-                                {
-                                    this.reviewing = false;
-                                    this.pending_review = None;
-                                    this.set_review_diagnostic(
-                                        document_id,
-                                        lens_for_result,
-                                        ReviewDiagnostic::new(
-                                            ReviewDiagnosticCode::InvalidRequest,
-                                            i18n::t(
-                                                i18n::Key::ReviewSkillPackageChanged,
-                                                cx,
-                                            )
-                                            .to_string(),
-                                        ),
-                                        cx,
-                                    );
-                                    return;
-                                }
-                                if let Err(error) = revalidation {
-                                    this.reviewing = false;
-                                    this.pending_review = None;
-                                    this.set_review_diagnostic(
-                                        document_id,
-                                        lens_for_result,
-                                        this.review_build_diagnostic(&error, cx),
-                                        cx,
-                                    );
-                                    return;
-                                }
-
-                                let mut consent = ConsentCapability::from_decision(
-                                    prepared.disclosure(),
-                                    ConsentDecision::Approve,
-                                );
-                                let authorization = match prepared.authorize(&mut consent) {
-                                    Ok(authorization) => authorization,
-                                    Err(error) => {
-                                        this.reviewing = false;
-                                        this.pending_review = None;
-                                        this.set_review_diagnostic(
-                                            document_id,
-                                            lens_for_result,
-                                            this.review_error_diagnostic(&error, cx),
-                                            cx,
-                                        );
-                                        return;
-                                    }
-                                };
-                                let cancel_for_request = cancelled.clone();
-                                this.set_status(
-                                    i18n::t(i18n::Key::ReviewWaiting, cx).into(),
-                                    cx,
-                                );
-                                cx.spawn_in(window, async move |this, cx| {
-                                    let result = cx
-                                        .background_spawn(async move {
-                                            prepared.execute_with(
-                                                authorization,
-                                                &cancel_for_request,
-                                                REVIEW_REQUEST_TIMEOUT,
-                                            )
-                                        })
-                                        .await;
-                                    let package_for_completion_revalidation = skill_package.clone();
-                                    let supporting_sources_revalidated = cx
-                                            .background_spawn(async move {
-                                            package_for_completion_revalidation
-                                                .is_none_or(|package| package.revalidate().is_ok())
-                                        })
-                                        .await;
-                                    let result = Arc::new(Mutex::new(Some(result)));
-                                    loop {
-                                        let result = result.clone();
-                                        let doc = doc.clone();
-                                        let source_snapshot = source_snapshot.clone();
-                                        let selection = selection.clone();
-                                        let partial = partial;
-                                        let skill_package = skill_package.clone();
-                                        let request_for_result_for_update =
-                                            request_for_result_for_update.clone();
-                                        if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                                            let Some(result) = result
-                                                .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                                .take()
-                                            else {
-                                                return;
-                                            };
-                                            if this.review_generation != generation {
-                                                return;
-                                            }
-                                            this.reviewing = false;
-                                            this.pending_review = None;
-                                            match result {
-                                                Ok(mut result) => {
-                                                    let Some(document) = doc.upgrade() else {
-                                                        this.set_status(
-                                                            i18n::t(
-                                                                i18n::Key::ReviewDocumentClosed,
-                                                                cx,
-                                                            )
-                                                            .into(),
-                                                            cx,
-                                                        );
-                                                        return;
-                                                    };
-                                                    let supporting_sources_current =
-                                                        skill_package.as_ref().is_none_or(|package| {
-                                                            supporting_sources_revalidated
-                                                                && !this
-                                                                    .has_dirty_skill_supporting_document(
-                                                                        package, cx,
-                                                                    )
-                                                        });
-                                                    let stale = document.read(cx).async_snapshot(cx)
-                                                        != source_snapshot
-                                                        || !supporting_sources_current;
-                                                    if stale {
-                                                        result.result.status = ReviewStatus::Stale;
-                                                    }
-                                                    let document_id = document.read(cx).id();
-                                                    let recovery_key = document.read(cx).recovery_key();
-                                                    if this
-                                                        .revision_context_has_authored_answers_for_other_document(
-                                                            document_id,
-                                                        )
-                                                    {
-                                                        this.review_target = None;
-                                                        this.review_target_document_id = None;
-                                                        this.set_status(
-                                                            i18n::t(
-                                                                i18n::Key::RevisionAnswersRetained,
-                                                                cx,
-                                                            )
-                                                            .into(),
-                                                            cx,
-                                                        );
-                                                        return;
-                                                    }
-                                                    this.review_result = Some(WorkspaceReviewResult {
-                                                        document_id,
-                                                        source_snapshot: source_snapshot.clone(),
-                                                        target,
-                                                        selection,
-                                                        lens: lens_for_result,
-                                                        partial,
-                                                        skill_package: skill_package.clone(),
-                                                        supporting_sources_current,
-                                                        result,
-                                                    });
-                                                    if let Some(output) = this
-                                                        .review_result
-                                                        .as_ref()
-                                                        .and_then(|review| review.result.result.output.clone())
-                                                    {
-                                                        this.install_revision_context(
-                                                            document_id,
-                                                            recovery_key,
-                                                            source_snapshot.clone(),
-                                                            request_for_result_for_update,
-                                                            output,
-                                                            skill_package,
-                                                            supporting_sources_current,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    }
-                                                    this.review_diagnostic = None;
-                                                    this.review_target = None;
-                                                    this.review_target_document_id = None;
-                                                    this.review_panel_open = true;
-                                                    this.set_status(
-                                                        i18n::t(
-                                                            if stale {
-                                                                i18n::Key::ReviewStale
-                                                            } else {
-                                                                i18n::Key::ReviewReady
-                                                            },
-                                                            cx,
-                                                        )
-                                                        .into(),
-                                                        cx,
-                                                    );
-                                                }
-                                                Err(error) => {
-                                                    this.set_review_diagnostic(
-                                                        document_id,
-                                                        lens_for_result,
-                                                        this.review_error_diagnostic(&error, cx),
-                                                        cx,
-                                                    );
-                                                }
-                                            }
-                                        })
-                                        .is_some()
-                                        {
-                                            break;
-                                        }
-                                        if this.upgrade().is_none() {
-                                            break;
-                                        }
-                                        cx.background_executor()
-                                            .timer(Duration::from_millis(1))
-                                            .await;
-                                    }
-                                })
-                                .detach();
-                            })
-                            .is_some()
-                            {
-                                break;
-                            }
-                            if this.upgrade().is_none() {
-                                break;
-                            }
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1))
-                                .await;
-                        }
-                    })
-                    .detach();
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    /// Run a read-only Review over a frozen editor snapshot.
-    ///
-    /// Consent is bound to the exact provider disclosure and is consumed once.
-    /// The request is rechecked against the same snapshot after consent and
-    /// before transport; a result that lands after an edit is retained only as
-    /// stale inspection. Review never mutates editor source text.
-    fn review(&mut self, target: ReviewTarget, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(doc) = self.active_document().cloned() else {
-            return;
-        };
-        let (document_id, source_path, skill_entrypoint_is_dirty, skill_origin) = {
-            let document = doc.read(cx);
-            (
-                document.id(),
-                document.source_path().map(Path::to_path_buf),
-                document.is_dirty(),
-                document.skill_origin().cloned(),
-            )
-        };
-        if self.revision_has_authored_answers_for_document(document_id, cx) {
-            self.set_status(i18n::t(i18n::Key::RevisionAnswersRetained, cx).into(), cx);
-            self.review_target = Some(target);
-            self.review_target_document_id = Some(document_id);
-            self.review_panel_open = true;
-            self.right_panel_open = true;
-            cx.notify();
-            return;
-        }
-        let source_snapshot = doc.read(cx).async_snapshot(cx);
-        let full_text = source_snapshot.text().to_owned();
-        // Infer a conservative first lens from the path. Once the user has
-        // corrected it in the Review panel, keep that choice for this tab.
-        let lens = self.visible_review_lens(cx);
-
-        // An attempted Review supersedes the previously displayed operation
-        // even when its scope is invalid or its provider is unavailable.
-        self.review_result = None;
-        self.review_diagnostic = None;
-        self.review_target = Some(target);
-        self.review_target_document_id = Some(document_id);
-        self.review_panel_open = true;
-        self.right_panel_open = true;
-        cx.notify();
-        let selection = match target {
-            ReviewTarget::Document => None,
-            ReviewTarget::Selection => {
-                let range = doc.read(cx).selection(cx);
-                if range.is_empty() {
-                    self.set_review_diagnostic(
-                        document_id,
-                        lens,
-                        ReviewDiagnostic::new(
-                            ReviewDiagnosticCode::EmptySelection,
-                            i18n::t(i18n::Key::ReviewEmptySelection, cx).to_string(),
-                        ),
-                        cx,
-                    );
-                    return;
-                }
-                if full_text.get(range.clone()).is_none() {
-                    self.set_review_diagnostic(
-                        document_id,
-                        lens,
-                        ReviewDiagnostic::new(
-                            ReviewDiagnosticCode::InvalidRequest,
-                            i18n::t(i18n::Key::ReviewFailed, cx).to_string(),
-                        ),
-                        cx,
-                    );
-                    return;
-                }
-                Some(range)
-            }
-        };
-
-        let language = match crate::settings::AppSettings::global(cx).language {
-            mt_core::settings::Language::English => ReviewLanguage::English,
-            mt_core::settings::Language::Chinese => ReviewLanguage::SimplifiedChinese,
-        };
-        let document_snapshot =
-            SourceSnapshot::new(doc.read(cx).revision(), source_snapshot.source_generation());
-        let generation = self.review_generation.wrapping_add(1);
-        self.review_generation = generation;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.pending_review = Some(PendingReview {
-            cancelled: cancelled.clone(),
-            document_id,
-            lens,
-        });
-        self.reviewing = true;
-        self.review_panel_open = true;
-        self.right_panel_open = true;
-        self.set_status(i18n::t(i18n::Key::ReviewWaiting, cx).into(), cx);
-
-        let doc = doc.downgrade();
-        let source_path_for_prepare = source_path.clone();
-        let full_text_for_prepare = full_text.clone();
-        let selection_for_prepare = selection.clone();
-        let skill_origin_for_prepare = skill_origin;
-        let selection_for_result = selection.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let built_request = cx
-                .background_spawn(async move {
-                    build_review_request(
-                        ReviewRequestBuildRequest::new(
-                            target,
-                            lens,
-                            source_path_for_prepare.as_deref(),
-                            &full_text_for_prepare,
-                            selection_for_prepare.as_ref(),
-                            document_snapshot,
-                            skill_entrypoint_is_dirty,
-                        )
-                        .with_skill_origin(skill_origin_for_prepare.as_ref()),
-                    )
-                })
-                .await;
-            let built_request = Arc::new(Mutex::new(Some(built_request)));
-            loop {
-                let built_request = built_request.clone();
-                let selection_for_update = selection_for_result.clone();
-                let source_snapshot_for_update = source_snapshot.clone();
-                let doc_for_update = doc.clone();
-                let cancelled_for_update = cancelled.clone();
-                if crate::views::try_update_in(&this, cx, move |this, window, cx| {
-                    let Some(built_request) = built_request
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .take()
-                    else {
-                        return;
-                    };
-                    this.start_review_after_preparation(
-                        built_request,
-                        target,
-                        document_id,
-                        lens,
-                        language,
-                        selection_for_update,
-                        source_snapshot_for_update,
-                        doc_for_update,
-                        generation,
-                        cancelled_for_update,
-                        window,
-                        cx,
-                    );
-                })
-                .is_some()
-                {
-                    break;
-                }
-                if this.upgrade().is_none() {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(1))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn set_review_diagnostic(
-        &mut self,
-        document_id: DocumentId,
-        lens: ArtifactLens,
-        diagnostic: ReviewDiagnostic,
-        cx: &mut Context<Self>,
-    ) {
-        let status = diagnostic.message.as_str().to_owned();
-        self.review_result = None;
-        self.review_diagnostic = Some(WorkspaceReviewDiagnostic {
-            document_id,
-            lens,
-            diagnostic,
-        });
-        self.review_panel_open = true;
-        self.right_panel_open = true;
-        self.set_status(status, cx);
-    }
-
-    fn review_build_diagnostic(
-        &self,
-        error: &ReviewRequestBuildError,
-        cx: &Context<Self>,
-    ) -> ReviewDiagnostic {
-        let code = match error {
-            ReviewRequestBuildError::InvalidSelection => ReviewDiagnosticCode::EmptySelection,
-            ReviewRequestBuildError::AgentSkillFileTooLarge { .. }
-            | ReviewRequestBuildError::AgentSkillPackageTooLarge { .. } => {
-                ReviewDiagnosticCode::OversizedPayload
-            }
-            _ => ReviewDiagnosticCode::InvalidRequest,
-        };
-        ReviewDiagnostic::new(
-            code,
-            i18n::t(review_request_build_status_key(error), cx).to_string(),
-        )
-    }
-
-    fn review_error_diagnostic(&self, error: &ReviewError, cx: &Context<Self>) -> ReviewDiagnostic {
-        let (code, key) = match error {
-            ReviewError::NoAvailableCredential => (
-                ReviewDiagnosticCode::NoProvider,
-                i18n::Key::ReviewNoProvider,
-            ),
-            ReviewError::MissingCredential { .. } => (
-                ReviewDiagnosticCode::Unavailable,
-                i18n::Key::ReviewMissingCredential,
-            ),
-            ReviewError::RequestTooLarge { .. }
-            | ReviewError::ResponseTooLarge { .. }
-            | ReviewError::InvalidRequest {
-                reason:
-                    ReviewRequestError::FileTooLarge { .. } | ReviewRequestError::SourceTooLarge { .. },
-            } => (
-                ReviewDiagnosticCode::OversizedPayload,
-                i18n::Key::ReviewOversized,
-            ),
-            ReviewError::Cancelled { .. } => {
-                (ReviewDiagnosticCode::Cancelled, i18n::Key::ReviewCancelled)
-            }
-            ReviewError::Timeout { .. } => {
-                (ReviewDiagnosticCode::Timeout, i18n::Key::ReviewTimeout)
-            }
-            ReviewError::MalformedResponse { .. } | ReviewError::MissingResponseText { .. } => (
-                ReviewDiagnosticCode::MalformedResponse,
-                i18n::Key::ReviewMalformed,
-            ),
-            ReviewError::TransportUnavailable { .. } | ReviewError::RequestFailed { .. } => (
-                ReviewDiagnosticCode::Unavailable,
-                i18n::Key::ReviewUnavailable,
-            ),
-            ReviewError::InvalidRequest { .. } => (
-                ReviewDiagnosticCode::InvalidRequest,
-                i18n::Key::ReviewFailed,
-            ),
-            _ => (ReviewDiagnosticCode::Unavailable, i18n::Key::ReviewFailed),
-        };
-        ReviewDiagnostic::new(code, i18n::t(key, cx).to_string())
-    }
-
-    fn visible_review_lens(&self, cx: &Context<Self>) -> ArtifactLens {
-        let Some(document) = self.active_document() else {
-            return ArtifactLens::default_lens();
-        };
-        let document = document.read(cx);
-        let document_id = document.id();
-        if let Some(lens) = self.review_lens_overrides.get(&document_id) {
-            return *lens;
-        }
-        if let Some(result) = &self.review_result
-            && result.document_id == document_id
-        {
-            return result.lens;
-        }
-        if let Some(diagnostic) = &self.review_diagnostic
-            && diagnostic.document_id == document_id
-        {
-            return diagnostic.lens;
-        }
-        document
-            .source_path()
-            .map(ArtifactLens::infer_from_path)
-            .unwrap_or_else(ArtifactLens::default_lens)
     }
 
     fn test_model_credential(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8084,1078 +3449,6 @@ impl Workspace {
 
     // --- Rendering --------------------------------------------------------
 
-    fn render_recovered_revision_panel(&self, cx: &Context<Self>) -> AnyElement {
-        let answer_count = self
-            .recovered_revision_answers_for_active_document(cx)
-            .map_or(0, |(_, recovery)| recovery.answers().len());
-        v_flex()
-            .id("review-panel")
-            .size_full()
-            .p(metrics::inset())
-            .gap(metrics::gap_group())
-            .overflow_y_scroll()
-            .child(
-                v_flex()
-                    .id("revision-recovered-answers")
-                    .role(gpui::Role::Group)
-                    .aria_label(i18n::t(i18n::Key::RevisionRecoveredAnswers, cx))
-                    .accessibility_id(REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID)
-                    .gap(metrics::gap())
-                    .child(div().text_xs().font_medium().child(format!(
-                        "{} ({answer_count})",
-                        i18n::t(i18n::Key::RevisionRecoveredAnswers, cx)
-                    )))
-                    .child(
-                        h_flex()
-                            .gap(metrics::gap())
-                            .child(
-                                Button::new("revision-copy-recovered-answers")
-                                    .accessibility_id(
-                                        REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
-                                    )
-                                    .label(i18n::t(i18n::Key::RevisionCopyRecoveredAnswers, cx))
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.copy_recovered_revision_answers(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("revision-discard-recovered-answers")
-                                    .accessibility_id(
-                                        REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
-                                    )
-                                    .label(i18n::t(i18n::Key::RevisionDiscardRecoveredAnswers, cx))
-                                    .small()
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.discard_recovered_revision_answers(cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_review_idle_panel(&self, cx: &Context<Self>) -> AnyElement {
-        let run_target = self.review_target.filter(|_| {
-            self.review_target_document_id
-                == self
-                    .active_document()
-                    .map(|document| document.read(cx).id())
-        });
-        v_flex()
-            .id("review-panel")
-            .size_full()
-            .p(metrics::inset())
-            .gap(metrics::gap_group())
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(i18n::t(i18n::Key::ReviewNoResult, cx)),
-            )
-            .when_some(run_target, |this, target| {
-                this.child(
-                    Button::new("run-review")
-                        .accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)
-                        .label(i18n::t(i18n::Key::ReviewRun, cx))
-                        .small()
-                        .primary()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.review(target, window, cx);
-                        })),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_review_panel(&self, cx: &Context<Self>) -> AnyElement {
-        let visible_lens = self.visible_review_lens(cx);
-        let active_document_has_authored_answers = self.active_document().is_some_and(|document| {
-            self.revision_has_authored_answers_for_document(document.read(cx).id(), cx)
-        });
-        let lens_options = [
-            ArtifactLens::Prompt,
-            ArtifactLens::Specification,
-            ArtifactLens::AgentInstructions,
-            ArtifactLens::AgentSkill,
-        ];
-        let mut content = Vec::<AnyElement>::new();
-        content.push(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(i18n::t(i18n::Key::ReviewReadOnly, cx))
-                .into_any_element(),
-        );
-        if self.reviewing {
-            content.push(
-                h_flex()
-                    .gap(metrics::gap())
-                    .items_center()
-                    .child(Spinner::new().small())
-                    .child(i18n::t(i18n::Key::ReviewWaiting, cx))
-                    .child(
-                        Button::new("cancel-review")
-                            .icon(IconName::Close)
-                            .xsmall()
-                            .ghost()
-                            .tooltip(i18n::t(i18n::Key::Cancel, cx))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.on_cancel_review(&CancelReview, window, cx)
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        content.push(
-            v_flex()
-                .gap(metrics::gap())
-                .child(
-                    div()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(i18n::t(i18n::Key::ReviewLens, cx)),
-                )
-                .child(
-                    h_flex()
-                        .gap(metrics::gap())
-                        .flex_wrap()
-                        .children(lens_options.map(|lens| {
-                            Button::new(SharedString::from(format!("review-lens-{}", lens.label())))
-                                .label(i18n::t(review_lens_key(lens), cx))
-                                .xsmall()
-                                .disabled(
-                                    self.reviewing
-                                        || self.revision_running
-                                        || self.revision_result.is_some()
-                                        || active_document_has_authored_answers,
-                                )
-                                .when(
-                                    review_lens_choice_is_selected(lens, visible_lens),
-                                    |button| button.primary(),
-                                )
-                                .when(
-                                    !review_lens_choice_is_selected(lens, visible_lens),
-                                    |button| button.ghost(),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let document_id = this
-                                        .active_document()
-                                        .map(|document| document.read(cx).id());
-                                    if let Some(document_id) = document_id {
-                                        if this.revision_has_authored_answers_for_document(
-                                            document_id,
-                                            cx,
-                                        ) {
-                                            this.set_status(
-                                                i18n::t(i18n::Key::RevisionAnswersRetained, cx)
-                                                    .into(),
-                                                cx,
-                                            );
-                                            return;
-                                        }
-                                        let target = this
-                                            .review_target
-                                            .filter(|_| {
-                                                this.review_target_document_id == Some(document_id)
-                                            })
-                                            .or_else(|| {
-                                                this.review_result.as_ref().and_then(|result| {
-                                                    (result.document_id == document_id)
-                                                        .then_some(result.target)
-                                                })
-                                            });
-                                        this.review_lens_overrides.insert(document_id, lens);
-                                        this.review_target = target;
-                                        this.review_target_document_id =
-                                            target.map(|_| document_id);
-                                    }
-                                    this.review_result = None;
-                                    this.review_diagnostic = None;
-                                    cx.notify();
-                                }))
-                        })),
-                )
-                .into_any_element(),
-        );
-
-        if let Some(target) = self.review_target
-            && self.review_target_document_id
-                == self
-                    .active_document()
-                    .map(|document| document.read(cx).id())
-            && !self.reviewing
-            && !active_document_has_authored_answers
-        {
-            content.push(
-                Button::new("run-review")
-                    .accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)
-                    .label(i18n::t(i18n::Key::ReviewRun, cx))
-                    .small()
-                    .primary()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.review(target, window, cx);
-                    }))
-                    .into_any_element(),
-            );
-        }
-
-        let diagnostic = self.review_diagnostic.as_ref().filter(|diagnostic| {
-            self.active_document()
-                .is_some_and(|document| document.read(cx).id() == diagnostic.document_id)
-        });
-        if let Some(diagnostic) = diagnostic {
-            content.push(
-                div()
-                    .id("review-diagnostic")
-                    .role(gpui_kit::Role::Label)
-                    .aria_value(diagnostic.diagnostic.message.as_str())
-                    .accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID)
-                    .text_sm()
-                    .text_color(cx.theme().warning)
-                    .child(diagnostic.diagnostic.message.as_str().to_owned())
-                    .into_any_element(),
-            );
-        }
-
-        let recovered_answers = self
-            .recovered_revision_answers_for_active_document(cx)
-            .map(|(_, recovery)| recovery.answers().clone());
-        if let Some(recovered_answers) = recovered_answers {
-            let answer_count = recovered_answers.len();
-            content.push(
-                v_flex()
-                    .id("revision-recovered-answers")
-                    .role(gpui::Role::Group)
-                    .aria_label(i18n::t(i18n::Key::RevisionRecoveredAnswers, cx))
-                    .accessibility_id(REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID)
-                    .gap(metrics::gap())
-                    .child(div().text_xs().font_medium().child(format!(
-                        "{} ({answer_count})",
-                        i18n::t(i18n::Key::RevisionRecoveredAnswers, cx)
-                    )))
-                    .child(
-                        h_flex()
-                            .gap(metrics::gap())
-                            .child(
-                                Button::new("revision-copy-recovered-answers")
-                                    .accessibility_id(
-                                        REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
-                                    )
-                                    .label(i18n::t(i18n::Key::RevisionCopyRecoveredAnswers, cx))
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.copy_recovered_revision_answers(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("revision-discard-recovered-answers")
-                                    .accessibility_id(
-                                        REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
-                                    )
-                                    .label(i18n::t(i18n::Key::RevisionDiscardRecoveredAnswers, cx))
-                                    .small()
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.discard_recovered_revision_answers(cx);
-                                    })),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        }
-
-        let Some(review) = &self.review_result else {
-            if diagnostic.is_none() {
-                content.push(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(i18n::t(i18n::Key::ReviewNoResult, cx))
-                        .into_any_element(),
-                );
-            }
-            return v_flex()
-                .id("review-panel")
-                .size_full()
-                .p(metrics::inset())
-                .gap(metrics::gap_group())
-                .overflow_y_scroll()
-                .children(content)
-                .into_any_element();
-        };
-
-        let stale = review.result.result.status.is_stale()
-            || self.active_document().is_none_or(|document| {
-                let document = document.read(cx);
-                document.id() != review.document_id
-                    || document.async_snapshot(cx) != review.source_snapshot
-            })
-            || !review.supporting_sources_current;
-        let Some(output) = review.result.result.output.as_ref() else {
-            content.push(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(i18n::t(i18n::Key::ReviewFailed, cx))
-                    .into_any_element(),
-            );
-            return v_flex()
-                .id("review-panel")
-                .size_full()
-                .p(metrics::inset())
-                .gap(metrics::gap_group())
-                .overflow_y_scroll()
-                .children(content)
-                .into_any_element();
-        };
-        let understanding = output.sections();
-        if !stale {
-            content.push(
-                div()
-                    .id("review-result")
-                    .role(gpui_kit::Role::Label)
-                    .aria_value(i18n::t(i18n::Key::ReviewReady, cx))
-                    .accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID)
-                    .text_sm()
-                    .font_medium()
-                    .child(i18n::t(i18n::Key::ReviewReady, cx))
-                    .into_any_element(),
-            );
-        }
-        if stale {
-            content.push(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().warning)
-                    .child(i18n::t(i18n::Key::ReviewStale, cx))
-                    .into_any_element(),
-            );
-        }
-        if review.selection.is_some() {
-            content.push(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(i18n::t(i18n::Key::ReviewSelectionContextOmitted, cx))
-                    .into_any_element(),
-            );
-        }
-        if review.partial {
-            content.push(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().warning)
-                    .child(i18n::t(i18n::Key::ReviewPartial, cx))
-                    .into_any_element(),
-            );
-        }
-        content.push(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!(
-                    "{} · {} {} · {} {} · {}",
-                    review.result.metadata.provider().label(),
-                    i18n::t(i18n::Key::ReviewRequestedModel, cx),
-                    review.result.metadata.requested_model(),
-                    i18n::t(i18n::Key::ReviewResponseModel, cx),
-                    review.result.metadata.response_model(),
-                    review.result.metadata.prompt_version(),
-                ))
-                .into_any_element(),
-        );
-
-        push_review_text_section(
-            &mut content,
-            i18n::t(i18n::Key::ReviewStatedGoal, cx),
-            understanding.stated_goal.as_str(),
-            cx,
-        );
-        push_review_text_list(
-            &mut content,
-            i18n::t(i18n::Key::ReviewContext, cx),
-            &understanding.relevant_context,
-            cx,
-        );
-        push_review_text_list(
-            &mut content,
-            i18n::t(i18n::Key::ReviewConstraints, cx),
-            &understanding.constraints,
-            cx,
-        );
-        push_review_text_list(
-            &mut content,
-            i18n::t(i18n::Key::ReviewNonGoals, cx),
-            &understanding.non_goals,
-            cx,
-        );
-        push_review_text_section(
-            &mut content,
-            i18n::t(i18n::Key::ReviewDeliverable, cx),
-            understanding.expected_deliverable.as_str(),
-            cx,
-        );
-        push_review_text_list(
-            &mut content,
-            i18n::t(i18n::Key::ReviewSuccessEvidence, cx),
-            &understanding.success_evidence,
-            cx,
-        );
-        push_review_text_list(
-            &mut content,
-            i18n::t(i18n::Key::ReviewAssumptions, cx),
-            &understanding.inferred_assumptions,
-            cx,
-        );
-        push_review_text_list(
-            &mut content,
-            i18n::t(i18n::Key::ReviewDecisions, cx),
-            &understanding.unresolved_decisions,
-            cx,
-        );
-
-        content.push(
-            div()
-                .text_xs()
-                .font_medium()
-                .text_color(cx.theme().muted_foreground)
-                .child(i18n::t(i18n::Key::ReviewFindings, cx))
-                .into_any_element(),
-        );
-        for (ix, finding) in output.findings.iter().enumerate() {
-            let anchor = finding.anchor.clone();
-            let anchor_label = review_anchor_label(&finding.anchor, cx);
-            let kind = match finding.kind {
-                FindingKind::Source | FindingKind::SourceStatement => {
-                    i18n::t(i18n::Key::ReviewSourceStatement, cx)
-                }
-                FindingKind::Inference => i18n::t(i18n::Key::ReviewInference, cx),
-            };
-            let row = ListItem::new(SharedString::from(format!("review-finding-{ix}")))
-                .w_full()
-                .child(
-                    v_flex()
-                        .gap(metrics::gap())
-                        .child(
-                            h_flex()
-                                .gap(metrics::gap())
-                                .child(div().text_xs().font_medium().child(kind))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(anchor_label),
-                                ),
-                        )
-                        .child(div().text_sm().child(finding.text.as_str().to_owned())),
-                );
-            let row = row.on_click(cx.listener(move |this, _, window, cx| {
-                this.reveal_review_anchor(&anchor, window, cx)
-            }));
-            content.push(row.into_any_element());
-        }
-        if output.findings.is_empty() {
-            content.push(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(i18n::t(i18n::Key::ReviewNoFindings, cx))
-                    .into_any_element(),
-            );
-        }
-
-        content.push(
-            div()
-                .text_xs()
-                .font_medium()
-                .text_color(cx.theme().muted_foreground)
-                .child(i18n::t(i18n::Key::ReviewQuestions, cx))
-                .into_any_element(),
-        );
-        for (ix, question) in output.clarification_questions.iter().take(5).enumerate() {
-            let impact = question
-                .impact
-                .as_ref()
-                .map(|impact| impact.as_str().to_owned());
-            content.push(
-                ListItem::new(SharedString::from(format!("review-question-{ix}")))
-                    .w_full()
-                    .child(
-                        v_flex()
-                            .gap(metrics::gap())
-                            .child(div().text_xs().font_medium().child(format!(
-                                "{} {}",
-                                i18n::t(i18n::Key::ReviewPriority, cx),
-                                clarification_priority_label(question.priority, cx)
-                            )))
-                            .child(div().text_sm().child(question.question.as_str().to_owned()))
-                            .when_some(impact, |this, impact| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(impact),
-                                )
-                            }),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if output.clarification_questions.is_empty() {
-            content.push(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(i18n::t(i18n::Key::ReviewNoQuestions, cx))
-                    .into_any_element(),
-            );
-        }
-
-        let active_document_id = self
-            .active_document()
-            .map(|document| document.read(cx).id());
-        let revision_context = self.revision_context.as_ref().filter(|context| {
-            Some(context.document_id) == active_document_id
-                && self
-                    .review_result
-                    .as_ref()
-                    .is_some_and(|review| review.document_id == context.document_id)
-        });
-        if let Some(context) = revision_context {
-            content.push(
-                div()
-                    .id("revision-answers")
-                    .role(gpui::Role::Group)
-                    .aria_label(i18n::t(i18n::Key::RevisionAnswers, cx))
-                    .accessibility_id("markturbo-revision-answers")
-                    .text_xs()
-                    .font_medium()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(i18n::t(i18n::Key::RevisionAnswers, cx))
-                    .into_any_element(),
-            );
-            for (index, question) in output.clarification_questions.iter().enumerate() {
-                let Some(input) = context.answer_inputs.get(index).cloned() else {
-                    continue;
-                };
-                let state = context
-                    .answer_states
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_else(RevisionAnswer::unanswered);
-                let answered = matches!(state, RevisionAnswer::Answered(_));
-                let unanswered_selected = matches!(state, RevisionAnswer::Unanswered);
-                let unspecified_selected =
-                    matches!(state, RevisionAnswer::IntentionallyUnspecified);
-                let question_id = revision_question_accessibility_id(index, question);
-                let question_text = question.question.as_str().to_owned();
-                content.push(
-                    v_flex()
-                        .id(question_id.clone())
-                        .accessibility_id(question_id.clone())
-                        .gap(metrics::gap())
-                        .child(div().text_sm().child(question_text.clone()))
-                        .child(
-                            h_flex()
-                                .gap(metrics::gap())
-                                .flex_wrap()
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "{question_id}-unanswered"
-                                    )))
-                                    .label(i18n::t(i18n::Key::RevisionAnswerUnanswered, cx))
-                                    .xsmall()
-                                    .accessibility_id(SharedString::from(format!(
-                                        "{question_id}-unanswered"
-                                    )))
-                                    .when(unanswered_selected, |button| button.primary())
-                                    .when(!unanswered_selected, |button| button.ghost())
-                                    .disabled(
-                                        self.revision_running || self.revision_result.is_some(),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_revision_answer_state(
-                                            index,
-                                            RevisionAnswer::unanswered(),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "{question_id}-unspecified"
-                                    )))
-                                    .label(i18n::t(
-                                        i18n::Key::RevisionAnswerIntentionallyUnspecified,
-                                        cx,
-                                    ))
-                                    .xsmall()
-                                    .accessibility_id(SharedString::from(format!(
-                                        "{question_id}-unspecified"
-                                    )))
-                                    .when(unspecified_selected, |button| button.primary())
-                                    .when(!unspecified_selected, |button| button.ghost())
-                                    .disabled(
-                                        self.revision_running || self.revision_result.is_some(),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_revision_answer_state(
-                                            index,
-                                            RevisionAnswer::intentionally_unspecified(),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "{question_id}-answered"
-                                    )))
-                                    .label(i18n::t(i18n::Key::RevisionAnswerAnswered, cx))
-                                    .xsmall()
-                                    .accessibility_id(SharedString::from(format!(
-                                        "{question_id}-answered"
-                                    )))
-                                    .when(answered, |button| button.primary())
-                                    .when(!answered, |button| button.ghost())
-                                    .disabled(
-                                        self.revision_running || self.revision_result.is_some(),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        let value = this
-                                            .revision_context
-                                            .as_ref()
-                                            .and_then(|context| context.answer_inputs.get(index))
-                                            .map(|input| input.read(cx).value().to_string())
-                                            .unwrap_or_default();
-                                        this.set_revision_answer_state(
-                                            index,
-                                            RevisionAnswer::answered(value),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                                ),
-                        )
-                        .child(
-                            Input::new(&input)
-                                .small()
-                                .w_full()
-                                .aria_label(question_text)
-                                .accessibility_id(SharedString::from(format!(
-                                    "{question_id}-input"
-                                )))
-                                .disabled(
-                                    !answered
-                                        || self.revision_running
-                                        || self.revision_result.is_some(),
-                                ),
-                        )
-                        .into_any_element(),
-                );
-            }
-            if !self.revision_running && self.revision_result.is_none() {
-                content.push(
-                    h_flex()
-                        .gap(metrics::gap())
-                        .child(
-                            Button::new("revision-run")
-                                .accessibility_id(REVISION_RUN_ACCESSIBILITY_ID)
-                                .label(i18n::t(i18n::Key::RevisionRun, cx))
-                                .small()
-                                .primary()
-                                .disabled(stale)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.start_revision(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("revision-discard-answers")
-                                .label(i18n::t(i18n::Key::RevisionDiscardAnswers, cx))
-                                .small()
-                                .ghost()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.discard_revision_answers(cx);
-                                })),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-        if self.revision_running {
-            content.push(
-                h_flex()
-                    .id("revision-running")
-                    .items_center()
-                    .gap(metrics::gap())
-                    .child(Spinner::new().small())
-                    .child(i18n::t(i18n::Key::RevisionRunning, cx))
-                    .child(
-                        Button::new("revision-cancel")
-                            .icon(IconName::Close)
-                            .xsmall()
-                            .ghost()
-                            .tooltip(i18n::t(i18n::Key::Cancel, cx))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.on_cancel_revision(cx);
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if let Some(diagnostic) = &self.revision_diagnostic {
-            content.push(
-                div()
-                    .id("revision-diagnostic")
-                    .accessibility_id("markturbo-revision-diagnostic")
-                    .text_sm()
-                    .text_color(cx.theme().warning)
-                    .child(diagnostic.clone())
-                    .into_any_element(),
-            );
-            if revision_context.is_some() && !self.revision_running {
-                content.push(
-                    h_flex()
-                        .gap(metrics::gap())
-                        .child(
-                            Button::new("revision-retry")
-                                .accessibility_id(REVISION_RETRY_ACCESSIBILITY_ID)
-                                .label(i18n::t(i18n::Key::RevisionRetry, cx))
-                                .small()
-                                .primary()
-                                .disabled(stale)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.start_revision(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("revision-dismiss")
-                                .accessibility_id(REVISION_DISMISS_ACCESSIBILITY_ID)
-                                .label(i18n::t(i18n::Key::RevisionDismiss, cx))
-                                .small()
-                                .ghost()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.dismiss_revision(cx);
-                                })),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-        let applied_awaiting_save = self.revision_applied_state_is_current_for_render(cx);
-        if let Some(revision) = &self.revision_result {
-            let revision_stale = !self.revision_result_is_current(revision, cx);
-            if revision_stale {
-                content.push(
-                    div()
-                        .id("revision-stale")
-                        .test_support()
-                        .accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)
-                        .role(gpui::Role::Label)
-                        .aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))
-                        .text_xs()
-                        .text_color(cx.theme().warning)
-                        .child(i18n::t(i18n::Key::RevisionStaleInspection, cx))
-                        .into_any_element(),
-                );
-            }
-            content.push(
-                div()
-                    .id("revision-result")
-                    .role(gpui::Role::Group)
-                    .aria_label(i18n::t(i18n::Key::RevisionResult, cx))
-                    .accessibility_id("markturbo-revision-result")
-                    .text_sm()
-                    .font_medium()
-                    .text_color(if revision_stale {
-                        cx.theme().warning
-                    } else {
-                        cx.theme().foreground
-                    })
-                    .child(i18n::t(
-                        if applied_awaiting_save {
-                            i18n::Key::RevisionAppliedSavePending
-                        } else if revision_stale {
-                            i18n::Key::RevisionStaleInspection
-                        } else {
-                            i18n::Key::RevisionResult
-                        },
-                        cx,
-                    ))
-                    .into_any_element(),
-            );
-            content.push(
-                h_flex()
-                    .gap(metrics::gap())
-                    .flex_wrap()
-                    .child(
-                        Button::new("revision-accept-all")
-                            .accessibility_id(REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)
-                            .label(i18n::t(i18n::Key::RevisionAcceptAll, cx))
-                            .small()
-                            .primary()
-                            .disabled(revision_stale)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_all_revision_decisions(true, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("revision-reject-all")
-                            .accessibility_id(REVISION_REJECT_ALL_ACCESSIBILITY_ID)
-                            .label(i18n::t(i18n::Key::RevisionRejectAll, cx))
-                            .small()
-                            .ghost()
-                            .disabled(revision_stale)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_all_revision_decisions(false, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("revision-copy")
-                            .accessibility_id(REVISION_COPY_ACCESSIBILITY_ID)
-                            .label(i18n::t(i18n::Key::RevisionCopy, cx))
-                            .small()
-                            .outline()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.copy_revision(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("revision-apply")
-                            .accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)
-                            .label(i18n::t(i18n::Key::RevisionApply, cx))
-                            .small()
-                            .primary()
-                            .disabled(revision_stale)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.apply_revision(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("revision-save")
-                            .accessibility_id(REVISION_SAVE_ACCESSIBILITY_ID)
-                            .label(i18n::t(i18n::Key::Save, cx))
-                            .small()
-                            .outline()
-                            .disabled(!applied_awaiting_save)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_revision(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("revision-save-as")
-                            .accessibility_id(REVISION_SAVE_AS_ACCESSIBILITY_ID)
-                            .label(i18n::t(i18n::Key::SaveAsPicker, cx))
-                            .small()
-                            .outline()
-                            .disabled(!applied_awaiting_save)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_as_revision(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("revision-dismiss-result")
-                            .accessibility_id(REVISION_RESULT_DISMISS_ACCESSIBILITY_ID)
-                            .label(i18n::t(i18n::Key::RevisionDismiss, cx))
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dismiss_revision(cx);
-                            })),
-                    )
-                    .into_any_element(),
-            );
-            let proposal = revision.result.proposal();
-            for change_id in revision_change_ids(proposal) {
-                let accepted = revision
-                    .decisions
-                    .iter()
-                    .find(|(id, _)| *id == change_id)
-                    .is_some_and(|(_, accepted)| *accepted);
-                let change_hunks: Vec<_> = proposal
-                    .hunks()
-                    .iter()
-                    .filter(|hunk| hunk.change_id() == change_id)
-                    .collect();
-                let rationale = change_hunks
-                    .first()
-                    .map(|hunk| hunk.rationale().to_owned())
-                    .unwrap_or_default();
-                let change_id_for_accept = change_id;
-                let change_id_for_reject = change_id;
-                let mut group =
-                    v_flex()
-                        .id(SharedString::from(format!(
-                            "revision-change-{}",
-                            change_id.0
-                        )))
-                        .role(gpui::Role::Group)
-                        .aria_label(SharedString::from(format!(
-                            "{} {}",
-                            i18n::t(i18n::Key::RevisionChange, cx),
-                            change_id.0
-                        )))
-                        .accessibility_id(SharedString::from(format!(
-                            "markturbo-revision-change-{}",
-                            change_id.0
-                        )))
-                        .gap(metrics::gap())
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .p(metrics::inset())
-                        .child(div().text_sm().font_medium().child(format!(
-                            "{} {} · {}",
-                            i18n::t(i18n::Key::RevisionChange, cx),
-                            change_id.0,
-                            i18n::t(
-                                if accepted {
-                                    i18n::Key::RevisionChangeAccepted
-                                } else {
-                                    i18n::Key::RevisionChangeRejected
-                                },
-                                cx,
-                            )
-                        )))
-                        .child(div().text_xs().child(format!(
-                            "{}: {rationale}",
-                            i18n::t(i18n::Key::RevisionRationale, cx)
-                        )))
-                        .child(
-                            h_flex()
-                                .gap(metrics::gap())
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "revision-change-{}-accept",
-                                        change_id.0
-                                    )))
-                                    .label(i18n::t(i18n::Key::RevisionAccept, cx))
-                                    .xsmall()
-                                    .accessibility_id(SharedString::from(format!(
-                                        "markturbo-revision-change-{}-accept",
-                                        change_id.0
-                                    )))
-                                    .when(accepted, |button| button.primary())
-                                    .when(!accepted, |button| button.ghost())
-                                    .disabled(revision_stale)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_revision_decision(change_id_for_accept, true, cx);
-                                    })),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "revision-change-{}-reject",
-                                        change_id.0
-                                    )))
-                                    .label(i18n::t(i18n::Key::RevisionReject, cx))
-                                    .xsmall()
-                                    .accessibility_id(SharedString::from(format!(
-                                        "markturbo-revision-change-{}-reject",
-                                        change_id.0
-                                    )))
-                                    .when(!accepted, |button| button.primary())
-                                    .when(accepted, |button| button.ghost())
-                                    .disabled(revision_stale)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_revision_decision(change_id_for_reject, false, cx);
-                                    })),
-                                ),
-                        );
-                for hunk in change_hunks {
-                    group = group.child(div().text_xs().child(format!(
-                        "{}..{}: {} -> {}",
-                        hunk.source().start,
-                        hunk.source().end,
-                        hunk.expected_source(),
-                        hunk.replacement()
-                    )));
-                }
-                content.push(group.into_any_element());
-            }
-            let preview: SharedString = self.revision_preview().unwrap_or_default().into();
-            content.push(
-                v_flex()
-                    .id("revision-preview")
-                    .role(gpui::Role::Group)
-                    .aria_label(i18n::t(i18n::Key::RevisionFinalPreview, cx))
-                    .accessibility_id("markturbo-revision-preview")
-                    .gap(metrics::gap())
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_medium()
-                            .child(i18n::t(i18n::Key::RevisionFinalPreview, cx)),
-                    )
-                    .child(
-                        div()
-                            .id("revision-preview-source")
-                            .role(gpui::Role::Label)
-                            .aria_label(i18n::t(i18n::Key::RevisionFinalPreviewSource, cx))
-                            .aria_value(preview.clone())
-                            .accessibility_id("markturbo-revision-preview-source")
-                            .text_xs()
-                            .font_family("monospace")
-                            .child(preview),
-                    )
-                    .into_any_element(),
-            );
-            content.push(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{} {}",
-                        revision.result.question_coverage().len(),
-                        i18n::t(i18n::Key::RevisionCoverageValidated, cx)
-                    ))
-                    .into_any_element(),
-            );
-            for coverage in revision.result.question_coverage() {
-                let status = match coverage.status() {
-                    RevisionQuestionCoverageStatus::Represented { change_ids } => {
-                        format!(
-                            "{} {:?}",
-                            i18n::t(i18n::Key::RevisionCoverageRepresented, cx),
-                            change_ids
-                        )
-                    }
-                    RevisionQuestionCoverageStatus::IntentionallyOmitted { reason } => {
-                        format!(
-                            "{}: {reason}",
-                            i18n::t(i18n::Key::RevisionCoverageIntentionallyOmitted, cx)
-                        )
-                    }
-                    RevisionQuestionCoverageStatus::NotAddressed => {
-                        i18n::t(i18n::Key::RevisionCoverageNotAddressed, cx).to_owned()
-                    }
-                };
-                content.push(
-                    div()
-                        .text_xs()
-                        .child(format!(
-                            "{} {}: {status}",
-                            i18n::t(i18n::Key::RevisionCoverageQuestion, cx),
-                            coverage.question_index()
-                        ))
-                        .into_any_element(),
-                );
-            }
-        }
-
-        v_flex()
-            .id("review-panel")
-            .size_full()
-            .p(metrics::inset())
-            .gap(metrics::gap_group())
-            .overflow_y_scroll()
-            .children(content)
-            .into_any_element()
-    }
-
     fn render_document_details(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let (title, kind, location, status) = {
             let document = self.active_document()?.read(cx);
@@ -9218,28 +3511,20 @@ impl Workspace {
         if !self.right_panel_open {
             return None;
         }
-        let review_belongs_to_active_document = self.active_document().is_some_and(|document| {
-            let document_id = document.read(cx).id();
-            self.review_result
-                .as_ref()
-                .is_some_and(|result| result.document_id == document_id)
-                || self
-                    .review_diagnostic
-                    .as_ref()
-                    .is_some_and(|diagnostic| diagnostic.document_id == document_id)
+        let active_document_id = self
+            .active_document()
+            .map(|document| document.read(cx).id());
+        let review_belongs_to_active_document = active_document_id.is_some_and(|document_id| {
+            self.review_flow.review_result_belongs_to(document_id)
+                || self.review_flow.review_diagnostic_belongs_to(document_id)
         });
-        let review_target_belongs_to_active_document = self.review_target.is_some()
-            && self.review_target_document_id
-                == self
-                    .active_document()
-                    .map(|document| document.read(cx).id());
-        let pending_review_belongs_to_active_document =
-            self.pending_review.as_ref().is_some_and(|pending| {
-                self.active_document()
-                    .is_some_and(|document| document.read(cx).id() == pending.document_id)
-            });
-        if self.review_panel_open
-            && ((self.reviewing && pending_review_belongs_to_active_document)
+        let review_target_belongs_to_active_document = active_document_id
+            .and_then(|document_id| self.review_flow.review_target_for_document(document_id))
+            .is_some();
+        let pending_review_belongs_to_active_document = active_document_id
+            .is_some_and(|document_id| self.review_flow.pending_review_belongs_to(document_id));
+        if self.review_flow.review_panel_is_open()
+            && ((self.review_flow.is_reviewing() && pending_review_belongs_to_active_document)
                 || review_target_belongs_to_active_document
                 || review_belongs_to_active_document)
         {
@@ -9251,19 +3536,19 @@ impl Workspace {
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.dismiss_review(cx);
                 }));
-            let review_panel = if self.review_result.is_none()
-                && !self.reviewing
-                && self.revision_context.is_none()
-                && self.review_diagnostic.is_none()
+            let review_panel = if self.review_flow.review_result().is_none()
+                && !self.review_flow.is_reviewing()
+                && !self.review_flow.has_revision_context()
+                && self.review_flow.review_diagnostic().is_none()
                 && self
                     .recovered_revision_answers_for_active_document(cx)
                     .is_some()
             {
                 self.render_recovered_revision_panel(cx)
-            } else if self.review_result.is_none()
-                && !self.reviewing
-                && self.revision_context.is_none()
-                && self.review_diagnostic.is_none()
+            } else if self.review_flow.review_result().is_none()
+                && !self.review_flow.is_reviewing()
+                && !self.review_flow.has_revision_context()
+                && self.review_flow.review_diagnostic().is_none()
             {
                 self.render_review_idle_panel(cx)
             } else {
@@ -9459,80 +3744,20 @@ impl Workspace {
         let Some(doc) = self.active_document().cloned() else {
             return;
         };
-        // The outline and the search results both land here, and both are the
-        // kind of jump a user expects Back to undo.
-        if let Some(path) = doc.read(cx).source_path() {
-            self.record_visit(path.to_path_buf(), offset);
+        // Path-only history cannot navigate a recovered buffer by its source
+        // path without selecting a different, ordinary file tab.
+        if let Some(path) = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.path())
+            .map(Path::to_path_buf)
+        {
+            self.record_visit(path, offset);
         }
         doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
     }
 
-    /// Navigate a provider finding only through the frozen source it was
-    /// validated against. A package path is first looked up in that inventory,
-    /// then reconstructed from normalized components under the Skill root.
-    fn reveal_review_anchor(
-        &mut self,
-        anchor: &SourceAnchor,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(review) = &self.review_result else {
-            return;
-        };
-        let document_id = review.document_id;
-        let supporting_sources_current = review.supporting_sources_current;
-        let document_current = self.active_document().is_some_and(|document| {
-            let document = document.read(cx);
-            document.id() == document_id && document.async_snapshot(cx) == review.source_snapshot
-        });
-        if !document_current || !supporting_sources_current {
-            self.set_status(i18n::t(i18n::Key::ReviewStale, cx).into(), cx);
-            return;
-        }
-
-        if let Some(offset) = resolve_document_anchor_offset(anchor, review.source_snapshot.text())
-        {
-            self.reveal_offset(offset, window, cx);
-            return;
-        }
-
-        let Some(skill_package) = review.skill_package.clone() else {
-            return;
-        };
-        if self.has_dirty_skill_supporting_document(&skill_package, cx)
-            || skill_package.revalidate().is_err()
-        {
-            self.mark_review_skill_package_stale(cx);
-            return;
-        }
-        let Some((path, offset)) = skill_package.resolve_anchor(anchor) else {
-            return;
-        };
-        let is_skill_entrypoint_anchor =
-            matches!(anchor, SourceAnchor::AgentSkillFile { path, .. } if path == "SKILL.md");
-        let editor_only_entrypoint_anchor =
-            skill_package.entrypoint_is_editor_text() && is_skill_entrypoint_anchor;
-        if editor_only_entrypoint_anchor {
-            // The active document and this result were checked against the same
-            // immutable snapshot above. In particular, editor-only SKILL.md
-            // anchors must reveal that dirty buffer rather than reopening the
-            // entrypoint through its canonical pathname.
-            self.reveal_offset(offset, window, cx);
-            return;
-        }
-        if is_skill_entrypoint_anchor {
-            // A disk-backed SKILL.md is also the active source document whose
-            // identity and text snapshot were verified above. Keep navigation
-            // on that tab rather than reopening the frozen package pathname.
-            self.reveal_offset(offset, window, cx);
-            return;
-        }
-        self.open_frozen_supporting_file(&skill_package, path, offset, window, cx);
-    }
-
-    /// Open a search result as a preview and put the cursor at its offset.
-    /// Search results are ordinary workspace paths; Agent Skill anchors use
-    /// the frozen-package path above instead.
+    /// Open a file-targeted search result as a preview at its source offset.
     fn reveal_in(
         &mut self,
         path: PathBuf,
@@ -9540,10 +3765,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_file_as(path.clone(), true, window, cx);
-        let Some(document) = self.active_document().cloned() else {
+        if !self.open_file_as(path.clone(), true, window, cx) {
+            return;
+        }
+        let Some(tab) = self.tabs.active() else {
             return;
         };
+        if !matches!(&tab.identity, TabIdentity::File(current) if current == &path) {
+            return;
+        }
+        let document = tab.payload.view.clone();
         if document.read(cx).source_path() != Some(path.as_path()) {
             return;
         }
@@ -9553,12 +3784,40 @@ impl Workspace {
         });
     }
 
-    fn mark_review_skill_package_stale(&mut self, cx: &mut Context<Self>) {
-        if let Some(review) = &mut self.review_result {
-            review.supporting_sources_current = false;
-            review.result.result.status = ReviewStatus::Stale;
+    /// Search hits in recovered-only tabs identify the open buffer, not its
+    /// source path. A closed result is inert; reopening that path would reveal
+    /// a different document's text. Path-only history cannot represent this
+    /// tab without redirecting Back to the ordinary file.
+    fn reveal_open_document(
+        &mut self,
+        id: DocumentId,
+        source_path: &Path,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.document_index(id, cx) else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(ix) else {
+            return;
+        };
+        if !matches!(&tab.identity, TabIdentity::Recovered(_))
+            || tab.payload.view.read(cx).source_path() != Some(source_path)
+        {
+            return;
         }
-        self.set_status(i18n::t(i18n::Key::ReviewStale, cx).into(), cx);
+        if !self.tabs.focus(ix) {
+            return;
+        }
+        let document = self
+            .document_at(ix)
+            .cloned()
+            .expect("a focused document index must exist");
+        document.update(cx, |document, cx| {
+            document.reveal_offset(offset, window, cx)
+        });
+        self.web_dirty(cx);
         cx.notify();
     }
 
@@ -9594,22 +3853,35 @@ impl Workspace {
         use crate::views::search::Scope;
 
         let mut corpus = Corpus::default();
+        let add_open = |corpus: &mut Corpus, identity: &TabIdentity, doc: &DocumentView| {
+            let (path, target) = match identity {
+                TabIdentity::File(path) => (path.as_path(), SearchTarget::File),
+                TabIdentity::Recovered(_) => {
+                    let Some(path) = doc.source_path() else {
+                        return;
+                    };
+                    (path, SearchTarget::OpenDocument(doc.id()))
+                }
+                TabIdentity::Memory(_) => return,
+            };
+            corpus.open.push(OpenSnapshot {
+                path: path.to_path_buf(),
+                text: doc.text(cx),
+                target,
+            });
+        };
         let add_open_tabs = |corpus: &mut Corpus| {
             for tab in self.tabs.iter() {
                 let doc = tab.payload.view.read(cx);
-                if let Some(path) = tab.path() {
-                    corpus.open.push((path.to_path_buf(), doc.text(cx)));
-                }
+                add_open(corpus, &tab.identity, doc);
             }
         };
 
         match self.search.read(cx).scope() {
             Scope::Document => {
-                if let Some(doc) = self.active_document() {
-                    let doc = doc.read(cx);
-                    if let Some(path) = doc.source_path() {
-                        corpus.open.push((path.to_path_buf(), doc.text(cx)));
-                    }
+                if let Some(tab) = self.tabs.active() {
+                    let doc = tab.payload.view.read(cx);
+                    add_open(&mut corpus, &tab.identity, doc);
                 }
             }
             Scope::OpenTabs => add_open_tabs(&mut corpus),
@@ -9693,24 +3965,41 @@ impl Workspace {
             .selected_index(self.tabs.active_index())
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let doc = tab.payload.view.read(cx);
-                let path = tab.path().map(Path::to_path_buf);
-                let full = path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|| "Unsaved document".to_string());
+                let recovered_only = matches!(&tab.identity, TabIdentity::Recovered(_));
+                let tab_path = tab.path();
+                // Recovered identities stay pathless in `Tabs`; only file
+                // affordances may consult their payload's original source.
+                let recovered_path = recovered_only.then(|| doc.source_path()).flatten();
+                let action_path = tab_path.or(recovered_path);
+                let document_title = doc.title(cx);
+                let recovered_prefix = i18n::t(i18n::Key::RecoveredSnapshot, cx);
+                let recovered_index = ix + 1;
+                let full = if recovered_only {
+                    let location = recovered_path
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|| document_title.clone());
+                    format!("{recovered_index} {recovered_prefix}: {location}")
+                } else {
+                    tab_path
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|| "Unsaved document".to_string())
+                };
                 // Relative only makes sense with a folder open, and only for a
                 // file actually under it — a globally-discovered skill is not.
-                let relative = path
-                    .as_deref()
+                let relative = action_path
                     .zip(root.as_deref())
                     .and_then(|(path, root)| path.strip_prefix(root).ok())
                     .map(|rest| rest.to_string_lossy().replace('\\', "/"));
-                let is_preview = path
-                    .as_deref()
-                    .is_some_and(|path| self.tabs.is_preview(path));
+                let is_preview = tab_path.is_some_and(|path| self.tabs.is_preview(path));
                 let dirty = doc.is_dirty();
                 let active_single_document = self.tabs.len() == 1 && self.tabs.active_index() == ix;
-                let label = elide_tab_label(&doc.title(cx));
+                let label = if recovered_only {
+                    elide_tab_label(&format!(
+                        "{recovered_index} {recovered_prefix}: {document_title}"
+                    ))
+                } else {
+                    elide_tab_label(&document_title)
+                };
                 let aria_label = if dirty {
                     format!("{label}, {}", i18n::t(i18n::Key::UnsavedChanges, cx))
                 } else {
@@ -9723,7 +4012,7 @@ impl Workspace {
                     .when(doc.is_externally_changed(), |tab| {
                         tab.icon(IconName::TriangleAlert)
                     })
-                    .when(!web_active && path.is_some(), |tab| {
+                    .when(!web_active && action_path.is_some(), |tab| {
                         tab.child(
                             div()
                                 .id(SharedString::from(format!("tab-affordances-{ix}")))
@@ -9822,268 +4111,6 @@ impl Workspace {
                 this.web_dirty(cx);
                 cx.notify();
             }))
-    }
-
-    fn render_welcome(&self, cx: &Context<Self>) -> AnyElement {
-        let recents = crate::settings::AppSettings::global(cx)
-            .recent_targets
-            .clone();
-        let sample_available = self.welcome_sample_available;
-
-        v_flex()
-            .id("welcome")
-            .role(gpui_kit::Role::Group)
-            .aria_label(i18n::t(i18n::Key::WelcomeTitle, cx))
-            .size_full()
-            .min_h_0()
-            .items_center()
-            .overflow_y_scroll()
-            .track_scroll(&self.welcome_scroll)
-            .px_6()
-            .py_8()
-            .child(
-                v_flex()
-                    .w(px(560.))
-                    .max_w_full()
-                    .flex_shrink_0()
-                    .gap_3()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(Icon::new(IconName::BookOpen).large())
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_lg()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(i18n::t(i18n::Key::WelcomeTitle, cx)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(i18n::t(i18n::Key::WelcomeSubtitle, cx)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("welcome-new")
-                                    .icon(IconName::Plus)
-                                    .label(i18n::t(i18n::Key::NewDocument, cx))
-                                    .accessibility_id(WELCOME_NEW_ACCESSIBILITY_ID)
-                                    .primary()
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_new_document(&NewDocument, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-paste")
-                                    .icon(IconName::Copy)
-                                    .label(i18n::t(i18n::Key::Paste, cx))
-                                    .accessibility_id(WELCOME_PASTE_ACCESSIBILITY_ID)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_paste_into_new(&PasteIntoNew, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-open-file")
-                                    .icon(IconName::File)
-                                    .label(i18n::t(i18n::Key::OpenFilePicker, cx))
-                                    .accessibility_id(WELCOME_OPEN_FILE_ACCESSIBILITY_ID)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_open_file(&OpenFile, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-open-folder")
-                                    .icon(IconName::FolderOpen)
-                                    .label(i18n::t(i18n::Key::OpenFolderPicker, cx))
-                                    .accessibility_id(WELCOME_OPEN_FOLDER_ACCESSIBILITY_ID)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_open_folder(&OpenFolder, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("welcome-open-sample")
-                                    .icon(IconName::BookOpen)
-                                    .label(i18n::t(i18n::Key::OpenBundledSample, cx))
-                                    .accessibility_id(WELCOME_OPEN_SAMPLE_ACCESSIBILITY_ID)
-                                    .disabled(!sample_available)
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_bundled_sample(window, cx);
-                                    })),
-                            ),
-                    )
-                    .when(!recents.is_empty(), |this| {
-                        this.child(
-                            v_flex()
-                                .mt_4()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(i18n::t(i18n::Key::Recent, cx)),
-                                )
-                                .children(recents.into_iter().map(|target| {
-                                    let issue = self.welcome_recent_target_issue(&target);
-                                    let path_text = target.path.to_string_lossy().into_owned();
-                                    let label = if target.display_name.is_empty() {
-                                        path_text.clone()
-                                    } else {
-                                        target
-                                            .path
-                                            .parent()
-                                            .map(|parent| {
-                                                format!(
-                                                    "{}  {}",
-                                                    target.display_name,
-                                                    parent.display()
-                                                )
-                                            })
-                                            .unwrap_or_else(|| target.display_name.clone())
-                                    };
-                                    let open_label =
-                                        i18n::open_recent_target_label(&target.path, cx);
-                                    let remove_label =
-                                        i18n::remove_recent_target_label(&target.path, cx);
-                                    let identity =
-                                        RecoveryKey::for_path(&target.path).as_str().to_owned();
-                                    let path = target.path.clone();
-                                    let remove_path = path.clone();
-                                    let open_id =
-                                        SharedString::from(format!("welcome-recent-{identity}"));
-                                    let open_accessibility_id = SharedString::from(format!(
-                                        "markturbo-welcome-recent-{identity}"
-                                    ));
-                                    let remove_id = SharedString::from(format!(
-                                        "welcome-recent-remove-{identity}"
-                                    ));
-                                    let status_id = SharedString::from(format!(
-                                        "markturbo-welcome-recent-status-{identity}"
-                                    ));
-                                    let icon = match target.kind {
-                                        mt_core::settings::RecentTargetKind::File => IconName::File,
-                                        mt_core::settings::RecentTargetKind::Workspace => {
-                                            IconName::Folder
-                                        }
-                                    };
-                                    let open_button = if issue.is_some() {
-                                        BaseButton::new(open_id)
-                                            .role(gpui_kit::Role::Button)
-                                            .disabled(true)
-                                            .accessibility_label(open_label)
-                                            .accessibility_id(open_accessibility_id)
-                                            .a11y_synthetic_children(|builder| {
-                                                builder.parent_node().set_disabled();
-                                            })
-                                            .styles(|styles| {
-                                                styles.disabled(|style| {
-                                                    style
-                                                        .bg(cx
-                                                            .theme()
-                                                            .input_background()
-                                                            .opacity(0.5))
-                                                        .border_color(cx.theme().input.opacity(0.5))
-                                                        .text_color(
-                                                            cx.theme()
-                                                                .muted_foreground
-                                                                .opacity(0.5),
-                                                        )
-                                                        .shadow_none()
-                                                })
-                                            })
-                                            .flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .h_8()
-                                            .px_2p5()
-                                            .gap_2()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(cx.theme().radius)
-                                            .border_1()
-                                            .child(Icon::new(icon).small())
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .truncate()
-                                                    .child(label.clone()),
-                                            )
-                                            .into_any_element()
-                                    } else {
-                                        Button::new(open_id)
-                                            .icon(icon)
-                                            .label(label.clone())
-                                            .accessibility_label(open_label)
-                                            .tooltip(path_text.clone())
-                                            .accessibility_id(open_accessibility_id)
-                                            .flex_1()
-                                            .min_w_0()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_recent_target(&path, window, cx);
-                                            }))
-                                            .into_any_element()
-                                    };
-                                    h_flex()
-                                        .w_full()
-                                        .gap_1()
-                                        .items_center()
-                                        .child(open_button)
-                                        .when_some(issue, move |this, issue| {
-                                            let label = i18n::t(issue, cx);
-                                            this.child(
-                                                div()
-                                                    .id(status_id.clone())
-                                                    .role(gpui_kit::Role::Label)
-                                                    .aria_value(label)
-                                                    .accessibility_id(status_id)
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(label),
-                                            )
-                                        })
-                                        .child(
-                                            Button::new(remove_id)
-                                                .icon(IconName::Close)
-                                                .accessibility_label(remove_label)
-                                                .accessibility_id(SharedString::from(format!(
-                                                    "markturbo-welcome-recent-remove-{identity}"
-                                                )))
-                                                .small()
-                                                .ghost()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.remove_recent_target(&remove_path, cx);
-                                                })),
-                                        )
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("welcome-dont-show-again")
-                            .label(i18n::t(i18n::Key::DontShowWelcomeAgain, cx))
-                            .accessibility_id(WELCOME_DONT_SHOW_ACCESSIBILITY_ID)
-                            .text()
-                            .w_full()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.dont_show_welcome_again(window, cx);
-                            })),
-                    ),
-            )
-            .into_any_element()
     }
 
     fn render_web_path_controls(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -10325,7 +4352,7 @@ impl Workspace {
                         IconName::Search,
                         i18n::t(i18n::Key::Review, cx),
                     )
-                    .loading(self.reviewing)
+                    .loading(self.review_flow.is_reviewing())
                     .when(tooltips, |button| {
                         button.tooltip(i18n::t(i18n::Key::Review, cx))
                     })
@@ -10561,8 +4588,8 @@ impl Workspace {
             cx,
         );
         let status = self
-            .recovery_warning
-            .clone()
+            .recovery_warning()
+            .map(str::to_owned)
             .or_else(|| self.status.clone());
 
         h_flex()
@@ -10859,7 +4886,7 @@ impl Render for Workspace {
             .aria_label("markturbo workspace")
             .track_focus(&self.focus_handle)
             .key_context(if self.show_welcome && !self.settings_open {
-                WELCOME_KEY_CONTEXT
+                welcome::WELCOME_KEY_CONTEXT
             } else {
                 "Workspace"
             })
@@ -10917,8 +4944,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewDocument, None),
         KeyBinding::new("ctrl-n", NewDocument, None),
-        KeyBinding::new("cmd-v", PasteIntoNew, Some(WELCOME_KEY_CONTEXT)),
-        KeyBinding::new("ctrl-v", PasteIntoNew, Some(WELCOME_KEY_CONTEXT)),
+        KeyBinding::new("cmd-v", PasteIntoNew, Some(welcome::WELCOME_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteIntoNew, Some(welcome::WELCOME_KEY_CONTEXT)),
         KeyBinding::new("cmd-o", OpenFile, None),
         KeyBinding::new("ctrl-o", OpenFile, None),
         KeyBinding::new("cmd-shift-o", OpenFolder, None),
@@ -10967,6 +4994,8 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    mod welcome;
+
     use std::{
         cell::RefCell,
         collections::{HashMap, HashSet},
@@ -10987,11 +5016,11 @@ mod tests {
     use super::{
         DestructiveAction, DestructiveRequest, DestructiveResolution, DetailsContent,
         DirtyDecision, DocumentRecoveryState, DocumentView, RecoveryAttempt,
-        RecoveryContentIdentity, RetirementCompletion, ReviewRequestBuildError, ReviewTarget,
-        SaveAsMode, SaveAsOutcome, SaveMode, SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace,
+        RecoveryContentIdentity, ReviewRequestBuildError, ReviewTarget, SaveAsMode, SaveAsOutcome,
+        SaveMode, SearchEvent, SearchTarget, SidePanel, StartupRecovery, TAB_LABEL_MAX, Workspace,
         WorkspaceResizeEdge, checkpoint_batch_status, clamped_dragged_panel_width,
-        current_checkpoint_write_completed, current_checkpoint_write_completed_for_identity,
-        details_content, document_details_status_key, elide_tab_label, hex_bytes, next_review_lens,
+        current_checkpoint_write_completed_for_identity, details_content,
+        document_details_status_key, elide_tab_label, hex_bytes, next_review_lens,
         path_affects_harness, prepare_recovery_records, resolved_workspace_panel_widths,
         revision_answer_is_incorporated, revision_apply_identity_matches, startup_recovery_status,
     };
@@ -11008,16 +5037,18 @@ mod tests {
         CheckpointBatchOutcome, CheckpointOutcome, CheckpointSchedule, RecoveredRecord,
         RecoveryCheckpoint, RecoveryError, RecoveryIssue, RecoveryKey, RecoveryLimits,
         RecoveryMaintenance, RecoveryMetadata, RecoveryProtector, RecoveryRecord, RecoveryScan,
-        RecoveryStore, RecoveryToken, RevisionRecovery,
+        RecoveryStore, RecoveryToken, RetirementCompletion, RevisionRecovery,
     };
     use mt_core::review::provider::{
         RevisionAnswer, RevisionAnswers, RevisionQuestionCoverageStatus, decode_revision_capture,
+        revision_question_id,
     };
     use mt_core::review::revision::ChangeId;
     use mt_core::review::{
         ArtifactLens, ClarificationPriority, ClarificationQuestion, ReviewDiagnosticCode,
         ReviewModelOutput, ReviewSections, SourceAnchor, SourceLocation, SourceSnapshot,
     };
+    use mt_core::workspace::search::{Query, Results, search_files, search_open_document};
     use mt_core::workspace::watcher::Change;
 
     fn build_document_review_request(
@@ -11105,25 +5136,28 @@ mod tests {
                 .source
                 .package()
                 .is_some_and(mt_core::review::SkillPackage::is_partial);
-            workspace.review_result = Some(super::WorkspaceReviewResult {
-                document_id,
-                source_snapshot,
-                target: ReviewTarget::Document,
-                selection: None,
-                lens: ArtifactLens::AgentSkill,
-                partial,
-                skill_package: Some(skill_package),
-                supporting_sources_current: true,
-                result: mt_core::review::provider::ReviewTransportResult {
-                    result,
-                    metadata: mt_core::review::provider::ReviewMetadata::from_response(
-                        mt_core::model::Provider::OpenAiResponses,
-                        "test-model",
-                        "test-model",
-                    )
-                    .unwrap(),
+            workspace.review_flow.install_review_result(
+                super::WorkspaceReviewResult {
+                    document_id,
+                    source_snapshot,
+                    target: ReviewTarget::Document,
+                    selection: None,
+                    lens: ArtifactLens::AgentSkill,
+                    partial,
+                    skill_package: Some(skill_package),
+                    supporting_sources_current: true,
+                    result: mt_core::review::provider::ReviewTransportResult {
+                        result,
+                        metadata: mt_core::review::provider::ReviewMetadata::from_response(
+                            mt_core::model::Provider::OpenAiResponses,
+                            "test-model",
+                            "test-model",
+                        )
+                        .unwrap(),
+                    },
                 },
-            });
+                false,
+            );
         });
         anchor
     }
@@ -11139,19 +5173,32 @@ mod tests {
         cx: &mut TestAppContext,
         initial: Option<PathBuf>,
     ) -> (Entity<Workspace>, &mut VisualTestContext) {
-        let (workspace, cx) =
-            open_test_workspace_with_startup_recovery(cx, initial, StartupRecovery::default);
-        cx.run_until_parked();
         let recovery_root = tempfile::tempdir().unwrap();
         let recovery = RecoveryStore::new_at(
             recovery_root.path().join("store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, initial, recovery);
         workspace.update(cx, |workspace, _| {
-            workspace.startup_recovery_pending = false;
-            workspace.recovery = Some(recovery);
             workspace._test_recovery_root = Some(recovery_root);
+        });
+        (workspace, cx)
+    }
+
+    fn open_test_workspace_with_recovery_store(
+        cx: &mut TestAppContext,
+        initial: Option<PathBuf>,
+        recovery: RecoveryStore,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        // Preserve the settled empty-startup path; store-owning tests inject
+        // their store once that arbitration has completed.
+        let (workspace, cx) =
+            open_test_workspace_with_startup_recovery(cx, initial, StartupRecovery::default);
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery_flow.startup_recovery_pending = false;
+            workspace.recovery_flow.recovery = Some(recovery);
         });
         (workspace, cx)
     }
@@ -11352,6 +5399,66 @@ mod tests {
         store.checkpoint(&checkpoint, &HashSet::new()).unwrap();
     }
 
+    fn emit_search_reveal(
+        workspace: &Entity<Workspace>,
+        event: SearchEvent,
+        cx: &mut VisualTestContext,
+    ) {
+        let search = workspace.read_with(cx, |workspace, _| workspace.search.clone());
+        search.update(cx, |_, cx| cx.emit(event));
+    }
+
+    fn restore_open_file_checkpoint(
+        workspace: &Entity<Workspace>,
+        path: &Path,
+        store: &RecoveryStore,
+        cx: &mut VisualTestContext,
+    ) -> (mt_core::document::lifecycle::DocumentId, usize) {
+        let live = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.tabs.iter().find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::File(open_path)
+                        if open_path.as_path() == path =>
+                    {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .expect("the ordinary source tab");
+        live.update(cx, |document, _| document.rotate_recovery_key());
+
+        let scan = store.recover().unwrap();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert_eq!(
+                    restore_recovery_for_test(workspace, scan, window, cx),
+                    (1, 0)
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let key = RecoveryKey::for_path(path);
+        let (id, index) = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(index, tab)| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::Recovered(recovered_key)
+                        if recovered_key == &key =>
+                    {
+                        Some((tab.payload.view.read(app).id(), index))
+                    }
+                    _ => None,
+                })
+                .expect("the checkpoint is restored as a recovered sibling")
+        });
+        workspace.update(cx, |workspace, _| assert!(workspace.tabs.focus(index)));
+        (id, index)
+    }
+
     fn write_memory_recovery_checkpoint(store: &RecoveryStore, text: &str) -> RecoveryKey {
         let key = RecoveryKey::new_memory();
         store
@@ -11406,7 +5513,7 @@ mod tests {
         let startup_targets = workspace.startup_recovery_targets(cx);
         workspace.restore_startup_recovery(
             StartupRecovery {
-                recovery: workspace.recovery.clone(),
+                recovery: workspace.recovery_flow.recovery.clone(),
                 documents,
                 recovery_issue_count: recovery_issue_count + preparation_issues,
                 recovery_error,
@@ -11560,7 +5667,6 @@ mod tests {
             .unwrap();
         RecoveryAttempt {
             token,
-            revision,
             content_identity: RecoveryContentIdentity::for_revision(revision),
             timing,
             cancelled,
@@ -11758,391 +5864,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn welcome_visibility_requires_a_no_argument_launch_and_the_saved_preference() {
-        assert!(super::should_show_welcome(None, true));
-        assert!(!super::should_show_welcome(
-            Some(Path::new("workspace")),
-            true
-        ));
-        assert!(!super::should_show_welcome(None, false));
-    }
-
-    #[gpui_kit::test]
-    fn no_argument_workspace_starts_on_the_welcome_state(cx: &mut TestAppContext) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.show_welcome);
-            assert!(workspace.tabs.is_empty());
-            assert!(workspace.root.is_none());
-        });
-    }
-
-    // Exercise rendered controls and native GPUI event dispatch, not handlers.
-    // This guards the first-use path without requiring a foreground desktop.
-    #[gpui_kit::test]
-    fn kit_welcome_new_click_opens_one_editable_document(cx: &mut TestAppContext) {
-        use gpui_kit::test::TestWindowExt as _;
-
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            window.render_frame(app);
-            assert!(window.find("welcome-new").visible());
-            window.click("welcome-new", app);
-        });
-        cx.run_until_parked();
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.source_path(), None);
-            assert_eq!(document.text(app), "");
-            assert!(!document.is_dirty());
-        });
-        cx.update(|window, app| {
-            window.render_frame(app);
-            assert!(window.try_find("welcome-new").is_none());
-            window.click("source", app);
-            assert_eq!(window.find("source").focused(), Some(true));
-            window.input("# Headless edit", app);
-        });
-        cx.run_until_parked();
-        workspace.read_with(cx, |workspace, app| {
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.text(app), "# Headless edit");
-            assert!(document.is_dirty());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn explicit_path_bypasses_welcome_and_records_its_file_target(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("opened.md");
-        fs::write(&path, "# Opened\n").unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.root.as_deref(), path.parent());
-            assert_eq!(
-                crate::settings::AppSettings::global(app)
-                    .recent_targets
-                    .first()
-                    .map(|target| target.path.as_path()),
-                Some(path.as_path())
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn paste_creates_an_exact_dirty_memory_document(cx: &mut TestAppContext) {
-        let text = "# \u{7cbe}\u{8d34} \u{1f680}\nexact clipboard text\n";
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            app.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-            workspace.update(app, |workspace, cx| {
-                workspace.on_paste_into_new(&super::PasteIntoNew, window, cx);
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.text(app), text);
-            assert!(document.is_dirty());
-            assert_eq!(document.layout(), Layout::Source);
-        });
-    }
-
-    #[gpui_kit::test]
-    fn unavailable_welcome_clipboard_preserves_the_surface_and_reports_the_reason(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.on_paste_into_new(&super::PasteIntoNew, window, cx);
-            });
-        });
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert_eq!(
-                workspace.status.as_deref(),
-                Some(i18n::t(i18n::Key::ClipboardTextUnavailable, app))
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn welcome_ctrl_v_pastes_into_a_new_document(cx: &mut TestAppContext) {
-        let text = "# Clipboard shortcut\nexact \u{4e2d}\u{6587} \u{1f680}\n";
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-
-        cx.simulate_keystrokes("ctrl-v");
-        cx.run_until_parked();
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.text(app), text);
-            assert!(document.is_dirty());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn welcome_paste_shortcut_is_inactive_while_settings_is_visible(cx: &mut TestAppContext) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            app.write_to_clipboard(ClipboardItem::new_string("settings input".to_string()));
-            workspace.update(app, |workspace, cx| {
-                workspace.on_open_settings(&super::OpenSettings, window, cx);
-            });
-        });
-
-        cx.simulate_keystrokes("ctrl-v");
-        cx.run_until_parked();
-
-        workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.settings_open);
-            assert!(workspace.show_welcome);
-            assert!(workspace.tabs.is_empty());
-        });
-    }
-
-    #[cfg(target_os = "windows")]
-    #[gpui_kit::test]
-    fn failed_file_open_keeps_welcome_root_tabs_and_focus_unchanged(cx: &mut TestAppContext) {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("locked.md");
-        fs::write(&path, "locked\n").unwrap();
-        let _lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(0)
-            .open(&path)
-            .unwrap();
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        let opened = cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.open_file_target(path.clone(), window, cx)
-            })
-        });
-
-        assert!(!opened);
-        cx.update(|window, app| {
-            let workspace = workspace.read(app);
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert!(workspace.focus_handle.is_focused(window));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn cancelling_file_and_folder_pickers_preserves_the_welcome_state_and_focus(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.on_open_file(&super::OpenFile, window, cx);
-            });
-        });
-        assert!(cx.did_prompt_for_paths());
-        cx.simulate_path_prompt_response(|options| {
-            assert!(options.files);
-            assert!(!options.directories);
-            None
-        });
-        cx.run_until_parked();
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.on_open_folder(&super::OpenFolder, window, cx);
-            });
-        });
-        assert!(cx.did_prompt_for_paths());
-        cx.simulate_path_prompt_response(|options| {
-            assert!(!options.files);
-            assert!(options.directories);
-            None
-        });
-        cx.run_until_parked();
-
-        cx.update(|window, app| {
-            let workspace = workspace.read(app);
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert!(workspace.status.is_none());
-            assert!(workspace.focus_handle.is_focused(window));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn bundled_sample_opens_from_welcome_and_becomes_the_recent_workspace(cx: &mut TestAppContext) {
-        let sample = crate::app_paths::bundled_sample_dir().expect("the debug sample");
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.open_bundled_sample(window, cx);
-            });
-        });
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.root.as_deref(), Some(sample.as_path()));
-            let recent = crate::settings::AppSettings::global(app)
-                .recent_targets
-                .first()
-                .expect("the sample recent target");
-            assert_eq!(recent.path, sample);
-            assert_eq!(recent.kind, mt_core::settings::RecentTargetKind::Workspace);
-        });
-    }
-
-    #[gpui_kit::test]
-    fn unavailable_bundled_sample_keeps_welcome_visible_and_reports_status(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.open_bundled_sample_result(
-                    Err(std::io::Error::other("test materialization failure")),
-                    window,
-                    cx,
-                );
-            });
-        });
-
-        workspace.read_with(cx, |workspace, app| {
-            assert!(workspace.show_welcome);
-            assert!(workspace.root.is_none());
-            assert!(workspace.tabs.is_empty());
-            assert_eq!(
-                workspace.status.as_deref(),
-                Some(i18n::t(i18n::Key::BundledSampleUnavailable, app))
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn missing_recent_target_is_disabled_and_removable_without_opening_anything(
-        cx: &mut TestAppContext,
-    ) {
-        let missing = PathBuf::from("Q:/definitely/not/here/markturbo-missing.md");
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            crate::settings::AppSettings::update(app, |settings| {
-                settings.record_recent_target(mt_core::settings::RecentTarget::new(
-                    missing.clone(),
-                    mt_core::settings::RecentTargetKind::File,
-                    "missing.md",
-                ));
-            });
-            workspace.update(app, |workspace, cx| {
-                assert!(!workspace.open_recent_target(&missing, window, cx));
-                workspace.remove_recent_target(&missing, cx);
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert!(workspace.tabs.is_empty());
-            assert!(
-                crate::settings::AppSettings::global(app)
-                    .recent_targets
-                    .is_empty()
-            );
-        });
-    }
-
-    #[test]
-    fn recent_target_validation_distinguishes_missing_and_mismatched_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let directory = mt_core::settings::RecentTarget::new(
-            dir.path(),
-            mt_core::settings::RecentTargetKind::File,
-            "directory",
-        );
-        assert_eq!(
-            super::recent_target_issue(&directory),
-            Some(i18n::Key::RecentUnavailable)
-        );
-        let missing = mt_core::settings::RecentTarget::new(
-            dir.path().join("missing.md"),
-            mt_core::settings::RecentTargetKind::File,
-            "missing.md",
-        );
-        assert_eq!(
-            super::recent_target_issue(&missing),
-            Some(i18n::Key::RecentMissing)
-        );
-    }
-
-    #[gpui_kit::test]
-    fn valid_recent_file_reopens_through_the_shared_target_path(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recent.md");
-        let text = "# Recent \u{4e2d}\u{6587} \u{1f680}\nexact text\n";
-        fs::write(&path, text).unwrap();
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            crate::settings::AppSettings::update(app, |settings| {
-                settings.record_recent_target(mt_core::settings::RecentTarget::new(
-                    path.clone(),
-                    mt_core::settings::RecentTargetKind::File,
-                    "recent.md",
-                ));
-            });
-            workspace.update(app, |workspace, cx| {
-                assert!(workspace.open_recent_target(&path, window, cx));
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert_eq!(workspace.root.as_deref(), path.parent());
-            assert_eq!(workspace.tabs.len(), 1);
-            assert_eq!(workspace.document_at(0).unwrap().read(app).text(app), text);
-            assert_eq!(
-                crate::settings::AppSettings::global(app)
-                    .recent_targets
-                    .first()
-                    .map(|target| target.path.as_path()),
-                Some(path.as_path())
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn dont_show_welcome_again_persists_and_starts_an_empty_memory_document(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, true);
-        cx.update(|window, app| {
-            workspace.update(app, |workspace, cx| {
-                workspace.dont_show_welcome_again(window, cx);
-            });
-        });
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert!(!crate::settings::AppSettings::global(app).show_welcome_on_startup);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.source_path(), None);
-            assert_eq!(document.text(app), "");
-            assert!(!document.is_dirty());
-        });
-    }
-
     #[gpui_kit::test]
     fn clean_window_close_defers_teardown_until_the_focused_input_handler_can_drain(
         cx: &mut TestAppContext,
@@ -12169,99 +5890,6 @@ mod tests {
                 assert!(workspace.request_window_close(window, cx));
             });
         });
-    }
-
-    #[gpui_kit::test]
-    fn disabled_welcome_starts_future_no_argument_workspaces_with_a_new_buffer(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, cx) = open_test_workspace_with_welcome_preference(cx, false);
-        workspace.read_with(cx, |workspace, app| {
-            assert!(!workspace.show_welcome);
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert_eq!(document.source_path(), None);
-            assert_eq!(document.text(app), "");
-            assert!(!document.is_dirty());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn ten_recent_targets_scroll_into_view_at_the_minimum_window_size(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut targets = Vec::new();
-        for ix in 0..10 {
-            let path = dir.path().join(format!(
-                "{ix:02}-a-very-long-recent-document-name-for-layout-\u{4e2d}\u{6587}.md"
-            ));
-            if ix < 8 {
-                fs::write(&path, format!("# Recent {ix}\n")).unwrap();
-            }
-            targets.push(path);
-        }
-
-        cx.update(|app| {
-            gpui_kit::init(app);
-            crate::settings::AppSettings::init(app);
-            super::init(app);
-        });
-        let captured = Rc::new(RefCell::new(None));
-        let window = cx.open_window(gpui_kit::size(px(720.), px(480.)), {
-            let captured = captured.clone();
-            move |window, app| {
-                let workspace = app.new(|cx| {
-                    Workspace::new_with_startup_recovery(None, StartupRecovery::default, window, cx)
-                });
-                *captured.borrow_mut() = Some(workspace.clone());
-                gpui_kit::component::Root::new(workspace, window, app)
-            }
-        });
-        let mut cx = VisualTestContext::from_window(window.into(), cx);
-        let workspace = captured.borrow().clone().expect("the Workspace entity");
-        cx.update(|window, app| {
-            crate::settings::AppSettings::update(app, |settings| {
-                for path in &targets {
-                    settings.record_recent_target(mt_core::settings::RecentTarget::new(
-                        path.clone(),
-                        mt_core::settings::RecentTargetKind::File,
-                        path.file_name().unwrap().to_string_lossy(),
-                    ));
-                }
-            });
-            let handle = workspace.read(app).focus_handle(app);
-            window.focus(&handle, app);
-            window.draw(app).clear(app);
-        });
-        cx.run_until_parked();
-        cx.update(|window, app| window.draw(app).clear(app));
-
-        let (before, max, bounds) = workspace.read_with(&cx, |workspace, _| {
-            (
-                workspace.welcome_scroll.offset(),
-                workspace.welcome_scroll.max_offset(),
-                workspace.welcome_scroll.bounds(),
-            )
-        });
-        assert!(
-            max.y > px(0.),
-            "ten recent targets must overflow vertically"
-        );
-        assert!(bounds.top() >= crate::metrics::title_bar());
-        assert!(bounds.bottom() <= px(480.) - crate::metrics::status_bar());
-
-        cx.simulate_event(gpui_kit::ScrollWheelEvent {
-            position: point(px(360.), px(240.)),
-            delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-2_000.))),
-            ..Default::default()
-        });
-        cx.update(|window, app| window.draw(app).clear(app));
-
-        let after = workspace.read_with(&cx, |workspace, _| workspace.welcome_scroll.offset());
-        assert!(
-            after.y < before.y,
-            "the welcome page must respond to scrolling"
-        );
-        assert_eq!(after.y, -max.y, "the full recent list must be reachable");
     }
 
     #[gpui_kit::test]
@@ -12542,7 +6170,7 @@ mod tests {
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.text(app), text);
             assert!(document.is_dirty());
-            assert!(workspace.recovery_schedules.contains_key(&id));
+            assert!(workspace.recovery_flow.recovery_schedules.contains_key(&id));
         });
     }
 
@@ -12585,7 +6213,7 @@ mod tests {
         workspace.read_with(cx, |workspace, app| {
             assert!(workspace.pending_destructive.is_none());
             assert_eq!(workspace.tabs.len(), 1);
-            assert!(workspace.recovery_schedules.contains_key(&id));
+            assert!(workspace.recovery_flow.recovery_schedules.contains_key(&id));
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.text(app), text);
             assert!(document.is_dirty());
@@ -12631,7 +6259,7 @@ mod tests {
         workspace.read_with(cx, |workspace, app| {
             assert!(workspace.pending_destructive.is_none());
             assert!(workspace.tabs.is_empty());
-            assert!(!workspace.recovery_schedules.contains_key(&id));
+            assert!(!workspace.recovery_flow.recovery_schedules.contains_key(&id));
             assert_eq!(
                 crate::settings::AppSettings::global(app)
                     .recent_targets
@@ -12682,7 +6310,10 @@ mod tests {
             assert_eq!(document.text(app), text);
             assert!(!document.is_dirty());
             assert!(
-                !workspace.recovery_schedules.contains_key(&document.id()),
+                !workspace
+                    .recovery_flow
+                    .recovery_schedules
+                    .contains_key(&document.id()),
                 "a clean dropped file must not enter dirty-buffer recovery"
             );
             let recents = &crate::settings::AppSettings::global(app).recent_targets;
@@ -12731,7 +6362,7 @@ mod tests {
         workspace.read_with(cx, |workspace, app| {
             assert!(workspace.pending_destructive.is_none());
             assert_eq!(workspace.tabs.len(), 1);
-            assert!(workspace.recovery_schedules.contains_key(&id));
+            assert!(workspace.recovery_flow.recovery_schedules.contains_key(&id));
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.text(app), revised);
             assert!(document.is_dirty());
@@ -12750,9 +6381,7 @@ mod tests {
         .unwrap();
         let key = write_memory_recovery_checkpoint(&store, "# Recovered prompt\n");
         let scan = store.recover().unwrap();
-        let (workspace, cx) = open_test_workspace_with(cx, None);
-        workspace.update(cx, |workspace, _| workspace.recovery = Some(store));
-
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store);
         let restored = cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 restore_recovery_for_test(workspace, scan, window, cx)
@@ -12866,8 +6495,8 @@ mod tests {
         let (workspace, cx) = open_test_workspace(cx, path.clone());
         cx.run_until_parked();
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
         });
         replace_document(&workspace, 0, "discarded editor text\n", cx);
         let id = workspace.read_with(cx, |workspace, app| {
@@ -12893,10 +6522,20 @@ mod tests {
 
         complete_startup_with_store(&workspace, store.clone(), cx);
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_retirement_batches.contains_key(&key));
-            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
             assert!(
-                !workspace.recovery_schedules.contains_key(&id),
+                workspace
+                    .recovery_flow
+                    .recovery_retirement_batches
+                    .contains_key(&key)
+            );
+            assert!(
+                !workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
+            assert!(
+                !workspace.recovery_flow.recovery_schedules.contains_key(&id),
                 "startup repair must not re-arm a document being durably discarded"
             );
         });
@@ -12926,8 +6565,8 @@ mod tests {
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
-                workspace.recovery = None;
-                workspace.startup_recovery_pending = true;
+                workspace.recovery_flow.recovery = None;
+                workspace.recovery_flow.startup_recovery_pending = true;
             });
         });
 
@@ -12949,6 +6588,7 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 workspace
+                    .recovery_flow
                     .recovery_retirement_batches
                     .contains_key(&first_key)
             );
@@ -12984,6 +6624,7 @@ mod tests {
         workspace.read_with(cx, |workspace, app| {
             assert!(workspace.document_at(0).unwrap().read(app).is_dirty());
             let state = workspace
+                .recovery_flow
                 .recovery_schedules
                 .get(&first_id)
                 .expect("the still-dirty first document must be re-armed after revalidation");
@@ -13020,8 +6661,8 @@ mod tests {
         let (workspace, cx) = open_test_workspace(cx, path.clone());
         cx.run_until_parked();
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
         });
         let edited = "saved while recovery starts\n";
         replace_document(&workspace, 0, edited, cx);
@@ -13048,6 +6689,248 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn startup_close_retires_live_aliases_but_preserves_old_checkpoints(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.md");
+        let second = dir.path().join("second.md");
+        fs::write(&first, "first disk\n").unwrap();
+        fs::write(&second, "second disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &first, "stale first checkpoint\n");
+        write_recovery_checkpoint(&store, &second, "stale second checkpoint\n");
+        let first_key = RecoveryKey::for_path(&first);
+        let second_key = RecoveryKey::for_path(&second);
+        assert_eq!(store.recover().unwrap().records.len(), 2);
+
+        let (workspace, cx) = open_test_workspace(cx, first.clone());
+        let first_id = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).id()
+        });
+        workspace.update(cx, |workspace, _| {
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
+            workspace
+                .recovery_flow
+                .startup_recovery_keys
+                .insert(first_id, first_key.clone());
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(second.clone(), window, cx);
+            });
+        });
+        let second_id = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(1).unwrap().read(app).id()
+        });
+
+        let saved_second = "saved second document\n";
+        replace_document(&workspace, 1, saved_second, cx);
+        let second_live_key = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(1).unwrap().read(app).recovery_key()
+        });
+        assert_ne!(second_live_key, second_key);
+        let second_document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(1).cloned())
+            .unwrap();
+        second_document.update(cx, |document, cx| {
+            assert!(document.save(SaveMode::Normal, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(fs::read_to_string(&second).unwrap(), saved_second);
+
+        replace_document(&workspace, 0, "discarded first document\n", cx);
+        let first_live_key = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).recovery_key()
+        });
+        assert_ne!(first_live_key, first_key);
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_close_tab(0, window, cx);
+            });
+        });
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert!(workspace.pending_startup_destructive.is_some());
+            assert!(
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&first_live_key)
+            );
+            assert!(
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&second_live_key)
+            );
+            assert_eq!(
+                workspace.recovery_flow.startup_recovery_keys.get(&first_id),
+                Some(&first_key)
+            );
+            assert_eq!(
+                workspace
+                    .recovery_flow
+                    .startup_recovery_keys
+                    .get(&second_id),
+                Some(&second_key)
+            );
+        });
+        assert_eq!(store.recover().unwrap().records.len(), 2);
+
+        let startup = populated_startup_recovery(store.clone());
+        let startup_targets =
+            workspace.read_with(cx, |workspace, app| workspace.startup_recovery_targets(app));
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.restore_startup_recovery(startup, startup_targets, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 3);
+            assert!(workspace.tabs.index_of(&first).is_none());
+            assert!(workspace.tabs.index_of(&second).is_some());
+            let live_second = workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::File(path) if path == &second => {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the saved live B tab must remain open");
+            let document = live_second.read(app);
+            assert!(!document.is_dirty());
+            assert_eq!(document.text(app), saved_second);
+
+            for (key, expected_text) in [
+                (&first_key, "stale first checkpoint\n"),
+                (&second_key, "stale second checkpoint\n"),
+            ] {
+                let recovered = workspace
+                    .tabs
+                    .iter()
+                    .find_map(|tab| match &tab.identity {
+                        mt_core::workspace::tabs::TabIdentity::Recovered(recovered_key)
+                            if recovered_key == key =>
+                        {
+                            Some(tab.payload.view.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("each older checkpoint must remain separately visible");
+                let recovered = recovered.read(app);
+                assert_eq!(recovered.text(app), expected_text);
+                assert!(recovered.is_dirty());
+            }
+        });
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first disk\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), saved_second);
+        let recovered = store.recover().unwrap().records;
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered
+                .iter()
+                .find(|record| record.record.key == first_key)
+                .map(|record| record.record.text.as_str()),
+            Some("stale first checkpoint\n")
+        );
+        assert_eq!(
+            recovered
+                .iter()
+                .find(|record| record.record.key == second_key)
+                .map(|record| record.record.text.as_str()),
+            Some("stale second checkpoint\n")
+        );
+        assert!(
+            !recovered
+                .iter()
+                .any(|record| record.record.key == first_live_key
+                    || record.record.key == second_live_key)
+        );
+    }
+
+    #[gpui_kit::test]
+    fn save_as_collision_preserves_independent_startup_recovery(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.md");
+        let destination = dir.path().join("destination.md");
+        let saved_source_text = "saved source bytes\n";
+        let old_destination_text = "independent destination checkpoint\n";
+        fs::write(&source, saved_source_text).unwrap();
+        fs::write(&destination, "original destination bytes\n").unwrap();
+
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &destination, old_destination_text);
+        let overwrite = Arc::new(
+            mt_core::document::io::SaveAsOverwriteAuthorization::capture(&destination).unwrap(),
+        );
+        let startup = populated_startup_recovery(store.clone());
+        let destination_for_save = destination.clone();
+        let (workspace, cx) = open_test_workspace_with_startup_recovery_inspection(
+            cx,
+            Some(source),
+            move || startup,
+            move |workspace, window, cx| {
+                let document_id = workspace.document_at(0).unwrap().read(cx).id();
+                workspace.finish_save_as(
+                    document_id,
+                    destination_for_save,
+                    SaveAsMode::Overwrite(overwrite),
+                    window,
+                    cx,
+                );
+            },
+        );
+
+        cx.run_until_parked();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), saved_source_text);
+        let editor_text = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert!(!document.is_dirty());
+            document.text(app)
+        });
+        assert_eq!(editor_text, saved_source_text);
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(
+                workspace.tabs.len(),
+                2,
+                "both saved and recovered text need a tab"
+            );
+            let recovered = workspace.document_at(1).unwrap().read(app);
+            assert_eq!(recovered.text(app), old_destination_text);
+            assert!(recovered.is_dirty());
+            assert!(recovered.is_externally_changed());
+        });
+
+        let retained_destination_text = store
+            .recover()
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| record.record.key == RecoveryKey::for_path(&destination))
+            .map(|record| record.record.text);
+        assert_eq!(
+            retained_destination_text.as_deref(),
+            Some(old_destination_text)
+        );
+    }
+
+    #[gpui_kit::test]
     fn saved_preview_is_kept_until_startup_retirement_is_durable(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first-preview.md");
@@ -13065,8 +6948,8 @@ mod tests {
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file_as(first.clone(), true, window, cx);
-                workspace.recovery = None;
-                workspace.startup_recovery_pending = true;
+                workspace.recovery_flow.recovery = None;
+                workspace.recovery_flow.startup_recovery_pending = true;
             });
         });
         replace_document(&workspace, 0, "saved preview text\n", cx);
@@ -13106,18 +6989,23 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace_with(cx, None);
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace.recovery = Some(store.clone());
                 workspace.open_file_as(first.clone(), true, window, cx);
             });
         });
         let key = RecoveryKey::for_path(&first);
         let old = store.begin_retirement(&key).unwrap();
         workspace.update(cx, |workspace, _| {
-            workspace.recovery_retirements.insert(key.clone(), old);
-            workspace.pending_recovery_retirements.insert(key, None);
+            workspace
+                .recovery_flow
+                .recovery_retirements
+                .insert(key.clone(), old);
+            workspace
+                .recovery_flow
+                .pending_recovery_retirements
+                .insert(key, None);
         });
 
         cx.update(|window, app| {
@@ -13144,8 +7032,8 @@ mod tests {
         let (workspace, cx) = open_test_workspace(cx, path);
         cx.run_until_parked();
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
         });
         replace_document(&workspace, 0, "must remain open\n", cx);
         cx.simulate_keystrokes("ctrl-w");
@@ -13171,7 +7059,7 @@ mod tests {
 
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(workspace.tabs.len(), 1);
-            assert!(!workspace.startup_recovery_pending);
+            assert!(!workspace.recovery_flow.startup_recovery_pending);
             assert!(workspace.pending_startup_destructive.is_none());
             assert_eq!(
                 workspace.status.as_deref(),
@@ -13458,8 +7346,8 @@ mod tests {
         let startup_targets =
             workspace.read_with(cx, |workspace, app| workspace.startup_recovery_targets(app));
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
         });
         cx.update(|_, app| {
             crate::settings::AppSettings::update(app, |settings| {
@@ -13947,26 +7835,25 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn discard_keeps_the_tab_open_when_recovery_retirement_fails(cx: &mut TestAppContext) {
+    fn save_retries_a_failed_durable_recovery_retirement(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("discard-retirement-failure.md");
+        let path = dir.path().join("save-retirement-retry.md");
         fs::write(&path, "disk\n").unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-        let edited = "discard only after durable retirement\n";
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let edited = "saved before retirement retry\n";
         replace_document(&workspace, 0, edited, cx);
         write_recovery_checkpoint(&store, &path, "older checkpoint\n");
         let now = cx.background_executor.now();
         workspace.update(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             let state = workspace
+                .recovery_flow
                 .recovery_schedules
                 .get_mut(&document.id())
                 .unwrap();
@@ -13977,7 +7864,6 @@ mod tests {
                     .token
                     .clone()
                     .expect("a ready test store must provide a recovery token"),
-                revision: document.revision(),
                 content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                 timing: schedule.checkpoint_dispatched(now).unwrap(),
                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -13998,6 +7884,7 @@ mod tests {
             assert_eq!(document.text(app), edited);
             assert!(
                 workspace
+                    .recovery_flow
                     .recovery_schedules
                     .get(&document.id())
                     .is_some_and(|state| state.in_flight.is_none())
@@ -14031,10 +7918,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "discarded after rename\n", cx);
         let checkpoint = workspace.read_with(cx, |workspace, app| {
             workspace
@@ -14063,20 +7948,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn save_retries_a_failed_durable_recovery_retirement(cx: &mut TestAppContext) {
+    fn discard_keeps_the_tab_open_when_recovery_retirement_fails(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("save-retirement-retry.md");
+        let path = dir.path().join("discard-retirement-failure.md");
         fs::write(&path, "disk\n").unwrap();
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-        let edited = "saved before retirement retry\n";
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let edited = "discard only after durable retirement\n";
         replace_document(&workspace, 0, edited, cx);
         let checkpoint = workspace.read_with(cx, |workspace, app| {
             workspace
@@ -14099,11 +7982,13 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .contains_key(&checkpoint.key)
             );
             assert!(
                 workspace
+                    .recovery_flow
                     .recovery_retirement_retries
                     .contains(&checkpoint.key)
             );
@@ -14118,11 +8003,13 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 !workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .contains_key(&checkpoint.key)
             );
             assert!(
                 !workspace
+                    .recovery_flow
                     .recovery_retirement_retries
                     .contains(&checkpoint.key)
             );
@@ -14141,10 +8028,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -14167,11 +8052,15 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
-                workspace.pending_recovery_retirements.get(&checkpoint.key),
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .get(&checkpoint.key),
                 Some(&Some(first_id))
             );
             assert!(
                 workspace
+                    .recovery_flow
                     .recovery_retirement_retries
                     .contains(&checkpoint.key)
             );
@@ -14189,6 +8078,7 @@ mod tests {
             assert!(workspace.tabs.index_of(&second).is_none());
             assert!(
                 workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .contains_key(&checkpoint.key)
             );
@@ -14207,13 +8097,18 @@ mod tests {
         });
         let original_key = RecoveryKey::for_path(&original);
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
             workspace
+                .recovery_flow
                 .startup_recovery_keys
                 .insert(id, original_key.clone());
         });
         replace_document(&workspace, 0, "saved elsewhere\n", cx);
+        let live_key = workspace.read_with(cx, |workspace, app| {
+            workspace.document_at(0).unwrap().read(app).recovery_key()
+        });
+        assert_ne!(live_key, original_key);
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.finish_save_as(id, saved_as.clone(), SaveAsMode::CreateOnly, window, cx);
@@ -14222,8 +8117,16 @@ mod tests {
 
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
-                workspace.pending_recovery_retirements.get(&original_key),
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .get(&live_key),
                 Some(&Some(id))
+            );
+            assert_eq!(
+                workspace.recovery_flow.startup_recovery_keys.get(&id),
+                Some(&original_key),
+                "the old startup key must stay independent from the saved live incarnation"
             );
             assert!(workspace.tabs.index_of(&saved_as).is_some());
         });
@@ -14238,8 +8141,8 @@ mod tests {
             let pending = workspace
                 .pending_startup_destructive
                 .as_ref()
-                .expect("the original startup key must delay the target tab close");
-            assert!(pending.keys.contains(&(original_key, Some(id))));
+                .expect("the live-key retirement must delay the target tab close");
+            assert!(pending.keys.contains(&(live_key, Some(id))));
         });
         assert_eq!(fs::read_to_string(saved_as).unwrap(), "saved elsewhere\n");
     }
@@ -14259,17 +8162,19 @@ mod tests {
 
         replace_document(&workspace, 0, "saved\n", cx);
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
             workspace
+                .recovery_flow
                 .startup_recovery_keys
                 .insert(id, startup_key.clone());
             workspace
+                .recovery_flow
                 .save_as_recovery_keys
                 .insert(id, save_as_key.clone());
             // Exercise the fallback selection directly; an active schedule
             // normally takes precedence in retire_document_recovery.
-            workspace.recovery_schedules.remove(&id);
+            workspace.recovery_flow.recovery_schedules.remove(&id);
         });
 
         document.update(cx, |document, cx| {
@@ -14278,24 +8183,213 @@ mod tests {
 
         workspace.read_with(cx, |workspace, _| {
             assert!(
-                !workspace.startup_recovery_keys.contains_key(&id),
+                !workspace
+                    .recovery_flow
+                    .startup_recovery_keys
+                    .contains_key(&id),
                 "saving must clear the startup recovery key"
             );
             assert!(
-                !workspace.save_as_recovery_keys.contains_key(&id),
+                !workspace
+                    .recovery_flow
+                    .save_as_recovery_keys
+                    .contains_key(&id),
                 "saving must clear the stale Save As recovery key"
             );
             assert_eq!(
-                workspace.pending_recovery_retirements.get(&save_as_key),
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .get(&save_as_key),
                 Some(&Some(id)),
                 "a Save As key identifies the dirty source and takes precedence"
             );
             assert!(
                 !workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .contains_key(&startup_key),
                 "the superseded startup key must not replace the Save As key"
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn clean_save_as_before_startup_scan_preserves_independent_recovery(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("clean-before-scan.md");
+        let saved_as = dir.path().join("saved-before-scan.md");
+        let clean_disk_bytes = b"# Clean source\r\nExact source bytes.\r\n";
+        let old_checkpoint = "# Earlier A checkpoint\nRecovered text stays available.\n";
+        fs::write(&original, clean_disk_bytes).unwrap();
+
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &original, old_checkpoint);
+
+        let save_as_completed = Arc::new(AtomicBool::new(false));
+        let scan_after_save_as = save_as_completed.clone();
+        let store_for_startup = store.clone();
+        let destination_for_save = saved_as.clone();
+        let (workspace, cx) = open_test_workspace_with_startup_recovery_inspection(
+            cx,
+            Some(original.clone()),
+            move || {
+                assert!(
+                    scan_after_save_as.load(Ordering::Acquire),
+                    "the deferred startup scan must run after Save As"
+                );
+                populated_startup_recovery(store_for_startup)
+            },
+            move |workspace, window, cx| {
+                let id = workspace.document_at(0).unwrap().read(cx).id();
+                workspace.finish_save_as(
+                    id,
+                    destination_for_save,
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+                save_as_completed.store(true, Ordering::Release);
+            },
+        );
+        cx.run_until_parked();
+
+        assert_eq!(fs::read(&original).unwrap().as_slice(), clean_disk_bytes);
+        assert_eq!(fs::read(&saved_as).unwrap().as_slice(), clean_disk_bytes);
+
+        let records = store.recover().unwrap().records;
+        assert_eq!(
+            records.len(),
+            1,
+            "the independent A checkpoint must remain durable"
+        );
+        let old_record = records
+            .iter()
+            .find(|record| record.record.key == RecoveryKey::for_path(&original))
+            .expect("the old A checkpoint must not be consumed by saving to C");
+        assert_eq!(old_record.record.text, old_checkpoint);
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let visible_old_checkpoint = workspace
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    let document = tab.payload.view.read(app);
+                    (document.text(app) == old_checkpoint).then(|| {
+                        (
+                            document.source_path().map(Path::to_path_buf),
+                            document.is_dirty(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(visible_old_checkpoint.len(), 1);
+            assert_eq!(
+                visible_old_checkpoint[0].0.as_deref(),
+                Some(original.as_path())
+            );
+            assert!(visible_old_checkpoint[0].1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn startup_edit_before_deferred_scan_preserves_old_checkpoint(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("edited-before-scan.md");
+        let disk_text = "clean A on disk\n";
+        let old_checkpoint = "older A checkpoint\n";
+        let live_text = "A edited before the startup scan\n";
+        fs::write(&original, disk_text).unwrap();
+
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &original, old_checkpoint);
+
+        let edited_before_scan = Arc::new(AtomicBool::new(false));
+        let scan_after_edit = edited_before_scan.clone();
+        let store_for_startup = store.clone();
+        let (workspace, cx) = open_test_workspace_with_startup_recovery_inspection(
+            cx,
+            Some(original.clone()),
+            move || {
+                assert!(
+                    scan_after_edit.load(Ordering::Acquire),
+                    "the startup scan must follow the user's edit"
+                );
+                populated_startup_recovery(store_for_startup)
+            },
+            move |workspace, window, cx| {
+                let document = workspace.document_at(0).cloned().unwrap();
+                document.update(cx, |document, cx| {
+                    document.replace_text(live_text.to_string(), window, cx);
+                });
+                edited_before_scan.store(true, Ordering::Release);
+            },
+        );
+        cx.run_until_parked();
+
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        let original_key = RecoveryKey::for_path(&original);
+        let records = store.recover().unwrap().records;
+        assert_eq!(
+            records.len(),
+            2,
+            "the edit must not overwrite A's older checkpoint"
+        );
+        let old_record = records
+            .iter()
+            .find(|record| record.record.key == original_key)
+            .expect("A's original recovery key must remain durable");
+        assert_eq!(old_record.record.text, old_checkpoint);
+        let live_record = records
+            .iter()
+            .find(|record| record.record.text == live_text)
+            .expect("the edited A buffer must receive its own checkpoint");
+        assert_ne!(live_record.record.key, original_key);
+        let live_key = live_record.record.key.clone();
+
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let live = workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::File(path) if path == &original => {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the current A document must stay open");
+            let live = live.read(app);
+            assert_eq!(live.text(app), live_text);
+            assert_eq!(live.recovery_key(), live_key);
+            assert!(live.is_dirty());
+
+            let recovered = workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::Recovered(key)
+                        if key == &original_key =>
+                    {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the old A checkpoint must be presented separately");
+            let recovered = recovered.read(app);
+            assert_eq!(recovered.text(app), old_checkpoint);
+            assert!(recovered.is_dirty());
         });
     }
 
@@ -14316,8 +8410,8 @@ mod tests {
         let startup = populated_startup_recovery(store.clone());
         let (workspace, cx) = open_test_workspace_with(cx, None);
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
         });
 
         cx.update(|window, app| {
@@ -14332,7 +8426,7 @@ mod tests {
         let original_key = RecoveryKey::for_path(&original);
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
-                workspace.startup_recovery_keys.get(&id),
+                workspace.recovery_flow.startup_recovery_keys.get(&id),
                 Some(&original_key),
                 "a clean tab opened during startup must retain its original key"
             );
@@ -14360,7 +8454,10 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
-                workspace.pending_recovery_retirements.get(&original_key),
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .get(&original_key),
                 Some(&Some(id))
             );
             assert!(workspace.tabs.index_of(&original).is_none());
@@ -14373,7 +8470,12 @@ mod tests {
                 assert_eq!(workspace.tabs.len(), 1);
                 assert!(workspace.tabs.index_of(&original).is_none());
                 assert!(workspace.tabs.index_of(&saved_as).is_some());
-                assert!(workspace.recovery_retirements.contains_key(&original_key));
+                assert!(
+                    workspace
+                        .recovery_flow
+                        .recovery_retirements
+                        .contains_key(&original_key)
+                );
             });
         });
         cx.run_until_parked();
@@ -14414,12 +8516,15 @@ mod tests {
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .insert(first_key.clone(), Some(first_id));
                 workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .insert(second_key.clone(), Some(second_id));
                 workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .insert(unknown_key.clone(), None);
 
@@ -14457,67 +8562,27 @@ mod tests {
                 workspace.perform_after_discard_retirement(request, action, Vec::new(), window, cx);
 
                 let batch = workspace
+                    .recovery_flow
                     .recovery_retirement_batches
                     .get(&first_key)
                     .cloned()
                     .expect("the first pending key must enter the batch");
                 assert_eq!(
-                    workspace.recovery_retirement_batches.get(&second_key),
+                    workspace
+                        .recovery_flow
+                        .recovery_retirement_batches
+                        .get(&second_key),
                     Some(&batch)
                 );
                 assert_eq!(
-                    workspace.recovery_retirement_batches.get(&unknown_key),
+                    workspace
+                        .recovery_flow
+                        .recovery_retirement_batches
+                        .get(&unknown_key),
                     Some(&batch)
                 );
-                assert_eq!(workspace.recovery_retirement_batches.len(), 3);
+                assert_eq!(workspace.recovery_flow.recovery_retirement_batches.len(), 3);
             });
-        });
-    }
-
-    #[gpui_kit::test]
-    fn second_save_replaces_a_stale_ui_retirement_owner(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("second-save-stale-owner.md");
-        fs::write(&path, "disk\n").unwrap();
-        let store = RecoveryStore::new_at(
-            dir.path().join("recovery-store"),
-            Arc::new(TestRecoveryProtector),
-        )
-        .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-        write_recovery_checkpoint(&store, &path, "first saved checkpoint\n");
-        let key = RecoveryKey::for_path(&path);
-        let old = store.begin_retirement(&key).unwrap();
-        workspace.update(cx, |workspace, _| {
-            workspace
-                .recovery_retirements
-                .insert(key.clone(), old.clone());
-        });
-        let old_completion = store.complete_retirement(old.clone()).unwrap();
-
-        workspace.update(cx, |workspace, cx| {
-            workspace.invalidate_recovery(&key, None, cx);
-        });
-        let fresh = workspace.read_with(cx, |workspace, _| {
-            let fresh = workspace
-                .recovery_retirements
-                .get(&key)
-                .cloned()
-                .expect("the second Save must install a fresh retirement owner");
-            assert_ne!(fresh, old);
-            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
-            fresh
-        });
-
-        workspace.update(cx, |workspace, cx| {
-            workspace.finish_recovery_retirement(key.clone(), old, None, Ok(old_completion), cx);
-        });
-        workspace.read_with(cx, |workspace, _| {
-            assert_eq!(workspace.recovery_retirements.get(&key), Some(&fresh));
-            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
         });
     }
 
@@ -14531,15 +8596,74 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         write_recovery_checkpoint(&store, &path, "queued checkpoint\n");
         let key = RecoveryKey::for_path(&path);
         let old = store.begin_retirement(&key).unwrap();
         workspace.update(cx, |workspace, _| {
             workspace
+                .recovery_flow
+                .recovery_retirements
+                .insert(key.clone(), old.clone());
+        });
+        let old_completion = store.complete_retirement(old.clone()).unwrap();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.invalidate_recovery(&key, None, cx);
+        });
+        let fresh = workspace.read_with(cx, |workspace, _| {
+            let fresh = workspace
+                .recovery_flow
+                .recovery_retirements
+                .get(&key)
+                .cloned()
+                .expect("the second Save must install a fresh retirement owner");
+            assert_ne!(fresh, old);
+            assert!(
+                !workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
+            fresh
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.finish_recovery_retirement(key.clone(), old, None, Ok(old_completion), cx);
+        });
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.recovery_flow.recovery_retirements.get(&key),
+                Some(&fresh)
+            );
+            assert!(
+                !workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn second_save_replaces_a_stale_ui_retirement_owner(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("second-save-stale-owner.md");
+        fs::write(&path, "disk\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        write_recovery_checkpoint(&store, &path, "first saved checkpoint\n");
+        let key = RecoveryKey::for_path(&path);
+        let old = store.begin_retirement(&key).unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .recovery_flow
                 .recovery_retirements
                 .insert(key.clone(), old.clone());
         });
@@ -14548,8 +8672,16 @@ mod tests {
             workspace.invalidate_recovery(&key, None, cx);
         });
         workspace.read_with(cx, |workspace, _| {
-            assert_eq!(workspace.recovery_retirements.get(&key), Some(&old));
-            assert!(workspace.pending_recovery_retirements.contains_key(&key));
+            assert_eq!(
+                workspace.recovery_flow.recovery_retirements.get(&key),
+                Some(&old)
+            );
+            assert!(
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
         });
         let old_completion = store.complete_retirement(old.clone()).unwrap();
 
@@ -14564,11 +8696,17 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, _| {
             let fresh = workspace
+                .recovery_flow
                 .recovery_retirements
                 .get(&key)
                 .expect("the matched old completion must replay the queued Save");
             assert_ne!(fresh, &old);
-            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
+            assert!(
+                !workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
         });
     }
 
@@ -14582,10 +8720,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let document = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
             .unwrap();
@@ -14593,6 +8729,7 @@ mod tests {
         let old = store.begin_retirement(&key).unwrap();
         workspace.update(cx, |workspace, _| {
             workspace
+                .recovery_flow
                 .recovery_retirements
                 .insert(key.clone(), old.clone());
         });
@@ -14606,8 +8743,16 @@ mod tests {
             });
         });
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.pending_recovery_retirements.contains_key(&key));
-            assert_eq!(workspace.recovery_retirements.get(&key), Some(&old));
+            assert!(
+                !workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
+            assert_eq!(
+                workspace.recovery_flow.recovery_retirements.get(&key),
+                Some(&old)
+            );
         });
     }
 
@@ -14621,10 +8766,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "discard after takeover\n", cx);
         let (id, checkpoint) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
@@ -14648,6 +8791,7 @@ mod tests {
                 ));
                 workspace.pending_destructive = Some(request);
                 workspace
+                    .recovery_flow
                     .recovery_retirement_batches
                     .insert(key.clone(), old_batch.clone());
                 workspace.invalidate_recovery(&key, Some(id), cx);
@@ -14681,10 +8825,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "keep open through replay retry\n", cx);
         let (id, checkpoint) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
@@ -14709,17 +8851,21 @@ mod tests {
                 ));
                 workspace.pending_destructive = Some(request);
                 workspace
+                    .recovery_flow
                     .recovery_retirement_batches
                     .insert(key.clone(), old_batch.clone());
                 workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .insert(key.clone(), Some(id));
                 let content_identity = workspace
+                    .recovery_flow
                     .recovery_schedules
                     .get(&id)
                     .expect("the dirty tab has a checkpoint schedule")
                     .content_identity;
                 workspace
+                    .recovery_flow
                     .recovery_retirement_suppressions
                     .entry(key.clone())
                     .or_default()
@@ -14736,7 +8882,12 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(workspace.tabs.len(), 1);
-            assert!(workspace.pending_recovery_retirements.contains_key(&key));
+            assert!(
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
             assert!(workspace.pending_startup_destructive.is_some());
         });
 
@@ -14759,15 +8910,17 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let retired_text = "retirement removes this checkpoint\n";
         replace_document(&workspace, 0, retired_text, cx);
         let (id, checkpoint, retired_identity) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             (
                 document.id(),
                 document.recovery_checkpoint(app),
@@ -14787,21 +8940,28 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
                 workspace
+                    .recovery_flow
                     .recovery_retirement_suppressions
                     .get(&key)
                     .and_then(|documents| documents.get(&id)),
                 Some(&retired_identity)
             );
-            assert!(workspace.recovery_retirements.contains_key(&key));
+            assert!(
+                workspace
+                    .recovery_flow
+                    .recovery_retirements
+                    .contains_key(&key)
+            );
         });
 
         let new_text = "newly authored text remains recoverable\n";
         replace_document(&workspace, 0, new_text, cx);
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert_ne!(state.content_identity, retired_identity);
             assert_eq!(
                 workspace
+                    .recovery_flow
                     .recovery_retirement_suppressions
                     .get(&key)
                     .and_then(|documents| documents.get(&id)),
@@ -14819,9 +8979,15 @@ mod tests {
         cx.background_executor.advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.recovery_retirements.contains_key(&key));
             assert!(
                 !workspace
+                    .recovery_flow
+                    .recovery_retirements
+                    .contains_key(&key)
+            );
+            assert!(
+                !workspace
+                    .recovery_flow
                     .recovery_retirement_suppressions
                     .contains_key(&key)
             );
@@ -14847,14 +9013,16 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "old document revision one\n", cx);
         let (old_id, checkpoint, retired_identity) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             (
                 document.id(),
                 document.recovery_checkpoint(app),
@@ -14892,6 +9060,7 @@ mod tests {
             (
                 document.id(),
                 workspace
+                    .recovery_flow
                     .recovery_schedules
                     .get(&document.id())
                     .unwrap()
@@ -14902,12 +9071,18 @@ mod tests {
         assert_eq!(new_identity, retired_identity);
         workspace.read_with(cx, |workspace, _| {
             let suppressions = workspace
+                .recovery_flow
                 .recovery_retirement_suppressions
                 .get(&key)
                 .unwrap();
             assert_eq!(suppressions.get(&old_id), Some(&retired_identity));
             assert!(!suppressions.contains_key(&new_id));
-            assert!(workspace.recovery_schedules.contains_key(&new_id));
+            assert!(
+                workspace
+                    .recovery_flow
+                    .recovery_schedules
+                    .contains_key(&new_id)
+            );
         });
 
         let now = cx.background_executor.now();
@@ -14918,9 +9093,15 @@ mod tests {
         cx.background_executor.advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.recovery_retirements.contains_key(&key));
             assert!(
                 !workspace
+                    .recovery_flow
+                    .recovery_retirements
+                    .contains_key(&key)
+            );
+            assert!(
+                !workspace
+                    .recovery_flow
                     .recovery_retirement_suppressions
                     .contains_key(&key)
             );
@@ -14946,10 +9127,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let text = "dirty source remains open\n";
         replace_document(&workspace, 0, text, cx);
         let (id, checkpoint, binding) = workspace.read_with(cx, |workspace, app| {
@@ -14989,25 +9168,27 @@ mod tests {
                     DestructiveResolution::Proceed(_)
                 ));
                 let content_identity = workspace
+                    .recovery_flow
                     .recovery_schedules
                     .get(&id)
                     .expect("the dirty tab has a checkpoint schedule")
                     .content_identity;
                 workspace.pending_destructive = Some(request);
                 workspace
+                    .recovery_flow
                     .recovery_retirement_batches
                     .insert(key.clone(), batch.clone());
                 workspace
+                    .recovery_flow
                     .recovery_retirement_suppressions
                     .entry(key.clone())
                     .or_default()
                     .insert(id, content_identity);
-                workspace
-                    .recovered_revision_records
-                    .insert(key.clone(), revision_recovery);
-                workspace
-                    .recovered_revision_documents
-                    .insert(id, key.clone());
+                workspace.review_flow.store_recovered_revision_record(
+                    id,
+                    key.clone(),
+                    revision_recovery,
+                );
                 workspace.finish_discard_retirements(
                     vec![(key.clone(), Some(id))],
                     batch.clone(),
@@ -15023,11 +9204,13 @@ mod tests {
             assert!(workspace.revision_has_authored_answers_for_document(id, app));
             assert!(
                 !workspace
+                    .recovery_flow
                     .recovery_retirement_suppressions
                     .contains_key(&key)
             );
             assert!(
                 workspace
+                    .recovery_flow
                     .recovery_schedules
                     .get(&id)
                     .is_some_and(|state| { state.content_identity.revision_binding.is_some() })
@@ -15079,7 +9262,12 @@ mod tests {
         workspace.read_with(cx, |workspace, app| {
             assert_eq!(workspace.tabs.len(), 1);
             assert!(workspace.revision_has_authored_answers_for_document(id, app));
-            assert!(workspace.recovery_retirement_batches.is_empty());
+            assert!(
+                workspace
+                    .recovery_flow
+                    .recovery_retirement_batches
+                    .is_empty()
+            );
             assert!(workspace.pending_startup_destructive.is_none());
         });
     }
@@ -15096,10 +9284,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -15121,9 +9307,15 @@ mod tests {
             assert!(document.save(SaveMode::Normal, cx));
         });
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_retirement_retries.contains(&first_key));
             assert!(
                 workspace
+                    .recovery_flow
+                    .recovery_retirement_retries
+                    .contains(&first_key)
+            );
+            assert!(
+                workspace
+                    .recovery_flow
                     .pending_recovery_retirements
                     .contains_key(&first_key)
             );
@@ -15167,7 +9359,10 @@ mod tests {
                     window,
                     cx,
                 );
-                workspace.pending_recovery_retirements.remove(&first_key);
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .remove(&first_key);
             });
         });
         cx.run_until_parked();
@@ -15179,11 +9374,24 @@ mod tests {
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, _| {
             assert!(
-                workspace.recovery_retirement_batches.is_empty(),
+                workspace
+                    .recovery_flow
+                    .recovery_retirement_batches
+                    .is_empty(),
                 "the old marker retry must not strand a later batch cleanup"
             );
-            assert!(workspace.pending_recovery_retirements.is_empty());
-            assert!(workspace.recovery_retirement_retries.is_empty());
+            assert!(
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .is_empty()
+            );
+            assert!(
+                workspace
+                    .recovery_flow
+                    .recovery_retirement_retries
+                    .is_empty()
+            );
         });
 
         replace_document(&workspace, 0, "dirty after cleanup\n", cx);
@@ -15204,11 +9412,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "saved text\n", cx);
         let saved_checkpoint = workspace.read_with(cx, |workspace, app| {
             workspace
@@ -15263,11 +9468,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         for decision in ["Save", "Discard"] {
             if workspace.read_with(cx, |workspace, _| workspace.tabs.is_empty()) {
                 cx.update(|window, app| {
@@ -15279,13 +9481,17 @@ mod tests {
             replace_document(&workspace, 0, &format!("{decision} text\n"), cx);
             let (id, checkpoint, attempt) = workspace.read_with(cx, |workspace, app| {
                 let document = workspace.document_at(0).unwrap().read(app);
-                let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+                let state = workspace
+                    .recovery_flow
+                    .recovery_schedules
+                    .get(&document.id())
+                    .unwrap();
                 let attempt = test_recovery_attempt(
                     state
                         .token
                         .clone()
                         .expect("a ready test store must provide a recovery token"),
-                    state.revision,
+                    state.content_identity.revision,
                     Instant::now(),
                     Arc::new(AtomicBool::new(false)),
                 );
@@ -15295,8 +9501,12 @@ mod tests {
                 .checkpoint(&checkpoint, &HashSet::from([checkpoint.key.clone()]))
                 .unwrap();
             workspace.update(cx, |workspace, _| {
-                workspace.recovery_schedules.get_mut(&id).unwrap().in_flight =
-                    Some(attempt.clone());
+                workspace
+                    .recovery_flow
+                    .recovery_schedules
+                    .get_mut(&id)
+                    .unwrap()
+                    .in_flight = Some(attempt.clone());
             });
 
             cx.simulate_keystrokes("ctrl-w");
@@ -15333,16 +9543,13 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store);
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store);
         replace_document(&workspace, 0, "save me\n", cx);
         let generation_before_save = workspace.read_with(cx, |workspace, _| {
-            assert_eq!(workspace.recovery_schedules.len(), 1);
-            assert!(workspace._recovery_timer.is_some());
-            workspace.recovery_timer_generation
+            assert_eq!(workspace.recovery_flow.recovery_schedules.len(), 1);
+            assert!(workspace.recovery_flow._recovery_timer.is_some());
+            workspace.recovery_flow.recovery_timer_generation
         });
         let document = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
@@ -15352,9 +9559,9 @@ mod tests {
         });
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_schedules.is_empty());
-            assert!(workspace._recovery_timer.is_none());
-            assert!(workspace.recovery_timer_generation > generation_before_save);
+            assert!(workspace.recovery_flow.recovery_schedules.is_empty());
+            assert!(workspace.recovery_flow._recovery_timer.is_none());
+            assert!(workspace.recovery_flow.recovery_timer_generation > generation_before_save);
         });
 
         cx.update(|window, app| {
@@ -15364,15 +9571,15 @@ mod tests {
         });
         replace_document(&workspace, 0, "discard me\n", cx);
         workspace.read_with(cx, |workspace, _| {
-            assert_eq!(workspace.recovery_schedules.len(), 1);
-            assert!(workspace._recovery_timer.is_some());
+            assert_eq!(workspace.recovery_flow.recovery_schedules.len(), 1);
+            assert!(workspace.recovery_flow._recovery_timer.is_some());
         });
         cx.simulate_keystrokes("ctrl-w");
         cx.simulate_prompt_answer("Discard");
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_schedules.is_empty());
-            assert!(workspace._recovery_timer.is_none());
+            assert!(workspace.recovery_flow.recovery_schedules.is_empty());
+            assert!(workspace.recovery_flow._recovery_timer.is_none());
         });
     }
 
@@ -15386,7 +9593,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let (id, key) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (document.id(), document.recovery_key())
@@ -15395,14 +9603,13 @@ mod tests {
         store.invalidate_and_delete(&key).unwrap();
         let new_token = store.current_token(&key);
         let now = Instant::now();
-        let mut schedule = super::CheckpointSchedule::default();
+        let mut schedule = CheckpointSchedule::default();
         schedule.mark_dirty(now);
         let timing = schedule
             .checkpoint_dispatched(now + Duration::from_secs(2))
             .unwrap();
         let attempt = super::RecoveryAttempt {
             token: new_token.clone(),
-            revision: 7,
             content_identity: super::RecoveryContentIdentity::for_revision(7),
             timing,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -15410,12 +9617,10 @@ mod tests {
         let deadline = schedule.next_deadline();
 
         workspace.update(cx, |workspace, cx| {
-            workspace.recovery = Some(store);
-            workspace.recovery_schedules.insert(
+            workspace.recovery_flow.recovery_schedules.insert(
                 id,
                 super::DocumentRecoveryState {
                     key,
-                    revision: 7,
                     content_identity: super::RecoveryContentIdentity::for_revision(7),
                     suppressed_oversized_revision: None,
                     token: Some(new_token),
@@ -15438,7 +9643,7 @@ mod tests {
         });
 
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert_eq!(state.in_flight.as_ref(), Some(&attempt));
             assert_eq!(state.schedule.next_deadline(), deadline);
         });
@@ -15456,10 +9661,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first_path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first_path), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second_path, window, cx);
@@ -15485,7 +9688,6 @@ mod tests {
                 schedule.mark_dirty(now);
                 let attempt = RecoveryAttempt {
                     token: store.activate_and_current_token(&document.recovery_key()).0,
-                    revision: document.revision(),
                     content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(now).unwrap(),
                     cancelled: if id == first_id {
@@ -15494,11 +9696,10 @@ mod tests {
                         second_cancelled.clone()
                     },
                 };
-                workspace.recovery_schedules.insert(
+                workspace.recovery_flow.recovery_schedules.insert(
                     id,
                     DocumentRecoveryState {
                         key: document.recovery_key(),
-                        revision: document.revision(),
                         content_identity: RecoveryContentIdentity::for_revision(
                             document.revision(),
                         ),
@@ -15518,8 +9719,16 @@ mod tests {
         assert!(first_cancelled.load(Ordering::Acquire));
         assert!(!second_cancelled.load(Ordering::Acquire));
         workspace.read_with(cx, |workspace, _| {
-            let first = workspace.recovery_schedules.get(&first_id).unwrap();
-            let second = workspace.recovery_schedules.get(&second_id).unwrap();
+            let first = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&first_id)
+                .unwrap();
+            let second = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&second_id)
+                .unwrap();
             assert!(first.in_flight.is_some());
             assert!(second.in_flight.is_some());
             assert!(!Arc::ptr_eq(
@@ -15539,16 +9748,18 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "first snapshot\n", cx);
 
         let now = cx.background_executor.now();
         let (id, attempt) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(now);
             (
@@ -15558,7 +9769,6 @@ mod tests {
                         .token
                         .clone()
                         .expect("a ready test store must provide a recovery token"),
-                    revision: document.revision(),
                     content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(now).unwrap(),
                     cancelled: Arc::new(AtomicBool::new(false)),
@@ -15566,7 +9776,11 @@ mod tests {
             )
         });
         workspace.update(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get_mut(&id)
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(now);
             let timing = schedule.checkpoint_dispatched(now).unwrap();
@@ -15584,6 +9798,7 @@ mod tests {
 
         let cancelled_attempt = workspace.read_with(cx, |workspace, _| {
             workspace
+                .recovery_flow
                 .recovery_schedules
                 .get(&id)
                 .unwrap()
@@ -15606,7 +9821,7 @@ mod tests {
         assert_eq!(recovered.records.len(), 1);
         assert_eq!(recovered.records[0].record.text, latest);
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_warning.is_none());
+            assert!(workspace.recovery_flow.recovery_warning.is_none());
         });
     }
 
@@ -15623,10 +9838,8 @@ mod tests {
         )
         .unwrap();
         let batches_before = store.checkpoint_batch_count_for_test();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let document = workspace
             .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
             .unwrap();
@@ -15638,7 +9851,11 @@ mod tests {
         let edited_at = cx.background_executor.now();
         let (id, checkpoint, attempt) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(edited_at);
             (
@@ -15646,7 +9863,6 @@ mod tests {
                 document.recovery_checkpoint(app),
                 RecoveryAttempt {
                     token: state.token.clone().unwrap(),
-                    revision: document.revision(),
                     content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule
                         .checkpoint_dispatched(edited_at + Duration::from_secs(2))
@@ -15656,7 +9872,11 @@ mod tests {
             )
         });
         workspace.update(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get_mut(&id)
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(edited_at);
             let timing = schedule
@@ -15668,8 +9888,8 @@ mod tests {
                 ..attempt.clone()
             });
             state.deadline_reported = false;
-            workspace.recovery_checkpoint_worker_active = true;
-            workspace._recovery_timer = None;
+            workspace.recovery_flow.recovery_checkpoint_worker_active = true;
+            workspace.recovery_flow._recovery_timer = None;
         });
 
         let (worker_paused, release_worker) = store.pause_after_checkpoint_final_check_for_test();
@@ -15713,6 +9933,7 @@ mod tests {
         });
         let same_attempt_while_paused = workspace.read_with(cx, |workspace, _| {
             workspace
+                .recovery_flow
                 .recovery_schedules
                 .get(&id)
                 .and_then(|state| state.in_flight.as_ref())
@@ -15761,14 +9982,17 @@ mod tests {
         let dispatched_at = cx.background_executor.now();
         let (id, attempt) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(dispatched_at);
             (
                 document.id(),
                 RecoveryAttempt {
                     token: state.token.clone().unwrap(),
-                    revision: document.revision(),
                     content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(dispatched_at).unwrap(),
                     cancelled: Arc::new(AtomicBool::new(false)),
@@ -15776,7 +10000,11 @@ mod tests {
             )
         });
         workspace.update(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get_mut(&id)
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(dispatched_at);
             let _ = schedule.checkpoint_dispatched(dispatched_at).unwrap();
@@ -15796,10 +10024,10 @@ mod tests {
         });
 
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert!(state.protection_warning);
             assert!(state.schedule.next_deadline().is_some());
-            assert!(workspace.recovery_warning.is_some());
+            assert!(workspace.recovery_flow.recovery_warning.is_some());
         });
     }
 
@@ -15815,14 +10043,17 @@ mod tests {
         let dispatched_at = cx.background_executor.now();
         let (id, attempt) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(dispatched_at);
             (
                 document.id(),
                 RecoveryAttempt {
                     token: state.token.clone().unwrap(),
-                    revision: document.revision(),
                     content_identity: RecoveryContentIdentity::for_revision(document.revision()),
                     timing: schedule.checkpoint_dispatched(dispatched_at).unwrap(),
                     cancelled: Arc::new(AtomicBool::new(false)),
@@ -15830,7 +10061,11 @@ mod tests {
             )
         });
         workspace.update(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get_mut(&id)
+                .unwrap();
             let mut schedule = CheckpointSchedule::default();
             schedule.mark_dirty(dispatched_at);
             let _ = schedule.checkpoint_dispatched(dispatched_at).unwrap();
@@ -15857,9 +10092,9 @@ mod tests {
         });
 
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert!(!state.protection_warning);
-            assert!(workspace.recovery_warning.is_none());
+            assert!(workspace.recovery_flow.recovery_warning.is_none());
         });
     }
 
@@ -15873,17 +10108,19 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let latest = "latest while stale worker is stuck\n";
         replace_document(&workspace, 0, latest, cx);
 
         let now = cx.background_executor.now();
         let (id, token, revision) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             (
                 document.id(),
                 state
@@ -15897,17 +10134,20 @@ mod tests {
         schedule.mark_dirty(now);
         let attempt = RecoveryAttempt {
             token,
-            revision,
             content_identity: RecoveryContentIdentity::for_revision(revision),
             timing: schedule.checkpoint_dispatched(now).unwrap(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         workspace.update(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get_mut(&id).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get_mut(&id)
+                .unwrap();
             state.schedule = schedule;
             state.in_flight = Some(attempt.clone());
             state.deadline_reported = false;
-            workspace.recovery_checkpoint_worker_active = true;
+            workspace.recovery_flow.recovery_checkpoint_worker_active = true;
         });
 
         cx.background_executor.advance_clock(
@@ -15921,25 +10161,25 @@ mod tests {
             workspace.checkpoint_recovery_at(deadline, cx);
         });
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert_eq!(state.in_flight.as_ref(), Some(&attempt));
             assert!(state.deadline_reported);
             assert!(state.protection_warning);
-            assert!(workspace._recovery_timer.is_none());
+            assert!(workspace.recovery_flow._recovery_timer.is_none());
         });
         assert!(attempt.cancelled.load(Ordering::Acquire));
 
         cx.background_executor.advance_clock(Duration::from_secs(1));
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert_eq!(state.in_flight.as_ref(), Some(&attempt));
-            assert!(workspace.recovery_warning.is_some());
+            assert!(workspace.recovery_flow.recovery_warning.is_some());
         });
         assert!(store.recover().unwrap().records.is_empty());
         workspace.update(cx, |workspace, _| {
-            workspace.recovery_checkpoint_worker_active = false;
-            workspace.recovery_schedules.remove(&id);
-            workspace._recovery_timer = None;
+            workspace.recovery_flow.recovery_checkpoint_worker_active = false;
+            workspace.recovery_flow.recovery_schedules.remove(&id);
+            workspace.recovery_flow._recovery_timer = None;
         });
     }
 
@@ -15955,16 +10195,18 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "protected late\n", cx);
 
         let now = cx.background_executor.now();
         let (id, key, revision, token) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             (
                 document.id(),
                 document.recovery_key(),
@@ -15980,17 +10222,15 @@ mod tests {
         let timing = schedule.checkpoint_dispatched(now).unwrap();
         let attempt = RecoveryAttempt {
             token: token.clone(),
-            revision,
             content_identity: RecoveryContentIdentity::for_revision(revision),
             timing,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         workspace.update(cx, |workspace, _| {
-            workspace.recovery_schedules.insert(
+            workspace.recovery_flow.recovery_schedules.insert(
                 id,
                 DocumentRecoveryState {
                     key,
-                    revision,
                     content_identity: RecoveryContentIdentity::for_revision(revision),
                     suppressed_oversized_revision: None,
                     token: Some(token),
@@ -16000,19 +10240,19 @@ mod tests {
                     protection_warning: false,
                 },
             );
-            workspace.recovery_checkpoint_worker_active = true;
+            workspace.recovery_flow.recovery_checkpoint_worker_active = true;
         });
 
         workspace.update(cx, |workspace, cx| {
             workspace.checkpoint_recovery_at(timing.durable_complete_by, cx);
         });
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert_eq!(state.in_flight.as_ref(), Some(&attempt));
             assert!(state.deadline_reported);
             assert!(state.protection_warning);
-            assert!(workspace.recovery_warning.is_some());
-            assert!(workspace._recovery_timer.is_none());
+            assert!(workspace.recovery_flow.recovery_warning.is_some());
+            assert!(workspace.recovery_flow._recovery_timer.is_none());
         });
         assert!(attempt.cancelled.load(Ordering::Acquire));
 
@@ -16030,22 +10270,23 @@ mod tests {
                 cx.background_executor().now(),
                 cx,
             );
-            workspace._recovery_timer = None;
+            workspace.recovery_flow._recovery_timer = None;
         });
 
         let latest = "latest after overdue 中文 \u{1f680}\n";
         replace_document(&workspace, 0, latest, cx);
         workspace.update(cx, |workspace, _| {
-            workspace._recovery_timer = None;
+            workspace.recovery_flow._recovery_timer = None;
         });
         cx.background_executor.advance_clock(Duration::from_secs(1));
         let retry_at = cx.background_executor.now();
         workspace.update(cx, |workspace, cx| {
-            workspace._recovery_timer = None;
+            workspace.recovery_flow._recovery_timer = None;
             workspace.checkpoint_recovery_at(retry_at, cx);
         });
         workspace.read_with(cx, |workspace, _| {
             let retry = workspace
+                .recovery_flow
                 .recovery_schedules
                 .get(&id)
                 .unwrap()
@@ -16056,7 +10297,7 @@ mod tests {
                 retry.timing.durable_complete_by,
                 retry_at + Duration::from_secs(8)
             );
-            assert!(workspace.recovery_warning.is_some());
+            assert!(workspace.recovery_flow.recovery_warning.is_some());
         });
         cx.run_until_parked();
 
@@ -16064,7 +10305,7 @@ mod tests {
         assert_eq!(recovered.records.len(), 1);
         assert_eq!(recovered.records[0].record.text, latest);
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_warning.is_none());
+            assert!(workspace.recovery_flow.recovery_warning.is_none());
         });
     }
 
@@ -16085,10 +10326,8 @@ mod tests {
             recovery_limits(max_record_bytes),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
 
         replace_document(
             &workspace,
@@ -16106,9 +10345,9 @@ mod tests {
         assert_eq!(store.checkpoint_batch_count_for_test(), 0);
         assert_eq!(protector.calls(), 0);
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.recovery_checkpoint_worker_active);
-            assert!(workspace.recovery_warning.is_some());
-            assert!(workspace._recovery_timer.is_none());
+            assert!(!workspace.recovery_flow.recovery_checkpoint_worker_active);
+            assert!(workspace.recovery_flow.recovery_warning.is_some());
+            assert!(workspace.recovery_flow._recovery_timer.is_none());
         });
 
         let smaller = "small recoverable edit 中文 \u{1f680}\n";
@@ -16120,7 +10359,7 @@ mod tests {
         assert_eq!(protector.calls(), 1);
         assert_eq!(store.recover().unwrap().records[0].record.text, smaller);
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_warning.is_none());
+            assert!(workspace.recovery_flow.recovery_warning.is_none());
         });
     }
 
@@ -16139,17 +10378,16 @@ mod tests {
             recovery_limits(max_record_bytes),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "below the plaintext ceiling\n", cx);
         cx.background_executor.advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         assert_eq!(protector.calls(), 1);
         assert_eq!(store.checkpoint_batch_count_for_test(), 1);
-        assert!(workspace.read_with(cx, |workspace, _| workspace.recovery_warning.is_some()));
+        assert!(workspace.read_with(cx, |workspace, _| {
+            workspace.recovery_flow.recovery_warning.is_some()
+        }));
 
         cx.background_executor
             .advance_clock(Duration::from_secs(30));
@@ -16174,11 +10412,8 @@ mod tests {
         let protector = Arc::new(CountingRecoveryProtector::new(CountingProtection::FailOnce));
         let store =
             RecoveryStore::new_at(dir.path().join("recovery-store"), protector.clone()).unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let text = "retry this exact revision 中文 \u{1f680}\n";
         replace_document(&workspace, 0, text, cx);
         let revision = workspace.read_with(cx, |workspace, app| {
@@ -16187,7 +10422,9 @@ mod tests {
         cx.background_executor.advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         assert_eq!(protector.calls(), 1);
-        assert!(workspace.read_with(cx, |workspace, _| workspace.recovery_warning.is_some()));
+        assert!(workspace.read_with(cx, |workspace, _| {
+            workspace.recovery_flow.recovery_warning.is_some()
+        }));
 
         cx.background_executor.advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
@@ -16200,7 +10437,7 @@ mod tests {
                 workspace.document_at(0).unwrap().read(app).revision(),
                 revision
             );
-            assert!(workspace.recovery_warning.is_none());
+            assert!(workspace.recovery_flow.recovery_warning.is_none());
         });
     }
 
@@ -16216,16 +10453,18 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         replace_document(&workspace, 0, "current revision\n", cx);
 
         let now = cx.background_executor.now();
         let (id, key, revision, token) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             (
                 document.id(),
                 document.recovery_key(),
@@ -16246,7 +10485,6 @@ mod tests {
             RevisionRequestBinding::new([1; 32], revision, 0, [2; 32], [3; 32], [5; 32]);
         let attempt = RecoveryAttempt {
             token: token.clone(),
-            revision,
             content_identity: RecoveryContentIdentity {
                 revision,
                 revision_binding: Some(stale_binding),
@@ -16255,12 +10493,10 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         workspace.update(cx, |workspace, cx| {
-            workspace.recovery = Some(store);
-            workspace.recovery_schedules.insert(
+            workspace.recovery_flow.recovery_schedules.insert(
                 id,
                 DocumentRecoveryState {
                     key,
-                    revision,
                     content_identity: RecoveryContentIdentity {
                         revision,
                         revision_binding: Some(current_binding),
@@ -16282,9 +10518,9 @@ mod tests {
         });
 
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert!(state.protection_warning);
-            assert!(workspace.recovery_warning.is_some());
+            assert!(workspace.recovery_flow.recovery_warning.is_some());
         });
     }
 
@@ -16327,14 +10563,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("the transaction must reserve its eviction victim");
 
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let edited = "edited during eviction reservation\n";
         replace_document(&workspace, 0, edited, cx);
-        let immediate_warning =
-            workspace.read_with(cx, |workspace, _| workspace.recovery_warning.clone());
+        let immediate_warning = workspace.read_with(cx, |workspace, _| {
+            workspace.recovery_flow.recovery_warning.clone()
+        });
 
         release.send(()).unwrap();
         assert!(matches!(
@@ -16344,16 +10579,20 @@ mod tests {
         let warning = "Recovery protection is unavailable for at least one dirty document. Editing and source files are unchanged.";
         assert_eq!(immediate_warning.as_deref(), Some(warning));
         workspace.read_with(cx, |workspace, _| {
-            assert_eq!(workspace.recovery_warning.as_deref(), Some(warning));
+            assert_eq!(
+                workspace.recovery_flow.recovery_warning.as_deref(),
+                Some(warning)
+            );
         });
 
         cx.background_executor.advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_warning.is_none());
+            assert!(workspace.recovery_flow.recovery_warning.is_none());
             assert!(
                 workspace
+                    .recovery_flow
                     .recovery_schedules
                     .values()
                     .all(|state| !state.protection_warning)
@@ -16376,11 +10615,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let first = "first checkpoint\n";
         replace_document(&workspace, 0, first, cx);
         cx.background_executor.advance_clock(Duration::from_secs(2));
@@ -16425,10 +10661,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -16475,11 +10709,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
-
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path), store.clone());
         let edited = "checkpoint 中文 \u{1f680}\n";
         replace_document(&workspace, 0, edited, cx);
         let started = Instant::now();
@@ -16501,10 +10732,8 @@ mod tests {
         assert_eq!(scan.records.len(), 1, "the two-second deadline dispatched");
         assert_eq!(scan.records[0].record.text, edited);
 
-        let (restored_workspace, cx) = open_test_workspace_with(cx, None);
-        restored_workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (restored_workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, None, store.clone());
         let restored = cx.update(|window, app| {
             restored_workspace.update(app, |workspace, cx| {
                 restore_recovery_for_test(workspace, scan, window, cx)
@@ -16527,8 +10756,8 @@ mod tests {
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.startup_recovery_pending);
-            assert!(workspace.recovery.is_none());
+            assert!(!workspace.recovery_flow.startup_recovery_pending);
+            assert!(workspace.recovery_flow.recovery.is_none());
             assert!(workspace.tabs.is_empty());
         });
     }
@@ -16546,8 +10775,8 @@ mod tests {
         let (workspace, cx) = open_test_workspace(cx, path);
         cx.run_until_parked();
         workspace.update(cx, |workspace, _| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
         });
 
         let edited_at = cx.background_executor.now();
@@ -16555,6 +10784,7 @@ mod tests {
         let id = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             let state = workspace
+                .recovery_flow
                 .recovery_schedules
                 .get(&document.id())
                 .expect("an early edit must create recovery timing state");
@@ -16570,15 +10800,15 @@ mod tests {
             workspace.checkpoint_recovery_at(unavailable_at, cx);
         });
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert!(state.protection_warning);
-            assert!(workspace.recovery_warning.is_some());
+            assert!(workspace.recovery_flow.recovery_warning.is_some());
         });
 
         let store_ready_at = edited_at + Duration::from_secs(3);
         complete_startup_with_store(&workspace, store, cx);
         workspace.read_with(cx, |workspace, _| {
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert!(
                 state.token.is_some(),
                 "the startup result must activate an existing unprotected schedule"
@@ -16589,7 +10819,7 @@ mod tests {
                 "activating recovery must preserve the first edit's deadline"
             );
             assert!(
-                workspace._recovery_timer.is_some(),
+                workspace.recovery_flow._recovery_timer.is_some(),
                 "the overdue schedule must be re-armed when recovery becomes available"
             );
         });
@@ -16598,6 +10828,7 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, _| {
             let attempt = workspace
+                .recovery_flow
                 .recovery_schedules
                 .get(&id)
                 .and_then(|state| state.in_flight.as_ref())
@@ -16616,12 +10847,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("initial.md");
         fs::write(&path, "disk\n").unwrap();
+        let recovered_text = "older recovered text\n";
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        write_recovery_checkpoint(&store, &path, "older recovered text\n");
+        write_recovery_checkpoint(&store, &path, recovered_text);
+        let recovered_key = RecoveryKey::for_path(&path);
         let store_for_startup = store.clone();
         let initial_was_interactive = Arc::new(AtomicBool::new(false));
         let loader_observation = initial_was_interactive.clone();
@@ -16653,21 +10886,677 @@ mod tests {
         cx.run_until_parked();
 
         let id = workspace.read_with(cx, |workspace, app| {
-            assert_eq!(workspace.tabs.len(), 1);
-            let document = workspace.document_at(0).unwrap().read(app);
-            assert!(document.is_dirty());
-            assert_eq!(document.text(app), latest);
-            document.id()
+            assert_eq!(workspace.tabs.len(), 2);
+            let live = workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::File(open_path)
+                        if open_path == &path =>
+                    {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the initial file must remain open");
+            let live = live.read(app);
+            assert!(live.is_dirty());
+            assert_eq!(live.text(app), latest);
+            live.id()
         });
-        workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery.is_some());
-            assert!(workspace.recovery_schedules.contains_key(&id));
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.recovery_flow.recovery.is_some());
+            assert!(workspace.recovery_flow.recovery_schedules.contains_key(&id));
             assert_eq!(
                 workspace.status.as_deref(),
                 Some(
-                    "Restored 0 recovery checkpoint(s); skipped 1 unavailable or invalid record(s)."
+                    "Restored 1 recovery checkpoint(s); skipped 0 unavailable or invalid record(s)."
                 )
             );
+            let recovered = workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::Recovered(key)
+                        if key == &recovered_key =>
+                    {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the old checkpoint must be visible separately");
+            let recovered = recovered.read(app);
+            assert!(recovered.is_dirty());
+            assert_eq!(recovered.text(app), recovered_text);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn explicit_reload_during_startup_keeps_old_checkpoint(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reloaded-before-scan.md");
+        let disk_text = "clean disk A\n";
+        let old_checkpoint = "old unsaved A checkpoint\n";
+        fs::write(&path, disk_text).unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, old_checkpoint);
+
+        let reloaded_before_scan = Arc::new(AtomicBool::new(false));
+        let scan_after_reload = reloaded_before_scan.clone();
+        let store_for_startup = store.clone();
+        let reload_observation = reloaded_before_scan.clone();
+        let (workspace, cx) = open_test_workspace_with_startup_recovery_inspection(
+            cx,
+            Some(path.clone()),
+            move || {
+                assert!(
+                    scan_after_reload.load(Ordering::Acquire),
+                    "the deferred startup scan must run after explicit Reload"
+                );
+                populated_startup_recovery(store_for_startup)
+            },
+            move |workspace, window, cx| {
+                let document = workspace.document_at(0).cloned().unwrap();
+                let before = document.read(cx).source_stamp();
+                document.update(cx, |document, cx| document.reload(window, cx));
+                let after = document.read(cx).source_stamp();
+                assert_ne!(before, after, "explicit Reload advances source identity");
+                document.read_with(cx, |document, app| {
+                    assert_eq!(document.text(app), disk_text);
+                    assert!(!document.is_dirty());
+                });
+                reload_observation.store(true, Ordering::Release);
+            },
+        );
+        cx.run_until_parked();
+
+        let live_document = workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let live = workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::File(open_path)
+                        if open_path == &path =>
+                    {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the reloaded A document must remain open");
+            let live_read = live.read(app);
+            assert_eq!(live_read.text(app), disk_text);
+            assert!(!live_read.is_dirty());
+            assert!(!live_read.is_externally_changed());
+            assert_eq!(live_read.source_path(), Some(path.as_path()));
+            assert_ne!(live_read.recovery_key(), RecoveryKey::for_path(&path));
+            live.clone()
+        });
+        workspace.read_with(cx, |workspace, app| {
+            let recovered = workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::Recovered(key)
+                        if key == &RecoveryKey::for_path(&path) =>
+                    {
+                        Some(tab.payload.view.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the old A checkpoint must be exposed as a recovered-only tab");
+            let recovered = recovered.read(app);
+            assert_eq!(recovered.text(app), old_checkpoint);
+            assert!(recovered.is_dirty());
+        });
+
+        let live_text = "edited after explicit Reload\n";
+        replace_document(&workspace, 0, live_text, cx);
+        let live_key = live_document.read_with(cx, |document, _| document.recovery_key());
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        let records = store.recover().unwrap().records;
+        assert_eq!(records.len(), 2);
+        let old_record = records
+            .iter()
+            .find(|record| record.record.key == RecoveryKey::for_path(&path))
+            .expect("the old path-key checkpoint must remain durable");
+        assert_eq!(old_record.record.text, old_checkpoint);
+        let live_record = records
+            .iter()
+            .find(|record| record.record.key == live_key)
+            .expect("the reloaded file's edit must use its own recovery key");
+        assert_eq!(live_record.record.text, live_text);
+        assert_ne!(live_record.record.key, old_record.record.key);
+        assert_eq!(fs::read_to_string(&path).unwrap(), disk_text);
+    }
+
+    #[gpui_kit::test]
+    fn recovered_tab_path_actions_use_the_document_source_path(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovered-path.md");
+        fs::write(&path, "disk source\n").unwrap();
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, "recovered source\n");
+
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let live_document = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        live_document.update(cx, |document, _| {
+            document.rotate_recovery_key();
+        });
+        let scan = store.recover().unwrap();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert_eq!(
+                    restore_recovery_for_test(workspace, scan, window, cx),
+                    (1, 0)
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_folder(dir.path().to_path_buf(), window, cx);
+            });
+        });
+
+        let recovered_index = workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let recovered = workspace.tabs.active().unwrap();
+            assert!(recovered.path().is_none());
+            assert!(matches!(
+                &recovered.identity,
+                mt_core::workspace::tabs::TabIdentity::Recovered(key)
+                    if key == &RecoveryKey::for_path(&path)
+            ));
+            assert_eq!(
+                recovered.payload.view.read(app).source_path(),
+                Some(path.as_path())
+            );
+            workspace.tabs.active_index()
+        });
+        let expected_path = path.to_string_lossy().replace('\\', "/");
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.on_copy_path(&super::CopyPath, window, cx);
+            });
+        });
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(expected_path.clone())
+        );
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.tabs.set_menu(recovered_index);
+                workspace.on_copy_path(&super::CopyPath, window, cx);
+            });
+        });
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(expected_path)
+        );
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.tabs.set_menu(recovered_index);
+                workspace.on_copy_relative_path(&super::CopyRelativePath, window, cx);
+            });
+        });
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("recovered-path.md".to_owned())
+        );
+    }
+
+    #[gpui_kit::test]
+    fn recovered_search_reveal_targets_the_buffer_and_stale_result_is_inert(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search-recovered-b.md");
+        let control_path = dir.path().join("search-control-c.md");
+        let ordinary_text = "ordinary B has needle\n";
+        let recovered_text = "recovered B has needle\n";
+        let control_text = "control C remains active\n";
+        fs::write(&path, ordinary_text).unwrap();
+        fs::write(&control_path, control_text).unwrap();
+
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, recovered_text);
+
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let ordinary = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        let ordinary_id = ordinary.read_with(cx, |document, _| document.id());
+        ordinary.update(cx, |document, _| document.rotate_recovery_key());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(control_path.clone(), window, cx);
+            });
+        });
+        let control_id = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .tabs
+                .iter()
+                .find_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::File(open_path)
+                        if open_path == &control_path =>
+                    {
+                        Some(tab.payload.view.read(app).id())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        });
+        let recovered_key = RecoveryKey::for_path(&path);
+        let scan = store.recover().unwrap();
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert_eq!(
+                    restore_recovery_for_test(workspace, scan, window, cx),
+                    (1, 0)
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let (recovered_id, recovered_index, control_index) =
+            workspace.read_with(cx, |workspace, app| {
+                let (recovered_index, recovered) = workspace
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, tab)| {
+                        matches!(
+                            &tab.identity,
+                            mt_core::workspace::tabs::TabIdentity::Recovered(key)
+                                if key == &recovered_key
+                        )
+                    })
+                    .expect("the checkpoint must appear as a recovered-only tab");
+                let recovered = recovered.payload.view.read(app);
+                assert_eq!(recovered.source_path(), Some(path.as_path()));
+                assert_eq!(recovered.text(app), recovered_text);
+                assert_ne!(recovered.id(), ordinary_id);
+                let control_index = workspace
+                    .tabs
+                    .iter()
+                    .position(|tab| {
+                        matches!(
+                            &tab.identity,
+                            mt_core::workspace::tabs::TabIdentity::File(open_path)
+                                if open_path == &control_path
+                        )
+                    })
+                    .unwrap();
+                (recovered.id(), recovered_index, control_index)
+            });
+        assert_eq!(
+            ordinary.read_with(cx, |document, app| document.text(app)),
+            ordinary_text
+        );
+
+        let mut matches = Results::default();
+        search_open_document(
+            recovered_id,
+            &path,
+            recovered_text,
+            &Query::new("needle"),
+            mt_core::workspace::search::DEFAULT_LIMIT,
+            &mut matches,
+        );
+        assert_eq!(matches.matches.len(), 1);
+        let hit = &matches.matches[0];
+        assert_eq!(hit.target, SearchTarget::OpenDocument(recovered_id));
+        assert_eq!(
+            &recovered_text[hit.offset..hit.offset + "needle".len()],
+            "needle"
+        );
+        let reveal = SearchEvent::Reveal {
+            path: hit.path.as_ref().clone(),
+            target: hit.target,
+            offset: hit.offset,
+        };
+
+        emit_search_reveal(&workspace, reveal.clone(), cx);
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 3);
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), recovered_id);
+            assert_eq!(active.source_path(), Some(path.as_path()));
+            assert_eq!(active.text(app), recovered_text);
+            assert_eq!(active.cursor(app), hit.offset);
+            let ordinary = workspace
+                .document_at(workspace.tabs.index_of(&path).unwrap())
+                .unwrap()
+                .read(app);
+            assert_eq!(ordinary.id(), ordinary_id);
+            assert_eq!(ordinary.text(app), ordinary_text);
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.tabs.focus(control_index));
+                workspace.request_close_tab(recovered_index, window, cx);
+            });
+        });
+        assert!(
+            cx.has_pending_prompt(),
+            "closing the recovered buffer asks for a decision"
+        );
+        cx.simulate_prompt_answer("Discard");
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert!(workspace.tabs.index_of(&path).is_some());
+            assert_eq!(
+                workspace.active_document().unwrap().read(app).id(),
+                control_id
+            );
+        });
+
+        emit_search_reveal(&workspace, reveal, cx);
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(
+                workspace.tabs.len(),
+                2,
+                "a stale result must not recreate a tab"
+            );
+            assert!(workspace.tabs.index_of(&path).is_some());
+            assert!(workspace.tabs.index_of(&control_path).is_some());
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(
+                active.id(),
+                control_id,
+                "a stale result must not focus File(B)"
+            );
+            assert_eq!(active.text(app), control_text);
+            let ordinary = workspace
+                .document_at(workspace.tabs.index_of(&path).unwrap())
+                .unwrap()
+                .read(app);
+            assert_eq!(ordinary.id(), ordinary_id);
+            assert_eq!(ordinary.text(app), ordinary_text);
+            assert!(workspace.tabs.iter().all(|tab| !matches!(
+                &tab.identity,
+                mt_core::workspace::tabs::TabIdentity::Recovered(key)
+                    if key == &recovered_key
+            )));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn recovered_outline_jumps_do_not_reopen_the_ordinary_file(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outline-recovery.md");
+        fs::write(&path, "# Ordinary file\n").unwrap();
+        let recovered_text = "# Recovered first\n\n## Recovered second\n";
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, recovered_text);
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let (recovered_id, _) = restore_open_file_checkpoint(&workspace, &path, &store, cx);
+        workspace.read_with(cx, |workspace, _| assert!(!workspace.history.can_go_back()));
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.reveal_offset(0, window, cx);
+                workspace.reveal_offset(recovered_text.find("##").unwrap(), window, cx);
+                workspace.on_navigate_back(&super::NavigateBack, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), recovered_id);
+            assert_eq!(active.text(app), recovered_text);
+            assert!(!workspace.history.can_go_back());
+            assert!(!workspace.history.can_go_forward());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn missing_file_search_result_cannot_move_recovered_buffer_or_add_history(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-search-result-b.md");
+        let control_path = dir.path().join("history-control-c.md");
+        let ordinary_text = "ordinary B result needle\n";
+        let recovered_text = "recovered B has needle\n";
+        fs::write(&path, ordinary_text).unwrap();
+        fs::write(&control_path, "control C\n").unwrap();
+
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, recovered_text);
+
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open_file(control_path.clone(), window, cx);
+            });
+        });
+        let (recovered_id, _) = restore_open_file_checkpoint(&workspace, &path, &store, cx);
+
+        let mut file_results = Results::default();
+        search_files(
+            std::slice::from_ref(&path),
+            &Query::new("needle"),
+            mt_core::workspace::search::DEFAULT_LIMIT,
+            &mut file_results,
+        );
+        assert_eq!(file_results.matches.len(), 1);
+        let file_hit = &file_results.matches[0];
+        assert_eq!(file_hit.target, SearchTarget::File);
+        let file_reveal = SearchEvent::Reveal {
+            path: file_hit.path.as_ref().clone(),
+            target: file_hit.target,
+            offset: file_hit.offset,
+        };
+
+        let mut recovered_results = Results::default();
+        search_open_document(
+            recovered_id,
+            &path,
+            recovered_text,
+            &Query::new("needle"),
+            mt_core::workspace::search::DEFAULT_LIMIT,
+            &mut recovered_results,
+        );
+        let recovered_hit = &recovered_results.matches[0];
+        assert_eq!(
+            recovered_hit.target,
+            SearchTarget::OpenDocument(recovered_id)
+        );
+        assert_ne!(file_hit.offset, recovered_hit.offset);
+        let recovered_reveal = SearchEvent::Reveal {
+            path: recovered_hit.path.as_ref().clone(),
+            target: recovered_hit.target,
+            offset: recovered_hit.offset,
+        };
+        emit_search_reveal(&workspace, recovered_reveal, cx);
+        cx.run_until_parked();
+
+        let ordinary_index = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .tabs
+                .index_of(&path)
+                .expect("ordinary B is still open")
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.request_close_tab(ordinary_index, window, cx);
+            });
+        });
+        assert!(
+            !cx.has_pending_prompt(),
+            "the clean ordinary tab closes directly"
+        );
+        fs::remove_file(&path).unwrap();
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.record_visit(control_path.clone(), 0);
+                workspace.record_visit(control_path.clone(), 1);
+                workspace.on_navigate_back(&super::NavigateBack, window, cx);
+            });
+        });
+        let recovered_index = workspace.read_with(cx, |workspace, app| {
+            workspace
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(index, tab)| {
+                    (tab.payload.view.read(app).id() == recovered_id).then_some(index)
+                })
+                .expect("recovered B remains open")
+        });
+        workspace.update(cx, |workspace, _| {
+            assert!(workspace.tabs.focus(recovered_index));
+            assert!(workspace.history.can_go_forward());
+        });
+        workspace.read_with(cx, |workspace, app| {
+            assert!(workspace.tabs.index_of(&path).is_none());
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), recovered_id);
+        });
+        let (cursor_before, tabs_before) = workspace.read_with(cx, |workspace, app| {
+            let document = workspace.active_document().unwrap().read(app);
+            assert_eq!(document.id(), recovered_id);
+            (document.cursor(app), workspace.tabs.len())
+        });
+
+        emit_search_reveal(&workspace, file_reveal, cx);
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), tabs_before);
+            assert!(workspace.tabs.index_of(&path).is_none());
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), recovered_id);
+            assert_eq!(active.cursor(app), cursor_before);
+            assert!(workspace.history.can_go_forward());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn recovered_search_result_is_inert_after_save_as_changes_tab_identity(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save-as-source-b.md");
+        let destination = dir.path().join("save-as-target-c.md");
+        let recovered_text = "recovered B has needle\n";
+        fs::write(&path, "ordinary B source\n").unwrap();
+
+        let store = RecoveryStore::new_at(
+            dir.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, recovered_text);
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let (recovered_id, _) = restore_open_file_checkpoint(&workspace, &path, &store, cx);
+
+        let mut recovered_results = Results::default();
+        search_open_document(
+            recovered_id,
+            &path,
+            recovered_text,
+            &Query::new("needle"),
+            mt_core::workspace::search::DEFAULT_LIMIT,
+            &mut recovered_results,
+        );
+        assert_eq!(recovered_results.matches.len(), 1);
+        let hit = &recovered_results.matches[0];
+        assert_eq!(hit.target, SearchTarget::OpenDocument(recovered_id));
+        assert_eq!(hit.path.as_path(), path.as_path());
+        assert!(hit.offset > 0);
+        let stale_reveal = SearchEvent::Reveal {
+            path: hit.path.as_ref().clone(),
+            target: hit.target,
+            offset: hit.offset,
+        };
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.finish_save_as(
+                    recovered_id,
+                    destination.clone(),
+                    SaveAsMode::CreateOnly,
+                    window,
+                    cx,
+                );
+            });
+        });
+        let destination_view = workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            let index = workspace.tabs.index_of(&destination).unwrap();
+            let tab = workspace.tabs.get(index).unwrap();
+            assert!(matches!(
+                &tab.identity,
+                mt_core::workspace::tabs::TabIdentity::File(saved_path)
+                    if saved_path == &destination
+            ));
+            let document = tab.payload.view.read(app);
+            assert_eq!(document.id(), recovered_id);
+            assert_eq!(document.source_path(), Some(destination.as_path()));
+            tab.payload.view.clone()
+        });
+        cx.update(|window, app| {
+            destination_view.update(app, |document, cx| {
+                document.reveal_offset(0, window, cx);
+            });
+        });
+
+        emit_search_reveal(&workspace, stale_reveal, cx);
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 2);
+            assert!(workspace.tabs.index_of(&path).is_some());
+            let index = workspace.tabs.index_of(&destination).unwrap();
+            assert_eq!(workspace.tabs.active_index(), index);
+            let tab = workspace.tabs.get(index).unwrap();
+            assert!(matches!(
+                &tab.identity,
+                mt_core::workspace::tabs::TabIdentity::File(saved_path)
+                    if saved_path == &destination
+            ));
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), recovered_id);
+            assert_eq!(active.source_path(), Some(destination.as_path()));
+            assert_eq!(active.cursor(app), 0);
         });
     }
 
@@ -16701,14 +11590,14 @@ mod tests {
         });
         let restored_at = cx.background_executor.now();
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.startup_recovery_pending);
-            let state = workspace.recovery_schedules.get(&id).unwrap();
+            assert!(!workspace.recovery_flow.startup_recovery_pending);
+            let state = workspace.recovery_flow.recovery_schedules.get(&id).unwrap();
             assert_eq!(
                 state.schedule.next_deadline(),
                 Some(restored_at + Duration::from_secs(10))
             );
             assert!(state.in_flight.is_none());
-            assert!(workspace._recovery_timer.is_some());
+            assert!(workspace.recovery_flow._recovery_timer.is_some());
         });
 
         cx.background_executor.advance_clock(Duration::from_secs(2));
@@ -16756,10 +11645,7 @@ mod tests {
             }],
             issues: Vec::new(),
         };
-        let (workspace, cx) = open_test_workspace_with(cx, None);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store.clone());
         let restored_at = cx.background_executor.now();
 
         let restored = cx.update(|window, app| {
@@ -16770,12 +11656,16 @@ mod tests {
         assert_eq!(restored, (1, 0));
         workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
-            let state = workspace.recovery_schedules.get(&document.id()).unwrap();
+            let state = workspace
+                .recovery_flow
+                .recovery_schedules
+                .get(&document.id())
+                .unwrap();
             assert_eq!(
                 state.schedule.next_deadline(),
                 Some(restored_at + Duration::from_secs(10))
             );
-            assert!(workspace._recovery_timer.is_some());
+            assert!(workspace.recovery_flow._recovery_timer.is_some());
         });
 
         cx.background_executor.advance_clock(Duration::from_secs(9));
@@ -16925,10 +11815,15 @@ mod tests {
         let key = RecoveryKey::for_path(&path);
 
         workspace.update(cx, |workspace, cx| {
-            workspace.recovery = None;
-            workspace.startup_recovery_pending = true;
+            workspace.recovery_flow.recovery = None;
+            workspace.recovery_flow.startup_recovery_pending = true;
             workspace.invalidate_recovery(&key, None, cx);
-            assert!(workspace.pending_recovery_retirements.contains_key(&key));
+            assert!(
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .contains_key(&key)
+            );
         });
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
@@ -16944,7 +11839,12 @@ mod tests {
                 workspace.document_at(0).unwrap().read(app).text(app),
                 "disk\n"
             );
-            assert!(workspace.pending_recovery_retirements.is_empty());
+            assert!(
+                workspace
+                    .recovery_flow
+                    .pending_recovery_retirements
+                    .is_empty()
+            );
         });
     }
 
@@ -17082,20 +11982,6 @@ mod tests {
         );
     }
     #[test]
-    fn stale_written_checkpoint_does_not_signal_current_durability() {
-        let written = CheckpointBatchOutcome::Written;
-        assert!(current_checkpoint_write_completed(true, 7, 7, &written));
-        assert!(!current_checkpoint_write_completed(true, 8, 7, &written));
-        assert!(!current_checkpoint_write_completed(false, 7, 7, &written));
-        assert!(!current_checkpoint_write_completed(
-            true,
-            7,
-            7,
-            &CheckpointBatchOutcome::Deferred,
-        ));
-    }
-
-    #[test]
     fn revision_answer_binding_invalidates_same_revision_checkpoint() {
         let first_binding = RevisionRequestBinding::new([1; 32], 7, 3, [2; 32], [3; 32], [4; 32]);
         let second_binding = RevisionRequestBinding::new([1; 32], 7, 3, [2; 32], [3; 32], [5; 32]);
@@ -17204,14 +12090,17 @@ mod tests {
         .with_source_dirty(false);
 
         workspace.update(cx, |workspace, cx| {
-            workspace
-                .recovered_revision_records
-                .insert(key.clone(), recovery.clone());
+            let document_id = workspace.document_at(0).unwrap().read(cx).id();
+            workspace.review_flow.store_recovered_revision_record(
+                document_id,
+                key.clone(),
+                recovery.clone(),
+            );
             workspace.open_review_panel(ReviewTarget::Document, cx);
         });
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.review_panel_open);
-            assert!(workspace.recovered_revision_records.contains_key(&key));
+            assert!(workspace.review_flow.review_panel_is_open());
+            assert!(workspace.review_flow.has_recovered_revision_record(&key));
         });
 
         workspace.update(cx, |workspace, cx| {
@@ -17249,18 +12138,251 @@ mod tests {
             serde_json::json!(hex_bytes(recovery.binding().answers_digest()))
         );
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.recovered_revision_records.contains_key(&key));
+            assert!(!workspace.review_flow.has_recovered_revision_record(&key));
         });
 
         workspace.update(cx, |workspace, cx| {
-            workspace
-                .recovered_revision_records
-                .insert(key.clone(), recovery);
+            let document_id = workspace.document_at(0).unwrap().read(cx).id();
+            workspace.review_flow.store_recovered_revision_record(
+                document_id,
+                key.clone(),
+                recovery,
+            );
             workspace.discard_revision_answers(cx);
         });
         workspace.read_with(cx, |workspace, _| {
-            assert!(!workspace.recovered_revision_records.contains_key(&key));
+            assert!(!workspace.review_flow.has_recovered_revision_record(&key));
         });
+    }
+
+    #[gpui_kit::test]
+    fn recovered_sibling_survives_reopened_file_checkpoint_save_and_discard(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reopened-recovery.md");
+        fs::write(&path, "ordinary disk text\n").unwrap();
+        let recovered_text = "independent recovered text\n";
+        let recovered_key = RecoveryKey::for_path(&path);
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, recovered_text);
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let (recovered_id, _) = restore_open_file_checkpoint(&workspace, &path, &store, cx);
+        workspace.update(cx, |workspace, cx| {
+            let ordinary = workspace.tabs.index_of(&path).unwrap();
+            workspace.close_tab_unchecked(ordinary, cx);
+        });
+
+        for (decision, text) in [
+            ("Save", "saved live text\n"),
+            ("Discard", "discarded live text\n"),
+        ] {
+            cx.update(|window, app| {
+                workspace.update(app, |workspace, cx| {
+                    assert!(workspace.open_file(path.clone(), window, cx));
+                });
+            });
+            let ordinary = workspace.read_with(cx, |workspace, _| workspace.tabs.active_index());
+            replace_document(&workspace, ordinary, text, cx);
+            let checkpoint = workspace.read_with(cx, |workspace, app| {
+                workspace
+                    .active_document()
+                    .unwrap()
+                    .read(app)
+                    .recovery_checkpoint(app)
+            });
+            store
+                .checkpoint(
+                    &checkpoint,
+                    &HashSet::from([recovered_key.clone(), checkpoint.key.clone()]),
+                )
+                .unwrap();
+
+            let scan = store.recover().unwrap();
+            let retained = scan
+                .records
+                .iter()
+                .find(|record| record.record.key == recovered_key)
+                .unwrap();
+            assert_eq!(retained.record.text, recovered_text);
+            assert_ne!(checkpoint.key, recovered_key);
+            assert!(scan.records.iter().any(|record| {
+                record.record.key == checkpoint.key && record.record.text == text
+            }));
+
+            cx.simulate_keystrokes("ctrl-w");
+            cx.simulate_prompt_answer(decision);
+            cx.run_until_parked();
+            let remaining = store.recover().unwrap();
+            assert_eq!(remaining.records.len(), 1);
+            assert_eq!(remaining.records[0].record.key, recovered_key);
+            assert_eq!(remaining.records[0].record.text, recovered_text);
+            workspace.read_with(cx, |workspace, app| {
+                let recovered = workspace.document_by_id(recovered_id, app).unwrap();
+                assert_eq!(recovered.read(app).text(app), recovered_text);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn recovered_answers_stay_with_the_recovered_tab_after_reopening_file(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovered-alias.md");
+        let disk_text = "ordinary disk text\n";
+        let recovered_text = "older recovered text\n";
+        fs::write(&path, disk_text).unwrap();
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let loaded = mt_core::document::io::load(&path).unwrap();
+        let recovered_key = RecoveryKey::for_path(&path);
+        let recovered_answer = "Keep the recovered intent.";
+        let revision_recovery = RevisionRecovery::new(
+            RevisionRequestBinding::new([1; 32], 7, 3, [2; 32], [3; 32], [4; 32]),
+            RevisionAnswers::for_recovery(vec![RevisionAnswer::answered(recovered_answer)])
+                .unwrap(),
+        )
+        .with_source_dirty(true);
+        store
+            .checkpoint(
+                &RecoveryCheckpoint {
+                    key: recovered_key.clone(),
+                    text: recovered_text.to_owned(),
+                    metadata: RecoveryMetadata::from_loaded_file(&loaded),
+                    revision: Some(revision_recovery),
+                },
+                &HashSet::new(),
+            )
+            .unwrap();
+
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let original_file = workspace
+            .read_with(cx, |workspace, _| workspace.document_at(0).cloned())
+            .unwrap();
+        original_file.update(cx, |document, _| document.rotate_recovery_key());
+        let scan = store.recover().unwrap();
+        let recovered_document_id = cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                let result = restore_recovery_for_test(workspace, scan, window, cx);
+                assert_eq!(result, (1, 0));
+                let recovered = workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| {
+                        matches!(
+                            &tab.identity,
+                            mt_core::workspace::tabs::TabIdentity::Recovered(key)
+                                if key == &recovered_key
+                        )
+                    })
+                    .expect("the old checkpoint must have a recovered-only tab");
+                recovered.payload.view.read(cx).id()
+            })
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let live_index = workspace
+                .tabs
+                .index_of(&path)
+                .expect("the original file tab remains open during restore");
+            workspace.close_tab_unchecked(live_index, cx);
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                assert!(workspace.open_file(path.clone(), window, cx));
+            });
+        });
+        cx.run_until_parked();
+
+        let (ordinary_document_id, ordinary_key) = workspace.read_with(cx, |workspace, app| {
+            let ordinary = workspace.active_document().unwrap().read(app);
+            assert_eq!(ordinary.source_path(), Some(path.as_path()));
+            (ordinary.id(), ordinary.recovery_key())
+        });
+        assert_ne!(ordinary_document_id, recovered_document_id);
+        assert_ne!(ordinary_key, recovered_key);
+
+        let recovered_answers_offered = cx.update(|window, app| {
+            use gpui_kit::test::TestWindowExt as _;
+
+            workspace.update(app, |workspace, cx| {
+                workspace.open_review_panel(ReviewTarget::Document, cx);
+            });
+            window.render_frame(app);
+            let offered = window.try_find("revision-recovered-answers").is_some();
+            if offered {
+                window.click("revision-discard-recovered-answers", app);
+            }
+            offered
+        });
+        if !recovered_answers_offered {
+            // Exercise the same handler even when the correctly-bound ordinary
+            // tab has no recovered-answer button to click.
+            workspace.update(cx, |workspace, cx| {
+                workspace.discard_recovered_revision_answers(cx);
+            });
+        }
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, app| {
+            let recovered = workspace
+                .document_by_id(recovered_document_id, app)
+                .expect("discarding from the ordinary tab must leave the recovered tab open");
+            assert_eq!(recovered.read(app).text(app), recovered_text);
+            let answers = workspace
+                .review_flow
+                .recovered_revision_record_for_document(recovered_document_id, &recovered_key)
+                .expect("the recovered tab must keep its answer binding");
+            assert_eq!(
+                answers.1.answers().as_slice(),
+                &[RevisionAnswer::answered(recovered_answer)]
+            );
+            assert!(
+                workspace
+                    .review_flow
+                    .recovered_revision_record_for_document(ordinary_document_id, &ordinary_key)
+                    .is_none(),
+                "the ordinary tab must not borrow another document's recovered answers"
+            );
+            assert!(
+                workspace
+                    .review_flow
+                    .recovered_revision_record_for_document(ordinary_document_id, &recovered_key)
+                    .is_none(),
+                "an explicit recovered key still requires its document's answer binding"
+            );
+        });
+        assert!(
+            !recovered_answers_offered,
+            "the ordinary file must not show recovered answers from the recovered-only tab"
+        );
+
+        let retained = store.recover().unwrap();
+        let old_record = retained
+            .records
+            .iter()
+            .find(|record| record.record.key == recovered_key)
+            .expect("discard from the ordinary alias must not retire the recovered checkpoint");
+        assert_eq!(old_record.record.text, recovered_text);
+        assert_eq!(
+            old_record
+                .record
+                .revision
+                .as_ref()
+                .unwrap()
+                .answers()
+                .as_slice(),
+            &[RevisionAnswer::answered(recovered_answer)]
+        );
     }
 
     #[gpui::test]
@@ -17273,10 +12395,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         replace_document(&workspace, 0, "dirty source survives copy\n", cx);
         let key = workspace.read_with(cx, |workspace, app| {
             workspace.document_at(0).unwrap().read(app).recovery_key()
@@ -17286,10 +12406,13 @@ mod tests {
             RevisionAnswers::for_recovery(vec![RevisionAnswer::answered("keep intent")]).unwrap(),
         )
         .with_source_dirty(true);
-        workspace.update(cx, |workspace, _| {
-            workspace
-                .recovered_revision_records
-                .insert(key.clone(), recovery);
+        workspace.update(cx, |workspace, cx| {
+            let document_id = workspace.document_at(0).unwrap().read(cx).id();
+            workspace.review_flow.store_recovered_revision_record(
+                document_id,
+                key.clone(),
+                recovery,
+            );
         });
 
         workspace.update(cx, |workspace, cx| {
@@ -17297,6 +12420,7 @@ mod tests {
         });
         assert!(workspace.read_with(cx, |workspace, _| {
             workspace
+                .recovery_flow
                 .recovery_schedules
                 .values()
                 .any(|state| state.key == key)
@@ -17331,10 +12455,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (
@@ -17387,7 +12509,7 @@ mod tests {
             .checkpoint(&checkpoint, &HashSet::from([old_recovery_key.clone()]))
             .unwrap();
         assert_eq!(store.recover().unwrap().records.len(), 1);
-        let question_id = super::revision_question_binding_id(0, &question);
+        let question_id = revision_question_id(0, &question);
         let raw_response = serde_json::json!({
             "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
@@ -17411,27 +12533,29 @@ mod tests {
 
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace.revision_context = Some(super::WorkspaceRevisionContext {
-                    document_id,
-                    source_snapshot: source_snapshot.clone(),
-                    request: request.clone(),
-                    review_output: output.clone(),
-                    skill_package: None,
-                    supporting_sources_current: true,
-                    applied: false,
-                    applied_preview: None,
-                    applied_decisions: None,
-                    answers_exported: false,
-                    answer_states: vec![RevisionAnswer::answered("keep")],
-                    answer_inputs: Vec::new(),
-                });
-                workspace.revision_result = Some(super::WorkspaceRevisionResult {
-                    document_id,
-                    source_snapshot,
-                    result: transport,
-                    decisions: vec![(ChangeId(0), false)],
-                    preview: "old\n".to_owned(),
-                });
+                workspace
+                    .review_flow
+                    .install_revision_context(super::WorkspaceRevisionContext {
+                        document_id,
+                        source_snapshot: source_snapshot.clone(),
+                        request: request.clone(),
+                        review_output: output.clone(),
+                        skill_package: None,
+                        supporting_sources_current: true,
+                        applied: None,
+                        answers_exported: false,
+                        answer_states: vec![RevisionAnswer::answered("keep")],
+                        answer_inputs: Vec::new(),
+                    });
+                workspace
+                    .review_flow
+                    .replace_revision_result(super::WorkspaceRevisionResult {
+                        document_id,
+                        source_snapshot,
+                        result: transport,
+                        decisions: vec![(ChangeId(0), false)],
+                        preview: "old\n".to_owned(),
+                    });
                 assert!(!workspace.apply_revision(window, cx));
             });
         });
@@ -17459,8 +12583,13 @@ mod tests {
         workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             assert!(!document.is_dirty());
-            assert!(!workspace.revision_context.as_ref().unwrap().applied);
-            assert!(workspace.revision_result.is_some());
+            assert!(
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .is_some_and(|context| context.applied.is_none())
+            );
+            assert!(workspace.review_flow.has_revision_result());
         });
 
         cx.update(|window, app| {
@@ -17492,8 +12621,8 @@ mod tests {
         workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.source_path(), Some(path.as_path()));
-            assert!(workspace.revision_context.is_none());
-            assert!(workspace.revision_result.is_none());
+            assert!(!workspace.review_flow.has_revision_context());
+            assert!(!workspace.review_flow.has_revision_result());
             assert!(!document.is_dirty());
         });
     }
@@ -17509,10 +12638,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (
@@ -17565,7 +12692,7 @@ mod tests {
             .checkpoint(&checkpoint, &HashSet::from([old_recovery_key.clone()]))
             .unwrap();
         assert_eq!(store.recover().unwrap().records.len(), 1);
-        let question_id = super::revision_question_binding_id(0, &question);
+        let question_id = revision_question_id(0, &question);
         let raw_response = serde_json::json!({
             "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
@@ -17589,27 +12716,29 @@ mod tests {
 
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace.revision_context = Some(super::WorkspaceRevisionContext {
-                    document_id,
-                    source_snapshot: source_snapshot.clone(),
-                    request: request.clone(),
-                    review_output: output.clone(),
-                    skill_package: None,
-                    supporting_sources_current: true,
-                    applied: false,
-                    applied_preview: None,
-                    applied_decisions: None,
-                    answers_exported: false,
-                    answer_states: vec![RevisionAnswer::answered("keep")],
-                    answer_inputs: Vec::new(),
-                });
-                workspace.revision_result = Some(super::WorkspaceRevisionResult {
-                    document_id,
-                    source_snapshot,
-                    result: transport,
-                    decisions: vec![(ChangeId(0), false)],
-                    preview: "old\n".to_owned(),
-                });
+                workspace
+                    .review_flow
+                    .install_revision_context(super::WorkspaceRevisionContext {
+                        document_id,
+                        source_snapshot: source_snapshot.clone(),
+                        request: request.clone(),
+                        review_output: output.clone(),
+                        skill_package: None,
+                        supporting_sources_current: true,
+                        applied: None,
+                        answers_exported: false,
+                        answer_states: vec![RevisionAnswer::answered("keep")],
+                        answer_inputs: Vec::new(),
+                    });
+                workspace
+                    .review_flow
+                    .replace_revision_result(super::WorkspaceRevisionResult {
+                        document_id,
+                        source_snapshot,
+                        result: transport,
+                        decisions: vec![(ChangeId(0), false)],
+                        preview: "old\n".to_owned(),
+                    });
                 assert!(!workspace.apply_revision(window, cx));
             });
         });
@@ -17639,8 +12768,13 @@ mod tests {
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.source_path(), Some(path.as_path()));
             assert!(!document.is_dirty());
-            assert!(!workspace.revision_context.as_ref().unwrap().applied);
-            assert!(workspace.revision_result.is_some());
+            assert!(
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .is_some_and(|context| context.applied.is_none())
+            );
+            assert!(workspace.review_flow.has_revision_result());
         });
 
         cx.update(|window, app| {
@@ -17677,8 +12811,8 @@ mod tests {
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.source_path(), Some(destination.as_path()));
             assert_eq!(document.text(app), "new\n");
-            assert!(workspace.revision_context.is_none());
-            assert!(workspace.revision_result.is_none());
+            assert!(!workspace.review_flow.has_revision_context());
+            assert!(!workspace.review_flow.has_revision_result());
             assert!(!document.is_dirty());
         });
     }
@@ -17689,9 +12823,6 @@ mod tests {
         store: &RecoveryStore,
         cx: &mut VisualTestContext,
     ) -> (super::DocumentId, RecoveryKey) {
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
         let (document_id, source_snapshot, revision) = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             (
@@ -17743,7 +12874,7 @@ mod tests {
         store
             .checkpoint(&checkpoint, &HashSet::from([recovery_key.clone()]))
             .unwrap();
-        let question_id = super::revision_question_binding_id(0, &question);
+        let question_id = revision_question_id(0, &question);
         let raw_response = serde_json::json!({
             "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
@@ -17767,27 +12898,29 @@ mod tests {
 
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace.revision_context = Some(super::WorkspaceRevisionContext {
-                    document_id,
-                    source_snapshot: source_snapshot.clone(),
-                    request: request.clone(),
-                    review_output: output.clone(),
-                    skill_package: None,
-                    supporting_sources_current: true,
-                    applied: false,
-                    applied_preview: None,
-                    applied_decisions: None,
-                    answers_exported: false,
-                    answer_states: answer_states.clone(),
-                    answer_inputs: Vec::new(),
-                });
-                workspace.revision_result = Some(super::WorkspaceRevisionResult {
-                    document_id,
-                    source_snapshot,
-                    result: transport,
-                    decisions: vec![(ChangeId(0), false)],
-                    preview: "old\n".to_owned(),
-                });
+                workspace
+                    .review_flow
+                    .install_revision_context(super::WorkspaceRevisionContext {
+                        document_id,
+                        source_snapshot: source_snapshot.clone(),
+                        request: request.clone(),
+                        review_output: output.clone(),
+                        skill_package: None,
+                        supporting_sources_current: true,
+                        applied: None,
+                        answers_exported: false,
+                        answer_states: answer_states.clone(),
+                        answer_inputs: Vec::new(),
+                    });
+                workspace
+                    .review_flow
+                    .replace_revision_result(super::WorkspaceRevisionResult {
+                        document_id,
+                        source_snapshot,
+                        result: transport,
+                        decisions: vec![(ChangeId(0), false)],
+                        preview: "old\n".to_owned(),
+                    });
                 assert!(!workspace.apply_revision(window, cx));
             });
         });
@@ -17795,7 +12928,7 @@ mod tests {
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.text(app), "old\n");
             assert_eq!(document.is_dirty(), path.is_none());
-            assert!(workspace.revision_context.as_ref().unwrap().applied);
+            assert!(workspace.review_flow.revision_is_applied(document_id));
         });
         (document_id, recovery_key)
     }
@@ -17817,6 +12950,73 @@ mod tests {
     }
 
     #[gpui::test]
+    fn revision_save_as_survives_other_tab_edits_but_not_its_own(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("reviewed-a.md");
+        let approved_copy = directory.path().join("approved-a.md");
+        fs::write(&source, "old\n").unwrap();
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(source.clone()), store.clone());
+        let (document_id, _) =
+            prepare_reject_all_revision_for_save_as(&workspace, Some(&source), &store, cx);
+        let other_document_id = add_secondary_memory_tab(&workspace, cx);
+        assert_ne!(document_id, other_document_id);
+
+        replace_document(&workspace, 1, "other tab edit\n", cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.review_flow.revision_is_applied(document_id),
+                "another tab's edit must not revoke A's approval"
+            );
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.focus_path(&source, cx);
+        });
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
+        cx.simulate_new_path_selection(|parent| {
+            assert_eq!(parent, directory.path());
+            Some(approved_copy.clone())
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            fs::read(&approved_copy).unwrap(),
+            b"old\n",
+            "editing another tab must not revoke A's approved Save As"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.review_flow.revision_is_applied(document_id));
+        });
+
+        replace_document(&workspace, 0, "A's own edit\n", cx);
+        workspace.read_with(cx, |workspace, app| {
+            let document = workspace.document_at(0).unwrap().read(app);
+            assert_eq!(document.text(app), "A's own edit\n");
+            assert!(document.is_dirty());
+            assert!(!workspace.review_flow.revision_is_applied(document_id));
+        });
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.save_as_revision(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.pending_save_as.is_none());
+        });
+    }
+
+    #[gpui::test]
     fn revision_save_as_rejects_clean_reload_during_picker_and_replace(cx: &mut TestAppContext) {
         let picker_directory = tempfile::tempdir().unwrap();
         let picker_source = picker_directory.path().join("picker-source.md");
@@ -17827,7 +13027,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (picker_workspace, cx) = open_test_workspace(cx, picker_source.clone());
+        let (picker_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(picker_source.clone()),
+            picker_store.clone(),
+        );
         let (picker_document_id, picker_recovery_key) = prepare_reject_all_revision_for_save_as(
             &picker_workspace,
             Some(&picker_source),
@@ -17869,13 +13073,22 @@ mod tests {
             assert_eq!(document.text(app), "old\n");
             assert!(!document.is_dirty());
             assert!(workspace.pending_save_as.is_none());
-            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert!(
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .is_some_and(|context| context.applied.is_none())
+            );
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().answer_states,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .answer_states,
                 vec![RevisionAnswer::answered("keep")]
             );
-            assert!(workspace.revision_result.is_some());
-            assert!(workspace.revision_diagnostic.is_some());
+            assert!(workspace.review_flow.has_revision_result());
+            assert!(workspace.review_flow.revision_diagnostic().is_some());
         });
         let picker_recovered = picker_store.recover().unwrap();
         let picker_record = picker_recovered
@@ -17906,7 +13119,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (replace_workspace, cx) = open_test_workspace(cx, replace_source.clone());
+        let (replace_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(replace_source.clone()),
+            replace_store.clone(),
+        );
         let (replace_document_id, replace_recovery_key) = prepare_reject_all_revision_for_save_as(
             &replace_workspace,
             Some(&replace_source),
@@ -17958,13 +13175,22 @@ mod tests {
             assert_eq!(document.text(app), externally_reloaded);
             assert!(!document.is_dirty());
             assert!(workspace.pending_save_as.is_none());
-            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert!(
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .is_some_and(|context| context.applied.is_none())
+            );
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().answer_states,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .answer_states,
                 vec![RevisionAnswer::answered("keep")]
             );
-            assert!(workspace.revision_result.is_some());
-            assert!(workspace.revision_diagnostic.is_some());
+            assert!(workspace.review_flow.has_revision_result());
+            assert!(workspace.review_flow.revision_diagnostic().is_some());
         });
         let replace_recovered = replace_store.recover().unwrap();
         let replace_record = replace_recovered
@@ -17990,7 +13216,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (pathless_workspace, cx) = open_test_workspace_with(cx, None);
+        let (pathless_workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, None, pathless_store.clone());
         let created_pathless_document_id = cx.update(|window, app| {
             pathless_workspace.update(app, |workspace, cx| {
                 workspace.new_memory("old\n".to_owned(), window, cx);
@@ -18020,12 +13247,21 @@ mod tests {
             assert_eq!(document.source_path(), None);
             assert!(document.is_dirty());
             assert!(workspace.pending_save_as.is_none());
-            assert!(!workspace.revision_context.as_ref().unwrap().applied);
+            assert!(
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .is_some_and(|context| context.applied.is_none())
+            );
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().answer_states,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .answer_states,
                 vec![RevisionAnswer::answered("keep")]
             );
-            assert!(workspace.revision_result.is_some());
+            assert!(workspace.review_flow.has_revision_result());
         });
         let pathless_recovered = pathless_store.recover().unwrap();
         let pathless_record = pathless_recovered
@@ -18053,7 +13289,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (picker_switch_workspace, cx) = open_test_workspace(cx, picker_switch_source.clone());
+        let (picker_switch_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(picker_switch_source.clone()),
+            picker_switch_store.clone(),
+        );
         let (picker_switch_document_id, _) = prepare_reject_all_revision_for_save_as(
             &picker_switch_workspace,
             Some(&picker_switch_source),
@@ -18088,7 +13328,11 @@ mod tests {
                 picker_switch_active_id
             );
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().answer_states,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .answer_states,
                 vec![RevisionAnswer::answered("keep")]
             );
             assert!(workspace.pending_save_as.is_none());
@@ -18104,7 +13348,11 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (replace_switch_workspace, cx) = open_test_workspace(cx, replace_switch_source.clone());
+        let (replace_switch_workspace, cx) = open_test_workspace_with_recovery_store(
+            cx,
+            Some(replace_switch_source.clone()),
+            replace_switch_store.clone(),
+        );
         let (replace_switch_document_id, _) = prepare_reject_all_revision_for_save_as(
             &replace_switch_workspace,
             Some(&replace_switch_source),
@@ -18142,7 +13390,11 @@ mod tests {
                 replace_switch_active_id
             );
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().answer_states,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .answer_states,
                 vec![RevisionAnswer::answered("keep")]
             );
             assert!(workspace.pending_save_as.is_none());
@@ -18196,7 +13448,7 @@ mod tests {
         };
         let answer_states = vec![RevisionAnswer::answered("keep")];
         let answers = RevisionAnswers::new(answer_states.clone()).unwrap();
-        let question_id = super::revision_question_binding_id(0, &question);
+        let question_id = revision_question_id(0, &question);
         let raw_response = serde_json::json!({
             "schema_version": mt_core::review::provider::REVISION_SCHEMA_VERSION,
             "groups": [{
@@ -18220,49 +13472,54 @@ mod tests {
 
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace.review_panel_open = true;
+                workspace.review_flow.set_review_panel_open(true);
                 workspace.right_panel_open = true;
-                workspace.review_result = Some(super::WorkspaceReviewResult {
-                    document_id,
-                    source_snapshot: source_snapshot.clone(),
-                    target: ReviewTarget::Document,
-                    selection: None,
-                    lens: ArtifactLens::Prompt,
-                    partial: false,
-                    skill_package: None,
-                    supporting_sources_current: true,
-                    result: mt_core::review::provider::ReviewTransportResult {
-                        result: mt_core::review::ReviewResult::ready(&request, output.clone())
+                workspace.review_flow.install_review_result(
+                    super::WorkspaceReviewResult {
+                        document_id,
+                        source_snapshot: source_snapshot.clone(),
+                        target: ReviewTarget::Document,
+                        selection: None,
+                        lens: ArtifactLens::Prompt,
+                        partial: false,
+                        skill_package: None,
+                        supporting_sources_current: true,
+                        result: mt_core::review::provider::ReviewTransportResult {
+                            result: mt_core::review::ReviewResult::ready(&request, output.clone())
+                                .unwrap(),
+                            metadata: mt_core::review::provider::ReviewMetadata::from_response(
+                                mt_core::model::Provider::OpenAiResponses,
+                                "test-model",
+                                "test-model",
+                            )
                             .unwrap(),
-                        metadata: mt_core::review::provider::ReviewMetadata::from_response(
-                            mt_core::model::Provider::OpenAiResponses,
-                            "test-model",
-                            "test-model",
-                        )
-                        .unwrap(),
+                        },
                     },
-                });
-                workspace.revision_context = Some(super::WorkspaceRevisionContext {
-                    document_id,
-                    source_snapshot: source_snapshot.clone(),
-                    request,
-                    review_output: output,
-                    skill_package: None,
-                    supporting_sources_current: true,
-                    applied: false,
-                    applied_preview: None,
-                    applied_decisions: None,
-                    answers_exported: false,
-                    answer_states,
-                    answer_inputs: Vec::new(),
-                });
-                workspace.revision_result = Some(super::WorkspaceRevisionResult {
-                    document_id,
-                    source_snapshot,
-                    result: transport,
-                    decisions: vec![(ChangeId(0), true)],
-                    preview: "new\n".to_owned(),
-                });
+                    false,
+                );
+                workspace
+                    .review_flow
+                    .install_revision_context(super::WorkspaceRevisionContext {
+                        document_id,
+                        source_snapshot: source_snapshot.clone(),
+                        request,
+                        review_output: output,
+                        skill_package: None,
+                        supporting_sources_current: true,
+                        applied: None,
+                        answers_exported: false,
+                        answer_states,
+                        answer_inputs: Vec::new(),
+                    });
+                workspace
+                    .review_flow
+                    .replace_revision_result(super::WorkspaceRevisionResult {
+                        document_id,
+                        source_snapshot,
+                        result: transport,
+                        decisions: vec![(ChangeId(0), true)],
+                        preview: "new\n".to_owned(),
+                    });
                 assert!(workspace.apply_revision(window, cx));
             });
         });
@@ -18293,10 +13550,10 @@ mod tests {
             Some("sentinel".to_owned())
         );
         workspace.read_with(cx, |workspace, app| {
-            assert!(workspace.review_panel_open);
+            assert!(workspace.review_flow.review_panel_is_open());
             assert!(workspace.right_panel_open);
             assert_eq!(
-                workspace.revision_diagnostic.as_deref(),
+                workspace.review_flow.revision_diagnostic(),
                 Some(i18n::t(i18n::Key::RevisionStale, app))
             );
         });
@@ -18323,16 +13580,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("restored-revision.md");
         let text = "# Restored\n\nKeep this intent.\n";
+        let old_recovered_text = "# Older recovered body\n\nKeep this quarantined answer.\n";
+        let old_recovered_answer = "Keep the original intent and heading.";
         fs::write(&path, text).unwrap();
         let store = RecoveryStore::new_at(
             directory.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, path.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
         let (document, document_id, recovery_key, revision, source_snapshot) =
             workspace.read_with(cx, |workspace, app| {
                 let document = workspace.document_at(0).unwrap();
@@ -18376,9 +13633,7 @@ mod tests {
         let recovery = super::build_revision_recovery(
             &request,
             &output,
-            &[RevisionAnswer::answered(
-                "Keep the original intent and heading.",
-            )],
+            &[RevisionAnswer::answered(old_recovered_answer)],
         )
         .unwrap();
         let binding = recovery.binding();
@@ -18407,6 +13662,7 @@ mod tests {
         let mismatched_checkpoint = workspace.read_with(cx, |workspace, app| {
             let document = workspace.document_at(0).unwrap().read(app);
             let mut checkpoint = document.recovery_checkpoint(app);
+            checkpoint.text = old_recovered_text.to_owned();
             checkpoint.revision = Some(mismatched_recovery.clone());
             checkpoint
         });
@@ -18419,9 +13675,11 @@ mod tests {
 
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace
-                    .recovered_revision_records
-                    .insert(recovery_key.clone(), shifted_recovery);
+                workspace.review_flow.store_recovered_revision_record(
+                    document_id,
+                    recovery_key.clone(),
+                    shifted_recovery,
+                );
                 workspace.install_revision_context(
                     document_id,
                     recovery_key.clone(),
@@ -18439,8 +13697,8 @@ mod tests {
 
         workspace.read_with(cx, |workspace, app| {
             let context = workspace
-                .revision_context
-                .as_ref()
+                .review_flow
+                .revision_context()
                 .expect("the revision context must be installed");
             assert_eq!(
                 context.answer_states,
@@ -18454,16 +13712,18 @@ mod tests {
             );
             assert!(
                 !workspace
-                    .recovered_revision_records
-                    .contains_key(&recovery_key)
+                    .review_flow
+                    .has_recovered_revision_record(&recovery_key)
             );
         });
 
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace
-                    .recovered_revision_records
-                    .insert(recovery_key.clone(), mismatched_recovery.clone());
+                workspace.review_flow.store_recovered_revision_record(
+                    document_id,
+                    recovery_key.clone(),
+                    mismatched_recovery.clone(),
+                );
                 workspace.install_revision_context(
                     document_id,
                     recovery_key.clone(),
@@ -18481,17 +13741,17 @@ mod tests {
 
         workspace.read_with(cx, |workspace, app| {
             let context = workspace
-                .revision_context
-                .as_ref()
+                .review_flow
+                .revision_context()
                 .expect("the mismatched context must remain visible but unanswered");
             assert_eq!(context.answer_states, vec![RevisionAnswer::unanswered()]);
             assert!(context.answer_inputs[0].read(app).value().is_empty());
             assert_eq!(
                 workspace
-                    .recovered_revision_records
-                    .get(&recovery_key)
-                    .map(RevisionRecovery::binding),
-                Some(mismatched_recovery.binding())
+                    .review_flow
+                    .recovered_revision_record_for_document(document_id, &recovery_key)
+                    .map(|(_, recovery)| *recovery.binding()),
+                Some(*mismatched_recovery.binding())
             );
         });
 
@@ -18507,6 +13767,7 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, _| {
             let live = workspace
+                .review_flow
                 .revision_recovery_for_document(document_id, &recovery_key)
                 .expect("the live answer must supersede quarantined recovery for checkpointing");
             assert_eq!(
@@ -18516,40 +13777,185 @@ mod tests {
             assert_ne!(live.binding(), mismatched_recovery.binding());
         });
 
-        workspace.update(cx, |workspace, cx| {
-            workspace.discard_recovered_revision_answers(cx);
-            assert!(
-                workspace
-                    .recovery_schedules
-                    .get(&document_id)
-                    .is_some_and(|state| state.key == recovery_key),
-                "retiring quarantined answers must re-arm clean documents with live answers"
-            );
-        });
-        cx.run_until_parked();
-        let now = cx.background_executor.now();
-        workspace.update(cx, |workspace, cx| {
-            workspace.checkpoint_recovery_at(now + Duration::from_secs(1), cx);
-        });
-        cx.run_until_parked();
-        cx.background_executor.advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        cx.background_executor.advance_clock(Duration::from_secs(1));
+        let live_text = "# Edited after the new answer\n\nKeep the new source text.\n";
+        replace_document(&workspace, 0, live_text, cx);
+        let live_key = document.read_with(cx, |document, _| document.recovery_key());
+        cx.background_executor.advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
 
-        let recovered = store.recover().unwrap();
-        assert_eq!(recovered.records.len(), 1);
-        let persisted = recovered.records[0]
+        let scan = store.recover().unwrap();
+        assert_eq!(
+            scan.records.len(),
+            2,
+            "the quarantined record and live checkpoint must remain independently durable"
+        );
+        {
+            let old_record = scan
+                .records
+                .iter()
+                .find(|record| record.record.key == recovery_key)
+                .expect("the quarantined record must retain its original key");
+            assert_eq!(old_record.record.text, old_recovered_text);
+            let old_persisted = old_record
+                .record
+                .revision
+                .as_ref()
+                .expect("the quarantined answers must remain inspectable");
+            assert_eq!(
+                old_persisted.answers().as_slice(),
+                &[RevisionAnswer::answered(old_recovered_answer)]
+            );
+            assert_eq!(old_persisted.binding(), mismatched_recovery.binding());
+
+            assert_ne!(live_key, recovery_key);
+            let live_record = scan
+                .records
+                .iter()
+                .find(|record| record.record.key == live_key)
+                .expect("the live checkpoint must use its distinct incarnation key");
+            assert_eq!(live_record.record.text, live_text);
+            let live_persisted = live_record
+                .record
+                .revision
+                .as_ref()
+                .expect("the live answer must be durable with its text");
+            assert_eq!(
+                live_persisted.answers().as_slice(),
+                &[RevisionAnswer::answered("Keep the new answer.")]
+            );
+            assert_ne!(live_persisted.binding(), mismatched_recovery.binding());
+        }
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                restore_startup_recovery_for_test(workspace, scan, 0, None, window, cx);
+            })
+        });
+        workspace.read_with(cx, |workspace, app| {
+            assert_eq!(workspace.tabs.len(), 3);
+            assert_eq!(workspace.tabs.index_of(&path), Some(0));
+            let recovered_tabs = workspace
+                .tabs
+                .iter()
+                .filter_map(|tab| match &tab.identity {
+                    mt_core::workspace::tabs::TabIdentity::Recovered(key) => {
+                        Some((key.clone(), tab.payload.view.clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>();
+            assert_eq!(recovered_tabs.len(), 2);
+
+            let old_view = recovered_tabs
+                .get(&recovery_key)
+                .expect("the old answer checkpoint must have its own recovered tab");
+            let old_document = old_view.read(app);
+            assert_eq!(old_document.text(app), old_recovered_text);
+            let old_answers = workspace
+                .review_flow
+                .revision_recovery_for_document(old_document.id(), &recovery_key)
+                .expect("the old quarantined answers must remain user-accessible");
+            assert_eq!(
+                old_answers.answers().as_slice(),
+                &[RevisionAnswer::answered(old_recovered_answer)]
+            );
+
+            let live_view = recovered_tabs
+                .get(&live_key)
+                .expect("the live answer checkpoint must have its own recovered tab");
+            let live_document = live_view.read(app);
+            assert_eq!(live_document.text(app), live_text);
+            let live_answers = workspace
+                .review_flow
+                .revision_recovery_for_document(live_document.id(), &live_key)
+                .expect("the live answer must remain user-accessible");
+            assert_eq!(
+                live_answers.answers().as_slice(),
+                &[RevisionAnswer::answered("Keep the new answer.")]
+            );
+        });
+
+        let ordinary_live_text =
+            "# Edited ordinary file after recovery\n\nKeep this newer source.\n";
+        replace_document(&workspace, 0, ordinary_live_text, cx);
+        let ordinary_key = document.read_with(cx, |document, _| document.recovery_key());
+        cx.background_executor.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        let updated_scan = store.recover().unwrap();
+        assert_eq!(
+            updated_scan.records.len(),
+            3,
+            "editing the ordinary tab must not overwrite either recovered-only checkpoint"
+        );
+        let old_record = updated_scan
+            .records
+            .iter()
+            .find(|record| record.record.key == recovery_key)
+            .expect("the old path-key checkpoint must remain durable");
+        assert_eq!(old_record.record.text, old_recovered_text);
+        let old_persisted = old_record
             .record
             .revision
             .as_ref()
-            .expect("the live Revision answers must be durable");
+            .expect("the old quarantined answer must remain inspectable");
+        assert_eq!(old_persisted.binding(), mismatched_recovery.binding());
         assert_eq!(
-            persisted.answers().as_slice(),
+            old_persisted.answers().as_slice(),
+            &[RevisionAnswer::answered(old_recovered_answer)]
+        );
+
+        let live_record = updated_scan
+            .records
+            .iter()
+            .find(|record| record.record.key == live_key)
+            .expect("the first live alias checkpoint must remain independent");
+        assert_eq!(live_record.record.text, live_text);
+        assert_eq!(
+            live_record
+                .record
+                .revision
+                .as_ref()
+                .expect("the live alias must retain its answer")
+                .answers()
+                .as_slice(),
             &[RevisionAnswer::answered("Keep the new answer.")]
         );
-        assert_ne!(persisted.binding(), mismatched_recovery.binding());
-        let _ = document;
+
+        assert_ne!(ordinary_key, recovery_key);
+        assert_ne!(ordinary_key, live_key);
+        let ordinary_record = updated_scan
+            .records
+            .iter()
+            .find(|record| record.record.key == ordinary_key)
+            .expect("the edited ordinary tab must use its own recovery key");
+        assert_eq!(ordinary_record.record.text, ordinary_live_text);
+        assert_eq!(
+            ordinary_record
+                .record
+                .revision
+                .as_ref()
+                .expect("the ordinary tab must keep its live answer")
+                .answers()
+                .as_slice(),
+            &[RevisionAnswer::answered("Keep the new answer.")]
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace
+                    .review_flow
+                    .recovered_revision_record_for_document(document_id, &ordinary_key)
+                    .is_none()
+            );
+            let ordinary_answers = workspace
+                .review_flow
+                .revision_recovery_for_document(document_id, &ordinary_key)
+                .expect("the ordinary document must keep only its live answer context");
+            assert_eq!(
+                ordinary_answers.answers().as_slice(),
+                &[RevisionAnswer::answered("Keep the new answer.")]
+            );
+        });
     }
 
     #[gpui::test]
@@ -18645,28 +14051,35 @@ mod tests {
                     window,
                     cx,
                 );
-                workspace.revision_context.as_mut().unwrap().answer_states[0] =
-                    RevisionAnswer::answered("Keep the first document intent.");
+                let _ = workspace.review_flow.set_revision_answer_state(
+                    0,
+                    RevisionAnswer::answered("Keep the first document intent."),
+                );
                 workspace.open_review_panel(ReviewTarget::Document, cx);
             });
         });
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().document_id,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .document_id,
                 first_id
             );
-            assert_ne!(workspace.review_target_document_id, Some(second_id));
+            assert_ne!(
+                workspace.review_flow.review_target_document_id(),
+                Some(second_id)
+            );
         });
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        workspace.update(cx, |workspace, _| {
-            workspace.revision_context.as_mut().unwrap().answer_states[0] =
-                RevisionAnswer::unanswered();
-            workspace.pending_revision = Some(super::PendingRevision {
-                cancelled: cancelled.clone(),
-                document_id: first_id,
-            });
-            workspace.revision_running = true;
+        let cancelled = workspace.update(cx, |workspace, _| {
+            let _ = workspace
+                .review_flow
+                .set_revision_answer_state(0, RevisionAnswer::unanswered());
+            let (generation, cancelled) = workspace.review_flow.begin_revision_request(first_id);
+            assert!(generation > 0);
+            cancelled
         });
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
@@ -18685,9 +14098,13 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, _| {
             assert!(cancelled.load(Ordering::Acquire));
-            assert!(workspace.pending_revision.is_none());
+            assert!(!workspace.review_flow.is_revision_running());
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().document_id,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .document_id,
                 second_id
             );
         });
@@ -18768,7 +14185,12 @@ mod tests {
             });
         });
         let input = workspace.read_with(cx, |workspace, _| {
-            workspace.revision_context.as_ref().unwrap().answer_inputs[0].clone()
+            workspace
+                .review_flow
+                .revision_context()
+                .unwrap()
+                .answer_inputs[0]
+                .clone()
         });
         cx.update(|window, app| {
             input.update(app, |input, cx| input.replace_all(answer_text, window, cx));
@@ -18788,8 +14210,8 @@ mod tests {
             assert!(document.is_dirty());
 
             let context = workspace
-                .revision_context
-                .as_ref()
+                .review_flow
+                .revision_context()
                 .expect("provider failure must retain the reviewed answer context");
             assert_eq!(context.document_id, document_id);
             assert_eq!(context.source_snapshot, source_snapshot);
@@ -18799,9 +14221,9 @@ mod tests {
                 context.answer_inputs[0].read(app).value().to_string(),
                 "Keep the reviewed source intact."
             );
-            assert!(!workspace.revision_running);
-            assert!(workspace.revision_diagnostic.is_some());
-            assert!(workspace.revision_result.is_none());
+            assert!(!workspace.review_flow.is_revision_running());
+            assert!(workspace.review_flow.revision_diagnostic().is_some());
+            assert!(!workspace.review_flow.has_revision_result());
         });
 
         workspace.update(cx, |workspace, cx| workspace.dismiss_revision(cx));
@@ -18809,9 +14231,13 @@ mod tests {
             let document = workspace.document_at(0).unwrap().read(app);
             assert_eq!(document.text(app), reviewed_text);
             assert!(document.is_dirty());
-            assert!(workspace.revision_diagnostic.is_none());
+            assert!(workspace.review_flow.revision_diagnostic().is_none());
             assert_eq!(
-                workspace.revision_context.as_ref().unwrap().answer_states,
+                workspace
+                    .review_flow
+                    .revision_context()
+                    .unwrap()
+                    .answer_states,
                 vec![answer]
             );
         });
@@ -18848,10 +14274,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -18882,23 +14306,20 @@ mod tests {
             second_schedule.mark_dirty(now);
             let first_attempt = RecoveryAttempt {
                 token: first_token.clone(),
-                revision: first_revision,
                 content_identity: RecoveryContentIdentity::for_revision(first_revision),
                 timing: first_schedule.checkpoint_dispatched(now).unwrap(),
                 cancelled: Arc::new(AtomicBool::new(false)),
             };
             let second_attempt = RecoveryAttempt {
                 token: second_token.clone(),
-                revision: second_revision,
                 content_identity: RecoveryContentIdentity::for_revision(second_revision),
                 timing: second_schedule.checkpoint_dispatched(now).unwrap(),
                 cancelled: Arc::new(AtomicBool::new(false)),
             };
-            workspace.recovery_schedules.insert(
+            workspace.recovery_flow.recovery_schedules.insert(
                 first_id,
                 DocumentRecoveryState {
                     key: first_key,
-                    revision: first_revision,
                     content_identity: RecoveryContentIdentity::for_revision(first_revision),
                     suppressed_oversized_revision: None,
                     token: Some(first_token),
@@ -18908,11 +14329,10 @@ mod tests {
                     protection_warning: false,
                 },
             );
-            workspace.recovery_schedules.insert(
+            workspace.recovery_flow.recovery_schedules.insert(
                 second_id,
                 DocumentRecoveryState {
                     key: second_key,
-                    revision: second_revision,
                     content_identity: RecoveryContentIdentity::for_revision(second_revision),
                     suppressed_oversized_revision: None,
                     token: Some(second_token),
@@ -18972,10 +14392,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -19023,6 +14441,7 @@ mod tests {
             for checkpoint in &checkpoints {
                 assert!(
                     workspace
+                        .recovery_flow
                         .pending_recovery_retirements
                         .contains_key(&checkpoint.key),
                     "a failed batch marker write must keep every retirement queued"
@@ -19054,10 +14473,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -19093,6 +14510,7 @@ mod tests {
             .expect("the old retirement batch");
         workspace.update(cx, |workspace, _| {
             workspace
+                .recovery_flow
                 .recovery_retirement_batches
                 .insert(first_key.clone(), old_batch.clone());
         });
@@ -19106,6 +14524,7 @@ mod tests {
             workspace.arm_document_recovery(&document, cx);
             let checkpoint = document.read(cx).recovery_checkpoint(cx);
             let token = workspace
+                .recovery_flow
                 .recovery_schedules
                 .get(&first_id)
                 .and_then(|state| state.token.clone())
@@ -19145,11 +14564,15 @@ mod tests {
 
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(
-                workspace.recovery_retirement_batches.get(&first_key),
+                workspace
+                    .recovery_flow
+                    .recovery_retirement_batches
+                    .get(&first_key),
                 Some(&old_batch)
             );
             assert!(
                 !workspace
+                    .recovery_flow
                     .recovery_retirement_batches
                     .contains_key(&second_key),
                 "a dirty-owned old retirement must block a partial B-only batch"
@@ -19184,10 +14607,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first.clone());
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first.clone()), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second.clone(), window, cx);
@@ -19218,6 +14639,7 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 workspace
+                    .recovery_flow
                     .recovery_retirements
                     .contains_key(&RecoveryKey::for_path(&first)),
                 "the saved document must retain its durable single-key retirement while cleanup retries"
@@ -19277,10 +14699,8 @@ mod tests {
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        let (workspace, cx) = open_test_workspace(cx, first);
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store.clone());
-        });
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(first), store.clone());
         cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 workspace.open_file(second, window, cx);
@@ -19603,16 +15023,12 @@ mod tests {
             }],
             issues: Vec::new(),
         };
-        let (workspace, cx) = open_test_workspace_with(cx, None);
         let store = RecoveryStore::new_at(
             dir.path().join("recovery-store"),
             Arc::new(TestRecoveryProtector),
         )
         .unwrap();
-        workspace.update(cx, |workspace, _| {
-            workspace.recovery = Some(store);
-        });
-
+        let (workspace, cx) = open_test_workspace_with_recovery_store(cx, None, store);
         let restored = cx.update(|window, app| {
             workspace.update(app, |workspace, cx| {
                 restore_recovery_for_test(workspace, scan, window, cx)
@@ -19625,8 +15041,8 @@ mod tests {
             .unwrap();
         let id = document.read_with(cx, |document, _| document.id());
         workspace.read_with(cx, |workspace, _| {
-            assert!(workspace.recovery_schedules.contains_key(&id));
-            assert!(workspace._recovery_timer.is_some());
+            assert!(workspace.recovery_flow.recovery_schedules.contains_key(&id));
+            assert!(workspace.recovery_flow._recovery_timer.is_some());
         });
         document.read_with(cx, |document, app| {
             assert!(document.is_dirty());
@@ -20093,20 +15509,20 @@ mod tests {
             clarification_questions: Vec::new(),
         };
         workspace.update(cx, |workspace, _| {
-            workspace.revision_context = Some(super::WorkspaceRevisionContext {
-                document_id,
-                source_snapshot,
-                request,
-                review_output: output,
-                skill_package: Some(package.clone()),
-                supporting_sources_current: true,
-                applied: false,
-                applied_preview: None,
-                applied_decisions: None,
-                answers_exported: false,
-                answer_states: Vec::new(),
-                answer_inputs: Vec::new(),
-            });
+            workspace
+                .review_flow
+                .install_revision_context(super::WorkspaceRevisionContext {
+                    document_id,
+                    source_snapshot,
+                    request,
+                    review_output: output,
+                    skill_package: Some(package.clone()),
+                    supporting_sources_current: true,
+                    applied: None,
+                    answers_exported: false,
+                    answer_states: Vec::new(),
+                    answer_inputs: Vec::new(),
+                });
         });
 
         workspace.update(cx, |workspace, cx| {
@@ -20119,8 +15535,8 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 !workspace
-                    .revision_context
-                    .as_ref()
+                    .review_flow
+                    .revision_context()
                     .unwrap()
                     .supporting_sources_current
             );
@@ -20130,10 +15546,8 @@ mod tests {
         fs::write(&new_support, "new support\n").unwrap();
         workspace.update(cx, |workspace, _| {
             workspace
-                .revision_context
-                .as_mut()
-                .unwrap()
-                .supporting_sources_current = true;
+                .review_flow
+                .set_revision_supporting_sources_current(true);
         });
         workspace.update(cx, |workspace, cx| {
             workspace.apply_watcher_changes(
@@ -20145,8 +15559,8 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 !workspace
-                    .revision_context
-                    .as_ref()
+                    .review_flow
+                    .revision_context()
                     .unwrap()
                     .supporting_sources_current
             );
@@ -20155,10 +15569,8 @@ mod tests {
         fs::remove_file(&new_support).unwrap();
         workspace.update(cx, |workspace, _| {
             workspace
-                .revision_context
-                .as_mut()
-                .unwrap()
-                .supporting_sources_current = true;
+                .review_flow
+                .set_revision_supporting_sources_current(true);
         });
         workspace.update(cx, |workspace, cx| {
             workspace.apply_watcher_changes(directory.path(), &[Change::Removed(new_support)], cx);
@@ -20166,8 +15578,8 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 !workspace
-                    .revision_context
-                    .as_ref()
+                    .review_flow
+                    .revision_context()
                     .unwrap()
                     .supporting_sources_current
             );
@@ -20175,17 +15587,15 @@ mod tests {
 
         workspace.update(cx, |workspace, _| {
             workspace
-                .revision_context
-                .as_mut()
-                .unwrap()
-                .supporting_sources_current = true;
+                .review_flow
+                .set_revision_supporting_sources_current(true);
         });
         replace_document(&workspace, 1, "changed support\n", cx);
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 !workspace
-                    .revision_context
-                    .as_ref()
+                    .review_flow
+                    .revision_context()
                     .unwrap()
                     .supporting_sources_current
             );
@@ -20200,8 +15610,8 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 !workspace
-                    .revision_context
-                    .as_ref()
+                    .review_flow
+                    .revision_context()
                     .unwrap()
                     .supporting_sources_current
             );
@@ -20219,8 +15629,8 @@ mod tests {
             workspace.update(app, |workspace, cx| {
                 let document_id = workspace.active_document().unwrap().read(cx).id();
                 workspace
-                    .review_lens_overrides
-                    .insert(document_id, ArtifactLens::AgentSkill);
+                    .review_flow
+                    .set_review_lens_override(document_id, ArtifactLens::AgentSkill);
                 workspace.review(ReviewTarget::Document, window, cx);
             });
         });
@@ -20234,15 +15644,15 @@ mod tests {
             assert!(!document.is_dirty());
 
             let diagnostic = workspace
-                .review_diagnostic
-                .as_ref()
+                .review_flow
+                .review_diagnostic()
                 .expect("request preparation reaches the unavailable-provider result");
             assert_eq!(diagnostic.lens, ArtifactLens::AgentSkill);
             assert!(matches!(
                 diagnostic.diagnostic.code,
                 ReviewDiagnosticCode::NoProvider | ReviewDiagnosticCode::Unavailable
             ));
-            assert!(!workspace.reviewing);
+            assert!(!workspace.review_flow.is_reviewing());
         });
         assert!(!cx.has_pending_prompt());
     }
@@ -20264,8 +15674,8 @@ mod tests {
             workspace.update(app, |workspace, cx| {
                 let document_id = workspace.active_document().unwrap().read(cx).id();
                 workspace
-                    .review_lens_overrides
-                    .insert(document_id, ArtifactLens::AgentSkill);
+                    .review_flow
+                    .set_review_lens_override(document_id, ArtifactLens::AgentSkill);
                 workspace.review(ReviewTarget::Document, window, cx);
             });
         });
@@ -20277,8 +15687,8 @@ mod tests {
             assert!(!document.is_dirty());
 
             let diagnostic = workspace
-                .review_diagnostic
-                .as_ref()
+                .review_flow
+                .review_diagnostic()
                 .expect("a substituted root fails during request preparation");
             assert_eq!(diagnostic.lens, ArtifactLens::AgentSkill);
             assert_eq!(
@@ -20289,7 +15699,7 @@ mod tests {
                 diagnostic.diagnostic.message.as_str(),
                 i18n::t(i18n::Key::ReviewSkillPackageChanged, app)
             );
-            assert!(!workspace.reviewing);
+            assert!(!workspace.review_flow.is_reviewing());
         });
         assert!(!cx.has_pending_prompt());
     }
@@ -20329,8 +15739,8 @@ mod tests {
                 workspace.insert_document(skill.clone(), document.clone(), window, cx);
                 let document_id = document.read(cx).id();
                 workspace
-                    .review_lens_overrides
-                    .insert(document_id, ArtifactLens::AgentSkill);
+                    .review_flow
+                    .set_review_lens_override(document_id, ArtifactLens::AgentSkill);
                 workspace.review(ReviewTarget::Document, window, cx);
                 document
             })
@@ -20344,8 +15754,8 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, app| {
             let diagnostic = workspace
-                .review_diagnostic
-                .as_ref()
+                .review_flow
+                .review_diagnostic()
                 .expect("recovered Skill Review must fail closed");
             assert_eq!(
                 diagnostic.diagnostic.code,
@@ -20355,7 +15765,7 @@ mod tests {
                 diagnostic.diagnostic.message.as_str(),
                 i18n::t(i18n::Key::ReviewSkillPackageUnavailable, app)
             );
-            assert!(!workspace.reviewing);
+            assert!(!workspace.review_flow.is_reviewing());
         });
         assert!(!cx.has_pending_prompt());
 
@@ -20421,8 +15831,8 @@ mod tests {
         workspace.read_with(cx, |workspace, _| {
             assert!(
                 workspace
-                    .review_result
-                    .as_ref()
+                    .review_flow
+                    .review_result()
                     .unwrap()
                     .skill_package
                     .as_ref()
@@ -20598,7 +16008,7 @@ mod tests {
             let support_document = workspace.document_at(1).unwrap().read(app);
             assert_eq!(support_document.text(app), dirty_support);
             assert!(support_document.is_dirty());
-            let review = workspace.review_result.as_ref().unwrap();
+            let review = workspace.review_flow.review_result().unwrap();
             assert!(!review.supporting_sources_current);
             assert!(review.result.result.status.is_stale());
         });

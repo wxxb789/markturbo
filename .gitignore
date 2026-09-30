@@ -22,6 +22,7 @@ Thumbs.db
 
 # Working notes from an agent session, not project documentation.
 /.plans
+/.omo/
 
 # Scratch is disposable by default. Versioned performance evidence is an
 # explicit exception.

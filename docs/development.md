@@ -48,6 +48,9 @@ off LTO and uses 16 codegen units. This avoids paying distribution-size link
 costs on every PR and keeps timing-sensitive tests optimized. It is not an
 artifact-size or runtime-performance baseline. `check full` runs production
 release validation directly, without first rebuilding a second test profile.
+The `mt-core` performance integration tests serialize their timing cases within
+the test binary so concurrent 100K-line parses cannot consume each other's
+wall-clock allowance; their 45-second bound remains unchanged.
 No measured speedup is claimed until comparable CI timings are available.
 The release privacy scan takes its executable path from Cargo's build artifact
 messages, including custom target directories and target triples; it never falls
@@ -63,7 +66,8 @@ DPAPI/session behavior. Keep native coverage for those boundaries.
 
 GPUI Kit `test-support` is enabled only for dev-dependencies. Reuse
 `open_test_workspace*` in `crates/mt-app/src/views/workspace.rs`; ordinary UI
-iterations need no external desktop runner. For example:
+iterations need no external desktop runner. First-use interaction tests live in
+`crates/mt-app/src/views/workspace/tests/welcome.rs`; for example:
 
 ```sh
 cargo test --locked --profile ci -p mt-app kit_welcome_new_click
@@ -77,6 +81,13 @@ Kit clicks also render frames. Kit/Base controls already expose observations;
 custom identified elements can use `TestSupportExt::test_support()` (inert in
 production). Prefer IDs over coordinates and import test types explicitly to
 avoid glob-importing Kit's `test` macro over Rust's built-in `#[test]`.
+
+`scripts/mt.py check fast` runs the explicit portable Python test manifest,
+including fake-UIA selectors, goal-specific source/privacy checks, and the
+Goal 07 loopback provider tests. It never launches the app or a Windows UIA
+session. Real desktop automation runs through `scripts/mt.py accept goal-02`,
+`goal-03`, `goal-06`, or `goal-07` with a final executable hash and full required
+case set; `--case` is a diagnostic run, not acceptance.
 
 These helpers test events, state, focus and layout, not rendered pixels. Do not
 add screenshot/foreground automation for ordinary state changes, or replace

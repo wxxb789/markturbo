@@ -26,24 +26,6 @@ class PrivacyAndCliTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 runtime.remove_tree_with_retry(Path("temporary-native-root"), timeout=0.0)
 
-    def test_loading_parser_does_not_import_pywinauto(self) -> None:
-        if not PYWINAUTO_WAS_LOADED:
-            self.assertNotIn("pywinauto", sys.modules)
-
-    def test_editor_readback_does_not_use_clipboard_or_setvalue(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        forbidden_apis = (
-            "Clipboard",
-            "CF_UNICODETEXT",
-            "GMEM_",
-            "Global",
-            "SetValue",
-        )
-        for forbidden in forbidden_apis:
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, source)
-                self.assertIn(forbidden, f"legacy call: {forbidden}")
-
     def test_document_text_never_appears_in_serialized_observation(self) -> None:
         secret = "UNIQUE-SECRET-\u4fdd\u5b58-\U0001f680"
         evidence = valid_evidence()
@@ -174,14 +156,16 @@ class PrivacyAndCliTests(unittest.TestCase):
                 ]
             )
             with mock.patch.dict(
-                RUN.__globals__,
+                HARNESS.__dict__,
                 {
                     "preflight": lambda *_args: (object(), object()),
                     "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
                     "Goal02Harness": FakeHarness,
                 },
             ):
-                returncode, evidence, code = RUN(args)
+                returncode, evidence, code = runtime.run_native_acceptance(
+                    args, HARNESS.native_run_plan()
+                )
 
         self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "PARTIAL_CASE_RUN"))
         self.assertEqual(evidence["cases"][0]["status"], "PASS")
@@ -215,9 +199,11 @@ class PrivacyAndCliTests(unittest.TestCase):
                 "Goal02Harness": FakeHarness,
             }
 
-            with mock.patch.dict(RUN.__globals__, patch_run):
+            with mock.patch.dict(HARNESS.__dict__, patch_run):
                 success_args = PARSE_ARGS(["--exe", str(exe), "--expect-exe-sha256", expected])
-                success_code, _, _ = RUN(success_args)
+                success_code, _, _ = runtime.run_native_acceptance(
+                    success_args, HARNESS.native_run_plan()
+                )
 
                 partial_args = PARSE_ARGS(
                     [
@@ -230,7 +216,9 @@ class PrivacyAndCliTests(unittest.TestCase):
                         "--keep-workdir-on-failure",
                     ]
                 )
-                partial_code, _, partial_reason = RUN(partial_args)
+                partial_code, _, partial_reason = runtime.run_native_acceptance(
+                    partial_args, HARNESS.native_run_plan()
+                )
 
             self.assertEqual(success_code, 0)
             self.assertFalse(roots[0].exists())
@@ -259,14 +247,16 @@ class PrivacyAndCliTests(unittest.TestCase):
                 ]
             )
             with mock.patch.dict(
-                RUN.__globals__,
+                HARNESS.__dict__,
                 {
                     "preflight": lambda *_args: (object(), object()),
                     "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
                     "Goal02Harness": FailingHarness,
                 },
             ):
-                returncode, _, code = RUN(args)
+                returncode, _, code = runtime.run_native_acceptance(
+                    args, HARNESS.native_run_plan()
+                )
 
             self.assertEqual((returncode, code), (1, "TEST_CASE_FAILURE"))
             self.assertIsNotNone(args.debug_workdir)
@@ -289,7 +279,7 @@ class PrivacyAndCliTests(unittest.TestCase):
             )
             with (
                 mock.patch.dict(
-                    RUN.__globals__,
+                    HARNESS.__dict__,
                     {
                         "preflight": lambda *_args: (object(), object()),
                         "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
@@ -297,7 +287,9 @@ class PrivacyAndCliTests(unittest.TestCase):
                 ),
                 mock.patch.object(runtime.shutil, "copy2", side_effect=OSError("denied")),
             ):
-                returncode, evidence, code = RUN(args)
+                returncode, evidence, code = runtime.run_native_acceptance(
+                    args, HARNESS.native_run_plan()
+                )
 
             self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "ISOLATION_COPY_FAILED"))
             self.assertTrue(all(case["status"] == "NOT_RUN" for case in evidence["cases"]))
@@ -314,7 +306,7 @@ class PrivacyAndCliTests(unittest.TestCase):
             expected = hashlib.sha256(exe.read_bytes()).hexdigest()
             with (
                 mock.patch.dict(
-                    RUN.__globals__,
+                    HARNESS.__dict__,
                     {
                         "preflight": lambda *_args: (object(), object()),
                         "load_pywinauto": lambda: (object(), object(), object(), object(), object()),

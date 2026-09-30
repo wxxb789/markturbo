@@ -16,16 +16,20 @@
 use std::path::{Path, PathBuf};
 
 use crate::document::lifecycle::DocumentId;
+use crate::recovery::RecoveryKey;
 
 /// Stable identity of a tab's document source.
 ///
 /// Memory buffers intentionally have no path. Assigning a placeholder path
 /// makes file-only operations such as watcher matching, history and copy-path
-/// controls act on a file that does not exist.
+/// controls act on a file that does not exist. A recovered file keeps its
+/// recovery key as a separate tab identity while its `DocumentView` retains the
+/// source path; this prevents it from shadowing the ordinary file tab.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TabIdentity {
     File(PathBuf),
     Memory(DocumentId),
+    Recovered(RecoveryKey),
 }
 
 impl From<PathBuf> for TabIdentity {
@@ -38,7 +42,7 @@ impl TabIdentity {
     pub fn path(&self) -> Option<&Path> {
         match self {
             Self::File(path) => Some(path),
-            Self::Memory(_) => None,
+            Self::Memory(_) | Self::Recovered(_) => None,
         }
     }
 }
@@ -448,5 +452,16 @@ mod tests {
             None,
             "Save As must not turn a memory tab into the preview slot"
         );
+    }
+
+    #[test]
+    fn recovered_file_identity_does_not_shadow_its_live_file_tab() {
+        let destination = p("destination.md");
+        let mut tabs = Tabs::default();
+        tabs.push(TabIdentity::File(destination.clone()), ());
+        tabs.push(TabIdentity::Recovered(RecoveryKey::new_memory()), ());
+
+        assert_eq!(tabs.index_of(&destination), Some(0));
+        assert_eq!(tabs.get(1).unwrap().path(), None);
     }
 }

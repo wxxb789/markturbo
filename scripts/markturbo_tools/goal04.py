@@ -17,14 +17,12 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import TypeVar
 
-from .metrics import inclusive_p95, nearest_rank_percentile
+from .metrics import inclusive_p95, nearest_rank_percentile, summarize_abba_samples
 
 REPO = Path(__file__).resolve().parents[2]
 STARTUP_TRACE_SCHEMA = "markturbo-startup-v1"
@@ -268,27 +266,6 @@ def trace_milestones(
     }
 
 
-T = TypeVar("T")
-
-
-def measure_startup_abba(
-    rounds: int,
-    measure_a: Callable[[], T],
-    measure_b: Callable[[], T],
-) -> tuple[tuple[T, ...], tuple[T, ...]]:
-    """Collect structured samples in strict A-B-B-A order."""
-    if rounds < 1:
-        raise ValueError("rounds must be at least 1")
-    samples_a: list[T] = []
-    samples_b: list[T] = []
-    for _ in range(rounds):
-        samples_a.append(measure_a())
-        samples_b.append(measure_b())
-        samples_b.append(measure_b())
-        samples_a.append(measure_a())
-    return tuple(samples_a), tuple(samples_b)
-
-
 def quiet_gate_failures(
     cpu: list[float],
     disk: list[float],
@@ -339,17 +316,16 @@ def milestone_comparison(
     for field in STARTUP_COMPARISON_FIELDS:
         values_a = [float(getattr(sample, field)) for sample in samples_a]
         values_b = [float(getattr(sample, field)) for sample in samples_b]
-        paired_a = [sum(values_a[ix : ix + 2]) / 2 for ix in range(0, len(values_a), 2)]
-        paired_b = [sum(values_b[ix : ix + 2]) / 2 for ix in range(0, len(values_b), 2)]
-        deltas = [b - a for a, b in zip(paired_a, paired_b, strict=True)]
-        percentages = [delta / a * 100 for a, delta in zip(paired_a, deltas, strict=True)]
+        comparison = summarize_abba_samples(
+            tuple(values_a), tuple(values_b), lambda pair: sum(pair) / 2
+        )
         result[field] = {
-            "paired_a": paired_a,
-            "paired_b": paired_b,
-            "b_minus_a": deltas,
-            "b_minus_a_percent": percentages,
-            "median_b_minus_a": median(deltas),
-            "median_b_minus_a_percent": median(percentages),
+            "paired_a": list(comparison.paired_a),
+            "paired_b": list(comparison.paired_b),
+            "b_minus_a": list(comparison.deltas),
+            "b_minus_a_percent": list(comparison.percentages),
+            "median_b_minus_a": median(comparison.deltas),
+            "median_b_minus_a_percent": median(comparison.percentages),
         }
     return result
 

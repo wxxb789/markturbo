@@ -979,7 +979,6 @@ def parser() -> argparse.ArgumentParser:
 
     scaffold = subcommands.add_parser(
         "scaffold",
-        aliases=["init"],
         help="Create a fail-closed 12-artifact owner-input scaffold.",
     )
     scaffold.add_argument("--root", type=Path, default=REPO, help=argparse.SUPPRESS)
@@ -988,14 +987,11 @@ def parser() -> argparse.ArgumentParser:
 
     record = subcommands.add_parser(
         "record",
-        aliases=["run"],
         help="Record owner-local metadata judgments; never contacts a model endpoint.",
     )
     record.add_argument("--root", type=Path, default=REPO, help=argparse.SUPPRESS)
     record.add_argument(
         "--owner-input-dir",
-        "--response-dir",
-        dest="owner_input_dir",
         type=Path,
         help="directory containing one metadata-only JSON file per artifact",
     )
@@ -1011,7 +1007,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if namespace.command == "verify-manifest":
             _print_json(verification.evidence())
             return 0
-        if namespace.command in {"scaffold", "init"}:
+        if namespace.command == "scaffold":
             evidence = scaffold_evidence(verification, created_at=namespace.created_at)
             if namespace.evidence is None:
                 _print_json(evidence)

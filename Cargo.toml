@@ -138,6 +138,8 @@ url = "2"
 # ~/.config there is invisible to every macOS convention for finding it.
 dirs = "6"
 wry = { version = "0.53.3", package = "lb-wry" }
+# Direct WebView2 profile attestation; keep aligned with lb-wry's binding.
+webview2-com = "=0.38.2"
 smol = "2"
 tempfile = "3"
 # Wry owns WebView2, but it does not expose the private WS_CHILD host or the
