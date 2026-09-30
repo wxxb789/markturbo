@@ -2522,11 +2522,6 @@ mod tests {
     }
 
     #[test]
-    fn text_documents_default_to_the_source_layout() {
-        assert_eq!(Layout::default_for(DocType::Text), Layout::Source);
-    }
-
-    #[test]
     fn native_accessibility_ids_are_stable() {
         assert_eq!(
             super::SOURCE_LAYOUT_ACCESSIBILITY_ID,

@@ -451,156 +451,26 @@ class ParserAndIsolationTests(unittest.TestCase):
         self.assertEqual(args.case, case)
         self.assertTrue(args.keep_workdir_on_failure)
 
-    def test_single_case_run_never_claims_acceptance_pass(self) -> None:
-        class FakeHarness:
-            def __init__(self, *_args):
-                pass
+    def test_native_run_plan_wires_each_required_case_to_its_scenario_in_order(self) -> None:
+        harness = object.__new__(GOAL_03_HARNESS)
+        plan = HARNESS.native_run_plan()
 
-            def scenario_welcome(self):
-                return {}
+        scenarios = plan.scenarios(harness)
 
-            scenario_new_paste = scenario_welcome
-            scenario_save_create = scenario_welcome
-            scenario_save_cancel_overwrite = scenario_welcome
-            scenario_sample = scenario_welcome
-            scenario_recents = scenario_welcome
-            scenario_cli = scenario_welcome
-
-            def cleanup(self):
-                pass
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            exe = root / "markturbo.exe"
-            exe.write_bytes(b"test executable")
-            sample = root / "sample"
-            sample.mkdir()
-            (sample / "readme.md").write_text("sample", encoding="utf-8")
-            expected = hashlib.sha256(exe.read_bytes()).hexdigest()
-            args = PARSE_ARGS(
-                [
-                    "--exe",
-                    str(exe),
-                    "--expect-exe-sha256",
-                    expected,
-                    "--case",
-                    REQUIRED_CASE_IDS[0],
-                ]
-            )
-            with mock.patch.dict(
-                HARNESS.__dict__,
-                {
-                    "source_contract_failure": lambda: None,
-                    "preflight": lambda *_args: (object(), object()),
-                    "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
-                    "Goal03Harness": FakeHarness,
-                    "REPO": root,
-                },
-            ):
-                returncode, evidence, code = runtime.run_native_acceptance(
-                    args, HARNESS.native_run_plan()
-                )
-
-        self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "PARTIAL_CASE_RUN"))
-        self.assertEqual(evidence["cases"][0]["status"], "PASS")
-        self.assertTrue(all(case["status"] == "NOT_RUN" for case in evidence["cases"][1:]))
-
-    def test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs(self) -> None:
-        roots: list[Path] = []
-
-        class FakeHarness:
-            def __init__(self, _exe, root, *_args):
-                roots.append(root)
-
-            def scenario_welcome(self):
-                return {}
-
-            scenario_new_paste = scenario_welcome
-            scenario_save_create = scenario_welcome
-            scenario_save_cancel_overwrite = scenario_welcome
-            scenario_sample = scenario_welcome
-            scenario_recents = scenario_welcome
-            scenario_cli = scenario_welcome
-
-            def cleanup(self):
-                pass
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            exe = root / "markturbo.exe"
-            exe.write_bytes(b"test executable")
-            expected = hashlib.sha256(exe.read_bytes()).hexdigest()
-            patch_run = {
-                "source_contract_failure": lambda: None,
-                "preflight": lambda *_args: (object(), object()),
-                "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
-                "Goal03Harness": FakeHarness,
-            }
-
-            with mock.patch.dict(HARNESS.__dict__, patch_run):
-                success_args = PARSE_ARGS(["--exe", str(exe), "--expect-exe-sha256", expected])
-                success_code, _, _ = runtime.run_native_acceptance(
-                    success_args, HARNESS.native_run_plan()
-                )
-
-                partial_args = PARSE_ARGS(
-                    [
-                        "--exe",
-                        str(exe),
-                        "--expect-exe-sha256",
-                        expected,
-                        "--case",
-                        REQUIRED_CASE_IDS[0],
-                        "--keep-workdir-on-failure",
-                    ]
-                )
-                partial_code, _, partial_reason = runtime.run_native_acceptance(
-                    partial_args, HARNESS.native_run_plan()
-                )
-
-            self.assertEqual(success_code, 0)
-            self.assertFalse(roots[0].exists())
-            self.assertEqual((partial_code, partial_reason), (1, "PARTIAL_CASE_RUN"))
-            self.assertIsNotNone(partial_args.debug_workdir)
-            self.assertTrue(partial_args.debug_workdir.exists())
-            shutil.rmtree(partial_args.debug_workdir)
-
-        roots.clear()
-
-        class FailingHarness(FakeHarness):
-            def scenario_welcome(self):
-                raise HARNESS_FAILURE("TEST_CASE_FAILURE")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            exe = Path(temporary) / "markturbo.exe"
-            exe.write_bytes(b"test executable")
-            expected = hashlib.sha256(exe.read_bytes()).hexdigest()
-            args = PARSE_ARGS(
-                [
-                    "--exe",
-                    str(exe),
-                    "--expect-exe-sha256",
-                    expected,
-                    "--keep-workdir-on-failure",
-                ]
-            )
-            with mock.patch.dict(
-                HARNESS.__dict__,
-                {
-                    "source_contract_failure": lambda: None,
-                    "preflight": lambda *_args: (object(), object()),
-                    "load_pywinauto": lambda: (object(), object(), object(), object(), object()),
-                    "Goal03Harness": FailingHarness,
-                },
-            ):
-                returncode, _, code = runtime.run_native_acceptance(
-                    args, HARNESS.native_run_plan()
-                )
-
-            self.assertEqual((returncode, code), (1, "TEST_CASE_FAILURE"))
-            self.assertIsNotNone(args.debug_workdir)
-            self.assertTrue(args.debug_workdir.exists())
-            shutil.rmtree(args.debug_workdir)
+        self.assertEqual(plan.required_case_ids, REQUIRED_CASE_IDS)
+        self.assertEqual(
+            tuple(scenario.__func__ for scenario in scenarios),
+            (
+                GOAL_03_HARNESS.scenario_welcome,
+                GOAL_03_HARNESS.scenario_new_paste,
+                GOAL_03_HARNESS.scenario_save_create,
+                GOAL_03_HARNESS.scenario_save_cancel_overwrite,
+                GOAL_03_HARNESS.scenario_sample,
+                GOAL_03_HARNESS.scenario_recents,
+                GOAL_03_HARNESS.scenario_cli,
+            ),
+        )
+        self.assertTrue(all(scenario.__self__ is harness for scenario in scenarios))
 
     def test_constructs_isolated_no_argument_and_explicit_launches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

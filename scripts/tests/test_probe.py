@@ -924,6 +924,45 @@ class AbbaMeasurementTests(unittest.TestCase):
         self.assertEqual(comparison.deltas, (9.0,))
         self.assertEqual(comparison.percentages, (75.0,))
 
+    def test_structured_comparison_uses_adjacent_pairs_and_pair_medians(self) -> None:
+        samples_a = tuple(
+            fixture_startup_sample("welcome", base=base)
+            for base in (10.0, 14.0, 100.0, 104.0, 1000.0, 1004.0)
+        )
+        samples_b = tuple(
+            fixture_startup_sample("welcome", base=base)
+            for base in (20.0, 22.0, 90.0, 92.0, 1100.0, 1104.0)
+        )
+
+        comparison = goal04.milestone_comparison(samples_a, samples_b)
+
+        self.assertEqual(
+            comparison["process_created_ms"],
+            {
+                "paired_a": [12.0, 102.0, 1002.0],
+                "paired_b": [21.0, 91.0, 1102.0],
+                "b_minus_a": [9.0, -11.0, 100.0],
+                "b_minus_a_percent": [
+                    75.0,
+                    -11.0 / 102.0 * 100,
+                    100.0 / 1002.0 * 100,
+                ],
+                "median_b_minus_a": 9.0,
+                "median_b_minus_a_percent": 100.0 / 1002.0 * 100,
+            },
+        )
+
+    def test_each_caller_retains_its_pair_mean_overflow_behavior(self) -> None:
+        with self.assertRaisesRegex(OverflowError, "intermediate overflow"):
+            metrics.measure_abba(1, lambda: 1e308, lambda: 1e308)
+
+        samples = (
+            fixture_startup_sample("welcome", base=1e308),
+            fixture_startup_sample("welcome", base=1e308),
+        )
+        comparison = goal04.milestone_comparison(samples, samples)
+        self.assertEqual(comparison["process_created_ms"]["paired_a"], [float("inf")])
+
     def test_metrics_rejects_a_zero_paired_baseline(self) -> None:
         with self.assertRaisesRegex(ValueError, "baseline samples must be non-zero"):
             metrics.measure_abba(1, lambda: 0.0, lambda: 1.0)

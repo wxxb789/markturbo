@@ -63,29 +63,42 @@ def measure_abba_samples(
     return tuple(samples_a), tuple(samples_b)
 
 
+def summarize_abba_samples(
+    samples_a: tuple[float, ...],
+    samples_b: tuple[float, ...],
+    pair_mean: Callable[[tuple[float, ...]], float] = statistics.fmean,
+) -> AbbaComparison:
+    """Summarize adjacent pairs from already collected A-B-B-A samples."""
+    paired_a = tuple(
+        pair_mean(samples_a[index : index + 2])
+        for index in range(0, len(samples_a), 2)
+    )
+    paired_b = tuple(
+        pair_mean(samples_b[index : index + 2])
+        for index in range(0, len(samples_b), 2)
+    )
+    deltas = tuple(b - a for a, b in zip(paired_a, paired_b, strict=True))
+    percentages = tuple(
+        delta / a * 100 for a, delta in zip(paired_a, deltas, strict=True)
+    )
+    return AbbaComparison(
+        samples_a,
+        samples_b,
+        paired_a,
+        paired_b,
+        deltas,
+        percentages,
+    )
+
+
 def measure_abba(
     rounds: int,
     measure_a: Callable[[], float],
     measure_b: Callable[[], float],
 ) -> AbbaComparison:
     """Measure two variants in A-B-B-A order to reduce drift bias."""
-    paired_a: list[float] = []
-    paired_b: list[float] = []
     samples_a, samples_b = measure_abba_samples(rounds, measure_a, measure_b)
-    for index in range(0, len(samples_a), 2):
-        paired_a.append(statistics.fmean(samples_a[index : index + 2]))
-        paired_b.append(statistics.fmean(samples_b[index : index + 2]))
-
-    deltas = [b - a for a, b in zip(paired_a, paired_b, strict=True)]
     try:
-        percentages = [delta / a * 100 for a, delta in zip(paired_a, deltas, strict=True)]
+        return summarize_abba_samples(samples_a, samples_b)
     except ZeroDivisionError as error:
         raise ValueError("A-B-B-A baseline samples must be non-zero") from error
-    return AbbaComparison(
-        tuple(samples_a),
-        tuple(samples_b),
-        tuple(paired_a),
-        tuple(paired_b),
-        tuple(deltas),
-        tuple(percentages),
-    )

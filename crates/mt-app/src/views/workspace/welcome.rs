@@ -102,12 +102,7 @@ impl Workspace {
         kind: mt_core::settings::RecentTargetKind,
         cx: &mut Context<Self>,
     ) {
-        let display_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let display_name = i18n::file_name(&path);
         let target = mt_core::settings::RecentTarget::new(path, kind, display_name);
         if crate::settings::AppSettings::global(cx)
             .recent_targets
@@ -282,9 +277,8 @@ impl Workspace {
                                 )
                                 .children(recents.iter().map(|target| {
                                     let issue = self.welcome_recent_target_issue(target);
-                                    let path_text = SharedString::from(
-                                        target.path.to_string_lossy().into_owned(),
-                                    );
+                                    let path_text =
+                                        SharedString::from(i18n::quoted_path(&target.path));
                                     let label = if target.display_name.is_empty() {
                                         path_text.clone()
                                     } else {

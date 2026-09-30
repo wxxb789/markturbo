@@ -66,11 +66,6 @@ MAX_REVISION_HUNKS = 512
 _MACHINE_RECEIPT_TRUST_TOKEN = object()
 _NATIVE_ACCEPTANCE_TRUST_TOKEN = object()
 
-# Re-export the verifier so callers cannot accidentally use a less strict
-# manifest check for a Goal 07 receipt.
-verify_manifest = evaluation.verify_manifest
-
-
 class RevisionEvaluationError(ValueError):
     """A corpus, receipt, registry, or owner judgment is invalid."""
 
@@ -2259,9 +2254,6 @@ def _add_external_args(parser: argparse.ArgumentParser) -> None:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="revision-evaluation", description="Verify Goal 07 revision evaluation facts and owner evidence.")
     subcommands = result.add_subparsers(dest="command", required=True)
-    verify = subcommands.add_parser("verify-manifest", help="Verify the immutable Goal 01 corpus manifest.")
-    verify.add_argument("--root", type=Path, default=REPO, help=argparse.SUPPRESS)
-    verify.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     scaffold = subcommands.add_parser(
         "scaffold",
         allow_abbrev=False,
@@ -2304,10 +2296,7 @@ def _write_or_print(evidence: Mapping[str, object], *, output: Path | None, root
 def main(argv: Sequence[str] | None = None) -> int:
     namespace = parser().parse_args(argv)
     try:
-        verification = verify_manifest(namespace.root)
-        if namespace.command == "verify-manifest":
-            _print_json(verification.evidence())
-            return 0
+        verification = evaluation.verify_manifest(namespace.root)
         if namespace.command == "scaffold":
             registry = machine = native = None
             if namespace.eligibility_registry is not None:

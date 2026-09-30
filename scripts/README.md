@@ -65,7 +65,6 @@ uv run --project scripts scripts/mt.py capacity
 uv run --project scripts scripts/mt.py evaluation verify-manifest
 uv run --project scripts scripts/mt.py evaluation scaffold --evidence .scratch/goal-06/evaluation.json
 uv run --project scripts scripts/mt.py evaluation record --owner-input-dir <owner-local-dir> --evidence .scratch/goal-06/evaluation.json
-uv run --project scripts scripts/mt.py revision-evaluation verify-manifest
 uv run --project scripts scripts/mt.py revision-evaluation scaffold --evidence .scratch/goal-07-revision.json
 uv run --project scripts scripts/mt.py revision-evaluation record --owner-input-dir <owner-local-dir> --evidence .scratch/goal-07-revision.json
 uv run --project scripts scripts/mt.py accept goal-02 -- --help
@@ -95,9 +94,9 @@ and contains only `artifact_id`, `decoded_completely`, sorted ID arrays for
 `usefulness`, and `model_reported_id`. The evidence destination must remain
 outside the immutable `evaluation/goal-01/` corpus.
 
-`revision-evaluation verify-manifest` verifies the same immutable corpus for
-Goal 07. `revision-evaluation scaffold` writes a fail-closed v2 record without
-inventing owner values. `revision-evaluation record` consumes an external
+The canonical `evaluation verify-manifest` command also verifies Goal 07's
+immutable corpus. `revision-evaluation scaffold` writes a fail-closed v2 record
+without inventing owner values. `revision-evaluation record` consumes an external
 eligibility registry, a v2 machine receipt, a separately hash-bound native
 Goal 07 `PASS` receipt, and one metadata-only owner JSON per artifact. The
 machine receipt schema is `markturbo-goal-07-machine-receipt-v2`. Per case,

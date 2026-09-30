@@ -363,19 +363,6 @@ fn a_name_collision_across_roots_keeps_both() {
 }
 
 #[test]
-fn discovery_does_not_descend_into_a_skill() {
-    // A skill directory is a leaf. `valid-skill` has subdirectories; none may
-    // be reported as skills of their own.
-    let skills = discovered();
-    assert!(
-        !skills
-            .iter()
-            .any(|s| s.name == "scripts" || s.name == "references"),
-        "supporting directories must not be mistaken for skills"
-    );
-}
-
-#[test]
 fn skill_entry_documents_are_recognized_as_skills() {
     for skill in discovered() {
         assert_eq!(

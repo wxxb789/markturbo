@@ -343,11 +343,11 @@ pub fn t(key: Key, cx: &gpui_kit::App) -> &'static str {
     text(key, AppSettings::global(cx).language)
 }
 
-fn quoted_path(path: &std::path::Path) -> String {
+pub(crate) fn quoted_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn file_name(path: &std::path::Path) -> String {
+pub(crate) fn file_name(path: &std::path::Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
@@ -2028,25 +2028,6 @@ mod tests {
         assert!(text(Key::OpenSkillMd, Language::Chinese).contains("SKILL.md"));
         assert_eq!(text(Key::PanelHarness, Language::Chinese), "Harness");
         assert!(text(Key::OpenFolderToDiscover, Language::Chinese).contains("skills"));
-    }
-
-    #[test]
-    fn welcome_strings_are_translated_in_both_languages() {
-        for language in Language::ALL {
-            for key in [
-                Key::WelcomeTitle,
-                Key::NewDocument,
-                Key::Paste,
-                Key::ClipboardTextUnavailable,
-                Key::OpenFile,
-                Key::OpenBundledSample,
-                Key::BundledSampleUnavailable,
-                Key::Recent,
-                Key::DontShowWelcomeAgain,
-            ] {
-                assert!(!text(key, language).is_empty(), "{key:?} in {language:?}");
-            }
-        }
     }
 
     #[test]

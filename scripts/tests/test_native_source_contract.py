@@ -2,9 +2,30 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
-from scripts.markturbo_tools.native.source_contract import rust_source_views
+from scripts.markturbo_tools.native.source_contract import production_source, rust_source_views
+
+
+class ProductionSourceTests(unittest.TestCase):
+    def test_only_the_final_exact_test_module_marker_ends_production_source(self) -> None:
+        production = 'const EXAMPLE: &str = r#"\n#[cfg(test)]\nmod tests {}\n"#;\n'
+        similar_marker = "fn production() {}\n#[cfg(test)]\nmod tests_helper {}"
+        cases = (
+            (production + "\n#[cfg(test)]\nmod tests {}", production),
+            (similar_marker, similar_marker),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.rs"
+            for text, expected in cases:
+                with self.subTest(source=text):
+                    source.write_text(text, encoding="utf-8")
+
+                    actual = production_source(source)
+
+                    self.assertEqual(actual, expected)
 
 
 class RustSourceViewsTests(unittest.TestCase):

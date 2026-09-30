@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .source_contract import rust_source_views
+from .source_contract import production_source, rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -485,14 +485,6 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
     }
     if summary != expected_summary:
         raise ValueError("case summary does not match case evidence")
-
-
-def production_source(path: Path) -> str:
-    source = path.read_text(encoding="utf-8")
-    test_module = source.rfind("\n#[cfg(test)]\nmod tests {")
-    if test_module != -1:
-        return source[:test_module]
-    return source
 
 
 def source_contract_failure() -> str | None:

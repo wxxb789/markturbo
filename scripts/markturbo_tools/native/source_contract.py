@@ -1,4 +1,4 @@
-"""Position-preserving lexical views for fail-closed Rust source guards.
+"""Source loading and lexical views for fail-closed Rust source guards.
 
 This module recognizes comments and literal boundaries only. It does not parse
 Rust syntax or validate control flow.
@@ -6,7 +6,16 @@ Rust syntax or validate control flow.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 _SIMPLE_ESCAPES = frozenset({"\\", "'", '"', "n", "r", "t", "0"})
+
+
+def production_source(path: Path) -> str:
+    """Read UTF-8 source before its final conventional test module."""
+    source = path.read_text(encoding="utf-8")
+    boundary = source.rfind("\n#[cfg(test)]\nmod tests {")
+    return source if boundary < 0 else source[:boundary]
 
 
 def _is_identifier_start(character: str) -> bool:

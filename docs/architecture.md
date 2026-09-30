@@ -138,13 +138,20 @@ protocol; its per-run request count is derived from recorded case observations,
 not a process-global evidence object. Merging goal policies into runtime would
 obscure which user operation and consent boundary each case proves.
 
+Each native launch joins its own non-breakaway Windows Job Object before its
+suspended primary thread resumes. Teardown waits for the private completion
+port's active-process-zero notification, including when the parent has already
+exited. A missing notification fails closed: neither the final artifact scan
+nor isolation removal may infer browser quiescence from parent exit alone.
+
 Other large Python sources keep separate owners: `evaluation.py` records Goal 06
 owner judgments; `revision_evaluation.py` binds Goal 07 registry, machine and
 native receipts to owner judgments; `goal04.py` owns build/evidence policy; and
 `probe.py` owns Windows measurement and process observations. Their output
-contracts and failure paths differ. Only the reused A-B-B-A sample order lives
-in `metrics.py`; a second Goal 04 forwarding scheduler is unnecessary. Icon
-generation, performance fixture generation, recovery capacity measurement and
+contracts and failure paths differ. Reused A-B-B-A scheduling and paired
+comparison arithmetic live in `metrics.py`; callers retain their averaging,
+validation and error contracts. A second Goal 04 forwarding scheduler is
+unnecessary. Icon generation, performance fixture generation, recovery capacity measurement and
 privacy scanning remain separate utilities because they do not share that
 policy. Shell scripts shipped inside sample/Skill fixtures are artifact content,
 not an alternative development harness; CI/release workflow commands remain
@@ -163,6 +170,8 @@ dialogs, IME, WebView2 or DPAPI. Only full native runs on an eligible Windows
 desktop with the final executable hash establish those OS boundaries. Source
 preflight for Goal 03 checks both the Workspace shell and its production Welcome
 module; spelling or source scans alone cannot replace UI observations.
+The [test ablation report](test-ablation.md) records the measured removals,
+stronger replacement detectors, and counterexamples that required retention.
 
 ## Why these boundaries
 
@@ -333,6 +342,17 @@ source scans are not evidence of WebView runtime behavior.
 So the honest summary is not "content can never reach anything". It is: nothing
 reaches the filesystem or the network unless the user trusted that specific
 document, and for HTML, trusting is exactly the act of handing it the disk.
+
+On Windows, the WebView worker requests an InPrivate profile and checks the
+created profile's actual mode through WebView2 before reporting ready or
+accepting document navigation. An unavailable interface, query error or
+non-private profile fails Web preview initialization rather than falling back
+to persistent browsing. Native source editing remains available.
+
+This changes new browser sessions, not historical data retention. The existing
+application-owned WebView2 data directory stays in place; the application does
+not delete or relocate older profiles. A clean isolated native privacy scan
+cannot establish that an existing user's profile contains no earlier content.
 
 ### Save safety
 

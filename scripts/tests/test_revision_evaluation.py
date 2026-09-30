@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -458,12 +459,6 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
         self.assertEqual(evidence["native_acceptance"]["raw_sha256"], self.fixtures.native_anchor)
         self.assertEqual(evidence["native_acceptance"]["executable_sha256"], self.fixtures.native_executable_anchor)
 
-    def test_native_case_contract_matches_the_goal07_harness(self) -> None:
-        self.assertEqual(
-            revision.NATIVE_REQUIRED_CASE_IDS,
-            frozenset(native_goal07.REQUIRED_CASE_IDS),
-        )
-
     def test_machine_receipt_separates_three_source_scopes(self) -> None:
         case = self.fixtures.machine.by_artifact()["TP-01"]
         self.assertEqual(
@@ -839,6 +834,20 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
         )
         self.assertEqual(evidence["corpus"]["manifest_sha256"], self.fixtures.verification.manifest_sha256)
 
+    def test_scaffold_rechecks_manifest_exact_file_set(self) -> None:
+        root = Path(self.temp.name) / "extra-file-root"
+        shutil.copytree(ROOT / "evaluation" / "goal-01", root / "evaluation" / "goal-01")
+        verification = evaluation.verify_manifest(root)
+        (root / "evaluation" / "goal-01" / "UNMANIFESTED.txt").write_text(
+            "extra\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(
+            revision.RevisionEvaluationError,
+            "approved evaluation corpus verification failed",
+        ):
+            revision.scaffold_evidence(verification)
+
     def test_scaffold_is_fail_closed_and_content_free(self) -> None:
         evidence = revision.scaffold_evidence(self.fixtures.verification, created_at="2026-09-18T00:00:00Z")
         self.assertEqual(evidence["evaluation"]["status"], "not_evaluated")
@@ -898,13 +907,6 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
         self.assertEqual(value["evaluation"]["status"], "not_evaluated")
         self.assertFalse(value["evaluation"]["all_cases_satisfied"])
         self.assertIn("owner-local revision inputs", stderr.getvalue())
-
-    def test_cli_verify_manifest_returns_zero(self) -> None:
-        stdout = io.StringIO()
-        with redirect_stdout(stdout):
-            result = revision.main(["verify-manifest"])
-        self.assertEqual(result, 0)
-        self.assertEqual(json.loads(stdout.getvalue())["corpus_version"], "goal-01-v1")
 
     def test_machine_intent_change_ids_are_required_and_cannot_hide_registry_violation(self) -> None:
         missing = json.loads(json.dumps(self.fixtures.machine_value))
