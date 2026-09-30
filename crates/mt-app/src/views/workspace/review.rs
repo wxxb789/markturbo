@@ -53,7 +53,7 @@ use super::{
     CancelReview, REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID, REVIEW_RESULT_ACCESSIBILITY_ID,
     REVIEW_RUN_ACCESSIBILITY_ID, REVISION_ACCEPT_ALL_ACCESSIBILITY_ID,
     REVISION_APPLY_ACCESSIBILITY_ID, REVISION_COPY_ACCESSIBILITY_ID,
-    REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID,
+    REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID, REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID,
     REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID, REVISION_DISMISS_ACCESSIBILITY_ID,
     REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID, REVISION_REJECT_ALL_ACCESSIBILITY_ID,
     REVISION_RESULT_DISMISS_ACCESSIBILITY_ID, REVISION_RETRY_ACCESSIBILITY_ID,
@@ -307,7 +307,6 @@ impl ReviewFlow {
             .is_some_and(|context| context.document_id == document_id && context.applied.is_some())
     }
 
-    #[cfg(test)]
     pub(super) fn has_recovered_revision_record(&self, key: &RecoveryKey) -> bool {
         self.recovered_revision_records.contains_key(key)
     }
@@ -3912,6 +3911,7 @@ impl Workspace {
                         )
                         .child(
                             Button::new("revision-discard-answers")
+                                .accessibility_id(REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID)
                                 .label(i18n::t(i18n::Key::RevisionDiscardAnswers, cx))
                                 .small()
                                 .ghost()

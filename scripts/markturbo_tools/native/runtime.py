@@ -108,6 +108,61 @@ WINDOWS_LAUNCH_ERROR_CODES = {
 }
 ISOLATION_CLEANUP_TIMEOUT = 5.0
 ISOLATION_CLEANUP_RETRY_INTERVAL = 0.05
+PROCESS_CLEANUP_TIMEOUT = 5.0
+CREATE_SUSPENDED = 0x00000004
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO = 4
+JOB_OBJECT_COMPLETION_KEY = 1
+WAIT_TIMEOUT = 258
+EVENT_OBJECT_SHOW = 0x8002
+EVENT_OBJECT_HIDE = 0x8003
+EVENT_OBJECT_FOCUS = 0x8005
+
+
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD), ("flags", wt.DWORD),
+        ("hwndActive", wt.HWND), ("hwndFocus", wt.HWND),
+        ("hwndCapture", wt.HWND), ("hwndMenuOwner", wt.HWND),
+        ("hwndMoveSize", wt.HWND), ("hwndCaret", wt.HWND),
+        ("rcCaret", wt.RECT),
+    ]
+
+
+class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wt.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wt.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wt.DWORD),
+        ("SchedulingClass", wt.DWORD),
+    ]
+
+
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+    )]
+
+
+class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class JOBOBJECT_ASSOCIATE_COMPLETION_PORT(ctypes.Structure):
+    _fields_ = [("CompletionKey", wt.LPVOID), ("CompletionPort", wt.HANDLE)]
 
 
 class CREDENTIALW(ctypes.Structure):
@@ -181,7 +236,7 @@ class LaunchSpec:
 
 @dataclass
 class RunningApp:
-    process: subprocess.Popen[bytes]
+    process: OwnedProcess
     window: Any
     hwnd: int
     spec: LaunchSpec
@@ -488,6 +543,149 @@ def load_pywinauto() -> Any:
     return Application, UIAElementInfo, UIAWrapper, IUIA, NoPatternInterfaceError
 
 
+class OwnedProcess:
+    """One suspended launch and its non-breakaway descendants, never a PID tree scan."""
+
+    def __init__(self, win32: Win32, spec: LaunchSpec) -> None:
+        self.win32 = win32
+        self.spec = spec
+        self.pid = 0
+        self.returncode: int | None = None
+        self._job = self._port = self._process = self._thread = None
+        self._assigned = False
+        self._closed = False
+        self._cleanup_failure: HarnessFailure | None = None
+
+    def start(self) -> None:
+        kernel = self.win32.kernel32
+        try:
+            self._job = kernel.CreateJobObjectW(None, None)
+            if not self._job:
+                raise HarnessFailure("PROCESS_JOB_CREATE_FAILED")
+            limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            # Neither BREAKAWAY_OK nor SILENT_BREAKAWAY_OK is enabled.
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel.SetInformationJobObject(
+                self._job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+            ):
+                raise HarnessFailure("PROCESS_JOB_LIMIT_FAILED")
+            self._port = kernel.CreateIoCompletionPort(wt.HANDLE(-1), None, 0, 1)
+            if not self._port:
+                raise HarnessFailure("PROCESS_JOB_PORT_CREATE_FAILED")
+            association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT(
+                JOB_OBJECT_COMPLETION_KEY, self._port
+            )
+            if not kernel.SetInformationJobObject(
+                self._job, 7, ctypes.byref(association), ctypes.sizeof(association)
+            ):
+                raise HarnessFailure("PROCESS_JOB_PORT_ASSOCIATE_FAILED")
+            self._process, self._thread, self.pid = self.win32.create_suspended_process(
+                self.spec
+            )
+            if not kernel.AssignProcessToJobObject(self._job, self._process):
+                raise HarnessFailure("PROCESS_JOB_ASSIGN_FAILED")
+            self._assigned = True
+            if kernel.ResumeThread(self._thread) == 0xFFFFFFFF:
+                raise HarnessFailure("PROCESS_RESUME_FAILED")
+            if not kernel.CloseHandle(self._thread):
+                raise HarnessFailure("PROCESS_HANDLE_CLOSE_FAILED")
+            self._thread = None
+        except BaseException:
+            self.cleanup()
+            raise
+
+    def poll(self) -> int | None:
+        try:
+            return self.wait(0)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def wait(self, timeout: float) -> int:
+        if self.returncode is None:
+            if self._cleanup_failure is not None:
+                raise self._cleanup_failure
+            result = self.win32.kernel32.WaitForSingleObject(
+                self._process, math.ceil(timeout * 1000)
+            )
+            if result == WAIT_TIMEOUT:
+                raise subprocess.TimeoutExpired(self.spec.args, timeout)
+            if result != 0:
+                raise HarnessFailure("PROCESS_WAIT_FAILED")
+            code = wt.DWORD()
+            if not self.win32.kernel32.GetExitCodeProcess(self._process, ctypes.byref(code)):
+                raise HarnessFailure("PROCESS_EXIT_CODE_FAILED")
+            self.returncode = int(code.value)
+        return self.returncode
+
+    def _wait_for_empty_job(self) -> None:
+        # A job handle is NOT signaled on ordinary last-process exit. Subscribe
+        # before assignment, then consume the private port's active-zero message.
+        # Job notifications are not guaranteed delivery: absence is a failure,
+        # never permission to scan/remove artifacts or infer quiescence from a PID.
+        deadline = time.monotonic() + PROCESS_CLEANUP_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HarnessFailure("PROCESS_JOB_QUIESCENCE_TIMEOUT")
+            message = wt.DWORD()
+            key = ctypes.c_size_t()
+            overlapped = wt.LPVOID()
+            if not self.win32.kernel32.GetQueuedCompletionStatus(
+                self._port, ctypes.byref(message), ctypes.byref(key),
+                ctypes.byref(overlapped), math.ceil(remaining * 1000),
+            ):
+                code = (
+                    "PROCESS_JOB_QUIESCENCE_TIMEOUT"
+                    if ctypes.get_last_error() == WAIT_TIMEOUT
+                    else "PROCESS_JOB_QUIESCENCE_WAIT_FAILED"
+                )
+                raise HarnessFailure(code)
+            if (
+                key.value == JOB_OBJECT_COMPLETION_KEY
+                and message.value == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO
+            ):
+                return
+
+    def cleanup(self) -> None:
+        if not self._closed:
+            kernel = self.win32.kernel32
+            try:
+                if self._assigned:
+                    # Stop only this launch's job, even if its parent already exited.
+                    if not kernel.TerminateJobObject(self._job, 1):
+                        raise HarnessFailure("PROCESS_JOB_TERMINATE_FAILED")
+                    self._wait_for_empty_job()
+                elif self._process:
+                    # Assignment failed: the unowned primary thread is still suspended.
+                    if not kernel.TerminateProcess(self._process, 1):
+                        raise HarnessFailure("CLEANUP_REAP_FAILED")
+                if self._process:
+                    self.wait(PROCESS_CLEANUP_TIMEOUT)
+            except HarnessFailure as error:
+                self._cleanup_failure = error
+            except (OSError, subprocess.TimeoutExpired) as error:
+                self._cleanup_failure = HarnessFailure(
+                    "CLEANUP_REAP_FAILED", safe_exception_name(error)
+                )
+            except BaseException as error:
+                self._cleanup_failure = HarnessFailure(
+                    "CLEANUP_REAP_FAILED", safe_exception_name(error)
+                )
+                raise
+            finally:
+                # Closing the job is a kill-on-close backstop, not proof of exit.
+                for name in ("_job", "_thread", "_process", "_port"):
+                    handle = getattr(self, name)
+                    if handle and not kernel.CloseHandle(handle):
+                        self._cleanup_failure = self._cleanup_failure or HarnessFailure(
+                            "PROCESS_HANDLE_CLOSE_FAILED"
+                        )
+                    setattr(self, name, None)
+                self._closed = True
+        if self._cleanup_failure is not None:
+            raise self._cleanup_failure
+
+
 class Win32:
     def __init__(self) -> None:
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -515,6 +713,27 @@ class Win32:
         self.kernel32.IsWow64Process2.restype = wt.BOOL
         self.kernel32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
         self.kernel32.TerminateProcess.restype = wt.BOOL
+        self.kernel32.CreateJobObjectW.argtypes = [wt.LPVOID, wt.LPCWSTR]
+        self.kernel32.CreateJobObjectW.restype = wt.HANDLE
+        self.kernel32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, wt.LPVOID, wt.DWORD]
+        self.kernel32.SetInformationJobObject.restype = wt.BOOL
+        self.kernel32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+        self.kernel32.AssignProcessToJobObject.restype = wt.BOOL
+        self.kernel32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+        self.kernel32.TerminateJobObject.restype = wt.BOOL
+        self.kernel32.CreateIoCompletionPort.argtypes = [wt.HANDLE, wt.HANDLE, ctypes.c_size_t, wt.DWORD]
+        self.kernel32.CreateIoCompletionPort.restype = wt.HANDLE
+        self.kernel32.GetQueuedCompletionStatus.argtypes = [
+            wt.HANDLE, ctypes.POINTER(wt.DWORD), ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(wt.LPVOID), wt.DWORD,
+        ]
+        self.kernel32.GetQueuedCompletionStatus.restype = wt.BOOL
+        self.kernel32.ResumeThread.argtypes = [wt.HANDLE]
+        self.kernel32.ResumeThread.restype = wt.DWORD
+        self.kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+        self.kernel32.WaitForSingleObject.restype = wt.DWORD
+        self.kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+        self.kernel32.GetExitCodeProcess.restype = wt.BOOL
 
         self.ntdll.RtlGetVersion.argtypes = [wt.LPVOID]
         self.ntdll.RtlGetVersion.restype = wt.LONG
@@ -576,6 +795,33 @@ class Win32:
         self.user32.BringWindowToTop.argtypes = [wt.HWND]
         self.user32.BringWindowToTop.restype = wt.BOOL
         self.user32.GetForegroundWindow.restype = wt.HWND
+        self.user32.GetGUIThreadInfo.argtypes = [wt.DWORD, ctypes.POINTER(GUITHREADINFO)]
+        self.user32.GetGUIThreadInfo.restype = wt.BOOL
+        self.user32.IsChild.argtypes = [wt.HWND, wt.HWND]
+        self.user32.IsChild.restype = wt.BOOL
+        self.user32.IsWindow.argtypes = [wt.HWND]
+        self.user32.IsWindow.restype = wt.BOOL
+        self.user32.FindWindowExW.argtypes = [wt.HWND, wt.HWND, wt.LPCWSTR, wt.LPCWSTR]
+        self.user32.FindWindowExW.restype = wt.HWND
+        self._win_event_proc = ctypes.WINFUNCTYPE(
+            None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG, wt.LONG, wt.DWORD, wt.DWORD
+        )
+        self.user32.SetWinEventHook.argtypes = [
+            wt.DWORD, wt.DWORD, wt.HMODULE, self._win_event_proc,
+            wt.DWORD, wt.DWORD, wt.DWORD,
+        ]
+        self.user32.SetWinEventHook.restype = wt.HANDLE
+        self.user32.UnhookWinEvent.argtypes = [wt.HANDLE]
+        self.user32.UnhookWinEvent.restype = wt.BOOL
+        self.user32.MsgWaitForMultipleObjectsEx.argtypes = [
+            wt.DWORD, ctypes.POINTER(wt.HANDLE), wt.DWORD, wt.DWORD, wt.DWORD,
+        ]
+        self.user32.MsgWaitForMultipleObjectsEx.restype = wt.DWORD
+        self.user32.PeekMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT]
+        self.user32.PeekMessageW.restype = wt.BOOL
+        self.user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+        self.user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+        self.user32.DispatchMessageW.restype = ctypes.c_ssize_t
         self._enum_windows_proc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
         self.user32.EnumWindows.argtypes = [self._enum_windows_proc, wt.LPARAM]
         self.user32.EnumWindows.restype = wt.BOOL
@@ -591,6 +837,35 @@ class Win32:
         self.user32.PostMessageW.restype = wt.BOOL
         self.user32.SendInput.argtypes = [wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         self.user32.SendInput.restype = wt.UINT
+
+    def create_suspended_process(self, spec: LaunchSpec) -> tuple[int, int, int]:
+        # CPython's Windows primitive retains the primary thread handle (Popen
+        # closes it). Its STARTUPINFO handle_list avoids leaking other handles.
+        import _winapi
+        import msvcrt
+
+        handles: list[int] = []
+        try:
+            with open(os.devnull, "r+b") as null, spec.stderr_path.open("ab") as stderr:
+                current = _winapi.GetCurrentProcess()
+                for stream in (null, stderr):
+                    handles.append(_winapi.DuplicateHandle(
+                        current, msvcrt.get_osfhandle(stream.fileno()), current,
+                        0, True, _winapi.DUPLICATE_SAME_ACCESS,
+                    ))
+                startup = subprocess.STARTUPINFO()
+                startup.dwFlags = subprocess.STARTF_USESTDHANDLES
+                startup.hStdInput = startup.hStdOutput = handles[0]
+                startup.hStdError = handles[1]
+                startup.lpAttributeList = {"handle_list": handles}
+                process, thread, pid, _tid = _winapi.CreateProcess(
+                    spec.args[0], subprocess.list2cmdline(spec.args), None, None,
+                    True, CREATE_SUSPENDED, spec.env, spec.cwd, startup,
+                )
+                return process, thread, pid
+        finally:
+            for handle in handles:
+                _winapi.CloseHandle(handle)
 
     def windows_version(self) -> tuple[int, int, int]:
         class RTL_OSVERSIONINFOEXW(ctypes.Structure):
@@ -765,6 +1040,71 @@ class Win32:
                 "foreground_attempts": attempts,
             },
         )
+
+    def foreground_focus(self, hwnd: int) -> int:
+        """Observe OS keyboard ownership, not GPUI/UIA's logical control focus."""
+        if self.user32.GetForegroundWindow() != hwnd:
+            return 0
+        info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+        if not self.user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+            raise HarnessFailure("NATIVE_FOCUS_QUERY_FAILED")
+        return int(info.hwndFocus or 0)
+
+    def visible_web_host(self, hwnd: int) -> int:
+        host = self.user32.FindWindowExW(hwnd, None, "MarkTurboWebHost", None)
+        return int(host) if host and self.user32.IsWindowVisible(host) else 0
+
+    def after_window_events(
+        self, hwnd: int, events: tuple[int, ...], action: Callable[[], Any],
+        observed: Callable[[], Any], timeout: float, failure_code: str,
+    ) -> Any:
+        """Subscribe before acting, then pump native notifications without polling."""
+        changed = True
+
+        @self._win_event_proc
+        def notify(_hook, _event, target, _object, _child, _thread, _time):
+            nonlocal changed
+            if target == hwnd or self.user32.IsChild(hwnd, target):
+                changed = True
+
+        hooks = []
+        try:
+            for event in events:
+                # Out-of-context hooks run on this thread while it pumps messages.
+                # Do not filter by PID: WebView descendants can belong to Edge.
+                hook = self.user32.SetWinEventHook(event, event, None, notify, 0, 0, 0)
+                if not hook:
+                    raise HarnessFailure("NATIVE_WINDOW_EVENT_HOOK_FAILED")
+                hooks.append(hook)
+            deadline = time.monotonic() + timeout
+            action()
+            while True:
+                if changed:
+                    changed = False
+                    if result := observed():
+                        return result
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HarnessFailure(failure_code)
+                # QS_ALLINPUT | MWMO_INPUTAVAILABLE: wait for actual queued input,
+                # including out-of-context WinEvents, never a periodic timer.
+                status = self.user32.MsgWaitForMultipleObjectsEx(
+                    0, None, math.ceil(remaining * 1000), 0x04FF, 0x0004
+                )
+                if status == WAIT_TIMEOUT:
+                    raise HarnessFailure(failure_code)
+                if status != 0:
+                    raise HarnessFailure("NATIVE_WINDOW_EVENT_WAIT_FAILED")
+                message = wt.MSG()
+                while self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):
+                    if time.monotonic() >= deadline:
+                        raise HarnessFailure(failure_code)
+                    self.user32.TranslateMessage(ctypes.byref(message))
+                    self.user32.DispatchMessageW(ctypes.byref(message))
+        finally:
+            unhooked = [self.user32.UnhookWinEvent(hook) for hook in hooks]
+            if not all(unhooked):
+                raise HarnessFailure("NATIVE_WINDOW_EVENT_UNHOOK_FAILED")
 
     def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
         dialogs: list[int] = []
@@ -1092,7 +1432,7 @@ class NativeHarness:
         self.iuia_class = iuia_class
         self.no_pattern_error_class = no_pattern_error_class
         self.parent_context = parent_context
-        self.processes: list[subprocess.Popen[bytes]] = []
+        self.processes: list[OwnedProcess] = []
 
     def case_roots(self, case_id: str) -> tuple[Path, Path, Path, Path]:
         case_root = (self.root / "cases" / case_id).resolve()
@@ -1121,19 +1461,12 @@ class NativeHarness:
             stderr_path,
             ephemeral_openai_api_key=self.openai_api_key_for_child(),
         )
+        process = OwnedProcess(self.win32, spec)
+        self.processes.append(process)
         try:
-            with stderr_path.open("ab") as stderr:
-                process = subprocess.Popen(
-                    spec.args,
-                    cwd=spec.cwd,
-                    env=spec.env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr,
-                )
+            process.start()
         except OSError as error:
             raise HarnessFailure(launch_failure_code(error), safe_exception_name(error)) from None
-        self.processes.append(process)
         if process.poll() is not None:
             raise HarnessFailure("PROCESS_EXITED_BEFORE_UI")
         child_context = self.win32.security_context(process.pid)
@@ -1302,6 +1635,44 @@ class NativeHarness:
             "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
         )
 
+    def activate_source_from_focused_web(self, app: RunningApp) -> None:
+        """Require the WebHost -> main-HWND handoff before any editor click."""
+        host = self.win32.after_window_events(
+            app.hwnd, (EVENT_OBJECT_SHOW,), lambda: None,
+            lambda: self.win32.visible_web_host(app.hwnd),
+            self.ui_timeout, "WEB_PREVIEW_VISIBLE_TIMEOUT",
+        )
+        web = self.uia_wrapper_class(self.uia_element_info_class(host))
+
+        def web_focused() -> bool:
+            focused = self.win32.foreground_focus(app.hwnd)
+            return bool(
+                self.win32.user32.IsWindowVisible(host)
+                and focused
+                and (focused == host or self.win32.user32.IsChild(host, focused))
+            )
+
+        self.win32.after_window_events(
+            app.hwnd, (EVENT_OBJECT_FOCUS,),
+            lambda: self.click_control(web, "WEB_PREVIEW_CLICK_FAILED"),
+            web_focused, self.ui_timeout, "WEB_PREVIEW_NATIVE_FOCUS_TIMEOUT",
+        )
+
+        def source_focused() -> bool:
+            # Source selection preserves GPUI's logical control focus. The
+            # contract is native keyboard ownership, NOT editor autofocus.
+            return bool(
+                self.win32.user32.IsWindow(host)
+                and not self.win32.user32.IsWindowVisible(host)
+                and self.win32.foreground_focus(app.hwnd) == app.hwnd
+            )
+
+        self.win32.after_window_events(
+            app.hwnd, (EVENT_OBJECT_HIDE, EVENT_OBJECT_FOCUS),
+            lambda: self.activate_source_layout(app), source_focused,
+            self.ui_timeout, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
+        )
+
     def control_absent(
         self,
         app: RunningApp,
@@ -1441,20 +1812,15 @@ class NativeHarness:
         self.wait_process_exit(app)
 
     def reap(self, app: RunningApp) -> None:
-        if app.process.poll() is None:
-            try:
-                self.win32.post_close(app.hwnd)
-                app.process.wait(timeout=2.0)
-            except (HarnessBlocked, HarnessFailure, subprocess.TimeoutExpired):
-                pass
-        if app.process.poll() is None:
-            try:
-                app.process.kill()
-                app.process.wait(timeout=5.0)
-            except (OSError, subprocess.TimeoutExpired):
-                raise HarnessFailure("CLEANUP_REAP_FAILED") from None
-        if app.process.poll() is None:
-            raise HarnessFailure("CLEANUP_REAP_FAILED")
+        try:
+            if app.process.poll() is None:
+                try:
+                    self.win32.post_close(app.hwnd)
+                    app.process.wait(timeout=2.0)
+                except (HarnessBlocked, HarnessFailure, subprocess.TimeoutExpired):
+                    pass
+        finally:
+            app.process.cleanup()
 
     def terminate(self, app: RunningApp) -> None:
         self.win32.terminate_process(app.process.pid)
@@ -1464,14 +1830,14 @@ class NativeHarness:
             raise HarnessFailure("TERMINATE_PROCESS_WAIT_FAILED") from None
 
     def cleanup(self) -> None:
+        failure: BaseException | None = None
         for process in self.processes:
-            if process.poll() is not None:
-                continue
             try:
-                process.kill()
-                process.wait(timeout=5.0)
-            except (OSError, subprocess.TimeoutExpired):
-                raise HarnessFailure("CLEANUP_REAP_FAILED") from None
+                process.cleanup()
+            except BaseException as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
 
     def wait_file(self, path: Path, expected: Fingerprint, code: str) -> Fingerprint:
         def matches() -> Fingerprint | None:
@@ -1742,9 +2108,11 @@ def run_native_acceptance(
                     else (0, "ALL_REQUIRED_CASES")
                 )
     finally:
+        cleanup_succeeded = False
         try:
             if harness is not None:
                 harness.cleanup()
+            cleanup_succeeded = True
         except HarnessFailure as error:
             returncode, code = 1, error.code
             _record_cleanup_failure(
@@ -1764,7 +2132,9 @@ def run_native_acceptance(
                 safe_exception_name(error),
             )
 
-        if returncode != 0 and getattr(args, "keep_workdir_on_failure", False):
+        if not cleanup_succeeded or (
+            returncode != 0 and getattr(args, "keep_workdir_on_failure", False)
+        ):
             args.debug_workdir = root
         else:
             try:

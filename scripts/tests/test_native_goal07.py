@@ -14,6 +14,7 @@ from unittest import mock
 from scripts.markturbo_tools.native import goal07 as HARNESS
 from scripts.markturbo_tools.native import goal07_provider as PROVIDER
 from scripts.markturbo_tools.native import runtime
+from .test_native_goal02_runtime import OwnedKernel, launch_owned, owned_harness
 
 
 HASH = "a" * 64
@@ -276,6 +277,14 @@ def _write_goal07_source_fixture(
         ),
         ("REVISION_APPLY_ACCESSIBILITY_ID", HARNESS.REVISION_APPLY_ACCESSIBILITY_ID),
         ("REVISION_COPY_ACCESSIBILITY_ID", HARNESS.REVISION_COPY_ACCESSIBILITY_ID),
+        (
+            "REVISION_RESULT_DISMISS_ACCESSIBILITY_ID",
+            HARNESS.REVISION_RESULT_DISMISS_ACCESSIBILITY_ID,
+        ),
+        (
+            "REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID",
+            HARNESS.REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID,
+        ),
     )
     workspace.write_text(
         "\n".join(
@@ -762,61 +771,118 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
         self.assertEqual(raised.exception.detail, "PermissionError")
 
-    def test_privacy_scan_runs_after_process_exit(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness._credential = "synthetic-credential"
-        events: list[str] = []
+    def test_privacy_scan_waits_for_owned_descendants_even_after_parent_exit(self) -> None:
+        for parent_exited in (False, True):
+            with self.subTest(parent_exited=parent_exited), tempfile.TemporaryDirectory() as directory:
+                harness, kernel = owned_harness(Path(directory), HARNESS.Goal07Harness)
+                app = launch_owned(harness)
+                kernel.parent_exited = parent_exited
+                case_root = harness.root / "cases" / "owned"
+                logs = case_root / "data" / "logs"
+                logs.mkdir()
+                (logs / "app.log").write_bytes(b"content-free log")
+                (case_root / "config" / "settings.toml").write_bytes(b"keyless")
+                (case_root / "stderr.log").write_bytes(b"")
+                provider = mock.Mock()
+                provider.contract_evidence.return_value = {"provider_request_count": 2}
+                real_scan = HARNESS.scan_case_artifacts
 
-        class FakeProcess:
-            returncode: int | None = None
+                def scan(*args):
+                    self.assertFalse(kernel.descendant_alive)
+                    self.assertIn("completion-4", kernel.events)
+                    kernel.events.append("scan")
+                    return real_scan(*args)
 
-            def poll(self) -> int | None:
-                return self.returncode
+                with mock.patch.object(HARNESS, "scan_case_artifacts", side_effect=scan):
+                    result = harness._finalize_observations(provider, case_root, app, {})
+                self.assertEqual(kernel.events[-2:], ["completion-4", "scan"])
+                self.assertEqual(result["runtime_scan"]["files_scanned"], 3)
+                self.assertCountEqual(kernel.closed, kernel.opened)
 
-            def wait(self, timeout: float) -> int:
-                events.append("wait")
-                self.returncode = 0
-                return 0
-
-            def kill(self) -> None:
-                events.append("kill")
-                self.returncode = -1
-
-        class FakeWin32:
-            def post_close(self, hwnd: int) -> None:
-                events.append("close")
-
-        harness.win32 = FakeWin32()
-        app = type("App", (), {"hwnd": 73, "process": FakeProcess()})()
-        provider = mock.Mock()
-        provider.contract_evidence.return_value = {
-            "provider_request_count": 2,
-            "provider_review_count": 1,
-            "provider_revision_count": 1,
-            "provider_paths_exact": True,
-            "provider_no_request_before_consent_click": True,
-            "provider_review_before_revision": True,
-            "provider_review_source_sha256_match": True,
-            "provider_revision_source_sha256_match": True,
-            "provider_revision_snapshot_match": True,
-            "provider_revision_answer_sentinel_present": True,
-        }
-
-        def scan(*_args: object) -> dict[str, int | bool]:
-            self.assertIsNotNone(app.process.poll())
-            events.append("scan")
-            return runtime_scan()
-
-        with mock.patch.object(
-            HARNESS,
-            "scan_case_artifacts",
-            side_effect=scan,
-        ):
-            result = harness._finalize_observations(
-                provider, Path("unused"), app, {}
+    def test_quiescence_failure_never_reaches_provider_finalization_or_privacy_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness, kernel = owned_harness(
+                Path(directory), HARNESS.Goal07Harness, OwnedKernel("completion")
             )
-        self.assertEqual(events, ["close", "wait", "scan"])
-        self.assertEqual(result["runtime_scan"]["files_scanned"], 3)
+            app = launch_owned(harness)
+            kernel.parent_exited = True
+            provider = mock.Mock()
+            observations = {}
+            with (
+                mock.patch.object(runtime.ctypes, "get_last_error", return_value=258, create=True),
+                mock.patch.object(HARNESS, "scan_case_artifacts") as scan,
+                self.assertRaisesRegex(runtime.HarnessFailure, "PROCESS_JOB_QUIESCENCE_TIMEOUT"),
+            ):
+                harness._finalize_observations(provider, Path(directory), app, observations)
+            scan.assert_not_called()
+            provider.contract_evidence.assert_not_called()
+            self.assertEqual(observations, {})
+            self.assertCountEqual(kernel.closed, kernel.opened)
+
+    def test_isolation_removal_requires_successful_owned_job_quiescence(self) -> None:
+        for fail in ("", "completion"):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                executable = root / "app.exe"
+                executable.write_bytes(b"synthetic fixture")
+                kernel = OwnedKernel(fail)
+                harnesses = []
+
+                def factory(_exe, workdir, *_args):
+                    harness, _kernel = owned_harness(workdir, HARNESS.Goal07Harness, kernel)
+                    harnesses.append(harness)
+                    return harness
+
+                def scenario():
+                    launch_owned(harnesses[0])
+                    kernel.parent_exited = True
+                    raise runtime.HarnessBlocked("FOREGROUND_PERMISSION_DENIED")
+
+                base = HARNESS.native_run_plan()
+                plan = runtime.NativeRunPlan(
+                    required_case_ids=HARNESS.REQUIRED_CASE_IDS,
+                    workdir_prefix="markturbo-owned-job-test-",
+                    new_evidence=base.new_evidence,
+                    validate_evidence=base.validate_evidence,
+                    preflight=lambda *_args: (None, None),
+                    ui_types_loader=lambda: (),
+                    harness_factory=factory,
+                    scenarios=lambda _harness: (scenario,) * len(HARNESS.REQUIRED_CASE_IDS),
+                    finalize_evidence=base.finalize_evidence,
+                )
+                args = argparse.Namespace(
+                    exe=executable, expect_exe_sha256=runtime.sha256_file(executable).sha256,
+                    ui_timeout=1.0, case=None, keep_workdir_on_failure=False,
+                )
+                real_remove = runtime.remove_tree_with_retry
+
+                def remove(workdir):
+                    self.assertFalse(kernel.descendant_alive)
+                    self.assertIn("completion-4", kernel.events)
+                    kernel.events.append("remove")
+                    real_remove(workdir)
+
+                try:
+                    with (
+                        mock.patch.object(runtime.ctypes, "get_last_error", return_value=258, create=True),
+                        mock.patch.object(runtime, "remove_tree_with_retry", side_effect=remove) as removal,
+                    ):
+                        result, evidence, reason = runtime.run_native_acceptance(args, plan)
+                    self.assertCountEqual(kernel.closed, kernel.opened)
+                    if fail:
+                        self.assertEqual((result, reason), (1, "PROCESS_JOB_QUIESCENCE_TIMEOUT"))
+                        self.assertEqual(evidence["cases"][0]["status"], "FAIL")
+                        removal.assert_not_called()
+                        self.assertTrue(args.debug_workdir.is_dir())
+                    else:
+                        self.assertEqual((result, reason), (2, "FOREGROUND_PERMISSION_DENIED"))
+                        self.assertEqual(kernel.events[-2:], ["completion-4", "remove"])
+                        self.assertIsNone(args.debug_workdir)
+                        self.assertFalse(harnesses[0].root.exists())
+                finally:
+                    if args.debug_workdir is not None:
+                        # The fake owns no OS processes; remove the deliberately retained fixture.
+                        real_remove(args.debug_workdir)
 
 class SourceContractFixtureTests(unittest.TestCase):
     def source_failure(
@@ -915,6 +981,119 @@ class SourceContractFixtureTests(unittest.TestCase):
 
 
 class SourceAndCliTests(unittest.TestCase):
+    def test_review_after_web_handoff_sends_keys_without_explicit_refocus(self) -> None:
+        for preserve in (False, True):
+            with self.subTest(preserve_focus=preserve):
+                harness = object.__new__(HARNESS.Goal07Harness)
+                harness.focus_editor = mock.Mock()
+                harness._require_foreground = mock.Mock()
+                harness.win32 = mock.Mock()
+                harness._click_id = mock.Mock()
+                harness._approve_consent = mock.Mock()
+                harness.find_control = mock.Mock()
+                app, provider = mock.Mock(), mock.Mock()
+                app.hwnd = 73
+                harness.win32.foreground_focus.return_value = app.hwnd
+
+                harness.run_review(app, provider, preserve_focus=preserve)
+
+                self.assertEqual(harness.focus_editor.call_count, 0 if preserve else 1)
+                self.assertEqual(harness._require_foreground.call_count, 0 if preserve else 1)
+                if preserve:
+                    harness.win32.foreground_focus.assert_called_once_with(app.hwnd)
+                keys = harness.win32.send_inputs.call_args.args[0]
+                self.assertEqual([item.ki.wVk for item in keys], [
+                    HARNESS.VK_CONTROL, HARNESS.VK_SHIFT, HARNESS.VK_R,
+                    HARNESS.VK_R, HARNESS.VK_SHIFT, HARNESS.VK_CONTROL,
+                ])
+                harness._approve_consent.assert_called_once_with(
+                    app, "REVIEW_CONSENT_CLICK_FAILED", provider=provider,
+                    expected_request_count=0, open_gate=provider.grant_review_consent,
+                )
+
+    def test_preserved_focus_never_sends_keys_to_a_different_native_owner(self) -> None:
+        for focused in (0, 74):
+            with self.subTest(focused=focused):
+                harness = object.__new__(HARNESS.Goal07Harness)
+                harness.win32 = mock.Mock()
+                harness.win32.foreground_focus.return_value = focused
+                harness.focus_editor = mock.Mock()
+                harness._require_foreground = mock.Mock()
+
+                with self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_LOST"):
+                    harness.run_review(mock.Mock(hwnd=73), mock.Mock(), preserve_focus=True)
+
+                harness.win32.send_inputs.assert_not_called()
+                harness.focus_editor.assert_not_called()
+                harness._require_foreground.assert_not_called()
+
+    def test_trust_scenario_requires_handoff_before_review_or_editor_helpers(self) -> None:
+        for broken in (False, True):
+            with self.subTest(broken=broken):
+                harness = object.__new__(HARNESS.Goal07Harness)
+                harness.ui_timeout = 1.0
+                app, provider = mock.Mock(), mock.Mock()
+                app.security_context.evidence.return_value = process_context()
+                app.process.poll.return_value = None
+                provider.start.return_value = provider
+                harness.profile = mock.Mock(return_value=(Path("unused"),) * 6)
+                harness.launch_app = mock.Mock(return_value=app)
+                harness.find_control = mock.Mock()
+                harness.click_control = mock.Mock()
+                harness._trust_label = mock.Mock(side_effect=["Trusted", "Restricted"])
+                harness.activate_source_layout = mock.Mock(side_effect=AssertionError("premature Source"))
+                harness.activate_source_from_focused_web = mock.Mock()
+                harness.run_review = mock.Mock()
+                harness.request_revision = mock.Mock()
+                harness._click_id = mock.Mock()
+                harness._require_foreground = mock.Mock(return_value=True)
+                final_text = HARNESS.apply_edits(
+                    HARNESS.HTML_EDITOR_SOURCE_BYTES,
+                    PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
+                ).decode("utf-8")
+                harness._preview_source_text = mock.Mock(return_value=final_text)
+                harness.editor_fingerprint = mock.Mock(side_effect=[
+                    runtime.fingerprint_bytes(HARNESS.HTML_EDITOR_SOURCE_BYTES),
+                    runtime.fingerprint_text(final_text),
+                ])
+                harness.win32 = mock.Mock()
+                harness.click_lifecycle_decision = mock.Mock()
+                harness.wait_process_exit = mock.Mock(
+                    side_effect=lambda _app: setattr(app.process.poll, "return_value", 0)
+                )
+                harness.reap = mock.Mock()
+                harness._finalize_observations = lambda _provider, _root, _app, obs: obs
+                order = mock.Mock()
+                for name in ("activate_source_from_focused_web", "run_review", "editor_fingerprint"):
+                    order.attach_mock(getattr(harness, name), name)
+                if broken:
+                    harness.activate_source_from_focused_web.side_effect = runtime.HarnessFailure(
+                        "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"
+                    )
+                with (
+                    mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
+                    mock.patch.object(HARNESS, "wait_until", side_effect=lambda check, *_a, **_k: check()),
+                    mock.patch.object(HARNESS, "trust_apply_source_contract_ok", return_value=True),
+                    mock.patch.object(HARNESS, "preview_inert_source_contract_ok", return_value=True),
+                ):
+                    if broken:
+                        with self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"):
+                            harness.scenario_trust_revoke()
+                        harness.run_review.assert_not_called()
+                        harness.editor_fingerprint.assert_not_called()
+                        harness.reap.assert_called_once_with(app)
+                    else:
+                        observations = harness.scenario_trust_revoke()
+                        self.assertTrue(observations["trust_before"])
+                        self.assertEqual(order.mock_calls[:2], [
+                            mock.call.activate_source_from_focused_web(app),
+                            mock.call.run_review(app, provider, preserve_focus=True),
+                        ])
+                        harness.request_revision.assert_called_once_with(app, provider=provider)
+                        harness.click_lifecycle_decision.assert_called_once_with(app, "Discard")
+                harness.activate_source_layout.assert_not_called()
+                provider.close.assert_called_once_with()
+
     def test_scenario_contract_failure_is_raised_before_shared_pass_status(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         observations = common(HARNESS.CASE_REJECT_ALL)

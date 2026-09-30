@@ -135,6 +135,7 @@ const REVISION_SAVE_ACCESSIBILITY_ID: &str = "markturbo-revision-save";
 const REVISION_SAVE_AS_ACCESSIBILITY_ID: &str = "markturbo-revision-save-as";
 const REVISION_STALE_ACCESSIBILITY_ID: &str = "markturbo-revision-stale";
 const REVISION_RESULT_DISMISS_ACCESSIBILITY_ID: &str = "markturbo-revision-result-dismiss";
+const REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID: &str = "markturbo-revision-discard-answers";
 const REVISION_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str = "markturbo-revision-recovered-answers";
 const REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
     "markturbo-revision-copy-recovered-answers";
@@ -1518,6 +1519,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.show_welcome = false;
+        if arm_dirty_recovery && matches!(&identity, TabIdentity::File(_)) {
+            self.isolate_reopened_file_recovery(&view, cx);
+        }
         self.remember_startup_recovery_key(&view, cx);
         // Both subscriptions ride with the tab, so closing it drops them.
         let subscriptions = [
@@ -3740,10 +3744,15 @@ impl Workspace {
         let Some(doc) = self.active_document().cloned() else {
             return;
         };
-        // The outline and the search results both land here, and both are the
-        // kind of jump a user expects Back to undo.
-        if let Some(path) = doc.read(cx).source_path() {
-            self.record_visit(path.to_path_buf(), offset);
+        // Path-only history cannot navigate a recovered buffer by its source
+        // path without selecting a different, ordinary file tab.
+        if let Some(path) = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.path())
+            .map(Path::to_path_buf)
+        {
+            self.record_visit(path, offset);
         }
         doc.update(cx, |doc, cx| doc.reveal_offset(offset, window, cx));
     }
@@ -11299,6 +11308,40 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn recovered_outline_jumps_do_not_reopen_the_ordinary_file(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outline-recovery.md");
+        fs::write(&path, "# Ordinary file\n").unwrap();
+        let recovered_text = "# Recovered first\n\n## Recovered second\n";
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, recovered_text);
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let (recovered_id, _) = restore_open_file_checkpoint(&workspace, &path, &store, cx);
+        workspace.read_with(cx, |workspace, _| assert!(!workspace.history.can_go_back()));
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.reveal_offset(0, window, cx);
+                workspace.reveal_offset(recovered_text.find("##").unwrap(), window, cx);
+                workspace.on_navigate_back(&super::NavigateBack, window, cx);
+            });
+        });
+
+        workspace.read_with(cx, |workspace, app| {
+            let active = workspace.active_document().unwrap().read(app);
+            assert_eq!(active.id(), recovered_id);
+            assert_eq!(active.text(app), recovered_text);
+            assert!(!workspace.history.can_go_back());
+            assert!(!workspace.history.can_go_forward());
+        });
+    }
+
+    #[gpui_kit::test]
     fn missing_file_search_result_cannot_move_recovered_buffer_or_add_history(
         cx: &mut TestAppContext,
     ) {
@@ -12112,10 +12155,82 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn recovered_answers_stay_with_recovered_tab_when_ordinary_file_reuses_its_key(
+    #[gpui_kit::test]
+    fn recovered_sibling_survives_reopened_file_checkpoint_save_and_discard(
         cx: &mut TestAppContext,
     ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reopened-recovery.md");
+        fs::write(&path, "ordinary disk text\n").unwrap();
+        let recovered_text = "independent recovered text\n";
+        let recovered_key = RecoveryKey::for_path(&path);
+        let store = RecoveryStore::new_at(
+            directory.path().join("recovery-store"),
+            Arc::new(TestRecoveryProtector),
+        )
+        .unwrap();
+        write_recovery_checkpoint(&store, &path, recovered_text);
+        let (workspace, cx) =
+            open_test_workspace_with_recovery_store(cx, Some(path.clone()), store.clone());
+        let (recovered_id, _) = restore_open_file_checkpoint(&workspace, &path, &store, cx);
+        workspace.update(cx, |workspace, cx| {
+            let ordinary = workspace.tabs.index_of(&path).unwrap();
+            workspace.close_tab_unchecked(ordinary, cx);
+        });
+
+        for (decision, text) in [
+            ("Save", "saved live text\n"),
+            ("Discard", "discarded live text\n"),
+        ] {
+            cx.update(|window, app| {
+                workspace.update(app, |workspace, cx| {
+                    assert!(workspace.open_file(path.clone(), window, cx));
+                });
+            });
+            let ordinary = workspace.read_with(cx, |workspace, _| workspace.tabs.active_index());
+            replace_document(&workspace, ordinary, text, cx);
+            let checkpoint = workspace.read_with(cx, |workspace, app| {
+                workspace
+                    .active_document()
+                    .unwrap()
+                    .read(app)
+                    .recovery_checkpoint(app)
+            });
+            store
+                .checkpoint(
+                    &checkpoint,
+                    &HashSet::from([recovered_key.clone(), checkpoint.key.clone()]),
+                )
+                .unwrap();
+
+            let scan = store.recover().unwrap();
+            let retained = scan
+                .records
+                .iter()
+                .find(|record| record.record.key == recovered_key)
+                .unwrap();
+            assert_eq!(retained.record.text, recovered_text);
+            assert_ne!(checkpoint.key, recovered_key);
+            assert!(scan.records.iter().any(|record| {
+                record.record.key == checkpoint.key && record.record.text == text
+            }));
+
+            cx.simulate_keystrokes("ctrl-w");
+            cx.simulate_prompt_answer(decision);
+            cx.run_until_parked();
+            let remaining = store.recover().unwrap();
+            assert_eq!(remaining.records.len(), 1);
+            assert_eq!(remaining.records[0].record.key, recovered_key);
+            assert_eq!(remaining.records[0].record.text, recovered_text);
+            workspace.read_with(cx, |workspace, app| {
+                let recovered = workspace.document_by_id(recovered_id, app).unwrap();
+                assert_eq!(recovered.read(app).text(app), recovered_text);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn recovered_answers_stay_with_the_recovered_tab_after_reopening_file(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recovered-alias.md");
         let disk_text = "ordinary disk text\n";
@@ -12194,7 +12309,7 @@ mod tests {
             (ordinary.id(), ordinary.recovery_key())
         });
         assert_ne!(ordinary_document_id, recovered_document_id);
-        assert_eq!(ordinary_key, recovered_key);
+        assert_ne!(ordinary_key, recovered_key);
 
         let recovered_answers_offered = cx.update(|window, app| {
             use gpui_kit::test::TestWindowExt as _;
@@ -12237,6 +12352,13 @@ mod tests {
                     .recovered_revision_record_for_document(ordinary_document_id, &ordinary_key)
                     .is_none(),
                 "the ordinary tab must not borrow another document's recovered answers"
+            );
+            assert!(
+                workspace
+                    .review_flow
+                    .recovered_revision_record_for_document(ordinary_document_id, &recovered_key)
+                    .is_none(),
+                "an explicit recovered key still requires its document's answer binding"
             );
         });
         assert!(

@@ -293,6 +293,24 @@ impl Workspace {
         self.recovery_flow.startup_recovery_keys.get(&document_id)
     }
 
+    pub(super) fn isolate_reopened_file_recovery(
+        &mut self,
+        document: &Entity<DocumentView>,
+        cx: &mut Context<Self>,
+    ) {
+        let (id, key, revision) = {
+            let document = document.read(cx);
+            (document.id(), document.recovery_key(), document.revision())
+        };
+        let already_owned = self.tabs.iter().any(|tab| {
+            let other = tab.payload.view.read(cx);
+            other.id() != id && other.recovery_key() == key
+        }) || self.review_flow.has_recovered_revision_record(&key);
+        if already_owned {
+            self.isolate_live_document_recovery_key(document, id, &key, revision, cx);
+        }
+    }
+
     pub(super) fn remember_startup_recovery_key(
         &mut self,
         document: &Entity<DocumentView>,

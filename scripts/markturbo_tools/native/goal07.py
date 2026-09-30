@@ -152,6 +152,8 @@ REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID = "markturbo-revision-preview-source"
 REVISION_PREVIEW_SOURCE_LABELS = frozenset(
     {"Final approved Revision source", "最终批准的修订源文本"}
 )
+REVISION_RESULT_DISMISS_ACCESSIBILITY_ID = "markturbo-revision-result-dismiss"
+REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID = "markturbo-revision-discard-answers"
 REVISION_STALE_ACCESSIBILITY_ID = "markturbo-revision-stale"
 REVISION_ACCEPT_ALL_ACCESSIBILITY_ID = "markturbo-revision-accept-all"
 REVISION_REJECT_ALL_ACCESSIBILITY_ID = "markturbo-revision-reject-all"
@@ -1241,6 +1243,14 @@ def source_contract_failure() -> str | None:
         ("REVISION_REJECT_ALL_ACCESSIBILITY_ID", REVISION_REJECT_ALL_ACCESSIBILITY_ID),
         ("REVISION_APPLY_ACCESSIBILITY_ID", REVISION_APPLY_ACCESSIBILITY_ID),
         ("REVISION_COPY_ACCESSIBILITY_ID", REVISION_COPY_ACCESSIBILITY_ID),
+        (
+            "REVISION_RESULT_DISMISS_ACCESSIBILITY_ID",
+            REVISION_RESULT_DISMISS_ACCESSIBILITY_ID,
+        ),
+        (
+            "REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID",
+            REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID,
+        ),
     ):
         if f'const {symbol}: &str = "{value}";' not in workspace:
             return "REVISION_UIA_CONTRACT_MISSING"
@@ -1734,10 +1744,15 @@ class Goal07Harness(ClipboardNativeHarness):
         provider.dispatch_consent_click(expected_request_count, click)
 
     def run_review(
-        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer
+        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer,
+        *, preserve_focus: bool = False,
     ) -> None:
-        self.focus_editor(app)
-        self._require_foreground(app)
+        if preserve_focus:
+            if self.win32.foreground_focus(app.hwnd) != app.hwnd:
+                raise HarnessFailure("WEB_TO_SOURCE_NATIVE_FOCUS_LOST")
+        else:
+            self.focus_editor(app)
+            self._require_foreground(app)
         self.win32.send_inputs(
             [
                 key_input(VK_CONTROL, False),
@@ -2112,7 +2127,6 @@ class Goal07Harness(ClipboardNativeHarness):
                 CASE_TRUST_REVOKE, provider.base_url, html=True
             )
             app = self.launch_app(source, data, config, workspace, stderr)
-            self.activate_source_layout(app)
             trust = self.find_control(
                 app,
                 TRUST_AUTOMATION_ID,
@@ -2133,8 +2147,10 @@ class Goal07Harness(ClipboardNativeHarness):
                 interval=0.05,
             )
             trust_before = self._is_trusted_label(str(trusted_label))
-            self.activate_source_layout(app)
-            self.run_review(app, provider)
+            # HTML opens in Web. Observe a visible, natively focused WebHost
+            # handing input to the main HWND before any helper can refocus it.
+            self.activate_source_from_focused_web(app)
+            self.run_review(app, provider, preserve_focus=True)
             self.request_revision(app, provider=provider)
             self._click_id(app, REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)
             editor_before_apply = self.editor_fingerprint(app)
@@ -2180,6 +2196,11 @@ class Goal07Harness(ClipboardNativeHarness):
                     "<script>" in preview_text and 'goal07 = "new"' in preview_text
                 ),
             }
+            self._click_id(app, REVISION_RESULT_DISMISS_ACCESSIBILITY_ID)
+            self._click_id(app, REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID)
+            self.win32.post_close(app.hwnd)
+            self.click_lifecycle_decision(app, "Discard")
+            self.wait_process_exit(app)
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
             try:
