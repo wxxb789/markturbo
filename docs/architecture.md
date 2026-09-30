@@ -20,13 +20,19 @@ Modules follow the workflow a caller needs, not technical tiers:
 ```text
 mt-core (GPUI-free)
   document/{doc,block,doctype,frontmatter,outline,io,lifecycle}
-              source, spans, lossless load/save, conflict and close decisions
+  document/io/commit
+              source, spans, lossless load/save, guarded write commit,
+              conflict and close decisions
   workspace/{tree,walk,search,watcher,tabs,history}
               folder discovery, external changes, navigation state
   agent_artifacts/{skill,harness,instruction,package}
-              discovery and exact frozen Agent Skill Review inputs
-  review/{provider,revision} + translate/{provider} + model
-              validation, approved edits, frozen disclosure and transport
+  agent_artifacts/package/source
+              discovery and identity-bound acquisition of exact frozen
+              Agent Skill Review inputs
+  review/{provider,revision} + review/provider/revision
+  translate/{provider} + model/endpoint + model
+              validation, approved edits, frozen disclosure, endpoint
+              identity, one-use authorization and transport
   rendering   diagram/math registry and embedded KaTeX faces
   credentials + settings + recovery + runtime_paths
               secure storage, user configuration, encrypted checkpoints
@@ -34,7 +40,10 @@ mt-core (GPUI-free)
        │ mt-app depends on mt-core
 mt-app (GPUI)
   views/{workspace,document,explorer,harness,search,settings_page}
-  views/workspace/{history,web_surface}   navigation controls and OS WebView
+  views/workspace/{review,recovery,history,web_surface}
+              Review/Revision, startup/checkpoint/retirement coordination,
+              navigation and OS WebView
+  views/document/preview   derived native and Web preview cache
   web + theme + i18n + assets + startup + main
               HTML/WebView presentation, UI resources and application lifetime
 ```
@@ -46,6 +55,123 @@ expose the behavior their callers need through one-way interfaces; the GPUI
 views decide when to invoke them and render their results. In particular,
 `Tabs<T>` and `History` keep their state invariants in core, while tab elements
 and navigation buttons stay in app.
+
+The app's `workspace::review::ReviewFlow` is the one owner of the Review to
+Approved Revision interaction state: captured result and source identity,
+pending cancellation/generation, answer bindings, user decisions, and the
+identity of an explicit Apply. Workspace supplies document observations,
+window prompts and asynchronous transport; it cannot turn a response into
+editor text. Core `review::provider` binds frozen requests to disclosure and
+one-use consent, while its private Revision implementation validates provider
+coverage and proposed edits. `DocumentView` performs the final source check
+and one undoable approved edit. Its `DocumentPreview` owns only derived
+rendering and Web failure/cache transitions, never editor or source identity.
+
+The app's `workspace::recovery::RecoveryFlow` is the single owner of the
+optional store handle, startup identity and scan readiness, the per-document
+checkpoint schedule and cancellation attempts, the one physical worker,
+content-specific warning, and exact durable retirement owners/queued intents. It
+arbitrates late completions against the current edit identity and reschedules
+work without overriding a newer warning. The same workflow handles Save and
+Discard retirement and resumes delayed close only after its exact durable
+ticket is established. Workspace retains the generic Save/Discard/Cancel
+decision, action-scoped collected recovery keys, picker, and window lifetime:
+it rechecks editor snapshots and newly authored answers before destructive
+execution. The recovery module owns the retirement protocol and continuation,
+not the lifecycle decision. ReviewFlow supplies typed answer-recovery
+observations; neither flow owns another copy of those
+answers or of the core store's generation and marker rules.
+
+Two independent buffers can name the same source path: a still-undisposed
+recovered snapshot and a newer live editor incarnation. Recovery keeps their
+opaque checkpoint keys distinct, preserving each text and answer binding until
+its own Save/Discard decision, subject to the existing retention limits and
+visible storage failures. `TabIdentity::Recovered(key)` does not claim the
+ordinary file tab's path for deduplication, but its `DocumentView` retains the
+source path, stamp, encoding and conflict checks. A recovered-only tab is
+visibly identified; an ambiguous startup result cannot overwrite a newly
+Save-As-written clean buffer. Search keeps the displayed path separate from
+its navigation target: file results use the ordinary path, while recovered
+in-memory results carry the still-open `DocumentId` and never reopen that path
+after the tab closes. Path-only history does not invent a visit to another
+buffer's source.
+
+Private core modules earn their interfaces by retaining whole rules, not by
+moving tests: `document::io::commit` implements the shared guarded Save and
+Save As transaction after encoding/staging; the parent retains loaded-source
+identity and authorization. `agent_artifacts::package::source` acquires and
+revalidates files using the load-time `SkillOrigin`; package assembly owns the
+frozen inventory and omission disclosure. `model::endpoint` canonicalizes
+endpoint/credential identity for Review and Translation; `model` retains
+outbound scope and one-use consent. None introduces another source of truth.
+
+### Large first-party source disposition
+
+This is a responsibility audit, not a file-size target. A private module is
+useful only when removing it would spread a real rule back across its callers.
+
+| Source before | Responsibility after | Why this seam, or why keep it together |
+| --- | --- | --- |
+| `views/workspace.rs`: open tabs, first-use Welcome, Review/Revision, recovery, lifecycle, presentation | `Workspace` keeps tabs, document events, target routing, shared Save As picker and destructive decision; `workspace/welcome.rs` owns Welcome presentation, entry-time availability and recent-target interaction; `workspace/review.rs` owns Review through Approved Revision, `workspace/recovery.rs` owns startup/checkpoint/retirement and close continuation | A user action can now be traced through Welcome availability and rechecked target opening, frozen Review request through explicit Apply, or the protected Recovery edit through exact durable retirement. Moving only helpers or tests would leave those rules split across callbacks. |
+| `views/document.rs`: editor, source lifetime, save, native/Web projection | `DocumentView` keeps source/edit/Save and approved Apply; `document/preview.rs` owns derived preview cache, failure and refresh transitions | Rebuilding the Web payload and retaining its failed revision vary independently of the source identity; a preview never authorizes an edit or source reload. |
+| `document/io.rs`: load/identity, encoding, Save/Save As, platform commit | `io.rs` retains load, source/Skill origin, authorization, encoding and staging; private `io/commit.rs` owns the shared guarded transaction through verification/rollback | Both Save and Save As require the same final race checks and platform-specific commit; splitting the source identity contract itself would create a second authority. |
+| `agent_artifacts/package.rs`: frozen package and authenticated directory acquisition | `package.rs` keeps scope, omission disclosure and anchors; private `package/source.rs` owns origin-bound enumeration and byte reads | No caller can safely reconstruct a Skill root from a path. Deleting acquisition would spread no-follow/identity checks across package construction and navigation. |
+| `review/provider.rs`: shared provider preparation and both operations | `provider.rs` keeps shared endpoint/credential preparation and Review; private `provider/revision.rs` owns answer binding, Revision disclosure, schema, execution and strict coverage decoding | Revision has its own user-approved change contract; its provider rules change together while consuming the already validated Review, not a duplicate provider configuration. |
+| `model.rs`: endpoint and consent/scope policy | `model.rs` keeps public types, exact outbound scopes and one-use authorization; private `model/endpoint.rs` owns parsing and canonical endpoint/credential identity | Review and Translation reuse one endpoint interpretation. Splitting consent from its scope or duplicating endpoint checks would weaken the disclosure guarantee. |
+| `recovery.rs`: encrypted records, generations, scheduling and durable retirement | Retain one core store and timing contract | Checkpoint, eviction, marker retirement and crash reconciliation share capability/marker/mutation locks; separating them would expose lock order and the durable linearization point. The pure schedule already has a small core interface. |
+| `review.rs`: immutable source and package requests, anchors, output validation | Retain one provider-independent Review contract | Request validation and grounded quote-to-anchor resolution share the frozen source/selection/package identity. A separate package validator would force both sides to coordinate the same error and scope rules. |
+| `views/i18n.rs`: typed strings and fallback | Retain one catalog | Exhaustive English keys and Chinese fallback share a coverage rule; per-screen catalogs would make missing strings harder to detect. |
+| `bin/markturbo-goal07-evaluate.rs`: offline Review/Revision capture evaluation | Retain the single capture-to-content-free-receipt command | Input path safety, source/proposal binding and receipt creation are one evaluation contract, not reusable UI workflows. |
+| `translate/provider.rs`, `views/model_settings.rs`, `views/web.rs`, `bin/markturbo-goal06-evaluate.rs`: Translation transport, credential settings UI, trusted Web projection and owner-operated corpus evaluation respectively | Retain their separate owners | Translation freezes endpoint/credential and consent for one operation; the settings view adapts secure vault state without owning policy; Web rendering applies one trust/CSP contract; the evaluator binds a fixed corpus to explicit send authorization. Splitting these smaller seams would make their callers reassemble privacy or source-identity rules. |
+| `views/workspace/web_surface.rs`, `agent_artifacts/skill.rs`, `credentials.rs`, `rendering/mod.rs`: OS WebView lease, Skill discovery, vault transaction and renderer registry respectively | Retain their existing owners | Each has one shared state/identity or registry invariant; splitting its platform helpers would make callers reconstruct that invariant. These near-threshold sources were checked as well as the larger files. |
+
+### Tooling, native acceptance, and test ownership
+
+`scripts/mt.py` is the one command entry point. `markturbo_tools/cli.py`
+dispatches canonical subcommands; `checks.py` owns the explicit portable test
+list and validation tiers. Native acceptance is never found by test discovery:
+`native/runtime.py` owns Windows preflight, UIA lookup, hash-bound case lifecycle,
+strict process close, and bounded artifact byte search. Goal 02/03/06/07 modules
+retain their distinct scenario, privacy, evidence, and failure policies. Goal 07's
+`native/goal07_provider.py` owns only the deterministic loopback request/response
+protocol; its per-run request count is derived from recorded case observations,
+not a process-global evidence object. Merging goal policies into runtime would
+obscure which user operation and consent boundary each case proves.
+
+Each native launch joins its own non-breakaway Windows Job Object before its
+suspended primary thread resumes. Teardown waits for the private completion
+port's active-process-zero notification, including when the parent has already
+exited. A missing notification fails closed: neither the final artifact scan
+nor isolation removal may infer browser quiescence from parent exit alone.
+
+Other large Python sources keep separate owners: `evaluation.py` records Goal 06
+owner judgments; `revision_evaluation.py` binds Goal 07 registry, machine and
+native receipts to owner judgments; `goal04.py` owns build/evidence policy; and
+`probe.py` owns Windows measurement and process observations. Their output
+contracts and failure paths differ. Reused A-B-B-A scheduling and paired
+comparison arithmetic live in `metrics.py`; callers retain their averaging,
+validation and error contracts. A second Goal 04 forwarding scheduler is
+unnecessary. Icon generation, performance fixture generation, recovery capacity measurement and
+privacy scanning remain separate utilities because they do not share that
+policy. Shell scripts shipped inside sample/Skill fixtures are artifact content,
+not an alternative development harness; CI/release workflow commands remain
+specific to their jobs.
+
+Tests follow their owner rather than one common runner: core unit tests stay
+beside GPUI-free invariants; Workspace Welcome headless interaction tests live
+in `workspace/tests/welcome.rs` and reuse the Workspace fixtures; DocumentView
+Apply/undo tests share file-backed setup but retain separate source, trust and
+failure assertions. App/core integration tests retain real fixture and
+discovery coverage, while machine-dependent cost diagnostics stay ignored.
+Python fake-UIA/provider tests in `scripts/tests/` prove harness selection,
+ordering, privacy and evidence contracts, not the shipped GUI. GPUI Kit tests
+prove rendered element events and app state but not the OS clipboard, native
+dialogs, IME, WebView2 or DPAPI. Only full native runs on an eligible Windows
+desktop with the final executable hash establish those OS boundaries. Source
+preflight for Goal 03 checks both the Workspace shell and its production Welcome
+module; spelling or source scans alone cannot replace UI observations.
+The [test ablation report](test-ablation.md) records the measured removals,
+stronger replacement detectors, and counterexamples that required retention.
 
 ## Why these boundaries
 
@@ -217,6 +343,17 @@ So the honest summary is not "content can never reach anything". It is: nothing
 reaches the filesystem or the network unless the user trusted that specific
 document, and for HTML, trusting is exactly the act of handing it the disk.
 
+On Windows, the WebView worker requests an InPrivate profile and checks the
+created profile's actual mode through WebView2 before reporting ready or
+accepting document navigation. An unavailable interface, query error or
+non-private profile fails Web preview initialization rather than falling back
+to persistent browsing. Native source editing remains available.
+
+This changes new browser sessions, not historical data retention. The existing
+application-owned WebView2 data directory stays in place; the application does
+not delete or relocate older profiles. A clean isolated native privacy scan
+cannot establish that an existing user's profile contains no earlier content.
+
 ### Save safety
 
 The filesystem is the source of truth, and agents write to it concurrently. A
@@ -339,18 +476,24 @@ ten-second durable deadline. A matching tab accepts recovery only if it is still
 clean and has not advanced
 from the identity captured when startup began. A clean file opened while the
 scan is running may also accept its matching record, while any edit or reload
-keeps the current tab untouched. Existing watcher conflict state is preserved.
+keeps the current tab untouched and offers the older record separately under
+its own key. The edited tab checkpoints under a distinct key; neither a late
+scan nor its first checkpoint replaces the other editor's text. Existing
+watcher conflict state is preserved.
 Watcher events still mark affected documents during this interval, but startup
 recovery is also an auto-reload barrier: automatic reload remains off until the
 scan has completed, even when the setting is enabled.
 Successful Save and confirmed Discard decisions made before the store is ready
-queue their recovery keys. The startup result filters those keys before it
-restores records. Once it has attached an available store, it durably retires
-the queued keys and only then resumes a waiting destructive action. If the
-store remains unavailable, the document stays open and the failure is reported;
-editing and source-file Save remain available. Restored dirty records are
-already durable, so they do not immediately rewrite their checkpoint; they are
-instead scheduled for a ten-second refresh from their restored durable baseline.
+queue only the recovery keys owned by those editor incarnations. An unseen
+older checkpoint at the same path is not proof that a clean Save As owns that
+record; it remains visible for independent recovery. The startup result
+filters queued keys before restoring records. Once it has attached an
+available store, it durably retires independent queued Saves while the exact
+keys in a waiting destructive action keep their batch marker and close
+continuation. If the store remains unavailable, the document stays open and
+the failure is reported; editing and source-file Save remain available.
+Restored dirty records are already durable, so they do not immediately rewrite
+their checkpoint; they are scheduled for a ten-second refresh from that baseline.
 
 The Windows production store validates the local-volume policy before it
 creates the root, then takes lifetime ownership before it opens any record. It
@@ -425,16 +568,18 @@ delayed destructive action proceeds, the workspace rechecks both editor
 snapshots and newly authored answers; an answer entered during cleanup keeps
 the document open and re-arms recovery.
 
-The workspace keeps action-scoped queued intent separate from durable cleanup
-ownership. `pending_recovery_retirements` records the originating document when
-known, so a tab-close action waits only for its own pending key; an unknown
-origin remains fail-closed for every destructive action. A pending entry means a
-newer Save or Discard still needs its own durable marker; it is not an owner.
+Workspace keeps the keys collected for a pending destructive action until its
+decision resolves. Separately, `RecoveryFlow` keeps queued retirement intent
+distinct from durable cleanup ownership. `pending_recovery_retirements` records
+the originating document when known, so a tab-close action waits only for its
+own pending key. An unknown origin remains fail-closed for every destructive
+action. A pending entry means a newer Save or Discard still needs its own
+durable marker; it is not an owner.
 `recovery_retirements` and
 `recovery_retirement_batches` hold the exact single-key or batch ticket that
 owns cleanup already made durable. An owner and queued intent for the same key
 therefore mean that a later decision is waiting behind the current owner. When
-that exact owner finishes, the workspace replays the queued intent to publish a
+that exact owner finishes, `RecoveryFlow` replays the queued intent to publish a
 fresh marker. An edit cancels only the queued intent, while the durable owner
 continues cleanup. Completion callbacks compare the complete ticket identity,
 so a stale callback cannot remove or replace a newer owner.
@@ -480,10 +625,10 @@ conflicting artifacts, recovery reports the condition rather than presenting
 them as ordinary records. The journal protects recovery retention only; it does
 not promise a multi-file transaction for user documents.
 
-After a successful Save or confirmed Discard, the matching recovery record is
-durably retired before long physical cleanup. Recovery
-stores the source path, encoding, BOM, line endings, conflict stamp, source
-identity, and decode-error state with the text. On restore, a changed,
+After a successful Save or confirmed Discard, the matching editor
+incarnation's recovery record is durably retired before long physical cleanup.
+Recovery stores the source path, encoding, BOM, line endings, conflict stamp,
+source identity, and decode-error state with the text. On restore, a changed,
 unreadable, or missing source remains a conflicted dirty buffer and cannot
 overwrite implicitly. Malformed, oversized, expired, unreadable, unavailable,
 or failed recovery data is reported without blocking the editor or modifying a
@@ -492,9 +637,11 @@ per-user store are restored into the startup window without filtering their
 source paths against `self.root`. Tab deduplication compares the stored paths
 lexically, so equivalent canonical, relative, or link spellings can still be
 distinct. A record from another workspace can therefore appear in that startup
-window; matching-workspace recovery scoping does not exist yet. In-memory record
-restoration creates an independent pathless Markdown tab and preserves the
-record's process-independent recovery key until Save As retires it.
+window; matching-workspace recovery scoping does not exist yet. Two file-backed
+records naming the same source remain distinct by their recovery keys rather
+than collapsing into one tab or overwriting the ordinary file tab. In-memory
+record restoration creates an independent pathless Markdown tab and preserves
+the record's process-independent recovery key until Save As retires it.
 
 ### Settings: a file a person opens
 

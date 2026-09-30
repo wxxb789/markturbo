@@ -45,17 +45,17 @@ fn body(html: &str) -> String {
 // --- The full pipeline ----------------------------------------------------
 
 #[test]
-fn every_fixture_opens_renders_and_survives_a_round_trip() {
+fn every_fixture_opens_and_renders() {
     let registry = registry();
-    for relative in [
-        "markdown.md",
-        "diagrams/diagrams.md",
-        "mdx/markdown-only.mdx",
-        "mdx/components.mdx",
-        "mdx/invalid.mdx",
-        "mdx/untrusted.mdx",
-        "skills/skills/valid-skill/SKILL.md",
-        "perf/diagram-heavy.md",
+    for (relative, expected_content) in [
+        ("markdown.md", "Heading 1"),
+        ("diagrams/diagrams.md", "Diagram and math fixtures"),
+        ("mdx/markdown-only.mdx", "Plain Markdown in an MDX file"),
+        ("mdx/components.mdx", "Quarterly report"),
+        ("mdx/invalid.mdx", "Invalid MDX"),
+        ("mdx/untrusted.mdx", "Untrusted executable content"),
+        ("skills/skills/valid-skill/SKILL.md", "Valid Skill"),
+        ("perf/diagram-heavy.md", "Diagram 0"),
     ] {
         let (file, doc) = load(relative);
 
@@ -69,8 +69,8 @@ fn every_fixture_opens_renders_and_survives_a_round_trip() {
         // Both renderers accept the same document model, and neither panics.
         let html = web::build_html(&doc, &registry, Trust::Restricted);
         assert!(
-            body(&html).len() > 10,
-            "{relative}: web render produced nothing"
+            body(&html).contains(expected_content),
+            "{relative}: expected rendered body to contain {expected_content:?}"
         );
 
         // Every out-of-band block resolves to markup or a diagnostic — never

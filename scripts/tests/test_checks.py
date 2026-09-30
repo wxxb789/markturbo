@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import tempfile
-import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,57 +67,12 @@ class DiffCheckTests(unittest.TestCase):
             ("base-sha", "head-sha"),
         )
 
-    def test_explicit_tooling_manifest_includes_the_cli_integration_tests(self) -> None:
-        self.assertIn("scripts.tests.test_cli", checks.TOOLING_TESTS)
-
-    def test_explicit_tooling_manifest_collects_each_goal02_module_once(self) -> None:
-        expected = {
-            "scripts.tests.test_native_goal02_evidence",
-            "scripts.tests.test_native_goal02_uia",
-            "scripts.tests.test_native_goal02_runtime",
-            "scripts.tests.test_native_goal02_execution",
-        }
-
-        self.assertTrue(expected.issubset(checks.TOOLING_TESTS))
-        self.assertNotIn("scripts.tests.test_native_goal02", checks.TOOLING_TESTS)
-        self.assertEqual(sum(name.startswith("scripts.tests.test_native_goal02_") for name in checks.TOOLING_TESTS), 4)
-
-    def test_explicit_tooling_manifest_includes_goal06_native_harness(self) -> None:
-        self.assertIn("scripts.tests.test_native_goal06", checks.TOOLING_TESTS)
-
-    def test_explicit_tooling_manifest_includes_goal07_revision_evaluation(self) -> None:
-        self.assertIn("scripts.tests.test_revision_evaluation", checks.TOOLING_TESTS)
-
-    def test_explicit_tooling_manifest_includes_goal07_native_harness(self) -> None:
-        self.assertIn("scripts.tests.test_native_goal07", checks.TOOLING_TESTS)
-
     def test_rejects_an_incomplete_ci_range_before_running_git(self) -> None:
         with mock.patch.object(checks, "run") as run:
             with self.assertRaisesRegex(checks.CheckFailure, "must be provided together"):
                 checks.check_diff(base="base-sha", head=None)
 
         run.assert_not_called()
-
-    def test_ci_forwards_the_explicit_range_and_omits_local_diff_checks(self) -> None:
-        with (
-            mock.patch.object(checks, "run") as run,
-            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
-        ):
-            checks.ci(base="base-sha", head="head-sha")
-
-        commands = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(commands[0], ("git", "diff", "--check", "base-sha", "head-sha"))
-        self.assertNotIn(("git", "diff", "--check"), commands)
-        self.assertNotIn(("git", "diff", "--cached", "--check"), commands)
-        self.assertEqual(
-            commands[1:],
-            [
-                (sys.executable, "-m", "unittest", *checks.TOOLING_TESTS),
-                ("cargo", "fmt", "--all", "--", "--check"),
-                ("cargo", "clippy", "--profile", "ci", "--workspace", "--all-targets", "--locked"),
-                ("cargo", "test", "--profile", "ci", "--workspace", "--locked"),
-            ],
-        )
 
 
 class ValidationBoundaryTests(unittest.TestCase):

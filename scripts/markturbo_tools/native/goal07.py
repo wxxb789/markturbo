@@ -11,17 +11,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import http.server
 import json
 import math
-import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from . import goal07_provider as provider_fixtures
 from .goal03 import Goal03Harness as ClipboardNativeHarness
+from .source_contract import production_source, rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -56,7 +56,7 @@ from .runtime import (
     validate_process_context,
     wait_until,
     write_durable,
-    run_native_acceptance,
+    artifact_contains,
 )
 
 
@@ -146,15 +146,14 @@ REVIEW_RUN_ACCESSIBILITY_ID = "markturbo-review-run"
 REVIEW_RESULT_ACCESSIBILITY_ID = "markturbo-review-result"
 REVISION_RUN_ACCESSIBILITY_ID = "markturbo-revision-run"
 REVISION_CONTROL_BOTTOM_INSET = 32
-# Keep the request alias for callers that used the pre-Goal-07 name. The
-# shipped UI exposes the revision action as `markturbo-revision-run`.
-REVISION_REQUEST_ACCESSIBILITY_ID = REVISION_RUN_ACCESSIBILITY_ID
 REVISION_RESULT_ACCESSIBILITY_ID = "markturbo-revision-result"
 REVISION_PREVIEW_ACCESSIBILITY_ID = "markturbo-revision-preview"
 REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID = "markturbo-revision-preview-source"
 REVISION_PREVIEW_SOURCE_LABELS = frozenset(
     {"Final approved Revision source", "最终批准的修订源文本"}
 )
+REVISION_RESULT_DISMISS_ACCESSIBILITY_ID = "markturbo-revision-result-dismiss"
+REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID = "markturbo-revision-discard-answers"
 REVISION_STALE_ACCESSIBILITY_ID = "markturbo-revision-stale"
 REVISION_ACCEPT_ALL_ACCESSIBILITY_ID = "markturbo-revision-accept-all"
 REVISION_REJECT_ALL_ACCESSIBILITY_ID = "markturbo-revision-reject-all"
@@ -162,10 +161,6 @@ REVISION_APPLY_ACCESSIBILITY_ID = "markturbo-revision-apply"
 REVISION_COPY_ACCESSIBILITY_ID = "markturbo-revision-copy"
 REVISION_QUESTION_PREFIX = "markturbo-revision-question-"
 REVISION_CHANGE_PREFIX = "markturbo-revision-change-"
-# Compatibility aliases for code that imports the old harness constants.
-REVISION_ANSWER_PREFIX = REVISION_QUESTION_PREFIX
-REVISION_ANSWER_UNSPECIFIED_PREFIX = REVISION_QUESTION_PREFIX
-REVISION_HUNK_PREFIX = REVISION_CHANGE_PREFIX
 CONFLICT_OVERWRITE_ACCESSIBILITY_ID = "markturbo-conflict-overwrite"
 TRUST_AUTOMATION_ID = "markturbo-document-trust"
 REVISION_CONSENT_AUTOMATION_ID = "CommandButton_1"
@@ -196,8 +191,6 @@ CASE_FLOWS = {
 }
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
-ANSWER_SENTINEL = "MTG07-NATIVE-ANSWER-SENTINEL"
-RAW_RESPONSE_SENTINEL = "MTG07-NATIVE-RAW-RESPONSE-SENTINEL"
 SOURCE_TEXT = (
     "---\r\n"
     "title: old\r\n"
@@ -227,14 +220,6 @@ HTML_EDITOR_SOURCE_TEXT = HTML_SOURCE_TEXT.replace("\r\n", "\n").replace("\r", "
 HTML_EDITOR_SOURCE_BYTES = HTML_EDITOR_SOURCE_TEXT.encode("utf-8")
 STALE_EDIT_TEXT = "---\ntitle: locally edited\nowner: TBD\n---\n"
 EXTERNAL_SOURCE_BYTES = b"external writer won\r\n"
-ANSWER_TEXT = f"Use the new title for the revised plan. {ANSWER_SENTINEL}"
-
-QUESTION_0 = "Which title should the revised plan use?"
-QUESTION_1 = "Should the owner field remain explicit?"
-QUESTION_2 = "Which rollout detail is intentionally left open?"
-QUESTION_IMPACT_0 = "A title choice changes the artifact's audience and identity."
-QUESTION_IMPACT_1 = "An owner choice changes accountability for the first step."
-QUESTION_IMPACT_2 = "A rollout choice changes the success evidence."
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES | {
     "keyless_loopback",
@@ -321,10 +306,10 @@ ALLOWED_OBSERVATION_KEYS = {
     "integrity",
     "editor_after_undo",
     "stale_visible",
-    "preview_inert_source_contract",
     "apply_control_observed",
     "apply_accessibility_reported_enabled",
     "editor_after_activation_attempt",
+    "preview_inert_source_contract",
     "trust_revocation_order_source_contract",
     "executable_expected",
     "executable_matches_expected",
@@ -343,30 +328,9 @@ ALLOWED_OBSERVATION_KEYS = {
 }
 
 
-_ACTIVE_EVIDENCE: dict[str, Any] | None = None
-
-
-def _question_id(index: int, question: str, priority: int, impact: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(b"markturbo-revision-question-v1\0")
-    digest.update(index.to_bytes(8, "big"))
-    digest.update(question.encode("utf-8"))
-    digest.update(bytes([priority]))
-    digest.update(b"\x01")
-    digest.update(impact.encode("utf-8"))
-    return digest.hexdigest()
-
-
-QUESTION_IDS = (
-    _question_id(0, QUESTION_0, 1, QUESTION_IMPACT_0),
-    _question_id(1, QUESTION_1, 2, QUESTION_IMPACT_1),
-    _question_id(2, QUESTION_2, 3, QUESTION_IMPACT_2),
-)
-
-
 def revision_question_accessibility_id(index: int) -> str:
     try:
-        question_id = QUESTION_IDS[index]
+        question_id = provider_fixtures.QUESTION_IDS[index]
     except IndexError as error:
         raise ValueError("native fixture question index is out of range") from error
     return f"{REVISION_QUESTION_PREFIX}{question_id}"
@@ -420,572 +384,6 @@ def endpoint_environment_key_identity(endpoint: str) -> str:
         "io.github.wxxb789.markturbo:model-credential:v2|wire=openai-responses"
         f"|host={host.casefold()}|identity-sha256={digest.hexdigest()}"
     )
-
-
-def _source_edit(source: str, old: str, new: str) -> dict[str, Any]:
-    source_bytes = source.encode("utf-8")
-    old_bytes = old.encode("utf-8")
-    start = source_bytes.find(old_bytes)
-    if start < 0:
-        raise ValueError("native fixture edit source is missing")
-    return {
-        "range": {"start": start, "end": start + len(old_bytes)},
-        "expected_source": old,
-        "replacement": new,
-    }
-
-
-def fixture_edits(source: str) -> list[dict[str, Any]]:
-    if "window.goal07" in source:
-        return [_source_edit(source, 'goal07 = "old"', 'goal07 = "new"')]
-    return [
-        _source_edit(source, "title: old", "title: new"),
-        _source_edit(source, "owner: TBD", "owner: team"),
-    ]
-
-
-def revision_response(source: str) -> str:
-    groups = (
-        [
-            {
-                "rationale": "The executable fixture changes only the requested script value.",
-                "edits": [_source_edit(source, 'goal07 = "old"', 'goal07 = "new"')],
-            }
-        ]
-        if "window.goal07" in source
-        else [
-            {
-                "rationale": "The answered title decision changes only the title line.",
-                "edits": [_source_edit(source, "title: old", "title: new")],
-            },
-            {
-                "rationale": "The answered owner decision changes only the owner line.",
-                "edits": [_source_edit(source, "owner: TBD", "owner: team")],
-            },
-        ]
-    )
-    coverage = [
-        {
-            "question_index": 0,
-            "question_id": QUESTION_IDS[0],
-            "status": {"kind": "represented", "change_ids": [0]},
-        },
-        {
-            "question_index": 1,
-            "question_id": QUESTION_IDS[1],
-            "status": {
-                "kind": "intentionally_omitted",
-                "reason": "The owner deliberately left this decision unchanged.",
-            },
-        },
-        {
-            "question_index": 2,
-            "question_id": QUESTION_IDS[2],
-            "status": {"kind": "not_addressed"},
-        },
-    ]
-    return json.dumps(
-        {"schema_version": "revision-v1", "groups": groups, "question_coverage": coverage},
-        separators=(",", ":"),
-    )
-
-
-def review_response() -> str:
-    return json.dumps(
-        {
-            "schema_version": "review-v1",
-            "scope": {"kind": "document"},
-            "understood_intent": {
-                "stated_goal": "Preserve the reviewed artifact while making approved decisions explicit.",
-                "relevant_context": [],
-                "constraints": [],
-                "non_goals": [],
-                "expected_deliverable": "A locally approved revision.",
-                "success_evidence": [],
-                "inferred_assumptions": [],
-                "unresolved_decisions": [],
-            },
-            "findings": [],
-            "clarification_questions": [
-                {"question": QUESTION_0, "priority": "high", "impact": QUESTION_IMPACT_0},
-                {"question": QUESTION_1, "priority": "medium", "impact": QUESTION_IMPACT_1},
-                {"question": QUESTION_2, "priority": "low", "impact": QUESTION_IMPACT_2},
-            ],
-        },
-        separators=(",", ":"),
-    )
-
-
-class _LoopbackHttpServer(http.server.ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-class LoopbackRevisionServer:
-    """A deterministic OpenAI Responses-compatible loopback provider."""
-
-    def __init__(self, source: str) -> None:
-        self.source = source
-        self._source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
-        self._source_snapshot = {"revision": 0, "source_generation": 0}
-        self.requests: list[dict[str, Any]] = []
-        self._server: _LoopbackHttpServer | None = None
-        self._thread: threading.Thread | None = None
-        self._lock = threading.RLock()
-        self._review_consent = False
-        self._revision_consent = False
-        self._event_sequence = 0
-        self._consent_click_sequence: dict[str, int | None] = {
-            "read_only_review": None,
-            "revision": None,
-        }
-        self._invalid_request = False
-        self._failure_code: str | None = None
-
-    @staticmethod
-    def _nested_values(value: Any, key: str) -> list[Any]:
-        values: list[Any] = []
-        if isinstance(value, dict):
-            if key in value:
-                values.append(value[key])
-            for nested in value.values():
-                values.extend(LoopbackRevisionServer._nested_values(nested, key))
-        elif isinstance(value, list):
-            for nested in value:
-                values.extend(LoopbackRevisionServer._nested_values(nested, key))
-        elif isinstance(value, str) and value[:1] in {"{", "["}:
-            try:
-                decoded = json.loads(value)
-            except (json.JSONDecodeError, RecursionError):
-                return values
-            values.extend(LoopbackRevisionServer._nested_values(decoded, key))
-        return values
-
-    @staticmethod
-    def _contains_exact_string(value: Any, expected: str) -> bool:
-        if isinstance(value, str):
-            if value == expected:
-                return True
-            if value[:1] in {"{", "["}:
-                try:
-                    return LoopbackRevisionServer._contains_exact_string(
-                        json.loads(value), expected
-                    )
-                except (json.JSONDecodeError, RecursionError):
-                    return False
-            return False
-        if isinstance(value, dict):
-            return any(
-                LoopbackRevisionServer._contains_exact_string(nested, expected)
-                for nested in value.values()
-            )
-        if isinstance(value, list):
-            return any(
-                LoopbackRevisionServer._contains_exact_string(nested, expected)
-                for nested in value
-            )
-        return False
-
-    @staticmethod
-    def _contains_text(value: Any, expected: str) -> bool:
-        if isinstance(value, str):
-            if expected in value:
-                return True
-            if value[:1] in {"{", "["}:
-                try:
-                    return LoopbackRevisionServer._contains_text(json.loads(value), expected)
-                except (json.JSONDecodeError, RecursionError):
-                    return False
-            return False
-        if isinstance(value, dict):
-            return any(
-                LoopbackRevisionServer._contains_text(nested, expected)
-                for nested in value.values()
-            )
-        if isinstance(value, list):
-            return any(
-                LoopbackRevisionServer._contains_text(nested, expected)
-                for nested in value
-            )
-        return False
-
-    @staticmethod
-    def _operations(value: Any) -> list[str]:
-        values: list[str] = []
-        if isinstance(value, dict):
-            operation = value.get("operation")
-            if isinstance(operation, str):
-                values.append(operation)
-            for nested in value.values():
-                values.extend(LoopbackRevisionServer._operations(nested))
-        elif isinstance(value, list):
-            for nested in value:
-                values.extend(LoopbackRevisionServer._operations(nested))
-        elif isinstance(value, str) and value[:1] in {"{", "["}:
-            try:
-                values.extend(LoopbackRevisionServer._operations(json.loads(value)))
-            except (json.JSONDecodeError, RecursionError):
-                return values
-        return values
-
-    def grant_review_consent(self) -> None:
-        with self._lock:
-            self._review_consent = True
-
-    def grant_revision_consent(self) -> None:
-        with self._lock:
-            self._revision_consent = True
-
-    def begin_consent_click(self, expected_request_count: int) -> None:
-        """Record the click-dispatch linearization point before UIA Invoke."""
-        operation = {
-            0: "read_only_review",
-            1: "revision",
-        }.get(expected_request_count)
-        if operation is None:
-            raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
-        with self._lock:
-            self._begin_consent_click_locked(operation, expected_request_count)
-
-    def _begin_consent_click_locked(self, operation: str, expected_request_count: int) -> None:
-        if self._invalid_request or len(self.requests) != expected_request_count:
-            raise HarnessFailure("CONSENT_REQUEST_SEQUENCE_INVALID")
-        if not (
-            self._review_consent if operation == "read_only_review" else self._revision_consent
-        ):
-            raise HarnessFailure("CONSENT_GATE_NOT_OPEN")
-        if self._consent_click_sequence[operation] is not None:
-            raise HarnessFailure("CONSENT_CLICK_ALREADY_RECORDED")
-        self._event_sequence += 1
-        self._consent_click_sequence[operation] = self._event_sequence
-
-    def dispatch_consent_click(self, expected_request_count: int, click: Any) -> None:
-        """Linearize UIA click dispatch and provider request arrival."""
-        operation = {
-            0: "read_only_review",
-            1: "revision",
-        }.get(expected_request_count)
-        if operation is None:
-            raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
-        with self._lock:
-            self._begin_consent_click_locked(operation, expected_request_count)
-            click()
-
-    def request_count_snapshot(self) -> int:
-        """Return only the accepted request count, without exposing request data."""
-        with self._lock:
-            return len(self.requests)
-
-    def _next_event_sequence(self) -> int:
-        with self._lock:
-            self._event_sequence += 1
-            return self._event_sequence
-
-    def request_snapshot(self) -> dict[str, int | bool]:
-        """Return the safe count/invalid-attempt state used before consent clicks."""
-        with self._lock:
-            return {
-                "request_count": len(self.requests),
-                "invalid_request": self._invalid_request,
-            }
-
-    def _reject(self, handler: http.server.BaseHTTPRequestHandler, code: str, status: int) -> None:
-        with self._lock:
-            self._invalid_request = True
-            self._failure_code = code
-        try:
-            handler.send_response(status)
-            handler.send_header("Content-Length", "0")
-            handler.send_header("Connection", "close")
-            handler.end_headers()
-        except (BrokenPipeError, ConnectionResetError):
-            return
-
-    def _validate_request(
-        self,
-        path: str,
-        parsed: Any,
-        body_length: int | None = None,
-        request_arrival_sequence: int | None = None,
-    ) -> tuple[dict[str, Any], str] | tuple[None, str]:
-        if request_arrival_sequence is None:
-            request_arrival_sequence = self._next_event_sequence()
-        if path != "/v1/responses":
-            return None, "LOOPBACK_PATH_MISMATCH"
-        if not isinstance(parsed, dict):
-            return None, "LOOPBACK_REQUEST_NOT_OBJECT"
-        operations = self._operations(parsed)
-        if len(operations) != 1:
-            return None, "LOOPBACK_OPERATION_MISSING_OR_DUPLICATE"
-        operation = operations[0]
-        if operation not in {"read_only_review", "revision"}:
-            return None, "LOOPBACK_OPERATION_UNEXPECTED"
-        stream = parsed.get("stream")
-        expected_stream = operation == "revision"
-        if stream is not expected_stream:
-            return None, "LOOPBACK_STREAM_MODE_MISMATCH"
-
-        canonical_hashes = self._nested_values(parsed, "canonical_source_sha256")
-        canonical_sizes = self._nested_values(parsed, "canonical_source_bytes")
-        source_hashes = self._nested_values(parsed, "source_sha256")
-        snapshots = self._nested_values(parsed, "source_snapshot")
-        source_present = self._contains_exact_string(parsed, self.source)
-        expected_size = len(self.source.encode("utf-8"))
-        if operation == "read_only_review":
-            source_hash_match = canonical_hashes == [self._source_sha256]
-            source_snapshot_match = canonical_sizes == [expected_size] and source_present
-            answer_sentinel_present = False
-        else:
-            source_hash_match = source_hashes == [self._source_sha256]
-            source_snapshot_match = snapshots == [self._source_snapshot] and source_present
-            answer_sentinel_present = self._contains_text(parsed, ANSWER_SENTINEL)
-        with self._lock:
-            review_count = sum(record["review"] for record in self.requests)
-            revision_count = sum(record["revision"] for record in self.requests)
-            consent = self._review_consent if operation == "read_only_review" else self._revision_consent
-            consent_click_sequence = self._consent_click_sequence[operation]
-            if not consent:
-                return None, "LOOPBACK_REQUEST_BEFORE_CONSENT"
-            if (
-                consent_click_sequence is None
-                or request_arrival_sequence <= consent_click_sequence
-            ):
-                return None, "LOOPBACK_REQUEST_BEFORE_CONSENT_CLICK"
-            if operation == "read_only_review" and (review_count != 0 or revision_count != 0):
-                return None, "LOOPBACK_REVIEW_ORDER_INVALID"
-            if operation == "revision" and (review_count != 1 or revision_count != 0):
-                return None, "LOOPBACK_REVISION_ORDER_INVALID"
-            if not source_hash_match:
-                return None, "LOOPBACK_SOURCE_SHA256_MISMATCH"
-            if not source_snapshot_match:
-                return None, "LOOPBACK_SOURCE_SNAPSHOT_MISMATCH"
-            if operation == "revision" and not answer_sentinel_present:
-                return None, "LOOPBACK_ANSWER_SENTINEL_MISSING"
-            record = {
-                "request_index": len(self.requests) + 1,
-                "byte_count": (
-                    body_length
-                    if body_length is not None
-                    else len(
-                        json.dumps(parsed, separators=(",", ":"), ensure_ascii=False).encode(
-                            "utf-8"
-                        )
-                    )
-                ),
-                "path_exact": True,
-                "stream": stream,
-                "review": operation == "read_only_review",
-                "revision": operation == "revision",
-                "consent_gate_open": True,
-                "source_sha256_match": source_hash_match,
-                "source_snapshot_match": source_snapshot_match,
-                "answer_sentinel_present": answer_sentinel_present,
-                "request_arrival_sequence": request_arrival_sequence,
-                "consent_click_sequence": consent_click_sequence,
-                "request_after_consent_click": request_arrival_sequence > consent_click_sequence,
-            }
-            return record, operation
-
-    def contract_evidence(self) -> dict[str, Any]:
-        with self._lock:
-            records = tuple(self.requests)
-            review_records = tuple(record for record in records if record["review"])
-            revision_records = tuple(record for record in records if record["revision"])
-            if self._invalid_request:
-                raise HarnessFailure(self._failure_code or "LOOPBACK_REQUEST_INVALID")
-            if len(records) != 2 or len(review_records) != 1 or len(revision_records) != 1:
-                raise HarnessFailure("LOOPBACK_REQUEST_SEQUENCE_INCOMPLETE")
-            if records[0]["review"] is not True or records[1]["revision"] is not True:
-                raise HarnessFailure("LOOPBACK_REQUEST_SEQUENCE_INVALID")
-            if not all(
-                record["request_after_consent_click"]
-                and record["request_arrival_sequence"] > record["consent_click_sequence"]
-                for record in records
-            ):
-                raise HarnessFailure("LOOPBACK_REQUEST_BEFORE_CONSENT_CLICK")
-            return {
-                "provider_request_count": len(records),
-                "provider_review_count": len(review_records),
-                "provider_revision_count": len(revision_records),
-                "provider_paths_exact": all(record["path_exact"] for record in records),
-                "provider_no_request_before_consent_click": all(
-                    record["request_after_consent_click"] for record in records
-                ),
-                "provider_review_before_revision": records[0]["review"]
-                and records[1]["revision"],
-                "provider_review_source_sha256_match": review_records[0][
-                    "source_sha256_match"
-                ],
-                "provider_revision_source_sha256_match": revision_records[0][
-                    "source_sha256_match"
-                ],
-                "provider_revision_snapshot_match": revision_records[0][
-                    "source_snapshot_match"
-                ],
-                "provider_revision_answer_sentinel_present": revision_records[0][
-                    "answer_sentinel_present"
-                ],
-            }
-
-    def start(self) -> "LoopbackRevisionServer":
-        owner = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, _format: str, *_args: Any) -> None:
-                return
-
-            def do_POST(self) -> None:  # noqa: N802
-                request_arrival_sequence = owner._next_event_sequence()
-                try:
-                    if self.path != "/v1/responses":
-                        owner._reject(self, "LOOPBACK_PATH_MISMATCH", 404)
-                        return
-                    try:
-                        length = int(self.headers.get("Content-Length", "0"))
-                    except (TypeError, ValueError):
-                        owner._reject(self, "LOOPBACK_CONTENT_LENGTH_INVALID", 400)
-                        return
-                    if length < 0 or length > 8 * 1024 * 1024:
-                        owner._reject(self, "LOOPBACK_REQUEST_TOO_LARGE", 413)
-                        return
-                    body = self.rfile.read(length)
-                    try:
-                        parsed = json.loads(body.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-                        owner._reject(self, "LOOPBACK_REQUEST_JSON_INVALID", 400)
-                        return
-                    try:
-                        record, operation = owner._validate_request(
-                            self.path,
-                            parsed,
-                            len(body),
-                            request_arrival_sequence,
-                        )
-                    except (RecursionError, ValueError):
-                        owner._reject(self, "LOOPBACK_REQUEST_INVALID", 400)
-                        return
-                    if record is None:
-                        owner._reject(self, operation, 409)
-                        return
-                    with owner._lock:
-                        owner.requests.append(record)
-                    response = (
-                        revision_response(owner.source)
-                        if operation == "revision"
-                        else review_response()
-                    )
-                    streaming = operation == "revision"
-                    if streaming:
-                        response_body = owner._sse(response)
-                        content_type = "text/event-stream"
-                    else:
-                        response_body = json.dumps(
-                            {
-                                "id": "resp-goal07-review",
-                                "object": "response",
-                                "status": "completed",
-                                "model": "goal07-loopback-model",
-                                "output": [
-                                    {
-                                        "type": "message",
-                                        "id": "msg-goal07-review",
-                                        "role": "assistant",
-                                        "content": [
-                                            {
-                                                "type": "output_text",
-                                                "text": response,
-                                                "annotations": [],
-                                            }
-                                        ],
-                                    }
-                                ],
-                            },
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                        content_type = "application/json"
-                    self.send_response(200)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Content-Length", str(len(response_body)))
-                    self.send_header("X-MarkTurbo-Goal07-Response-Sentinel", RAW_RESPONSE_SENTINEL)
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(response_body)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    return
-
-        self._server = _LoopbackHttpServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-        return self
-
-    @property
-    def base_url(self) -> str:
-        if self._server is None:
-            raise RuntimeError("loopback server is not started")
-        host, port = self._server.server_address
-        return f"http://{host}:{port}/v1/"
-
-    @staticmethod
-    def _sse(response: str) -> bytes:
-        raw = response.encode("utf-8")
-        split = len(raw) // 2
-        chunks = (
-            raw[:split].decode("utf-8", "ignore"),
-            raw[split:].decode("utf-8", "ignore"),
-        )
-        # An SSE comment is ignored by the parser but gives the privacy scan a
-        # raw-response sentinel to catch if transport diagnostics are leaked.
-        events = [f": {RAW_RESPONSE_SENTINEL}\n\n"]
-        for chunk in chunks:
-            events.append(
-                "event: response.output_text.delta\n"
-                + "data: "
-                + json.dumps(
-                    {
-                        "type": "response.output_text.delta",
-                        "delta": chunk,
-                        "output_index": 0,
-                        "content_index": 0,
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n\n"
-            )
-        events.append(
-            "event: response.completed\n"
-            + "data: "
-            + json.dumps(
-                {
-                    "type": "response.completed",
-                    "response": {
-                        "id": "resp-goal07",
-                        "object": "response",
-                        "status": "completed",
-                        "model": "goal07-loopback-model",
-                        "output": [],
-                    },
-                },
-                separators=(",", ":"),
-            )
-            + "\n\n"
-        )
-        return "".join(events).encode("utf-8")
-
-    def close(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-    def __enter__(self) -> "LoopbackRevisionServer":
-        return self.start()
-
-    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
-        self.close()
 
 
 def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
@@ -1078,7 +476,6 @@ def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
 
 
 def new_evidence(expected_hash: str) -> dict[str, Any]:
-    global _ACTIVE_EVIDENCE
     evidence = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -1117,15 +514,37 @@ def new_evidence(expected_hash: str) -> dict[str, Any]:
         ],
         "summary": {},
     }
-    _ACTIVE_EVIDENCE = evidence
     return evidence
 
 
+def finalize_evidence(evidence: dict[str, Any]) -> None:
+    request_count = 0
+    for case in evidence.get("cases", ()):
+        if not isinstance(case, dict):
+            continue
+        observations = case.get("observations")
+        if not isinstance(observations, dict) or "provider_request_count" not in observations:
+            continue
+        observed = observations["provider_request_count"]
+        if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            raise ValueError("invalid provider request count")
+        request_count += observed
+    transport = evidence.get("transport")
+    if not isinstance(transport, dict):
+        raise ValueError("invalid loopback transport evidence")
+    transport["request_count"] = request_count
+
+
 def complete_evidence(evidence: dict[str, Any], status: str) -> None:
+    finalize_evidence(evidence)
     complete_evidence_envelope(evidence, status, REQUIRED_CASE_IDS)
 
 
-PRIVATE_SENTINELS = (DOCUMENT_SENTINEL, ANSWER_SENTINEL, RAW_RESPONSE_SENTINEL)
+PRIVATE_SENTINELS = (
+    DOCUMENT_SENTINEL,
+    provider_fixtures.ANSWER_SENTINEL,
+    provider_fixtures.RAW_RESPONSE_SENTINEL,
+)
 PRIVATE_KEYS = frozenset({"request_body", "credential", "api_key", "api-key"})
 
 FINGERPRINT_KEYS = frozenset({"byte_count", "sha256"})
@@ -1536,14 +955,17 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
     reject_private_content(evidence)
     cases_for_transport = evidence.get("cases")
     if isinstance(cases_for_transport, list):
-        observed_request_count = sum(
-            int(case.get("observations", {}).get("provider_request_count", 0))
-            for case in cases_for_transport
-            if isinstance(case, dict)
-            and isinstance(case.get("observations"), dict)
-            and isinstance(case["observations"].get("provider_request_count"), int)
-            and not isinstance(case["observations"].get("provider_request_count"), bool)
-        )
+        observed_request_count = 0
+        for case in cases_for_transport:
+            if not isinstance(case, dict):
+                continue
+            observations = case.get("observations")
+            if not isinstance(observations, dict) or "provider_request_count" not in observations:
+                continue
+            count = observations["provider_request_count"]
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise ValueError("invalid provider request count")
+            observed_request_count += count
         if transport["request_count"] != observed_request_count:
             raise ValueError("top-level transport request count is not synchronized")
 
@@ -1644,26 +1066,46 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
         require_exact_keys(evidence.get("environment"), ENVIRONMENT_KEYS, "environment")
 
 
-def production_source(path: Path) -> str:
-    return path.read_text(encoding="utf-8").split("\n#[cfg(test)]", 1)[0]
+def _rust_function_body(source: str | None, signature: str) -> str | None:
+    if source is None:
+        return None
+    views = rust_source_views(source)
+    if views is None:
+        return None
+    code_only, _ = views
+
+    start = code_only.find(signature)
+    if start < 0:
+        return None
+    opening = code_only.find("{", start + len(signature))
+    if opening < 0:
+        return None
+
+    depth = 0
+    for index in range(opening, len(code_only)):
+        if code_only[index] == "{":
+            depth += 1
+        elif code_only[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return code_only[opening + 1 : index]
+    return None
 
 
 def trust_apply_source_contract_ok() -> bool:
-    """Check the production ordering that makes trusted Apply fail closed."""
+    """Check the production trust revocation boundary before source replacement."""
     document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
-    start = document.find("pub fn apply_approved_revision")
-    if start < 0:
+    body = _rust_function_body(document, "pub fn apply_approved_revision(")
+    if body is None:
         return False
-    end = document.find("\n    ///", start + 1)
-    body = document[start:] if end < 0 else document[start:end]
     markers = (
-        "let revoke_trust =",
         "self.trust == Trust::Trusted",
         "matches!(self.document.doc_type(),",
         "DocType::Html | DocType::Mdx",
-        "if revoke_trust {",
+        "current_text != final_text",
         "self.trust = Trust::Restricted;",
-        "self.rebuild_web(cx);",
+        "self.preview",
+        ".trust_changed(",
         "self.replace_text(final_text, window, cx);",
     )
     if any(marker not in body for marker in markers):
@@ -1671,48 +1113,86 @@ def trust_apply_source_contract_ok() -> bool:
     revoke = body.find("let revoke_trust =")
     branch = body.find("if revoke_trust {")
     trust = body.find("self.trust = Trust::Restricted;")
-    rebuild = body.find("self.rebuild_web(cx);", trust)
-    replace = body.find("self.replace_text(final_text, window, cx);", rebuild)
-    return (
+    preview_state = body.find("self.preview", trust)
+    preview = body.find(".trust_changed(", preview_state)
+    preview_trust = body.find("Trust::Restricted", preview)
+    replace = body.find("self.replace_text(final_text, window, cx);", preview_trust)
+    ordered = (
         revoke >= 0
         and branch > revoke
         and trust > branch
-        and rebuild > trust
-        and replace > rebuild
+        and preview_state > trust
+        and preview > trust
+        and preview_trust > preview
+        and replace > preview_trust
+    )
+    if not ordered:
+        return False
+
+    preview_source = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "document" / "preview.rs"
+    )
+    trust_changed = _rust_function_body(preview_source, "pub(super) fn trust_changed(")
+    rebuild_web = _rust_function_body(preview_source, "fn rebuild_web(")
+    return (
+        trust_changed is not None
+        and "self.rebuild_web(document, source_path, trust, cx);" in trust_changed
+        and rebuild_web is not None
+        and "self.web_revision = self.web_revision.wrapping_add(1);" in rebuild_web
+        and "self.web_html = Some(" in rebuild_web
+        and "Trust::Restricted => web::build_html_raw(document, trust)" in rebuild_web
+        and "web::build_html_themed(" in rebuild_web
     )
 
 
 def preview_inert_source_contract_ok() -> bool:
-    """Check that the approved preview is rendered as inert GPUI text."""
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
-    start = workspace.find("self.revision_preview().unwrap_or_default()")
+    """Guard the Revision preview's stable, inert GPUI text surface."""
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
+    if review is None:
+        return False
+    views = rust_source_views(review)
+    if views is None:
+        return False
+    _, comment_free = views
+
+    start = comment_free.find('.id("revision-preview")')
     if start < 0:
         return False
-    end = workspace.find("for coverage in revision.result.question_coverage()", start)
-    body = workspace[start:] if end < 0 else workspace[start:end]
+    end = comment_free.find(".into_any_element()", start)
+    if end < 0:
+        return False
+    body = comment_free[start:end]
     required = (
-        'accessibility_id("markturbo-revision-preview")',
-        'accessibility_id("markturbo-revision-preview-source")',
+        ".role(gpui::Role::Group)",
+        f'.accessibility_id("{REVISION_PREVIEW_ACCESSIBILITY_ID}")',
+        '.id("revision-preview-source")',
         ".role(gpui::Role::Label)",
         ".aria_value(preview.clone())",
+        f'.accessibility_id("{REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}")',
         ".child(preview)",
     )
-    forbidden = ("WebSurface", "WebView", "rebuild_web", "render_html", "set_html")
+    forbidden = ("WebSurface", "WebView", "render_html", "set_html", "web_payload")
     return all(marker in body for marker in required) and not any(
         marker in body for marker in forbidden
     )
 
 
 def stale_accessibility_source_contract_ok() -> bool:
-    """Check that the stale warning is exposed as an inert UIA text node."""
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
-    start = workspace.find('.id("revision-stale")')
+    """Guard the stale warning's stable, inert UIA text node."""
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
+    if review is None:
+        return False
+    start = review.find('.id("revision-stale")')
     if start < 0:
         return False
-    end = workspace.find(".into_any_element()", start)
+    end = review.find(".into_any_element()", start)
     if end < 0:
         return False
-    body = workspace[start:end]
+    body = review[start:end]
     return all(
         marker in body
         for marker in (
@@ -1724,15 +1204,19 @@ def stale_accessibility_source_contract_ok() -> bool:
 
 
 def stale_apply_source_contract_ok() -> bool:
-    """Check that the stale state disables the rendered Apply command."""
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
-    start = workspace.find('Button::new("revision-apply")')
+    """Guard that stale state disables the rendered Revision Apply command."""
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
+    if review is None:
+        return False
+    start = review.find('Button::new("revision-apply")')
     if start < 0:
         return False
-    end = workspace.find(".into_any_element()", start)
+    end = review.find('Button::new("revision-save")', start)
     if end < 0:
         return False
-    body = workspace[start:end]
+    body = review[start:end]
     return all(
         marker in body
         for marker in (
@@ -1745,51 +1229,60 @@ def stale_apply_source_contract_ok() -> bool:
 
 def source_contract_failure() -> str | None:
     workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
     document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
+    if workspace is None or review is None:
+        return "REVISION_UIA_CONTRACT_MISSING"
+    if document is None:
+        return "REVISION_BOUNDARY_CONTRACT_MISSING"
+    review_views = rust_source_views(review)
+    if review_views is None:
+        return "REVISION_UIA_CONTRACT_MISSING"
+    _, review_comment_free = review_views
+    for symbol, value in (
+        ("REVIEW_RUN_ACCESSIBILITY_ID", REVIEW_RUN_ACCESSIBILITY_ID),
+        ("REVIEW_RESULT_ACCESSIBILITY_ID", REVIEW_RESULT_ACCESSIBILITY_ID),
+        ("REVISION_RUN_ACCESSIBILITY_ID", REVISION_RUN_ACCESSIBILITY_ID),
+        ("REVISION_STALE_ACCESSIBILITY_ID", REVISION_STALE_ACCESSIBILITY_ID),
+        ("REVISION_ACCEPT_ALL_ACCESSIBILITY_ID", REVISION_ACCEPT_ALL_ACCESSIBILITY_ID),
+        ("REVISION_REJECT_ALL_ACCESSIBILITY_ID", REVISION_REJECT_ALL_ACCESSIBILITY_ID),
+        ("REVISION_APPLY_ACCESSIBILITY_ID", REVISION_APPLY_ACCESSIBILITY_ID),
+        ("REVISION_COPY_ACCESSIBILITY_ID", REVISION_COPY_ACCESSIBILITY_ID),
+        (
+            "REVISION_RESULT_DISMISS_ACCESSIBILITY_ID",
+            REVISION_RESULT_DISMISS_ACCESSIBILITY_ID,
+        ),
+        (
+            "REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID",
+            REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID,
+        ),
+    ):
+        if f'const {symbol}: &str = "{value}";' not in workspace:
+            return "REVISION_UIA_CONTRACT_MISSING"
+        if f"accessibility_id({symbol})" not in review_comment_free:
+            return "REVISION_SOURCE_CONTRACT_MISSING"
+
     for value in (
-        REVIEW_RUN_ACCESSIBILITY_ID,
-        REVIEW_RESULT_ACCESSIBILITY_ID,
-        REVISION_REQUEST_ACCESSIBILITY_ID,
+        REVISION_RESULT_ACCESSIBILITY_ID,
         REVISION_PREVIEW_ACCESSIBILITY_ID,
         REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
-        REVISION_STALE_ACCESSIBILITY_ID,
-        REVISION_ACCEPT_ALL_ACCESSIBILITY_ID,
-        REVISION_REJECT_ALL_ACCESSIBILITY_ID,
-        REVISION_APPLY_ACCESSIBILITY_ID,
-        REVISION_COPY_ACCESSIBILITY_ID,
+        REVISION_QUESTION_PREFIX,
         REVISION_CHANGE_PREFIX,
     ):
-        if value not in workspace:
+        if value not in review_comment_free:
             return "REVISION_UIA_CONTRACT_MISSING"
-    for contract in (
-        "accessibility_id(REVISION_RUN_ACCESSIBILITY_ID)",
-        'accessibility_id("markturbo-revision-preview")',
-        'accessibility_id("markturbo-revision-preview-source")',
-        "accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_REJECT_ALL_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)",
-        "accessibility_id(REVISION_COPY_ACCESSIBILITY_ID)",
-        "revision_question_binding_id(index, question)",
-        '"{question_id}-answered"',
-        '"{question_id}-input"',
-        '"markturbo-revision-change-{}"',
-        "apply_approved_revision",
-        "Revision",
+
+    if (
+        "DocumentEvent::Conflict" not in workspace
+        or 'Button::new("trust")' not in document
+        or "accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID)" not in document
+        or TRUST_AUTOMATION_ID not in document
+        or "accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID)" not in document
+        or CONFLICT_OVERWRITE_ACCESSIBILITY_ID not in document
     ):
-        if contract not in workspace:
-            return "REVISION_SOURCE_CONTRACT_MISSING"
-    for contract in (
-        "DocumentEvent::Conflict",
-        'Button::new("trust")',
-        "accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID)",
-        '"markturbo-document-trust"',
-        "Trust::Trusted",
-        "CONFLICT_OVERWRITE_ACCESSIBILITY_ID",
-        '"markturbo-conflict-overwrite"',
-    ):
-        if contract not in document and contract not in workspace:
-            return "REVISION_BOUNDARY_CONTRACT_MISSING"
+        return "REVISION_BOUNDARY_CONTRACT_MISSING"
     if not trust_apply_source_contract_ok():
         return "REVISION_TRUST_SOURCE_CONTRACT_MISSING"
     if not preview_inert_source_contract_ok():
@@ -1798,19 +1291,6 @@ def source_contract_failure() -> str | None:
         return "REVISION_STALE_ACCESSIBILITY_CONTRACT_MISSING"
     if not stale_apply_source_contract_ok():
         return "REVISION_STALE_APPLY_CONTRACT_MISSING"
-    return None
-
-
-def artifact_contains(path: Path, patterns: tuple[bytes, ...]) -> bytes | None:
-    overlap = max(len(pattern) for pattern in patterns) - 1
-    tail = b""
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            value = tail + chunk
-            for pattern in patterns:
-                if pattern in value:
-                    return pattern
-            tail = value[-overlap:] if overlap else b""
     return None
 
 
@@ -1837,10 +1317,10 @@ def scan_case_artifacts(case_root: Path, ephemeral_credential: str) -> dict[str,
         DOCUMENT_SENTINEL.encode("utf-16-le"),
         ephemeral_credential.encode("utf-8"),
         ephemeral_credential.encode("utf-16-le"),
-        ANSWER_SENTINEL.encode("utf-8"),
-        ANSWER_SENTINEL.encode("utf-16-le"),
-        RAW_RESPONSE_SENTINEL.encode("utf-8"),
-        RAW_RESPONSE_SENTINEL.encode("utf-16-le"),
+        provider_fixtures.ANSWER_SENTINEL.encode("utf-8"),
+        provider_fixtures.ANSWER_SENTINEL.encode("utf-16-le"),
+        provider_fixtures.RAW_RESPONSE_SENTINEL.encode("utf-8"),
+        provider_fixtures.RAW_RESPONSE_SENTINEL.encode("utf-16-le"),
     )
     for path in paths:
         try:
@@ -2095,7 +1575,7 @@ class Goal07Harness(ClipboardNativeHarness):
         anchors = [(REVIEW_RESULT_ACCESSIBILITY_ID, "Text")]
         anchors.extend(
             (revision_answer_accessibility_id(index, "input"), "Edit")
-            for index in range(len(QUESTION_IDS))
+            for index in range(len(provider_fixtures.QUESTION_IDS))
         )
         anchors.append((REVISION_PREVIEW_ACCESSIBILITY_ID, "Group"))
         for _ in range(8):
@@ -2158,7 +1638,7 @@ class Goal07Harness(ClipboardNativeHarness):
                 (REVISION_RESULT_ACCESSIBILITY_ID, "Group"),
                 *(
                     (revision_answer_accessibility_id(index, "input"), "Edit")
-                    for index in range(len(QUESTION_IDS))
+                    for index in range(len(provider_fixtures.QUESTION_IDS))
                 ),
             ):
                 anchor = self.control_by_id(
@@ -2226,7 +1706,7 @@ class Goal07Harness(ClipboardNativeHarness):
 
     def _open_consent_gate(
         self,
-        provider: LoopbackRevisionServer,
+        provider: provider_fixtures.LoopbackRevisionServer,
         expected_request_count: int,
         open_gate: Any,
     ) -> None:
@@ -2245,7 +1725,7 @@ class Goal07Harness(ClipboardNativeHarness):
         app: Any,
         failure_code: str,
         *,
-        provider: LoopbackRevisionServer | None = None,
+        provider: provider_fixtures.LoopbackRevisionServer,
         expected_request_count: int | None = None,
         open_gate: Any = None,
     ) -> None:
@@ -2264,27 +1744,22 @@ class Goal07Harness(ClipboardNativeHarness):
             )
 
         button = wait_until(locate, self.ui_timeout, "REVISION_CONSENT_UIA_TIMEOUT", interval=0.025)
-        if provider is not None:
-            if expected_request_count is None or open_gate is None:
-                raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
-            self._open_consent_gate(provider, expected_request_count, open_gate)
-            click = lambda: self.click_control(button, failure_code)
-            if isinstance(provider, LoopbackRevisionServer):
-                provider.dispatch_consent_click(expected_request_count, click)
-                return
-            begin_click = getattr(provider, "begin_consent_click", None)
-            if begin_click is None:
-                raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
-            begin_click(expected_request_count)
-            click()
-            return
-        self.click_control(button, failure_code)
+        if expected_request_count is None or open_gate is None:
+            raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
+        self._open_consent_gate(provider, expected_request_count, open_gate)
+        click = lambda: self.click_control(button, failure_code)
+        provider.dispatch_consent_click(expected_request_count, click)
 
     def run_review(
-        self, app: Any, provider: LoopbackRevisionServer | None = None
+        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer,
+        *, preserve_focus: bool = False,
     ) -> None:
-        self.focus_editor(app)
-        self._require_foreground(app)
+        if preserve_focus:
+            if self.win32.foreground_focus(app.hwnd) != app.hwnd:
+                raise HarnessFailure("WEB_TO_SOURCE_NATIVE_FOCUS_LOST")
+        else:
+            self.focus_editor(app)
+            self._require_foreground(app)
         self.win32.send_inputs(
             [
                 key_input(VK_CONTROL, False),
@@ -2301,7 +1776,7 @@ class Goal07Harness(ClipboardNativeHarness):
             "REVIEW_CONSENT_CLICK_FAILED",
             provider=provider,
             expected_request_count=0,
-            open_gate=provider.grant_review_consent if provider is not None else None,
+            open_gate=provider.grant_review_consent,
         )
         self.find_control(
             app,
@@ -2315,19 +1790,17 @@ class Goal07Harness(ClipboardNativeHarness):
         self,
         app: Any,
         *,
-        answer: bool = True,
-        provider: LoopbackRevisionServer | None = None,
+        provider: provider_fixtures.LoopbackRevisionServer,
     ) -> None:
-        if answer:
-            self._set_answer(app, 0, ANSWER_TEXT)
-            self._mark_intentionally_unspecified(app, 1)
+        self._set_answer(app, 0, provider_fixtures.ANSWER_TEXT)
+        self._mark_intentionally_unspecified(app, 1)
         self._click_id(app, REVISION_RUN_ACCESSIBILITY_ID)
         self._approve_consent(
             app,
             "REVISION_CONSENT_CLICK_FAILED",
             provider=provider,
             expected_request_count=1,
-            open_gate=provider.grant_revision_consent if provider is not None else None,
+            open_gate=provider.grant_revision_consent,
         )
         self.find_control(
             app,
@@ -2374,7 +1847,9 @@ class Goal07Harness(ClipboardNativeHarness):
 
         return bool(wait_until(locate, self.ui_timeout, "SAVE_CONFLICT_UIA_TIMEOUT", interval=0.05))
 
-    def _common_observations(self, provider: LoopbackRevisionServer) -> dict[str, Any]:
+    def _common_observations(
+        self, provider: provider_fixtures.LoopbackRevisionServer
+    ) -> dict[str, Any]:
         contract = provider.contract_evidence()
         return {
             "loopback_provider": True,
@@ -2385,7 +1860,7 @@ class Goal07Harness(ClipboardNativeHarness):
 
     def _finalize_observations(
         self,
-        provider: LoopbackRevisionServer,
+        provider: provider_fixtures.LoopbackRevisionServer,
         case_root: Path,
         app: Any,
         observations: dict[str, Any],
@@ -2397,7 +1872,7 @@ class Goal07Harness(ClipboardNativeHarness):
         return observations
 
     def scenario_reject_all(self) -> dict[str, Any]:
-        provider = LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
+        provider = provider_fixtures.LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
         app = None
         try:
             case_root, data, config, workspace, stderr, source = self.profile(
@@ -2435,12 +1910,14 @@ class Goal07Harness(ClipboardNativeHarness):
             }
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
-            if app is not None:
-                self.reap(app)
-            provider.close()
+            try:
+                if app is not None and app.process.poll() is None:
+                    self.reap(app)
+            finally:
+                provider.close()
 
     def scenario_selective_undo(self) -> dict[str, Any]:
-        provider = LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
+        provider = provider_fixtures.LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
         app = None
         try:
             case_root, data, config, workspace, stderr, source = self.profile(
@@ -2453,7 +1930,10 @@ class Goal07Harness(ClipboardNativeHarness):
             self.run_review(app, provider)
             self.request_revision(app, provider=provider)
             expected_preview = fingerprint_bytes(
-                apply_edits(EDITOR_SOURCE_BYTES, fixture_edits(EDITOR_SOURCE_TEXT)[:1])
+                apply_edits(
+                    EDITOR_SOURCE_BYTES,
+                    provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT)[:1],
+                )
             )
             self._click_id(app, revision_change_accessibility_id(0, "accept"))
             self._click_id(app, revision_change_accessibility_id(1, "reject"))
@@ -2480,12 +1960,14 @@ class Goal07Harness(ClipboardNativeHarness):
             }
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
-            if app is not None:
-                self.reap(app)
-            provider.close()
+            try:
+                if app is not None and app.process.poll() is None:
+                    self.reap(app)
+            finally:
+                provider.close()
 
     def scenario_accept_all_preview(self) -> dict[str, Any]:
-        provider = LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
+        provider = provider_fixtures.LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
         app = None
         try:
             case_root, data, config, workspace, stderr, source = self.profile(
@@ -2500,7 +1982,10 @@ class Goal07Harness(ClipboardNativeHarness):
             preview_text = self._preview_source_text(app)
             final_preview = fingerprint_text(preview_text)
             expected = fingerprint_bytes(
-                apply_edits(EDITOR_SOURCE_BYTES, fixture_edits(EDITOR_SOURCE_TEXT))
+                apply_edits(
+                    EDITOR_SOURCE_BYTES,
+                    provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT),
+                )
             )
             editor_after_preview = self.editor_fingerprint(app)
             copy_editor_before = editor_after_preview
@@ -2546,12 +2031,14 @@ class Goal07Harness(ClipboardNativeHarness):
             }
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
-            if app is not None:
-                self.reap(app)
-            provider.close()
+            try:
+                if app is not None and app.process.poll() is None:
+                    self.reap(app)
+            finally:
+                provider.close()
 
     def scenario_stale(self) -> dict[str, Any]:
-        provider = LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
+        provider = provider_fixtures.LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
         app = None
         try:
             case_root, data, config, workspace, stderr, source = self.profile(
@@ -2592,12 +2079,14 @@ class Goal07Harness(ClipboardNativeHarness):
             }
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
-            if app is not None:
-                self.reap(app)
-            provider.close()
+            try:
+                if app is not None and app.process.poll() is None:
+                    self.reap(app)
+            finally:
+                provider.close()
 
     def scenario_save_conflict(self) -> dict[str, Any]:
-        provider = LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
+        provider = provider_fixtures.LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
         app = None
         try:
             case_root, data, config, workspace, stderr, source = self.profile(
@@ -2631,19 +2120,20 @@ class Goal07Harness(ClipboardNativeHarness):
             }
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
-            if app is not None:
-                self.reap(app)
-            provider.close()
+            try:
+                if app is not None and app.process.poll() is None:
+                    self.reap(app)
+            finally:
+                provider.close()
 
     def scenario_trust_revoke(self) -> dict[str, Any]:
-        provider = LoopbackRevisionServer(HTML_EDITOR_SOURCE_TEXT).start()
+        provider = provider_fixtures.LoopbackRevisionServer(HTML_EDITOR_SOURCE_TEXT).start()
         app = None
         try:
             case_root, data, config, workspace, stderr, source = self.profile(
                 CASE_TRUST_REVOKE, provider.base_url, html=True
             )
             app = self.launch_app(source, data, config, workspace, stderr)
-            self.activate_source_layout(app)
             trust = self.find_control(
                 app,
                 TRUST_AUTOMATION_ID,
@@ -2664,13 +2154,18 @@ class Goal07Harness(ClipboardNativeHarness):
                 interval=0.05,
             )
             trust_before = self._is_trusted_label(str(trusted_label))
-            self.activate_source_layout(app)
-            self.run_review(app, provider)
+            # HTML opens in Web. Observe a visible, natively focused WebHost
+            # handing input to the main HWND before any helper can refocus it.
+            self.activate_source_from_focused_web(app)
+            self.run_review(app, provider, preserve_focus=True)
             self.request_revision(app, provider=provider)
             self._click_id(app, REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)
             editor_before_apply = self.editor_fingerprint(app)
             expected = fingerprint_bytes(
-                apply_edits(HTML_EDITOR_SOURCE_BYTES, fixture_edits(HTML_EDITOR_SOURCE_TEXT))
+                apply_edits(
+                    HTML_EDITOR_SOURCE_BYTES,
+                    provider_fixtures.fixture_edits(HTML_EDITOR_SOURCE_TEXT),
+                )
             )
             preview_text = self._preview_source_text(app)
             preview = fingerprint_text(preview_text)
@@ -2708,11 +2203,18 @@ class Goal07Harness(ClipboardNativeHarness):
                     "<script>" in preview_text and 'goal07 = "new"' in preview_text
                 ),
             }
+            self._click_id(app, REVISION_RESULT_DISMISS_ACCESSIBILITY_ID)
+            self._click_id(app, REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID)
+            self.win32.post_close(app.hwnd)
+            self.click_lifecycle_decision(app, "Discard")
+            self.wait_process_exit(app)
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
-            if app is not None:
-                self.reap(app)
-            provider.close()
+            try:
+                if app is not None and app.process.poll() is None:
+                    self.reap(app)
+            finally:
+                provider.close()
 
     def scenario(self, case_id: str) -> dict[str, Any]:
         observations = {
@@ -2727,17 +2229,7 @@ class Goal07Harness(ClipboardNativeHarness):
             validate_passed_case(case_id, observations, self.parent_context.evidence())
         except (KeyError, TypeError, ValueError) as error:
             raise HarnessFailure("CASE_CONTRACT_FAILED", safe_exception_name(error)) from None
-        if _ACTIVE_EVIDENCE is not None:
-            _ACTIVE_EVIDENCE["transport"]["request_count"] = sum(
-                int(case.get("observations", {}).get("provider_request_count", 0))
-                for case in _ACTIVE_EVIDENCE.get("cases", ())
-                if isinstance(case, dict)
-            ) + int(observations["provider_request_count"])
         return observations
-
-
-def goal07_preflight(exe: Path, expected_hash: str, evidence: dict[str, Any]) -> tuple[Any, Any]:
-    return preflight(exe, expected_hash, evidence)
 
 
 def native_run_plan() -> NativeRunPlan:
@@ -2747,7 +2239,8 @@ def native_run_plan() -> NativeRunPlan:
         new_evidence=new_evidence,
         validate_evidence=validate_evidence,
         source_contract=source_contract_failure,
-        preflight=goal07_preflight,
+        finalize_evidence=finalize_evidence,
+        preflight=preflight,
         ui_types_loader=load_pywinauto,
         harness_factory=Goal07Harness,
         scenarios=lambda harness: tuple(
@@ -2755,10 +2248,6 @@ def native_run_plan() -> NativeRunPlan:
             for case_id in REQUIRED_CASE_IDS
         ),
     )
-
-
-def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
-    return run_native_acceptance(args, native_run_plan())
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

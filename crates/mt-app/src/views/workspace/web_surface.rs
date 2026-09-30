@@ -28,6 +28,18 @@ struct DocumentLease {
     tab: usize,
 }
 
+#[cfg(target_os = "windows")]
+/// One confirmed-hide request per worker and Source document lease.
+/// Retain its host after acknowledgement until native focus transfer succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceHideRequest {
+    worker_id: usize,
+    lease: DocumentLease,
+    generation: u64,
+    hidden_host: Option<NonZeroIsize>,
+    focus_restored: bool,
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WebPayloadKey {
@@ -76,6 +88,10 @@ pub(super) struct WebSurface {
     webview: Option<WindowsWebView>,
     #[cfg(target_os = "windows")]
     starting: bool,
+    #[cfg(target_os = "windows")]
+    hide_ack_generation: u64,
+    #[cfg(target_os = "windows")]
+    source_hide_request: Option<SourceHideRequest>,
     #[cfg(target_os = "macos")]
     webview: Option<Entity<gpui_wry::WebView>>,
     #[cfg(target_os = "macos")]
@@ -196,6 +212,58 @@ impl WebSurface {
         was_visible
     }
 
+    #[cfg(target_os = "windows")]
+    fn next_hide_ack_generation(&mut self) -> u64 {
+        self.hide_ack_generation = self.hide_ack_generation.wrapping_add(1);
+        self.hide_ack_generation
+    }
+
+    #[cfg(target_os = "windows")]
+    fn accept_hide_acknowledgement(
+        &mut self,
+        worker_id: usize,
+        lease: DocumentLease,
+        generation: u64,
+        host: NonZeroIsize,
+    ) -> bool {
+        let Some(request) = &mut self.source_hide_request else {
+            return false;
+        };
+        if request.worker_id != worker_id
+            || request.lease != lease
+            || request.generation != generation
+            || request.hidden_host.is_some_and(|previous| previous != host)
+        {
+            return false;
+        }
+        request.hidden_host = Some(host);
+        true
+    }
+
+    #[cfg(target_os = "windows")]
+    fn retry_source_focus(&mut self, window: &Window, worker_id: usize, lease: DocumentLease) {
+        let Some(mut request) = self.source_hide_request else {
+            return;
+        };
+        if request.worker_id != worker_id
+            || request.lease != lease
+            || request.focus_restored
+            || self.visible
+        {
+            return;
+        }
+        let Some(host) = request.hidden_host else {
+            return;
+        };
+        // Preserve the confirmed host on a transient guard failure so a later
+        // Source sync can retry without enqueueing another Hide.
+        if !focus_native_window_from_hidden_web_host(window, host) {
+            return;
+        }
+        request.focus_restored = true;
+        self.source_hide_request = Some(request);
+    }
+
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn begin_navigation(&mut self, key: WebPayloadKey) -> Navigation {
         debug_assert!(self.loading.is_none(), "navigations are serialized");
@@ -302,6 +370,10 @@ impl WebSurface {
         self.loaded = None;
         self.failed = Some(key);
         self.retrying = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.source_hide_request = None;
+        }
         self.lent_document.take().is_some()
     }
 }
@@ -374,30 +446,106 @@ impl Workspace {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn active_source_lease(&self, cx: &App) -> Option<DocumentLease> {
+        if self.settings_open {
+            return None;
+        }
+        let tab = self.tabs.active_index();
+        let document = self.active_document()?;
+        let document = document.read(cx);
+        if document.layout() != crate::views::Layout::Source {
+            return None;
+        }
+        Some(DocumentLease {
+            document_id: document.id(),
+            tab,
+        })
+    }
+
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn sync_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (key, html) = match self.webview_intent(cx) {
-            WebIntent::Unchanged => return,
+            WebIntent::Unchanged => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.web.source_hide_request = None;
+                }
+                return;
+            }
             WebIntent::Hide => {
                 let was_visible = self.web.begin_hide();
                 #[cfg(target_os = "windows")]
-                if was_visible && !focus_native_window(window) {
+                let source_lease = self.active_source_lease(cx);
+                #[cfg(target_os = "windows")]
+                let worker_id = self.web.webview.as_ref().map(WindowsWebView::identity);
+                #[cfg(target_os = "windows")]
+                let source_request_matches =
+                    match (source_lease, worker_id, self.web.source_hide_request) {
+                        (Some(lease), Some(worker_id), Some(request)) => {
+                            request.worker_id == worker_id && request.lease == lease
+                        }
+                        _ => false,
+                    };
+                #[cfg(target_os = "windows")]
+                if !source_request_matches {
+                    self.web.source_hide_request = None;
+                }
+                #[cfg(target_os = "windows")]
+                if was_visible && source_lease.is_none() && !focus_native_window(window) {
                     log::debug!("failed to restore native focus before hiding Web preview");
                 }
-                if was_visible
-                    && let Some(webview) = &self.web.webview
-                    && !hide_webview(webview, cx)
-                {
-                    window.focus(&self.focus_handle, cx);
-                    let failed_key = self
-                        .web
-                        .loading
-                        .map(|navigation| navigation.key)
-                        .or(self.web.current);
-                    if let Some(key) = failed_key {
-                        self.webview_operation_failed(key, window, cx);
-                        return;
+                #[cfg(target_os = "windows")]
+                let source_hide_request = match (source_lease, worker_id) {
+                    (Some(lease), Some(worker_id)) if !source_request_matches => {
+                        Some(SourceHideRequest {
+                            worker_id,
+                            lease,
+                            generation: self.web.next_hide_ack_generation(),
+                            hidden_host: None,
+                            focus_restored: false,
+                        })
                     }
+                    _ => None,
+                };
+                #[cfg(target_os = "windows")]
+                let hide_generation = source_hide_request.map(|request| request.generation);
+                #[cfg(target_os = "windows")]
+                let should_send_hide =
+                    source_hide_request.is_some() || (source_lease.is_none() && was_visible);
+                #[cfg(target_os = "macos")]
+                let should_send_hide = was_visible;
+                if should_send_hide && let Some(webview) = &self.web.webview {
+                    #[cfg(target_os = "windows")]
+                    let hide_sent = hide_webview(webview, hide_generation, cx);
+                    #[cfg(target_os = "macos")]
+                    let hide_sent = hide_webview(webview, cx);
+                    #[cfg(target_os = "windows")]
+                    if hide_sent && let Some(request) = source_hide_request {
+                        self.web.source_hide_request = Some(request);
+                    }
+                    if !hide_sent {
+                        #[cfg(target_os = "windows")]
+                        if source_hide_request.is_some() {
+                            self.web.source_hide_request = None;
+                        }
+                        if was_visible {
+                            window.focus(&self.focus_handle, cx);
+                            let failed_key = self
+                                .web
+                                .loading
+                                .map(|navigation| navigation.key)
+                                .or(self.web.current);
+                            if let Some(key) = failed_key {
+                                self.webview_operation_failed(key, window, cx);
+                                return;
+                            }
+                        }
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                if let (Some(lease), Some(worker_id)) = (source_lease, worker_id) {
+                    self.web.retry_source_focus(window, worker_id, lease);
                 }
                 if self.web.lent_document.take().is_some() {
                     self.lend_webview(None, None, cx);
@@ -411,7 +559,13 @@ impl Workspace {
                 }
                 return;
             }
-            WebIntent::Show { key, html } => (key, html),
+            WebIntent::Show { key, html } => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.web.source_hide_request = None;
+                }
+                (key, html)
+            }
         };
 
         if self.web.requires_surface_replacement(key) {
@@ -421,6 +575,9 @@ impl Workspace {
                 log::debug!("failed to restore native focus before replacing Web preview");
             }
             if let Some(webview) = &self.web.webview {
+                #[cfg(target_os = "windows")]
+                let _ = hide_webview(webview, None, cx);
+                #[cfg(target_os = "macos")]
                 let _ = hide_webview(webview, cx);
             }
             let previous_lease = self.web.abandon_for_document_change(key);
@@ -529,6 +686,9 @@ impl Workspace {
             log::debug!("failed to restore native focus after Web preview failure");
         }
         if let Some(webview) = &self.web.webview {
+            #[cfg(target_os = "windows")]
+            let _ = hide_webview(webview, None, cx);
+            #[cfg(target_os = "macos")]
             let _ = hide_webview(webview, cx);
         }
         let was_lent = self.web.fail_operation(key);
@@ -555,15 +715,33 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self
+        let worker_identity_matches = self
             .web
             .webview
             .as_ref()
-            .is_some_and(|worker| worker.identity() == worker_id)
-        {
+            .is_some_and(|worker| worker.identity() == worker_id);
+        if !worker_identity_matches {
             return;
         }
         match event {
+            WorkerEvent::Hidden { generation, host } => {
+                let Some(request) = self.web.source_hide_request else {
+                    return;
+                };
+                if !self
+                    .web
+                    .accept_hide_acknowledgement(worker_id, request.lease, generation, host)
+                {
+                    return;
+                }
+                if self.active_source_lease(cx) == Some(request.lease) && !self.web.visible {
+                    // This repairs native focus only. In particular, do not
+                    // refocus the Workspace here: the user may already have
+                    // focused the source editor while the worker was hiding.
+                    self.web
+                        .retry_source_focus(window, worker_id, request.lease);
+                }
+            }
             WorkerEvent::PageLoaded(navigation) => {
                 if let Some(navigation) = self.web.finish_navigation_for(navigation) {
                     self.clear_web_preview_failure(navigation.key, cx);
@@ -788,8 +966,8 @@ enum MacWebViewCreateError {
 }
 
 #[cfg(target_os = "windows")]
-fn hide_webview(webview: &WindowsWebView, _: &mut App) -> bool {
-    webview.send(WorkerCommand::Hide).is_ok()
+fn hide_webview(webview: &WindowsWebView, generation: Option<u64>, _: &mut App) -> bool {
+    webview.send(WorkerCommand::Hide { generation }).is_ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -812,6 +990,69 @@ fn focus_native_window(window: &Window) -> bool {
     unsafe {
         let _ = SetFocus(Some(hwnd));
         GetFocus() == hwnd
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn focus_native_window_from_hidden_web_host(window: &Window, host: NonZeroIsize) -> bool {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, IsChild, IsWindow, IsWindowVisible,
+    };
+
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+        return false;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return false;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut _);
+    let host = HWND(host.get() as *mut _);
+    let mut thread_info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+
+    // `GetFocus` alone only reports this thread's focus. The WebHost belongs
+    // to the worker, so inspect the foreground GUI thread and repair focus
+    // only while this app is still foreground and that hidden subtree owns it.
+    // SAFETY: These User32 calls consume opaque HWND values; the output pointer
+    // refers to initialized GUI-thread info storage with `cbSize` set.
+    unsafe {
+        let foreground_main = GetForegroundWindow() == hwnd;
+        let host_exists = IsWindow(Some(host)).as_bool();
+        let host_hidden = !IsWindowVisible(host).as_bool();
+        let gui_info_ok = GetGUIThreadInfo(0, &mut thread_info).is_ok();
+        let focused = thread_info.hwndFocus;
+        let gui_focus_under_host =
+            gui_info_ok && (focused == host || IsChild(host, focused).as_bool());
+        let focus_guard =
+            foreground_main && host_exists && host_hidden && gui_info_ok && gui_focus_under_host;
+        if !focus_guard {
+            return false;
+        }
+
+        // Native repair leaves GPUI's selected control untouched.
+        let _ = SetFocus(Some(hwnd));
+        let native_focus_main_after = GetFocus() == hwnd;
+        let foreground_main_after = GetForegroundWindow() == hwnd;
+        let host_exists_after = IsWindow(Some(host)).as_bool();
+        let host_hidden_after = !IsWindowVisible(host).as_bool();
+        let mut after_info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let gui_info_after_ok = GetGUIThreadInfo(0, &mut after_info).is_ok();
+        let focused_after = after_info.hwndFocus;
+        let gui_focus_main_after = gui_info_after_ok && focused_after == hwnd;
+        native_focus_main_after
+            && foreground_main_after
+            && host_exists_after
+            && host_hidden_after
+            && gui_info_after_ok
+            && gui_focus_main_after
     }
 }
 
@@ -919,7 +1160,7 @@ fn clamp_bounds_to_client(
 #[cfg(target_os = "windows")]
 enum WorkerCommand {
     Show,
-    Hide,
+    Hide { generation: Option<u64> },
     LoadUrl { url: String, navigation: Navigation },
     Evaluate(String),
     Bounds(PhysicalBounds),
@@ -929,6 +1170,7 @@ enum WorkerCommand {
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerEvent {
+    Hidden { generation: u64, host: NonZeroIsize },
     PageLoaded(Navigation),
     NavigationFailed(Navigation),
 }
@@ -1199,6 +1441,26 @@ impl raw_window_handle::HasWindowHandle for WebHost {
 }
 
 #[cfg(target_os = "windows")]
+fn attest_private_webview_profile(webview: &wry::WebView) -> Result<bool, ()> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_13;
+    use windows::core::{BOOL, Interface as _};
+    use wry::WebViewExtWindows as _;
+
+    let webview = webview
+        .webview()
+        .cast::<ICoreWebView2_13>()
+        .map_err(|_| ())?;
+    // SAFETY: the live WebView retains its controller on this owning STA for
+    // the call, and Profile returns an owned COM interface.
+    let profile = unsafe { webview.Profile() }.map_err(|_| ())?;
+    let mut enabled = BOOL(0);
+    // SAFETY: `enabled` is initialized writable storage valid for this call;
+    // `profile` is the live interface returned by the WebView above.
+    unsafe { profile.IsInPrivateModeEnabled(&mut enabled) }.map_err(|_| ())?;
+    Ok(enabled.as_bool())
+}
+
+#[cfg(target_os = "windows")]
 fn run_windows_webview(
     parent: isize,
     rx: mpsc::Receiver<WorkerCommand>,
@@ -1240,6 +1502,7 @@ fn run_windows_webview(
     let navigation_in_flight = Arc::new(Mutex::new(None::<Navigation>));
     let page_navigation_in_flight = navigation_in_flight.clone();
     let builder = wry::WebViewBuilder::new_with_web_context(&mut web_context)
+        .with_incognito(true)
         .with_on_page_load_handler(move |event, _url| {
             if matches!(event, wry::PageLoadEvent::Finished)
                 && let Some(navigation) = page_navigation_in_flight
@@ -1264,6 +1527,17 @@ fn run_windows_webview(
             return;
         }
     };
+
+    if !matches!(attest_private_webview_profile(&webview), Ok(true)) {
+        drop(webview);
+        // SAFETY: this worker created and owns `host_hwnd`; its WebView has
+        // already been dropped on the same STA thread.
+        let _ = unsafe { DestroyWindow(host_hwnd) };
+        let _ = ready.send(Err(
+            "the WebView2 profile could not be verified as private".to_string()
+        ));
+        return;
+    }
 
     let mut message = MSG::default();
     // `PostThreadMessageW` needs an existing thread queue. Create it before the
@@ -1414,16 +1688,22 @@ fn apply_worker_command(
 ) -> bool {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, HWND_TOP, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SetWindowPos,
-        ShowWindow,
+        GetClientRect, HWND_TOP, IsWindowVisible, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+        SWP_NOOWNERZORDER, SetWindowPos, ShowWindow,
     };
 
     match command {
         WorkerCommand::Show => {
             let _ = unsafe { ShowWindow(host, SW_SHOW) };
         }
-        WorkerCommand::Hide => {
+        WorkerCommand::Hide { generation } => {
             let _ = unsafe { ShowWindow(host, SW_HIDE) };
+            if let Some(generation) = generation
+                && unsafe { !IsWindowVisible(host).as_bool() }
+                && let Some(host) = NonZeroIsize::new(host.0 as isize)
+            {
+                let _ = events.try_send(WorkerEvent::Hidden { generation, host });
+            }
         }
         WorkerCommand::LoadUrl { url, navigation } => {
             if let Ok(mut current) = navigation_in_flight.lock() {
@@ -1481,7 +1761,7 @@ mod tests {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     use super::{Navigation, PendingScroll, WebPayloadKey, WebSurface};
     #[cfg(target_os = "windows")]
-    use super::{PhysicalBounds, clamp_bounds_to_client};
+    use super::{PhysicalBounds, SourceHideRequest, clamp_bounds_to_client};
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     use mt_core::document::lifecycle::DocumentId;
 
@@ -1534,6 +1814,49 @@ mod tests {
 
         assert!(surface.begin_hide());
         assert!(!surface.begin_hide());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stale_source_hide_acknowledgement_is_rejected() {
+        use std::num::NonZeroIsize;
+
+        let old_key = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 1,
+            revision: 1,
+        };
+        let current_key = WebPayloadKey {
+            document_id: DocumentId::next(),
+            tab: 2,
+            revision: 1,
+        };
+        let lease = current_key.lease();
+        let host = NonZeroIsize::new(123).unwrap();
+        let request = SourceHideRequest {
+            worker_id: 9,
+            lease,
+            generation: 2,
+            hidden_host: None,
+            focus_restored: false,
+        };
+        let mut surface = WebSurface {
+            hide_ack_generation: 2,
+            source_hide_request: Some(request),
+            ..Default::default()
+        };
+
+        assert!(!surface.accept_hide_acknowledgement(8, lease, 2, host));
+        assert!(!surface.accept_hide_acknowledgement(9, old_key.lease(), 2, host));
+        assert!(!surface.accept_hide_acknowledgement(9, lease, 1, host));
+        assert_eq!(surface.source_hide_request, Some(request));
+
+        assert!(surface.accept_hide_acknowledgement(9, lease, 2, host));
+        assert_eq!(surface.source_hide_request.unwrap().hidden_host, Some(host));
+        assert!(surface.accept_hide_acknowledgement(9, lease, 2, host));
+        assert!(
+            !surface.accept_hide_acknowledgement(9, lease, 2, NonZeroIsize::new(124).unwrap(),)
+        );
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]

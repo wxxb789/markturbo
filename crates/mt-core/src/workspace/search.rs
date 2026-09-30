@@ -12,8 +12,10 @@
 //! text it is given and [`search_files`] reads.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::DocType;
+use crate::document::lifecycle::DocumentId;
 
 /// What to look for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +51,12 @@ impl Query {
 /// One hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
-    pub path: PathBuf,
+    /// Shared among matches from the same searched document.
+    pub path: Arc<PathBuf>,
+    /// Where navigation should go. A file target uses `path`; an open-document
+    /// target identifies the in-memory document even when its display path is
+    /// also the path of a different file.
+    pub target: SearchTarget,
     /// Byte offset of the match in the document, for [`crate::Document`]-style
     /// navigation.
     pub offset: usize,
@@ -63,6 +70,18 @@ pub struct Match {
     /// Character offset of the match within `line_text`, so the row can
     /// highlight it without searching the line again.
     pub line_offset: usize,
+}
+
+/// The identity to reveal for a search result.
+///
+/// `File` intentionally carries no path: [`Match::path`] is both its displayed
+/// path and its file navigation target. Recovered open documents need a
+/// separate identity because their display path may name a different disk
+/// file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTarget {
+    File,
+    OpenDocument(DocumentId),
 }
 
 /// How many results to collect before stopping.
@@ -130,6 +149,37 @@ impl Results {
 /// "ignore case" does, and the alternative pulls in a full folding table for a
 /// difference nobody searching a Markdown file will notice.
 pub fn search_text(path: &Path, text: &str, query: &Query, limit: usize, out: &mut Results) {
+    search_text_with_target(path, SearchTarget::File, text, query, limit, out);
+}
+
+/// Search an open in-memory document, keeping its navigation identity apart
+/// from the path shown in the result row.
+pub fn search_open_document(
+    id: DocumentId,
+    display_path: &Path,
+    text: &str,
+    query: &Query,
+    limit: usize,
+    out: &mut Results,
+) {
+    search_text_with_target(
+        display_path,
+        SearchTarget::OpenDocument(id),
+        text,
+        query,
+        limit,
+        out,
+    );
+}
+
+fn search_text_with_target(
+    path: &Path,
+    target: SearchTarget,
+    text: &str,
+    query: &Query,
+    limit: usize,
+    out: &mut Results,
+) {
     if !query.is_runnable() || out.matches.len() >= limit {
         return;
     }
@@ -139,6 +189,7 @@ pub fn search_text(path: &Path, text: &str, query: &Query, limit: usize, out: &m
         query.text.to_lowercase()
     };
     let before = out.matches.len();
+    let mut result_path: Option<Arc<PathBuf>> = None;
 
     // One pass over the lines rather than over the whole text: the line number,
     // the column and the row's own text all come from the line we are already
@@ -181,8 +232,11 @@ pub fn search_text(path: &Path, text: &str, query: &Query, limit: usize, out: &m
             } else {
                 (1, 0, 0)
             };
+            let matched_path =
+                Arc::clone(result_path.get_or_insert_with(|| Arc::new(path.to_path_buf())));
             out.matches.push(Match {
-                path: path.to_path_buf(),
+                path: matched_path,
+                target,
                 offset: offset + byte_at,
                 line: line_number,
                 column,
@@ -377,7 +431,31 @@ mod tests {
         assert_eq!(m.line, 2);
         assert_eq!(m.column, 6, "columns count from 1, like every editor");
         assert_eq!(m.line_text, "beta gamma");
+        assert_eq!(m.target, SearchTarget::File);
         assert_eq!(&"alpha\nbeta gamma\n"[m.offset..m.offset + 5], "gamma");
+    }
+
+    #[test]
+    fn open_document_search_keeps_navigation_id_separate_from_display_path() {
+        let id = DocumentId::next();
+        let path = Path::new("source.md");
+        let text = "before NEEDLE after\n";
+        let mut out = Results::default();
+
+        search_open_document(
+            id,
+            path,
+            text,
+            &Query::new("needle"),
+            DEFAULT_LIMIT,
+            &mut out,
+        );
+
+        assert_eq!(out.matches.len(), 1);
+        let found = &out.matches[0];
+        assert_eq!(found.path.as_path(), path);
+        assert_eq!(found.target, SearchTarget::OpenDocument(id));
+        assert_eq!(&text[found.offset..found.offset + "NEEDLE".len()], "NEEDLE");
     }
 
     #[test]
@@ -547,7 +625,9 @@ mod tests {
         let mut out = Results::default();
         search_files(&paths, &Query::new("needle"), DEFAULT_LIMIT, &mut out);
         assert!(
-            out.matches.iter().all(|m| m.path == real),
+            out.matches
+                .iter()
+                .all(|m| m.path.as_path() == real.as_path()),
             "a NUL-filled file contributed a result: {:?}",
             out.matches.iter().map(|m| &m.path).collect::<Vec<_>>()
         );
@@ -591,7 +671,7 @@ mod tests {
             "a missing file must be skipped, not fatal"
         );
         assert_eq!(out.matches[0].line, 2);
-        assert_eq!(out.matches[0].path, path);
+        assert_eq!(out.matches[0].path.as_path(), path.as_path());
     }
 
     #[test]
@@ -636,14 +716,19 @@ mod tests {
         );
 
         assert!(
-            out.matches.iter().any(|m| m.path == wanted),
+            out.matches
+                .iter()
+                .any(|m| m.path.as_path() == wanted.as_path()),
             "the second file's match must survive the first file's 400; got {} \
              match(es), all from {:?}",
             out.matches.len(),
             out.matches.first().map(|m| &m.path)
         );
         assert_eq!(
-            out.matches.iter().filter(|m| m.path == hog).count(),
+            out.matches
+                .iter()
+                .filter(|m| m.path.as_path() == hog.as_path())
+                .count(),
             10,
             "one file's share of a cap of 100 is a tenth of it"
         );

@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .source_contract import production_source, rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -35,6 +36,7 @@ from .runtime import (
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
+    artifact_contains,
     complete_evidence as complete_evidence_envelope,
     finite_nonnegative,
     fingerprint_text,
@@ -52,7 +54,6 @@ from .runtime import (
     validate_process_context,
     wait_until,
     write_durable,
-    run_native_acceptance,
 )
 
 
@@ -486,17 +487,38 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
         raise ValueError("case summary does not match case evidence")
 
 
-def production_source(path: Path) -> str:
-    return path.read_text(encoding="utf-8").split("\n#[cfg(test)]", 1)[0]
-
-
 def source_contract_failure() -> str | None:
     workspace = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
     )
+    try:
+        welcome = production_source(
+            REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "welcome.rs"
+        )
+    except OSError:
+        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
     document = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "document.rs"
     )
+    if workspace is None or welcome is None:
+        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
+    if document is None:
+        return "SAVE_AS_SOURCE_CONTRACT_MISSING"
+    workspace_views = rust_source_views(workspace)
+    if workspace_views is None:
+        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
+    workspace_code, _ = workspace_views
+
+    welcome_views = rust_source_views(welcome)
+    if welcome_views is None:
+        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
+    welcome_code, welcome_comment_free = welcome_views
+
+    document_views = rust_source_views(document)
+    if document_views is None:
+        return "SAVE_AS_SOURCE_CONTRACT_MISSING"
+    document_code, document_comment_free = document_views
+
     for value in (
         WELCOME_NEW_AUTOMATION_ID,
         WELCOME_PASTE_AUTOMATION_ID,
@@ -505,25 +527,26 @@ def source_contract_failure() -> str | None:
         WELCOME_OPEN_SAMPLE_AUTOMATION_ID,
         WELCOME_DONT_SHOW_AUTOMATION_ID,
     ):
-        if value not in workspace:
+        if value not in welcome_comment_free:
             return "WELCOME_UIA_CONTRACT_MISSING"
-    if DOCUMENT_SAVE_AS_AUTOMATION_ID not in document:
+    if DOCUMENT_SAVE_AS_AUTOMATION_ID not in document_comment_free:
         return "SAVE_AS_UIA_CONTRACT_MISSING"
-    if "initial.is_none() && show_welcome_on_startup" not in workspace:
+    if "initial.is_none() && show_welcome_on_startup" not in welcome_code:
         return "NO_ARGUMENT_WELCOME_CONTRACT_MISSING"
-    if "fn dont_show_welcome_again" not in workspace:
+    if "fn dont_show_welcome_again" not in welcome_code:
         return "DONT_SHOW_WELCOME_CONTRACT_MISSING"
+    for contract in ("fn open_bundled_sample", "fn record_recent_target"):
+        if contract not in welcome_code:
+            return "FIRST_USE_SOURCE_CONTRACT_MISSING"
     for contract in (
         "fn on_paste_into_new",
         "cx.read_from_clipboard()",
-        "fn open_bundled_sample",
-        "fn record_recent_target",
         "fn prompt_save_as_overwrite",
         "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
     ):
-        if contract not in workspace:
+        if contract not in workspace_code:
             return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    if "DocumentEvent::SaveAsRequested" not in document:
+    if "DocumentEvent::SaveAsRequested" not in document_code:
         return "SAVE_AS_SOURCE_CONTRACT_MISSING"
     return None
 
@@ -579,20 +602,6 @@ def materialized_sample_inventory(data_root: Path) -> dict[str, Any]:
         "sample_content": content.evidence(),
         "sample_version": versions[0].name,
     }
-
-
-def artifact_contains(path: Path, patterns: tuple[bytes, ...]) -> bytes | None:
-    """Find a sensitive byte sequence while keeping only a chunk boundary tail."""
-    overlap = max(len(pattern) for pattern in patterns) - 1
-    tail = b""
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            value = tail + chunk
-            for pattern in patterns:
-                if pattern in value:
-                    return pattern
-            tail = value[-overlap:] if overlap else b""
-    return None
 
 
 def scan_case_artifacts(case_root: Path) -> dict[str, Any]:
@@ -716,10 +725,6 @@ class Goal03Harness(BaseNativeHarness):
             "MEMORY_DISCARD_TIMEOUT",
         )
         self.close_app(app)
-
-    def close_app(self, app: Any) -> None:
-        self.win32.post_close(app.hwnd)
-        self.wait_process_exit(app)
 
     def read_text_clipboard(self) -> str | None:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -1346,10 +1351,6 @@ def native_run_plan() -> NativeRunPlan:
             harness.scenario_cli,
         ),
     )
-
-
-def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
-    return run_native_acceptance(args, native_run_plan())
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

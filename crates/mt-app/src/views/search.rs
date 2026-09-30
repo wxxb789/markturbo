@@ -38,7 +38,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::*;
-use mt_core::workspace::search::{self, Query, Results};
+use mt_core::workspace::search::{self, Query, Results, SearchTarget};
 
 use crate::i18n;
 use crate::metrics;
@@ -52,11 +52,15 @@ pub enum SearchEvent {
     /// lives in their editors and the harness paths in the harness view. The
     /// workspace collects a [`Corpus`] and hands it back through [`SearchView::run`].
     Ready,
-    /// Open `path` and put the cursor at `offset`.
+    /// Reveal `target` at `offset`, showing `path` in the result list.
     ///
-    /// Always a preview open: scanning down a result list is exactly the
-    /// browsing pattern preview tabs exist for.
-    Reveal { path: PathBuf, offset: usize },
+    /// File targets use a preview open; an open-document target resolves to
+    /// the existing in-memory document identified by its ID.
+    Reveal {
+        path: PathBuf,
+        target: SearchTarget,
+        offset: usize,
+    },
 }
 
 /// Where to search.
@@ -111,14 +115,24 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// settled keystroke. The expansion happens on the background task instead.
 #[derive(Debug, Clone, Default)]
 pub struct Corpus {
-    /// Documents whose text is already in memory, because they are open and may
-    /// hold unsaved edits. Searching the file on disk instead would report
-    /// matches that are no longer there.
-    pub open: Vec<(PathBuf, String)>,
+    /// Open document snapshots in tab order, because that is also the result
+    /// priority when the global cap is reached. Searching their in-memory text
+    /// avoids reporting stale disk contents for ordinary open files.
+    pub open: Vec<OpenSnapshot>,
     /// Individual documents to read from disk.
     pub files: Vec<PathBuf>,
     /// Directories to walk for documents, off the UI thread.
     pub roots: Vec<PathBuf>,
+}
+
+/// An in-memory open-document snapshot.
+#[derive(Debug, Clone)]
+pub struct OpenSnapshot {
+    pub path: PathBuf,
+    pub text: String,
+    /// `File` uses `path` as its navigation target; recovered tabs carry their
+    /// document ID here instead.
+    pub target: SearchTarget,
 }
 
 pub struct SearchView {
@@ -245,36 +259,7 @@ impl SearchView {
 
         self._search = Some(cx.spawn(async move |this, cx| {
             let results = cx
-                .background_spawn(async move {
-                    let mut out = Results::default();
-                    for (path, body) in &corpus.open {
-                        search::search_text(path, body, &query, search::DEFAULT_LIMIT, &mut out);
-                    }
-                    search::search_files(&corpus.files, &query, search::DEFAULT_LIMIT, &mut out);
-
-                    // Walking is done here rather than by the caller: on a real
-                    // vault it is seconds, and the caller assembles the corpus
-                    // on the UI thread. Skip what is already searched, or every
-                    // match in an open document is reported twice.
-                    let mut walked: Vec<std::path::PathBuf> = Vec::new();
-                    for root in &corpus.roots {
-                        // Nothing more to find, so stop before paying for the
-                        // walk — the cap is what bounds the worst case and it
-                        // has to bound the filesystem work, not just the list.
-                        if out.matches.len() >= search::DEFAULT_LIMIT {
-                            out.truncated = true;
-                            break;
-                        }
-                        walked.extend(search::document_paths(root));
-                    }
-                    walked.sort();
-                    walked.dedup();
-                    walked.retain(|p| {
-                        !corpus.files.contains(p) && !corpus.open.iter().any(|(o, _)| o == p)
-                    });
-                    search::search_files(&walked, &query, search::DEFAULT_LIMIT, &mut out);
-                    out
-                })
+                .background_spawn(async move { search_corpus(&corpus, &query) })
                 .await;
 
             crate::views::try_update(&this, cx, |this, cx| {
@@ -324,6 +309,7 @@ impl SearchView {
                 .into_any_element();
         }
 
+        let recovered_label = i18n::t(i18n::Key::RecoveredSnapshot, cx);
         v_flex()
             .id("search-results")
             .size_full()
@@ -333,9 +319,11 @@ impl SearchView {
             .overflow_y_scroll()
             .children(self.results.matches.iter().enumerate().map(|(ix, m)| {
                 let path = m.path.clone();
+                let target = m.target;
                 let offset = m.offset;
                 let name = m
                     .path
+                    .as_ref()
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or_default()
@@ -361,6 +349,16 @@ impl SearchView {
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!(":{}", m.line)),
+                                    )
+                                    .children(
+                                        matches!(target, SearchTarget::OpenDocument(_)).then(
+                                            || {
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(recovered_label)
+                                            },
+                                        ),
                                     ),
                             )
                             .child(
@@ -373,7 +371,8 @@ impl SearchView {
                     )
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(SearchEvent::Reveal {
-                            path: path.clone(),
+                            path: path.as_ref().clone(),
+                            target,
                             offset,
                         });
                     }))
@@ -413,6 +412,54 @@ impl SearchView {
     }
 }
 
+fn search_corpus(corpus: &Corpus, query: &Query) -> Results {
+    let mut out = Results::default();
+    for snapshot in &corpus.open {
+        match snapshot.target {
+            SearchTarget::File => search::search_text(
+                &snapshot.path,
+                &snapshot.text,
+                query,
+                search::DEFAULT_LIMIT,
+                &mut out,
+            ),
+            SearchTarget::OpenDocument(id) => search::search_open_document(
+                id,
+                &snapshot.path,
+                &snapshot.text,
+                query,
+                search::DEFAULT_LIMIT,
+                &mut out,
+            ),
+        }
+    }
+    search::search_files(&corpus.files, query, search::DEFAULT_LIMIT, &mut out);
+
+    // Walking is done here rather than by the caller: on a real vault it is
+    // seconds, and the caller assembles the corpus on the UI thread. Skip what
+    // is already searched, or every match in an open document is reported twice.
+    let mut walked: Vec<std::path::PathBuf> = Vec::new();
+    for root in &corpus.roots {
+        // Nothing more to find, so stop before paying for the walk — the cap is
+        // what bounds the filesystem work, not just the result list.
+        if out.matches.len() >= search::DEFAULT_LIMIT {
+            out.truncated = true;
+            break;
+        }
+        walked.extend(search::document_paths(root));
+    }
+    walked.sort();
+    walked.dedup();
+    walked.retain(|path| {
+        !corpus.files.contains(path)
+            && !corpus.open.iter().any(|snapshot| {
+                snapshot.target == SearchTarget::File && snapshot.path.as_path() == path.as_path()
+            })
+    });
+    search::search_files(&walked, query, search::DEFAULT_LIMIT, &mut out);
+    out
+}
+
 impl EventEmitter<SearchEvent> for SearchView {}
 
 impl Focusable for SearchView {
@@ -446,7 +493,108 @@ mod tests {
     // Import selectively: the `gpui_kit::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::Scope;
+    use super::{Corpus, OpenSnapshot, Query, Scope, SearchTarget, search_corpus};
+    use mt_core::document::lifecycle::DocumentId;
+
+    #[test]
+    fn a_recovered_snapshot_does_not_hide_a_disk_file_with_the_same_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("same-source.md");
+        std::fs::write(&path, "needle on disk\n").unwrap();
+        let id = DocumentId::next();
+        let corpus = Corpus {
+            open: vec![OpenSnapshot {
+                path: path.clone(),
+                text: "needle in recovered buffer\n".to_string(),
+                target: SearchTarget::OpenDocument(id),
+            }],
+            roots: vec![directory.path().to_path_buf()],
+            ..Corpus::default()
+        };
+
+        let results = search_corpus(&corpus, &Query::new("needle"));
+
+        assert_eq!(results.matches.len(), 2);
+        assert!(
+            results
+                .matches
+                .iter()
+                .all(|found| found.path.as_path() == path.as_path())
+        );
+        assert_eq!(results.matches[0].line_text, "needle in recovered buffer");
+        assert_eq!(results.matches[0].target, SearchTarget::OpenDocument(id));
+        assert_eq!(results.matches[1].line_text, "needle on disk");
+        assert_eq!(results.matches[1].target, SearchTarget::File);
+        assert_eq!(results.files, 2);
+    }
+
+    #[test]
+    fn open_snapshot_tab_order_controls_results_at_the_global_cap() {
+        let recovered_id = DocumentId::next();
+        let corpus = Corpus {
+            open: vec![
+                OpenSnapshot {
+                    path: "recovered.md".into(),
+                    text: "needle\n".repeat(mt_core::workspace::search::DEFAULT_LIMIT - 1),
+                    target: SearchTarget::OpenDocument(recovered_id),
+                },
+                OpenSnapshot {
+                    path: "ordinary.md".into(),
+                    text: "needle\n".into(),
+                    target: SearchTarget::File,
+                },
+            ],
+            ..Corpus::default()
+        };
+
+        let results = search_corpus(&corpus, &Query::new("needle"));
+
+        assert_eq!(
+            results.matches.len(),
+            mt_core::workspace::search::DEFAULT_LIMIT
+        );
+        assert_eq!(
+            results.matches[mt_core::workspace::search::DEFAULT_LIMIT - 2].target,
+            SearchTarget::OpenDocument(recovered_id)
+        );
+        assert_eq!(
+            results.matches[mt_core::workspace::search::DEFAULT_LIMIT - 1].target,
+            SearchTarget::File
+        );
+        assert!(results.truncated);
+        assert_eq!(results.files, 2);
+    }
+
+    #[test]
+    fn identical_result_rows_keep_distinct_navigation_targets() {
+        let path = std::path::PathBuf::from("same-source.md");
+        let id = DocumentId::next();
+        let corpus = Corpus {
+            open: vec![
+                OpenSnapshot {
+                    path: path.clone(),
+                    text: "same needle line\n".into(),
+                    target: SearchTarget::File,
+                },
+                OpenSnapshot {
+                    path: path.clone(),
+                    text: "same needle line\n".into(),
+                    target: SearchTarget::OpenDocument(id),
+                },
+            ],
+            ..Corpus::default()
+        };
+
+        let results = search_corpus(&corpus, &Query::new("needle"));
+
+        assert_eq!(results.matches.len(), 2);
+        assert_eq!(results.matches[0].path.as_path(), path.as_path());
+        assert_eq!(results.matches[1].path.as_path(), path.as_path());
+        assert_eq!(results.matches[0].line, results.matches[1].line);
+        assert_eq!(results.matches[0].line_text, results.matches[1].line_text);
+        assert_eq!(results.matches[0].target, SearchTarget::File);
+        assert_eq!(results.matches[1].target, SearchTarget::OpenDocument(id));
+    }
 
     #[test]
     fn every_scope_is_reachable_and_named_distinctly() {

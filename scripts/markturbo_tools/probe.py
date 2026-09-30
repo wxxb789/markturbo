@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
 
-from .metrics import inclusive_p95, measure_abba, nearest_rank_percentile
+from .metrics import inclusive_p95, measure_abba, measure_abba_samples, nearest_rank_percentile
 from .goal04 import (
     EVIDENCE_VARIANT_LABELS,
     GOAL04_BUILD_VARIANTS,
@@ -66,7 +66,6 @@ from .goal04 import (
     goal04_tree_command,
     load_build_evidence,
     load_threshold_evidence,
-    measure_startup_abba,
     milestone_comparison,
     model_first_use_cache_state,
     normalize_goal04_bloat_crates,
@@ -1079,7 +1078,7 @@ def cmd_startup_milestones(a: argparse.Namespace, requested_exes: list[Path]) ->
                 measure(index)
 
         if a.compare:
-            samples_a, samples_b = measure_startup_abba(
+            samples_a, samples_b = measure_abba_samples(
                 a.rounds,
                 lambda: measure(0),
                 lambda: measure(1),

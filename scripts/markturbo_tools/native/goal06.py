@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .source_contract import production_source, rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -35,6 +36,7 @@ from .runtime import (
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
+    artifact_contains,
     complete_evidence as complete_evidence_envelope,
     finite_nonnegative,
     key_input,
@@ -51,7 +53,6 @@ from .runtime import (
     validate_process_context,
     wait_until,
     write_durable,
-    run_native_acceptance,
 )
 
 
@@ -408,46 +409,48 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
         raise ValueError("case summary does not match case evidence")
 
 
-def production_source(path: Path) -> str:
-    return path.read_text(encoding="utf-8").split("\n#[cfg(test)]", 1)[0]
-
-
 def source_contract_failure() -> str | None:
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
+    workspace = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
+    )
+    review = production_source(
+        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
+    )
+    if workspace is None or review is None:
+        return "REVIEW_SOURCE_CONTRACT_MISSING"
+    workspace_views = rust_source_views(workspace)
+    review_views = rust_source_views(review)
+    if workspace_views is None or review_views is None:
+        return "REVIEW_SOURCE_CONTRACT_MISSING"
+    _, workspace_comment_free = workspace_views
+    review_code, _ = review_views
+
     for value in (
         REVIEW_RUN_ACCESSIBILITY_ID,
         REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID,
         REVIEW_RESULT_ACCESSIBILITY_ID,
     ):
-        if value not in workspace:
+        if value not in workspace_comment_free:
             return "REVIEW_UIA_CONTRACT_MISSING"
+    for contract in (
+        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None)',
+        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None)',
+    ):
+        if contract not in workspace_comment_free:
+            return "REVIEW_SOURCE_CONTRACT_MISSING"
     for contract in (
         "accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)",
         "accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID)",
         "accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID)",
         "gpui_kit::Role::Label",
-        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None)',
-        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None)',
+        ".aria_value(diagnostic.diagnostic.message.as_str())",
         "ReviewError::MissingCredential",
         "i18n::Key::ReviewMissingCredential",
         "PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx))",
         "i18n::Key::ReviewReady",
     ):
-        if contract not in workspace:
+        if contract not in review_code:
             return "REVIEW_SOURCE_CONTRACT_MISSING"
-    return None
-
-
-def artifact_contains(path: Path, patterns: tuple[bytes, ...]) -> bytes | None:
-    overlap = max(len(pattern) for pattern in patterns) - 1
-    tail = b""
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            value = tail + chunk
-            for pattern in patterns:
-                if pattern in value:
-                    return pattern
-            tail = value[-overlap:] if overlap else b""
     return None
 
 
@@ -565,10 +568,6 @@ class Goal06Harness(BaseNativeHarness):
             inputs.append(key_input(VK_MENU, True))
         inputs.extend([key_input(VK_SHIFT, True), key_input(VK_CONTROL, True)])
         self.win32.send_inputs(inputs)
-
-    def close_app(self, app: Any) -> None:
-        self.win32.post_close(app.hwnd)
-        self.wait_process_exit(app)
 
     def run_review(self, app: Any) -> None:
         button = self.find_control(
@@ -708,12 +707,6 @@ def native_run_plan(configured_provider: bool = False) -> NativeRunPlan:
             lambda: harness.scenario(CASE_DOCUMENT),
             lambda: harness.scenario(CASE_SELECTION),
         ),
-    )
-
-
-def run(args: argparse.Namespace) -> tuple[int, dict[str, Any], str]:
-    return run_native_acceptance(
-        args, native_run_plan(getattr(args, "configured_provider", False))
     )
 
 

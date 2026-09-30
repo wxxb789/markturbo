@@ -13,9 +13,17 @@ from scripts.markturbo_tools import perf_fixtures
 
 
 class PerformanceFixtureTests(unittest.TestCase):
-    def test_document_generation_is_deterministic(self) -> None:
-        self.assertEqual(perf_fixtures.make(40), perf_fixtures.make(40))
-        self.assertTrue(perf_fixtures.make(40).endswith("\n"))
+    def test_generated_bytes_match_the_committed_benchmark_inputs(self) -> None:
+        for name, document in (
+            ("large-10k.md", perf_fixtures.make(10_000)),
+            ("huge-100k.md", perf_fixtures.make(100_000)),
+            ("diagram-heavy.md", perf_fixtures.make_diagram_heavy()),
+        ):
+            with self.subTest(fixture=name):
+                self.assertEqual(
+                    document.encode("utf-8"),
+                    (perf_fixtures.OUT / name).read_bytes(),
+                )
 
     def test_diagram_fixture_has_unique_diagrams(self) -> None:
         document = perf_fixtures.make_diagram_heavy(3)

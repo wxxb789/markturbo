@@ -52,6 +52,7 @@ raw-window-handle.workspace = true
 wry.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+webview2-com.workspace = true
 windows.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
