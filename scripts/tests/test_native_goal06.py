@@ -455,7 +455,7 @@ class HarnessContractTests(unittest.TestCase):
 
                 self.assertEqual(events, [("close", 42), ("wait", 1.0)])
 
-    def test_production_source_keeps_cfg_test_imports_and_strips_test_module(self) -> None:
+    def test_production_source_removes_test_imports_without_losing_later_code(self) -> None:
         source_text = (
             "pub fn before_test_import() {}\n"
             "#[cfg(test)]\nuse crate::test_support::TestDependency;\n"
@@ -468,7 +468,9 @@ class HarnessContractTests(unittest.TestCase):
 
             production = HARNESS.production_source(source)
 
-        self.assertIn("use crate::test_support::TestDependency;", production)
+        self.assertIsNotNone(production)
+        self.assertNotIn("use crate::test_support::TestDependency;", production)
+        self.assertIn("before_test_import", production)
         self.assertIn("after_test_import", production)
         self.assertNotIn("mod tests", production)
 
@@ -513,6 +515,21 @@ class SourceContractTests(unittest.TestCase):
         self.assertIsNone(
             self.source_contract_failure(self.WORKSPACE_SOURCE, self.REVIEW_SOURCE)
         )
+
+    def test_real_repository_satisfies_source_contract(self) -> None:
+        self.assertIsNone(HARNESS.source_contract_failure())
+
+    def test_unsafe_projection_returns_existing_source_contract_failure(self) -> None:
+        malformed = "\n#[cfg(test)] mod checks {\n"
+        for workspace, review in (
+            (self.WORKSPACE_SOURCE + malformed, self.REVIEW_SOURCE),
+            (self.WORKSPACE_SOURCE, self.REVIEW_SOURCE + malformed),
+        ):
+            with self.subTest(workspace=workspace, review=review):
+                self.assertEqual(
+                    self.source_contract_failure(workspace, review),
+                    "REVIEW_SOURCE_CONTRACT_MISSING",
+                )
 
     def test_each_missing_workspace_accessibility_id_returns_uia_contract_failure(
         self,
@@ -624,19 +641,33 @@ class SourceContractTests(unittest.TestCase):
             ),
         )
 
+        test_scopes = (
+            self.TEST_MODULE,
+            "\n#[cfg(test)] mod checks {\n"
+            "fn decoy() {\n// test-only contract decoy\n}\n}\n",
+            "\n# [ cfg (\n test \n) ]\npub(crate) mod checks\n{\n"
+            "fn decoy() {\n// test-only contract decoy\n}\n}\n",
+            "\n#[cfg(test)] fn decoy() {\n// test-only contract decoy\n}\n",
+            "\n#[cfg(all(test, windows))] fn decoy() {\n"
+            "// test-only contract decoy\n}\n",
+            "\nmod helpers {\n#[cfg(test)] mod checks {\n"
+            "fn decoy() {\n// test-only contract decoy\n}\n}\n}\n",
+        )
         for name, source_file, contract, failure in cases:
-            workspace, review = self.WORKSPACE_SOURCE, self.REVIEW_SOURCE
-            source = workspace if source_file == "workspace" else review
-            decoy = contract.strip()
-            source = source.replace(contract, "", 1) + self.TEST_MODULE.replace(
-                "// test-only contract decoy", decoy
-            )
-            if source_file == "workspace":
-                workspace = source
-            else:
-                review = source
-            with self.subTest(contract=name):
-                self.assertEqual(self.source_contract_failure(workspace, review), failure)
+            for test_scope in test_scopes:
+                workspace, review = self.WORKSPACE_SOURCE, self.REVIEW_SOURCE
+                source = workspace if source_file == "workspace" else review
+                source = test_scope.replace(
+                    "// test-only contract decoy", contract.strip()
+                ) + source.replace(contract, "", 1)
+                if source_file == "workspace":
+                    workspace = source
+                else:
+                    review = source
+                with self.subTest(contract=name, test_scope=test_scope):
+                    self.assertEqual(
+                        self.source_contract_failure(workspace, review), failure
+                    )
 
     def test_comment_or_string_decoys_do_not_preserve_removed_diagnostic_exposure(
         self,

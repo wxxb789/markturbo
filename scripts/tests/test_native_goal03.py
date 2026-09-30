@@ -602,6 +602,56 @@ mod tests {
                 )
             )
 
+    def test_real_repository_satisfies_source_contract(self) -> None:
+        self.assertIsNone(HARNESS.source_contract_failure())
+
+    def test_alternate_test_modules_cannot_supply_production_contracts(self) -> None:
+        cases = (
+            ("workspace", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("welcome", "WELCOME_UIA_CONTRACT_MISSING"),
+            ("document", "SAVE_AS_UIA_CONTRACT_MISSING"),
+        )
+        for source_name, expected in cases:
+            with self.subTest(source=source_name), tempfile.TemporaryDirectory() as temporary:
+                sources = {
+                    "workspace": self.WORKSPACE_SOURCE,
+                    "welcome": self.WELCOME_SOURCE,
+                    "document": self.DOCUMENT_SOURCE,
+                }
+                sources[source_name] = (
+                    "#[cfg(test)] mod checks {\n"
+                    + sources[source_name]
+                    + "\n}\nfn production_after_tests() {}\n"
+                )
+                self.assertEqual(
+                    self.source_failure(
+                        Path(temporary), sources["workspace"], sources["document"],
+                        welcome=sources["welcome"],
+                    ),
+                    expected,
+                )
+
+    def test_unsafe_projection_returns_existing_source_contract_codes(self) -> None:
+        for source_name, expected in (
+            ("workspace", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("welcome", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+            ("document", "SAVE_AS_SOURCE_CONTRACT_MISSING"),
+        ):
+            with self.subTest(source=source_name), tempfile.TemporaryDirectory() as temporary:
+                sources = {
+                    "workspace": self.WORKSPACE_SOURCE,
+                    "welcome": self.WELCOME_SOURCE,
+                    "document": self.DOCUMENT_SOURCE,
+                }
+                sources[source_name] += "\n#[cfg(test)] mod checks {\n"
+                self.assertEqual(
+                    self.source_failure(
+                        Path(temporary), sources["workspace"], sources["document"],
+                        welcome=sources["welcome"],
+                    ),
+                    expected,
+                )
+
     def test_missing_production_markers_fail_with_their_contract_codes(self) -> None:
         welcome_markers = (
             ("markturbo-welcome-new", "WELCOME_UIA_CONTRACT_MISSING"),

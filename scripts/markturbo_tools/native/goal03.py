@@ -500,6 +500,10 @@ def source_contract_failure() -> str | None:
     document = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "document.rs"
     )
+    if workspace is None or welcome is None:
+        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
+    if document is None:
+        return "SAVE_AS_SOURCE_CONTRACT_MISSING"
     workspace_views = rust_source_views(workspace)
     if workspace_views is None:
         return "FIRST_USE_SOURCE_CONTRACT_MISSING"

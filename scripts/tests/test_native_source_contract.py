@@ -10,22 +10,125 @@ from scripts.markturbo_tools.native.source_contract import production_source, ru
 
 
 class ProductionSourceTests(unittest.TestCase):
-    def test_only_the_final_exact_test_module_marker_ends_production_source(self) -> None:
-        production = 'const EXAMPLE: &str = r#"\n#[cfg(test)]\nmod tests {}\n"#;\n'
-        similar_marker = "fn production() {}\n#[cfg(test)]\nmod tests_helper {}"
-        cases = (
-            (production + "\n#[cfg(test)]\nmod tests {}", production),
-            (similar_marker, similar_marker),
-        )
+    @staticmethod
+    def project(text: str) -> str | None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.rs"
-            for text, expected in cases:
-                with self.subTest(source=text):
-                    source.write_text(text, encoding="utf-8")
+            source.write_bytes(text.encode("utf-8"))
+            return production_source(source)
 
-                    actual = production_source(source)
+    @staticmethod
+    def masked(text: str) -> str:
+        return "".join(character if character in "\r\n" else " " for character in text)
 
-                    self.assertEqual(actual, expected)
+    def test_test_only_items_are_masked_without_shifting_later_production(self) -> None:
+        items = (
+            "#[cfg(test)] mod checks { fn test_only() {} }\n",
+            "# /* attr */ [ cfg /* condition */ (\n test \n) ]\n"
+            "pub(crate) mod arbitrary_name\n{ fn test_only() {} }\n",
+            "#[inline]\n#[cfg(test)]\n#[allow(dead_code)]\n"
+            "pub(crate) async fn test_only() { nested({ 1 }); }\n",
+            "#[cfg(test)] use crate::fixtures::{First, Second};\n",
+            "#[cfg(test)] extern crate fixtures;\n",
+            "#[cfg(test)] const TEST_ONLY: usize = { let value = 1; value };\n",
+            "#[cfg(test)] static TEST_ONLY: [u8; 1] = [1];\n",
+            "#[cfg(test)] type TestOnly = Result<First, Second>;\n",
+            "#[cfg(test)] struct TestOnly(usize);\n",
+            "#[cfg(test)] struct TestOnly { field: usize }\n",
+            "#[cfg(test)] enum TestOnly { First, Second }\n",
+            "#[cfg(test)] trait TestOnly { fn check(); }\n",
+            "#[cfg(test)] impl TestOnly { fn check() {} }\n",
+            '#[cfg(test)] unsafe extern "C" { fn test_only(); }\n',
+            "#[cfg(test)] macro_rules! test_only { () => { check(); } }\n",
+            "#[cfg(test)] fixtures::test_only! { check(); }\n",
+            "#[cfg(test)] fn test_only<const N: usize>() -> Sized<{ N }> {}\n",
+        )
+        before = "fn production_before() {}\n"
+        after = "fn production_after() {}\n"
+        for item in items:
+            for newline in ("\n", "\r\n"):
+                with self.subTest(item=item, newline=newline):
+                    text = (before + item + after).replace("\n", newline)
+                    expected = (before + self.masked(item) + after).replace("\n", newline)
+                    self.assertEqual(self.project(text), expected)
+
+    def test_interleaved_and_nested_test_items_leave_production_in_place(self) -> None:
+        first = "#[cfg(test)] mod checks { fn decoy() {} }\n"
+        second = "#[cfg(test)] fn another_decoy() {}\n"
+        before = "mod shipping {\nfn before() {}\n"
+        middle = "fn between() {}\n"
+        after = "fn after() {}\n}\nfn outside() {}\n"
+        self.assertEqual(
+            self.project(before + first + middle + second + after),
+            before + self.masked(first) + middle + self.masked(second) + after,
+        )
+
+    def test_test_only_fields_do_not_hide_later_fields_or_functions(self) -> None:
+        item = "#[cfg(test)] fixture: Result<First, Second>,\n"
+        before = "struct Shipping {\n"
+        after = "production: usize,\n}\nfn production() {}\n"
+        self.assertEqual(
+            self.project(before + item + after),
+            before + self.masked(item) + after,
+        )
+
+    def test_positive_test_predicates_are_excluded_but_shipping_alternatives_remain(
+        self,
+    ) -> None:
+        for predicate in (
+            "test",
+            'all(test, feature = "fixture")',
+            "all(windows, all(test, unix))",
+            "any(all(test, windows), test)",
+        ):
+            with self.subTest(predicate=predicate):
+                item = f"#[cfg({predicate})] fn decoy() {{}}\n"
+                after = "fn production() {}\n"
+                self.assertEqual(self.project(item + after), self.masked(item) + after)
+        for predicate in (
+            "any(test, windows)",
+            'any(test, feature = "test")',
+            "not(test)",
+            'all(windows, feature = "fixture")',
+        ):
+            with self.subTest(predicate=predicate):
+                source = f"#[cfg({predicate})] fn potentially_shipping() {{}}\n"
+                self.assertEqual(self.project(source), source)
+
+    def test_comments_and_literals_cannot_introduce_test_boundaries(self) -> None:
+        source = (
+            'const RAW: &str = r###"\n#[cfg(test)]\nmod tests {}\n"###;\n'
+            'const TEXT: &str = "#[cfg(test)] mod checks {}";\n'
+            'const BYTES: &[u8] = br#"#[cfg(test)] mod checks {}"#;\n'
+            "// #[cfg(test)] mod checks { unmatched comment brace\n"
+            "/* #[cfg(test)] mod checks { /* nested */ */\n"
+            "fn production() {}\n"
+        )
+        self.assertEqual(self.project(source), source)
+
+    def test_crlf_multiline_literals_preserve_offsets(self) -> None:
+        source = 'const TEXT: &str = "first\r\nsecond";\r\nfn production() {}\r\n'
+        self.assertEqual(self.project(source), source)
+
+    def test_unsafe_lexical_attribute_and_item_boundaries_fail_closed(self) -> None:
+        malformed = (
+            'const TEXT: &str = "unfinished',
+            'const TEXT: &str = "bare\rcarriage return";',
+            "/* unfinished comment",
+            "#[cfg(test)] mod checks {",
+            "#[cfg(test)] fn checks(] {}",
+            "#[cfg(test)]",
+            "#[cfg(test)] use fixtures::OnlyForTests",
+            "#[cfg(test)] unsupported_item",
+            "#[cfg()] fn checks() {}",
+            "#[cfg(all(test,,windows))] fn checks() {}",
+            "#[cfg(not(not(test)))] fn checks() {}",
+            "#![cfg(test)] fn checks() {}",
+            "#[cfg_attr(test, cfg(test))] fn checks() {}",
+        )
+        for source in malformed:
+            with self.subTest(source=source):
+                self.assertIsNone(self.project("fn production() {}\n" + source))
 
 
 class RustSourceViewsTests(unittest.TestCase):

@@ -416,6 +416,8 @@ def source_contract_failure() -> str | None:
     review = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
+    if workspace is None or review is None:
+        return "REVIEW_SOURCE_CONTRACT_MISSING"
     workspace_views = rust_source_views(workspace)
     review_views = rust_source_views(review)
     if workspace_views is None or review_views is None:

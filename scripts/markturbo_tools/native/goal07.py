@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 from . import goal07_provider as provider_fixtures
 from .goal03 import Goal03Harness as ClipboardNativeHarness
-from .source_contract import rust_source_views
+from .source_contract import production_source, rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -1066,12 +1066,9 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
         require_exact_keys(evidence.get("environment"), ENVIRONMENT_KEYS, "environment")
 
 
-def production_source(path: Path) -> str:
-    source = path.read_text(encoding="utf-8")
-    return source.split("\n#[cfg(test)]\nmod tests", 1)[0]
-
-
-def _rust_function_body(source: str, signature: str) -> str | None:
+def _rust_function_body(source: str | None, signature: str) -> str | None:
+    if source is None:
+        return None
     views = rust_source_views(source)
     if views is None:
         return None
@@ -1153,6 +1150,8 @@ def preview_inert_source_contract_ok() -> bool:
     review = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
+    if review is None:
+        return False
     views = rust_source_views(review)
     if views is None:
         return False
@@ -1185,6 +1184,8 @@ def stale_accessibility_source_contract_ok() -> bool:
     review = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
+    if review is None:
+        return False
     start = review.find('.id("revision-stale")')
     if start < 0:
         return False
@@ -1207,6 +1208,8 @@ def stale_apply_source_contract_ok() -> bool:
     review = production_source(
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
+    if review is None:
+        return False
     start = review.find('Button::new("revision-apply")')
     if start < 0:
         return False
@@ -1230,6 +1233,10 @@ def source_contract_failure() -> str | None:
         REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
     )
     document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
+    if workspace is None or review is None:
+        return "REVISION_UIA_CONTRACT_MISSING"
+    if document is None:
+        return "REVISION_BOUNDARY_CONTRACT_MISSING"
     review_views = rust_source_views(review)
     if review_views is None:
         return "REVISION_UIA_CONTRACT_MISSING"

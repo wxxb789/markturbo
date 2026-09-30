@@ -914,6 +914,71 @@ class SourceContractFixtureTests(unittest.TestCase):
                 self.assertTrue(HARNESS.trust_apply_source_contract_ok())
                 self.assertTrue(HARNESS.preview_inert_source_contract_ok())
 
+    def test_real_repository_satisfies_source_contract(self) -> None:
+        self.assertIsNone(HARNESS.source_contract_failure())
+
+    def test_alternate_test_modules_cannot_supply_any_source_surface(self) -> None:
+        cases = (
+            ("workspace.rs", "REVISION_UIA_CONTRACT_MISSING"),
+            ("workspace/review.rs", "REVISION_SOURCE_CONTRACT_MISSING"),
+            ("document.rs", "REVISION_BOUNDARY_CONTRACT_MISSING"),
+            ("document/preview.rs", "REVISION_TRUST_SOURCE_CONTRACT_MISSING"),
+        )
+        for relative, expected in cases:
+            with self.subTest(source=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_goal07_source_fixture(root)
+                source = root / "crates" / "mt-app" / "src" / "views" / relative
+                original = source.read_text(encoding="utf-8")
+                source.write_text(
+                    "#[cfg(test)] mod checks {\n"
+                    + original
+                    + "\n}\nfn production_after_tests() {}\n",
+                    encoding="utf-8",
+                )
+                with mock.patch.object(HARNESS, "REPO", root):
+                    self.assertEqual(HARNESS.source_contract_failure(), expected)
+
+    def test_test_imports_and_modules_do_not_hide_later_production(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_goal07_source_fixture(root)
+            views = root / "crates" / "mt-app" / "src" / "views"
+            for relative in (
+                "workspace.rs", "workspace/review.rs",
+                "document.rs", "document/preview.rs",
+            ):
+                source = views / relative
+                original = source.read_text(encoding="utf-8")
+                source.write_text(
+                    "#[cfg(test)] use crate::fixtures::TestOnly;\n"
+                    "#[cfg(test)]\nmod tests { fn decoy() {} }\n"
+                    + original,
+                    encoding="utf-8",
+                )
+            with mock.patch.object(HARNESS, "REPO", root):
+                self.assertIsNone(HARNESS.source_contract_failure())
+
+    def test_unsafe_projection_returns_existing_source_contract_codes(self) -> None:
+        cases = (
+            ("workspace.rs", "REVISION_UIA_CONTRACT_MISSING"),
+            ("workspace/review.rs", "REVISION_UIA_CONTRACT_MISSING"),
+            ("document.rs", "REVISION_BOUNDARY_CONTRACT_MISSING"),
+            ("document/preview.rs", "REVISION_TRUST_SOURCE_CONTRACT_MISSING"),
+        )
+        for relative, expected in cases:
+            with self.subTest(source=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_goal07_source_fixture(root)
+                source = root / "crates" / "mt-app" / "src" / "views" / relative
+                original = source.read_text(encoding="utf-8")
+                source.write_text(
+                    original + "\n#[cfg(test)] mod checks {\n",
+                    encoding="utf-8",
+                )
+                with mock.patch.object(HARNESS, "REPO", root):
+                    self.assertEqual(HARNESS.source_contract_failure(), expected)
+
     def test_source_contract_rejects_replace_before_trust_revocation(self) -> None:
         wrong_order = """\
         self.replace_text(final_text, window, cx);
