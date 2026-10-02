@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use crate::model::{
     AgentSkillContentKind, AgentSkillRequest, ConsentCapability, ConsentError, ModelOperation,
-    ModelRequestDisclosure, Provider, RequestAuthorization, RevisionDisclosureDetails,
-    RevisionRequestBinding,
+    ModelRequestDisclosure, OutboundScope, Provider, RequestAuthorization,
+    RevisionDisclosureDetails, RevisionRequestBinding,
 };
 use crate::review as doc_review;
 use crate::review::ByteRange;
@@ -26,7 +26,8 @@ use super::{
     RevisionAnswer, RevisionAnswerError, RevisionAnswerRecord, RevisionAnswers, RevisionError,
     RevisionExecutionError, RevisionExecutionRecord, RevisionQuestionCoverage,
     RevisionQuestionCoverageStatus, RevisionTransportResult, ValidatedRevisionCapture, digest_hex,
-    document_agent_skill_request, document_outbound_scope, validate_document_request,
+    document_agent_skill_request, document_outbound_scope, selected_context_outbound,
+    validate_document_request,
 };
 
 #[cfg(all(not(feature = "model-transport"), any(test, feature = "test-support")))]
@@ -337,7 +338,7 @@ pub(super) fn decode_revision_capture(
         &lens_bytes,
         &review_bytes,
         &answers_bytes,
-    );
+    )?;
     let (proposal, question_coverage) = decode_revision_proposal(
         raw_response,
         request,
@@ -356,6 +357,9 @@ impl PreparedReview {
     /// Bind a fresh Goal 07 Revision operation to one frozen Review request,
     /// validated Review context, and exact answer states.  This deliberately
     /// does not reuse the Review disclosure or Agent Skill Review adapter.
+    /// Selected instructions remain prior Review evidence, not resent source
+    /// files. The original document or package is disclosed; package edits
+    /// remain restricted to its active SKILL.md entrypoint.
     pub fn bind_revision_request(
         self,
         request: doc_review::ReviewRequest,
@@ -377,6 +381,9 @@ impl PreparedReview {
                 .map_err(|_| RevisionError::InvalidRequest)?;
         let scope = match &agent_skill_request {
             Some(agent_skill_request) => agent_skill_request.outbound_scope(),
+            None if request.effective_agent_context.is_some() => {
+                OutboundScope::document(request.outbound_bytes().len() as u64)
+            }
             None => document_outbound_scope(&request).map_err(|_| RevisionError::InvalidRequest)?,
         };
         if !scope.permits_revision() || !scope.permits_review() {
@@ -409,7 +416,7 @@ impl PreparedReview {
             &lens_bytes,
             &review_context_bytes,
             &answers_bytes,
-        );
+        )?;
         let disclosure = ModelRequestDisclosure::revision_with_details(
             self.endpoint().clone(),
             scope,
@@ -1110,15 +1117,32 @@ pub(super) fn revision_request_binding_from_bytes(
     lens_bytes: &[u8],
     review_bytes: &[u8],
     answers_bytes: &[u8],
-) -> RevisionRequestBinding {
-    RevisionRequestBinding::new(
+) -> Result<RevisionRequestBinding, RevisionError> {
+    // Recovery and outbound consent retain the exact context that informed
+    // the prior Review, even though Revision does not resend those sources.
+    let review_context_digest = match &request.effective_agent_context {
+        Some(context) => {
+            let context_bytes = selected_context_outbound(context)
+                .and_then(|context| serde_json::to_vec(&context))
+                .map_err(|_| RevisionError::InvalidRequest)?;
+            let mut digest = Sha256::new();
+            digest.update(b"markturbo-revision-prior-context-v1\0");
+            digest.update((review_bytes.len() as u64).to_be_bytes());
+            digest.update(review_bytes);
+            digest.update((context_bytes.len() as u64).to_be_bytes());
+            digest.update(context_bytes);
+            digest.finalize().into()
+        }
+        None => digest_array(review_bytes),
+    };
+    Ok(RevisionRequestBinding::new(
         digest_array(source_bytes),
         request.snapshot.revision,
         request.snapshot.source_generation,
         digest_array(lens_bytes),
-        digest_array(review_bytes),
+        review_context_digest,
         digest_array(answers_bytes),
-    )
+    ))
 }
 
 fn revision_skill_frames(
@@ -1244,6 +1268,7 @@ fn build_revision_user_payload(
         "frames": frames,
         "active_entrypoint": active_entrypoint,
         "review_context": review_output,
+        "effective_agent_context_resent": false,
         "answers": answer_records,
     });
     let bytes = serde_json::to_vec(&payload).map_err(|_| RevisionError::InvalidRequest)?;

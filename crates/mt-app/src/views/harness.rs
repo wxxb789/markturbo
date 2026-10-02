@@ -15,7 +15,10 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    input::{Input, InputEvent, InputState},
     list::ListItem,
+    searchable_list::{SearchableListItem, SearchableVec},
+    select::{Select, SelectEvent, SelectState},
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -27,6 +30,10 @@ use mt_core::{Instruction, Origin, Severity, Skill};
 use crate::i18n;
 use crate::metrics;
 use crate::settings::AppSettings;
+use mt_core::agent_artifacts::context::{
+    CODEX_PROFILE_ID, ContextInput, InclusionRule, ProjectTrust, ResolutionStatus, ResolvedContext,
+    SourceOccurrence,
+};
 use mt_core::settings::GroupBy;
 
 /// Emitted when the user wants to open an artifact's document.
@@ -36,6 +43,10 @@ pub enum HarnessEvent {
     /// the next single click replaces it, which is what keeps browsing a list
     /// from leaving a bar full of tabs.
     OpenFile { path: PathBuf, preview: bool },
+    /// The scenario inputs changed. Workspace clears per-request source choices
+    /// and resolves this exact snapshot off the UI thread; `None` means a field
+    /// is not currently parseable and must not reuse an older result.
+    ContextChanged { input: Option<ContextInput> },
 }
 
 /// Which kind of artifact the panel is listing.
@@ -43,15 +54,71 @@ pub enum HarnessEvent {
 pub enum Section {
     Skills,
     Instructions,
+    Context,
 }
 
 impl Section {
-    const ALL: [Section; 2] = [Section::Skills, Section::Instructions];
+    const ALL: [Section; 3] = [Section::Skills, Section::Instructions, Section::Context];
 
-    fn label(self) -> crate::i18n::Key {
+    fn label(self) -> Option<crate::i18n::Key> {
         match self {
-            Section::Skills => crate::i18n::Key::SectionSkills,
-            Section::Instructions => crate::i18n::Key::SectionInstructions,
+            Section::Skills => Some(crate::i18n::Key::SectionSkills),
+            Section::Instructions => Some(crate::i18n::Key::SectionInstructions),
+            Section::Context => None,
+        }
+    }
+}
+
+/// Stable identity for an instruction occurrence, independent of chain order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextSourceIdentity {
+    path: PathBuf,
+    scope: PathBuf,
+    origin: Origin,
+    rule: InclusionRule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexHomeSource {
+    EnvironmentOverride,
+    UserHomeDefault,
+    HomeUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextProfileChoice {
+    profile_id: String,
+    supported: bool,
+}
+
+impl SearchableListItem for ContextProfileChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        format!(
+            "{} — {}",
+            self.profile_id,
+            if self.supported {
+                "verified AGENTS instructions"
+            } else {
+                "inventory only"
+            }
+        )
+        .into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.profile_id
+    }
+}
+
+impl From<&SourceOccurrence> for ContextSourceIdentity {
+    fn from(source: &SourceOccurrence) -> Self {
+        Self {
+            path: source.path.clone(),
+            scope: source.scope.clone(),
+            origin: source.origin,
+            rule: source.rule,
         }
     }
 }
@@ -76,6 +143,22 @@ pub struct HarnessView {
     skills: Vec<Skill>,
     instructions: Vec<Instruction>,
     selected: Option<usize>,
+    target_input: Entity<InputState>,
+    cwd_input: Entity<InputState>,
+    profile_select: Entity<SelectState<SearchableVec<ContextProfileChoice>>>,
+    codex_home_input: Entity<InputState>,
+    fallback_input: Entity<InputState>,
+    byte_budget_input: Entity<InputState>,
+    root_markers_input: Entity<InputState>,
+    project_trust: ProjectTrust,
+    codex_home_default: PathBuf,
+    codex_home_source: CodexHomeSource,
+    context_input: Option<ContextInput>,
+    context_error: Option<String>,
+    resolved_context: Option<ResolvedContext>,
+    selected_context_source: Option<ContextSourceIdentity>,
+    context_pending: bool,
+    _context_subscriptions: Vec<Subscription>,
     /// True while a scan is in flight — which is both what keeps an empty list
     /// from reading as "nothing installed" before the first scan lands, and
     /// what spins the rescan button.
@@ -96,8 +179,70 @@ impl HarnessView {
     pub fn new(
         root: PathBuf,
         skill_cache: Arc<Mutex<skill::DiscoveryCache>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (codex_home, codex_home_source) = default_codex_home();
+        let codex_home_default = codex_home.clone();
+        let target_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(root.to_string_lossy().to_string())
+        });
+        let cwd_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(root.to_string_lossy().to_string())
+        });
+        let profile_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(context_profile_choices()),
+                Some(gpui_kit::component::IndexPath::new(0)),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let codex_home_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(codex_home.to_string_lossy().to_string())
+        });
+        let fallback_input = cx.new(|cx| InputState::new(window, cx));
+        let byte_budget_input = cx.new(|cx| InputState::new(window, cx).default_value("32768"));
+        let root_markers_input = cx.new(|cx| InputState::new(window, cx).default_value(".git"));
+        let mut context_subscriptions: Vec<Subscription> = [
+            target_input.clone(),
+            cwd_input.clone(),
+            codex_home_input.clone(),
+            fallback_input.clone(),
+            byte_budget_input.clone(),
+            root_markers_input.clone(),
+        ]
+        .into_iter()
+        .map(|input| {
+            cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.context_input_changed(cx);
+                }
+            })
+        })
+        .collect();
+        context_subscriptions.push(cx.subscribe(
+            &profile_select,
+            |this, _, event: &SelectEvent<SearchableVec<ContextProfileChoice>>, cx| {
+                if matches!(event, SelectEvent::Confirm(Some(_))) {
+                    this.context_input_changed(cx);
+                }
+            },
+        ));
+
+        let context_input = ContextInput {
+            workspace: root.clone(),
+            target: root.clone(),
+            cwd: root.clone(),
+            profile_id: CODEX_PROFILE_ID.to_string(),
+            codex_home,
+            codex_home_override: codex_home_source == CodexHomeSource::EnvironmentOverride,
+            fallback_filenames: Vec::new(),
+            project_doc_max_bytes: 32_768,
+            project_root_markers: vec![".git".to_string()],
+            project_trust: ProjectTrust::Unspecified,
+        };
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             root,
@@ -106,6 +251,22 @@ impl HarnessView {
             skills: Vec::new(),
             instructions: Vec::new(),
             selected: None,
+            target_input,
+            cwd_input,
+            profile_select,
+            codex_home_input,
+            fallback_input,
+            byte_budget_input,
+            root_markers_input,
+            project_trust: ProjectTrust::Unspecified,
+            codex_home_default,
+            codex_home_source,
+            context_input: Some(context_input),
+            context_error: None,
+            resolved_context: None,
+            selected_context_source: None,
+            context_pending: false,
+            _context_subscriptions: context_subscriptions,
             scanning: true,
             _scan: None,
         };
@@ -180,7 +341,7 @@ impl HarnessView {
         self.skills = skills;
         self.instructions = instructions;
         self.selected = previous.and_then(|path| self.position_of(&path));
-        if self.selected.is_none() {
+        if self.selected.is_none() && self.section != Section::Context {
             self.section =
                 populated_section(self.section, self.skills.len(), self.instructions.len())
                     .unwrap_or(self.section);
@@ -195,6 +356,10 @@ impl HarnessView {
         match self.section {
             Section::Skills => self.skills.get(ix).map(|s| s.dir.clone()),
             Section::Instructions => self.instructions.get(ix).map(|i| i.path.clone()),
+            Section::Context => self
+                .selected_context_source
+                .as_ref()
+                .map(|source| source.path.clone()),
         }
     }
 
@@ -202,6 +367,7 @@ impl HarnessView {
         match self.section {
             Section::Skills => self.skills.iter().position(|s| s.dir == path),
             Section::Instructions => self.instructions.iter().position(|i| i.path == path),
+            Section::Context => None,
         }
     }
 
@@ -209,6 +375,10 @@ impl HarnessView {
         match self.section {
             Section::Skills => self.skills.is_empty(),
             Section::Instructions => self.instructions.is_empty(),
+            Section::Context => self
+                .resolved_context
+                .as_ref()
+                .is_none_or(|context| context.sources.is_empty()),
         }
     }
 
@@ -217,6 +387,10 @@ impl HarnessView {
             return;
         }
         self.section = section;
+        if section == Section::Context {
+            cx.notify();
+            return;
+        }
         // The selection indexes into whichever list was showing, so it cannot
         // carry across. Selecting the first row beats leaving the inspector on
         // an artifact the list no longer contains.
@@ -230,6 +404,107 @@ impl HarnessView {
 
     pub fn instructions(&self) -> &[Instruction] {
         &self.instructions
+    }
+
+    /// The current validated input snapshot consumed by Workspace's resolver.
+    pub fn context_input(&self) -> Option<&ContextInput> {
+        self.context_input.as_ref()
+    }
+
+    /// The latest result, only while it still matches the current input identity.
+    pub fn resolved_context(&self) -> Option<&ResolvedContext> {
+        self.resolved_context.as_ref()
+    }
+
+    /// Whether Workspace is already resolving the current scenario.
+    pub fn context_is_pending(&self) -> bool {
+        self.context_pending
+    }
+
+    /// The visible scenario target. Opening a context source does not change it.
+    pub fn selected_target(&self, cx: &App) -> PathBuf {
+        PathBuf::from(self.target_input.read(cx).value().to_string())
+    }
+
+    /// Mark the exact input snapshot as pending in Workspace's background resolver.
+    pub fn set_context_pending(&mut self, pending: bool, cx: &mut Context<Self>) {
+        self.context_pending = pending;
+        cx.notify();
+    }
+
+    /// Accept only results for the exact current input snapshot.
+    pub fn apply_resolved_context(
+        &mut self,
+        context: ResolvedContext,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !context_matches_input(self.context_input.as_ref(), &context) {
+            return false;
+        }
+        let previous = self.selected_context_source.clone();
+        self.selected_context_source = previous
+            .filter(|key| {
+                context
+                    .sources
+                    .iter()
+                    .any(|source| ContextSourceIdentity::from(source) == *key)
+            })
+            .or_else(|| context.sources.first().map(ContextSourceIdentity::from));
+        self.resolved_context = Some(context);
+        self.context_pending = false;
+        cx.notify();
+        true
+    }
+
+    fn build_context_input(&self, cx: &App) -> Result<ContextInput, String> {
+        let byte_budget = self
+            .byte_budget_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| "Project byte budget must be a non-negative integer".to_string())?;
+        Ok(ContextInput {
+            workspace: self.root.clone(),
+            target: PathBuf::from(self.target_input.read(cx).value().to_string()),
+            cwd: PathBuf::from(self.cwd_input.read(cx).value().to_string()),
+            profile_id: self
+                .profile_select
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default(),
+            codex_home: PathBuf::from(self.codex_home_input.read(cx).value().to_string()),
+            codex_home_override: self.codex_home_is_override(cx),
+            fallback_filenames: split_config_names(self.fallback_input.read(cx).value().as_ref()),
+            project_doc_max_bytes: byte_budget,
+            project_root_markers: split_config_names(
+                self.root_markers_input.read(cx).value().as_ref(),
+            ),
+            project_trust: self.project_trust,
+        })
+    }
+
+    fn codex_home_is_override(&self, cx: &App) -> bool {
+        codex_home_is_override(
+            self.codex_home_source,
+            &self.codex_home_default,
+            &PathBuf::from(self.codex_home_input.read(cx).value().to_string()),
+        )
+    }
+
+    fn context_input_changed(&mut self, cx: &mut Context<Self>) {
+        let (input, error) = match self.build_context_input(cx) {
+            Ok(input) => (Some(input), None),
+            Err(error) => (None, Some(error)),
+        };
+        self.context_input = input.clone();
+        self.context_error = error;
+        self.resolved_context = None;
+        self.selected_context_source = None;
+        self.context_pending = input.is_some();
+        cx.emit(HarnessEvent::ContextChanged { input });
+        cx.notify();
     }
 
     /// Whether the current result set contains an artifact below `path`.
@@ -256,6 +531,7 @@ impl HarnessView {
         match self.section {
             Section::Skills => self.skills.get(ix).map(|s| s.entry.clone()),
             Section::Instructions => self.instructions.get(ix).map(|i| i.path.clone()),
+            Section::Context => None,
         }
     }
 
@@ -419,6 +695,522 @@ impl HarnessView {
             .into_any_element()
     }
 
+    fn render_context_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut content = v_flex()
+            .id("harness-context")
+            .p(metrics::inset())
+            .gap(metrics::gap())
+            .child(label(cx, "Effective context scenario"))
+            .child(context_input_field(
+                &self.target_input,
+                "Target path",
+                "harness-context-target",
+                "MarkTurbo scenario target; editing this does not change Codex discovery rules.",
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .child(
+                        Button::new("harness-context-use-target-parent-as-cwd")
+                            .label("Use target parent as cwd")
+                            .xsmall()
+                            .outline()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let target = PathBuf::from(
+                                    this.target_input.read(cx).value().to_string(),
+                                );
+                                let Some(cwd) = target_parent_as_cwd(&target) else {
+                                    return;
+                                };
+                                let cwd = cwd.to_string_lossy().to_string();
+                                if this.cwd_input.read(cx).value().as_ref() == cwd {
+                                    return;
+                                }
+                                this.cwd_input.update(cx, |input, cx| {
+                                    input.set_value(cwd, window, cx);
+                                });
+                                // InputState::set_value intentionally emits no Change event.
+                                this.context_input_changed(cx);
+                            })),
+                    ),
+            )
+            .child(context_input_field(
+                &self.cwd_input,
+                "Execution cwd",
+                "harness-context-cwd",
+                "Codex project instruction discovery follows this directory, not target ancestors.",
+                cx,
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("For a file target this sets its parent as MarkTurbo scenario cwd; for a directory target, set cwd to that directory."),
+            )
+            .child(context_profile_selector(&self.profile_select, cx))
+            .child(context_input_field(
+                &self.codex_home_input,
+                "CODEX_HOME",
+                "harness-context-codex-home",
+                "Editable local scenario input; the resolver checks membership and reports invalid overrides.",
+                cx,
+            ))
+            .child(context_input_field(
+                &self.fallback_input,
+                "Project fallback filenames",
+                "harness-context-fallback-filenames",
+                "Separate names with commas; empty names are ignored by the profile.",
+                cx,
+            ))
+            .child(context_input_field(
+                &self.byte_budget_input,
+                "Project document byte budget",
+                "harness-context-byte-budget",
+                "Raw project bytes only; global instructions and separators are excluded.",
+                cx,
+            ))
+            .child(context_input_field(
+                &self.root_markers_input,
+                "Project root markers",
+                "harness-context-root-markers",
+                "Separate marker names with commas; an empty list uses the cwd only.",
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .gap(metrics::row_gap())
+                    .child(label(cx, "Project trust"))
+                    .child(
+                        h_flex()
+                            .gap(metrics::gap())
+                            .children(
+                                [
+                                    ProjectTrust::Unspecified,
+                                    ProjectTrust::Trusted,
+                                    ProjectTrust::Untrusted,
+                                ]
+                                .into_iter()
+                                .map(|trust| {
+                                    Button::new(format!("harness-context-trust-{trust:?}"))
+                                        .label(project_trust_label(trust))
+                                        .xsmall()
+                                        .when(self.project_trust == trust, |button| {
+                                            button.primary()
+                                        })
+                                        .when(self.project_trust != trust, |button| {
+                                            button.ghost()
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if this.project_trust != trust {
+                                                this.project_trust = trust;
+                                                this.context_input_changed(cx);
+                                            }
+                                        }))
+                                }),
+                            ),
+                    ),
+            )
+            .child(self.render_context_summary(cx));
+
+        if let Some(error) = &self.context_error {
+            content = content.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone()),
+            );
+        }
+
+        let Some(context) = &self.resolved_context else {
+            let message = if self.context_pending {
+                "Waiting for Workspace to resolve these inputs."
+            } else {
+                "No result is available for these inputs."
+            };
+            return content
+                .child(context_section_heading(cx, "Effective instruction chain"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(message),
+                )
+                .into_any_element();
+        };
+
+        content = content
+            .child(context_section_heading(cx, "Effective instruction chain"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} · {} occurrence(s)",
+                        resolution_status_label(context.status),
+                        context.sources.len()
+                    )),
+            );
+
+        content = content.children(context.sources.iter().enumerate().map(|(index, source)| {
+            let identity = ContextSourceIdentity::from(source);
+            let selected = self.selected_context_source.as_ref() == Some(&identity);
+            let duplicate_count = source.content_index.map_or(0, |content_index| {
+                context
+                    .sources
+                    .iter()
+                    .filter(|other| other.content_index == Some(content_index))
+                    .count()
+                    .saturating_sub(1)
+            });
+            ListItem::new(context_source_element_id(source))
+                .w_full()
+                .px(metrics::row_pad())
+                .py_1()
+                .rounded(cx.theme().radius)
+                .selected(selected)
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            h_flex()
+                                .gap(metrics::gap())
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("{}.", index + 1)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_sm()
+                                        .truncate()
+                                        .child(source.path.display().to_string()),
+                                )
+                                .when(source.is_truncated(), |this| {
+                                    this.child(
+                                        Icon::new(IconName::TriangleAlert)
+                                            .small()
+                                            .text_color(cx.theme().warning),
+                                    )
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap(metrics::gap())
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(source.origin.label())
+                                .child(inclusion_rule_label(source.rule))
+                                .child(format!("scope: {}", source.scope.display()))
+                                .when(duplicate_count > 0, |this| {
+                                    this.child(format!(
+                                        "+{duplicate_count} same-content occurrence(s)"
+                                    ))
+                                }),
+                        ),
+                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    this.selected_context_source = Some(identity.clone());
+                    cx.emit(HarnessEvent::OpenFile {
+                        path: identity.path.clone(),
+                        preview: event.click_count() < 2,
+                    });
+                    cx.notify();
+                }))
+        }));
+
+        if let Some(profile) = &context.profile {
+            content = content.child(
+                v_flex()
+                    .gap(metrics::row_gap())
+                    .children(field(cx, "Profile", &profile.id))
+                    .children(field(cx, "Revision", &profile.source_revision))
+                    .children(field(cx, "Retrieved", &profile.retrieved_on))
+                    .children(field(cx, "Source", &profile.source_url))
+                    .children(field(cx, "Profile SHA-256", &profile.content_digest)),
+            );
+        }
+
+        if let Some(project_root) = &context.project_root {
+            content = content.children(field(
+                cx,
+                "Project root",
+                &project_root.display().to_string(),
+            ));
+        }
+
+        if !context.assumptions.is_empty() {
+            content = content.child(
+                v_flex()
+                    .gap(metrics::row_gap())
+                    .child(context_section_heading(cx, "Assumptions and configuration"))
+                    .children(context.assumptions.iter().map(|assumption| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(assumption.clone())
+                    })),
+            );
+        }
+
+        if !context.diagnostics.is_empty() {
+            content = content.child(
+                v_flex()
+                    .gap(metrics::row_gap())
+                    .child(context_section_heading(cx, "Diagnostics"))
+                    .children(context.diagnostics.iter().map(|diagnostic| {
+                        let color = match diagnostic.severity {
+                            Severity::Error => cx.theme().danger,
+                            Severity::Warning => cx.theme().warning,
+                            Severity::Info => cx.theme().muted_foreground,
+                        };
+                        h_flex()
+                            .gap(metrics::gap())
+                            .items_start()
+                            .text_xs()
+                            .when_some(diagnostic.line, |this, line| {
+                                this.child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .child(format!("line {line}")),
+                                )
+                            })
+                            .child(div().flex_1().text_color(color).child(format!(
+                                "{}: {}: {}",
+                                diagnostic.source, diagnostic.severity, diagnostic.message
+                            )))
+                    })),
+            );
+        }
+
+        content = content.child(context_section_heading(cx, "Discovered Skill candidates"));
+        if context.available_skills.is_empty() {
+            content = content.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No Skill candidates were discovered in the Harness inventory."),
+            );
+        } else {
+            content = content.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Discovered from the all-Harness inventory. Runtime invocation and exact availability are unverified; contents are not part of automatic AGENTS instructions.",
+                    ),
+            );
+            content = content.children(context.available_skills.iter().map(|skill| {
+                let entry = skill.entry.clone();
+                ListItem::new(format!("harness-context-skill:{}", skill.entry.display()))
+                    .w_full()
+                    .px(metrics::row_pad())
+                    .py_1()
+                    .rounded(cx.theme().radius)
+                    .child(
+                        h_flex()
+                            .gap(metrics::gap())
+                            .items_center()
+                            .child(Icon::new(IconName::Bot).small())
+                            .child(div().flex_1().text_sm().child(skill.name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(skill.entry.display().to_string()),
+                            ),
+                    )
+                    .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+                        cx.emit(HarnessEvent::OpenFile {
+                            path: entry.clone(),
+                            preview: event.click_count() < 2,
+                        });
+                    }))
+            }));
+        }
+
+        content.into_any_element()
+    }
+
+    fn render_context_summary(&self, cx: &Context<Self>) -> AnyElement {
+        let profile_id = self.profile_select.read(cx).selected_value().cloned();
+        let verified = profile_id.as_deref() == Some(CODEX_PROFILE_ID);
+        let status = if verified {
+            "Verified AGENTS instructions"
+        } else {
+            "Inventory only · no context resolution"
+        };
+        let current_codex_home = self.codex_home_input.read(cx).value().to_string();
+        let codex_home_source = if Path::new(&current_codex_home) != self.codex_home_default {
+            "Edited scenario input"
+        } else {
+            match self.codex_home_source {
+                CodexHomeSource::EnvironmentOverride => {
+                    "Explicit CODEX_HOME override; resolver diagnostics determine validity"
+                }
+                CodexHomeSource::UserHomeDefault => "Defaulted from <home>/.codex",
+                CodexHomeSource::HomeUnavailable => {
+                    "CODEX_HOME is unset and the platform home directory is unavailable"
+                }
+            }
+        };
+        v_flex()
+            .id("harness-context-summary")
+            .gap(metrics::row_gap())
+            .child(
+                h_flex()
+                    .gap(metrics::gap())
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if verified {
+                                cx.theme().info
+                            } else {
+                                cx.theme().warning
+                            })
+                            .child(status),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("harness-context-workspace")
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("Workspace: {}", self.root.display())),
+                    ),
+            )
+            .children(field(cx, "CODEX_HOME source", codex_home_source))
+            .into_any_element()
+    }
+
+    fn render_context_inspector(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(context) = &self.resolved_context else {
+            return v_flex()
+                .p(metrics::inset())
+                .gap(metrics::gap())
+                .child(context_section_heading(cx, "Effective source"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Select a resolved chain occurrence to inspect its provenance."),
+                )
+                .into_any_element();
+        };
+        let Some(identity) = &self.selected_context_source else {
+            return v_flex()
+                .p(metrics::inset())
+                .gap(metrics::gap())
+                .child(context_section_heading(cx, "Effective source"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("This result has no effective instruction occurrences."),
+                )
+                .into_any_element();
+        };
+        let Some((index, occurrence)) = context
+            .sources
+            .iter()
+            .enumerate()
+            .find(|(_, source)| ContextSourceIdentity::from(*source) == *identity)
+        else {
+            return div().into_any_element();
+        };
+        let path = occurrence.path.clone();
+        let duplicate_paths = context
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(other_index, source)| {
+                *other_index != index
+                    && occurrence.content_index.is_some()
+                    && source.content_index == occurrence.content_index
+            })
+            .map(|(other_index, source)| {
+                format!("{} · occurrence {}", source.path.display(), other_index + 1)
+            })
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .p(metrics::inset())
+            .gap(metrics::gap())
+            .child(context_section_heading(cx, "Effective source"))
+            .child(
+                h_flex()
+                    .gap(metrics::gap())
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_semibold()
+                            .child(format!("Occurrence {}", index + 1)),
+                    )
+                    .child(
+                        Button::new("harness-context-open-source")
+                            .label("Open source")
+                            .xsmall()
+                            .outline()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(HarnessEvent::OpenFile {
+                                    path: path.clone(),
+                                    preview: false,
+                                });
+                            })),
+                    ),
+            )
+            .children(field(cx, "Path", &occurrence.path.display().to_string()))
+            .children(field(cx, "Origin", occurrence.origin.label()))
+            .children(field(cx, "Rule", inclusion_rule_label(occurrence.rule)))
+            .children(field(cx, "Scope", &occurrence.scope.display().to_string()))
+            .children(
+                occurrence
+                    .physical_path
+                    .as_ref()
+                    .and_then(|path| field(cx, "Physical file", &path.display().to_string())),
+            )
+            .children(field(cx, "Raw bytes", &occurrence.raw_bytes.to_string()))
+            .children(field(
+                cx,
+                "Included bytes",
+                &occurrence.included_bytes.to_string(),
+            ))
+            .children(field(
+                cx,
+                "Project bytes before",
+                &occurrence.project_bytes_before.to_string(),
+            ))
+            .children(field(
+                cx,
+                "Truncated",
+                if occurrence.is_truncated() {
+                    "Yes"
+                } else {
+                    "No"
+                },
+            ))
+            .children((!duplicate_paths.is_empty()).then(|| {
+                v_flex()
+                    .gap(metrics::row_gap())
+                    .child(label(cx, "Same effective content also reached through"))
+                    .children(duplicate_paths.iter().map(|path| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(path.clone())
+                    }))
+            }))
+            .into_any_element()
+    }
+
     fn render_list(&self, cx: &Context<Self>) -> impl IntoElement {
         if self.skills.is_empty() {
             let hint = if self.scanning {
@@ -539,12 +1331,15 @@ impl HarnessView {
         match self.section {
             Section::Skills => self.render_inspector(cx),
             Section::Instructions => self.render_instruction_inspector(cx),
+            Section::Context => self.render_context_inspector(cx),
         }
     }
 
     /// Whether anything is selected, so the caller can skip an empty panel.
     pub fn has_selection(&self) -> bool {
-        self.selected_skill().is_some() || self.selected_instruction().is_some()
+        self.selected_skill().is_some()
+            || self.selected_instruction().is_some()
+            || self.selected_context_source.is_some()
     }
 
     fn render_inspector(&self, cx: &Context<Self>) -> AnyElement {
@@ -779,6 +1574,160 @@ fn group(skills: &[Skill], group_by: GroupBy) -> Vec<Row> {
     rows
 }
 
+fn default_codex_home() -> (PathBuf, CodexHomeSource) {
+    codex_home_default(std::env::var_os("CODEX_HOME"), dirs::home_dir())
+}
+
+fn target_parent_as_cwd(target: &Path) -> Option<PathBuf> {
+    target.parent().map(Path::to_path_buf)
+}
+
+fn codex_home_default(
+    codex_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> (PathBuf, CodexHomeSource) {
+    if let Some(codex_home) = codex_home.filter(|value| !value.is_empty()) {
+        return (
+            PathBuf::from(codex_home),
+            CodexHomeSource::EnvironmentOverride,
+        );
+    }
+    if let Some(home) = home {
+        return (home.join(".codex"), CodexHomeSource::UserHomeDefault);
+    }
+    (PathBuf::new(), CodexHomeSource::HomeUnavailable)
+}
+
+fn codex_home_is_override(source: CodexHomeSource, default: &Path, current: &Path) -> bool {
+    source == CodexHomeSource::EnvironmentOverride || current != default
+}
+
+fn split_config_names(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split(',').map(str::to_string).collect()
+    }
+}
+
+fn context_matches_input(input: Option<&ContextInput>, context: &ResolvedContext) -> bool {
+    context_input_matches(input, &context.input)
+}
+
+fn context_input_matches(input: Option<&ContextInput>, resolved_input: &ContextInput) -> bool {
+    input == Some(resolved_input)
+}
+
+fn context_source_element_id(source: &SourceOccurrence) -> String {
+    format!(
+        "harness-context-source:{:?}:{}:{}",
+        source.rule,
+        source.scope.display(),
+        source.path.display()
+    )
+}
+
+fn project_trust_label(trust: ProjectTrust) -> &'static str {
+    match trust {
+        ProjectTrust::Trusted => "Trusted",
+        ProjectTrust::Untrusted => "Untrusted",
+        ProjectTrust::Unspecified => "Unspecified",
+    }
+}
+
+fn resolution_status_label(status: ResolutionStatus) -> &'static str {
+    match status {
+        ResolutionStatus::Resolved => "Resolved",
+        ResolutionStatus::Partial => "Partial",
+        ResolutionStatus::InvalidInput => "Invalid input",
+        ResolutionStatus::InventoryOnly => "Inventory only",
+    }
+}
+
+fn inclusion_rule_label(rule: InclusionRule) -> &'static str {
+    match rule {
+        InclusionRule::GlobalOverride => "global override",
+        InclusionRule::GlobalAgents => "global AGENTS.md",
+        InclusionRule::ProjectOverride => "project override",
+        InclusionRule::ProjectAgents => "project AGENTS.md",
+        InclusionRule::ProjectFallback => "project fallback",
+    }
+}
+
+fn context_profile_choices() -> Vec<ContextProfileChoice> {
+    let mut choices = vec![ContextProfileChoice {
+        profile_id: CODEX_PROFILE_ID.to_string(),
+        supported: true,
+    }];
+    for harness in mt_core::agent_artifacts::harness::HARNESSES {
+        let profile_id = harness.id.to_string();
+        if !choices.iter().any(|choice| choice.profile_id == profile_id) {
+            choices.push(ContextProfileChoice {
+                profile_id,
+                supported: false,
+            });
+        }
+    }
+    choices
+}
+
+fn context_profile_selector(
+    state: &Entity<SelectState<SearchableVec<ContextProfileChoice>>>,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .gap_0p5()
+        .child(label(cx, "Harness profile"))
+        .child(
+            Select::new(state)
+                .id("harness-context-profile")
+                .placeholder("Choose a harness profile")
+                .accessibility_label("Harness profile")
+                .search_placeholder("Search profiles"),
+        )
+        .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Only codex-agents-md-2026-08-29 resolves automatic AGENTS instructions; other Harness entries are inventory-only.",
+                    ),
+        )
+        .into_any_element()
+}
+
+fn context_input_field(
+    input: &Entity<InputState>,
+    name: &str,
+    id: &str,
+    help: &str,
+    cx: &App,
+) -> impl IntoElement {
+    v_flex()
+        .gap_0p5()
+        .child(label(cx, name))
+        .child(
+            Input::new(input)
+                .id(SharedString::from(id.to_string()))
+                .accessibility_id(id)
+                .aria_label(name),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(help.to_string()),
+        )
+}
+
+fn context_section_heading(cx: &App, text: &str) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_medium()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.to_string())
+}
+
 fn field(cx: &App, name: &str, value: &str) -> Option<AnyElement> {
     if value.is_empty() {
         return None;
@@ -867,7 +1816,13 @@ impl Render for HarnessView {
                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
                         this.set_section(Section::ALL[*ix], cx);
                     }))
-                    .children(Section::ALL.map(|s| Tab::new().label(i18n::t(s.label(), cx)))),
+                    .children(Section::ALL.map(|s| {
+                        Tab::new().label(
+                            s.label()
+                                .map(|key| i18n::t(key, cx).to_string())
+                                .unwrap_or_else(|| "Context".to_string()),
+                        )
+                    })),
             )
             .child(
                 h_flex()
@@ -886,6 +1841,12 @@ impl Render for HarnessView {
                                 Section::Instructions => {
                                     format!("INSTRUCTIONS ({})", self.instructions.len())
                                 }
+                                Section::Context => format!(
+                                    "EFFECTIVE CONTEXT ({})",
+                                    self.resolved_context
+                                        .as_ref()
+                                        .map_or(0, |context| context.sources.len())
+                                ),
                             }),
                     )
                     .when(section == Section::Skills && invalid > 0, |this| {
@@ -951,12 +1912,14 @@ impl Render for HarnessView {
             .child(
                 div()
                     .id("harness-list")
+                    .test_support()
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .map(|this| match section {
                         Section::Skills => this.child(self.render_list(cx)),
                         Section::Instructions => this.child(self.render_instructions(cx)),
+                        Section::Context => this.child(self.render_context_panel(cx)),
                     }),
             )
     }
@@ -967,11 +1930,20 @@ mod tests {
     // Import selectively: the `gpui_kit::*` glob above re-exports a `test`
     // attribute macro that shadows the built-in one and blows the recursion
     // limit.
-    use super::{Row, Section, artifacts_under, group, populated_section};
+    use super::{
+        CodexHomeSource, ContextSourceIdentity, HarnessView, Row, Section, artifacts_under,
+        codex_home_default, codex_home_is_override, context_input_matches, context_profile_choices,
+        context_source_element_id, group, populated_section, split_config_names,
+        target_parent_as_cwd,
+    };
+    use mt_core::agent_artifacts::context::{
+        ContextContent, ContextInput, ContextProfile, InclusionRule, ProjectTrust,
+        ResolutionStatus, ResolvedContext, SourceOccurrence,
+    };
     use mt_core::agent_artifacts::skill::{Skill, SkillMeta};
     use mt_core::settings::GroupBy;
     use mt_core::{Diagnostic, DocType, Instruction, Origin};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn both_sections_are_reachable_and_named_distinctly() {
@@ -981,8 +1953,13 @@ mod tests {
         use crate::i18n::{Key, text};
         use mt_core::settings::Language;
 
-        let keys: Vec<Key> = Section::ALL.iter().map(|s| s.label()).collect();
+        let keys: Vec<Key> = [Section::Skills, Section::Instructions]
+            .into_iter()
+            .filter_map(Section::label)
+            .collect();
         assert_eq!(keys.len(), 2);
+        assert_eq!(Section::ALL.len(), 3);
+        assert!(Section::ALL.contains(&Section::Context));
         assert_ne!(keys[0], keys[1], "the two sections share a label key");
         // …and the strings behind them differ in every language, which is what
         // the user actually sees.
@@ -1159,5 +2136,297 @@ mod tests {
             SPINNER_FLOOR <= Duration::from_millis(500),
             "a floor long enough to notice as a delay would make rescan feel slow"
         );
+    }
+
+    fn context_input() -> ContextInput {
+        ContextInput {
+            workspace: PathBuf::from("/workspace"),
+            target: PathBuf::from("/workspace/task.md"),
+            cwd: PathBuf::from("/workspace"),
+            profile_id: super::CODEX_PROFILE_ID.to_string(),
+            codex_home: PathBuf::from("/home/user/.codex"),
+            codex_home_override: false,
+            fallback_filenames: Vec::new(),
+            project_doc_max_bytes: 32_768,
+            project_root_markers: vec![".git".to_string()],
+            project_trust: ProjectTrust::Unspecified,
+        }
+    }
+
+    #[test]
+    fn stale_resolution_identity_rejects_target_and_configuration_changes() {
+        let input = context_input();
+        assert!(context_input_matches(Some(&input), &input));
+        assert!(!context_input_matches(None, &input));
+
+        let mut changed_target = input.clone();
+        changed_target.target = PathBuf::from("/workspace/other.md");
+        assert!(!context_input_matches(Some(&input), &changed_target));
+
+        let mut changed_cwd = input.clone();
+        changed_cwd.cwd = PathBuf::from("/workspace/nested");
+        assert!(!context_input_matches(Some(&input), &changed_cwd));
+
+        let mut changed_config = input.clone();
+        changed_config.project_doc_max_bytes = 16_384;
+        assert!(!context_input_matches(Some(&input), &changed_config));
+    }
+
+    #[test]
+    fn context_source_element_identity_tracks_path_and_provenance() {
+        let source = SourceOccurrence {
+            path: PathBuf::from("/workspace/AGENTS.md"),
+            physical_path: None,
+            origin: Origin::Workspace,
+            scope: PathBuf::from("/workspace"),
+            rule: InclusionRule::ProjectAgents,
+            raw_bytes: 8,
+            included_bytes: 8,
+            project_bytes_before: 0,
+            content_index: Some(0),
+        };
+        let same_identity = SourceOccurrence {
+            path: source.path.clone(),
+            ..source.clone()
+        };
+        let alias = SourceOccurrence {
+            path: PathBuf::from("/workspace/nested/AGENTS.md"),
+            scope: PathBuf::from("/workspace/nested"),
+            ..source.clone()
+        };
+
+        assert_eq!(
+            ContextSourceIdentity::from(&source),
+            ContextSourceIdentity::from(&same_identity)
+        );
+        assert_eq!(
+            context_source_element_id(&source),
+            context_source_element_id(&same_identity)
+        );
+        assert_ne!(
+            context_source_element_id(&source),
+            context_source_element_id(&alias)
+        );
+    }
+
+    #[test]
+    fn context_name_inputs_keep_order_and_leave_normalization_to_the_profile() {
+        assert!(split_config_names("").is_empty());
+        assert_eq!(
+            split_config_names("AGENTS.md, TEAM.md,,"),
+            vec!["AGENTS.md", " TEAM.md", "", ""]
+        );
+    }
+
+    #[test]
+    fn profile_selector_supports_only_the_frozen_snapshot() {
+        let choices = context_profile_choices();
+        assert_eq!(
+            choices.first().map(|choice| choice.profile_id.as_str()),
+            Some(super::CODEX_PROFILE_ID)
+        );
+        assert!(choices[0].supported);
+        assert!(choices[1..].iter().all(|choice| !choice.supported));
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.profile_id == "codex" && !choice.supported)
+        );
+        let mut ids: Vec<_> = choices
+            .iter()
+            .map(|choice| choice.profile_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), choices.len());
+    }
+
+    #[test]
+    fn explicit_codex_home_is_preserved_exactly_instead_of_using_home_default() {
+        let override_value = std::ffi::OsString::from("  invalid-codex-home  ");
+        let (path, source) = codex_home_default(
+            Some(override_value.clone()),
+            Some(PathBuf::from("/home/user")),
+        );
+
+        assert_eq!(path, PathBuf::from(override_value));
+        assert_eq!(source, CodexHomeSource::EnvironmentOverride);
+    }
+
+    #[test]
+    fn codex_home_default_distinguishes_missing_environment_and_missing_home() {
+        assert_eq!(
+            codex_home_default(None, Some(PathBuf::from("/home/user"))),
+            (
+                PathBuf::from("/home/user/.codex"),
+                CodexHomeSource::UserHomeDefault
+            )
+        );
+        assert_eq!(
+            codex_home_default(None, None),
+            (PathBuf::new(), CodexHomeSource::HomeUnavailable)
+        );
+        assert_eq!(
+            codex_home_default(
+                Some(std::ffi::OsString::new()),
+                Some(PathBuf::from("/home/user"))
+            ),
+            (
+                PathBuf::from("/home/user/.codex"),
+                CodexHomeSource::UserHomeDefault
+            )
+        );
+    }
+
+    #[test]
+    fn codex_home_edit_is_explicit_and_environment_override_provenance_is_retained() {
+        let default = PathBuf::from("/home/user/.codex");
+        assert!(!codex_home_is_override(
+            CodexHomeSource::UserHomeDefault,
+            &default,
+            &default
+        ));
+        assert!(codex_home_is_override(
+            CodexHomeSource::UserHomeDefault,
+            &default,
+            Path::new("/tmp/custom-codex")
+        ));
+        assert!(codex_home_is_override(
+            CodexHomeSource::EnvironmentOverride,
+            &default,
+            &default
+        ));
+    }
+
+    #[test]
+    fn target_parent_cwd_action_uses_the_lexical_file_parent() {
+        let target = PathBuf::from("workspace").join("src").join("auth.rs");
+        assert_eq!(
+            target_parent_as_cwd(&target),
+            Some(PathBuf::from("workspace").join("src"))
+        );
+        assert_eq!(
+            target,
+            PathBuf::from("workspace").join("src").join("auth.rs")
+        );
+    }
+
+    #[test]
+    fn remote_scenario_inputs_never_acquire_context_watches() {
+        let mut input = context_input();
+        input.codex_home = PathBuf::from("\\\\context-test.invalid\\share\0");
+        let context = mt_core::agent_artifacts::context::resolve(&input, &[]);
+        assert_eq!(context.status, ResolutionStatus::InvalidInput);
+        assert!(
+            context
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.source == "context.unsupported-remote" })
+        );
+        assert!(context.watch_paths().is_empty());
+        assert!(context.watch_directories().is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn context_source_navigation_and_target_parent_action_keep_paths_independent(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::sync::{Arc, Mutex};
+
+        let directory = tempfile::tempdir().expect("workspace directory");
+        let root = directory.path().to_path_buf();
+        cx.update(|app| {
+            gpui_kit::init(app);
+            crate::settings::AppSettings::init(app);
+        });
+        let root_for_view = root.clone();
+        let skill_cache = Arc::new(Mutex::new(
+            mt_core::agent_artifacts::skill::DiscoveryCache::default(),
+        ));
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            HarnessView::new(root_for_view, skill_cache, window, cx)
+        });
+        let input = view.read_with(cx, |view, _| {
+            view.context_input().expect("initial input").clone()
+        });
+        let source = SourceOccurrence {
+            path: root.join("AGENTS.md"),
+            physical_path: None,
+            origin: Origin::Workspace,
+            scope: root.clone(),
+            rule: InclusionRule::ProjectAgents,
+            raw_bytes: 8,
+            included_bytes: 8,
+            project_bytes_before: 0,
+            content_index: Some(0),
+        };
+        let resolved = ResolvedContext {
+            input: input.clone(),
+            profile: Some(ContextProfile::codex()),
+            project_root: Some(root.clone()),
+            status: ResolutionStatus::Resolved,
+            assumptions: Vec::new(),
+            discovery_digest: None,
+            sources: vec![source.clone()],
+            contents: vec![ContextContent {
+                text: "context fixture".to_string(),
+            }],
+            diagnostics: Vec::new(),
+            available_skills: Vec::new(),
+        };
+        view.update(cx, |view, cx| {
+            view.set_section(Section::Context, cx);
+            assert!(view.apply_resolved_context(resolved, cx));
+        });
+
+        let source_id = context_source_element_id(&source);
+        let target = root.join("src/auth.rs");
+        let target_text = target.to_string_lossy().to_string();
+        cx.update(|window, app| {
+            window.render_frame(app);
+            window.scroll(
+                "harness-list",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                    gpui_kit::px(0.),
+                    gpui_kit::px(-2_000.),
+                )),
+                app,
+            );
+            window.render_frame(app);
+            window.click(gpui_kit::SharedString::from(source_id.clone()), app);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, app| {
+            assert_eq!(view.selected_target(app), root);
+            assert!(view.resolved_context().is_some());
+        });
+
+        cx.update(|window, app| {
+            window.scroll(
+                "harness-list",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                    gpui_kit::px(0.),
+                    gpui_kit::px(2_000.),
+                )),
+                app,
+            );
+            window.render_frame(app);
+            window.click("harness-context-target", app);
+            window.press("ctrl-a", app);
+            window.input(&target_text, app);
+            window.render_frame(app);
+            window.click("harness-context-use-target-parent-as-cwd", app);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, app| {
+            assert_eq!(view.selected_target(app), target);
+            assert_eq!(
+                view.context_input().expect("updated input").cwd,
+                target.parent().expect("file target parent")
+            );
+            assert!(view.resolved_context().is_none());
+        });
     }
 }
