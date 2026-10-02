@@ -44,6 +44,7 @@ pub struct Watcher {
     rx: Receiver<Vec<DebouncedEvent>>,
     root: PathBuf,
     document_directories: HashSet<PathBuf>,
+    context_paths: HashSet<PathBuf>,
 }
 
 /// Debounce window. Long enough to coalesce an agent's multi-file write, short
@@ -86,6 +87,7 @@ impl Watcher {
             rx,
             root: root.to_path_buf(),
             document_directories: HashSet::new(),
+            context_paths: HashSet::new(),
         })
     }
 
@@ -125,6 +127,17 @@ impl Watcher {
         Ok(())
     }
 
+    /// Replace the exact context candidate and root-marker paths to report,
+    /// including missing paths and paths normally filtered as noise.
+    ///
+    /// This does not add watches or include descendants. The workspace must
+    /// combine these paths' parents with open-document directories when calling
+    /// [`Self::sync_document_directories`]. Paths must use the same spelling as
+    /// the watched paths so they match filesystem events.
+    pub fn sync_context_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.context_paths = paths.into_iter().collect();
+    }
+
     /// Drain pending changes without blocking.
     ///
     /// Returns an empty vec when nothing happened, so this is safe to poll from
@@ -133,7 +146,12 @@ impl Watcher {
         let mut changes = Vec::new();
         while let Ok(events) = self.rx.try_recv() {
             for event in events {
-                changes.extend(classify(&event, &self.root, &self.document_directories));
+                changes.extend(classify(
+                    &event,
+                    &self.root,
+                    &self.document_directories,
+                    &self.context_paths,
+                ));
             }
         }
         dedup(changes)
@@ -144,7 +162,8 @@ impl Watcher {
     }
 }
 
-/// Directory churn a workspace watcher never reports.
+/// Directory churn a workspace watcher filters unless an exact context path
+/// has been registered.
 ///
 /// Without it, a `cargo build` or an `npm install` inside the workspace floods
 /// the UI with reload prompts. The list is [`super::walk::SKIP_DIRS`] — a
@@ -158,6 +177,7 @@ fn classify(
     event: &DebouncedEvent,
     root: &Path,
     document_directories: &HashSet<PathBuf>,
+    context_paths: &HashSet<PathBuf>,
 ) -> Vec<Change> {
     use notify::EventKind;
 
@@ -165,6 +185,9 @@ fn classify(
         .paths
         .iter()
         .filter(|path| {
+            if context_paths.contains(path.as_path()) {
+                return true;
+            }
             let root = std::iter::once(root)
                 .chain(document_directories.iter().map(PathBuf::as_path))
                 .filter(|root| path.starts_with(root))
@@ -212,19 +235,142 @@ fn dedup(changes: Vec<Change>) -> Vec<Change> {
 mod tests {
     use super::*;
 
-    /// Wait for a change matching `pred`, or give up.
-    ///
-    /// Filesystem notifications are inherently asynchronous and platform
-    /// dependent, so polling with a deadline is the only reliable shape.
-    fn wait_for(watcher: &Watcher, pred: impl Fn(&Change) -> bool) -> Option<Change> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if let Some(found) = watcher.poll().into_iter().find(&pred) {
-                return Some(found);
-            }
-            std::thread::sleep(Duration::from_millis(50));
+    fn event(kind: notify::EventKind, paths: &[PathBuf]) -> DebouncedEvent {
+        let event = paths.iter().fold(notify::Event::new(kind), |event, path| {
+            event.add_path(path.clone())
+        });
+        DebouncedEvent::new(event, std::time::Instant::now())
+    }
+
+    #[test]
+    fn context_marker_creation_and_removal_bypass_noise_filtering() {
+        use notify::EventKind;
+        use notify::event::{CreateKind, RemoveKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".git");
+        let mut watcher = Watcher::new(dir.path()).unwrap();
+        watcher.sync_context_paths([marker.clone()]);
+        let (tx, rx) = channel();
+        watcher.rx = rx;
+
+        for kind in [
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Create(CreateKind::File),
+        ] {
+            tx.send(vec![event(kind, std::slice::from_ref(&marker))])
+                .unwrap();
+            assert_eq!(watcher.poll(), vec![Change::Created(marker.clone())]);
         }
-        None
+        for kind in [
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Remove(RemoveKind::File),
+        ] {
+            tx.send(vec![event(kind, std::slice::from_ref(&marker))])
+                .unwrap();
+            assert_eq!(watcher.poll(), vec![Change::Removed(marker.clone())]);
+        }
+    }
+
+    #[test]
+    fn context_marker_rename_reports_both_registered_paths() {
+        use notify::EventKind;
+        use notify::event::{ModifyKind, RenameMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join(".git");
+        let to = dir.path().join("nested/.git");
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::create_dir(&from).unwrap();
+        let context_paths = HashSet::from([from.clone(), to.clone()]);
+        let rename = event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[from.clone(), to.clone()],
+        );
+
+        std::fs::rename(&from, &to).unwrap();
+        assert_eq!(
+            classify(&rename, dir.path(), &HashSet::new(), &context_paths),
+            vec![Change::Removed(from.clone()), Change::Created(to.clone())]
+        );
+        std::fs::rename(&to, &from).unwrap();
+        assert_eq!(
+            classify(&rename, dir.path(), &HashSet::new(), &context_paths),
+            vec![Change::Created(from), Change::Removed(to)]
+        );
+    }
+
+    #[test]
+    fn context_paths_do_not_allow_descendants_or_unregistered_noise() {
+        use notify::EventKind;
+        use notify::event::ModifyKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".git");
+        let candidate = dir.path().join("node_modules/AGENTS.md");
+        let real = dir.path().join("real.md");
+        let changed = event(
+            EventKind::Modify(ModifyKind::Any),
+            &[
+                marker.clone(),
+                marker.join("HEAD"),
+                dir.path().join("nested/.git"),
+                candidate.clone(),
+                dir.path().join("node_modules/pkg.md"),
+                dir.path().join(".venv/AGENTS.md"),
+                real.clone(),
+            ],
+        );
+        let mut watcher = Watcher::new(dir.path()).unwrap();
+        let (tx, rx) = channel();
+        watcher.rx = rx;
+        watcher.sync_context_paths([marker.clone(), candidate.clone()]);
+        tx.send(vec![changed.clone()]).unwrap();
+        assert_eq!(
+            watcher.poll(),
+            vec![
+                Change::Modified(marker),
+                Change::Modified(candidate.clone()),
+                Change::Modified(real.clone()),
+            ]
+        );
+
+        watcher.sync_context_paths([candidate.clone()]);
+        tx.send(vec![changed.clone()]).unwrap();
+        assert_eq!(
+            watcher.poll(),
+            vec![Change::Modified(candidate), Change::Modified(real.clone())]
+        );
+        watcher.sync_context_paths([]);
+        tx.send(vec![changed]).unwrap();
+        assert_eq!(watcher.poll(), vec![Change::Modified(real)]);
+    }
+
+    /// Receive the exact change from the channel registered before the write.
+    fn receive_change(watcher: &Watcher, expected: &Change) -> Change {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let events = watcher
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("expected filesystem notification before the deadline");
+            let changes = dedup(
+                events
+                    .iter()
+                    .flat_map(|event| {
+                        classify(
+                            event,
+                            &watcher.root,
+                            &watcher.document_directories,
+                            &watcher.context_paths,
+                        )
+                    })
+                    .collect(),
+            );
+            if let Some(found) = changes.into_iter().find(|change| change == expected) {
+                return found;
+            }
+        }
     }
 
     #[test]
@@ -234,12 +380,10 @@ mod tests {
         std::fs::write(&path, "one\n").unwrap();
 
         let watcher = Watcher::new(dir.path()).unwrap();
-        // Let the watcher establish itself before mutating.
-        std::thread::sleep(Duration::from_millis(200));
         std::fs::write(&path, "two\n").unwrap();
 
-        let change = wait_for(&watcher, |c| c.path().ends_with("a.md"));
-        assert!(change.is_some(), "expected a change for a.md");
+        let expected = Change::Modified(path);
+        assert_eq!(receive_change(&watcher, &expected), expected);
     }
 
     #[test]
@@ -253,14 +397,10 @@ mod tests {
         watcher
             .sync_document_directories([external.path().to_path_buf()])
             .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
         std::fs::write(&path, "two\n").unwrap();
 
-        let change = wait_for(&watcher, |c| c.path().ends_with("saved-as.md"));
-        assert!(
-            change.is_some(),
-            "expected a change outside the primary root"
-        );
+        let expected = Change::Modified(path);
+        assert_eq!(receive_change(&watcher, &expected), expected);
     }
 
     #[test]
@@ -284,21 +424,15 @@ mod tests {
 
     #[test]
     fn ignores_noise_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
-        let watcher = Watcher::new(dir.path()).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        std::fs::write(dir.path().join("node_modules/pkg.md"), "x").unwrap();
-        std::fs::write(dir.path().join("real.md"), "x").unwrap();
-
-        let change = wait_for(&watcher, |c| c.path().ends_with("real.md"));
-        assert!(change.is_some(), "real file must be reported");
-        // And nothing from node_modules ever surfaced.
-        assert!(
-            watcher
-                .poll()
-                .iter()
-                .all(|c| !c.path().to_string_lossy().contains("node_modules"))
+        let root = Path::new("/w");
+        let real = root.join("real.md");
+        let created = event(
+            notify::EventKind::Create(notify::event::CreateKind::File),
+            &[root.join("node_modules/pkg.md"), real.clone()],
+        );
+        assert_eq!(
+            classify(&created, root, &HashSet::new(), &HashSet::new()),
+            vec![Change::Created(real)]
         );
     }
 
