@@ -1,0 +1,16 @@
+{
+  "cwd": "nested/deep",
+  "target": "nested/deep/task.md",
+  "fallbacks": [" ", " TEAM.md ", "TEAM.md", "SECOND.md"],
+  "files": {
+    "home/AGENTS.override.md": " \n\t",
+    "home/AGENTS.md": " GLOBAL_FALLBACK_SENTINEL ",
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/AGENTS.override.md": " \n\t",
+    "workspace/AGENTS.md": "SUPPRESSED_AGENTS_SENTINEL",
+    "workspace/TEAM.md": "SUPPRESSED_FALLBACK_SENTINEL",
+    "workspace/nested/TEAM.md": "TEAM_SENTINEL",
+    "workspace/nested/SECOND.md": "SECOND_SENTINEL",
+    "workspace/nested/deep/task.md": "TASK_SENTINEL"
+  }
+}
