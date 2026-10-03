@@ -1,4 +1,5 @@
 use super::super::review::ReviewFlow;
+use crate::i18n;
 use mt_core::agent_artifacts::context::{CODEX_PROFILE_ID, ContextInput, ProjectTrust, resolve};
 use mt_core::agent_artifacts::package::ReviewTarget;
 use mt_core::document::lifecycle::{AsyncSnapshot, DocumentId};
@@ -364,13 +365,29 @@ fn effective_context_original_editable_source_uses_snapshot_safety_not_supportin
     assert!(!flow.revision_context_is_current(Some(document), Some(&changed), true));
 }
 
-// Compiled with the app tests; execution is reserved for the integrated GUI milestone.
 #[gpui_kit::test]
-fn kit_effective_context_controls_select_without_sending_and_navigation_does_not_retarget(
+fn kit_effective_context_controls_fit_review_pane_and_keep_source_identity(
     cx: &mut gpui_kit::TestAppContext,
 ) {
     use gpui_kit::test::TestWindowExt as _;
-    let (_directory, input) = context_fixture();
+    let (_directory, mut input) = context_fixture();
+    let long_workspace = input
+        .workspace
+        .join("effective-context-source-with-a-long-directory-name")
+        .join("another-long-directory-component-for-pane-regression");
+    fs::create_dir_all(long_workspace.join(".git")).unwrap();
+    fs::write(long_workspace.join("document.md"), "# Artifact\n").unwrap();
+    fs::write(
+        long_workspace.join("AGENTS.md"),
+        "Preserve source identity.\n",
+    )
+    .unwrap();
+    input.workspace = fs::canonicalize(long_workspace).unwrap();
+    input.cwd = input.workspace.clone();
+    input.target = input.workspace.join("document.md");
+    let source_path = input.workspace.join("AGENTS.md");
+    let source_path = source_path.display().to_string();
+    assert!(source_path.len() > 100);
     let (workspace, cx) = super::open_test_workspace(cx, input.target.clone());
     workspace.update(cx, |workspace, cx| {
         install_context(&mut workspace.review_flow, &input);
@@ -390,7 +407,46 @@ fn kit_effective_context_controls_select_without_sending_and_navigation_does_not
     });
     cx.update(|window, app| {
         window.render_frame(app);
+        let panel = window.find("review-panel").bounds();
+        let source = window.find("review-context-source-1");
+        let open = window.find("review-context-open-1");
+        assert!(source.visible());
+        assert!(open.visible());
+        assert_eq!(
+            source.label(),
+            Some(
+                format!(
+                    "{}: {source_path}",
+                    i18n::effective_context_choice_label(false, app)
+                )
+                .as_str()
+            )
+        );
+        for control in [source.bounds(), open.bounds()] {
+            assert!(control.origin.x >= panel.origin.x);
+            assert!(control.origin.y >= panel.origin.y);
+            assert!(control.origin.x + control.size.width <= panel.origin.x + panel.size.width);
+            assert!(control.origin.y + control.size.height <= panel.origin.y + panel.size.height);
+        }
         window.click("review-context-source-1", app);
+        window.render_frame(app);
+        let source = window.find("review-context-source-1");
+        assert_eq!(
+            source.label(),
+            Some(
+                format!(
+                    "{}: {source_path}",
+                    i18n::effective_context_choice_label(true, app)
+                )
+                .as_str()
+            )
+        );
+        let panel = window.find("review-panel").bounds();
+        let bounds = source.bounds();
+        assert!(bounds.origin.x >= panel.origin.x);
+        assert!(bounds.origin.y >= panel.origin.y);
+        assert!(bounds.origin.x + bounds.size.width <= panel.origin.x + panel.size.width);
+        assert!(bounds.origin.y + bounds.size.height <= panel.origin.y + panel.size.height);
     });
     workspace.read_with(cx, |workspace, _| {
         assert!(

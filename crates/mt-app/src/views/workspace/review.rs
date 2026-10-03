@@ -25,6 +25,8 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
+#[cfg(test)]
+use gpui_kit::test::TestSupportExt as _;
 use gpui_kit::*;
 use mt_core::agent_artifacts::context::{ContextInput, ResolvedContext, SelectedContext, resolve};
 use mt_core::agent_artifacts::package::{
@@ -1660,14 +1662,26 @@ impl Workspace {
         {
             for (index, source) in context.sources.iter().enumerate() {
                 let path = source.path.clone();
+                let full_path = path.display().to_string();
+                let visible_path = path.file_name().map_or_else(
+                    || full_path.clone(),
+                    |file_name| {
+                        path.parent().and_then(Path::file_name).map_or_else(
+                            || file_name.to_string_lossy().into_owned(),
+                            |parent| Path::new(parent).join(file_name).display().to_string(),
+                        )
+                    },
+                );
                 let selected = document_id
                     .and_then(|id| self.review_flow.context_choices.get(&id))
                     .is_some_and(|choices| choices.contains(&index));
                 let selectable = context.select_sources(&[index]).is_ok();
+                let choice_label = i18n::effective_context_choice_label(selected, cx);
                 content.push(
                     h_flex()
+                        .w_full()
+                        .min_w_0()
                         .gap(metrics::gap())
-                        .flex_wrap()
                         .child(
                             Button::new(SharedString::from(format!(
                                 "review-context-source-{index}"
@@ -1675,12 +1689,12 @@ impl Workspace {
                             .accessibility_id(SharedString::from(format!(
                                 "markturbo-review-context-source-{index}"
                             )))
-                            .label(format!(
-                                "{}: {}",
-                                i18n::effective_context_choice_label(selected, cx),
-                                source.path.display()
-                            ))
+                            .label(format!("{choice_label}: {visible_path}"))
+                            .accessibility_label(format!("{choice_label}: {full_path}"))
+                            .tooltip(full_path)
                             .small()
+                            .flex_1()
+                            .min_w_0()
                             .disabled(
                                 !selectable
                                     || self.review_flow.is_reviewing()
@@ -1718,6 +1732,8 @@ impl Workspace {
         }
         v_flex()
             .id("review-context-choices")
+            .w_full()
+            .min_w_0()
             .gap(metrics::gap())
             .children(content)
             .into_any_element()
@@ -3503,12 +3519,15 @@ impl Workspace {
             self.review_flow
                 .review_target_for_document(document.read(cx).id())
         });
-        v_flex()
+        let panel = v_flex()
             .id("review-panel")
             .size_full()
             .p(metrics::inset())
             .gap(metrics::gap_group())
-            .overflow_y_scroll()
+            .overflow_y_scroll();
+        #[cfg(test)]
+        let panel = panel.test_support();
+        panel
             .child(
                 div()
                     .text_sm()
