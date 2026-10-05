@@ -1481,7 +1481,7 @@ fn document_outbound_scope(
                 .outbound_scope(),
         );
     }
-    let byte_size = request.outbound_bytes().len() as u64;
+    let byte_size = request.outbound_text().map_or(0, str::len) as u64;
     if let Some(context) = &request.effective_agent_context {
         let scope = OutboundScope::document_with_effective_agent_context(
             byte_size,

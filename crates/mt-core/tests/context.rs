@@ -671,6 +671,84 @@ fn no_marker_empty_markers_and_nearest_marker_use_execution_cwd() {
 }
 
 #[test]
+fn no_marker_watches_probed_ancestors_until_a_new_marker_expands_the_chain() {
+    let mut fixture = Fixture::load("deep");
+    // A fixture-specific name makes this independent of markers above the
+    // platform temp directory, without changing the process's filesystem.
+    let marker = format!(
+        ".context-root-{}",
+        fixture
+            .temp
+            .path()
+            .file_name()
+            .expect("unique fixture name")
+            .to_string_lossy()
+    );
+    fixture.input.project_root_markers = vec![marker.clone()];
+    fixture.input.fallback_filenames = vec!["docs/TEAM.md".to_string()];
+    fs::create_dir(fixture.input.workspace.join("docs")).expect("ancestor fallback directory");
+    write(&fixture.input.cwd.join("AGENTS.md"), "CWD_SENTINEL");
+    let context = fixture.resolve();
+    assert_eq!(context.project_root, Some(fixture.input.cwd.clone()));
+    assert_eq!(context.automatic_text(), "CWD_SENTINEL");
+    let selected = context.select_sources(&[0]).expect("cwd-only selection");
+    let paths = context.watch_paths();
+    let directories = context.watch_directories();
+    for ancestor in fixture.input.cwd.ancestors() {
+        assert!(paths.contains(&ancestor.join(&marker)));
+        assert!(directories.contains(&ancestor.to_path_buf()));
+    }
+    assert!(!paths.contains(&fixture.input.workspace.join("AGENTS.md")));
+    assert!(!paths.contains(&fixture.input.workspace.join("docs/TEAM.md")));
+    assert!(!directories.contains(&fixture.input.workspace.join("docs")));
+
+    let new_marker = fixture.input.workspace.join(&marker);
+    write(&new_marker, "NEW_MARKER_SENTINEL");
+    assert!(
+        paths.contains(&new_marker),
+        "marker creation must be an exact context event"
+    );
+    assert!(selected.revalidate().is_err());
+    let current = fixture.resolve();
+    assert_eq!(current.project_root, Some(fixture.input.workspace.clone()));
+    assert_eq!(
+        current.automatic_text(),
+        "ROOT_SENTINEL\n\nNESTED_SENTINEL\n\nCWD_SENTINEL"
+    );
+    assert!(
+        !current
+            .watch_paths()
+            .contains(&fixture.temp.path().join(&marker))
+    );
+    assert!(
+        !current
+            .watch_directories()
+            .contains(&fixture.temp.path().to_path_buf())
+    );
+}
+
+#[test]
+fn empty_marker_configuration_adds_no_ancestor_marker_or_instruction_watches() {
+    let mut fixture = Fixture::load("deep");
+    fixture.input.project_root_markers.clear();
+    let context = fixture.resolve();
+    let paths = context.watch_paths();
+    assert!(
+        fixture
+            .input
+            .cwd
+            .ancestors()
+            .all(|ancestor| !paths.contains(&ancestor.join(".git")))
+    );
+    assert!(!paths.contains(&fixture.input.workspace.join("AGENTS.md")));
+    assert!(
+        !context
+            .watch_directories()
+            .contains(&fixture.temp.path().to_path_buf())
+    );
+}
+
+#[test]
 fn discovery_candidates_content_and_root_changes_invalidate_same_input_selection() {
     for change in ["override", "fallback", "root", "content", "global"] {
         let mut fixture = Fixture::load("removed");
@@ -1137,6 +1215,219 @@ fn known_remote_link_targets_are_not_followed_for_inputs_candidates_or_markers()
     assert_eq!(context.status, ResolutionStatus::InvalidInput);
     assert!(has_diagnostic(&context, "context.unsupported-remote"));
     assert!(context.sources.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn chained_remote_links_and_target_ancestors_are_rejected_offline() {
+    use std::os::unix::fs::symlink;
+
+    for kind in ["file", "directory", "target-ancestor"] {
+        let mut fixture = Fixture::load("removed");
+        let remote = fixture.input.cwd.join("remote-alias");
+        let local = fixture.input.cwd.join("local-alias");
+        // Backslashes are ordinary filename bytes on Unix, so even a broken
+        // guard cannot reach a network filesystem through this fixture.
+        symlink(r"\\offline.invalid\share", &remote).expect("offline remote spelling");
+        let target = if kind == "target-ancestor" {
+            "remote-alias/child"
+        } else {
+            "remote-alias"
+        };
+        symlink(target, &local).expect("relative local-looking hop");
+        if kind == "file" {
+            symlink("local-alias", fixture.input.cwd.join("AGENTS.md"))
+                .expect("built-in instruction link");
+        } else {
+            fixture.input.fallback_filenames = vec!["local-alias/AGENTS.md".to_string()];
+        }
+        let context = fixture.resolve();
+        assert_eq!(context.status, ResolutionStatus::Partial, "{kind}");
+        assert!(
+            context.diagnostics.iter().any(|diagnostic| {
+                diagnostic.source == "context.unsupported-remote"
+                    && diagnostic.severity == Severity::Error
+            }),
+            "{kind}"
+        );
+        assert!(has_diagnostic(&context, "context.project-unavailable"));
+        assert!(context.contents.is_empty());
+        assert!(
+            !context
+                .watch_paths()
+                .iter()
+                .any(|path| path.starts_with(r"\\offline.invalid\share"))
+        );
+        assert!(
+            !context
+                .watch_directories()
+                .iter()
+                .any(|path| path.starts_with(r"\\offline.invalid\share"))
+        );
+
+        if kind == "file" {
+            fs::remove_file(fixture.input.cwd.join("AGENTS.md")).expect("remove instruction link");
+        }
+        fixture.input.fallback_filenames.clear();
+        fixture.input.project_root_markers =
+            vec!["local-alias/marker".to_string(), ".git".to_string()];
+        let context = fixture.resolve();
+        assert_eq!(context.status, ResolutionStatus::Resolved);
+        assert!(context.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source == "context.unsupported-remote"
+                && diagnostic.severity == Severity::Warning
+        }));
+        assert!(
+            context
+                .select_sources(&[0])
+                .expect("local source after remote marker")
+                .revalidate()
+                .is_ok()
+        );
+
+        fixture.input.project_root_markers = vec![".git".to_string()];
+        symlink(&local, fixture.input.codex_home.join("AGENTS.md")).expect("global linked source");
+        let context = fixture.resolve();
+        assert_eq!(context.status, ResolutionStatus::Resolved);
+        assert!(context.diagnostics.iter().any(|diagnostic| {
+            diagnostic.source == "context.unsupported-remote"
+                && diagnostic.severity == Severity::Warning
+        }));
+        assert_eq!(context.automatic_text(), "REMOVABLE_SENTINEL");
+
+        for field in ["workspace", "target", "cwd", "home"] {
+            let mut input = fixture.input.clone();
+            match field {
+                "workspace" => input.workspace = local.clone(),
+                "target" => input.target = local.join("task.md"),
+                "cwd" => input.cwd = local.clone(),
+                "home" => input.codex_home = local.clone(),
+                _ => unreachable!("fixed input fields"),
+            }
+            let context = resolve(&input, &[]);
+            assert_eq!(
+                context.status,
+                ResolutionStatus::InvalidInput,
+                "{kind}: {field}"
+            );
+            assert!(
+                has_diagnostic(&context, "context.unsupported-remote"),
+                "{kind}: {field}"
+            );
+            assert!(context.sources.is_empty());
+        }
+    }
+}
+
+#[test]
+fn chained_local_directory_aliases_preserve_lexical_sources_and_revalidation() {
+    let mut fixture = Fixture::load("deep");
+    let second = fixture.temp.path().join("second-alias");
+    let first = fixture.temp.path().join("first-alias");
+    directory_alias(&fixture.input.workspace, &second);
+    directory_alias(&second.join("nested"), &first);
+    fixture.input.codex_home = first.clone();
+    let context = fixture.resolve();
+    assert_eq!(context.status, ResolutionStatus::Resolved);
+    assert_eq!(context.sources[0].path, first.join("AGENTS.md"));
+    assert_eq!(
+        context.sources[0].physical_path,
+        context.sources[2].physical_path
+    );
+    assert_eq!(
+        context.automatic_text(),
+        "NESTED_SENTINEL\n\n--- project-doc ---\n\nROOT_SENTINEL\n\nNESTED_SENTINEL"
+    );
+    assert!(
+        context
+            .select_sources(&[0, 1, 2])
+            .expect("chained local aliases")
+            .revalidate()
+            .is_ok()
+    );
+    assert!(context.watch_paths().contains(&first.join("AGENTS.md")));
+    remove_directory_alias(&first);
+    remove_directory_alias(&second);
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_link_targets_keep_parent_traversal_and_finite_repeated_links() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::load("removed");
+    symlink("../AGENTS.md", fixture.input.cwd.join("relative-source"))
+        .expect("relative instruction target");
+    symlink("relative-source", fixture.input.cwd.join("AGENTS.md"))
+        .expect("relative instruction chain");
+    let context = fixture.resolve();
+    assert_eq!(context.status, ResolutionStatus::Resolved);
+    assert_eq!(context.sources.len(), 2);
+    assert_eq!(
+        context.sources[0].physical_path,
+        context.sources[1].physical_path
+    );
+    assert!(
+        context
+            .select_sources(&[0, 1])
+            .expect("relative source chain")
+            .revalidate()
+            .is_ok()
+    );
+
+    fs::remove_file(fixture.input.cwd.join("AGENTS.md")).expect("remove relative source chain");
+    symlink("..", fixture.input.cwd.join("parent-alias")).expect("relative parent directory link");
+    symlink(
+        "parent-alias/nested/parent-alias/AGENTS.md",
+        fixture.input.cwd.join("AGENTS.md"),
+    )
+    .expect("finite repeated parent alias");
+    let context = fixture.resolve();
+    assert_eq!(context.status, ResolutionStatus::Resolved);
+    assert_eq!(context.sources.len(), 2);
+    assert!(!has_diagnostic(&context, "context.cyclic-discovery"));
+}
+
+#[cfg(unix)]
+#[test]
+fn chained_relative_cycles_and_broken_targets_keep_discovery_diagnostics() {
+    use std::os::unix::fs::symlink;
+
+    for cyclic in [false, true] {
+        let mut fixture = Fixture::load("removed");
+        fixture.input.fallback_filenames = vec!["TEAM.md".to_string()];
+        write(&fixture.input.cwd.join("TEAM.md"), "FALLBACK_SENTINEL");
+        symlink("first-link", fixture.input.cwd.join("AGENTS.md")).expect("instruction link");
+        symlink("second-link", fixture.input.cwd.join("first-link")).expect("first local hop");
+        let target = if cyclic {
+            "../nested/first-link"
+        } else {
+            "missing/../TEAM.md"
+        };
+        symlink(target, fixture.input.cwd.join("second-link")).expect("second local hop");
+        let context = fixture.resolve();
+        assert!(!has_diagnostic(&context, "context.unsupported-remote"));
+        if cyclic {
+            assert_eq!(context.status, ResolutionStatus::Partial);
+            assert!(has_diagnostic(&context, "context.cyclic-discovery"));
+            assert!(has_diagnostic(&context, "context.project-unavailable"));
+            assert!(context.contents.is_empty());
+        } else {
+            assert_eq!(context.status, ResolutionStatus::Resolved);
+            assert!(!has_diagnostic(&context, "context.cyclic-discovery"));
+            assert_eq!(
+                context.automatic_text(),
+                "REMOVABLE_SENTINEL\n\nFALLBACK_SENTINEL"
+            );
+            assert!(
+                context
+                    .select_sources(&[0, 1])
+                    .expect("fallback after broken chain")
+                    .revalidate()
+                    .is_ok()
+            );
+        }
+    }
 }
 
 #[test]

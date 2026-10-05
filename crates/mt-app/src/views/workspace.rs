@@ -5060,6 +5060,7 @@ pub fn init(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     mod effective_context;
+    mod revision_context;
     mod welcome;
 
     use std::{

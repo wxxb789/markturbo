@@ -626,9 +626,7 @@ impl ReviewFlow {
         target: mt_core::agent_artifacts::package::ReviewTarget,
         document_id: DocumentId,
     ) {
-        self.review_outcome = None;
-        self.review_context = None;
-        self.review_disclosure = None;
+        self.clear_review_outcome();
         self.review_target = Some(ReviewTargetState {
             target,
             document_id,
@@ -1854,8 +1852,7 @@ impl Workspace {
             .revision_context()
             .filter(|context| context.document_id == revision.document_id)
             .and_then(|context| context.skill_package.as_ref())
-            .is_none_or(|package| !self.has_dirty_skill_supporting_document(package, cx))
-            && self.revision_effective_context_is_current(cx);
+            .is_none_or(|package| !self.has_dirty_skill_supporting_document(package, cx));
         self.review_flow.revision_result_is_current(
             revision,
             active_document
@@ -1879,7 +1876,8 @@ impl Workspace {
             .review_flow
             .revision_context()
             .and_then(|context| context.skill_package.as_ref())
-            .is_none_or(|package| package.revalidate().is_ok());
+            .is_none_or(|package| package.revalidate().is_ok())
+            && self.revision_effective_context_is_current(cx);
         if !package_current {
             self.review_flow.mark_revision_supporting_sources_stale();
         }
@@ -2201,12 +2199,44 @@ impl Workspace {
                 document.is_dirty(),
             )
         };
-        if self.review_flow.observe_document_change(
+        let mut changed = self.review_flow.observe_document_change(
             document_id,
             &source_snapshot,
             source_path.as_deref(),
             is_dirty,
-        ) {
+        );
+        // Resolve supporting-source aliases on edits, not during repainting.
+        let review_context_dirty = is_dirty
+            && self.review_flow.review_result().is_some_and(|review| {
+                review.supporting_sources_current
+                    && self
+                        .review_flow
+                        .review_context
+                        .as_ref()
+                        .is_some_and(|context| {
+                            self.has_dirty_context_source(context, Some(review.document_id), cx)
+                        })
+            });
+        let revision_context_dirty = is_dirty
+            && self.review_flow.revision_context().is_some_and(|revision| {
+                revision.supporting_sources_current
+                    && revision
+                        .request
+                        .effective_agent_context
+                        .as_ref()
+                        .is_some_and(|context| {
+                            self.has_dirty_context_source(context, Some(revision.document_id), cx)
+                        })
+            });
+        if review_context_dirty {
+            self.review_flow.mark_review_supporting_sources_stale();
+            changed = true;
+        }
+        if revision_context_dirty {
+            self.review_flow.mark_revision_supporting_sources_stale();
+            changed = true;
+        }
+        if changed {
             cx.notify();
         }
     }
@@ -2715,6 +2745,7 @@ impl Workspace {
             cx,
         );
 
+        cx.notify();
         let pending = Arc::new(Mutex::new(Some(prepared)));
         let selection_for_result = selection.clone();
         let request_for_result = frozen_request.clone();

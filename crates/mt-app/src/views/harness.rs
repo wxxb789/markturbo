@@ -7,6 +7,7 @@
 //! exposes its metadata, validation state, and files; selecting either opens the
 //! underlying document.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -88,7 +89,12 @@ enum CodexHomeSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContextProfileChoice {
     profile_id: String,
-    supported: bool,
+}
+
+impl ContextProfileChoice {
+    fn is_supported(&self) -> bool {
+        self.profile_id == CODEX_PROFILE_ID
+    }
 }
 
 impl SearchableListItem for ContextProfileChoice {
@@ -98,7 +104,7 @@ impl SearchableListItem for ContextProfileChoice {
         format!(
             "{} — {}",
             self.profile_id,
-            if self.supported {
+            if self.is_supported() {
                 "verified AGENTS instructions"
             } else {
                 "inventory only"
@@ -867,16 +873,17 @@ impl HarnessView {
                     )),
             );
 
+        let mut content_counts = HashMap::<usize, usize>::new();
+        for source in &context.sources {
+            if let Some(content_index) = source.content_index {
+                *content_counts.entry(content_index).or_default() += 1;
+            }
+        }
         content = content.children(context.sources.iter().enumerate().map(|(index, source)| {
             let identity = ContextSourceIdentity::from(source);
             let selected = self.selected_context_source.as_ref() == Some(&identity);
             let duplicate_count = source.content_index.map_or(0, |content_index| {
-                context
-                    .sources
-                    .iter()
-                    .filter(|other| other.content_index == Some(content_index))
-                    .count()
-                    .saturating_sub(1)
+                content_counts[&content_index].saturating_sub(1)
             });
             ListItem::new(context_source_element_id(source))
                 .w_full()
@@ -1672,15 +1679,11 @@ fn inclusion_rule_label(rule: InclusionRule) -> &'static str {
 fn context_profile_choices() -> Vec<ContextProfileChoice> {
     let mut choices = vec![ContextProfileChoice {
         profile_id: CODEX_PROFILE_ID.to_string(),
-        supported: true,
     }];
     for harness in mt_core::agent_artifacts::harness::HARNESSES {
         let profile_id = harness.id.to_string();
         if !choices.iter().any(|choice| choice.profile_id == profile_id) {
-            choices.push(ContextProfileChoice {
-                profile_id,
-                supported: false,
-            });
+            choices.push(ContextProfileChoice { profile_id });
         }
     }
     choices
@@ -2240,12 +2243,12 @@ mod tests {
             choices.first().map(|choice| choice.profile_id.as_str()),
             Some(super::CODEX_PROFILE_ID)
         );
-        assert!(choices[0].supported);
-        assert!(choices[1..].iter().all(|choice| !choice.supported));
+        assert!(choices[0].is_supported());
+        assert!(choices[1..].iter().all(|choice| !choice.is_supported()));
         assert!(
             choices
                 .iter()
-                .any(|choice| choice.profile_id == "codex" && !choice.supported)
+                .any(|choice| choice.profile_id == "codex" && !choice.is_supported())
         );
         let mut ids: Vec<_> = choices
             .iter()
@@ -2346,7 +2349,10 @@ mod tests {
     fn context_source_navigation_and_target_parent_action_keep_paths_independent(
         cx: &mut gpui_kit::TestAppContext,
     ) {
+        use super::HarnessEvent;
         use gpui_kit::test::TestWindowExt as _;
+        use std::cell::RefCell;
+        use std::rc::Rc;
         use std::sync::{Arc, Mutex};
 
         let directory = tempfile::tempdir().expect("workspace directory");
@@ -2396,6 +2402,20 @@ mod tests {
             assert!(view.apply_resolved_context(resolved, cx));
         });
 
+        let opened_files = Rc::new(RefCell::new(Vec::new()));
+        let _events = cx.update({
+            let opened_files = opened_files.clone();
+            let view = view.clone();
+            move |_, app| {
+                app.subscribe(&view, move |_, event: &HarnessEvent, _| {
+                    if let HarnessEvent::OpenFile { path, preview } = event {
+                        opened_files.borrow_mut().push((path.clone(), *preview));
+                    }
+                })
+            }
+        });
+        cx.run_until_parked();
+
         let source_id = context_source_element_id(&source);
         let target = root.join("src/auth.rs");
         let target_text = target.to_string_lossy().to_string();
@@ -2413,8 +2433,13 @@ mod tests {
             window.click(gpui_kit::SharedString::from(source_id.clone()), app);
         });
         cx.run_until_parked();
+        assert_eq!(*opened_files.borrow(), vec![(source.path.clone(), true)]);
         view.read_with(cx, |view, app| {
             assert_eq!(view.selected_target(app), root);
+            assert_eq!(
+                view.context_input().expect("unchanged input").cwd,
+                input.cwd
+            );
             assert!(view.resolved_context().is_some());
         });
 
@@ -2429,7 +2454,14 @@ mod tests {
             );
             window.render_frame(app);
             window.click("harness-context-target", app);
-            window.press("ctrl-a", app);
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-a"
+                } else {
+                    "ctrl-a"
+                },
+                app,
+            );
             window.input(&target_text, app);
             window.render_frame(app);
             window.click("harness-context-use-target-parent-as-cwd", app);

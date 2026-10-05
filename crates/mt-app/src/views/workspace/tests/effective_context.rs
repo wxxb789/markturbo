@@ -35,6 +35,374 @@ fn install_context(flow: &mut ReviewFlow, input: &ContextInput) {
     assert!(flow.accept_context_resolution(generation, resolve(input, &[])));
 }
 
+#[cfg(feature = "model-transport")]
+fn observe_review_state(
+    workspace: &gpui_kit::Entity<super::Workspace>,
+    cx: &gpui_kit::VisualTestContext,
+    ready: impl Fn(&super::Workspace, &gpui_kit::App) -> bool + 'static,
+) -> (gpui_kit::Subscription, std::sync::mpsc::Receiver<()>) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let mut sender = Some(sender);
+    let subscription = cx.cx.update(|app| {
+        app.observe(workspace, move |workspace, app| {
+            if ready(workspace.read(app), app)
+                && let Some(sender) = sender.take()
+            {
+                sender.send(()).unwrap();
+            }
+        })
+    });
+    (subscription, receiver)
+}
+
+#[cfg(feature = "model-transport")]
+#[gpui_kit::test]
+fn kit_effective_context_review_rejects_source_changed_during_consent_without_watcher(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::test::TestWindowExt as _;
+    use mt_core::review::ReviewDiagnosticCode;
+    use std::{io::ErrorKind, net::TcpListener, time::Duration};
+
+    let (_directory, input) = context_fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (workspace, cx) = super::open_test_workspace(cx, input.target.clone());
+    super::configure_test_translation(cx, &base_url);
+    let harness = workspace.read_with(cx, |workspace, _| workspace.harness.clone().unwrap());
+    harness.update(cx, |harness, cx| {
+        harness.set_context_input_for_test(input.clone(), cx)
+    });
+    cx.run_until_parked();
+    workspace.update(cx, |workspace, cx| {
+        // Consent-time revalidation must work even when no watcher is delivering events.
+        workspace.watcher = None;
+        workspace.open_review_panel(ReviewTarget::Document, cx);
+    });
+    cx.update(|window, app| {
+        window.render_frame(app);
+        window.click("review-context-source-1", app);
+    });
+    let (document_id, snapshot, frozen) = workspace.read_with(cx, |workspace, app| {
+        let document = workspace.active_document().unwrap().read(app);
+        (
+            document.id(),
+            document.async_snapshot(app),
+            workspace
+                .review_flow
+                .selected_context(document.id())
+                .unwrap(),
+        )
+    });
+    assert_eq!(frozen.selected().sources().len(), 1);
+    assert_eq!(
+        frozen.selected().sources()[0].occurrence().path,
+        input.workspace.join("AGENTS.md")
+    );
+    assert_eq!(
+        frozen.selected().contents()[0].text,
+        "Preserve source identity.\n"
+    );
+    let prompt_cx = cx.cx.clone();
+    let (_prompt_subscription, prompt_opened) =
+        observe_review_state(&workspace, cx, move |workspace, _| {
+            workspace.review_flow.is_reviewing() && prompt_cx.has_pending_prompt()
+        });
+    let (_completion_subscription, completed) =
+        observe_review_state(&workspace, cx, |workspace, _| {
+            !workspace.review_flow.is_reviewing()
+                && workspace.review_flow.review_diagnostic().is_some()
+        });
+    cx.update(|window, app| {
+        workspace.update(app, |workspace, cx| {
+            workspace.review(ReviewTarget::Document, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    prompt_opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (_, disclosure) = cx
+        .pending_prompt()
+        .expect("the actual Review consent prompt");
+    assert!(disclosure.contains(input.workspace.join("AGENTS.md").to_str().unwrap()));
+    assert!(!disclosure.contains(input.codex_home.join("AGENTS.md").to_str().unwrap()));
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+    fs::write(
+        input.workspace.join("AGENTS.md"),
+        "Changed after disclosure.\n",
+    )
+    .unwrap();
+    workspace.read_with(cx, |workspace, app| {
+        assert!(workspace.watcher.is_none());
+        assert!(
+            workspace
+                .review_flow
+                .context_request_is_current(document_id, &frozen)
+        );
+        assert_eq!(
+            workspace
+                .review_flow
+                .selected_context(document_id)
+                .unwrap()
+                .selected(),
+            frozen.selected()
+        );
+        assert_eq!(
+            workspace
+                .active_document()
+                .unwrap()
+                .read(app)
+                .async_snapshot(app),
+            snapshot
+        );
+    });
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Send");
+    cx.run_until_parked();
+    completed.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    assert!(!cx.has_pending_prompt());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        ErrorKind::WouldBlock,
+        "obsolete selected source must be rejected before any outbound connection"
+    );
+    workspace.read_with(cx, |workspace, app| {
+        let flow = &workspace.review_flow;
+        let diagnostic = flow.review_diagnostic().unwrap();
+        assert_eq!(diagnostic.document_id, document_id);
+        assert_eq!(
+            diagnostic.diagnostic.code,
+            ReviewDiagnosticCode::InvalidRequest
+        );
+        assert!(!flow.is_reviewing());
+        assert!(flow.review_result().is_none());
+        assert!(flow.revision_context().is_none());
+        let document = workspace.active_document().unwrap().read(app);
+        assert_eq!(document.async_snapshot(app), snapshot);
+        assert_eq!(document.text(app), "# Artifact\n");
+        assert!(!document.is_dirty());
+    });
+    assert_eq!(fs::read(&input.target).unwrap(), b"# Artifact\n");
+}
+
+#[cfg(feature = "model-transport")]
+#[gpui_kit::test]
+fn kit_effective_context_review_approval_sends_one_selected_only_request(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::test::TestWindowExt as _;
+    use mt_core::agent_artifacts::context::SelectedContext;
+    use mt_core::review::ReviewStatus;
+    use std::{
+        io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _},
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    let (_directory, input) = context_fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (workspace, cx) = super::open_test_workspace(cx, input.target.clone());
+    super::configure_test_translation(cx, &base_url);
+    let harness = workspace.read_with(cx, |workspace, _| workspace.harness.clone().unwrap());
+    harness.update(cx, |harness, cx| {
+        harness.set_context_input_for_test(input.clone(), cx)
+    });
+    cx.run_until_parked();
+    workspace.update(cx, |workspace, cx| {
+        workspace.watcher = None;
+        workspace.open_review_panel(ReviewTarget::Document, cx);
+    });
+    cx.update(|window, app| {
+        window.render_frame(app);
+        window.click("review-context-source-1", app);
+    });
+    let (document_id, snapshot, frozen) = workspace.read_with(cx, |workspace, app| {
+        let document = workspace.active_document().unwrap().read(app);
+        (
+            document.id(),
+            document.async_snapshot(app),
+            workspace
+                .review_flow
+                .selected_context(document.id())
+                .unwrap(),
+        )
+    });
+    let prompt_cx = cx.cx.clone();
+    let (_prompt_subscription, prompt_opened) =
+        observe_review_state(&workspace, cx, move |workspace, _| {
+            workspace.review_flow.is_reviewing() && prompt_cx.has_pending_prompt()
+        });
+    let (_completion_subscription, completed) =
+        observe_review_state(&workspace, cx, |workspace, _| {
+            !workspace.review_flow.is_reviewing()
+                && (workspace.review_flow.review_result().is_some()
+                    || workspace.review_flow.review_diagnostic().is_some())
+        });
+    cx.update(|window, app| {
+        workspace.update(app, |workspace, cx| {
+            workspace.review(ReviewTarget::Document, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    prompt_opened.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (_, disclosure) = cx
+        .pending_prompt()
+        .expect("the actual Review consent prompt");
+    assert!(disclosure.contains(input.workspace.join("AGENTS.md").to_str().unwrap()));
+    assert!(!disclosure.contains(input.codex_home.join("AGENTS.md").to_str().unwrap()));
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+    // Use the same HTTP fixture framing as the provider/Translation tests, but
+    // retain the listener to detect extra connections after Review completes.
+    let incoming = smol::Async::new(listener.try_clone().unwrap()).unwrap();
+    let (request_sender, received) = std::sync::mpsc::sync_channel(1);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let count_for_server = request_count.clone();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = smol::block_on(smol::future::or(incoming.accept(), async {
+            smol::Timer::after(Duration::from_secs(10)).await;
+            Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "Review did not connect",
+            ))
+        }))
+        .unwrap();
+        count_for_server.fetch_add(1, Ordering::SeqCst);
+        let mut stream = stream.into_inner().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(&stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut body = vec![0; content_length.expect("the provider sends a sized JSON body")];
+        reader.read_exact(&mut body).unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        request_sender.send((request_line, request)).unwrap();
+        drop(reader);
+        let output = serde_json::json!({
+            "schema_version": mt_core::review::REVIEW_SCHEMA_VERSION,
+            "scope": {"kind": "document"},
+            "understood_intent": {
+                "stated_goal": "preserve the artifact",
+                "relevant_context": [], "constraints": [], "non_goals": [],
+                "expected_deliverable": "a read-only Review",
+                "success_evidence": [], "inferred_assumptions": [], "unresolved_decisions": []
+            },
+            "findings": [], "clarification_questions": []
+        })
+        .to_string();
+        let response = serde_json::json!({
+            "id": "chatcmpl-review",
+            "model": "review-response-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": output}, "finish_reason": "stop"}]
+        }).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+            response.len()
+        ).unwrap();
+        stream.flush().unwrap();
+    });
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+    cx.simulate_prompt_answer("Send");
+    cx.run_until_parked();
+    let (request_line, wire) = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    completed.recv_timeout(Duration::from_secs(10)).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        request_line.trim_end(),
+        "POST /v1/chat/completions HTTP/1.1"
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    assert!(!cx.has_pending_prompt());
+    let user_messages = wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect::<Vec<_>>();
+    assert_eq!(user_messages.len(), 1);
+    let payload_text = user_messages[0]["content"].as_str().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(payload_text).unwrap();
+    assert_eq!(payload["operation"], "read_only_review");
+    assert_eq!(payload["scope"], "document_with_effective_agent_context");
+    assert_eq!(payload["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["frames"][0]["content"], snapshot.text());
+    assert_eq!(payload["frames"][0]["content_bytes"], snapshot.text().len());
+    let context_wire = &payload["effective_agent_context"];
+    let sent_context: SelectedContext = serde_json::from_value(context_wire.clone()).unwrap();
+    assert_eq!(sent_context.sources().len(), 1);
+    assert_eq!(sent_context.sources()[0].source_index(), 1);
+    assert_eq!(sent_context.sources(), frozen.selected().sources());
+    assert_eq!(sent_context.contents(), frozen.selected().contents());
+    assert_eq!(sent_context.input(), &input);
+    assert_eq!(
+        sent_context.contents()[0].text,
+        "Preserve source identity.\n"
+    );
+    assert!(context_wire.get("discovery_digest").is_none());
+    assert!(context_wire.get("available_skills").is_none());
+    assert!(!payload_text.contains("Name every outbound source."));
+    assert!(!payload_text.contains(
+        &serde_json::to_string(&input.codex_home.join("AGENTS.md").to_string_lossy()).unwrap()
+    ));
+    workspace.read_with(cx, |workspace, app| {
+        let flow = &workspace.review_flow;
+        let review = flow
+            .review_result()
+            .expect("the real provider response was validated");
+        assert_eq!(review.document_id, document_id);
+        assert_eq!(review.source_snapshot, snapshot);
+        assert_eq!(review.result.result.status, ReviewStatus::Ready);
+        assert_eq!(
+            review.result.metadata.response_model(),
+            "review-response-model"
+        );
+        assert!(review.supporting_sources_current);
+        assert!(flow.review_diagnostic().is_none());
+        assert!(!flow.is_reviewing());
+        let revision = flow.revision_context().unwrap();
+        assert_eq!(
+            revision.request.effective_agent_context.as_ref(),
+            Some(frozen.selected())
+        );
+        let document = workspace.active_document().unwrap().read(app);
+        assert_eq!(document.id(), document_id);
+        assert_eq!(document.async_snapshot(app), snapshot);
+        assert_eq!(document.text(app), "# Artifact\n");
+        assert!(!document.is_dirty());
+    });
+    assert_eq!(fs::read(&input.target).unwrap(), b"# Artifact\n");
+}
+
 #[gpui_kit::test]
 fn effective_context_inventory_notification_does_not_restart_pending_resolution(
     cx: &mut gpui_kit::TestAppContext,
@@ -770,5 +1138,66 @@ fn kit_effective_context_controls_fit_review_pane_and_keep_source_identity(
                 .is_none()
         );
         assert!(!workspace.review_flow.is_reviewing());
+    });
+}
+
+#[gpui_kit::test]
+fn kit_effective_context_new_ancestor_marker_refreshes_chain_and_clears_selection(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use mt_core::workspace::watcher::Change;
+
+    let (_directory, mut input) = context_fixture();
+    fs::remove_dir(input.workspace.join(".git")).unwrap();
+    input.cwd = input.workspace.join("nested");
+    fs::create_dir(&input.cwd).unwrap();
+    fs::write(input.cwd.join("AGENTS.md"), "Nested instructions.\n").unwrap();
+    let (workspace, cx) = super::open_test_workspace(cx, input.target.clone());
+    let harness = workspace.read_with(cx, |workspace, _| workspace.harness.clone().unwrap());
+    harness.update(cx, |harness, cx| {
+        harness.set_context_input_for_test(input.clone(), cx)
+    });
+    cx.run_until_parked();
+    let document_id = workspace.update(cx, |workspace, cx| {
+        let document_id = workspace.active_document().unwrap().read(cx).id();
+        assert_eq!(
+            harness.read(cx).resolved_context().unwrap().sources.len(),
+            2
+        );
+        assert!(workspace.review_flow.choose_context_source(document_id, 1));
+        assert!(
+            workspace
+                .review_flow
+                .selected_context(document_id)
+                .is_some()
+        );
+        document_id
+    });
+    let marker = input.workspace.join(".git");
+    fs::create_dir(&marker).unwrap();
+
+    cx.update(|_, app| {
+        workspace.update(app, |workspace, cx| {
+            workspace.apply_watcher_changes(
+                &input.workspace,
+                &[Change::Created(marker.clone())],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, app| {
+        let context = harness.read(app).resolved_context().unwrap();
+        assert_eq!(context.project_root.as_ref(), Some(&input.workspace));
+        assert_eq!(context.sources.len(), 3);
+        assert_eq!(context.sources[1].path, input.workspace.join("AGENTS.md"));
+        assert_eq!(context.sources[2].path, input.cwd.join("AGENTS.md"));
+        assert!(
+            workspace
+                .review_flow
+                .selected_context(document_id)
+                .is_none()
+        );
     });
 }

@@ -164,18 +164,7 @@ pub fn resolve(input: &ContextInput, skills: &[Skill]) -> ResolvedContext {
         .take_while(|directory| directory.starts_with(&root))
         .collect();
     directories.reverse();
-    let mut names = vec![
-        (
-            "AGENTS.override.md".to_string(),
-            InclusionRule::ProjectOverride,
-        ),
-        ("AGENTS.md".to_string(), InclusionRule::ProjectAgents),
-    ];
-    for name in input.fallback_filenames.iter().map(|name| name.trim()) {
-        if !name.is_empty() && !names.iter().any(|(existing, _)| existing == name) {
-            names.push((name.to_string(), InclusionRule::ProjectFallback));
-        }
-    }
+    let names = project_instruction_candidates(&input.fallback_filenames);
     let mut selected = Vec::new();
     if input.project_trust != ProjectTrust::Untrusted && input.project_doc_max_bytes > 0 {
         for directory in directories {
@@ -278,6 +267,22 @@ pub fn resolve(input: &ContextInput, skills: &[Skill]) -> ResolvedContext {
     result.discovery_digest = Some(state.finalize().into());
     duplicate_lines(&mut result);
     result
+}
+
+fn project_instruction_candidates(fallback_filenames: &[String]) -> Vec<(String, InclusionRule)> {
+    let mut names = vec![
+        (
+            "AGENTS.override.md".to_string(),
+            InclusionRule::ProjectOverride,
+        ),
+        ("AGENTS.md".to_string(), InclusionRule::ProjectAgents),
+    ];
+    for name in fallback_filenames.iter().map(|name| name.trim()) {
+        if !name.is_empty() && !names.iter().any(|(existing, _)| existing == name) {
+            names.push((name.to_string(), InclusionRule::ProjectFallback));
+        }
+    }
+    names
 }
 
 fn validate_input(input: &ContextInput, state: &mut Sha256) -> Result<(), Diagnostic> {
@@ -431,21 +436,75 @@ fn remote_path_error() -> io::Error {
 }
 
 fn local_path(path: &Path) -> io::Result<()> {
-    if remote_path(path) {
-        return Err(remote_path_error());
-    }
-    // Probe local ancestors first, so a known remote link target is never
-    // traversed while probing its children. Mapped filesystems still rely on
-    // the profile's explicit local-filesystem assumption.
-    let ancestors: Vec<_> = path.ancestors().collect();
-    for ancestor in ancestors.into_iter().rev() {
-        if let Ok(target) = fs::read_link(ancestor)
-            && remote_path(&target)
-        {
+    fn inspect(path: &Path, links: &mut Vec<PathBuf>) -> io::Result<PathBuf> {
+        if remote_path(path) {
             return Err(remote_path_error());
         }
+        // Win32 collapses parents before lookup, even after a missing prefix.
+        #[cfg(windows)]
+        let normalized = std::path::absolute(path)?;
+        #[cfg(windows)]
+        let path = normalized.as_path();
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component.as_os_str());
+            if matches!(component, Component::Prefix(_)) {
+                continue;
+            }
+            if !fs::symlink_metadata(&current)?.file_type().is_symlink() {
+                continue;
+            }
+            let target = fs::read_link(&current)?;
+            if remote_path(&target) {
+                return Err(remote_path_error());
+            }
+            // Normalize only the loop key. Probes retain parent segments so
+            // missing/../source still has the filesystem's missing semantics.
+            let mut key = PathBuf::new();
+            for component in current.components() {
+                if component == Component::ParentDir {
+                    key.pop();
+                } else {
+                    key.push(component.as_os_str());
+                }
+            }
+            // Windows permits at most 63 reparse points per path. Bound the
+            // inspection itself so an acyclic chain cannot exhaust the stack.
+            if links.len() >= 63 || links.contains(&key) {
+                let code = if cfg!(windows) {
+                    1921
+                } else if cfg!(target_os = "macos") {
+                    62
+                } else {
+                    40
+                };
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            links.push(key);
+            current = inspect(
+                &current.parent().unwrap_or(Path::new("")).join(target),
+                links,
+            )?;
+            links.pop();
+        }
+        Ok(current)
     }
-    Ok(())
+    // Resolve every link target and its ancestors before probing a child.
+    // Mapped filesystems retain the explicit local-filesystem assumption.
+    match inspect(path, &mut Vec::new()) {
+        Ok(_) => Ok(()),
+        // A missing or non-directory prefix cannot be traversed by the
+        // following acquisition. Leave its existing failure semantics there.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn local_metadata(path: &Path) -> io::Result<fs::Metadata> {
@@ -518,6 +577,23 @@ fn project_root(input: &ContextInput, state: &mut Sha256, result: &mut ResolvedC
     input.cwd.clone()
 }
 
+fn project_marker_candidates(input: &ContextInput) -> Vec<(&Path, PathBuf)> {
+    let mut candidates = Vec::new();
+    if !input.project_root_markers.is_empty() {
+        for directory in input.cwd.ancestors() {
+            for marker in &input.project_root_markers {
+                let path = directory.join(marker);
+                let exists = local_metadata(&path).is_ok();
+                candidates.push((directory, path));
+                if exists {
+                    return candidates;
+                }
+            }
+        }
+    }
+    candidates
+}
+
 enum CandidateData {
     Missing,
     NotFile,
@@ -539,7 +615,11 @@ fn candidate(path: &Path, state: &mut Sha256) -> Candidate {
         data: CandidateData::Missing,
     };
     if let Err(error) = local_path(path) {
-        hash(state, b"unsupported-remote");
+        if error.kind() == io::ErrorKind::Unsupported {
+            hash(state, b"unsupported-remote");
+        } else {
+            hash(state, format!("{:?}", error.kind()).as_bytes());
+        }
         candidate.data = CandidateData::Failure(error);
         return candidate;
     }
@@ -860,10 +940,16 @@ impl ResolvedContext {
                 break;
             }
         }
-        let mut names = vec!["AGENTS.override.md".to_string(), "AGENTS.md".to_string()];
-        for name in self.input.fallback_filenames.iter().map(|name| name.trim()) {
-            if !name.is_empty() && !names.iter().any(|existing| existing == name) {
-                names.push(name.to_string());
+        let names = project_instruction_candidates(&self.input.fallback_filenames);
+        for (directory, path) in project_marker_candidates(&self.input) {
+            push_watch_path(&mut paths, directory);
+            push_watch_path(&mut paths, &path);
+            for parent in path
+                .ancestors()
+                .skip(1)
+                .take_while(|parent| parent.starts_with(directory))
+            {
+                push_watch_path(&mut paths, parent);
             }
         }
         let root = self.project_root.as_deref().unwrap_or(&self.input.cwd);
@@ -874,24 +960,10 @@ impl ResolvedContext {
             .take_while(|directory| directory.starts_with(root))
         {
             push_watch_path(&mut paths, directory);
-            for marker in &self.input.project_root_markers {
-                let path = directory.join(marker);
-                push_watch_path(&mut paths, &path);
-                for parent in path
-                    .ancestors()
-                    .skip(1)
-                    .take_while(|parent| parent.starts_with(directory))
-                {
-                    push_watch_path(&mut paths, parent);
-                }
-                if local_metadata(&path).is_ok() {
-                    break;
-                }
-            }
             if self.input.project_trust != ProjectTrust::Untrusted
                 && self.input.project_doc_max_bytes > 0
             {
-                for name in &names {
+                for (name, _) in &names {
                     let path = directory.join(name);
                     push_watch_path(&mut paths, &path);
                     for parent in path
@@ -921,7 +993,8 @@ impl ResolvedContext {
     }
 
     /// Non-recursive directory watches for candidate changes in the current chain.
-    /// Stops at the nearest project root; includes global discovery and alias parents.
+    /// Instructions stop at the project root; markers cover their search frontier.
+    /// Includes global discovery and alias parents.
     /// Consent revalidation rescans markers if the current root is removed.
     pub fn watch_directories(&self) -> Vec<PathBuf> {
         if !matches!(
@@ -931,6 +1004,7 @@ impl ResolvedContext {
             return Vec::new();
         }
         let mut paths = Vec::new();
+        let mut checked_directories = std::collections::HashSet::new();
         if let Some(parent) = self.input.target.parent() {
             paths.push(parent.to_path_buf());
         }
@@ -947,21 +1021,16 @@ impl ResolvedContext {
             .chain(global)
         {
             paths.push(directory.to_path_buf());
-            if let Ok(physical) = local_canonicalize(directory) {
+            let first_visit = checked_directories.insert(directory);
+            if first_visit && let Ok(physical) = local_canonicalize(directory) {
                 paths.push(physical);
             }
             for name in self
                 .input
-                .project_root_markers
+                .fallback_filenames
                 .iter()
-                .map(String::as_str)
-                .chain(
-                    self.input
-                        .fallback_filenames
-                        .iter()
-                        .map(|name| name.trim())
-                        .filter(|name| !name.is_empty()),
-                )
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
             {
                 let candidate = directory.join(name);
                 let parent = if candidate.as_path() == directory {
@@ -980,9 +1049,37 @@ impl ResolvedContext {
                     }
                 }
             }
-            if local_path(directory)
-                .and_then(|()| fs::read_link(directory))
-                .is_ok()
+            if first_visit
+                && local_path(directory)
+                    .and_then(|()| fs::read_link(directory))
+                    .is_ok()
+                && let Some(parent) = directory.parent()
+            {
+                paths.push(parent.to_path_buf());
+            }
+        }
+        for (directory, candidate) in project_marker_candidates(&self.input) {
+            paths.push(directory.to_path_buf());
+            let first_visit = checked_directories.insert(directory);
+            if first_visit && let Ok(physical) = local_canonicalize(directory) {
+                paths.push(physical);
+            }
+            let parent = if candidate.as_path() == directory {
+                Some(directory)
+            } else {
+                candidate.parent()
+            };
+            if let Some(existing) = parent.and_then(|parent| {
+                parent
+                    .ancestors()
+                    .find(|path| local_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+            }) {
+                paths.push(existing.to_path_buf());
+            }
+            if first_visit
+                && local_path(directory)
+                    .and_then(|()| fs::read_link(directory))
+                    .is_ok()
                 && let Some(parent) = directory.parent()
             {
                 paths.push(parent.to_path_buf());
@@ -1035,5 +1132,49 @@ impl SelectedContext {
         } else {
             Err(ContextRevalidationError)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_path;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_rejects_an_acyclic_over_limit_link_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("hop64"), "instructions").unwrap();
+        for index in (0..64).rev() {
+            std::os::unix::fs::symlink(
+                format!("hop{}", index + 1),
+                directory.path().join(format!("hop{index}")),
+            )
+            .unwrap();
+        }
+        let error = local_path(&directory.path().join("hop0")).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(if cfg!(target_os = "macos") { 62 } else { 40 })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_path_checks_windows_parents_after_a_missing_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("loop");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&link)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let error = local_path(&directory.path().join("missing/../loop/AGENTS.md")).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(1921));
     }
 }

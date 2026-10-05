@@ -382,7 +382,7 @@ impl PreparedReview {
         let scope = match &agent_skill_request {
             Some(agent_skill_request) => agent_skill_request.outbound_scope(),
             None if request.effective_agent_context.is_some() => {
-                OutboundScope::document(request.outbound_bytes().len() as u64)
+                OutboundScope::document(request.outbound_text().map_or(0, str::len) as u64)
             }
             None => document_outbound_scope(&request).map_err(|_| RevisionError::InvalidRequest)?,
         };

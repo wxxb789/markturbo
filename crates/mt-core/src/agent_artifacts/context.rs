@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -70,17 +71,20 @@ pub struct ContextProfile {
 impl ContextProfile {
     /// Bind checked-in profile evidence to the frozen Codex source identity.
     pub fn codex() -> Self {
+        static CONTENT_DIGEST: LazyLock<String> = LazyLock::new(|| {
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../assets/context-profiles/codex-agents-md-2026-08-29.json"
+                ))
+            )
+        });
         Self {
             id: CODEX_PROFILE_ID.to_string(),
             source_revision: CODEX_SOURCE_REVISION.to_string(),
             source_url: CODEX_SOURCE_URL.to_string(),
             retrieved_on: "2026-10-02".to_string(),
-            content_digest: format!(
-                "{:x}",
-                Sha256::digest(include_bytes!(
-                    "../../assets/context-profiles/codex-agents-md-2026-08-29.json"
-                ))
-            ),
+            content_digest: CONTENT_DIGEST.clone(),
         }
     }
 }
