@@ -449,7 +449,7 @@ fn unsupported_local_and_remote_imports_are_not_followed() {
 fn platform_case_and_separators_follow_filesystem_identity() {
     let mut fixture = Fixture::load("platform");
     #[cfg(windows)]
-    {
+    let workspace_is_alias = {
         fixture.input.workspace = PathBuf::from(
             fixture
                 .input
@@ -460,7 +460,22 @@ fn platform_case_and_separators_follow_filesystem_identity() {
         );
         fixture.input.target =
             PathBuf::from(fixture.input.target.to_string_lossy().replace('\\', "/"));
-        let context = fixture.resolve();
+        true
+    };
+    #[cfg(not(windows))]
+    let workspace_is_alias = {
+        let alternate = fixture.temp.path().join("WORKSPACE");
+        let is_alias = match fs::create_dir(&alternate) {
+            Ok(()) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+            Err(error) => panic!("case directory probe failed: {error}"),
+        };
+        fixture.input.workspace = alternate;
+        is_alias
+    };
+
+    let context = fixture.resolve();
+    if workspace_is_alias {
         assert_eq!(context.status, ResolutionStatus::Resolved);
         assert_eq!(context.input, fixture.input);
         assert_eq!(
@@ -474,14 +489,8 @@ fn platform_case_and_separators_follow_filesystem_identity() {
                 .revalidate()
                 .is_ok()
         );
-    }
-    #[cfg(not(windows))]
-    {
+    } else {
         // A distinct, differently cased existing directory is not an alias.
-        let alternate = fixture.temp.path().join("WORKSPACE");
-        fs::create_dir(&alternate).expect("distinct case directory");
-        fixture.input.workspace = alternate;
-        let context = fixture.resolve();
         assert_eq!(context.status, ResolutionStatus::InvalidInput);
         assert!(has_diagnostic(&context, "context.outside-workspace"));
     }
