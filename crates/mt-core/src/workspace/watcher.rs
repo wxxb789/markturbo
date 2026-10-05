@@ -347,8 +347,12 @@ mod tests {
         assert_eq!(watcher.poll(), vec![Change::Modified(real)]);
     }
 
-    /// Receive the exact change from the channel registered before the write.
-    fn receive_change(watcher: &Watcher, expected: &Change) -> Change {
+    /// Receive a matching change for the exact path from the pre-write subscription.
+    fn receive_change(
+        watcher: &Watcher,
+        path: &Path,
+        matches_change: impl Fn(&Change) -> bool,
+    ) -> Change {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut observed = Vec::new();
         loop {
@@ -364,7 +368,7 @@ mod tests {
             observed.extend(events.iter().map(|event| {
                 (
                     event.kind,
-                    event.paths.iter().any(|path| path == expected.path()),
+                    event.paths.iter().any(|event_path| event_path == path),
                 )
             }));
             let changes = dedup(
@@ -380,7 +384,10 @@ mod tests {
                     })
                     .collect(),
             );
-            if let Some(found) = changes.into_iter().find(|change| change == expected) {
+            if let Some(found) = changes
+                .into_iter()
+                .find(|change| change.path() == path && matches_change(change))
+            {
                 return found;
             }
         }
@@ -395,7 +402,19 @@ mod tests {
         let watcher = Watcher::new(&root).unwrap();
         std::fs::write(&path, "one\n").unwrap();
         let created = Change::Created(path.clone());
-        assert_eq!(receive_change(&watcher, &created), created);
+        assert_eq!(
+            receive_change(&watcher, &path, |change| matches!(
+                change,
+                Change::Created(_)
+            )),
+            created
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\n");
+
+        // A fresh subscription excludes queued fixture notifications. Native
+        // FSEvents kinds are hints: a content change can still include Created.
+        drop(watcher);
+        let watcher = Watcher::new(&root).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -403,8 +422,11 @@ mod tests {
             .write_all(b"two\n")
             .unwrap();
 
-        let expected = Change::Modified(path);
-        assert_eq!(receive_change(&watcher, &expected), expected);
+        let changed = receive_change(&watcher, &path, |change| {
+            matches!(change, Change::Created(_) | Change::Modified(_))
+        });
+        assert_eq!(changed.path(), path);
+        assert_eq!(std::fs::read(changed.path()).unwrap(), b"two\n");
     }
 
     #[test]
@@ -416,10 +438,23 @@ mod tests {
         let path = external_root.join("saved-as.md");
 
         let mut watcher = Watcher::new(&primary_root).unwrap();
-        watcher.sync_document_directories([external_root]).unwrap();
+        watcher
+            .sync_document_directories([external_root.clone()])
+            .unwrap();
         std::fs::write(&path, "one\n").unwrap();
         let created = Change::Created(path.clone());
-        assert_eq!(receive_change(&watcher, &created), created);
+        assert_eq!(
+            receive_change(&watcher, &path, |change| matches!(
+                change,
+                Change::Created(_)
+            )),
+            created
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\n");
+
+        drop(watcher);
+        let mut watcher = Watcher::new(&primary_root).unwrap();
+        watcher.sync_document_directories([external_root]).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -427,8 +462,28 @@ mod tests {
             .write_all(b"two\n")
             .unwrap();
 
-        let expected = Change::Modified(path);
-        assert_eq!(receive_change(&watcher, &expected), expected);
+        let changed = receive_change(&watcher, &path, |change| {
+            matches!(change, Change::Created(_) | Change::Modified(_))
+        });
+        assert_eq!(changed.path(), path);
+        assert_eq!(std::fs::read(changed.path()).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn content_modification_events_keep_the_exact_modified_classification() {
+        use notify::EventKind;
+        use notify::event::{DataChange, ModifyKind};
+
+        let root = Path::new("/w");
+        let path = root.join("a.md");
+        let changed = event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            std::slice::from_ref(&path),
+        );
+        assert_eq!(
+            classify(&changed, root, &HashSet::new(), &HashSet::new()),
+            vec![Change::Modified(path)]
+        );
     }
 
     #[test]
