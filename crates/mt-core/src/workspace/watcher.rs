@@ -234,6 +234,7 @@ fn dedup(changes: Vec<Change>) -> Vec<Change> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     fn event(kind: notify::EventKind, paths: &[PathBuf]) -> DebouncedEvent {
         let event = paths.iter().fold(notify::Event::new(kind), |event, path| {
@@ -395,7 +396,12 @@ mod tests {
         std::fs::write(&path, "one\n").unwrap();
         let created = Change::Created(path.clone());
         assert_eq!(receive_change(&watcher, &created), created);
-        std::fs::write(&path, "two\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"two\n")
+            .unwrap();
 
         let expected = Change::Modified(path);
         assert_eq!(receive_change(&watcher, &expected), expected);
@@ -414,7 +420,12 @@ mod tests {
         std::fs::write(&path, "one\n").unwrap();
         let created = Change::Created(path.clone());
         assert_eq!(receive_change(&watcher, &created), created);
-        std::fs::write(&path, "two\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"two\n")
+            .unwrap();
 
         let expected = Change::Modified(path);
         assert_eq!(receive_change(&watcher, &expected), expected);
