@@ -376,10 +376,11 @@ mod tests {
     #[test]
     fn detects_an_external_modification() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.md");
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("a.md");
         std::fs::write(&path, "one\n").unwrap();
 
-        let watcher = Watcher::new(dir.path()).unwrap();
+        let watcher = Watcher::new(&root).unwrap();
         std::fs::write(&path, "two\n").unwrap();
 
         let expected = Change::Modified(path);
@@ -390,13 +391,13 @@ mod tests {
     fn detects_a_change_in_an_added_directory_outside_the_primary_root() {
         let primary = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
-        let path = external.path().join("saved-as.md");
+        let primary_root = primary.path().canonicalize().unwrap();
+        let external_root = external.path().canonicalize().unwrap();
+        let path = external_root.join("saved-as.md");
         std::fs::write(&path, "one\n").unwrap();
 
-        let mut watcher = Watcher::new(primary.path()).unwrap();
-        watcher
-            .sync_document_directories([external.path().to_path_buf()])
-            .unwrap();
+        let mut watcher = Watcher::new(&primary_root).unwrap();
+        watcher.sync_document_directories([external_root]).unwrap();
         std::fs::write(&path, "two\n").unwrap();
 
         let expected = Change::Modified(path);
