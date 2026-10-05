@@ -395,10 +395,18 @@ fn remote_path(path: &Path) -> bool {
         .strip_prefix("//?/")
         .or_else(|| spelling.strip_prefix("//./"))
     {
-        return rest
-            .split('/')
-            .next()
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC"));
+        let mut components = rest.split('/');
+        let prefix = components.next().unwrap_or_default();
+        return prefix.eq_ignore_ascii_case("UNC")
+            || (prefix.eq_ignore_ascii_case("GLOBALROOT")
+                && components
+                    .next()
+                    .is_some_and(|component| component.eq_ignore_ascii_case("Device"))
+                && components.next().is_some_and(|device| {
+                    ["Mup", "LanmanRedirector", "WebDavRedirector"]
+                        .into_iter()
+                        .any(|redirector| device.eq_ignore_ascii_case(redirector))
+                }));
     }
     if spelling.starts_with("//") {
         return true;

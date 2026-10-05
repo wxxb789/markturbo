@@ -35,11 +35,12 @@ fn install_context(flow: &mut ReviewFlow, input: &ContextInput) {
     assert!(flow.accept_context_resolution(generation, resolve(input, &[])));
 }
 
-#[test]
-fn effective_context_inventory_notification_does_not_restart_pending_resolution() {
+#[gpui_kit::test]
+fn effective_context_inventory_notification_does_not_restart_pending_resolution(
+    cx: &mut gpui_kit::TestAppContext,
+) {
     use mt_core::agent_artifacts::skill::{Origin, Skill, SkillMeta};
     let (_directory, input) = context_fixture();
-    let previous = resolve(&input, &[]);
     let skill_dir = input.workspace.join(".agents/skills/test-skill");
     let skills = vec![Skill {
         entry: skill_dir.join("SKILL.md"),
@@ -52,30 +53,51 @@ fn effective_context_inventory_notification_does_not_restart_pending_resolution(
         diagnostics: Vec::new(),
         support_dirs: Vec::new(),
     }];
-    assert!(super::super::context_inventory_needs_refresh(
-        Some(&previous),
-        &skills,
-        false,
-    ));
-    let mut flow = ReviewFlow::default();
-    let generation = flow.begin_context_resolution(Some(input.clone()));
-    // set_context_pending notifies with the previous Harness result still installed.
-    if super::super::context_inventory_needs_refresh(Some(&previous), &skills, true) {
-        flow.begin_context_resolution(Some(input.clone()));
-    }
-    let current = resolve(&input, &skills);
-    assert!(flow.accept_context_resolution(generation, current.clone()));
-    assert!(!super::super::context_inventory_needs_refresh(
-        Some(&current),
-        &skills,
-        false,
-    ));
-    // An inventory change during the job must still trigger a refresh after it lands.
-    assert!(super::super::context_inventory_needs_refresh(
-        Some(&current),
-        &[],
-        false,
-    ));
+    let (workspace, cx) = super::open_test_workspace(cx, input.target.clone());
+    let harness = workspace.read_with(cx, |workspace, _| workspace.harness.clone().unwrap());
+    harness.update(cx, |harness, cx| {
+        harness.set_context_input_for_test(input.clone(), cx)
+    });
+    cx.run_until_parked();
+    let generation = workspace.update(cx, |workspace, _| {
+        workspace
+            .review_flow
+            .begin_context_resolution(Some(input.clone()))
+    });
+    harness.update(cx, |harness, cx| {
+        harness.set_context_pending(true, cx);
+        harness.apply(skills.clone(), Vec::new(), cx);
+    });
+    cx.run_until_parked();
+    // Accept the same ticket: inventory delivery must not restart the pending job.
+    let current = resolve(&input, &[]);
+    workspace.update(cx, |workspace, cx| {
+        assert!(
+            workspace
+                .review_flow
+                .accept_context_resolution(generation, current.clone())
+        );
+        assert!(harness.update(cx, |harness, cx| {
+            harness.apply_resolved_context(current, cx)
+        }));
+    });
+    cx.run_until_parked();
+    harness.read_with(cx, |harness, _| {
+        assert!(!harness.context_is_pending());
+        assert_eq!(harness.resolved_context().unwrap().available_skills, skills);
+    });
+    harness.update(cx, |harness, cx| harness.apply(Vec::new(), Vec::new(), cx));
+    cx.run_until_parked();
+    harness.read_with(cx, |harness, _| {
+        assert!(!harness.context_is_pending());
+        assert!(
+            harness
+                .resolved_context()
+                .unwrap()
+                .available_skills
+                .is_empty()
+        );
+    });
 }
 
 #[test]
@@ -95,6 +117,139 @@ fn effective_context_model_change_accepts_pending_filesystem_resolution() {
         assert!(flow.accept_context_resolution(generation, resolve(&input, &[])));
         assert!(flow.choose_context_source(DocumentId::next(), 1));
     }
+}
+
+#[gpui_kit::test]
+fn kit_effective_context_inventory_preserves_current_workflow(cx: &mut gpui_kit::TestAppContext) {
+    use mt_core::agent_artifacts::skill::{Origin, Skill, SkillMeta};
+    use mt_core::model::Provider;
+    use mt_core::review::provider::{ReviewMetadata, ReviewTransportResult};
+    use mt_core::review::{ArtifactLens, ReviewResult, ReviewStatus};
+    use mt_core::workspace::watcher::Change;
+    use std::sync::atomic::Ordering;
+
+    let (_directory, input) = context_fixture();
+    let (workspace, cx) = super::open_test_workspace(cx, input.target.clone());
+    let harness = workspace.read_with(cx, |workspace, _| workspace.harness.clone().unwrap());
+    harness.update(cx, |harness, cx| {
+        harness.apply(Vec::new(), Vec::new(), cx);
+        harness.set_context_input_for_test(input.clone(), cx);
+    });
+    cx.run_until_parked();
+    let (document, frozen, snapshot, request, answers, review_ticket, revision_ticket) = workspace
+        .update(cx, |workspace, cx| {
+            let active = workspace.active_document().unwrap().read(cx);
+            let document = active.id();
+            let snapshot = active.async_snapshot(cx);
+            let mut context = revision_context(document, &input);
+            context.source_snapshot = snapshot.clone();
+            let request = context.request.clone();
+            let answers = context.answer_states.clone();
+            workspace.review_flow.install_review_result(
+                super::super::review::WorkspaceReviewResult {
+                    document_id: document,
+                    source_snapshot: snapshot.clone(),
+                    target: ReviewTarget::Document,
+                    selection: None,
+                    lens: ArtifactLens::Prompt,
+                    partial: false,
+                    skill_package: None,
+                    supporting_sources_current: true,
+                    result: ReviewTransportResult {
+                        result: ReviewResult::ready(&request, context.review_output.clone())
+                            .unwrap(),
+                        metadata: ReviewMetadata::from_response(
+                            Provider::OpenAiResponses,
+                            "test-model",
+                            "test-model",
+                        )
+                        .unwrap(),
+                    },
+                },
+                false,
+            );
+            workspace
+                .review_flow
+                .open_review_panel(ReviewTarget::Document, document, true, false);
+            assert!(workspace.review_flow.choose_context_source(document, 1));
+            let frozen = workspace.review_flow.selected_context(document).unwrap();
+            workspace
+                .review_flow
+                .install_review_context_for_test(frozen.selected().clone());
+            workspace.review_flow.install_revision_context(context);
+            let review_ticket = workspace
+                .review_flow
+                .begin_review_request(document, ArtifactLens::Prompt);
+            let revision_ticket = workspace.review_flow.begin_revision_request(document);
+            (
+                document,
+                frozen,
+                snapshot,
+                request,
+                answers,
+                review_ticket,
+                revision_ticket,
+            )
+        });
+    let skill_dir = input.workspace.join(".agents/skills/unrelated");
+    let skill = Skill {
+        entry: skill_dir.join("SKILL.md"),
+        dir: skill_dir,
+        root: input.workspace.join(".agents/skills"),
+        origin: Origin::Workspace,
+        aliases: Vec::new(),
+        name: "unrelated".to_owned(),
+        meta: SkillMeta::default(),
+        diagnostics: Vec::new(),
+        support_dirs: Vec::new(),
+    };
+    for skills in [vec![skill], Vec::new()] {
+        harness.update(cx, |harness, cx| {
+            harness.apply(skills.clone(), Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, app| {
+            let flow = &workspace.review_flow;
+            assert!(flow.context_request_is_current(document, &frozen));
+            assert_eq!(
+                flow.selected_context(document).unwrap().selected(),
+                frozen.selected()
+            );
+            let review = flow.review_result().unwrap();
+            assert!(review.supporting_sources_current);
+            assert_eq!(review.result.result.status, ReviewStatus::Ready);
+            assert!(flow.revision_context_is_current(Some(document), Some(&snapshot), true));
+            let revision = flow.revision_context().unwrap();
+            assert_eq!(revision.request, request);
+            assert_eq!(revision.answer_states, answers);
+            assert!(flow.review_request_is_current(review_ticket.0, &review_ticket.1));
+            assert!(flow.revision_request_is_current(revision_ticket.0, &revision_ticket.1));
+            assert!(!review_ticket.1.load(Ordering::Acquire));
+            assert!(!revision_ticket.1.load(Ordering::Acquire));
+            let harness = harness.read(app);
+            assert!(!harness.context_is_pending());
+            assert_eq!(harness.resolved_context().unwrap().available_skills, skills);
+        });
+    }
+    workspace.update(cx, |workspace, cx| {
+        workspace.apply_watcher_changes(
+            &input.workspace,
+            &[Change::Modified(input.workspace.join("AGENTS.md"))],
+            cx,
+        );
+        let flow = &workspace.review_flow;
+        assert!(!flow.context_request_is_current(document, &frozen));
+        assert!(flow.selected_context(document).is_none());
+        assert!(!flow.review_result().unwrap().supporting_sources_current);
+        assert_eq!(
+            flow.review_result().unwrap().result.result.status,
+            ReviewStatus::Stale
+        );
+        assert!(!flow.revision_context_is_current(Some(document), Some(&snapshot), true));
+        assert!(review_ticket.1.load(Ordering::Acquire));
+        assert!(revision_ticket.1.load(Ordering::Acquire));
+    });
+    cx.run_until_parked();
 }
 
 #[test]
@@ -120,6 +275,140 @@ fn effective_context_choices_are_unchecked_document_scoped_and_explicit() {
     assert!(flow.selected_context(first).is_none());
     assert_eq!(frozen.selected().sources().len(), 1);
     assert!(!flow.choose_context_source(first, 99));
+}
+
+#[gpui_kit::test]
+fn kit_effective_context_watcher_matches_candidate_identity(cx: &mut gpui_kit::TestAppContext) {
+    use mt_core::workspace::watcher::Change;
+    let (_directory, mut input) = context_fixture();
+    fs::remove_file(input.workspace.join("AGENTS.md")).unwrap();
+    #[cfg(windows)]
+    let candidate = input.workspace.join("TEAM.md");
+    #[cfg(not(windows))]
+    let candidate = input.workspace.join("team.md");
+    fs::write(&candidate, "Original team instructions.\n").unwrap();
+    input.fallback_filenames = vec!["team.md".to_owned()];
+    #[cfg(windows)]
+    let event = {
+        let canonical = candidate.to_str().unwrap();
+        std::path::PathBuf::from(
+            canonical
+                .strip_prefix(r"\\?\")
+                .unwrap()
+                .to_ascii_uppercase(),
+        )
+    };
+    #[cfg(not(windows))]
+    let event = candidate.clone();
+    let (workspace, cx) = super::open_test_workspace(cx, input.target.clone());
+    let harness = workspace.read_with(cx, |workspace, _| workspace.harness.clone().unwrap());
+    harness.update(cx, |harness, cx| {
+        harness.set_context_input_for_test(input.clone(), cx)
+    });
+    cx.run_until_parked();
+    let (document, frozen) = workspace.update(cx, |workspace, cx| {
+        let document = workspace.active_document().unwrap().read(cx).id();
+        assert!(workspace.review_flow.choose_context_source(document, 1));
+        let frozen = workspace.review_flow.selected_context(document).unwrap();
+        assert_eq!(
+            frozen.selected().sources()[0].occurrence().path,
+            input.workspace.join("team.md")
+        );
+        #[cfg(windows)]
+        assert!(
+            harness
+                .read(cx)
+                .resolved_context()
+                .unwrap()
+                .watch_paths()
+                .iter()
+                .all(|path| path != &event)
+        );
+        (document, frozen)
+    });
+    let unrelated = vec![
+        Change::Modified(event.with_extension("md.bak")),
+        Change::Removed(std::path::PathBuf::from(format!(
+            "{}-sibling",
+            event.parent().unwrap().display()
+        ))),
+        Change::Removed(event.with_extension("md.bak")),
+    ];
+    #[cfg(not(windows))]
+    let unrelated = {
+        let mut unrelated = unrelated;
+        unrelated.extend([
+            Change::Modified(input.workspace.join("TEAM.md")),
+            Change::Removed(input.workspace.join("TEAM.md")),
+        ]);
+        unrelated
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace.apply_watcher_changes(&input.workspace, &unrelated, cx);
+        assert!(
+            workspace
+                .review_flow
+                .context_request_is_current(document, &frozen)
+        );
+        assert!(!harness.read(cx).context_is_pending());
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _| {
+        assert!(
+            workspace
+                .review_flow
+                .context_request_is_current(document, &frozen)
+        );
+    });
+
+    fs::write(&candidate, "Updated team instructions.\n").unwrap();
+    workspace.update(cx, |workspace, cx| {
+        workspace.apply_watcher_changes(&input.workspace, &[Change::Modified(event.clone())], cx);
+        assert!(
+            !workspace
+                .review_flow
+                .context_request_is_current(document, &frozen)
+        );
+        assert!(workspace.review_flow.selected_context(document).is_none());
+        assert!(harness.read(cx).context_is_pending());
+    });
+    cx.run_until_parked();
+    let updated = workspace.update(cx, |workspace, cx| {
+        assert!(!harness.read(cx).context_is_pending());
+        assert!(workspace.review_flow.choose_context_source(document, 1));
+        let selected = workspace.review_flow.selected_context(document).unwrap();
+        assert_eq!(
+            selected.selected().contents()[0].text,
+            "Updated team instructions.\n"
+        );
+        selected
+    });
+
+    fs::remove_file(&candidate).unwrap();
+    assert!(!event.exists());
+    workspace.update(cx, |workspace, cx| {
+        workspace.apply_watcher_changes(&input.workspace, &[Change::Removed(event)], cx);
+        assert!(
+            !workspace
+                .review_flow
+                .context_request_is_current(document, &updated)
+        );
+        assert!(workspace.review_flow.selected_context(document).is_none());
+        assert!(harness.read(cx).context_is_pending());
+    });
+    cx.run_until_parked();
+    harness.read_with(cx, |harness, _| {
+        assert!(!harness.context_is_pending());
+        let context = harness.resolved_context().unwrap();
+        assert_eq!(context.sources.len(), 1);
+        assert_eq!(context.sources[0].path, input.codex_home.join("AGENTS.md"));
+        assert!(
+            context
+                .contents
+                .iter()
+                .all(|content| !content.text.contains("team instructions"))
+        );
+    });
 }
 
 #[test]

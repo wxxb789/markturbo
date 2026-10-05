@@ -1009,9 +1009,9 @@ fn unsupported_profile_configuration_and_explicit_invalid_home_are_diagnosed() {
 #[cfg(windows)]
 #[test]
 fn explicit_remote_inputs_and_references_are_rejected_before_filesystem_probes() {
-    // Embedded NUL keeps UNC cases offline even if the guard regresses: Windows
-    // cannot open these names. The diagnostic code must come from the remote
-    // guard, not from the filesystem's invalid-name error.
+    // Embedded NUL keeps UNC and redirector cases offline even if the guard
+    // regresses: Windows cannot open these names. The diagnostic code must come
+    // from the remote guard, not from the filesystem's invalid-name error.
     for remote in [
         "https://offline.invalid/AGENTS.md",
         "smb://offline.invalid/share/AGENTS.md",
@@ -1021,6 +1021,18 @@ fn explicit_remote_inputs_and_references_are_rejected_before_filesystem_probes()
         "\\\\?\\UNC\\offline\0\\share\\AGENTS.md",
         "//?/UNC/offline\0/share/AGENTS.md",
         "\\\\?\\unc\\offline\0\\share\\AGENTS.md",
+        "\\\\?\\GLOBALROOT\\Device\\Mup\\offline\0\\share\\AGENTS.md",
+        "\\\\.\\GLOBALROOT\\Device\\Mup\\offline\0\\share\\AGENTS.md",
+        "//?/GLOBALROOT/Device/Mup/offline\0/share/AGENTS.md",
+        "//./GLOBALROOT/Device/Mup/offline\0/share/AGENTS.md",
+        "\\\\?\\globalroot\\device\\mup\\offline\0\\share\\AGENTS.md",
+        "\\\\.\\globalroot\\device\\mup\\offline\0\\share\\AGENTS.md",
+        "\\\\?\\GlObAlRoOt/DeViCe\\MuP/offline\0\\share/AGENTS.md",
+        "//./GlObAlRoOt\\DeViCe/MuP\\offline\0/share\\AGENTS.md",
+        "\\\\?\\GLOBALROOT\\Device\\LanmanRedirector\\offline\0\\share\\AGENTS.md",
+        "//./globalroot/device/lanmanredirector/offline\0/share/AGENTS.md",
+        "\\\\?\\GLOBALROOT\\Device\\WebDavRedirector\\offline\0\\share\\AGENTS.md",
+        "//./globalroot/device/webdavredirector/offline\0/share/AGENTS.md",
     ] {
         for field in ["workspace", "target", "cwd", "home", "fallback", "marker"] {
             let mut fixture = Fixture::load("removed");
@@ -1040,7 +1052,10 @@ fn explicit_remote_inputs_and_references_are_rejected_before_filesystem_probes()
             let context = fixture.resolve();
             assert_eq!(context.status, ResolutionStatus::InvalidInput);
             assert_eq!(context.diagnostics.len(), 1);
-            assert_eq!(context.diagnostics[0].source, "context.unsupported-remote");
+            assert_eq!(
+                context.diagnostics[0].source, "context.unsupported-remote",
+                "{field}: {remote:?}"
+            );
             assert_eq!(context.diagnostics[0].severity, Severity::Error);
             assert!(context.sources.is_empty());
             assert!(context.contents.is_empty());

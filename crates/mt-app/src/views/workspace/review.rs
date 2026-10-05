@@ -1535,6 +1535,11 @@ impl ReviewFlow {
     pub(super) fn set_review_panel_open(&mut self, open: bool) {
         self.review_panel_open = open;
     }
+
+    #[cfg(test)]
+    pub(super) fn install_review_context_for_test(&mut self, context: SelectedContext) {
+        self.review_context = Some(context);
+    }
 }
 
 impl Workspace {

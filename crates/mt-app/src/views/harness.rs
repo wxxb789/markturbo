@@ -329,7 +329,7 @@ impl HarnessView {
         self.refresh(cx);
     }
 
-    fn apply(
+    pub(super) fn apply(
         &mut self,
         skills: Vec<Skill>,
         instructions: Vec<Instruction>,
@@ -339,6 +339,9 @@ impl HarnessView {
         // reorder either list.
         let previous = self.selected_path();
         self.skills = skills;
+        if let Some(context) = &mut self.resolved_context {
+            context.available_skills.clone_from(&self.skills);
+        }
         self.instructions = instructions;
         self.selected = previous.and_then(|path| self.position_of(&path));
         if self.selected.is_none() && self.section != Section::Context {
@@ -411,6 +414,16 @@ impl HarnessView {
         self.context_input.as_ref()
     }
 
+    #[cfg(test)]
+    pub(super) fn set_context_input_for_test(
+        &mut self,
+        input: ContextInput,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_input = Some(input.clone());
+        cx.emit(HarnessEvent::ContextChanged { input: Some(input) });
+    }
+
     /// The latest result, only while it still matches the current input identity.
     pub fn resolved_context(&self) -> Option<&ResolvedContext> {
         self.resolved_context.as_ref()
@@ -435,12 +448,14 @@ impl HarnessView {
     /// Accept only results for the exact current input snapshot.
     pub fn apply_resolved_context(
         &mut self,
-        context: ResolvedContext,
+        mut context: ResolvedContext,
         cx: &mut Context<Self>,
     ) -> bool {
         if !context_matches_input(self.context_input.as_ref(), &context) {
             return false;
         }
+        // A discovery result may have arrived while automatic instructions resolved.
+        context.available_skills.clone_from(&self.skills);
         let previous = self.selected_context_source.clone();
         self.selected_context_source = previous
             .filter(|key| {
@@ -2376,6 +2391,7 @@ mod tests {
             available_skills: Vec::new(),
         };
         view.update(cx, |view, cx| {
+            view.apply(Vec::new(), Vec::new(), cx);
             view.set_section(Section::Context, cx);
             assert!(view.apply_resolved_context(resolved, cx));
         });
