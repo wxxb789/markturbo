@@ -349,11 +349,23 @@ mod tests {
     /// Receive the exact change from the channel registered before the write.
     fn receive_change(watcher: &Watcher, expected: &Change) -> Change {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut observed = Vec::new();
         loop {
             let events = watcher
                 .rx
                 .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .expect("expected filesystem notification before the deadline");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "expected filesystem notification before the deadline: {error:?}; \
+                         observed event kinds and exact path matches: {observed:?}"
+                    )
+                });
+            observed.extend(events.iter().map(|event| {
+                (
+                    event.kind,
+                    event.paths.iter().any(|path| path == expected.path()),
+                )
+            }));
             let changes = dedup(
                 events
                     .iter()
@@ -378,9 +390,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let path = root.join("a.md");
-        std::fs::write(&path, "one\n").unwrap();
 
         let watcher = Watcher::new(&root).unwrap();
+        std::fs::write(&path, "one\n").unwrap();
+        let created = Change::Created(path.clone());
+        assert_eq!(receive_change(&watcher, &created), created);
         std::fs::write(&path, "two\n").unwrap();
 
         let expected = Change::Modified(path);
@@ -394,10 +408,12 @@ mod tests {
         let primary_root = primary.path().canonicalize().unwrap();
         let external_root = external.path().canonicalize().unwrap();
         let path = external_root.join("saved-as.md");
-        std::fs::write(&path, "one\n").unwrap();
 
         let mut watcher = Watcher::new(&primary_root).unwrap();
         watcher.sync_document_directories([external_root]).unwrap();
+        std::fs::write(&path, "one\n").unwrap();
+        let created = Change::Created(path.clone());
+        assert_eq!(receive_change(&watcher, &created), created);
         std::fs::write(&path, "two\n").unwrap();
 
         let expected = Change::Modified(path);
