@@ -1,0 +1,9 @@
+{
+  "cwd": ".",
+  "target": "task.md",
+  "files": {
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/AGENTS.md": "---\nmodel: [broken\nscope: sibling/**\n@import missing.md\nOPAQUE_SENTINEL",
+    "workspace/task.md": "TASK_SENTINEL"
+  }
+}

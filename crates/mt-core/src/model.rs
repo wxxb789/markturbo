@@ -210,9 +210,12 @@ enum OutboundScopeDetails {
     DocumentWithEffectiveAgentContext {
         document_byte_size: u64,
         sources: Vec<String>,
+        canonical_source_digest: Option<[u8; 32]>,
     },
     AgentSkillPackage {
         inventory: AgentSkillInventory,
+        effective_context_sources: Vec<String>,
+        canonical_source_digest: Option<[u8; 32]>,
     },
 }
 
@@ -272,12 +275,17 @@ impl OutboundScope {
             OutboundScopeDetails::DocumentWithEffectiveAgentContext {
                 document_byte_size,
                 sources,
+                canonical_source_digest: None,
             },
         ))
     }
 
     fn agent_skill_package(inventory: AgentSkillInventory) -> Self {
-        Self::new(OutboundScopeDetails::AgentSkillPackage { inventory })
+        Self::new(OutboundScopeDetails::AgentSkillPackage {
+            inventory,
+            effective_context_sources: Vec::new(),
+            canonical_source_digest: None,
+        })
     }
 
     fn new(details: OutboundScopeDetails) -> Self {
@@ -307,43 +315,86 @@ impl OutboundScope {
             OutboundScopeDetails::DocumentWithEffectiveAgentContext {
                 document_byte_size, ..
             } => *document_byte_size,
-            OutboundScopeDetails::AgentSkillPackage { inventory } => inventory.total_byte_size(),
+            OutboundScopeDetails::AgentSkillPackage { inventory, .. } => {
+                inventory.total_byte_size()
+            }
         }
     }
 
     pub fn effective_context_sources(&self) -> &[String] {
         match &self.details {
             OutboundScopeDetails::DocumentWithEffectiveAgentContext { sources, .. } => sources,
+            OutboundScopeDetails::AgentSkillPackage {
+                effective_context_sources,
+                ..
+            } => effective_context_sources,
             _ => &[],
+        }
+    }
+
+    /// Only the frozen Review boundary can bind the displayed sources to the
+    /// exact document and selected-context frames that will leave the device.
+    pub(crate) fn bind_effective_context_request(mut self, digest: [u8; 32]) -> Self {
+        if let OutboundScopeDetails::DocumentWithEffectiveAgentContext {
+            canonical_source_digest,
+            ..
+        } = &mut self.details
+        {
+            *canonical_source_digest = Some(digest);
+        }
+        self
+    }
+
+    pub const fn review_request_digest(&self) -> Option<[u8; 32]> {
+        match &self.details {
+            OutboundScopeDetails::DocumentWithEffectiveAgentContext {
+                canonical_source_digest,
+                ..
+            }
+            | OutboundScopeDetails::AgentSkillPackage {
+                canonical_source_digest,
+                ..
+            } => *canonical_source_digest,
+            _ => None,
         }
     }
 
     pub fn agent_skill_inventory(&self) -> Option<&AgentSkillInventory> {
         match &self.details {
-            OutboundScopeDetails::AgentSkillPackage { inventory } => Some(inventory),
+            OutboundScopeDetails::AgentSkillPackage { inventory, .. } => Some(inventory),
             _ => None,
         }
     }
 
-    /// Goal 06 Review is document-only. Effective Agent Context is introduced
-    /// by Goal 08 and may remain a valid scope for other operations.
+    /// Named context alone grants no Review authority. Its exact selected
+    /// projection must first be bound by the frozen Review request boundary.
     pub const fn permits_review(&self) -> bool {
-        !matches!(
-            self.details,
-            OutboundScopeDetails::DocumentWithEffectiveAgentContext { .. }
-        )
+        match &self.details {
+            OutboundScopeDetails::DocumentWithEffectiveAgentContext {
+                canonical_source_digest: None,
+                ..
+            } => false,
+            OutboundScopeDetails::AgentSkillPackage {
+                effective_context_sources,
+                canonical_source_digest,
+                ..
+            } => effective_context_sources.is_empty() || canonical_source_digest.is_some(),
+            _ => true,
+        }
     }
 
     /// Goal 07 Revision may disclose only a document, selection, or frozen
     /// Agent Skill package. Blocks and Effective Agent Context are separate
     /// flows and cannot inherit Revision consent.
     pub const fn permits_revision(&self) -> bool {
-        matches!(
-            self.details,
-            OutboundScopeDetails::Selection { .. }
-                | OutboundScopeDetails::Document { .. }
-                | OutboundScopeDetails::AgentSkillPackage { .. }
-        )
+        match &self.details {
+            OutboundScopeDetails::Selection { .. } | OutboundScopeDetails::Document { .. } => true,
+            OutboundScopeDetails::AgentSkillPackage {
+                effective_context_sources,
+                ..
+            } => effective_context_sources.is_empty(),
+            _ => false,
+        }
     }
 }
 
@@ -824,6 +875,30 @@ impl AgentSkillRequest {
 
     pub fn outbound_scope(&self) -> OutboundScope {
         self.scope.clone()
+    }
+
+    /// Decorate the same frozen inventory scope, retaining the adapter's exact
+    /// scope identity while adding the explicitly selected Review evidence.
+    pub(crate) fn with_effective_agent_context(
+        mut self,
+        sources: Vec<String>,
+        digest: [u8; 32],
+    ) -> Result<Self, OutboundScopeError> {
+        let context = OutboundScope::document_with_effective_agent_context(
+            self.inventory().total_byte_size(),
+            sources,
+        )?;
+        let OutboundScopeDetails::AgentSkillPackage {
+            effective_context_sources,
+            canonical_source_digest,
+            ..
+        } = &mut self.scope.details
+        else {
+            unreachable!("Agent Skill requests own package scopes");
+        };
+        *effective_context_sources = context.effective_context_sources().to_vec();
+        *canonical_source_digest = Some(digest);
+        Ok(self)
     }
 
     pub fn framed_payload(&self) -> Vec<u8> {
@@ -1340,6 +1415,7 @@ impl ModelRequestDisclosure {
             scope: self.scope.binding.clone(),
             revision_binding: self.revision_binding,
             revision_details: self.revision_details,
+            review_request_digest: self.scope.review_request_digest(),
         }
     }
 
@@ -1396,11 +1472,11 @@ impl fmt::Display for ModelRequestDisclosureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReviewEffectiveAgentContext => formatter.write_str(
-                "Review cannot resolve or include Effective Agent Context before Goal 08",
+                "Review effective context must be bound to a frozen selected-source request",
             ),
-            Self::RevisionEffectiveAgentContext => formatter.write_str(
-                "Revision cannot resolve or include Effective Agent Context before Goal 08",
-            ),
+            Self::RevisionEffectiveAgentContext => {
+                formatter.write_str("Revision does not resend Effective Agent Context sources")
+            }
             Self::RevisionScopeNotAllowed => formatter.write_str(
                 "Revision scope must be a document, selection, or frozen Agent Skill package",
             ),
@@ -1428,6 +1504,7 @@ struct RequestBinding {
     scope: ScopeBinding,
     revision_binding: Option<RevisionRequestBinding>,
     revision_details: Option<RevisionDisclosureDetails>,
+    review_request_digest: Option<[u8; 32]>,
 }
 
 impl RequestBinding {
@@ -1437,6 +1514,7 @@ impl RequestBinding {
             && self.scope == request.scope.binding
             && self.revision_binding == request.revision_binding
             && self.revision_details == request.revision_details
+            && self.review_request_digest == request.scope.review_request_digest()
     }
 }
 
@@ -2031,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn review_cannot_authorize_effective_agent_context() {
+    fn review_cannot_authorize_unbound_effective_agent_context() {
         let scope = OutboundScope::document_with_effective_agent_context(4, ["AGENTS.md"]).unwrap();
         let endpoint = EndpointIdentity::parse(Provider::OpenAiResponses, None).unwrap();
         assert_eq!(
@@ -2065,6 +2143,91 @@ mod tests {
         let mut translation_consent =
             ConsentCapability::from_decision(&translation, ConsentDecision::Approve);
         assert!(translation_consent.authorize(&translation).is_ok());
+    }
+
+    #[test]
+    fn frozen_context_review_binds_digest_even_with_the_same_scope_identity() {
+        let named = OutboundScope::document_with_effective_agent_context(4, ["AGENTS.md"]).unwrap();
+        let first = named.clone().bind_effective_context_request([1; 32]);
+        let changed = named.bind_effective_context_request([2; 32]);
+        let endpoint = EndpointIdentity::parse(Provider::OpenAiResponses, None).unwrap();
+        let disclosure =
+            ModelRequestDisclosure::try_new(ModelOperation::Review, endpoint.clone(), first)
+                .unwrap();
+        let different =
+            ModelRequestDisclosure::try_new(ModelOperation::Review, endpoint, changed).unwrap();
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        assert_eq!(
+            consent.authorize(&different).unwrap_err(),
+            ConsentError::Mismatch
+        );
+        assert_eq!(
+            consent.authorize(&disclosure).unwrap_err(),
+            ConsentError::Consumed
+        );
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        assert!(consent.authorize(&disclosure).unwrap().matches(&disclosure));
+    }
+
+    #[test]
+    fn skill_context_keeps_inventory_consent_and_rejects_unbound_or_revision_scope() {
+        let request = AgentSkillRequest::new(
+            vec![
+                AgentSkillRequestEntry::from_source_bytes(
+                    "SKILL.md",
+                    "entrypoint",
+                    b"skill".to_vec(),
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let source_scope = request.outbound_scope();
+        let endpoint = EndpointIdentity::parse(Provider::OpenAiResponses, None).unwrap();
+        let source = ModelRequestDisclosure::new(
+            ModelOperation::Review,
+            endpoint.clone(),
+            source_scope.clone(),
+        );
+        let combined = request
+            .with_effective_agent_context(vec!["AGENTS.md".to_owned()], [1; 32])
+            .unwrap();
+        let disclosure = combined.disclosure(ModelOperation::Review, endpoint.clone());
+        assert_eq!(
+            disclosure.scope().agent_skill_inventory(),
+            source.scope().agent_skill_inventory()
+        );
+        assert_eq!(
+            disclosure.scope().effective_context_sources(),
+            ["AGENTS.md"]
+        );
+        let mut consent = ConsentCapability::from_decision(&source, ConsentDecision::Approve);
+        assert_eq!(
+            consent.authorize(&disclosure).unwrap_err(),
+            ConsentError::Mismatch
+        );
+        let mut unbound = source_scope;
+        if let OutboundScopeDetails::AgentSkillPackage {
+            effective_context_sources,
+            ..
+        } = &mut unbound.details
+        {
+            effective_context_sources.push("AGENTS.md".to_owned());
+        }
+        let unbound =
+            ModelRequestDisclosure::new(ModelOperation::Review, endpoint.clone(), unbound);
+        let mut consent = ConsentCapability::from_decision(&unbound, ConsentDecision::Approve);
+        assert_eq!(
+            consent.authorize(&unbound).unwrap_err(),
+            ConsentError::Rejected(ModelRequestDisclosureError::ReviewEffectiveAgentContext)
+        );
+        let revision = revision_disclosure(endpoint, combined.outbound_scope(), [2; 32], [3; 32]);
+        let mut consent = ConsentCapability::from_decision(&revision, ConsentDecision::Approve);
+        assert_eq!(
+            consent.authorize(&revision).unwrap_err(),
+            ConsentError::Rejected(ModelRequestDisclosureError::RevisionScopeNotAllowed)
+        );
     }
 
     #[test]

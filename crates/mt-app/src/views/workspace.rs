@@ -141,6 +141,7 @@ const REVISION_COPY_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
     "markturbo-revision-copy-recovered-answers";
 const REVISION_DISCARD_RECOVERED_ANSWERS_ACCESSIBILITY_ID: &str =
     "markturbo-revision-discard-recovered-answers";
+
 /// Shorten `name` to [`TAB_LABEL_MAX`], keeping the extension.
 ///
 /// The extension is what distinguishes `notes.md` from `notes.mdx`, so eliding
@@ -1105,7 +1106,8 @@ impl Workspace {
         // dropdown change rebuild every open document's HTML.
         this._subscriptions.push(
             cx.observe_global::<crate::settings::AppSettings>(|this, cx| {
-                let _ = &this;
+                this.review_flow
+                    .observe_model_configuration(crate::settings::AppSettings::global(cx));
                 cx.notify();
             }),
         );
@@ -1174,7 +1176,7 @@ impl Workspace {
 
         let explorer = cx.new(|cx| Explorer::new(path.clone(), window, cx));
         let skill_cache = self.skill_cache.clone();
-        let harness = cx.new(|cx| HarnessView::new(path.clone(), skill_cache, cx));
+        let harness = cx.new(|cx| HarnessView::new(path.clone(), skill_cache, window, cx));
 
         // Kept apart from `_subscriptions`: this set is replaced wholesale on
         // every folder change, and folding it into the general one would take
@@ -1192,9 +1194,13 @@ impl Workspace {
             cx.subscribe_in(
                 &harness,
                 window,
-                |this: &mut Self, _, event: &HarnessEvent, window, cx| {
-                    let HarnessEvent::OpenFile { path, preview } = event;
-                    this.open_file_as(path.clone(), *preview, window, cx);
+                |this: &mut Self, _, event: &HarnessEvent, window, cx| match event {
+                    HarnessEvent::OpenFile { path, preview } => {
+                        this.open_file_as(path.clone(), *preview, window, cx);
+                    }
+                    HarnessEvent::ContextChanged { input } => {
+                        this.resolve_effective_context(input.clone(), cx);
+                    }
                 },
             ),
             cx.observe(&harness, |this, _, cx| {
@@ -1215,6 +1221,11 @@ impl Workspace {
         self.harness = Some(harness);
         self.root = Some(path);
         self.show_welcome = false;
+        let context_input = self
+            .harness
+            .as_ref()
+            .and_then(|harness| harness.read(cx).context_input().cloned());
+        self.resolve_effective_context(context_input, cx);
         self.sync_document_watches(cx);
         // Any results on screen came from the folder that was open a moment
         // ago. Leaving them would present another project's matches as this
@@ -1240,9 +1251,18 @@ impl Workspace {
                 directories.insert(parent.to_path_buf());
             }
         }
+        let mut context_paths = Vec::new();
+        if let Some(harness) = &self.harness {
+            let harness = harness.read(cx);
+            if let Some(context) = harness.resolved_context() {
+                context_paths = context.watch_paths();
+                directories.extend(context.watch_directories());
+            }
+        }
         let Some(watcher) = self.watcher.as_mut() else {
             return;
         };
+        watcher.sync_context_paths(context_paths);
         if let Err(err) = watcher.sync_document_directories(directories) {
             log::warn!("filesystem document watching could not be synchronized: {err}");
         }
@@ -2246,6 +2266,51 @@ impl Workspace {
         // makes the frozen result stale immediately, without rereading files
         // from render or risking a current-looking result after an edit.
         self.review_flow.observe_supporting_source_changes(changes);
+        let context_changed = self
+            .harness
+            .as_ref()
+            .and_then(|harness| harness.read(cx).resolved_context())
+            .is_some_and(|context| {
+                let paths = context.watch_paths();
+                changes.iter().any(|change| {
+                    paths.iter().any(|path| {
+                        #[cfg(windows)]
+                        {
+                            // Deleted paths must match without canonicalizing them.
+                            let path = path.to_string_lossy().replace('\\', "/");
+                            let changed = change.path().to_string_lossy().replace('\\', "/");
+                            let path = path
+                                .strip_prefix("//?/")
+                                .or_else(|| path.strip_prefix("//./"))
+                                .unwrap_or(&path)
+                                .trim_end_matches('/');
+                            let changed = changed
+                                .strip_prefix("//?/")
+                                .or_else(|| changed.strip_prefix("//./"))
+                                .unwrap_or(&changed)
+                                .trim_end_matches('/');
+                            path.eq_ignore_ascii_case(changed)
+                                || change.affects_tree()
+                                    && path
+                                        .get(..changed.len())
+                                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(changed))
+                                    && path.as_bytes().get(changed.len()) == Some(&b'/')
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            path == change.path()
+                                || change.affects_tree() && path.starts_with(change.path())
+                        }
+                    })
+                })
+            });
+        if context_changed {
+            let input = self
+                .harness
+                .as_ref()
+                .and_then(|harness| harness.read(cx).context_input().cloned());
+            self.resolve_effective_context(input, cx);
+        }
 
         let tree_changed = changes
             .iter()
@@ -4994,6 +5059,8 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    mod effective_context;
+    mod revision_context;
     mod welcome;
 
     use std::{

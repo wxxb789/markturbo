@@ -1,0 +1,91 @@
+{
+  "profile_id": "codex-agents-md-2026-08-29",
+  "upstream_revision": "b8c86376a258e55efc8e5ecfbabc21c16c07d814",
+  "retrieved_on": "2026-10-02",
+  "authoritative_url": "https://developers.openai.com/codex/agent-configuration/agents-md",
+  "sources": [
+    {
+      "path": "codex-rs/core/src/agents_md.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/core/src/agents_md.rs",
+      "sha256": "8bbaf068c099fdeeaf4fe49076d398da7671f20c9a962fde5c4eb7653008fed4"
+    },
+    {
+      "path": "codex-rs/codex-home/src/instructions/mod.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/codex-home/src/instructions/mod.rs",
+      "sha256": "fad349ac9be95dfcbf5401d814f35a8cb118ab6cdfe3cf48ae89fda8b39e4614"
+    },
+    {
+      "path": "codex-rs/config/src/project_root_markers.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/config/src/project_root_markers.rs",
+      "sha256": "21d3a86eea7a34f39b1ebc82037d78dd9c1c46fef0c4c74de584bae7cab17f53"
+    },
+    {
+      "path": "codex-rs/core/src/config/mod.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/core/src/config/mod.rs",
+      "sha256": "7e5f8df04304e70451abef58d220ce87417092bbdb8f8f040b5223fa0c6e2bd3"
+    },
+    {
+      "path": "codex-rs/config/src/config_toml.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/config/src/config_toml.rs",
+      "sha256": "125cf3a29c57890e78e06c0a0ee5fcaf853bd370dbdbd460572e22bbac47fec6"
+    },
+    {
+      "path": "codex-rs/core/src/agents_md_tests.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/core/src/agents_md_tests.rs",
+      "sha256": "f3c2c04087eed398afef2b02ab6955166586b63ebf6788d558534da617e1409a"
+    },
+    {
+      "path": "codex-rs/ext/skills/src/fragments.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/ext/skills/src/fragments.rs",
+      "sha256": "4e61b21994402a08554ae02352a3eb5c99f13f7a7f974ec656a22a3b5eb05a42"
+    },
+    {
+      "path": "codex-rs/utils/home-dir/src/lib.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/utils/home-dir/src/lib.rs",
+      "sha256": "1338259489ade54b01caa1468b6d25fc5a183657fa94cca0add8b91865635ef5"
+    },
+    {
+      "path": "codex-rs/file-system/src/find_up.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/file-system/src/find_up.rs",
+      "sha256": "5e24e7a4d593b47fafbada89a84fc7917c8e3b26a9acd30b93341b2e70a7ff19"
+    },
+    {
+      "path": "codex-rs/file-system/src/lib.rs",
+      "url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/codex-rs/file-system/src/lib.rs",
+      "sha256": "8755f5ba4d6599a5c5757ffa9acb2eac1c042cc42175f9b3ef87df72f9afae5b"
+    }
+  ],
+  "rules": [
+    { "id": "project-cwd", "description": "Resolve from the project root to the execution cwd; selected target ancestors are not used as an alternate chain.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 185, "line_end": 235 },
+    { "id": "global-first-readable", "description": "Try AGENTS.override.md then AGENTS.md and select the first readable, non-empty trimmed global instruction text.", "source": "codex-rs/codex-home/src/instructions/mod.rs", "line_start": 24, "line_end": 67 },
+    { "id": "project-first-existing", "description": "For each project directory, select override, AGENTS.md, then configured fallback names; the first existing regular file wins before content is checked.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 237, "line_end": 280 },
+    { "id": "project-order", "description": "Apply selected project files in project-root-to-cwd order after the global instructions.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 237, "line_end": 280 },
+    { "id": "root-marker", "description": "When marker configuration is unset, use the default [.git]; when no marker is found or the configured marker list is explicitly empty, use the cwd only.", "source": "codex-rs/config/src/project_root_markers.rs", "line_start": 1, "line_end": 46 },
+    { "id": "fallback-normalization", "description": "Trim and drop empty fallback names and exact-name deduplicate them while preserving order.", "source": "codex-rs/core/src/config/mod.rs", "line_start": 4191, "line_end": 4204 },
+    { "id": "project-byte-budget", "description": "Apply the default 32768-byte raw project-document budget.", "source": "codex-rs/config/src/config_toml.rs", "line_start": 73, "line_end": 83 },
+    { "id": "raw-byte-truncation", "description": "Truncate raw bytes before lossy UTF-8 conversion; empty text consumes no budget.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 129, "line_end": 175 },
+    { "id": "separators", "description": "Insert the documented global and project separators between instruction sections.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 352, "line_end": 377 },
+    { "id": "symlink-read", "description": "Follow symlinks for reads while preserving lexical discovery paths and cwd.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 129, "line_end": 175 },
+    { "id": "untrusted-project", "description": "An explicit untrusted project excludes project content but retains global instructions.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 60, "line_end": 63 },
+    { "id": "opaque-text", "description": "AGENTS.md text is opaque; frontmatter, imports, and scope-like text do not alter applicability or execute imports.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 129, "line_end": 175 },
+    { "id": "skills-on-demand", "description": "Skills are available on demand and are not part of the automatic instruction chain.", "source": "codex-rs/core/src/agents_md_tests.rs", "line_start": 1669, "line_end": 1683 },
+    { "id": "skills-available-fragment", "description": "Available Skills are represented separately from automatic AGENTS.md instructions.", "source": "codex-rs/ext/skills/src/fragments.rs", "line_start": 1, "line_end": 57 },
+    { "id": "codex-home-env", "description": "Use non-empty CODEX_HOME exactly as provided, without whitespace trimming, requiring an existing directory and canonicalizing it; when unset, use <platform home>/.codex.", "source": "codex-rs/utils/home-dir/src/lib.rs", "line_start": 6, "line_end": 66 },
+    { "id": "marker-ancestor-search", "description": "Search ancestors for the nearest configured marker, preserving nearest-match behavior.", "source": "codex-rs/file-system/src/find_up.rs", "line_start": 22, "line_end": 126 },
+    { "id": "symlink-read-options", "description": "File read options follow symlinks by default.", "source": "codex-rs/file-system/src/lib.rs", "line_start": 48, "line_end": 84 },
+    { "id": "project-budget-excludes-global", "description": "Global instructions and separators are excluded from the project document budget while project bytes are budgeted and truncated.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 60, "line_end": 89 },
+    { "id": "project-budget-read-truncation", "description": "Project instruction reads apply the raw byte budget and truncation behavior, including empty-text handling.", "source": "codex-rs/core/src/agents_md.rs", "line_start": 129, "line_end": 175 }
+  ],
+  "defaults": {
+    "project_doc_max_bytes": 32768,
+    "project_root_markers": [".git"],
+    "project_doc_fallback_filenames": []
+  },
+  "assumptions": [
+    "This profile freezes inspected source semantics at upstream revision b8c86376a258e55efc8e5ecfbabc21c16c07d814; the live documentation URL identifies the contract but is not runtime input.",
+    "AGENTS.md is a built-in candidate; the configured project fallback filename default is empty. Empty configured names are omitted and exact duplicates are removed.",
+    "MarkTurbo may deduplicate its display or Review projection while retaining occurrence order, raw provenance, and budget effects.",
+    "This profile resolves one local execution context with explicit effective configuration and trust only; it does not claim layered-config, sandbox, multi-environment, plugin, or complete harness fidelity.",
+    "Unsupported or malformed constructs are MarkTurbo product diagnostics, not upstream Codex discovery rules; content failures do not discard editable source text."
+  ]
+}

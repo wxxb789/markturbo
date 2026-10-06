@@ -1,0 +1,10 @@
+{
+  "cwd": ".",
+  "target": "task.md",
+  "files": {
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/AGENTS.md": "@import remote.md\n@import https://example.invalid/AGENTS.md\nIMPORT_SENTINEL",
+    "workspace/remote.md": "NOT_IMPORTED_SENTINEL",
+    "workspace/task.md": "TASK_SENTINEL"
+  }
+}

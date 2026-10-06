@@ -1,0 +1,10 @@
+{
+  "cwd": "nested",
+  "target": "nested/task.md",
+  "files": {
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/AGENTS.md": "SHARED_SENTINEL",
+    "workspace/nested/task.md": "TASK_SENTINEL",
+    "alternate/AGENTS.md": "SHARED_SENTINEL"
+  }
+}

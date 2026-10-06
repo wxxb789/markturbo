@@ -16,6 +16,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::agent_artifacts::context::SelectedContext;
+
 /// The structured response schema used by the first Review implementation.
 pub const REVIEW_SCHEMA_VERSION: &str = "review-v1";
 
@@ -786,6 +788,9 @@ pub struct ReviewRequest {
     pub scope: ReviewScope,
     pub source: ReviewSource,
     pub snapshot: SourceSnapshot,
+    /// Explicitly selected, frozen instructions; never part of the editable source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_agent_context: Option<SelectedContext>,
 }
 
 impl ReviewRequest {
@@ -807,6 +812,7 @@ impl ReviewRequest {
             scope,
             source,
             snapshot,
+            effective_agent_context: None,
         };
         request.validate()?;
         Ok(request)
@@ -851,7 +857,29 @@ impl ReviewRequest {
         )
     }
 
+    /// Attach an explicit nonempty selection to a whole document or Agent Skill Review.
+    /// Context resolution itself grants neither consent nor outbound authority.
+    pub fn with_effective_agent_context(
+        mut self,
+        context: SelectedContext,
+    ) -> Result<Self, ReviewValidationError> {
+        self.effective_agent_context = Some(context);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), ReviewValidationError> {
+        if let Some(context) = &self.effective_agent_context {
+            if !matches!(
+                self.scope,
+                ReviewScope::Document | ReviewScope::AgentSkillPackage
+            ) {
+                return Err(ReviewValidationError::EffectiveContextRequiresWholeArtifact);
+            }
+            if context.is_empty() {
+                return Err(ReviewValidationError::EmptyEffectiveContext);
+            }
+        }
         match (&self.scope, &self.source) {
             (ReviewScope::Document, ReviewSource::Document { .. }) => {}
             (
@@ -909,8 +937,9 @@ impl ReviewRequest {
         Ok(())
     }
 
-    /// The exact user-content bytes covered by this request, excluding any
-    /// provider protocol framing.
+    /// The editable source bytes covered by this request, excluding context
+    /// evidence and provider protocol framing. Anchors and Revision always use
+    /// this source identity, never a concatenated instruction chain.
     pub fn outbound_bytes(&self) -> Vec<u8> {
         match (&self.scope, &self.source) {
             (ReviewScope::Document, ReviewSource::Document { text, .. }) => {
@@ -1642,6 +1671,8 @@ pub enum ReviewValidationError {
     AnchorPathNotInPackage(String),
     AnchorPathNotNormalized,
     SelectionContextNotMarkedMissing,
+    EffectiveContextRequiresWholeArtifact,
+    EmptyEffectiveContext,
     ScopeSourceMismatch,
     LensScopeMismatch,
     ResultScopeMismatch,
@@ -1727,6 +1758,12 @@ impl fmt::Display for ReviewValidationError {
             }
             Self::SelectionContextNotMarkedMissing => formatter
                 .write_str("selection Review must mark surrounding document context as missing"),
+            Self::EffectiveContextRequiresWholeArtifact => formatter.write_str(
+                "effective context requires document or Agent Skill package Review scope",
+            ),
+            Self::EmptyEffectiveContext => {
+                formatter.write_str("effective context must explicitly select at least one source")
+            }
             Self::ScopeSourceMismatch => {
                 formatter.write_str("Review scope and source do not match")
             }

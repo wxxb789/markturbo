@@ -25,13 +25,16 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
+#[cfg(test)]
+use gpui_kit::test::TestSupportExt as _;
 use gpui_kit::*;
+use mt_core::agent_artifacts::context::{ContextInput, ResolvedContext, SelectedContext, resolve};
 use mt_core::agent_artifacts::package::{
     FrozenSkillPackage, ReviewRequestBuildError, ReviewRequestBuildRequest,
     ReviewRequestBuildResult, ReviewTarget, build_review_request, resolve_document_anchor_offset,
 };
 use mt_core::document::lifecycle::{AsyncSnapshot, DocumentId};
-use mt_core::model::{ConsentCapability, ConsentDecision};
+use mt_core::model::{ConsentCapability, ConsentDecision, ModelRequestDisclosure};
 use mt_core::recovery::{RecoveryKey, RevisionRecovery};
 use mt_core::review::provider::{
     PreparedReview, REVIEW_REQUEST_TIMEOUT, ReviewError, ReviewLanguage, ReviewRequestError,
@@ -70,6 +73,14 @@ use crate::metrics;
 /// collection of related `Workspace` fields independently.
 #[derive(Default)]
 pub(super) struct ReviewFlow {
+    context_generation: u64,
+    context_input: Option<ContextInput>,
+    resolved_context: Option<ResolvedContext>,
+    context_choices: HashMap<DocumentId, BTreeSet<usize>>,
+    review_context: Option<SelectedContext>,
+    review_disclosure: Option<(DocumentId, ModelRequestDisclosure)>,
+    revision_disclosure: Option<(DocumentId, ModelRequestDisclosure)>,
+    model_configuration: Option<[String; 4]>,
     review_lens_overrides: HashMap<DocumentId, ArtifactLens>,
     review_outcome: Option<ReviewOutcome>,
     review_target: Option<ReviewTargetState>,
@@ -174,6 +185,20 @@ struct PendingReview {
     cancelled: Arc<AtomicBool>,
     document_id: DocumentId,
     lens: ArtifactLens,
+    context: Option<EffectiveContextRequest>,
+}
+
+#[derive(Clone)]
+pub(super) struct EffectiveContextRequest {
+    generation: u64,
+    selected: SelectedContext,
+}
+
+impl EffectiveContextRequest {
+    #[cfg(test)]
+    pub(super) fn selected(&self) -> &SelectedContext {
+        &self.selected
+    }
 }
 
 /// Immutable identity of one in-flight Revision.
@@ -226,6 +251,122 @@ pub(super) enum RevisionSaveOutcome {
 }
 
 impl ReviewFlow {
+    pub(super) fn observe_model_configuration(&mut self, settings: &crate::settings::AppSettings) {
+        let configuration = [
+            settings.model_provider.clone(),
+            settings.model_name.clone(),
+            settings.model_base_url.clone(),
+            settings.model_environment_key_identity.clone(),
+        ];
+        if self
+            .model_configuration
+            .as_ref()
+            .is_some_and(|previous| previous != &configuration)
+        {
+            // Consent changes do not invalidate an in-flight filesystem resolution.
+            self.context_choices.clear();
+            self.cancel_review();
+            self.cancel_revision();
+            self.mark_review_supporting_sources_stale();
+            self.mark_revision_supporting_sources_stale();
+        }
+        self.model_configuration = Some(configuration);
+    }
+    pub(super) fn begin_context_resolution(&mut self, input: Option<ContextInput>) -> u64 {
+        self.context_generation = self.context_generation.wrapping_add(1);
+        self.context_input = input;
+        self.resolved_context = None;
+        self.context_choices.clear();
+        if self.review_context.is_some() {
+            self.mark_review_supporting_sources_stale();
+        }
+        if self
+            .revision_context
+            .as_ref()
+            .is_some_and(|context| context.request.effective_agent_context.is_some())
+        {
+            self.mark_revision_supporting_sources_stale();
+            self.cancel_revision();
+        }
+        if self
+            .pending_review
+            .as_ref()
+            .is_some_and(|pending| pending.context.is_some())
+        {
+            self.cancel_review();
+        }
+        self.context_generation
+    }
+
+    pub(super) fn accept_context_resolution(
+        &mut self,
+        generation: u64,
+        context: ResolvedContext,
+    ) -> bool {
+        if self.context_generation != generation
+            || self.context_input.as_ref() != Some(&context.input)
+        {
+            return false;
+        }
+        self.resolved_context = Some(context);
+        true
+    }
+
+    pub(super) fn choose_context_source(&mut self, document_id: DocumentId, index: usize) -> bool {
+        let Some(context) = &self.resolved_context else {
+            return false;
+        };
+        if context.select_sources(&[index]).is_err() {
+            return false;
+        }
+        let choices = self.context_choices.entry(document_id).or_default();
+        if !choices.remove(&index) {
+            choices.insert(index);
+        }
+        if self.pending_review_belongs_to(document_id) {
+            self.cancel_review();
+        }
+        if self.review_result_belongs_to(document_id) && self.review_context.is_some() {
+            self.mark_review_supporting_sources_stale();
+        }
+        if self.revision_context.as_ref().is_some_and(|context| {
+            context.document_id == document_id && context.request.effective_agent_context.is_some()
+        }) {
+            self.mark_revision_supporting_sources_stale();
+        }
+        true
+    }
+
+    pub(super) fn selected_context(
+        &self,
+        document_id: DocumentId,
+    ) -> Option<EffectiveContextRequest> {
+        let choices = self.context_choices.get(&document_id)?;
+        if choices.is_empty() {
+            return None;
+        }
+        let selected = self
+            .resolved_context
+            .as_ref()?
+            .select_sources(&choices.iter().copied().collect::<Vec<_>>())
+            .ok()?;
+        Some(EffectiveContextRequest {
+            generation: self.context_generation,
+            selected,
+        })
+    }
+
+    pub(super) fn context_request_is_current(
+        &self,
+        document_id: DocumentId,
+        request: &EffectiveContextRequest,
+    ) -> bool {
+        self.context_generation == request.generation
+            && self
+                .selected_context(document_id)
+                .is_some_and(|current| current.selected == request.selected)
+    }
+
     pub(super) fn is_reviewing(&self) -> bool {
         self.pending_review.is_some()
     }
@@ -426,10 +567,13 @@ impl ReviewFlow {
 
     pub(super) fn clear_review_outcome(&mut self) {
         self.review_outcome = None;
+        self.review_context = None;
+        self.review_disclosure = None;
     }
 
     pub(super) fn remove_document_lens_override(&mut self, document_id: DocumentId) {
         self.review_lens_overrides.remove(&document_id);
+        self.context_choices.remove(&document_id);
     }
 
     pub(super) fn visible_review_lens(
@@ -471,7 +615,6 @@ impl ReviewFlow {
         if has_authored_answers {
             OpenReviewPanel::AnswersRetained
         } else {
-            self.review_outcome = None;
             OpenReviewPanel::Opened
         }
     }
@@ -483,7 +626,7 @@ impl ReviewFlow {
         target: mt_core::agent_artifacts::package::ReviewTarget,
         document_id: DocumentId,
     ) {
-        self.review_outcome = None;
+        self.clear_review_outcome();
         self.review_target = Some(ReviewTargetState {
             target,
             document_id,
@@ -499,10 +642,15 @@ impl ReviewFlow {
         let generation = self.review_generation.wrapping_add(1);
         self.review_generation = generation;
         let cancelled = Arc::new(AtomicBool::new(false));
+        let context = self
+            .review_target_for_document(document_id)
+            .filter(|target| *target == ReviewTarget::Document)
+            .and_then(|_| self.selected_context(document_id));
         self.pending_review = Some(PendingReview {
             cancelled: cancelled.clone(),
             document_id,
             lens,
+            context,
         });
         self.review_panel_open = true;
         (generation, cancelled)
@@ -576,6 +724,7 @@ impl ReviewFlow {
         diagnostic: ReviewDiagnostic,
     ) -> String {
         let status = diagnostic.message.as_str().to_owned();
+        self.context_choices.remove(&document_id);
         self.pending_review = None;
         self.review_outcome = Some(ReviewOutcome::Diagnostic(WorkspaceReviewDiagnostic {
             document_id,
@@ -587,6 +736,7 @@ impl ReviewFlow {
     }
 
     pub(super) fn install_review_result(&mut self, mut result: WorkspaceReviewResult, stale: bool) {
+        self.context_choices.remove(&result.document_id);
         if stale {
             result.result.result.status = ReviewStatus::Stale;
         }
@@ -608,6 +758,41 @@ impl ReviewFlow {
         is_dirty: bool,
     ) -> bool {
         let mut changed = false;
+        self.context_choices.remove(&document_id);
+        let context_source_changed = is_dirty
+            && self.resolved_context.as_ref().is_some_and(|context| {
+                source_path.is_some_and(|path| {
+                    context.sources.iter().any(|source| {
+                        source.path == path
+                            || source.physical_path.as_deref() == Some(path)
+                            || std::fs::canonicalize(path).ok().as_ref()
+                                == source.physical_path.as_ref()
+                                && source.physical_path.is_some()
+                    })
+                })
+            });
+        if context_source_changed {
+            self.context_choices.clear();
+            self.context_generation = self.context_generation.wrapping_add(1);
+            if self.review_context.is_some() {
+                self.mark_review_supporting_sources_stale();
+            }
+            if self.revision_context.as_ref().is_some_and(|context| {
+                context.document_id != document_id
+                    && context.request.effective_agent_context.is_some()
+            }) {
+                self.mark_revision_supporting_sources_stale();
+                self.cancel_revision();
+            }
+            if self
+                .pending_review
+                .as_ref()
+                .is_some_and(|pending| pending.context.is_some())
+            {
+                self.cancel_review();
+            }
+            changed = true;
+        }
         if let Some(ReviewOutcome::Result(review)) = &mut self.review_outcome {
             if review.document_id == document_id && review.source_snapshot != *source_snapshot {
                 review.result.result.status = ReviewStatus::Stale;
@@ -1348,9 +1533,215 @@ impl ReviewFlow {
     pub(super) fn set_review_panel_open(&mut self, open: bool) {
         self.review_panel_open = open;
     }
+
+    #[cfg(test)]
+    pub(super) fn install_review_context_for_test(&mut self, context: SelectedContext) {
+        self.review_context = Some(context);
+    }
 }
 
 impl Workspace {
+    pub(super) fn resolve_effective_context(
+        &mut self,
+        input: Option<ContextInput>,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.review_flow.begin_context_resolution(input.clone());
+        let Some(harness) = self.harness.clone() else {
+            return;
+        };
+        harness.update(cx, |harness, cx| {
+            harness.set_context_pending(input.is_some(), cx)
+        });
+        self.sync_document_watches(cx);
+        cx.notify();
+        let Some(input) = input else { return };
+        let skills = harness.read(cx).skills().to_vec();
+        cx.spawn(async move |this, cx| {
+            let context = cx
+                .background_spawn(async move { resolve(&input, &skills) })
+                .await;
+            loop {
+                let context = context.clone();
+                let harness = harness.clone();
+                if crate::views::try_update(&this, cx, move |this, cx| {
+                    if !this
+                        .review_flow
+                        .accept_context_resolution(generation, context.clone())
+                    {
+                        return;
+                    }
+                    harness.update(cx, |harness, cx| {
+                        harness.apply_resolved_context(context, cx);
+                    });
+                    this.sync_document_watches(cx);
+                    cx.notify();
+                })
+                .is_some()
+                {
+                    break;
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn has_dirty_context_source(
+        &self,
+        context: &SelectedContext,
+        except_document: Option<DocumentId>,
+        cx: &App,
+    ) -> bool {
+        self.document_views().iter().any(|document| {
+            let document = document.read(cx);
+            Some(document.id()) != except_document
+                && document.is_dirty()
+                && context.sources().iter().any(|source| {
+                    document.watches_path(&source.occurrence().path)
+                        || source
+                            .occurrence()
+                            .physical_path
+                            .as_deref()
+                            .is_some_and(|path| document.watches_path(path))
+                })
+        })
+    }
+
+    fn effective_context_request_is_current(
+        &self,
+        document_id: DocumentId,
+        request: &Option<EffectiveContextRequest>,
+        cx: &App,
+    ) -> bool {
+        request.as_ref().is_none_or(|request| {
+            self.review_flow
+                .context_request_is_current(document_id, request)
+                && !self.has_dirty_context_source(&request.selected, None, cx)
+        })
+    }
+
+    fn revision_effective_context_is_current(&self, cx: &App) -> bool {
+        self.review_flow.revision_context().is_none_or(|revision| {
+            revision
+                .request
+                .effective_agent_context
+                .as_ref()
+                .is_none_or(|context| {
+                    !self.has_dirty_context_source(context, Some(revision.document_id), cx)
+                        && context.revalidate().is_ok()
+                })
+        })
+    }
+
+    fn render_effective_context_choices(
+        &self,
+        target: ReviewTarget,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let document_id = self
+            .active_document()
+            .map(|document| document.read(cx).id());
+        let mut content = vec![
+            Button::new("review-context-show-chain")
+                .accessibility_id("markturbo-review-context-show-chain")
+                .label(i18n::t(i18n::Key::PanelHarness, cx))
+                .small()
+                .ghost()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.side_panel = super::SidePanel::Harness;
+                    this.left_panel_open = true;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        ];
+        if target == ReviewTarget::Document
+            && let Some(context) = &self.review_flow.resolved_context
+        {
+            for (index, source) in context.sources.iter().enumerate() {
+                let path = source.path.clone();
+                let full_path = path.display().to_string();
+                let visible_path = path.file_name().map_or_else(
+                    || full_path.clone(),
+                    |file_name| {
+                        path.parent().and_then(Path::file_name).map_or_else(
+                            || file_name.to_string_lossy().into_owned(),
+                            |parent| Path::new(parent).join(file_name).display().to_string(),
+                        )
+                    },
+                );
+                let selected = document_id
+                    .and_then(|id| self.review_flow.context_choices.get(&id))
+                    .is_some_and(|choices| choices.contains(&index));
+                let selectable = context.select_sources(&[index]).is_ok();
+                let choice_label = i18n::effective_context_choice_label(selected, cx);
+                content.push(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap(metrics::gap())
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "review-context-source-{index}"
+                            )))
+                            .accessibility_id(SharedString::from(format!(
+                                "markturbo-review-context-source-{index}"
+                            )))
+                            .label(format!("{choice_label}: {visible_path}"))
+                            .accessibility_label(format!("{choice_label}: {full_path}"))
+                            .tooltip(full_path)
+                            .small()
+                            .flex_1()
+                            .min_w_0()
+                            .disabled(
+                                !selectable
+                                    || self.review_flow.is_reviewing()
+                                    || self.review_flow.is_revision_running(),
+                            )
+                            .when(selected, |button| button.primary())
+                            .when(!selected, |button| button.ghost())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if let Some(id) = this
+                                        .active_document()
+                                        .map(|document| document.read(cx).id())
+                                    {
+                                        this.review_flow.choose_context_source(id, index);
+                                        cx.notify();
+                                    }
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("review-context-open-{index}")))
+                                .accessibility_id(SharedString::from(format!(
+                                    "markturbo-review-context-open-{index}"
+                                )))
+                                .label(i18n::t(i18n::Key::Open, cx))
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_file(path.clone(), window, cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        v_flex()
+            .id("review-context-choices")
+            .w_full()
+            .min_w_0()
+            .gap(metrics::gap())
+            .children(content)
+            .into_any_element()
+    }
+
     pub(super) fn on_review_document(
         &mut self,
         _: &ReviewDocument,
@@ -1435,7 +1826,7 @@ impl Workspace {
         });
         let skill_package_is_current = context.skill_package.as_ref().is_none_or(|package| {
             !self.has_dirty_skill_supporting_document(package, cx) && package.revalidate().is_ok()
-        });
+        }) && self.revision_effective_context_is_current(cx);
         self.review_flow.revision_context_is_current(
             active_document
                 .as_ref()
@@ -1485,7 +1876,8 @@ impl Workspace {
             .review_flow
             .revision_context()
             .and_then(|context| context.skill_package.as_ref())
-            .is_none_or(|package| package.revalidate().is_ok());
+            .is_none_or(|package| package.revalidate().is_ok())
+            && self.revision_effective_context_is_current(cx);
         if !package_current {
             self.review_flow.mark_revision_supporting_sources_stale();
         }
@@ -1612,7 +2004,7 @@ impl Workspace {
             && document.read(cx).text_matches(&revision.preview, cx);
         let skill_package_is_current = context.skill_package.as_ref().is_none_or(|package| {
             !self.has_dirty_skill_supporting_document(package, cx) && package.revalidate().is_ok()
-        });
+        }) && self.revision_effective_context_is_current(cx);
         self.review_flow
             .revision_applied_state_is_current_for_document(
                 document_id,
@@ -1807,12 +2199,44 @@ impl Workspace {
                 document.is_dirty(),
             )
         };
-        if self.review_flow.observe_document_change(
+        let mut changed = self.review_flow.observe_document_change(
             document_id,
             &source_snapshot,
             source_path.as_deref(),
             is_dirty,
-        ) {
+        );
+        // Resolve supporting-source aliases on edits, not during repainting.
+        let review_context_dirty = is_dirty
+            && self.review_flow.review_result().is_some_and(|review| {
+                review.supporting_sources_current
+                    && self
+                        .review_flow
+                        .review_context
+                        .as_ref()
+                        .is_some_and(|context| {
+                            self.has_dirty_context_source(context, Some(review.document_id), cx)
+                        })
+            });
+        let revision_context_dirty = is_dirty
+            && self.review_flow.revision_context().is_some_and(|revision| {
+                revision.supporting_sources_current
+                    && revision
+                        .request
+                        .effective_agent_context
+                        .as_ref()
+                        .is_some_and(|context| {
+                            self.has_dirty_context_source(context, Some(revision.document_id), cx)
+                        })
+            });
+        if review_context_dirty {
+            self.review_flow.mark_review_supporting_sources_stale();
+            changed = true;
+        }
+        if revision_context_dirty {
+            self.review_flow.mark_revision_supporting_sources_stale();
+            changed = true;
+        }
+        if changed {
             cx.notify();
         }
     }
@@ -1859,6 +2283,8 @@ impl Workspace {
     }
 
     pub(super) fn start_revision(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.review_flow
+            .observe_model_configuration(crate::settings::AppSettings::global(cx));
         if self.review_flow.is_revision_running() {
             return;
         }
@@ -1920,6 +2346,7 @@ impl Workspace {
             }
         };
 
+        self.review_flow.revision_disclosure = Some((document_id, prepared.disclosure().clone()));
         let prompt_description = i18n::model_request_disclosure(prepared.disclosure(), cx);
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -2040,6 +2467,7 @@ impl Workspace {
                                             return;
                                         };
                                         let supporting_sources_current = supporting_sources_current
+                                            && this.revision_effective_context_is_current(cx)
                                             && skill_package.as_ref().is_none_or(|package| {
                                                 !this.has_dirty_skill_supporting_document(
                                                     package, cx,
@@ -2166,6 +2594,7 @@ impl Workspace {
         document_id: DocumentId,
         lens: ArtifactLens,
         language: ReviewLanguage,
+        context_request: Option<EffectiveContextRequest>,
         selection: Option<std::ops::Range<usize>>,
         source_snapshot: AsyncSnapshot,
         doc: WeakEntity<super::DocumentView>,
@@ -2178,6 +2607,18 @@ impl Workspace {
             .review_flow
             .review_request_is_current(generation, &cancelled)
         {
+            return;
+        }
+        if !self.effective_context_request_is_current(document_id, &context_request, cx) {
+            self.set_review_diagnostic(
+                document_id,
+                lens,
+                ReviewDiagnostic::new(
+                    ReviewDiagnosticCode::InvalidRequest,
+                    i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string(),
+                ),
+                cx,
+            );
             return;
         }
         let Some(document) = doc.upgrade() else {
@@ -2216,11 +2657,34 @@ impl Workspace {
                 return;
             }
         };
-        let (request, skill_package) = built_request.into_parts();
+        let (mut request, skill_package) = built_request.into_parts();
+        if let Some(context) = &context_request {
+            request = match request.with_effective_agent_context(context.selected.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.set_review_diagnostic(
+                        document_id,
+                        lens,
+                        ReviewDiagnostic::new(
+                            ReviewDiagnosticCode::InvalidRequest,
+                            error.to_string(),
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+            };
+        }
         let partial = request
             .source
             .package()
-            .is_some_and(SkillPackage::is_partial);
+            .is_some_and(SkillPackage::is_partial)
+            || request
+                .effective_agent_context
+                .as_ref()
+                .is_some_and(|context| {
+                    context.status() == mt_core::agent_artifacts::context::ResolutionStatus::Partial
+                });
         let frozen_request = request.clone();
         if let Some(skill_package) = &skill_package
             && self.has_dirty_skill_supporting_document(skill_package, cx)
@@ -2268,6 +2732,7 @@ impl Workspace {
                 return;
             }
         };
+        self.review_flow.review_disclosure = Some((document_id, prepared.disclosure().clone()));
         let prompt_description = i18n::model_request_disclosure(prepared.disclosure(), cx);
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -2280,6 +2745,7 @@ impl Workspace {
             cx,
         );
 
+        cx.notify();
         let pending = Arc::new(Mutex::new(Some(prepared)));
         let selection_for_result = selection.clone();
         let request_for_result = frozen_request.clone();
@@ -2299,6 +2765,7 @@ impl Workspace {
                 let partial = partial;
                 let request_for_result = request_for_result.clone();
                 let skill_package = skill_package_for_result.clone();
+                let context_request = context_request.clone();
                 if crate::views::try_update_in(&this, cx, move |this, window, cx| {
                     let Some(prepared) = pending
                         .lock()
@@ -2324,6 +2791,11 @@ impl Workspace {
                             ),
                             cx,
                         );
+                        return;
+                    }
+                    if !this.effective_context_request_is_current(document_id, &context_request, cx) {
+                        this.set_review_diagnostic(document_id, lens_for_result, ReviewDiagnostic::new(
+                            ReviewDiagnosticCode::InvalidRequest, i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string()), cx);
                         return;
                     }
 
@@ -2370,12 +2842,13 @@ impl Workspace {
                     // supporting buffers before creating the authorization.
                     let pending = Arc::new(Mutex::new(Some(prepared)));
                     let package_for_revalidation = skill_package.clone();
+                    let context_for_revalidation = context_request.clone();
                     let cancelled_for_revalidation = cancelled.clone();
                     cx.spawn_in(window, async move |this, cx| {
                         let revalidation = cx
                             .background_spawn(async move {
-                                package_for_revalidation
-                                    .map_or(Ok(()), |package| package.revalidate())
+                                (package_for_revalidation.map_or(Ok(()), |package| package.revalidate()),
+                                 context_for_revalidation.is_none_or(|context| context.selected.revalidate().is_ok()))
                             })
                             .await;
                         let revalidation = Arc::new(Mutex::new(Some(revalidation)));
@@ -2389,6 +2862,7 @@ impl Workspace {
                             let request_for_result = request_for_result.clone();
                             let request_for_result_for_update = request_for_result.clone();
                             let skill_package = skill_package.clone();
+                            let context_request = context_request.clone();
                             let cancelled = cancelled_for_revalidation.clone();
                             if crate::views::try_update_in(&this, cx, move |this, window, cx| {
                                 let Some(revalidation) = revalidation
@@ -2451,7 +2925,12 @@ impl Workspace {
                                     );
                                     return;
                                 }
-                                if let Err(error) = revalidation {
+                                if !revalidation.1 || !this.effective_context_request_is_current(document_id, &context_request, cx) {
+                                    this.set_review_diagnostic(document_id, lens_for_result, ReviewDiagnostic::new(
+                                        ReviewDiagnosticCode::InvalidRequest, i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string()), cx);
+                                    return;
+                                }
+                                if let Err(error) = revalidation.0 {
                                     this.set_review_diagnostic(
                                         document_id,
                                         lens_for_result,
@@ -2493,10 +2972,11 @@ impl Workspace {
                                         })
                                         .await;
                                     let package_for_completion_revalidation = skill_package.clone();
+                                    let context_for_completion_revalidation = context_request.clone();
                                     let supporting_sources_revalidated = cx
                                         .background_spawn(async move {
-                                            package_for_completion_revalidation
-                                                .is_none_or(|package| package.revalidate().is_ok())
+                                            package_for_completion_revalidation.is_none_or(|package| package.revalidate().is_ok())
+                                                && context_for_completion_revalidation.is_none_or(|context| context.selected.revalidate().is_ok())
                                         })
                                         .await;
                                     let result = Arc::new(Mutex::new(Some(result)));
@@ -2508,6 +2988,7 @@ impl Workspace {
                                         let selection = selection.clone();
                                         let partial = partial;
                                         let skill_package = skill_package.clone();
+                                        let context_request = context_request.clone();
                                         let cancelled = cancelled_for_completion.clone();
                                         let request_for_result_for_update =
                                             request_for_result_for_update.clone();
@@ -2542,10 +3023,11 @@ impl Workspace {
                                                             return;
                                                         };
                                                         let supporting_sources_current =
-                                                            skill_package.as_ref().is_none_or(
+                                                            supporting_sources_revalidated
+                                                            && this.effective_context_request_is_current(document_id, &context_request, cx)
+                                                            && skill_package.as_ref().is_none_or(
                                                                 |package| {
-                                                                    supporting_sources_revalidated
-                                                                        && !this
+                                                                    !this
                                                                             .has_dirty_skill_supporting_document(
                                                                                 package, cx,
                                                                             )
@@ -2592,6 +3074,7 @@ impl Workspace {
                                                             },
                                                             stale,
                                                         );
+                                                        this.review_flow.review_context = request_for_result_for_update.effective_agent_context.clone();
                                                         if let Some(output) = this
                                                             .review_flow
                                                             .review_result()
@@ -2690,6 +3173,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.review_flow
+            .observe_model_configuration(crate::settings::AppSettings::global(cx));
         let Some(doc) = self.active_document().cloned() else {
             return;
         };
@@ -2759,6 +3244,23 @@ impl Workspace {
         };
         let document_snapshot =
             SourceSnapshot::new(doc.read(cx).revision(), source_snapshot.source_generation());
+        let context_request = if target == ReviewTarget::Document {
+            self.review_flow.selected_context(document_id)
+        } else {
+            None
+        };
+        if !self.effective_context_request_is_current(document_id, &context_request, cx) {
+            self.set_review_diagnostic(
+                document_id,
+                lens,
+                ReviewDiagnostic::new(
+                    ReviewDiagnosticCode::InvalidRequest,
+                    i18n::t(i18n::Key::ReviewDocumentChanged, cx).to_string(),
+                ),
+                cx,
+            );
+            return;
+        }
         let (generation, cancelled) = self.review_flow.begin_review_request(document_id, lens);
         self.right_panel_open = true;
         self.set_status(i18n::t(i18n::Key::ReviewWaiting, cx).into(), cx);
@@ -2793,6 +3295,7 @@ impl Workspace {
                 let source_snapshot_for_update = source_snapshot.clone();
                 let doc_for_update = doc.clone();
                 let cancelled_for_update = cancelled.clone();
+                let context_for_update = context_request.clone();
                 if crate::views::try_update_in(&this, cx, move |this, window, cx| {
                     let Some(built_request) = built_request
                         .lock()
@@ -2807,6 +3310,7 @@ impl Workspace {
                         document_id,
                         lens,
                         language,
+                        context_for_update,
                         selection_for_update,
                         source_snapshot_for_update,
                         doc_for_update,
@@ -3051,18 +3555,24 @@ impl Workspace {
             self.review_flow
                 .review_target_for_document(document.read(cx).id())
         });
-        v_flex()
+        let panel = v_flex()
             .id("review-panel")
             .size_full()
             .p(metrics::inset())
             .gap(metrics::gap_group())
-            .overflow_y_scroll()
+            .overflow_y_scroll();
+        #[cfg(test)]
+        let panel = panel.test_support();
+        panel
             .child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(i18n::t(i18n::Key::ReviewNoResult, cx)),
             )
+            .when_some(run_target, |this, target| {
+                this.child(self.render_effective_context_choices(target, cx))
+            })
             .when_some(run_target, |this, target| {
                 this.child(
                     Button::new("run-review")
@@ -3419,6 +3929,30 @@ impl Workspace {
 
         let run_target = active_document_id
             .and_then(|document_id| self.review_flow.review_target_for_document(document_id));
+        if let Some(target) = run_target {
+            content.push(self.render_effective_context_choices(target, cx));
+        }
+        for (id, disclosure) in self
+            .review_flow
+            .review_disclosure
+            .iter()
+            .chain(self.review_flow.revision_disclosure.iter())
+        {
+            if Some(*id) == active_document_id {
+                content.push(
+                    div()
+                        .id(match disclosure.operation() {
+                            mt_core::model::ModelOperation::Revision => {
+                                "revision-retained-disclosure"
+                            }
+                            _ => "review-retained-disclosure",
+                        })
+                        .text_xs()
+                        .child(i18n::model_request_disclosure(disclosure, cx))
+                        .into_any_element(),
+                );
+            }
+        }
         if let Some(target) = run_target
             && !self.review_flow.is_reviewing()
             && !active_document_has_authored_answers

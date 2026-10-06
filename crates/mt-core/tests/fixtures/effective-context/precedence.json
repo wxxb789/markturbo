@@ -1,0 +1,13 @@
+{
+  "cwd": "nested",
+  "target": "nested/task.md",
+  "files": {
+    "home/AGENTS.override.md": "  GLOBAL_OVERRIDE_SENTINEL \n",
+    "home/AGENTS.md": "GLOBAL_AGENTS_SENTINEL",
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/AGENTS.override.md": "ROOT_OVERRIDE_SENTINEL",
+    "workspace/AGENTS.md": "ROOT_AGENTS_SENTINEL",
+    "workspace/nested/AGENTS.md": "NESTED_SENTINEL",
+    "workspace/nested/task.md": "TASK_SENTINEL"
+  }
+}
