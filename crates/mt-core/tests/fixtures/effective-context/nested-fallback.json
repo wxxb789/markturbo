@@ -1,0 +1,11 @@
+{
+  "cwd": "nested/deep",
+  "target": "nested/deep/task.md",
+  "fallbacks": [" docs/TEAM.md ", "docs/TEAM.md", "SKILL.md"],
+  "files": {
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/docs/TEAM.md": "ROOT_TEAM_SENTINEL",
+    "workspace/nested/docs/TEAM.md": "NESTED_TEAM_SENTINEL",
+    "workspace/nested/deep/task.md": "TASK_SENTINEL"
+  }
+}

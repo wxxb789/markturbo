@@ -26,10 +26,11 @@ Built with Rust, [GPUI](https://github.com/zed-industries/zed), and
 - Discover Agent Skills and agent instruction files across the conventional
   roots of 80+ harnesses, project-local and global, parse and validate
   `SKILL.md` frontmatter, and inspect them in the Harness panel. Discovery is
-  an inventory, not a claim that every discovered instruction applies. Goal 08
-  will implement and verify the first Effective Agent Context profile,
-  `codex-agents-md-2026-08-29`; other instruction files remain individually
-  reviewable without claiming verified inheritance semantics.
+  an inventory, not a claim that every discovered instruction applies. The
+  verified Effective Agent Context profile, `codex-agents-md-2026-08-29`, explains
+  the applicable instruction chain and can include explicitly selected sources
+  in Review after endpoint/content disclosure. Other harnesses remain inventory-only,
+  and available Skills stay separate from automatic instructions.
 - Search the open tabs, the whole project, or every discovered skill and
   instruction file — including the directories outside the open folder.
 - Translate a selection, a block, or a whole document while preserving code,

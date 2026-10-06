@@ -1,0 +1,9 @@
+{
+  "cwd": ".",
+  "target": "task.md",
+  "files": {
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/task.md": "TASK_SENTINEL",
+    "outside.md": "OUTSIDE_SENTINEL"
+  }
+}

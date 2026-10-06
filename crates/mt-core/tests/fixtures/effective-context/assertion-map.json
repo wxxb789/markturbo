@@ -1,0 +1,38 @@
+{
+  "profile_id": "codex-agents-md-2026-08-29",
+  "source_revision": "b8c86376a258e55efc8e5ecfbabc21c16c07d814",
+  "source_url": "https://raw.githubusercontent.com/openai/codex/b8c86376a258e55efc8e5ecfbabc21c16c07d814/",
+  "retrieved_on": "2026-10-02",
+  "profile_content_digest": "dc11eb1476774f775dff3aae7006ea035fc87240254e1532be47a9f359de227d",
+  "profile_snapshot": "../../../assets/context-profiles/codex-agents-md-2026-08-29.json",
+  "cases": [
+    {"case": 1, "fixture": "deep.json", "assertion": "deep_root_nested_order_uses_cwd_not_target_ancestors"},
+    {"case": 2, "fixture": "deep.json", "assertion": "sibling_instruction_is_excluded_even_when_target_is_in_sibling"},
+    {"case": 3, "fixture": "outside.json", "assertion": "outside_target_and_cwd_are_rejected_by_physical_membership"},
+    {"case": 4, "fixture": "removed.json", "assertion": "missing_removed_and_renamed_sources_invalidate_selection"},
+    {"case": 5, "fixture": "aliases.json", "assertion": "multiple_discovery_aliases_preserve_occurrences_and_physical_identity"},
+    {"case": 6, "fixture": "duplicates.json", "assertion": "duplicate_content_and_directives_report_all_provenance_after_budget"},
+    {"case": 7, "fixture": "opaque.json", "assertion": "malformed_metadata_import_and_scope_remain_opaque_with_diagnostics"},
+    {"case": 8, "fixture": "precedence.json", "assertion": "global_override_and_project_precedence_use_frozen_separators"},
+    {"case": 9, "fixture": "import.json", "assertion": "unsupported_local_and_remote_imports_are_not_followed"},
+    {"case": 10, "fixture": "platform.json", "assertion": "platform_case_and_separators_follow_filesystem_identity"}
+  ],
+  "boundary_assertions": [
+    "explicit_remote_inputs_and_references_are_rejected_before_filesystem_probes",
+    "verbatim_local_drive_inputs_preserve_discovery_and_revalidation",
+    "known_remote_link_targets_are_not_followed_for_inputs_candidates_or_markers",
+    "exact_watch_paths_include_missing_candidates_and_only_nearest_root_markers",
+    "exact_watch_paths_preserve_aliases_and_exclude_shadowed_candidates",
+    "whitespace_normalized_nested_fallback_resolves_selects_and_round_trips",
+    "marker_metadata_errors_warn_and_continue_without_discarding_project_sources",
+    "root_marker_strings_are_verbatim_including_empty_and_parent_segments",
+    "shadowed_content_changes_do_not_change_discovery_digest_or_selection",
+    "unreadable_shadowed_global_and_project_files_are_not_probed_or_read",
+    "local_discovery_digest_round_trips_without_entering_assumptions",
+    "missing_default_codex_home_is_allowed_but_explicit_override_must_exist",
+    "markers_above_nearest_root_do_not_change_discovery_or_watches",
+    "discovery_watches_stop_at_root_and_include_global_and_fallback_parents",
+    "broken_directory_alias_candidates_are_missing_and_fallback_applies",
+    "cyclic_discovery_is_diagnosed_and_does_not_keep_a_project_prefix"
+  ]
+}

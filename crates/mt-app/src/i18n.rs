@@ -464,6 +464,15 @@ fn model_endpoint_status_in(endpoint: &EndpointIdentity, language: Language) -> 
     }
 }
 
+pub fn effective_context_choice_label(selected: bool, cx: &gpui_kit::App) -> &'static str {
+    match (AppSettings::global(cx).language, selected) {
+        (Language::English, false) => "Include context source (unchecked)",
+        (Language::English, true) => "Include context source (selected)",
+        (Language::Chinese, false) => "包含 Context 来源（未选择）",
+        (Language::Chinese, true) => "包含 Context 来源（已选择）",
+    }
+}
+
 pub fn model_request_disclosure(disclosure: &ModelRequestDisclosure, cx: &gpui_kit::App) -> String {
     model_request_disclosure_in(disclosure, AppSettings::global(cx).language)
 }
@@ -602,6 +611,23 @@ fn model_request_disclosure_in(disclosure: &ModelRequestDisclosure, language: La
                 ),
             }
         }
+    };
+    let scope = if disclosure.scope().kind() == OutboundScopeKind::AgentSkillPackage
+        && !disclosure.scope().effective_context_sources().is_empty()
+    {
+        let sources = disclosure
+            .scope()
+            .effective_context_sources()
+            .iter()
+            .map(|source| format!("- {source}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match language {
+            Language::English => format!("{scope}\nEffective Agent Context sources:\n{sources}"),
+            Language::Chinese => format!("{scope}\nEffective Agent Context 来源：\n{sources}"),
+        }
+    } else {
+        scope
     };
     let revision_details = match (language, disclosure.operation()) {
         (Language::English, ModelOperation::Revision) => match disclosure.revision_binding() {

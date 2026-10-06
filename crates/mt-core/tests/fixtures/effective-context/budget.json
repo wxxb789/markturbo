@@ -1,0 +1,12 @@
+{
+  "cwd": "nested",
+  "target": "nested/task.md",
+  "files": {
+    "home/AGENTS.md": "GLOBAL_SENTINEL",
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/AGENTS.md": "\u20acROOT_SENTINEL",
+    "workspace/nested/AGENTS.md": "NESTED_SENTINEL",
+    "workspace/nested/task.md": "TASK_SENTINEL",
+    "workspace/.agents/skills/demo/SKILL.md": "---\nname: demo\ndescription: catalog sentinel\n---\nSKILL_BODY_SENTINEL"
+  }
+}

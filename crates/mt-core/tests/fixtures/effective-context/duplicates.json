@@ -1,0 +1,11 @@
+{
+  "cwd": "nested/deep",
+  "target": "nested/deep/task.md",
+  "files": {
+    "workspace/.git": "MARKER_SENTINEL",
+    "workspace/AGENTS.md": "DUP_SENTINEL",
+    "workspace/nested/AGENTS.md": "DUP_SENTINEL",
+    "workspace/nested/deep/AGENTS.md": "DUP_SENTINEL\nDEEP_SENTINEL",
+    "workspace/nested/deep/task.md": "TASK_SENTINEL"
+  }
+}
