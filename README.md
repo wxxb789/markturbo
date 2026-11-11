@@ -21,6 +21,9 @@ thresholds are defined in the owner-approved [Product Contract](PRODUCT.md).
 > shortcuts, the Goal 09 visual matrix, native acceptance on the nsh backends, and
 > macOS/Linux clean-machine evidence.
 
+The guarded in-app Quit applies Save all / Discard all to the buffers dirty when
+the dialog is confirmed, including translations completed while it is open.
+
 Built with Rust and [Native Shell (nsh)](https://nsh.dev) 0.4, drawn by each
 desktop's native backend: Win32/Direct2D on Windows, AppKit on macOS and GTK 4
 on Linux. There is no GPUI or GPUI Kit dependency.
