@@ -22,7 +22,7 @@ use mt_core::{
         skill::{self, Discovery, Skill},
     },
     credentials::CredentialVault,
-    document::io::{self, LoadedFile, SaveError},
+    document::io::{self, FileStamp, LoadedFile, Newline, SaveError, SourceIdentity},
     model::{ConsentCapability, ConsentDecision},
     recovery::{RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RecoveryStore},
     review::{
@@ -79,6 +79,7 @@ pub struct Tab {
     pub pane: Signal<Pane>,
     pub web_trusted: Signal<bool>,
     pub conflict: Signal<bool>,
+    pub untitled: bool,
     pub loaded: Rc<RefCell<LoadedFile>>,
 }
 
@@ -320,6 +321,82 @@ impl AppState {
         });
     }
 
+    /// Start an empty document that does not have a source file yet.
+    pub fn new_document(&self) {
+        self.add_untitled(String::new());
+    }
+
+    /// Create a document from the clipboard's text.
+    pub fn new_from_clipboard(&self) {
+        let state = self.clone();
+        self.spawn_task(async move {
+            let text = clipboard_string().await;
+            if text.trim().is_empty() {
+                state.status.set(SharedString::from(
+                    crate::i18n::t(
+                        state.settings.get().language,
+                        crate::i18n::Key::ClipboardTextUnavailable,
+                    )
+                    .to_owned(),
+                ));
+                return;
+            }
+            state.add_untitled(text);
+        });
+    }
+
+    fn add_untitled(&self, text: String) {
+        let state = self.clone();
+        self.owner.run(move || state.add_untitled_inner(text));
+    }
+
+    fn add_untitled_inner(&self, text: String) {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let path = PathBuf::from(format!("Untitled-{id}.md"));
+        let dirty = !text.is_empty();
+        let loaded = LoadedFile {
+            path: path.clone(),
+            text: text.clone(),
+            stamp: FileStamp {
+                modified: None,
+                len: 0,
+                digest: [0; 32],
+                object_id: None,
+            },
+            skill_origin: None,
+            newline: Newline::Lf,
+            had_bom: false,
+            encoding: encoding_rs::UTF_8,
+            decode_had_errors: false,
+            source_identity: SourceIdentity::Regular,
+        };
+        let title = SharedString::from(crate::i18n::t(
+            self.settings.get().language,
+            crate::i18n::Key::Untitled,
+        ));
+        let text = signal(SharedString::from(text));
+        self.tabs.update(|tabs| {
+            tabs.push(Tab {
+                id,
+                path,
+                title,
+                text,
+                dirty: signal(dirty),
+                revision: signal(0),
+                pane: signal(Pane::Split),
+                web_trusted: signal(false),
+                conflict: signal(false),
+                untitled: true,
+                loaded: Rc::new(RefCell::new(loaded)),
+            });
+        });
+        if dirty {
+            self.note_edit(id);
+        }
+        self.set_active(id);
+    }
+
     fn add_tab(&self, loaded: LoadedFile) {
         self.add_tab_with(loaded, false);
     }
@@ -351,6 +428,7 @@ impl AppState {
                 pane: signal(Pane::Split),
                 web_trusted: signal(false),
                 conflict: signal(false),
+                untitled: false,
                 loaded: Rc::new(RefCell::new(loaded)),
             });
         });
@@ -397,6 +475,7 @@ impl AppState {
         let open = !self.context_open.get();
         self.context_open.set(open);
         if open {
+            self.close_review();
             self.refresh_context();
         }
     }
@@ -527,7 +606,7 @@ impl AppState {
             .tabs
             .get()
             .iter()
-            .filter(|tab| tab.dirty.get())
+            .filter(|tab| tab.dirty.get() && !tab.untitled)
             .cloned()
             .collect();
         if tabs.is_empty() {
@@ -592,7 +671,7 @@ impl AppState {
             .tabs
             .get()
             .iter()
-            .filter(|tab| tab.dirty.get())
+            .filter(|tab| tab.dirty.get() && !tab.untitled)
             .cloned()
             .collect();
         if tabs.is_empty() {
@@ -966,6 +1045,10 @@ impl AppState {
         let Some(tab) = self.active_tab() else {
             return;
         };
+        if tab.untitled {
+            self.save_as_active();
+            return;
+        }
         self.save_tab(tab.id);
     }
 
@@ -973,6 +1056,12 @@ impl AppState {
         let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() else {
             return false;
         };
+        if tab.untitled {
+            self.status.set(SharedString::from(
+                "Save this untitled document with Save As first.",
+            ));
+            return false;
+        }
         let text = tab.text.get().to_string();
         let saved = {
             let loaded = tab.loaded.borrow();

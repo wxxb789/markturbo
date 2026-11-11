@@ -57,6 +57,10 @@ fn translation_requires_consent_and_updates_the_active_buffer() {
         .expect("source editor");
 
     app.on_dialog(|_| DialogAnswer::Press("Send".to_owned()));
+    app.press("text:More layouts")
+        .expect("open the secondary actions");
+    app.wait_for("text:Translate")
+        .expect("translation is a secondary action");
     app.press("text:Translate").expect("start translation");
     app.wait_for_within(
         "text:Translated 1 segment(s) into zh.",
