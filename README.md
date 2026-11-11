@@ -10,32 +10,37 @@ prompts, specs, plans, and MDX.
 The current user, product promise, capability roles, data policy, and success
 thresholds are defined in the owner-approved [Product Contract](PRODUCT.md).
 
-Built with Rust, [GPUI](https://github.com/zed-industries/zed), and
-[`longbridge/gpui-component`](https://github.com/longbridge/gpui-component).
+> **Native Shell migration in progress (2026-11-11).** Ported: workspace open,
+> source editor, native and Web preview, Save/Save As/close protection, encrypted
+> recovery checkpoints and startup restore, explorer/content search, Welcome and
+> bundled sample, Review with consent, Effective Agent Context selection with
+> Revision approval, explicit Web-script trust, settings and session/secure
+> credentials, theme/i18n, and Windows packaging. Pending: Translation, native
+> acceptance on the nsh backends, and macOS/Linux clean-machine evidence.
+
+Built with Rust and [Native Shell (nsh)](https://nsh.dev) 0.4, drawn by each
+desktop's native backend: Win32/Direct2D on Windows, AppKit on macOS and GTK 4
+on Linux. There is no GPUI or GPUI Kit dependency.
 
 ## What it does
 
 - Open a directory as a workspace; browse it in a native file tree.
 - Open Markdown, MDX, and agent artifacts in tabs.
-- Inspect the active document in the always-available Details panel; selecting
-  a Harness artifact shows its specialized details there instead.
-- Read in **Source / Native / Web / Split·Native / Split·Web** layouts, each
-  offered only where it makes sense: a `.rs` file gets Source alone, an `.html`
-  gets the WebView.
+- Open the Context panel to inspect discovered Skills, instruction files, and
+  the applicable Effective Agent Context chain for the active document.
+- Read in **Source / Native / Web / Split·Native / Split·Web** layouts.
 - Render Mermaid, D2, PlantUML, and LaTeX from document source.
-- Discover Agent Skills and agent instruction files across the conventional
-  roots of 80+ harnesses, project-local and global, parse and validate
-  `SKILL.md` frontmatter, and inspect them in the Harness panel. Discovery is
+- Discover project Skills and agent instruction files, parse and validate
+  `SKILL.md` frontmatter, and inspect them in the Context panel. Discovery is
   an inventory, not a claim that every discovered instruction applies. The
-  verified Effective Agent Context profile, `codex-agents-md-2026-08-29`, explains
+  verified Effective Agent Context profile, `codex-agents-md-2026-08-29`, shows
   the applicable instruction chain and can include explicitly selected sources
-  in Review after endpoint/content disclosure. Other harnesses remain inventory-only,
-  and available Skills stay separate from automatic instructions.
-- Search the open tabs, the whole project, or every discovered skill and
-  instruction file — including the directories outside the open folder.
-- Translate a selection, a block, or a whole document while preserving code,
-  URLs, diagram source, math, and markup.
-- Detect external filesystem changes and refuse to overwrite them silently.
+  in Review after endpoint/content disclosure. Other harnesses remain
+  inventory-only, and available Skills stay separate from automatic instructions.
+- Search workspace file names and document contents.
+- Review a document and approve individual Revision changes before they reach
+  the buffer; nothing is applied automatically.
+- Refuse to overwrite a file that changed on disk after it was opened.
 
 Files stay ordinary files. No import step, no proprietary format — Codex, Claude
 Code, Cursor, OpenCode, git, and shell tools consume them unchanged.
@@ -82,19 +87,24 @@ cargo release version alpha --workspace --execute --no-confirm
 Or build and run directly:
 
 ```sh
-cargo run --release -p mt-app --bin markturbo -- sample    # opens the sample workspace
-cargo run --release -p mt-app --bin markturbo -- /my/repo  # or any directory
+nsh run crates/mt-app                         # this machine's native backend
+nsh run crates/mt-app --target macos          # macOS (AppKit)
+nsh run crates/mt-app --target linux          # Linux (GTK 4)
+nsh run crates/mt-app --target windows        # Windows (Win32/Direct2D)
+cargo run --release -p mt-app                 # the same app without the nsh CLI
 ```
 
-The first build is long: GPUI is compiled from source. See
-[docs/platforms.md](docs/platforms.md) for per-platform requirements.
+Package a standalone app with `nsh package --target windows|macos|linux` from
+`crates/mt-app`; the icon, theme and metadata come from `nsh.json`. The first
+build compiles the nsh runtime; see [docs/platforms.md](docs/platforms.md) for
+the per-platform toolchain.
 
 ## Architecture
 
 See [docs/architecture.md](docs/architecture.md). The short version:
 
 ```text
-mt-core (headless, no GPUI)
+mt-core (headless, no UI framework)
     document    source, blocks, outline, lossless file I/O and close rules
     workspace   tree, search, watcher, tabs and history state
     agent_artifacts   Skill/instruction discovery and frozen Review package
@@ -103,13 +113,13 @@ mt-core (headless, no GPUI)
     settings + credentials + recovery + runtime_paths
          ▲
          │
-mt-app (GPUI desktop shell)
-    views + web + theme + i18n + assets + startup
-    GPUI settings/credential globals, Welcome sample adapter and WebView
+mt-app (nsh desktop shell)
+    shell + document + review + settings + web + theme + i18n
+    nsh signals, native backends and the platform WebView
 ```
 
 `mt-app` depends on `mt-core`, not vice versa. Core's provider transport is
-optional; the desktop enables it. Headless CLI tools use core without GPUI.
+optional; the desktop enables it. Headless CLI tools use core without a UI framework.
 
 ## Renderers
 

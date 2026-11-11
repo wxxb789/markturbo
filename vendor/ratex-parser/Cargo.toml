@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "ratex-parser"
-version = "0.1.14"
+version = "0.1.15"
 build = false
 autolib = false
 autobins = false
@@ -38,17 +38,25 @@ path = "src/bin/parse.rs"
 name = "ce_line91_brace"
 path = "tests/ce_line91_brace.rs"
 
+[[test]]
+name = "char_numeric"
+path = "tests/char_numeric.rs"
+
+[[test]]
+name = "expansion_allocations"
+path = "tests/expansion_allocations.rs"
+
 [dependencies.fancy-regex]
 version = "0.14"
 
 [dependencies.ratex-font]
-version = "0.1.14"
+version = "0.1.15"
 
 [dependencies.ratex-lexer]
-version = "0.1.14"
+version = "0.1.15"
 
 [dependencies.ratex-types]
-version = "0.1.14"
+version = "0.1.15"
 
 [dependencies.regex]
 version = "1.11"

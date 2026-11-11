@@ -1,5 +1,6 @@
 pub mod environments;
 pub mod error;
+pub(crate) mod expansion_budget;
 pub mod functions;
 pub mod macro_expander;
 pub mod mhchem;

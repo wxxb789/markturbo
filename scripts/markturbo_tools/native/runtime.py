@@ -1945,6 +1945,19 @@ def run_native_acceptance(
     evidence = plan.new_evidence(args.expect_exe_sha256)
     args.debug_workdir = None
 
+    # A missing executable is the first, unambiguous acceptance failure. The
+    # legacy source contracts target the removed GPUI shell and must not decide
+    # what an absent candidate executable reports.
+    if not args.exe.is_file():
+        return _complete_early(
+            evidence,
+            plan.required_case_ids,
+            1,
+            "EXECUTABLE_MISSING",
+            blocked=False,
+            finalize_evidence=plan.finalize_evidence,
+        )
+
     if plan.source_contract is not None:
         try:
             if code := plan.source_contract():

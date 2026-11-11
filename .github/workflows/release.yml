@@ -26,7 +26,7 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-  RELEASE_ASSET: markturbo-windows-x64.exe
+  RELEASE_ASSET: markturbo-windows-x64.zip
 
 jobs:
   contract:
@@ -99,10 +99,16 @@ jobs:
       - name: Check
         run: uv run --locked --project scripts scripts/mt.py check full
 
-      - name: Stage executable
+      - name: Install nsh
+        run: irm https://nsh.dev/install.ps1 | iex
+
+      - name: Package the nsh app
+        working-directory: crates/mt-app
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item -LiteralPath target\release\markturbo.exe -Destination "release\$env:RELEASE_ASSET"
+          $nsh = Join-Path $env:LOCALAPPDATA "nsh\bin\nsh.exe"
+          & $nsh package --target windows
+          New-Item -ItemType Directory -Force -Path $env:GITHUB_WORKSPACE\release | Out-Null
+          Copy-Item -LiteralPath .nsh\out\MarkTurbo.zip -Destination "$env:GITHUB_WORKSPACE\release\$env:RELEASE_ASSET"
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:

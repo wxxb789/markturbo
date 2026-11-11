@@ -1,15 +1,12 @@
 //! Interface strings.
 //!
-//! One enum of keys and one table per language, rather than scattered literals.
-//! A key with no translation falls back to English rather than showing the key
-//! itself: a missing string should degrade to a language the user may not read
-//! rather than to `MenuOpenFolder`, which nobody reads.
+//! One enum of keys and one exhaustive table per language, rather than scattered
+//! literals. Missing translations are compile errors.
 //!
 //! Deliberately not a general i18n framework. There is no pluralization, no
 //! gender, no date formatting — this app's interface is a few dozen labels, and
 //! the cost of a framework would exceed the strings it manages.
 
-use crate::settings::AppSettings;
 use mt_core::model::{
     EndpointIdentity, EndpointIdentityError, EndpointLocation, ModelOperation,
     ModelRequestDisclosure, OutboundScopeKind, ProxyDisclosure, TransportEncryption,
@@ -339,8 +336,11 @@ pub enum Key {
 }
 
 /// The string for `key` in the language the user picked.
-pub fn t(key: Key, cx: &gpui_kit::App) -> &'static str {
-    text(key, AppSettings::global(cx).language)
+pub fn t(language: Language, key: Key) -> &'static str {
+    match language {
+        Language::English => english(key),
+        Language::Chinese => chinese(key),
+    }
 }
 
 pub(crate) fn quoted_path(path: &std::path::Path) -> String {
@@ -355,11 +355,7 @@ pub(crate) fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| quoted_path(path))
 }
 
-pub fn replace_file_title(path: &std::path::Path, cx: &gpui_kit::App) -> String {
-    replace_file_title_in(path, AppSettings::global(cx).language)
-}
-
-fn replace_file_title_in(path: &std::path::Path, language: Language) -> String {
+pub fn replace_file_title(language: Language, path: &std::path::Path) -> String {
     let name = file_name(path);
     match language {
         Language::English => format!("Replace \u{201c}{name}\u{201d}?"),
@@ -367,11 +363,7 @@ fn replace_file_title_in(path: &std::path::Path, language: Language) -> String {
     }
 }
 
-pub fn replace_file_description(path: &std::path::Path, cx: &gpui_kit::App) -> String {
-    replace_file_description_in(path, AppSettings::global(cx).language)
-}
-
-fn replace_file_description_in(path: &std::path::Path, language: Language) -> String {
+pub fn replace_file_description(language: Language, path: &std::path::Path) -> String {
     let path = quoted_path(path);
     match language {
         Language::English => {
@@ -381,21 +373,21 @@ fn replace_file_description_in(path: &std::path::Path, language: Language) -> St
     }
 }
 
-pub fn open_recent_target_label(path: &std::path::Path, cx: &gpui_kit::App) -> String {
-    recent_target_label_in(path, AppSettings::global(cx).language, true)
+pub fn open_recent_target_label(language: Language, path: &std::path::Path) -> String {
+    recent_target_label_in(language, path, true)
 }
 
-pub fn remove_recent_target_label(path: &std::path::Path, cx: &gpui_kit::App) -> String {
-    recent_target_label_in(path, AppSettings::global(cx).language, false)
+pub fn remove_recent_target_label(language: Language, path: &std::path::Path) -> String {
+    recent_target_label_in(language, path, false)
 }
 
-pub fn save_as_snapshot_changed_message(cx: &gpui_kit::App) -> &'static str {
-    t(Key::SaveAsSnapshotChanged, cx)
+pub fn save_as_snapshot_changed_message(language: Language) -> &'static str {
+    t(language, Key::SaveAsSnapshotChanged)
 }
 
-pub fn save_as_path_already_open_message(path: &std::path::Path, cx: &gpui_kit::App) -> String {
+pub fn save_as_path_already_open_message(language: Language, path: &std::path::Path) -> String {
     let path = quoted_path(path);
-    match AppSettings::global(cx).language {
+    match language {
         Language::English => {
             format!("\u{201c}{path}\u{201d} is already open. Choose another Save As path.")
         }
@@ -403,7 +395,7 @@ pub fn save_as_path_already_open_message(path: &std::path::Path, cx: &gpui_kit::
     }
 }
 
-fn recent_target_label_in(path: &std::path::Path, language: Language, open: bool) -> String {
+fn recent_target_label_in(language: Language, path: &std::path::Path, open: bool) -> String {
     let path = quoted_path(path);
     match (language, open) {
         (Language::English, true) => format!("Open \u{201c}{path}\u{201d}"),
@@ -413,23 +405,7 @@ fn recent_target_label_in(path: &std::path::Path, language: Language, open: bool
     }
 }
 
-/// The string for `key` in an explicit language.
-///
-/// Exposed separately so the table can be tested without an `App`.
-pub fn text(key: Key, language: Language) -> &'static str {
-    match language {
-        Language::English => english(key),
-        // Falling back to English rather than to the key name: an untranslated
-        // label in a language the user may still read beats `PanelHarness`.
-        Language::Chinese => chinese(key).unwrap_or_else(|| english(key)),
-    }
-}
-
-pub fn model_endpoint_status(endpoint: &EndpointIdentity, cx: &gpui_kit::App) -> String {
-    model_endpoint_status_in(endpoint, AppSettings::global(cx).language)
-}
-
-fn model_endpoint_status_in(endpoint: &EndpointIdentity, language: Language) -> String {
+pub fn model_endpoint_status(language: Language, endpoint: &EndpointIdentity) -> String {
     let base_url = endpoint.base_url();
     match (
         language,
@@ -464,8 +440,8 @@ fn model_endpoint_status_in(endpoint: &EndpointIdentity, language: Language) -> 
     }
 }
 
-pub fn effective_context_choice_label(selected: bool, cx: &gpui_kit::App) -> &'static str {
-    match (AppSettings::global(cx).language, selected) {
+pub fn effective_context_choice_label(language: Language, selected: bool) -> &'static str {
+    match (language, selected) {
         (Language::English, false) => "Include context source (unchecked)",
         (Language::English, true) => "Include context source (selected)",
         (Language::Chinese, false) => "包含 Context 来源（未选择）",
@@ -473,11 +449,7 @@ pub fn effective_context_choice_label(selected: bool, cx: &gpui_kit::App) -> &'s
     }
 }
 
-pub fn model_request_disclosure(disclosure: &ModelRequestDisclosure, cx: &gpui_kit::App) -> String {
-    model_request_disclosure_in(disclosure, AppSettings::global(cx).language)
-}
-
-fn model_request_disclosure_in(disclosure: &ModelRequestDisclosure, language: Language) -> String {
+pub fn model_request_disclosure(language: Language, disclosure: &ModelRequestDisclosure) -> String {
     let endpoint = disclosure.endpoint();
     let (operation, location, encryption, proxy, suffix) = match language {
         Language::English => (
@@ -680,7 +652,10 @@ fn model_request_disclosure_in(disclosure: &ModelRequestDisclosure, language: La
             }
             None => "\n修订绑定不可用。".to_owned(),
         },
-        _ => String::new(),
+        (
+            Language::English | Language::Chinese,
+            ModelOperation::Review | ModelOperation::Translation,
+        ) => String::new(),
     };
 
     match language {
@@ -708,7 +683,7 @@ fn disclosure_digest_label(digest: Option<&[u8; 32]>) -> String {
         .unwrap_or_else(|| "unavailable".to_owned())
 }
 
-pub fn model_endpoint_error(error: &EndpointIdentityError, cx: &gpui_kit::App) -> String {
+pub fn model_endpoint_error(language: Language, error: &EndpointIdentityError) -> String {
     let key = match error {
         EndpointIdentityError::InvalidUrl(_) => Key::EndpointInvalidUrl,
         EndpointIdentityError::UnsupportedScheme => Key::EndpointUnsupportedScheme,
@@ -718,16 +693,16 @@ pub fn model_endpoint_error(error: &EndpointIdentityError, cx: &gpui_kit::App) -
         EndpointIdentityError::FragmentNotAllowed => Key::EndpointFragmentNotAllowed,
         EndpointIdentityError::InsecureRemoteTransport => Key::EndpointInsecureRemoteTransport,
     };
-    t(key, cx).into()
+    t(language, key).into()
 }
 
 pub fn environment_credential_description(
+    language: Language,
     variable: &str,
     endpoint: &EndpointIdentity,
-    cx: &gpui_kit::App,
 ) -> String {
     let base_url = endpoint.base_url();
-    match AppSettings::global(cx).language {
+    match language {
         Language::English => format!(
             "Allow {variable} only for {base_url}. Changing the provider or endpoint makes this authorization inactive."
         ),
@@ -738,12 +713,12 @@ pub fn environment_credential_description(
 }
 
 pub fn delete_model_credential_description(
+    language: Language,
     endpoint: &EndpointIdentity,
-    cx: &gpui_kit::App,
 ) -> String {
     let provider = endpoint.provider().label();
     let base_url = endpoint.base_url();
-    match AppSettings::global(cx).language {
+    match language {
         Language::English => format!(
             "Delete the session and securely stored credential for {provider} at {base_url}? Credentials for other endpoint identities are unchanged."
         ),
@@ -754,12 +729,12 @@ pub fn delete_model_credential_description(
 }
 
 pub fn migrate_legacy_credential_description(
+    language: Language,
     endpoint: &EndpointIdentity,
-    cx: &gpui_kit::App,
 ) -> String {
     let provider = endpoint.provider().label();
     let base_url = endpoint.base_url();
-    match AppSettings::global(cx).language {
+    match language {
         Language::English => format!(
             "Move the legacy plaintext credential to secure storage for {provider} at {base_url}. The plaintext setting is removed only after the secure write is verified."
         ),
@@ -1153,11 +1128,10 @@ fn english(key: Key) -> &'static str {
 
 /// Chinese strings.
 ///
-/// `Option` rather than an exhaustive match: this returns `None` for anything
-/// not yet translated, and the caller falls back. Technical terms and file names
-/// stay in English — `SKILL.md` is a filename, not a word.
-fn chinese(key: Key) -> Option<&'static str> {
-    Some(match key {
+/// Technical terms and file names stay in English — `SKILL.md` is a filename,
+/// not a word. The exhaustive match requires a translation for every key.
+fn chinese(key: Key) -> &'static str {
+    match key {
         Key::OpenFolder => "打开文件夹",
         Key::OpenFile => "打开文件",
         Key::OpenFolderPicker => "打开文件夹\u{2026}",
@@ -1490,7 +1464,7 @@ fn chinese(key: Key) -> Option<&'static str> {
             "标记了 `metadata.internal: true` 的 skills，参考工具默认将其隐藏。"
         }
         Key::GroupByHelp => "Skills 列表的组织方式。",
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1790,7 +1764,7 @@ mod tests {
     fn every_key_has_a_string_in_every_language() {
         for &key in EVERY_KEY {
             for language in Language::ALL {
-                let value = text(key, language);
+                let value = t(language, key);
                 assert!(
                     !value.is_empty(),
                     "{key:?} is empty in {}",
@@ -1802,31 +1776,27 @@ mod tests {
 
     #[test]
     fn chinese_covers_every_key() {
-        // The fallback exists so a *new* key does not break the UI, not as a
-        // license to leave the table half-finished. This is what keeps it
-        // honest.
-        let missing: Vec<Key> = EVERY_KEY
-            .iter()
-            .copied()
-            .filter(|&k| chinese(k).is_none())
-            .collect();
-        assert!(missing.is_empty(), "untranslated: {missing:?}");
+        for &key in EVERY_KEY {
+            assert!(
+                !chinese(key).is_empty(),
+                "{key:?} has no Chinese translation"
+            );
+        }
     }
 
     #[test]
-    fn an_untranslated_key_falls_back_to_english_not_to_the_key_name() {
-        // Simulated by asking for a key the Chinese table happens to leave in
-        // English: the result must still be a readable label.
-        assert_eq!(text(Key::ModeWeb, Language::Chinese), "Web");
-        assert!(!text(Key::ModeWeb, Language::Chinese).contains("Key::"));
+    fn chinese_preserves_shared_english_labels() {
+        // A shared technical label remains readable, not an enum variant name.
+        assert_eq!(t(Language::Chinese, Key::ModeWeb), "Web");
+        assert!(!t(Language::Chinese, Key::ModeWeb).contains("Key::"));
     }
 
     #[test]
     fn the_html_sandbox_banner_names_the_way_out() {
         // A banner that says only "blocked" leaves the user with a broken page
         // and no next step; both languages must point at Trust.
-        assert!(text(Key::HtmlNeedsTrust, Language::English).contains("Trust"));
-        assert!(text(Key::HtmlNeedsTrust, Language::Chinese).contains("信任"));
+        assert!(t(Language::English, Key::HtmlNeedsTrust).contains("Trust"));
+        assert!(t(Language::Chinese, Key::HtmlNeedsTrust).contains("信任"));
     }
 
     #[test]
@@ -1857,7 +1827,7 @@ mod tests {
             Key::SaveAsPicker,
         ] {
             for language in Language::ALL {
-                let label = text(key, language);
+                let label = t(language, key);
                 assert!(label.ends_with('\u{2026}'), "{key:?}: {label}");
                 assert!(!label.ends_with("..."), "{key:?}: {label}");
             }
@@ -1868,10 +1838,10 @@ mod tests {
     fn destructive_and_recent_labels_name_the_exact_path() {
         let path = std::path::Path::new("C:/work/notes.md");
         for language in Language::ALL {
-            assert!(replace_file_title_in(path, language).contains("notes.md"));
-            assert!(replace_file_description_in(path, language).contains("C:/work/notes.md"));
-            assert!(recent_target_label_in(path, language, true).contains("C:/work/notes.md"));
-            assert!(recent_target_label_in(path, language, false).contains("C:/work/notes.md"));
+            assert!(replace_file_title(language, path).contains("notes.md"));
+            assert!(replace_file_description(language, path).contains("C:/work/notes.md"));
+            assert!(open_recent_target_label(language, path).contains("C:/work/notes.md"));
+            assert!(remove_recent_target_label(language, path).contains("C:/work/notes.md"));
         }
     }
 
@@ -1893,7 +1863,7 @@ mod tests {
             OutboundScope::block(37),
         );
 
-        let english = model_request_disclosure_in(&disclosure, Language::English);
+        let english = model_request_disclosure(Language::English, &disclosure);
         for expected in [
             "Operation: Translation",
             "Endpoint: local",
@@ -1909,7 +1879,7 @@ mod tests {
             );
         }
 
-        let chinese = model_request_disclosure_in(&disclosure, Language::Chinese);
+        let chinese = model_request_disclosure(Language::Chinese, &disclosure);
         for expected in [
             "操作：翻译",
             "端点：本地",
@@ -1931,7 +1901,7 @@ mod tests {
             RevisionRequestBinding::new([0x03; 32], 7, 11, [0x04; 32], [0x01; 32], [0x02; 32]),
             RevisionDisclosureDetails::new(123, 45, 2),
         );
-        let revision_english = model_request_disclosure_in(&revision, Language::English);
+        let revision_english = model_request_disclosure(Language::English, &revision);
         for expected in [
             "Operation: Revision",
             "Scope: document, 37 UTF-8 content bytes",
@@ -1951,7 +1921,7 @@ mod tests {
             );
         }
 
-        let revision_chinese = model_request_disclosure_in(&revision, Language::Chinese);
+        let revision_chinese = model_request_disclosure(Language::Chinese, &revision);
         for expected in [
             "操作：修订",
             "范围：文档，37 UTF-8 内容字节",
@@ -1981,7 +1951,7 @@ mod tests {
             .unwrap(),
         );
         for language in Language::ALL {
-            let message = model_request_disclosure_in(&context, language);
+            let message = model_request_disclosure(language, &context);
             assert!(message.contains("workspace AGENTS.md"));
             assert!(message.contains("project CONTEXT.md"));
         }
@@ -2007,7 +1977,7 @@ mod tests {
         .unwrap();
         let package = package.disclosure(ModelOperation::Review, endpoint);
         for language in Language::ALL {
-            let message = model_request_disclosure_in(&package, language);
+            let message = model_request_disclosure(language, &package);
             for expected in [
                 "SKILL.md (4 bytes): entrypoint",
                 "references/guide.md (5 bytes): referenced support",
@@ -2018,8 +1988,8 @@ mod tests {
                 );
             }
         }
-        assert!(model_request_disclosure_in(&package, Language::English).contains("partial"));
-        assert!(model_request_disclosure_in(&package, Language::Chinese).contains("部分"));
+        assert!(model_request_disclosure(Language::English, &package).contains("partial"));
+        assert!(model_request_disclosure(Language::Chinese, &package).contains("部分"));
     }
 
     #[test]
@@ -2030,11 +2000,11 @@ mod tests {
         )
         .unwrap();
 
-        let english = model_endpoint_status_in(&endpoint, Language::English);
+        let english = model_endpoint_status(Language::English, &endpoint);
         assert!(english.contains("Transport is encrypted"), "{english}");
         assert!(english.contains("proxy is disabled"), "{english}");
 
-        let chinese = model_endpoint_status_in(&endpoint, Language::Chinese);
+        let chinese = model_endpoint_status(Language::Chinese, &endpoint);
         assert!(chinese.contains("传输已加密"), "{chinese}");
         assert!(chinese.contains("已禁用代理"), "{chinese}");
     }
@@ -2051,9 +2021,9 @@ mod tests {
     fn filenames_and_technical_terms_stay_untranslated() {
         // `SKILL.md` is a filename: translating it would name a file that does
         // not exist. Same for the harness vocabulary the ecosystem uses.
-        assert!(text(Key::OpenSkillMd, Language::Chinese).contains("SKILL.md"));
-        assert_eq!(text(Key::PanelHarness, Language::Chinese), "Harness");
-        assert!(text(Key::OpenFolderToDiscover, Language::Chinese).contains("skills"));
+        assert!(t(Language::Chinese, Key::OpenSkillMd).contains("SKILL.md"));
+        assert_eq!(t(Language::Chinese, Key::PanelHarness), "Harness");
+        assert!(t(Language::Chinese, Key::OpenFolderToDiscover).contains("skills"));
     }
 
     #[test]
@@ -2073,19 +2043,19 @@ mod tests {
                 Key::CredentialDeleted,
                 Key::SecureStoreUnavailable,
             ] {
-                let value = text(key, language);
+                let value = t(language, key);
                 assert!(!value.is_empty(), "{key:?} in {language:?}");
                 assert!(!value.contains("sentinel-secret"));
             }
         }
 
         assert_ne!(
-            text(Key::StoreCredentialSecurely, Language::English),
-            text(Key::StoreCredentialSecurely, Language::Chinese)
+            t(Language::English, Key::StoreCredentialSecurely),
+            t(Language::Chinese, Key::StoreCredentialSecurely)
         );
         assert_ne!(
-            text(Key::DeleteCredentialTitle, Language::English),
-            text(Key::DeleteCredentialTitle, Language::Chinese)
+            t(Language::English, Key::DeleteCredentialTitle),
+            t(Language::Chinese, Key::DeleteCredentialTitle)
         );
     }
 }

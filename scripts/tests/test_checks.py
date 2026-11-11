@@ -76,6 +76,27 @@ class DiffCheckTests(unittest.TestCase):
 
 
 class ValidationBoundaryTests(unittest.TestCase):
+    def test_current_and_native_tooling_suites_do_not_overlap(self) -> None:
+        self.assertFalse(set(checks.TOOLING_TESTS) & set(checks.NATIVE_TOOLING_TESTS))
+
+    def test_shards_are_deterministic_and_cover_every_test_once(self) -> None:
+        ids = [f"tests.test_{index}" for index in range(17)]
+        shards = checks.test_shards(ids, 5)
+
+        self.assertEqual([len(shard) for shard in shards], [4, 4, 3, 3, 3])
+        self.assertEqual(sorted(item for shard in shards for item in shard), sorted(ids))
+        self.assertEqual(shards, checks.test_shards(ids, 5))
+
+    def test_native_tier_runs_only_native_harness_tests(self) -> None:
+        with (
+            mock.patch.object(checks, "check_diff") as diff,
+            mock.patch.object(checks, "run_tooling_suite") as suite,
+        ):
+            checks.native()
+
+        diff.assert_called_once_with(base=None, head=None)
+        suite.assert_called_once_with(checks.NATIVE_TOOLING_TESTS)
+
     def test_ci_stops_before_tests_when_clippy_fails(self) -> None:
         calls = []
 

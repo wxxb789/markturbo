@@ -1,4 +1,8 @@
+use crate::expansion_budget::{Cost, ExpansionBudget};
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+mod template;
+use template::{token_cost, Template};
 
 use ratex_lexer::token::{SourceLocation, Token};
 use ratex_lexer::Lexer;
@@ -39,11 +43,22 @@ impl std::fmt::Debug for MacroDefinition {
     }
 }
 
-/// Result of expanding a macro once.
-struct MacroExpansion {
-    tokens: Vec<Token>,
-    num_args: usize,
-    unexpandable: bool,
+/// Immutable namespace storage. Aliases and group undo records share the body.
+struct StoredMacro {
+    definition: MacroDefinition,
+    token_cost: Option<Cost>,
+}
+impl StoredMacro {
+    fn new(definition: MacroDefinition) -> Self {
+        let token_cost = match &definition {
+            MacroDefinition::Tokens { tokens, .. } => token_cost(tokens),
+            _ => Some(Cost::default()),
+        };
+        Self {
+            definition,
+            token_cost,
+        }
+    }
 }
 
 /// The MacroExpander (or "gullet") manages macro expansion.
@@ -59,30 +74,65 @@ pub struct MacroExpander<'a> {
     stack: Vec<Token>,
     macros: MacroNamespace,
     expansion_count: usize,
+    allocation_budget: ExpansionBudget,
     max_expand: usize,
     depth_budget: DepthBudget,
     expand_tokens_depth: usize,
 }
 
+// Builtins never change in place. Each parse stores only its own overrides;
+// aliases and group undo records can safely retain these shared definitions.
+static BUILTINS: LazyLock<HashMap<String, Arc<StoredMacro>>> = LazyLock::new(|| {
+    let mut me = MacroExpander {
+        lexer: Lexer::new(""),
+        mode: Mode::Math,
+        stack: Vec::new(),
+        macros: MacroNamespace::empty(),
+        expansion_count: 0,
+        allocation_budget: ExpansionBudget::default(),
+        max_expand: 1000,
+        depth_budget: DepthBudget::new(MAX_INPUT_DEPTH),
+        expand_tokens_depth: 0,
+    };
+    me.load_builtins();
+    me.macros.current
+});
+
 /// Scoped macro namespace supporting group nesting.
 struct MacroNamespace {
-    current: HashMap<String, MacroDefinition>,
-    group_stack: Vec<HashMap<String, Option<MacroDefinition>>>,
+    builtins: Option<&'static HashMap<String, Arc<StoredMacro>>>,
+    current: HashMap<String, Arc<StoredMacro>>,
+    group_stack: Vec<HashMap<String, Option<Arc<StoredMacro>>>>,
 }
 
 impl MacroNamespace {
     fn new() -> Self {
         Self {
+            builtins: Some(&BUILTINS),
+            ..Self::empty()
+        }
+    }
+    fn empty() -> Self {
+        Self {
+            builtins: None,
             current: HashMap::new(),
             group_stack: Vec::new(),
         }
     }
 
+    fn get_shared(&self, name: &str) -> Option<&Arc<StoredMacro>> {
+        self.current
+            .get(name)
+            .or_else(|| self.builtins.and_then(|b| b.get(name)))
+    }
     fn get(&self, name: &str) -> Option<&MacroDefinition> {
-        self.current.get(name)
+        self.get_shared(name).map(|d| &d.definition)
     }
 
     fn set(&mut self, name: String, def: MacroDefinition) {
+        self.set_shared(name, Arc::new(StoredMacro::new(def)));
+    }
+    fn set_shared(&mut self, name: String, def: Arc<StoredMacro>) {
         if let Some(undo) = self.group_stack.last_mut() {
             undo.entry(name.clone())
                 .or_insert_with(|| self.current.get(&name).cloned());
@@ -91,11 +141,11 @@ impl MacroNamespace {
     }
 
     fn set_global(&mut self, name: String, def: MacroDefinition) {
-        self.current.insert(name, def);
+        self.current.insert(name, Arc::new(StoredMacro::new(def)));
     }
 
     fn has(&self, name: &str) -> bool {
-        self.current.contains_key(name)
+        self.get_shared(name).is_some()
     }
 
     fn begin_group(&mut self) {
@@ -125,18 +175,19 @@ impl MacroNamespace {
 }
 
 /// Tokenize a macro expansion string into stack order (same as [`MacroDefinition::Text`] bodies).
-fn lex_string_to_stack_tokens(text: &str) -> Vec<Token> {
-    let mut body_lexer = Lexer::new(text);
+fn lex_string_to_stack_tokens(text: &str, budget: &ExpansionBudget) -> ParseResult<Vec<Token>> {
+    let mut lexer = Lexer::new(text);
     let mut tokens = Vec::new();
     loop {
-        let tok = body_lexer.lex();
-        if tok.is_eof() {
+        let span = lexer.next_span();
+        if span.is_eof {
             break;
         }
-        tokens.push(tok);
+        budget.charge(Some(Cost::token(span.text)), "generated text lexer")?;
+        tokens.push(span.into_token());
     }
     tokens.reverse();
-    tokens
+    Ok(tokens)
 }
 
 fn dotsc_space_after(next: &str) -> bool {
@@ -236,18 +287,17 @@ impl<'a> MacroExpander<'a> {
     }
 
     pub(crate) fn new_with_budget(input: &'a str, mode: Mode, depth_budget: DepthBudget) -> Self {
-        let mut me = Self {
+        Self {
             lexer: Lexer::new(input),
             mode,
             stack: Vec::new(),
             macros: MacroNamespace::new(),
             expansion_count: 0,
+            allocation_budget: ExpansionBudget::default(),
             max_expand: 1000,
             depth_budget,
             expand_tokens_depth: 0,
-        };
-        me.load_builtins();
-        me
+        }
     }
 
     fn load_builtins(&mut self) {
@@ -662,9 +712,9 @@ impl<'a> MacroExpander<'a> {
                 // char_arg is reversed; the "first" char in original order is the last element
                 let char_text = char_arg.first().map_or("", |t| t.text.as_str());
                 if next == char_text {
-                    Ok(args[1].clone())
+                    Ok(args.into_iter().nth(1).unwrap())
                 } else {
-                    Ok(args[2].clone())
+                    Ok(args.into_iter().nth(2).unwrap())
                 }
             }),
         );
@@ -677,9 +727,9 @@ impl<'a> MacroExpander<'a> {
                 let next = me.future().text.clone();
                 if next == "*" {
                     me.pop_token();
-                    Ok(args[0].clone())
+                    Ok(args.into_iter().nth(0).unwrap())
                 } else {
-                    Ok(args[1].clone())
+                    Ok(args.into_iter().nth(1).unwrap())
                 }
             }),
         );
@@ -690,9 +740,9 @@ impl<'a> MacroExpander<'a> {
             MacroDefinition::Function(|me: &mut MacroExpander| -> ParseResult<Vec<Token>> {
                 let args = me.consume_args(2)?;
                 if me.mode == Mode::Text {
-                    Ok(args[0].clone())
+                    Ok(args.into_iter().nth(0).unwrap())
                 } else {
-                    Ok(args[1].clone())
+                    Ok(args.into_iter().nth(1).unwrap())
                 }
             }),
         );
@@ -708,7 +758,7 @@ impl<'a> MacroExpander<'a> {
                     .map_err(|_| ParseError::recursion_limit_exceeded())?;
                 me.expand_once(false)?;
                 let next = me.future().text.clone();
-                Ok(lex_string_to_stack_tokens(contextual_dots_for(&next)))
+                lex_string_to_stack_tokens(contextual_dots_for(&next), &me.allocation_budget)
             }),
         );
 
@@ -723,7 +773,7 @@ impl<'a> MacroExpander<'a> {
                 } else {
                     "\\ldots"
                 };
-                Ok(lex_string_to_stack_tokens(text))
+                lex_string_to_stack_tokens(text, &me.allocation_budget)
             }),
         );
 
@@ -736,7 +786,7 @@ impl<'a> MacroExpander<'a> {
                 } else {
                     "\\ldots"
                 };
-                Ok(lex_string_to_stack_tokens(text))
+                lex_string_to_stack_tokens(text, &me.allocation_budget)
             }),
         );
 
@@ -749,7 +799,7 @@ impl<'a> MacroExpander<'a> {
                 } else {
                     "\\@cdots"
                 };
-                Ok(lex_string_to_stack_tokens(text))
+                lex_string_to_stack_tokens(text, &me.allocation_budget)
             }),
         );
 
@@ -800,16 +850,14 @@ impl<'a> MacroExpander<'a> {
                     } else {
                         number = tok.text.chars().next().map_or(0, |c| c as i64);
                     }
-                    // Build \@char{N} tokens in reverse (stack order)
-                    let s = number.to_string();
-                    let loc = tok.loc.clone();
-                    let mut result = vec![Token::new("}", loc.start, loc.end)];
-                    for ch in s.chars().rev() {
-                        result.push(Token::new(ch.to_string(), loc.start, loc.end));
+                    let text = me
+                        .allocation_budget
+                        .format(format_args!("\\@char{{{number}}}"))?;
+                    let mut tokens = lex_string_to_stack_tokens(&text, &me.allocation_budget)?;
+                    for t in &mut tokens {
+                        t.loc = tok.loc.clone();
                     }
-                    result.push(Token::new("{", loc.start, loc.end));
-                    result.push(Token::new("\\@char", loc.start, loc.end));
-                    return Ok(result);
+                    return Ok(tokens);
                 } else {
                     base = Some(10);
                 }
@@ -820,7 +868,10 @@ impl<'a> MacroExpander<'a> {
                         let next = me.future().text.clone();
                         if let Ok(d) = i64::from_str_radix(&next, b) {
                             me.pop_token();
-                            number = number * (b as i64) + d;
+                            number = number
+                                .checked_mul(i64::from(b))
+                                .and_then(|n| n.checked_add(d))
+                                .ok_or_else(|| ParseError::msg("\\char number out of range"))?;
                         } else {
                             break;
                         }
@@ -829,15 +880,14 @@ impl<'a> MacroExpander<'a> {
                     number = 0;
                 }
 
-                let s = number.to_string();
-                let loc = tok.loc.clone();
-                let mut result = vec![Token::new("}", loc.start, loc.end)];
-                for ch in s.chars().rev() {
-                    result.push(Token::new(ch.to_string(), loc.start, loc.end));
+                let text = me
+                    .allocation_budget
+                    .format(format_args!("\\@char{{{number}}}"))?;
+                let mut tokens = lex_string_to_stack_tokens(&text, &me.allocation_budget)?;
+                for t in &mut tokens {
+                    t.loc = tok.loc.clone();
                 }
-                result.push(Token::new("{", loc.start, loc.end));
-                result.push(Token::new("\\@char", loc.start, loc.end));
-                Ok(result)
+                Ok(tokens)
             }),
         );
 
@@ -874,136 +924,25 @@ impl<'a> MacroExpander<'a> {
                 name.clone(),
                 MacroDefinition::Function(|me: &mut MacroExpander| -> ParseResult<Vec<Token>> {
                     let args = me.consume_args(2)?;
-                    let content = args[1].iter().cloned().rev().collect::<Vec<_>>();
+                    let content = args
+                        .into_iter()
+                        .nth(1)
+                        .unwrap()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>();
                     Ok(content)
                 }),
             );
         }
 
-        // \bra@ket: like \bra@set but replaces ALL | at depth 0 (for \Braket)
         self.macros.set(
             "\\bra@ket".to_string(),
-            MacroDefinition::Function(|me: &mut MacroExpander| -> ParseResult<Vec<Token>> {
-                let args = me.consume_args(4)?;
-                let left = args[0].clone();
-                let middle = args[1].clone();
-                let middle_double = args[2].clone();
-                let right = args[3].clone();
-
-                let content = me.consume_args(1)?;
-                let content = content.into_iter().next().unwrap();
-
-                // Convert stack-order (reversed) to logical order, replace all | at depth 0,
-                // then reverse back to stack order.
-                let logical: Vec<Token> = content.into_iter().rev().collect();
-                let mut new_logical: Vec<Token> = Vec::new();
-                let mut depth: i32 = 0;
-                let mut i = 0;
-                while i < logical.len() {
-                    let t = &logical[i];
-                    if t.text == "{" {
-                        depth += 1;
-                        new_logical.push(t.clone());
-                    } else if t.text == "}" {
-                        depth -= 1;
-                        new_logical.push(t.clone());
-                    } else if depth == 0 && t.text == "|" {
-                        // Check for || (double pipe) → middleDouble
-                        if !middle_double.is_empty()
-                            && i + 1 < logical.len()
-                            && logical[i + 1].text == "|"
-                        {
-                            // middle_double is in stack/reversed order; reverse to logical order
-                            new_logical.extend(middle_double.iter().rev().cloned());
-                            i += 2;
-                            continue;
-                        }
-                        // middle is in stack/reversed order; reverse to logical order
-                        new_logical.extend(middle.iter().rev().cloned());
-                    } else {
-                        new_logical.push(t.clone());
-                    }
-                    i += 1;
-                }
-
-                // Reverse back to stack order
-                let content_rev: Vec<Token> = new_logical.into_iter().rev().collect();
-
-                // Build: right + content + left (reversed for stack)
-                let mut to_expand = Vec::new();
-                to_expand.extend(right);
-                to_expand.extend(content_rev);
-                to_expand.extend(left);
-
-                me.begin_group();
-                let expanded = me.expand_tokens(to_expand);
-                me.end_group();
-                let expanded = expanded?;
-
-                Ok(expanded)
-            }),
+            MacroDefinition::Function(|me| me.expand_braket(false)),
         );
-
-        // \bra@set: braket set notation helper
-        // Only replaces the FIRST | with middle tokens (one-shot), matching KaTeX
         self.macros.set(
             "\\bra@set".to_string(),
-            MacroDefinition::Function(|me: &mut MacroExpander| -> ParseResult<Vec<Token>> {
-                let args = me.consume_args(4)?;
-                let left = args[0].clone();
-                let middle = args[1].clone();
-                let middle_double = args[2].clone();
-                let right = args[3].clone();
-
-                let content = me.consume_args(1)?;
-                let mut content = content.into_iter().next().unwrap();
-
-                // Scan content and replace only the first | at depth 0
-                // Content tokens are in reversed order (stack), so iterate from end
-                let mut depth: i32 = 0;
-                let mut _first_pipe_idx: Option<usize> = None;
-                // Tokens are reversed (last token first in vec), scan in logical order
-                for i in (0..content.len()).rev() {
-                    let t = &content[i];
-                    if t.text == "{" {
-                        depth += 1;
-                    } else if t.text == "}" {
-                        depth -= 1;
-                    } else if depth == 0 && t.text == "|" {
-                        // Check for || (double pipe) → middleDouble
-                        if !middle_double.is_empty() && i > 0 && content[i - 1].text == "|" {
-                            _first_pipe_idx = Some(i);
-                            // Replace || with middleDouble
-                            content.remove(i);
-                            content.remove(i - 1);
-                            let insert_at = if i >= 2 { i - 1 } else { 0 };
-                            for (j, tok) in middle_double.iter().enumerate() {
-                                content.insert(insert_at + j, tok.clone());
-                            }
-                            break;
-                        }
-                        _first_pipe_idx = Some(i);
-                        content.remove(i);
-                        for (j, tok) in middle.iter().enumerate() {
-                            content.insert(i + j, tok.clone());
-                        }
-                        break;
-                    }
-                }
-
-                // Build: right + content + left (reversed for stack)
-                let mut to_expand = Vec::new();
-                to_expand.extend(right);
-                to_expand.extend(content);
-                to_expand.extend(left);
-
-                me.begin_group();
-                let expanded = me.expand_tokens(to_expand);
-                me.end_group();
-                let expanded = expanded?;
-
-                Ok(expanded)
-            }),
+            MacroDefinition::Function(|me| me.expand_braket(true)),
         );
 
         // \\ce / \\pu: KaTeX mhchem 3.3.0 (Rust port in `crate::mhchem`)
@@ -1011,22 +950,32 @@ impl<'a> MacroExpander<'a> {
             "\\ce".to_string(),
             MacroDefinition::Function(|me: &mut MacroExpander| -> ParseResult<Vec<Token>> {
                 let args = me.consume_args(1)?;
-                let s = crate::mhchem::mhchem_arg_tokens_to_string(&args[0]);
-                let tex =
-                    crate::mhchem::chem_parse_str_with_budget(&s, "ce", me.depth_budget.clone())
-                        .map_err(|e| ParseError::msg(format!("\\ce: {e}")))?;
-                Ok(lex_string_to_stack_tokens(&tex))
+                let s = crate::mhchem::arg_tokens_with_resources(&args[0], &me.allocation_budget)
+                    .map_err(|e| ParseError::msg(e.to_string()))?;
+                let tex = crate::mhchem::chem_parse_str_with_resources(
+                    &s,
+                    "ce",
+                    me.depth_budget.clone(),
+                    me.allocation_budget.clone(),
+                )
+                .map_err(|e| ParseError::msg(format!("\\ce: {e}")))?;
+                lex_string_to_stack_tokens(&tex, &me.allocation_budget)
             }),
         );
         self.macros.set(
             "\\pu".to_string(),
             MacroDefinition::Function(|me: &mut MacroExpander| -> ParseResult<Vec<Token>> {
                 let args = me.consume_args(1)?;
-                let s = crate::mhchem::mhchem_arg_tokens_to_string(&args[0]);
-                let tex =
-                    crate::mhchem::chem_parse_str_with_budget(&s, "pu", me.depth_budget.clone())
-                        .map_err(|e| ParseError::msg(format!("\\pu: {e}")))?;
-                Ok(lex_string_to_stack_tokens(&tex))
+                let s = crate::mhchem::arg_tokens_with_resources(&args[0], &me.allocation_budget)
+                    .map_err(|e| ParseError::msg(e.to_string()))?;
+                let tex = crate::mhchem::chem_parse_str_with_resources(
+                    &s,
+                    "pu",
+                    me.depth_budget.clone(),
+                    me.allocation_budget.clone(),
+                )
+                .map_err(|e| ParseError::msg(format!("\\pu: {e}")))?;
+                lex_string_to_stack_tokens(&tex, &me.allocation_budget)
             }),
         );
     }
@@ -1065,7 +1014,7 @@ impl<'a> MacroExpander<'a> {
         let saved_stack = std::mem::take(&mut self.stack);
         self.stack = tokens;
 
-        let result = (|| {
+        let result: ParseResult<Vec<Token>> = (|| {
             let mut result = Vec::new();
             loop {
                 if self.stack.is_empty() {
@@ -1151,127 +1100,108 @@ impl<'a> MacroExpander<'a> {
         }
     }
 
-    /// Expand the next token once if possible.
-    /// Returns Ok(true) if expanded, Ok(false) if not expandable.
+    /// Expand the next token once, charging only newly constructed output.
     fn expand_once(&mut self, expandable_only: bool) -> ParseResult<bool> {
         let top_token = self.pop_token();
         let name = &top_token.text;
-
         if top_token.noexpand {
             self.push_token(top_token);
             return Ok(false);
         }
-
-        // Check for function-based macro first — always expandable
-        if let Some(MacroDefinition::Function(handler)) = self.macros.get(name).cloned() {
-            self.count_expansion(1)?;
-            let tokens = handler(self)?;
-            self.stack.extend(tokens);
-            return Ok(true);
-        }
-
-        let expansion = self.get_expansion(name);
-        match expansion {
-            None => {
-                if expandable_only && name.starts_with('\\') && !self.is_defined(name) {
-                    return Err(ParseError::new(
-                        format!("Undefined control sequence: {}", name),
-                        Some(&top_token),
-                    ));
-                }
+        let def = self.macros.get_shared(name).cloned();
+        let Some(def) = def else {
+            if expandable_only && name.starts_with('\\') && !self.is_defined(name) {
+                return Err(ParseError::new(
+                    format!("Undefined control sequence: {}", name),
+                    Some(&top_token),
+                ));
+            }
+            self.push_token(top_token);
+            return Ok(false);
+        };
+        // Function macros have historically bypassed active-character checks.
+        if !matches!(&def.definition, MacroDefinition::Function(_)) && name.len() == 1 {
+            let code = self.lexer_catcode(name.chars().next().unwrap());
+            if code != 0 && code != 13 {
                 self.push_token(top_token);
-                Ok(false)
-            }
-            Some(exp) if expandable_only && exp.unexpandable => {
-                self.push_token(top_token);
-                Ok(false)
-            }
-            Some(exp) => {
-                self.count_expansion(1)?;
-                let mut tokens = exp.tokens;
-                if exp.num_args > 0 {
-                    let args = self.consume_args(exp.num_args)?;
-                    tokens = self.substitute_args(tokens, &args);
-                }
-                self.stack.extend(tokens);
-                Ok(true)
+                return Ok(false);
             }
         }
-    }
-
-    fn substitute_args(&self, mut tokens: Vec<Token>, args: &[Vec<Token>]) -> Vec<Token> {
-        let mut i = tokens.len();
-        while i > 0 {
-            i -= 1;
-            if tokens[i].text == "#" && i > 0 {
-                let next = &tokens[i - 1];
-                if next.text == "#" {
-                    tokens.remove(i);
-                    i -= 1;
-                } else if let Ok(n) = next.text.parse::<usize>() {
-                    if n >= 1 && n <= args.len() {
-                        tokens.remove(i);
-                        tokens.remove(i - 1);
-                        let arg_tokens = &args[n - 1];
-                        for (j, t) in arg_tokens.iter().enumerate() {
-                            tokens.insert(i - 1 + j, t.clone());
-                        }
-                        i = i.saturating_sub(1);
-                    }
-                }
-            }
-        }
-        tokens
-    }
-
-    fn get_expansion(&self, name: &str) -> Option<MacroExpansion> {
-        let def = self.macros.get(name)?;
-
-        if name.len() == 1 {
-            let ch = name.chars().next().unwrap();
-            let catcode = self.lexer_catcode(ch);
-            if catcode != 0 && catcode != 13 {
-                return None;
-            }
-        }
-
-        match def {
+        self.count_expansion(1)?;
+        let tokens = match &def.definition {
+            MacroDefinition::Function(handler) => handler(self)?,
             MacroDefinition::Text(text) => {
-                let mut num_args = 0;
-                let stripped = text.replace("##", "");
-                while stripped.contains(&format!("#{}", num_args + 1)) {
-                    num_args += 1;
-                }
-                let mut body_lexer = Lexer::new(text);
-                let mut tokens = Vec::new();
-                loop {
-                    let tok = body_lexer.lex();
-                    if tok.is_eof() {
-                        break;
-                    }
-                    tokens.push(tok);
-                }
-                tokens.reverse();
-                Some(MacroExpansion {
-                    tokens,
-                    num_args,
-                    unexpandable: false,
-                })
+                let template = Template::Text(text);
+                let args = self.consume_args(template.num_args())?;
+                template.expand(args, &self.allocation_budget)?
             }
-            MacroDefinition::Tokens { tokens, num_args } => Some(MacroExpansion {
-                tokens: tokens.clone(),
-                num_args: *num_args,
-                unexpandable: false,
-            }),
-            MacroDefinition::Function(_) => {
-                // Signal that this is a function macro; handled in expand_once
-                Some(MacroExpansion {
-                    tokens: vec![],
-                    num_args: 0,
-                    unexpandable: false,
-                })
+            MacroDefinition::Tokens { tokens, num_args } => {
+                if *num_args == 0 {
+                    self.allocation_budget
+                        .charge(def.token_cost, "token macro body")?;
+                    tokens.clone()
+                } else {
+                    let args = self.consume_args(*num_args)?;
+                    Template::Tokens(tokens).expand(args, &self.allocation_budget)?
+                }
             }
+        };
+        self.stack.extend(tokens);
+        Ok(true)
+    }
+
+    fn expand_braket(&mut self, first_only: bool) -> ParseResult<Vec<Token>> {
+        let mut args = self.consume_args(4)?.into_iter();
+        let left = args.next().unwrap();
+        let middle = args.next().unwrap();
+        let double = args.next().unwrap();
+        let right = args.next().unwrap();
+        let content = self.consume_arg(None)?.tokens;
+        let mut iter = content.into_iter().rev().peekable();
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut replaced = false;
+        while let Some(t) = iter.next() {
+            if t.text == "{" {
+                depth += 1;
+            } else if t.text == "}" {
+                depth -= 1;
+            } else if depth == 0 && t.text == "|" && !(first_only && replaced) {
+                let replacement =
+                    if !double.is_empty() && iter.peek().is_some_and(|t| t.text == "|") {
+                        iter.next();
+                        &double
+                    } else {
+                        &middle
+                    };
+                self.allocation_budget
+                    .charge(token_cost(replacement), "braket replacement")?;
+                out.extend(replacement.iter().rev().cloned());
+                replaced = true;
+                continue;
+            }
+            out.push(t);
         }
+        let mut to_expand = right;
+        to_expand.extend(out.into_iter().rev());
+        to_expand.extend(left);
+        self.begin_group();
+        let result = self.expand_tokens(to_expand);
+        self.end_group();
+        result
+    }
+
+    /// Alias the immutable definition without copying a macro body.
+    pub(crate) fn alias_macro(&mut self, name: &str, source: &str, global: bool) -> bool {
+        let Some(def) = self.macros.get_shared(source).cloned() else {
+            return false;
+        };
+        if global {
+            self.macros.current.insert(name.to_string(), def);
+        } else {
+            self.macros.set_shared(name.to_string(), def);
+        }
+        true
     }
 
     fn lexer_catcode(&self, ch: char) -> u8 {
@@ -1279,7 +1209,11 @@ impl<'a> MacroExpander<'a> {
     }
 
     fn count_expansion(&mut self, amount: usize) -> ParseResult<()> {
-        self.expansion_count += amount;
+        self.expansion_count = self
+            .expansion_count
+            .checked_add(amount)
+            .ok_or_else(|| ParseError::msg("Too many expansions"))?;
+        self.allocation_budget.calls(self.expansion_count);
         if self.expansion_count > self.max_expand {
             Err(ParseError::msg(
                 "Too many expansions: infinite loop or need to increase maxExpand setting",
@@ -1296,7 +1230,7 @@ impl<'a> MacroExpander<'a> {
             if !expanded {
                 let mut token = self.stack.pop().unwrap();
                 if token.treat_as_relax {
-                    token.text = "\\relax".to_string();
+                    token.text = self.allocation_budget.text("\\relax")?;
                 }
                 return Ok(token);
             }
@@ -1313,12 +1247,10 @@ impl<'a> MacroExpander<'a> {
         let start = self.future().clone();
         let mut tokens = Vec::new();
         let mut depth: i32 = 0;
-        let mut end_tok;
+        let end_tok;
 
         loop {
             let tok = self.pop_token();
-            end_tok = tok.clone();
-            tokens.push(tok.clone());
 
             if tok.text == "{" {
                 depth += 1;
@@ -1335,6 +1267,8 @@ impl<'a> MacroExpander<'a> {
             }
 
             if depth == 0 && !is_delimited {
+                end_tok = tok.clone();
+                tokens.push(tok);
                 break;
             }
 
@@ -1342,12 +1276,13 @@ impl<'a> MacroExpander<'a> {
                 if is_delimited && depth == 0 {
                     if let Some(last) = delims.last() {
                         if tok.text == *last {
-                            tokens.pop();
+                            end_tok = tok;
                             break;
                         }
                     }
                 }
             }
+            tokens.push(tok);
         }
 
         if start.text == "{" && tokens.last().is_some_and(|t| t.text == "}") {
@@ -1366,7 +1301,7 @@ impl<'a> MacroExpander<'a> {
 
     /// Consume N arguments.
     fn consume_args(&mut self, num_args: usize) -> ParseResult<Vec<Vec<Token>>> {
-        let mut args = Vec::with_capacity(num_args);
+        let mut args = Vec::new();
         for _ in 0..num_args {
             let arg = self.consume_arg(None)?;
             args.push(arg.tokens);
@@ -1490,3 +1425,6 @@ fn is_known_symbol(name: &str) -> bool {
     symbols::get_symbol(name, symbols::Mode::Math).is_some()
         || symbols::get_symbol(name, symbols::Mode::Text).is_some()
 }
+
+#[cfg(test)]
+mod resource_tests;

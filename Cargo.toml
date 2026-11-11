@@ -11,74 +11,6 @@ license = "Apache-2.0"
 [workspace.dependencies]
 mt-core = { path = "crates/mt-core" }
 
-# Kit and its GPUI snapshot must resolve to one registry source. Kit does not
-# forward `stacker`: retain this direct dependency to enable deep-layout stack
-# protection for the same gpui-pre package used by Kit.
-gpui = { package = "gpui-pre", version = "=0.3.6", features = ["stacker"] }
-# Grammars named one at a time, not `tree-sitter-languages`. That feature is
-# gpui-component's "everything" switch — 34 generated C parse tables, and they
-# are `.rdata` rather than code, which is why the binary's `.rdata` used to be
-# larger than its `.text`. Kotlin alone is an 11.9MB static library; C# 11.0MB,
-# Swift 8.3MB, C++ 7.4MB, SQL 5.5MB.
-#
-# Measured on x86_64-pc-windows-msvc: 82,848,000 -> 54,269,952 bytes, **-34.5%**,
-# with no code change. `.rdata` alone went 47,887KB -> 17,161KB.
-#
-# **This list is chosen by what appears in a ``` fence, not by what files the
-# app opens.** That distinction is the whole reason the list is not shorter.
-# A fenced block inside a Markdown document is highlighted through the same
-# grammars: `CodeBlock::styles` -> `SyntaxHighlighter::new(lang)` ->
-# `LanguageRegistry::singleton().language(lang)`, and that registry is built
-# from `Language::all()` — the same cfg-gated enum. So dropping
-# `tree-sitter-rust` does not merely stop highlighting `.rs` files, it renders
-# every ```rust block in every README as flat grey text. Counted across this
-# repository's Markdown: 8606 ```rust, 77 ```bash, 23 ```toml, 6 ```json,
-# 4 ```yaml, 4 ```diff — which is what this list is.
-#
-# Trimming to `tree-sitter-markdown` alone was measured too: 49,107,456 bytes,
-# a further 5.2MB. It is rejected on both counts — the fences go unhighlighted,
-# and it does not even compile (see the cfg note below).
-#
-# Three things to know before editing this list:
-#
-# * A grammar feature gates the `Language` enum **variant**, not just its
-#   highlighting. `#[cfg(feature = "tree-sitter-rust")]` sits on the variant,
-#   on its `name()` arm and on its `from_name` arm alike, so removing a feature
-#   whose variant is named anywhere is an E0599 compile error, not a silent
-#   downgrade. Removing all but markdown produces 5 of them in `document.rs`.
-# * `tree-sitter-json` is not a feature name. JSON comes in via the base
-#   `tree-sitter` feature, which every grammar feature below enables, so
-#   `Language::Json` still resolves.
-# * `tree-sitter-make` is here for `a_file_with_no_grammar_falls_back_to_plain`,
-#   which asserts a `Makefile` maps to `Language::Make`. Dropping it is a test
-#   failure, not a silent loss.
-#
-# Adding a grammar is one line. A fence language absent from this list falls
-# back to `Language::Plain` at runtime — no highlighting, never a wrong grammar
-# and never a panic (`SyntaxHighlighter::new` logs and builds an inert
-# highlighter). `tree-sitter-tsx` is the one addition that costs 0 bytes: it
-# reuses the `tree-sitter-typescript` parse table already compiled in.
-gpui-kit = { version = "=0.6.6", features = [
-    # Markdown itself, plus the inline grammar it needs. One feature, two variants.
-    "tree-sitter-markdown",
-    # The rest are fence languages, ordered by how often they appear in one.
-    "tree-sitter-rust",
-    "tree-sitter-bash",
-    "tree-sitter-toml",
-    "tree-sitter-yaml",
-    "tree-sitter-python",
-    "tree-sitter-javascript",
-    "tree-sitter-typescript",
-    "tree-sitter-html",
-    "tree-sitter-css",
-    # Not a fence language: `a_file_with_no_grammar_falls_back_to_plain` names
-    # `Language::Make`, and the variant only exists with this feature on.
-    "tree-sitter-make",
-] }
-gpui-wry = "=0.6.6"
-# GPUI's X11 window icon is an `image::RgbaImage`. Keep only PNG decoding: the
-# icon is the one place markturbo names this already-transitive crate directly.
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 anyhow = "1"
 env_logger = "0.11"
@@ -87,9 +19,9 @@ log = "0.4"
 # subscriber before env_logger so dependency traces can never carry model
 # response bodies into the application log.
 tracing = "0.1"
-# Already in the graph via gpui-component; naming it here costs no extra
-# compilation and closes the data-loss path where a legacy-encoded document
-# was decoded lossily and saved back as U+FFFD.
+# Already in the graph through `mt-core`; naming it here keeps the decoder
+# identity one implementation and closes the data-loss path where a
+# legacy-encoded document was decoded lossily and saved back as U+FFFD.
 encoding_rs = "0.8"
 # Its detector half. Same author as encoding_rs — this is Firefox's own
 # detector, and it is only consulted for bytes that are not valid UTF-8.
@@ -108,10 +40,10 @@ markdown = "1.0"
 # Emitting the SVG in `crates/mt-core/src/rendering/mod.rs` instead deletes all
 # three at the source. Measured after: 4.34MB baseline, 4.55MB after 1000 CJK
 # renders, zero stderr lines, no platform font path in the binary.
-ratex-parser = "=0.1.14"
-ratex-layout = "=0.1.14"
-ratex-types = "=0.1.14"
-ratex-font = "=0.1.14"
+ratex-parser = "=0.1.15"
+ratex-layout = "=0.1.15"
+ratex-types = "=0.1.15"
+ratex-font = "=0.1.15"
 # Reads the KaTeX `.ttf` files and yields glyph outlines. `FontRef` borrows the
 # bytes rather than copying them, so a 17.7MB face costs 0.02MB to parse.
 ab_glyph = "0.2"
@@ -122,12 +54,11 @@ rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-raw-window-handle = "0.6"
 serde_yaml = "0.9"
 # The settings format. TOML rather than JSON because a settings file is meant to
 # be hand-edited: it takes comments, which JSON cannot, and it does not punish a
-# trailing comma. Already in the native tree via gpui-component, so naming it
-# costs no extra compilation.
+# trailing comma. Already in the native tree through `mt-core` settings, so
+# naming it costs no extra compilation.
 toml = "1.1"
 # Model endpoint identity is security-sensitive and must be parsed rather than
 # assembled as text. `url` is already in the desktop dependency graph through
@@ -137,9 +68,6 @@ url = "2"
 # branches, one of which was wrong: macOS is not an XDG platform, and a file in
 # ~/.config there is invisible to every macOS convention for finding it.
 dirs = "6"
-wry = { version = "0.53.3", package = "lb-wry" }
-# Direct WebView2 profile attestation; keep aligned with lb-wry's binding.
-webview2-com = "=0.38.2"
 smol = "2"
 tempfile = "3"
 # Wry owns WebView2, but it does not expose the private WS_CHILD host or the
@@ -160,10 +88,8 @@ windows = { version = "0.61", features = [
 ] }
 # The translation transport. Pulls reqwest and its stack — 41 crates that were
 # not compiled before, measured on x86_64-pc-windows-msvc (510 -> 551). tokio
-# and hyper are among them: gpui-component-assets declares reqwest only under
-# `cfg(target_family = "wasm")`, so none of it built on a desktop target.
-# `cargo tree --target all` folds that wasm branch in and reports a smaller
-# delta; it is not the number you ship.
+# and hyper are among them. `cargo tree --target all` folds in wasm-only
+# branches and reports a smaller delta; it is not the number you ship.
 #
 # `default-features = false` to escape `rustls-tls`, which selects `aws-lc-rs`
 # and therefore `aws-lc-sys` — a C library needing cmake and nasm. The two
@@ -193,8 +119,8 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 # genai is async-only and its transport is reqwest, which needs a tokio reactor
 # running. `rt-multi-thread` rather than `rt`: a current_thread runtime can only
-# be driven by whichever thread calls block_on, and gpui hands each
-# background_spawn an arbitrary pool thread. Nothing else in the app is async.
+# be driven by whichever thread calls block_on, and the blocking bridge runs on
+# arbitrary pool threads. Nothing else in the app is async.
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "net",
@@ -207,7 +133,7 @@ debug = "limited"
 split-debuginfo = "unpacked"
 
 [patch.crates-io]
-# `ratex-parser` 0.1.14 plus one 25-line clamp. `\begin{alignat}{N}` allocates
+# `ratex-parser` 0.1.15 plus one 25-line clamp. `\begin{alignat}{N}` allocates
 # `N * 2` 64-byte `AlignSpec` values with no bound, so a 45-byte document
 # requests 68GB and dies with an allocation abort — the one failure class
 # `catch_unwind` below cannot contain.
@@ -226,11 +152,8 @@ ratex-parser = { path = "vendor/ratex-parser" }
 [profile.dev.package]
 # Rendering / layout hot paths are unusable in debug builds otherwise.
 resvg = { opt-level = 3 }
-rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
-gpui-pre = { opt-level = 3 }
-gpui-pre-platform = { opt-level = 3 }
 
 [profile.release]
 # `debug = false` alone leaves the symbols in; `strip` is what actually removes

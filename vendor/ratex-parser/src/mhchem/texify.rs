@@ -1,5 +1,6 @@
 //! `texify.go` — turn parser output into TeX (KaTeX mhchem 3.3).
 
+use crate::expansion_budget::ExpansionBudget;
 use crate::mhchem::error::{MhchemError, MhchemResult};
 use crate::stack_safety::DepthBudget;
 #[cfg(test)]
@@ -8,21 +9,28 @@ use serde_json::Value;
 
 #[cfg(test)]
 pub fn go(input: &[Value], is_inner: bool) -> MhchemResult<String> {
-    go_with_budget(input, is_inner, &DepthBudget::new(MAX_INPUT_DEPTH))
+    go_with_budget(
+        input,
+        is_inner,
+        &DepthBudget::new(MAX_INPUT_DEPTH),
+        &ExpansionBudget::default(),
+    )
 }
 
 pub(crate) fn go_with_budget(
     input: &[Value],
     is_inner: bool,
     budget: &DepthBudget,
+    resources: &ExpansionBudget,
 ) -> MhchemResult<String> {
-    go_scoped(input, is_inner, budget, false)
+    go_scoped(input, is_inner, budget, resources, false)
 }
 
 fn go_scoped(
     input: &[Value],
     is_inner: bool,
     budget: &DepthBudget,
+    resources: &ExpansionBudget,
     count_scope: bool,
 ) -> MhchemResult<String> {
     let _guard = if count_scope {
@@ -39,247 +47,280 @@ fn go_scoped(
     let mut cee = false;
     for inputi in input {
         match inputi {
-            Value::String(s) => res.push_str(s),
+            Value::String(s) => resources.append(&mut res, s)?,
             v => {
-                if type_str(v).as_deref() == Some("1st-level escape") {
+                if type_str(v) == Some("1st-level escape") {
                     cee = true;
                 }
-                res.push_str(&go2(v, budget)?);
+                resources.append(&mut res, &go2(v, budget, resources)?)?;
             }
         }
     }
     if !is_inner && !cee && !res.is_empty() {
-        res = format!("{{{res}}}");
+        res = resources.format(format_args!("{{{res}}}"))?;
     }
     Ok(res)
 }
 
-fn arr_inner(v: &Value, key: &str, budget: &DepthBudget) -> MhchemResult<String> {
+fn arr_inner(
+    v: &Value,
+    key: &str,
+    budget: &DepthBudget,
+    resources: &ExpansionBudget,
+) -> MhchemResult<String> {
     let sl = v
         .get(key)
         .and_then(|x| x.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
-    go_scoped(sl, true, budget, true)
+    go_scoped(sl, true, budget, resources, true)
 }
 
-fn type_str(v: &Value) -> Option<String> {
-    v.get("type_").and_then(|x| x.as_str()).map(String::from)
+fn type_str(v: &Value) -> Option<&str> {
+    v.get("type_").and_then(|x| x.as_str())
 }
 
-fn go2(buf: &Value, budget: &DepthBudget) -> MhchemResult<String> {
+fn go2(buf: &Value, budget: &DepthBudget, resources: &ExpansionBudget) -> MhchemResult<String> {
     let typ = type_str(buf).ok_or_else(|| MhchemError::msg("texify: missing type_"))?;
-    Ok(match typ.as_str() {
+    Ok(match typ {
         "chemfive" => {
-            let b5a = arr_inner(buf, "a", budget)?;
-            let b5b = arr_inner(buf, "b", budget)?;
-            let b5p = arr_inner(buf, "p", budget)?;
-            let b5o = arr_inner(buf, "o", budget)?;
-            let b5q = arr_inner(buf, "q", budget)?;
-            let b5d = arr_inner(buf, "d", budget)?;
+            let b5a = arr_inner(buf, "a", budget, resources)?;
+            let b5b = arr_inner(buf, "b", budget, resources)?;
+            let b5p = arr_inner(buf, "p", budget, resources)?;
+            let b5o = arr_inner(buf, "o", budget, resources)?;
+            let b5q = arr_inner(buf, "q", budget, resources)?;
+            let b5d = arr_inner(buf, "d", budget, resources)?;
             let mut res = String::new();
             if !b5a.is_empty() {
                 let a = if b5a.starts_with('+') || b5a.starts_with('-') {
-                    format!("{{{b5a}}}")
+                    resources.format(format_args!("{{{b5a}}}"))?
                 } else {
                     b5a
                 };
-                res.push_str(&a);
-                res.push_str("\\,");
+                resources.append(&mut res, &a)?;
+                resources.append(&mut res, "\\,")?;
             }
             if !b5b.is_empty() || !b5p.is_empty() {
-                res.push_str("{\\vphantom{X}}");
-                res.push_str(&format!(
-                    "^{{\\hphantom{{{}}}}}_{{\\hphantom{{{}}}}}",
-                    b5b, b5p
-                ));
-                res.push_str("{\\vphantom{X}}");
-                res.push_str(&format!(
-                    "^{{\\smash[t]{{\\vphantom{{2}}}}\\mathllap{{{}}}}}",
-                    b5b
-                ));
-                res.push_str(&format!(
-                    "_{{\\vphantom{{2}}\\mathllap{{\\smash[t]{{{}}}}}}}",
-                    b5p
-                ));
+                resources.append(&mut res, "{\\vphantom{X}}")?;
+                resources.append(
+                    &mut res,
+                    &resources.format(format_args!(
+                        "^{{\\hphantom{{{}}}}}_{{\\hphantom{{{}}}}}",
+                        b5b, b5p
+                    ))?,
+                )?;
+                resources.append(&mut res, "{\\vphantom{X}}")?;
+                resources.append(
+                    &mut res,
+                    &resources.format(format_args!(
+                        "^{{\\smash[t]{{\\vphantom{{2}}}}\\mathllap{{{}}}}}",
+                        b5b
+                    ))?,
+                )?;
+                resources.append(
+                    &mut res,
+                    &resources.format(format_args!(
+                        "_{{\\vphantom{{2}}\\mathllap{{\\smash[t]{{{}}}}}}}",
+                        b5p
+                    ))?,
+                )?;
             }
             if !b5o.is_empty() {
                 let o = if b5o.starts_with('+') || b5o.starts_with('-') {
-                    format!("{{{b5o}}}")
+                    resources.format(format_args!("{{{b5o}}}"))?
                 } else {
                     b5o
                 };
-                res.push_str(&o);
+                resources.append(&mut res, &o)?;
             }
             let d_ty = buf.get("dType").and_then(|x| x.as_str()).unwrap_or("");
             if d_ty == "kv" {
                 if !b5d.is_empty() || !b5q.is_empty() {
-                    res.push_str("{\\vphantom{X}}");
+                    resources.append(&mut res, "{\\vphantom{X}}")?;
                 }
                 if !b5d.is_empty() {
-                    res.push_str(&format!("^{{{b5d}}}"));
+                    resources.append(&mut res, &resources.format(format_args!("^{{{b5d}}}"))?)?;
                 }
                 if !b5q.is_empty() {
-                    res.push_str(&format!("_{{\\smash[t]{{{b5q}}}}}"));
+                    resources.append(
+                        &mut res,
+                        &resources.format(format_args!("_{{\\smash[t]{{{b5q}}}}}"))?,
+                    )?;
                 }
             } else if d_ty == "oxidation" {
                 if !b5d.is_empty() {
-                    res.push_str("{\\vphantom{X}}");
-                    res.push_str(&format!("^{{{b5d}}}"));
+                    resources.append(&mut res, "{\\vphantom{X}}")?;
+                    resources.append(&mut res, &resources.format(format_args!("^{{{b5d}}}"))?)?;
                 }
                 if !b5q.is_empty() {
-                    res.push_str("{\\vphantom{X}}");
-                    res.push_str(&format!("_{{\\smash[t]{{{b5q}}}}}"));
+                    resources.append(&mut res, "{\\vphantom{X}}")?;
+                    resources.append(
+                        &mut res,
+                        &resources.format(format_args!("_{{\\smash[t]{{{b5q}}}}}"))?,
+                    )?;
                 }
             } else {
                 if !b5q.is_empty() {
-                    res.push_str("{\\vphantom{X}}");
-                    res.push_str(&format!("_{{\\smash[t]{{{b5q}}}}}"));
+                    resources.append(&mut res, "{\\vphantom{X}}")?;
+                    resources.append(
+                        &mut res,
+                        &resources.format(format_args!("_{{\\smash[t]{{{b5q}}}}}"))?,
+                    )?;
                 }
                 if !b5d.is_empty() {
-                    res.push_str("{\\vphantom{X}}");
-                    res.push_str(&format!("^{{{b5d}}}"));
+                    resources.append(&mut res, "{\\vphantom{X}}")?;
+                    resources.append(&mut res, &resources.format(format_args!("^{{{b5d}}}"))?)?;
                 }
             }
             res
         }
         "rm" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
-            format!("\\mathrm{{{p1}}}")
+            resources.format(format_args!("\\mathrm{{{p1}}}"))?
         }
         "text" => {
-            let mut p1 = buf
-                .get("p1")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
+            let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
             if p1.contains('^') || p1.contains('_') {
-                p1 = p1.replace(' ', "~").replace('-', "\\text{-}");
-                format!("\\mathrm{{{p1}}}")
+                let mut replaced = String::new();
+                for ch in p1.chars() {
+                    let mut bytes = [0; 4];
+                    let text = match ch {
+                        ' ' => "~",
+                        '-' => "\\text{-}",
+                        _ => ch.encode_utf8(&mut bytes),
+                    };
+                    resources.append(&mut replaced, text)?;
+                }
+                resources.format(format_args!("\\mathrm{{{replaced}}}"))?
             } else {
-                format!("\\text{{{p1}}}")
+                resources.format(format_args!("\\text{{{p1}}}"))?
             }
         }
+
         "roman numeral" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
-            format!("\\mathrm{{{p1}}}")
+            resources.format(format_args!("\\mathrm{{{p1}}}"))?
         }
         "state of aggregation" => {
-            let i = arr_inner(buf, "p1", budget)?;
-            format!("\\mskip2mu {i}")
+            let i = arr_inner(buf, "p1", budget, resources)?;
+            resources.format(format_args!("\\mskip2mu {i}"))?
         }
         "state of aggregation subscript" => {
-            let i = arr_inner(buf, "p1", budget)?;
-            format!("\\mskip1mu {i}")
+            let i = arr_inner(buf, "p1", budget, resources)?;
+            resources.format(format_args!("\\mskip1mu {i}"))?
         }
         "bond" => {
             let k = buf.get("kind_").and_then(|x| x.as_str()).unwrap_or("");
-            get_bond(k)
-                .ok_or_else(|| MhchemError::msg(format!("Unknown bond ({k})")))?
-                .to_string()
+            resources.text(get_bond(k).ok_or_else(|| MhchemError::msg("Unknown bond"))?)?
         }
         "frac" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
             let p2 = buf.get("p2").and_then(|x| x.as_str()).unwrap_or("");
-            let c = format!("\\frac{{{p1}}}{{{p2}}}");
-            format!(r"\mathchoice{{\textstyle{}}}{{{}}}{{{}}}{{{}}}", c, c, c, c)
+            let c = resources.format(format_args!("\\frac{{{p1}}}{{{p2}}}"))?;
+            resources.format(format_args!(
+                r"\mathchoice{{\textstyle{}}}{{{}}}{{{}}}{{{}}}",
+                c, c, c, c
+            ))?
         }
         "pu-frac" => {
-            let p1 = arr_inner(buf, "p1", budget)?;
-            let p2 = arr_inner(buf, "p2", budget)?;
-            let d = format!("\\frac{{{p1}}}{{{p2}}}");
-            format!(r"\mathchoice{{\textstyle{}}}{{{}}}{{{}}}{{{}}}", d, d, d, d)
+            let p1 = arr_inner(buf, "p1", budget, resources)?;
+            let p2 = arr_inner(buf, "p2", budget, resources)?;
+            let d = resources.format(format_args!("\\frac{{{p1}}}{{{p2}}}"))?;
+            resources.format(format_args!(
+                r"\mathchoice{{\textstyle{}}}{{{}}}{{{}}}{{{}}}",
+                d, d, d, d
+            ))?
         }
         "tex-math" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
-            format!("{p1} ")
+            resources.format(format_args!("{p1} "))?
         }
         "frac-ce" => {
-            let p1 = arr_inner(buf, "p1", budget)?;
-            let p2 = arr_inner(buf, "p2", budget)?;
-            format!("\\frac{{{p1}}}{{{p2}}}")
+            let p1 = arr_inner(buf, "p1", budget, resources)?;
+            let p2 = arr_inner(buf, "p2", budget, resources)?;
+            resources.format(format_args!("\\frac{{{p1}}}{{{p2}}}"))?
         }
         "overset" => {
-            let p1 = arr_inner(buf, "p1", budget)?;
-            let p2 = arr_inner(buf, "p2", budget)?;
-            format!("\\overset{{{p1}}}{{{p2}}}")
+            let p1 = arr_inner(buf, "p1", budget, resources)?;
+            let p2 = arr_inner(buf, "p2", budget, resources)?;
+            resources.format(format_args!("\\overset{{{p1}}}{{{p2}}}"))?
         }
         "underset" => {
-            let p1 = arr_inner(buf, "p1", budget)?;
-            let p2 = arr_inner(buf, "p2", budget)?;
-            format!("\\underset{{{p1}}}{{{p2}}}")
+            let p1 = arr_inner(buf, "p1", budget, resources)?;
+            let p2 = arr_inner(buf, "p2", budget, resources)?;
+            resources.format(format_args!("\\underset{{{p1}}}{{{p2}}}"))?
         }
         "underbrace" => {
-            let p1 = arr_inner(buf, "p1", budget)?;
-            let p2 = arr_inner(buf, "p2", budget)?;
-            format!("\\underbrace{{{p1}}}_{{{p2}}}")
+            let p1 = arr_inner(buf, "p1", budget, resources)?;
+            let p2 = arr_inner(buf, "p2", budget, resources)?;
+            resources.format(format_args!("\\underbrace{{{p1}}}_{{{p2}}}"))?
         }
         "color" => {
             let c1 = buf.get("color1").and_then(|x| x.as_str()).unwrap_or("");
-            let c2 = arr_inner(buf, "color2", budget)?;
-            format!("{{\\color{{{c1}}}{{{c2}}}}}")
+            let c2 = arr_inner(buf, "color2", budget, resources)?;
+            resources.format(format_args!("{{\\color{{{c1}}}{{{c2}}}}}"))?
         }
         "color0" => {
             let c = buf.get("color").and_then(|x| x.as_str()).unwrap_or("");
-            format!("\\color{{{c}}}")
+            resources.format(format_args!("\\color{{{c}}}"))?
         }
         "arrow" => {
-            let rd = arr_inner(buf, "rd", budget)?;
-            let rq = arr_inner(buf, "rq", budget)?;
+            let rd = arr_inner(buf, "rd", budget, resources)?;
+            let rq = arr_inner(buf, "rq", budget, resources)?;
             let r = buf.get("r").and_then(|x| x.as_str()).unwrap_or("");
-            let mut arrow = format!("\\x{}", get_arrow(r)?);
+            let mut arrow = resources.format(format_args!("\\x{}", get_arrow(r)?))?;
             if !rq.is_empty() {
-                arrow.push_str(&format!("[{{{rq}}}]"));
+                resources.append(&mut arrow, &resources.format(format_args!("[{{{rq}}}]"))?)?;
             }
             if !rd.is_empty() {
-                arrow.push_str(&format!("{{{rd}}}"));
+                resources.append(&mut arrow, &resources.format(format_args!("{{{rd}}}"))?)?;
             } else {
-                arrow.push_str("{}");
+                resources.append(&mut arrow, "{}")?;
             }
             arrow
         }
         "operator" => {
             let k = buf.get("kind_").and_then(|x| x.as_str()).unwrap_or("");
-            get_operator(k).ok_or_else(|| MhchemError::msg(format!("Unknown operator ({k})")))?
+            resources.text(get_operator(k).ok_or_else(|| MhchemError::msg("Unknown operator"))?)?
         }
         "1st-level escape" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
-            format!("{p1} ")
+            resources.format(format_args!("{p1} "))?
         }
-        "space" => " ".to_string(),
-        "entitySkip" => "~".to_string(),
-        "pu-space-1" => "~".to_string(),
-        "pu-space-2" => "\\mkern3mu ".to_string(),
-        "1000 separator" => "\\mkern2mu ".to_string(),
-        "commaDecimal" => "{,}".to_string(),
+        "space" => resources.text(" ")?,
+        "entitySkip" => resources.text("~")?,
+        "pu-space-1" => resources.text("~")?,
+        "pu-space-2" => resources.text("\\mkern3mu ")?,
+        "1000 separator" => resources.text("\\mkern2mu ")?,
+        "commaDecimal" => resources.text("{,}")?,
         "comma enumeration L" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
-            format!("{{{p1}}}\\mkern6mu ")
+            resources.format(format_args!("{{{p1}}}\\mkern6mu "))?
         }
         "comma enumeration M" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
-            format!("{{{p1}}}\\mkern3mu ")
+            resources.format(format_args!("{{{p1}}}\\mkern3mu "))?
         }
         "comma enumeration S" => {
             let p1 = buf.get("p1").and_then(|x| x.as_str()).unwrap_or("");
-            format!("{{{p1}}}\\mkern1mu ")
+            resources.format(format_args!("{{{p1}}}\\mkern1mu "))?
         }
-        "hyphen" => "\\text{-}".to_string(),
-        "addition compound" => "\\,{\\cdot}\\,".to_string(),
-        "electron dot" => "\\mkern1mu \\bullet\\mkern1mu ".to_string(),
-        "KV x" => "{\\times}".to_string(),
-        "prime" => "\\prime ".to_string(),
-        "cdot" => "\\cdot ".to_string(),
-        "tight cdot" => "\\mkern1mu{\\cdot}\\mkern1mu ".to_string(),
-        "times" => "\\times ".to_string(),
-        "circa" => "{\\sim}".to_string(),
-        "^" => "\\uparrow ".to_string(),
-        "v" => "\\downarrow ".to_string(),
-        "ellipsis" => "\\ldots ".to_string(),
-        "/" => "/".to_string(),
-        " / " => "\\,/\\,".to_string(),
+        "hyphen" => resources.text("\\text{-}")?,
+        "addition compound" => resources.text("\\,{\\cdot}\\,")?,
+        "electron dot" => resources.text("\\mkern1mu \\bullet\\mkern1mu ")?,
+        "KV x" => resources.text("{\\times}")?,
+        "prime" => resources.text("\\prime ")?,
+        "cdot" => resources.text("\\cdot ")?,
+        "tight cdot" => resources.text("\\mkern1mu{\\cdot}\\mkern1mu ")?,
+        "times" => resources.text("\\times ")?,
+        "circa" => resources.text("{\\sim}")?,
+        "^" => resources.text("\\uparrow ")?,
+        "v" => resources.text("\\downarrow ")?,
+        "ellipsis" => resources.text("\\ldots ")?,
+        "/" => resources.text("/")?,
+        " / " => resources.text("\\,/\\,")?,
         t => {
-            return Err(MhchemError::msg(format!("texify: unknown type ({t})")));
+            return Err(MhchemError::msg(format!("texify: unknown type ({t:.64})")));
         }
     })
 }
@@ -293,7 +334,7 @@ fn get_arrow(a: &str) -> MhchemResult<&'static str> {
         "<=>" | "\u{21cc}" => "rightleftharpoons",
         "<=>>" => "rightequilibrium",
         "<<=>" => "leftequilibrium",
-        _ => return Err(MhchemError::msg(format!("unknown arrow {a:?}"))),
+        _ => return Err(MhchemError::msg(format!("unknown arrow {a:.64}"))),
     })
 }
 
@@ -321,19 +362,19 @@ fn get_bond(a: &str) -> Option<&'static str> {
     })
 }
 
-fn get_operator(a: &str) -> Option<String> {
+fn get_operator(a: &str) -> Option<&'static str> {
     Some(match a {
-        "+" => " {}+{} ".to_string(),
-        "-" => " {}-{} ".to_string(),
-        "=" => " {}={} ".to_string(),
-        "<" => " {}<{} ".to_string(),
-        ">" => " {}>{} ".to_string(),
-        "<<" => " {}\\ll{} ".to_string(),
-        ">>" => " {}\\gg{} ".to_string(),
-        "\\pm" => " {}\\pm{} ".to_string(),
-        "\\approx" | "$\\approx$" => " {}\\approx{} ".to_string(),
-        "v" | "(v)" => " \\downarrow{} ".to_string(),
-        "^" | "(^)" => " \\uparrow{} ".to_string(),
+        "+" => " {}+{} ",
+        "-" => " {}-{} ",
+        "=" => " {}={} ",
+        "<" => " {}<{} ",
+        ">" => " {}>{} ",
+        "<<" => " {}\\ll{} ",
+        ">>" => " {}\\gg{} ",
+        "\\pm" => " {}\\pm{} ",
+        "\\approx" | "$\\approx$" => " {}\\approx{} ",
+        "v" | "(v)" => " \\downarrow{} ",
+        "^" | "(^)" => " \\uparrow{} ",
         _ => return None,
     })
 }
