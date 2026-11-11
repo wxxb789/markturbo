@@ -5,6 +5,11 @@ use nsh_testing::Headless;
 
 #[test]
 fn untitled_draft_is_checkpointed() {
+    if !cfg!(windows) {
+        // DPAPI is the production protector; non-Windows builds intentionally
+        // have no plaintext recovery fallback.
+        return;
+    }
     let config = tempfile::tempdir().expect("config dir");
 
     // SAFETY: this binary has one test.
