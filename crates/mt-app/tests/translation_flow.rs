@@ -92,20 +92,23 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     }
     app.press("text:Translate")
         .expect("start another translation");
+    app.wait_for("text:Waiting for model request approval…")
+        .expect("second translation is pending");
     app.press("text:other.md").expect("open another tab");
     app.wait_for("text:Other").expect("other document");
     app.type_text("label:Markdown source", "\nUnsaved edit.")
         .expect("dirty the other tab");
+    app.press("text:plan.md >> nth=0")
+        .expect("return to the translation target");
+    app.wait_for("label:Markdown source")
+        .expect("translation target editor");
     app.answer_dialogs_myself();
     app.press("text:Quit").expect("request quit");
     assert!(app.pending_dialog().is_some(), "Quit must await a decision");
 
     release_response.send(()).expect("release translation");
-    app.wait_for_within(
-        "text:Translated 1 segment(s) into zh.",
-        Duration::from_secs(20),
-    )
-    .expect("translation completes while Quit is pending");
+    app.wait_for_within("text:你好，再见", Duration::from_secs(20))
+        .expect("second translation applies while Quit is pending");
     assert!(app.pending_dialog().is_some(), "Quit must still be pending");
     app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
         .expect("save all and quit");
