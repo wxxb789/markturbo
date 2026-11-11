@@ -11,12 +11,14 @@ The current user, product promise, capability roles, data policy, and success
 thresholds are defined in the owner-approved [Product Contract](PRODUCT.md).
 
 > **Native Shell migration in progress (2026-11-11).** Ported: workspace open,
-> source editor, native and Web preview, Save/Save As/close protection, encrypted
-> recovery checkpoints and startup restore, explorer/content search, Welcome and
-> bundled sample, Review with consent, Effective Agent Context selection with
-> Revision approval, explicit Web-script trust, settings and session/secure
-> credentials, theme/i18n, and Windows packaging. Pending: Translation, native
-> acceptance on the nsh backends, and macOS/Linux clean-machine evidence.
+> source editor, native and Web preview, Save/Save As, tab-close protection and a
+> guarded in-app Quit, encrypted recovery checkpoints and startup restore,
+> explorer/content search, Welcome and bundled sample, Review with consent,
+> Effective Agent Context selection with Revision approval, explicit Web-script
+> trust, document Translation with consent, settings, session/secure credentials,
+> and Windows packaging. Pending: cancellable native window close, complete UI
+> localization and application keyboard shortcuts (Goal 09), native acceptance on
+> the nsh backends, and macOS/Linux clean-machine evidence.
 
 Built with Rust and [Native Shell (nsh)](https://nsh.dev) 0.4, drawn by each
 desktop's native backend: Win32/Direct2D on Windows, AppKit on macOS and GTK 4
@@ -158,7 +160,7 @@ the base URL at it:
 | OpenAI Responses | `/v1/responses` | `OPENAI_API_KEY` |
 
 Configure the provider, credential, model, base URL, and target language in
-Settings (`Ctrl/Cmd+,`). Persistent credentials use Windows Credential Manager;
+Settings. Persistent credentials use Windows Credential Manager;
 session credentials remain in memory. Either outranks the environment. Vendor
 environment keys apply automatically only to the vendor's default endpoint, and
 a custom endpoint requires explicit authorization for that exact identity. With
@@ -221,22 +223,9 @@ implicit, and no trust level lets a document markturbo renders reach the network
 
 ## Keyboard
 
-| Key | Action |
-|---|---|
-| `Ctrl/Cmd+O` | Open folder |
-| `Ctrl/Cmd+S` | Save |
-| `Ctrl/Cmd+W` | Close tab |
-| `Ctrl/Cmd+,` | Settings |
-| `Ctrl/Cmd+F` | Find in editor |
-| `Ctrl/Cmd+Shift+F` | Search the workspace |
-| `Ctrl/Cmd+Z` / `Ctrl+Y` | Undo / redo |
-| `Ctrl/Cmd+B` | Side panel |
-| `Ctrl/Cmd+Alt+B` | Details panel |
-| `Alt+Left` / `Ctrl+Alt+-` | Back |
-| `Alt+Right` / `Ctrl+Alt+Shift+-` | Forward |
-| `Ctrl/Cmd+Shift+T` | Translate document |
-| `Ctrl/Cmd+Shift+L` | Translate selection |
-| `Ctrl/Cmd+Shift+B` | Translate block at cursor |
+The nsh shell currently keeps editor-native shortcuts (find, undo/redo, and text
+editing). Application-level shortcuts from the retired GPUI shell have not been
+re-registered yet; restoring and testing them is Goal 09 work.
 
 ## Tests
 

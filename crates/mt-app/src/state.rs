@@ -14,6 +14,7 @@ use std::{
 };
 
 use mt_core::{
+    Document,
     agent_artifacts::{
         context::{CODEX_PROFILE_ID, ContextInput, ProjectTrust, ResolvedContext, resolve},
         instruction::{self, Instruction},
@@ -34,6 +35,10 @@ use mt_core::{
         revision::{ChangeId, RevisionProposal},
     },
     settings::{Language, RecentTarget, RecentTargetKind, SettingsData, ThemePreference},
+    translate::{
+        Scope, TranslationRequest,
+        provider::{PreparedTranslation, PreparedTranslationRequest},
+    },
     workspace::{
         search::{self, Query},
         tree::{self, FileNode},
@@ -110,6 +115,7 @@ pub struct AppState {
     pub review_consent: Signal<Option<SharedString>>,
     pub review_view: Signal<Option<ReviewView>>,
     pub review_busy: Signal<bool>,
+    pub translation_busy: Signal<bool>,
     pub revision_questions: Signal<Vec<RevisionQuestionView>>,
     pub revision_consent: Signal<Option<SharedString>>,
     pub revision_hunks: Signal<Vec<RevisionHunkView>>,
@@ -118,11 +124,13 @@ pub struct AppState {
     owner: Owner,
     vault: CredentialVault,
     pending_review: Rc<RefCell<Option<PreparedDocumentReviewRequest>>>,
+    review_origin: Rc<RefCell<Option<ReviewOrigin>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
     pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
     revision_proposal: Rc<RefCell<Option<RevisionProposal>>>,
     recovery: Option<Rc<RecoveryStore>>,
     recovery_tracks: Rc<RefCell<HashMap<u64, RecoveryTrack>>>,
+    quit_discarded: Rc<Cell<bool>>,
     next_id: Rc<Cell<u64>>,
 }
 
@@ -154,9 +162,18 @@ pub struct RevisionHunkView {
 
 /// Immutable inputs retained after a successful Review for a later Revision.
 struct RevisionContext {
+    tab_id: u64,
+    snapshot: SourceSnapshot,
     request: ReviewRequest,
     output: ReviewModelOutput,
     language: ReviewLanguage,
+}
+
+/// The tab and source state a prepared Review belongs to.
+#[derive(Clone, Copy)]
+struct ReviewOrigin {
+    tab_id: u64,
+    snapshot: SourceSnapshot,
 }
 
 /// A Review result reduced to the strings the panel shows.
@@ -236,6 +253,7 @@ impl AppState {
             review_consent: signal(None),
             review_view: signal(None),
             review_busy: signal(false),
+            translation_busy: signal(false),
             revision_questions: signal(Vec::new()),
             revision_consent: signal(None),
             revision_hunks: signal(Vec::new()),
@@ -243,11 +261,13 @@ impl AppState {
             revision_busy: signal(false),
             vault: CredentialVault::production(),
             pending_review: Rc::new(RefCell::new(None)),
+            review_origin: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
             pending_revision: Rc::new(RefCell::new(None)),
             revision_proposal: Rc::new(RefCell::new(None)),
             recovery,
             recovery_tracks: Rc::new(RefCell::new(HashMap::new())),
+            quit_discarded: Rc::new(Cell::new(false)),
             next_id: Rc::new(Cell::new(1)),
         }
     }
@@ -554,6 +574,42 @@ impl AppState {
             self.status.set(SharedString::from(format!(
                 "Recovery checkpoint failed: {error}"
             )));
+        }
+    }
+
+    /// Best-effort checkpoint of every dirty buffer before the guarded quit
+    /// dialog. This is not a substitute for the Save / Discard / Cancel
+    /// decision; it only keeps the latest text recoverable if the dialog or
+    /// save path fails.
+    fn checkpoint_dirty_now(&self) {
+        if self.quit_discarded.get() {
+            return;
+        }
+        let Some(store) = self.recovery.as_ref() else {
+            return;
+        };
+        let tabs: Vec<Tab> = self
+            .tabs
+            .get()
+            .iter()
+            .filter(|tab| tab.dirty.get())
+            .cloned()
+            .collect();
+        if tabs.is_empty() {
+            return;
+        }
+        let active_keys: HashSet<RecoveryKey> = tabs
+            .iter()
+            .map(|tab| RecoveryKey::for_path(&tab.path))
+            .collect();
+        for tab in tabs {
+            let checkpoint = RecoveryCheckpoint {
+                key: RecoveryKey::for_path(&tab.path),
+                text: tab.text.get().to_string(),
+                metadata: RecoveryMetadata::from_loaded_file(&tab.loaded.borrow()),
+                revision: None,
+            };
+            let _ = store.checkpoint(&checkpoint, &active_keys);
         }
     }
 
@@ -910,27 +966,226 @@ impl AppState {
         let Some(tab) = self.active_tab() else {
             return;
         };
+        self.save_tab(tab.id);
+    }
+
+    fn save_tab(&self, id: u64) -> bool {
+        let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() else {
+            return false;
+        };
         let text = tab.text.get().to_string();
-        match io::save(&tab.loaded.borrow(), &text, false) {
-            Ok(_) => {
+        let saved = {
+            let loaded = tab.loaded.borrow();
+            io::save(&loaded, &text, false)
+        };
+        match saved {
+            Ok(stamp) => {
+                tab.loaded.borrow_mut().stamp = stamp;
                 tab.dirty.set(false);
                 tab.conflict.set(false);
                 self.retire_recovery(&tab.path);
                 self.recovery_tracks.borrow_mut().remove(&tab.id);
                 self.status
                     .set(SharedString::from(format!("Saved {}", tab.path.display())));
+                true
             }
             Err(SaveError::Conflict) => {
                 tab.conflict.set(true);
                 self.status.set(SharedString::from(
                     "Save refused: the file changed on disk. Reload, overwrite, or save as a new file.",
                 ));
+                false
             }
             Err(error) => {
                 self.status
                     .set(SharedString::from(format!("Save failed: {error:?}")));
+                false
             }
         }
+    }
+
+    /// Ask before discarding every dirty buffer, then close the window. This
+    /// is the guarded close path available inside the app; the platform title
+    /// bar and Alt+F4 still have no cancellable close event in nsh 0.4, so the
+    /// periodic checkpoint remains the only recovery protection on that path.
+    /// A dirty buffer is checkpointed before the dialog as a best-effort extra
+    /// guard against a failed save or dialog.
+    pub fn request_quit(&self) {
+        let dirty: Vec<u64> = self
+            .tabs
+            .get()
+            .iter()
+            .filter(|tab| tab.dirty.get())
+            .map(|tab| tab.id)
+            .collect();
+        if dirty.is_empty() {
+            nsh_core::element::desktop::close_window();
+            return;
+        }
+        self.checkpoint_dirty_now();
+
+        let state = self.clone();
+        self.spawn_task(async move {
+            let answer = alert_dialog()
+                .title("Quit MarkTurbo?")
+                .description("Some documents have unsaved changes.")
+                .action("save", "Save all")
+                .destructive("discard", "Discard all")
+                .cancel("cancel", "Cancel")
+                .show()
+                .await;
+            match answer {
+                Ok(answer) if answer.action.as_deref() == Some("save") => {
+                    for &id in &dirty {
+                        if !state.save_tab(id) {
+                            state.status.set(SharedString::from(
+                                "Quit cancelled: a document could not be saved.",
+                            ));
+                            return;
+                        }
+                    }
+                    nsh_core::element::desktop::close_window();
+                }
+                Ok(answer) if answer.action.as_deref() == Some("discard") => {
+                    state.quit_discarded.set(true);
+                    for id in &dirty {
+                        if let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == *id) {
+                            state.retire_recovery(&tab.path);
+                        }
+                    }
+                    nsh_core::element::desktop::close_window();
+                }
+                Ok(_) => {}
+                Err(error) => state
+                    .status
+                    .set(SharedString::from(format!("Quit dialog failed: {error}"))),
+            }
+        });
+    }
+
+    /// Translate the active document through the consent-bound provider path.
+    /// The editor text is replaced only if the originating tab and source
+    /// revision still match after the response returns.
+    pub fn translate_active(&self) {
+        if self.translation_busy.get() {
+            return;
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let origin = ReviewOrigin {
+            tab_id: tab.id,
+            snapshot: SourceSnapshot::new(tab.revision.get(), 0),
+        };
+        let source = Document::new(Some(tab.path.clone()), tab.text.get().to_string());
+        let request = TranslationRequest::prepare(&source, &Scope::Document);
+        if request.inputs().is_empty() {
+            self.status
+                .set(SharedString::from("No translatable text in this document."));
+            return;
+        }
+
+        let settings = self.settings.get();
+        let language = settings.language;
+        let target = if settings.translate_to.trim().is_empty() {
+            "zh".to_owned()
+        } else {
+            settings.translate_to.trim().to_owned()
+        };
+        let prepared = match PreparedTranslation::from_settings(&settings, &self.vault) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.status.set(SharedString::from(format!(
+                    "Translation unavailable: {error}"
+                )));
+                return;
+            }
+        };
+        let prepared: PreparedTranslationRequest = prepared.bind_request(request);
+        let disclosure = prepared.disclosure().clone();
+        let description = crate::i18n::model_request_disclosure(language, &disclosure);
+        let state = self.clone();
+        self.spawn_task(async move {
+            let answer = alert_dialog()
+                .title(crate::i18n::t(language, crate::i18n::Key::Translate).to_owned())
+                .description(description)
+                .action(
+                    "translate",
+                    crate::i18n::t(language, crate::i18n::Key::SendToModel).to_owned(),
+                )
+                .cancel(
+                    "cancel",
+                    crate::i18n::t(language, crate::i18n::Key::Cancel).to_owned(),
+                )
+                .show()
+                .await;
+            if !answer.is_ok_and(|answer| answer.action.as_deref() == Some("translate")) {
+                return;
+            }
+
+            let mut consent =
+                ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+            let authorization = match prepared.authorize(&mut consent) {
+                Ok(authorization) => authorization,
+                Err(error) => {
+                    state.status.set(SharedString::from(format!(
+                        "Translation unavailable: {error}"
+                    )));
+                    return;
+                }
+            };
+            state.translation_busy.set(true);
+            state.status.set(SharedString::from(
+                crate::i18n::t(language, crate::i18n::Key::ModelRequestWaiting).to_owned(),
+            ));
+            let target_for_request = target.clone();
+            let result =
+                blocking(move || prepared.execute(authorization, &target_for_request)).await;
+            state.translation_busy.set(false);
+            match result {
+                Ok(Ok(translation)) => {
+                    let translated = translation.text;
+                    let segments = translation
+                        .segments
+                        .iter()
+                        .filter(|segment| segment.translatable)
+                        .count();
+                    let Some(tab) = state
+                        .tabs
+                        .get()
+                        .iter()
+                        .find(|tab| tab.id == origin.tab_id)
+                        .cloned()
+                    else {
+                        state.status.set(SharedString::from(
+                            crate::i18n::t(language, crate::i18n::Key::ModelRequestDocumentClosed)
+                                .to_owned(),
+                        ));
+                        return;
+                    };
+                    if origin.snapshot.revision != tab.revision.get() {
+                        state.status.set(SharedString::from(
+                            crate::i18n::t(language, crate::i18n::Key::ModelRequestDocumentChanged)
+                                .to_owned(),
+                        ));
+                        return;
+                    }
+                    tab.text.set(SharedString::from(translated));
+                    tab.dirty.set(true);
+                    tab.revision.update(|revision| *revision += 1);
+                    state.note_edit(tab.id);
+                    state.status.set(SharedString::from(format!(
+                        "Translated {segments} segment(s) into {target}."
+                    )));
+                }
+                Ok(Err(error)) => state
+                    .status
+                    .set(SharedString::from(format!("Translation failed: {error}"))),
+                Err(error) => state.status.set(SharedString::from(format!(
+                    "Translation task failed: {error}"
+                ))),
+            }
+        });
     }
 
     /// Prepare one Review: bind the frozen document request, resolve the
@@ -940,9 +1195,14 @@ impl AppState {
         let Some(tab) = self.active_tab() else {
             return;
         };
+        let origin = ReviewOrigin {
+            tab_id: tab.id,
+            snapshot: SourceSnapshot::new(tab.revision.get(), 0),
+        };
         self.context_open.set(false);
         self.review_view.set(None);
         self.review_consent.set(None);
+        *self.review_origin.borrow_mut() = None;
         self.reset_revision();
 
         let settings = self.settings.get();
@@ -1015,6 +1275,7 @@ impl AppState {
         let disclosure =
             crate::i18n::model_request_disclosure(settings.language, bound.disclosure());
         *self.pending_review.borrow_mut() = Some(bound);
+        *self.review_origin.borrow_mut() = Some(origin);
         self.review_consent
             .set(Some(SharedString::from(disclosure)));
         self.review_open.set(true);
@@ -1024,6 +1285,9 @@ impl AppState {
     /// disclosure the user just saw.
     pub fn send_review(&self) {
         let Some(bound) = self.pending_review.borrow_mut().take() else {
+            return;
+        };
+        let Some(origin) = self.review_origin.borrow_mut().take() else {
             return;
         };
         let revision_request = bound.request().clone();
@@ -1044,7 +1308,10 @@ impl AppState {
         self.review_busy.set(true);
         let state = self.clone();
         let revision = self
-            .active_tab()
+            .tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == origin.tab_id)
             .map(|tab| tab.revision)
             .unwrap_or_else(|| signal(0));
         self.spawn_task(async move {
@@ -1054,7 +1321,12 @@ impl AppState {
                 Ok(Ok(transport)) => {
                     let stale = transport.result.snapshot.revision != revision.get();
                     if let Some(output) = transport.result.output.clone() {
-                        state.set_revision_context(revision_request, output, revision_language);
+                        state.set_revision_context(
+                            origin,
+                            revision_request,
+                            output,
+                            revision_language,
+                        );
                     }
                     ReviewView::from_result(&transport.result, stale)
                 }
@@ -1071,6 +1343,7 @@ impl AppState {
 
     fn set_revision_context(
         &self,
+        origin: ReviewOrigin,
         request: ReviewRequest,
         output: ReviewModelOutput,
         language: ReviewLanguage,
@@ -1087,6 +1360,8 @@ impl AppState {
             })
             .collect();
         *self.revision_context.borrow_mut() = Some(RevisionContext {
+            tab_id: origin.tab_id,
+            snapshot: origin.snapshot,
             request,
             output,
             language,
@@ -1248,12 +1523,24 @@ impl AppState {
         let Some(proposal) = self.revision_proposal.borrow().clone() else {
             return;
         };
+        let Some((tab_id, snapshot)) = self
+            .revision_context
+            .borrow()
+            .as_ref()
+            .map(|context| (context.tab_id, context.snapshot))
+        else {
+            self.revision_status.set(Some(SharedString::from(
+                "Run Review first to prepare a Revision.",
+            )));
+            return;
+        };
         let Some(tab) = self.active_tab() else {
             return;
         };
-        if proposal.source() != tab.text.get().as_str() {
+        let current_snapshot = SourceSnapshot::new(tab.revision.get(), 0);
+        if tab.id != tab_id || !snapshot.matches(current_snapshot) {
             self.revision_status.set(Some(SharedString::from(
-                "The document changed since Review. Run Review again before applying.",
+                "This Revision belongs to another document or source state. Run Review again before applying.",
             )));
             return;
         }
@@ -1262,7 +1549,7 @@ impl AppState {
             decisions.insert(ChangeId(hunk.change_id), hunk.accepted.get());
         }
         let decisions: Vec<_> = decisions.into_iter().collect();
-        let text = match proposal.compose(&decisions) {
+        let text = match proposal.compose_against(&tab.text.get(), current_snapshot, &decisions) {
             Ok(text) => text,
             Err(error) => {
                 self.revision_status.set(Some(SharedString::from(format!(
@@ -1290,6 +1577,7 @@ impl AppState {
     /// Withdraw the prepared request before it is sent.
     pub fn cancel_review(&self) {
         self.pending_review.borrow_mut().take();
+        self.review_origin.borrow_mut().take();
         self.review_consent.set(None);
         self.review_busy.set(false);
     }
