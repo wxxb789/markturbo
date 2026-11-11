@@ -9,32 +9,28 @@ names Windows 11 x64 as the only first public-quality platform.
 
 | Platform | App | Native rendering | Editor | WebView | Release status |
 |---|---|---|---|---|---|
-| Windows 11 (x64) | Yes | Yes | Yes | Yes | **Only public-quality and CD target** |
-| macOS | Compatibility build | Yes | Yes | Yes | No CD asset |
-| Linux (X11 + Wayland) | Compatibility build | Yes | Yes | No | No CD asset |
-| FreeBSD | Best effort | Yes | Yes | No | Untested |
+| Windows 11 (x64) | Yes (nsh Win32) | Yes | Yes | Yes | **Only public-quality target** |
+| macOS 14+ | Yes (nsh AppKit) | Yes | Yes | Yes | Compatibility build |
+| Linux | Yes (nsh GTK 4.14+) | Yes | Yes | Yes (WebKitGTK 6.0) | Compatibility build |
 | WebAssembly | No | - | - | - | Out of scope |
 
-Windows 11 x64 is the only platform with a public release contract. The release
-workflow publishes one raw `markturbo-windows-x64.exe`, with the required fonts
-and bundled sample embedded. Other platforms remain useful for compile and
-compatibility coverage, not downloadable product artifacts. The Windows
+Windows 11 x64 is the only platform with a public release contract. The app is
+built and packaged by `nsh package --target windows|macos|linux` from
+`crates/mt-app`; the executable and `nsh/` assets form the distributable. The
+release workflow's single-file Windows asset is pending migration to this
+packaging output. Other platforms remain useful for compile and compatibility
+coverage until their own clean-machine acceptance runs. The Windows
 installer and release-channel signing belong to Goal 10. A downloadable macOS
 `.app` with Developer ID signing and notarization remains deferred in
 [TODO](TODO.md).
 
 ### macOS arm64 PR compatibility check
 
-The pull-request workflow has a dedicated `macos-15` arm64 job. It checks the
-runner architecture, builds the locked `mt-app` release executable, stages a
-copy in a temporary directory, verifies its Mach-O arm64 slice and existing
-code signature, prints linked libraries, and launches that unchanged copy with
-the content-free startup trace enabled. The check passes only
-when the process emits a `markturbo-startup-v1` `first_frame_painted` event
-with the job's nonce and process ID within 120 seconds and remains alive for
-two seconds afterward. A launch failure, exit during that window (including a
-missing dynamic library), window startup failure, or timeout fails the job;
-content-free milestones and captured stdout/stderr are printed when available.
+The pull-request workflow has a dedicated `macos-15` arm64 job. It builds the
+locked `mt-app` release executable and runs the nsh headless acceptance suite
+(`cargo test -p mt-app`), then verifies the Mach-O arm64 slice. The old
+GPUI startup-trace launch check was removed with the GPUI shell; a native
+first-frame check on the nsh backend remains a pending acceptance step.
 
 This is evidence only that a source-built executable reached its own
 first-frame milestone on the hosted CI runner. It is not a screenshot or a
@@ -96,6 +92,12 @@ failure from the CI check; they do not by themselves establish its cause. A
 quarantined download can also fail Gatekeeper even when the Mach-O signature
 verifies; do not treat `codesign --verify` as a notarization check.
 
+> **Migration note:** everything below this line describes the retired GPUI
+> shell. The current app is an nsh Rust app in `crates/mt-app`; run it with
+> `nsh run crates/mt-app` (or `cargo run -p mt-app`) and package it with
+> `nsh package --target windows|macos|linux`. The GPUI runtime, Wry host and
+> per-platform GPUI dependency notes below are historical.
+
 ## Where the support comes from
 
 The `Cargo.lock`-selected `gpui-pre-platform` 0.3.6 selects a backend per
@@ -119,7 +121,7 @@ The stable platform identifier is `io.github.wxxb789.markturbo`.
   raw-executable build does not apply either or produce a `.app` bundle.
 
 All platform icon forms are derived from
-`crates/mt-app/resources/icons/markturbo.png`; run
+`crates/mt-app/icon.png`; run
 `uv run --project scripts scripts/mt.py icons` after replacing that 1024 px master.
 
 **gpui-wry** (the WebView) states in its own README:

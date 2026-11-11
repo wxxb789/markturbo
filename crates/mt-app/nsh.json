@@ -1,0 +1,11 @@
+{
+  "name": "MarkTurbo",
+  "id": "com.markturbo.app",
+  "version": "0.1.4-alpha.2",
+  "build": 1,
+  "rust": ".",
+  "root": "App",
+  "appearance": "system",
+  "theme": "theme.json",
+  "icon": "icon.png"
+}

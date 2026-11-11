@@ -55,15 +55,9 @@ impl Buffer {
         slot.as_ref().is_none_or(|s| s.is_empty())
     }
 
-    /// Assigns `v` to the slot, reusing existing [`String`] capacity when possible.
+    /// Moves `v` into the slot without duplicating its text.
     pub fn set_slot(slot: &mut Option<String>, v: String) {
-        match slot {
-            Some(s) => {
-                s.clear();
-                s.push_str(&v);
-            }
-            None => *slot = Some(v),
-        }
+        *slot = Some(v);
     }
 
     pub fn clear_all(&mut self) {

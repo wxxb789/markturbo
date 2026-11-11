@@ -1,6 +1,6 @@
 # vendor/ratex-parser
 
-`ratex-parser` 0.1.14 from crates.io, with one 25-line patch applied.
+`ratex-parser` 0.1.15 from crates.io, with one 25-line patch applied.
 
 ## Why this exists
 

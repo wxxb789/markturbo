@@ -10,11 +10,13 @@ mod engine;
 mod error;
 mod json;
 mod patterns;
+mod resources;
 mod texify;
 
 pub use data::data;
 pub use error::{MhchemError, MhchemResult};
 
+use crate::expansion_budget::ExpansionBudget;
 use crate::mhchem::data::MhchemData;
 use crate::stack_safety::{DepthBudget, MAX_INPUT_DEPTH};
 use serde_json::Value;
@@ -37,6 +39,7 @@ impl ParserCtx<'_> {
         RuntimeCtx {
             data: self.data,
             depth_budget: DepthBudget::new(MAX_INPUT_DEPTH),
+            resources: ExpansionBudget::default(),
         }
         .go(input, machine)
     }
@@ -47,6 +50,7 @@ impl ParserCtx<'_> {
 pub(crate) struct RuntimeCtx<'a> {
     pub(crate) data: &'a MhchemData,
     pub depth_budget: DepthBudget,
+    pub(crate) resources: ExpansionBudget,
 }
 
 impl RuntimeCtx<'_> {
@@ -65,10 +69,20 @@ pub(crate) fn chem_parse_str_with_budget(
     mode: &str,
     depth_budget: DepthBudget,
 ) -> MhchemResult<String> {
+    chem_parse_str_with_resources(input, mode, depth_budget, ExpansionBudget::default())
+}
+
+pub(crate) fn chem_parse_str_with_resources(
+    input: &str,
+    mode: &str,
+    depth_budget: DepthBudget,
+    resources: ExpansionBudget,
+) -> MhchemResult<String> {
     let d = data();
     let ctx = RuntimeCtx {
         data: d,
         depth_budget: depth_budget.clone(),
+        resources: resources.clone(),
     };
     let sm = match mode {
         "ce" => "ce",
@@ -80,7 +94,27 @@ pub(crate) fn chem_parse_str_with_budget(
         }
     };
     let ast = ctx.go(input.trim(), sm)?;
-    texify::go_with_budget(&ast, false, &depth_budget)
+    texify::go_with_budget(&ast, false, &depth_budget, &resources)
+}
+
+pub(crate) fn arg_tokens_with_resources(
+    tokens: &[ratex_lexer::token::Token],
+    resources: &ExpansionBudget,
+) -> MhchemResult<String> {
+    let Some(last) = tokens.last() else {
+        return Ok(String::new());
+    };
+    let mut expected_loc = last.loc.start;
+    let mut out = String::new();
+    for t in tokens.iter().rev() {
+        if t.loc.start > expected_loc {
+            resources.append(&mut out, " ")?;
+            expected_loc = t.loc.start;
+        }
+        resources.append(&mut out, &t.text)?;
+        expected_loc = expected_loc.saturating_add(t.text.len());
+    }
+    Ok(out)
 }
 
 /// Rebuild a macro argument string from tokens ([KaTeX `chemParse`]).
@@ -148,6 +182,7 @@ mod tests {
         let ctx = RuntimeCtx {
             data: d,
             depth_budget: DepthBudget::new(MAX_INPUT_DEPTH),
+            resources: ExpansionBudget::default(),
         };
 
         assert!(ctx.go(&nested_ce(30), "ce").is_ok());

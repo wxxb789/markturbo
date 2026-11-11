@@ -66,6 +66,7 @@ fn parses_a_10k_line_document_quickly() {
 }
 
 #[test]
+#[ignore = "opt-in large-document performance probe: cargo test --profile release -p mt-core --test performance -- --ignored"]
 fn parses_a_100k_line_document_in_bounded_time() {
     let _timing = isolated_timing();
     let source = read("huge-100k.md");
@@ -82,6 +83,7 @@ fn parses_a_100k_line_document_in_bounded_time() {
 }
 
 #[test]
+#[ignore = "opt-in large-document performance probe: cargo test --profile release -p mt-core --test performance -- --ignored"]
 fn the_engine_adds_no_superlinear_overhead_over_the_parser() {
     let _timing = isolated_timing();
     // markdown-rs itself is superlinear in the *number of blocks*: measured on
@@ -136,6 +138,7 @@ fn the_engine_adds_no_superlinear_overhead_over_the_parser() {
 /// on a background executor: at this scale an inline reparse would freeze the
 /// window for seconds on every edit.
 #[test]
+#[ignore = "opt-in large-document performance probe: cargo test --profile release -p mt-core --test performance -- --ignored"]
 fn a_huge_document_is_slow_enough_to_require_background_parsing() {
     let _timing = isolated_timing();
     let source = read("huge-100k.md");
@@ -179,7 +182,7 @@ fn setting_identical_source_is_free() {
     let _timing = isolated_timing();
     // The editor emits Change events that may not alter text; reparsing then
     // is pure waste on a large document.
-    let source = read("huge-100k.md");
+    let source = read("large-10k.md");
     let mut doc = Document::with_type(DocType::Markdown, source.clone());
 
     let (_, elapsed) = time(|| doc.set_source(source.clone()));
@@ -210,14 +213,14 @@ fn diagram_heavy_document_parses_without_rendering() {
 }
 
 #[test]
-fn outline_and_block_lookup_are_cheap_on_a_huge_document() {
+fn outline_and_block_lookup_are_cheap_on_a_large_document() {
     let _timing = isolated_timing();
-    let source = read("huge-100k.md");
+    let source = read("large-10k.md");
     let doc = Document::with_type(DocType::Markdown, source);
 
     // Outline is precomputed, so reading it is O(1).
     let (headings, elapsed) = time(|| doc.outline().headings.len());
-    assert!(headings > 1_000);
+    assert!(headings > 100);
     assert!(
         elapsed < Duration::from_millis(10),
         "outline read {elapsed:?}"

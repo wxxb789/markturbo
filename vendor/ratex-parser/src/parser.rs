@@ -5,7 +5,7 @@ use crate::error::{ParseError, ParseResult};
 use crate::functions::{self, ArgType, FunctionContext, FUNCTIONS};
 use crate::macro_expander::{MacroExpander, IMPLICIT_COMMANDS};
 use crate::parse_node::{AtomFamily, Mode, ParseNode};
-use crate::stack_safety::{validate_parse_nodes_depth, DepthBudget, MAX_INPUT_DEPTH};
+use crate::stack_safety::{validate_parse_nodes, DepthBudget, MAX_INPUT_DEPTH};
 
 /// End-of-expression tokens.
 static END_OF_EXPRESSION: &[&str] = &["}", "\\endgroup", "\\end", "\\right", "&"];
@@ -113,8 +113,7 @@ impl<'a> Parser<'a> {
                 let eof_result = self.expect("EOF", true);
                 self.gullet.end_group();
                 eof_result?;
-                validate_parse_nodes_depth(&parse, MAX_INPUT_DEPTH)
-                    .map_err(|_| ParseError::recursion_limit_exceeded())?;
+                validate_parse_nodes(&parse, MAX_INPUT_DEPTH)?;
                 Ok(parse)
             }
             Err(e) => {
@@ -535,7 +534,7 @@ impl<'a> Parser<'a> {
             }
 
             self.gullet.begin_group();
-            let result = (|| {
+            let result: ParseResult<_> = (|| {
                 let expression = if depth_already_counted {
                     self.parse_expression_impl(false, Some(group_end))?
                 } else {
@@ -967,7 +966,7 @@ impl<'a> Parser<'a> {
         }
 
         self.gullet.begin_group();
-        let result = (|| {
+        let result: ParseResult<_> = (|| {
             let expression = self.parse_expression(false, Some("EOF"))?;
             self.expect("EOF", true)?;
             Ok(expression)

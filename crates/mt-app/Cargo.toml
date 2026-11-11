@@ -1,6 +1,6 @@
 [package]
 name = "mt-app"
-description = "markturbo: a native GPUI workspace for Markdown as the human-agent interface."
+description = "markturbo: a native workspace for Markdown as the human-agent interface."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -15,56 +15,37 @@ doctest = false
 name = "markturbo"
 path = "src/main.rs"
 
-[[bin]]
-name = "markturbo-gpui-shell"
-path = "src/bin/markturbo-gpui-shell.rs"
-
 [features]
 default = ["model-transport"]
-# Goal 04 measurement apparatus. The public build keeps this default; disabling
-# it is only the compile-time upper bound for the model/network closure.
+# The public build keeps this default; disabling it is only the compile-time
+# upper bound for the model/network closure.
 model-transport = ["mt-core/model-transport"]
-profiler = ["gpui-kit/profiler"]
 
 [dependencies]
 mt-core.workspace = true
 
-anyhow.workspace = true
-dirs.workspace = true
-gpui.workspace = true
-gpui-kit.workspace = true
-log.workspace = true
-tracing.workspace = true
-encoding_rs.workspace = true
 env_logger.workspace = true
 markdown.workspace = true
+encoding_rs.workspace = true
+dirs.workspace = true
 rust-embed.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-smol.workspace = true
-tempfile.workspace = true
-toml.workspace = true
 
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-gpui-wry.workspace = true
-raw-window-handle.workspace = true
-wry.workspace = true
-
-[target.'cfg(target_os = "windows")'.dependencies]
-webview2-com.workspace = true
-windows.workspace = true
+nsh-core = "0.4.0"
+nsh-base = "0.4.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-image.workspace = true
+# `webview` links WebKitGTK 6.0; the Web pane is part of the product surface.
+nsh-platform-linux = { version = "0.4.0", default-features = false, features = ["webview"] }
 
-[build-dependencies]
-# Embeds the multi-resolution icon in the Windows PE. The crate is already in
-# the GPUI graph; naming it here makes the resource part of this binary.
-embed-resource = "3"
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.4.0", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = { version = "0.4.0", default-features = false }
 
 [dev-dependencies]
-image.workspace = true
-gpui-kit = { workspace = true, features = ["test-support"] }
 mt-core = { workspace = true, features = ["test-support"] }
+nsh-engine = "0.4.0"
+nsh-testing = "0.4.0"
+serde_json.workspace = true
 tempfile.workspace = true

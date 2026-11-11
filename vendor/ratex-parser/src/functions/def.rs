@@ -261,18 +261,13 @@ fn let_command(
     mut tok: ratex_lexer::token::Token,
     global: bool,
 ) {
-    let macro_def = ctx.parser.gullet.get_macro(&tok.text).cloned();
-    let def = match macro_def {
-        Some(d) => d,
-        None => {
-            tok.noexpand = true;
-            let unexpandable = !ctx.parser.gullet.is_expandable(&tok.text);
-            let _ = unexpandable;
-            MacroDefinition::Tokens {
-                tokens: vec![tok],
-                num_args: 0,
-            }
-        }
+    if ctx.parser.gullet.alias_macro(name, &tok.text, global) {
+        return;
+    }
+    tok.noexpand = true;
+    let def = MacroDefinition::Tokens {
+        tokens: vec![tok],
+        num_args: 0,
     };
 
     if global {

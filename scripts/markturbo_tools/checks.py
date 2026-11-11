@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import unittest
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -23,8 +27,8 @@ class CheckFailure(RuntimeError):
     """A required command could not start or returned a non-zero status."""
 
 
-# This list is intentionally not discovery-driven. Native acceptance harnesses
-# have unit tests here but their real UI scenarios need explicit `mt.py accept`.
+# This list is intentionally not discovery-driven. These tests gate ordinary
+# product and tooling changes.
 TOOLING_TESTS = (
     "scripts.tests.test_checks",
     "scripts.tests.test_privacy",
@@ -34,6 +38,13 @@ TOOLING_TESTS = (
     "scripts.tests.test_icons",
     "scripts.tests.test_perf_fixtures",
     "scripts.tests.test_recovery_capacity",
+    "scripts.tests.test_probe",
+)
+
+# Native harness unit tests describe a Windows automation path that does not run
+# on PRs and still targets the retired GPUI surface. Run them only when changing
+# the harness, not for every product change.
+NATIVE_TOOLING_TESTS = (
     "scripts.tests.test_native_goal02_evidence",
     "scripts.tests.test_native_goal02_uia",
     "scripts.tests.test_native_goal02_runtime",
@@ -43,7 +54,6 @@ TOOLING_TESTS = (
     "scripts.tests.test_native_goal07",
     "scripts.tests.test_native_goal07_provider",
     "scripts.tests.test_native_source_contract",
-    "scripts.tests.test_probe",
 )
 
 
@@ -74,8 +84,80 @@ def cargo(*args: str) -> tuple[str, ...]:
     return (executable, *args)
 
 
-def run_tooling_tests() -> None:
-    run((sys.executable, "-m", "unittest", *TOOLING_TESTS))
+def test_shards(test_ids: list[str], workers: int) -> list[list[str]]:
+    """Partition sorted IDs deterministically, one shard per worker."""
+
+    ordered = sorted(test_ids)
+    count = max(1, min(workers, len(ordered)))
+    return [ordered[index::count] for index in range(count)]
+
+
+def run_tooling_suite(modules: Iterable[str]) -> None:
+    """Run independent unittest modules in parallel shards.
+
+    The suite is a set of pure, process-isolated tests: modules do not share
+    mutable state and each test owns its temporary paths. Splitting the flattened
+    IDs keeps one slow module from serializing the whole gate.
+    """
+
+    root = str(ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    suite = unittest.defaultTestLoader.loadTestsFromNames(tuple(modules))
+
+    def ids(item: unittest.TestSuite | unittest.TestCase) -> Iterable[str]:
+        if isinstance(item, unittest.TestSuite):
+            for child in item:
+                yield from ids(child)
+        else:
+            yield item.id()
+
+    test_ids = sorted(ids(suite))
+    if not test_ids:
+        return
+    workers = min(8, os.cpu_count() or 1, len(test_ids))
+    shards = test_shards(test_ids, workers)
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="markturbo-tests-") as temporary:
+        commands: list[tuple[str, ...]] = []
+        for index, shard in enumerate(shards):
+            path = Path(temporary) / f"shard-{index}.txt"
+            path.write_text("\n".join(shard) + "\n", encoding="utf-8")
+            commands.append(
+                (sys.executable, "-m", "scripts.markturbo_tools.test_shard", str(path))
+            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    subprocess.run,
+                    command,
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                for command in commands
+            ]
+            results = [future.result() for future in futures]
+    failures = [
+        (index, result)
+        for index, result in enumerate(results)
+        if result.returncode != 0
+    ]
+    elapsed = time.perf_counter() - started
+    if failures:
+        for index, result in failures:
+            print(f"shard {index} failed:", file=sys.stderr)
+            if result.stdout:
+                print(result.stdout, file=sys.stderr)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr)
+        raise CheckFailure(f"{len(failures)} of {len(shards)} tooling test shards failed")
+    print(
+        f"tooling tests: {len(test_ids)} passed in {elapsed:.1f}s "
+        f"across {len(shards)} shards"
+    )
 
 
 def diff_range(
@@ -105,7 +187,7 @@ def check_diff(*, base: str | None = None, head: str | None = None) -> None:
 
 def fast(*, base: str | None = None, head: str | None = None) -> None:
     check_diff(base=base, head=head)
-    run_tooling_tests()
+    run_tooling_suite(TOOLING_TESTS)
 
 
 def doc(*, base: str | None = None, head: str | None = None) -> None:
@@ -125,6 +207,13 @@ def rust_checks(profile: str) -> None:
 def ci(*, base: str | None = None, head: str | None = None) -> None:
     fast(base=base, head=head)
     rust_checks("ci")
+
+
+def native(*, base: str | None = None, head: str | None = None) -> None:
+    """Native-harness unit tests only; not the native acceptance run."""
+
+    check_diff(base=base, head=head)
+    run_tooling_suite(NATIVE_TOOLING_TESTS)
 
 
 def build_release_binary() -> Path:
@@ -173,6 +262,7 @@ CHECKS = {
     "fast": fast,
     "doc": doc,
     "ci": ci,
+    "native": native,
     "full": full,
 }
 
