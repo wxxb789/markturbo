@@ -1011,14 +1011,7 @@ impl AppState {
     /// A dirty buffer is checkpointed before the dialog as a best-effort extra
     /// guard against a failed save or dialog.
     pub fn request_quit(&self) {
-        let dirty: Vec<u64> = self
-            .tabs
-            .get()
-            .iter()
-            .filter(|tab| tab.dirty.get())
-            .map(|tab| tab.id)
-            .collect();
-        if dirty.is_empty() {
+        if !self.tabs.get().iter().any(|tab| tab.dirty.get()) {
             nsh_core::element::desktop::close_window();
             return;
         }
@@ -1034,6 +1027,14 @@ impl AppState {
                 .cancel("cancel", "Cancel")
                 .show()
                 .await;
+            // Translation can dirty another tab while the dialog is open.
+            let dirty: Vec<u64> = state
+                .tabs
+                .get()
+                .iter()
+                .filter(|tab| tab.dirty.get())
+                .map(|tab| tab.id)
+                .collect();
             match answer {
                 Ok(answer) if answer.action.as_deref() == Some("save") => {
                     for &id in &dirty {

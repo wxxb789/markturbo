@@ -1,5 +1,5 @@
 //! Translation must remain reachable, disclose its outbound scope, and apply
-//! only to the source revision it was prepared from.
+//! only to the source revision it was prepared from, including during Quit.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -9,21 +9,32 @@ use nsh_engine::{EngineConfig, Root};
 use nsh_testing::{DialogAnswer, Headless};
 
 #[test]
-fn translation_requires_consent_and_updates_the_active_buffer() {
+fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialog() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (release_response, response_ready) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        let _ = read_http_body(&mut stream);
-        write_json(&mut stream, "[\"你好\"]");
+        for (request, content) in ["[\"你好\"]", "[\"你好，再见\"]"].into_iter().enumerate()
+        {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = read_http_body(&mut stream);
+            if request == 1 {
+                response_ready
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("release response during Quit");
+            }
+            write_json(&mut stream, content);
+        }
     });
 
     let dir = tempfile::tempdir().expect("temp dir");
     let config = tempfile::tempdir().expect("config dir");
     let document = dir.path().join("plan.md");
+    let other = dir.path().join("other.md");
     std::fs::write(&document, "# Hello\n").expect("write fixture");
+    std::fs::write(&other, "# Other\n").expect("write other fixture");
     let endpoint = mt_core::model::EndpointIdentity::parse(
         mt_core::model::Provider::OpenAiChat,
         Some(&base_url),
@@ -72,6 +83,37 @@ fn translation_requires_consent_and_updates_the_active_buffer() {
     app.press("text:Save").expect("save translation");
     let saved = std::fs::read_to_string(&document).expect("read saved file");
     assert!(saved.contains("你好"), "translation not saved: {saved:?}");
+
+    app.press("text:Translate")
+        .expect("start another translation");
+    app.press("text:other.md").expect("open another tab");
+    app.wait_for("text:Other").expect("other document");
+    app.type_text("label:Markdown source", "\nUnsaved edit.")
+        .expect("dirty the other tab");
+    app.answer_dialogs_myself();
+    app.press("text:Quit").expect("request quit");
+    assert!(app.pending_dialog().is_some(), "Quit must await a decision");
+
+    release_response.send(()).expect("release translation");
+    app.wait_for_within(
+        "text:Translated 1 segment(s) into zh.",
+        Duration::from_secs(20),
+    )
+    .expect("translation completes while Quit is pending");
+    assert!(app.pending_dialog().is_some(), "Quit must still be pending");
+    app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
+        .expect("save all and quit");
+
+    let saved = std::fs::read_to_string(&document).expect("read translated file");
+    assert!(
+        saved.contains("你好，再见"),
+        "Quit lost the translation received during its dialog: {saved:?}"
+    );
+    let saved = std::fs::read_to_string(&other).expect("read other file");
+    assert!(
+        saved.contains("Unsaved edit."),
+        "Quit lost the original dirty tab"
+    );
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
