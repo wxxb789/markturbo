@@ -7,11 +7,12 @@ use mt_core::{
     BlockKind, Document,
     agent_artifacts::{context::SourceOccurrence, instruction::Instruction, skill::Skill},
     rendering::{RenderOutcome, RendererRegistry},
-    settings::{RecentTarget, RecentTargetKind},
+    settings::{Language, RecentTarget, RecentTargetKind},
 };
 use nsh_base::{TextViewMath, button, editor, input, text_view, theme};
 use nsh_core::{element::ImageSrc, file_dialog::OpenDialog, prelude::*};
 
+use crate::i18n::{self, Key};
 use crate::state::{AppState, Pane, Tab, language_for_path};
 
 /// The application's root component.
@@ -37,13 +38,43 @@ pub fn App() -> impl IntoElement {
         }
     }));
     let _ticker_guard = stored(TickerGuard(ticker_alive));
+    let shell_state = state.clone();
     view()
         .flex_1()
         .flex_row()
         .bg(move || theme().background)
         .text_color(move || theme().foreground)
-        .child(sidebar(state.clone()))
-        .child(main(state))
+        .child(each(
+            move || {
+                vec![(
+                    shell_state.settings.get().language,
+                    window().width.0 < 900.0,
+                )]
+            },
+            |key: &(Language, bool)| (language_code(key.0), key.1),
+            {
+                let state = state.clone();
+                move |key: ReadSignal<(Language, bool)>, _| {
+                    let (language, compact) = key.get();
+                    shell(state.clone(), language, compact).into_element()
+                }
+            },
+        ))
+}
+
+fn language_code(language: Language) -> u8 {
+    match language {
+        Language::English => 0,
+        Language::Chinese => 1,
+    }
+}
+
+fn shell(state: AppState, language: Language, compact: bool) -> impl IntoElement {
+    view()
+        .flex_1()
+        .flex_row()
+        .child(sidebar(state.clone(), language, compact))
+        .child(main(state, language, compact))
 }
 
 /// Marks the checkpoint ticker inactive when the window's owner is disposed,
@@ -56,9 +87,9 @@ impl Drop for TickerGuard {
     }
 }
 
-fn sidebar(state: AppState) -> impl IntoElement {
+fn sidebar(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     view()
-        .w(px(260.0))
+        .w(px(if compact { 200.0 } else { 260.0 }))
         .h(relative(1.0))
         .flex_col()
         .bg(move || theme().card)
@@ -74,7 +105,7 @@ fn sidebar(state: AppState) -> impl IntoElement {
                 .border_b_1()
                 .border_color(move || theme().border)
                 .child(
-                    text("Workspace")
+                    text(i18n::t(language, Key::Workspace))
                         .text_size(px(13.0))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
@@ -88,36 +119,17 @@ fn sidebar(state: AppState) -> impl IntoElement {
                             let state = state.clone();
                             move || choose_folder(state.clone())
                         })
-                        .child(text("Open").text_size(px(12.0))),
+                        .child(text(i18n::t(language, Key::Open)).text_size(px(12.0))),
                 ),
         )
-        .child(search_row(state.clone()))
-        .child(
-            view()
-                .px_2()
-                .pb_2()
-                .flex_row()
-                .gap_1()
-                .child(small_button("Review", {
-                    let state = state.clone();
-                    move || state.start_review()
-                }))
-                .child(small_button("Context", {
-                    let state = state.clone();
-                    move || state.toggle_context()
-                }))
-                .child(small_button("Settings", {
-                    let state = state.clone();
-                    move || state.open_settings()
-                })),
-        )
+        .child(search_row(state.clone(), language))
         .child(
             scroll().flex_1().child(
                 view()
                     .flex_col()
                     .child(when(move || state.search_ran.get(), {
                         let state = state.clone();
-                        move || search_results_view(state.clone()).into_element()
+                        move || search_results_view(state.clone(), language).into_element()
                     }))
                     .child(when(move || !state.search_ran.get(), {
                         let state = state.clone();
@@ -130,14 +142,24 @@ fn sidebar(state: AppState) -> impl IntoElement {
                 .p_2()
                 .border_t_1()
                 .border_color(move || theme().border)
-                .child(small_button("Quit", {
+                .flex_col()
+                .gap_1()
+                .child(small_button(i18n::t(language, Key::AgentContext), {
+                    let state = state.clone();
+                    move || state.toggle_context()
+                }))
+                .child(small_button(i18n::t(language, Key::Settings), {
+                    let state = state.clone();
+                    move || state.open_settings()
+                }))
+                .child(small_button(i18n::t(language, Key::Quit), {
                     let state = state.clone();
                     move || state.request_quit()
                 })),
         )
 }
 
-fn search_row(state: AppState) -> impl IntoElement {
+fn search_row(state: AppState, language: Language) -> impl IntoElement {
     let change_state = state.clone();
     let submit_state = state.clone();
     let go_state = state.clone();
@@ -151,7 +173,7 @@ fn search_row(state: AppState) -> impl IntoElement {
             input()
                 .test_id("search-input")
                 .value(move || state.search_query.get())
-                .placeholder("Search files")
+                .placeholder(i18n::t(language, Key::SearchFiles))
                 .on_change(move |value: &str| change_state.search_query.set(value.to_owned()))
                 .on_submit(move |value: &str| submit_state.run_search(value))
                 .px_2()
@@ -164,10 +186,11 @@ fn search_row(state: AppState) -> impl IntoElement {
             view()
                 .flex_row()
                 .gap_1()
-                .child(small_button("Search", move || {
-                    go_state.run_search(&go_state.search_query.get())
-                }))
-                .child(small_button("Clear", {
+                .child(small_button(
+                    i18n::t(language, Key::PanelSearch),
+                    move || go_state.run_search(&go_state.search_query.get()),
+                ))
+                .child(small_button(i18n::t(language, Key::Clear), {
                     let state = state.clone();
                     move || state.clear_search()
                 })),
@@ -203,30 +226,30 @@ fn tree_view(state: AppState) -> impl IntoElement {
     )
 }
 
-fn search_results_view(state: AppState) -> impl IntoElement {
+fn search_results_view(state: AppState, language: Language) -> impl IntoElement {
     let results = state.search_results;
     view()
         .flex_col()
         .child(when(
             move || state.search_busy.get(),
-            || {
-                text("Searching…")
+            move || {
+                text(i18n::t(language, Key::Searching))
                     .text_size(px(12.0))
                     .text_color(move || theme().muted_foreground)
             },
         ))
         .child(when(
             move || state.search_truncated.get(),
-            || {
-                text("Showing the first results only.")
+            move || {
+                text(i18n::t(language, Key::ShowingFirstResults))
                     .text_size(px(11.0))
                     .text_color(move || theme().muted_foreground)
             },
         ))
         .child(when(
             move || !state.search_busy.get() && results.get().is_empty(),
-            || {
-                text("No matches.")
+            move || {
+                text(i18n::t(language, Key::NoMatches))
                     .text_size(px(12.0))
                     .text_color(move || theme().muted_foreground)
             },
@@ -251,14 +274,23 @@ fn search_results_view(state: AppState) -> impl IntoElement {
         ))
 }
 
-fn main(state: AppState) -> impl IntoElement {
+fn main(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     let state_for_settings = state.clone();
+    let state_for_toolbar = state.clone();
+    let state_for_tabs = state.clone();
     view()
         .flex_1()
         .h(relative(1.0))
         .flex_col()
-        .child(tab_bar(state.clone()))
-        .child(toolbar(state.clone()))
+        .child(header(state.clone(), language))
+        .child(when(move || !state_for_tabs.tabs.get().is_empty(), {
+            let state = state.clone();
+            move || tab_bar(state.clone()).into_element()
+        }))
+        .child(when(move || state_for_toolbar.active_tab().is_some(), {
+            let state = state.clone();
+            move || toolbar(state.clone(), language, compact).into_element()
+        }))
         .child(when(
             {
                 let state = state.clone();
@@ -266,23 +298,55 @@ fn main(state: AppState) -> impl IntoElement {
             },
             {
                 let state = state.clone();
-                move || recovery_banner(state.clone()).into_element()
+                move || recovery_banner(state.clone(), language).into_element()
             },
         ))
         .child(
             when(move || state_for_settings.settings_open.get(), {
                 let state = state.clone();
-                move || settings_page(state.clone()).into_element()
+                move || settings_page(state.clone(), language, compact).into_element()
             })
             .otherwise({
                 let state = state.clone();
-                move || document_area(state.clone()).into_element()
+                move || document_area(state.clone(), language, compact).into_element()
             }),
         )
-        .child(status_bar(state))
+        .child(status_bar(state, language))
 }
 
-fn document_area(state: AppState) -> impl IntoElement {
+fn header(state: AppState, language: Language) -> impl IntoElement {
+    let press_state = state.clone();
+    view()
+        .h(px(48.0))
+        .px_3()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .border_b_1()
+        .border_color(move || theme().border)
+        .child(
+            text("MarkTurbo")
+                .text_size(px(15.0))
+                .font_weight(FontWeight::SEMIBOLD),
+        )
+        .child(view().flex_1())
+        .child(
+            button()
+                .px_3()
+                .py_1()
+                .rounded(px(6.0))
+                .bg(move || theme().primary)
+                .disabled(move || state.active_tab().is_none())
+                .on_press(move || press_state.start_review())
+                .child(
+                    text(i18n::t(language, Key::Review))
+                        .text_size(px(12.0))
+                        .text_color(move || theme().primary_foreground),
+                ),
+        )
+}
+
+fn document_area(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     let state_for_empty = state.clone();
     let state_for_review = state.clone();
     view()
@@ -293,7 +357,7 @@ fn document_area(state: AppState) -> impl IntoElement {
                 .flex_1()
                 .child(when(move || state_for_empty.active_tab().is_none(), {
                     let state = state.clone();
-                    move || welcome(state.clone()).into_element()
+                    move || welcome(state.clone(), language, compact).into_element()
                 }))
                 .child(each(
                     {
@@ -304,14 +368,14 @@ fn document_area(state: AppState) -> impl IntoElement {
                     {
                         let state = state.clone();
                         move |tab: ReadSignal<Tab>, _| {
-                            document_surface(tab.get(), state.clone()).into_element()
+                            document_surface(tab.get(), state.clone(), language).into_element()
                         }
                     },
                 )),
         )
         .child(when(move || state_for_review.review_open.get(), {
             let state = state.clone();
-            move || review_panel(state.clone()).into_element()
+            move || review_panel(state.clone(), language, compact).into_element()
         }))
         .child(when(
             {
@@ -320,12 +384,12 @@ fn document_area(state: AppState) -> impl IntoElement {
             },
             {
                 let state = state.clone();
-                move || context_panel(state.clone()).into_element()
+                move || context_panel(state.clone(), language, compact).into_element()
             },
         ))
 }
 
-fn recovery_banner(state: AppState) -> impl IntoElement {
+fn recovery_banner(state: AppState, language: Language) -> impl IntoElement {
     let restore_state = state.clone();
     let discard_state = state.clone();
     let count_state = state.clone();
@@ -344,25 +408,28 @@ fn recovery_banner(state: AppState) -> impl IntoElement {
                 .flex_1()
                 .child(text(move || {
                     format!(
-                        "{} unsaved document(s) recovered from a previous session",
+                        "{} ({})",
+                        i18n::t(language, Key::RestoredDocuments),
                         count_state.recovery_records.get().len()
                     )
                 }))
                 .child(
-                    text("Restore keeps the original file untouched until you save.")
+                    text(i18n::t(language, Key::RestoreKeepsSource))
                         .text_size(px(11.0))
                         .text_color(move || theme().muted_foreground),
                 ),
         )
-        .child(small_button("Restore all", move || {
-            restore_state.restore_all_recovered()
-        }))
-        .child(small_button("Discard all", move || {
-            discard_state.discard_all_recovered()
-        }))
+        .child(small_button(
+            i18n::t(language, Key::RestoreAll),
+            move || restore_state.restore_all_recovered(),
+        ))
+        .child(small_button(
+            i18n::t(language, Key::DiscardAll),
+            move || discard_state.discard_all_recovered(),
+        ))
 }
 
-fn context_panel(state: AppState) -> impl IntoElement {
+fn context_panel(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     let close_state = state.clone();
     let refresh_state = state.clone();
     let review_state = state.clone();
@@ -370,7 +437,7 @@ fn context_panel(state: AppState) -> impl IntoElement {
     let rows_state = state.clone();
     let error_state = state.clone();
     view()
-        .w(px(420.0))
+        .w(px(if compact { 320.0 } else { 420.0 }))
         .h(relative(1.0))
         .flex_col()
         .bg(move || theme().card)
@@ -386,15 +453,17 @@ fn context_panel(state: AppState) -> impl IntoElement {
                 .border_b_1()
                 .border_color(move || theme().border)
                 .child(
-                    text("Effective Agent Context")
+                    text(i18n::t(language, Key::EffectiveAgentContext))
                         .text_size(px(13.0))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
                 .child(view().flex_1())
-                .child(small_button("Refresh", move || {
+                .child(small_button(i18n::t(language, Key::Refresh), move || {
                     refresh_state.refresh_context()
                 }))
-                .child(small_button("Close", move || close_state.close_context())),
+                .child(small_button(i18n::t(language, Key::Close), move || {
+                    close_state.close_context()
+                })),
         )
         .child(
             scroll()
@@ -408,7 +477,7 @@ fn context_panel(state: AppState) -> impl IntoElement {
                         move || state.context_busy.get()
                     },
                     move || {
-                        text("Resolving instructions...")
+                        text(i18n::t(language, Key::ResolvingInstructions))
                             .text_size(px(12.0))
                             .text_color(move || theme().muted_foreground)
                     },
@@ -478,7 +547,7 @@ fn context_panel(state: AppState) -> impl IntoElement {
                                             .text_size(px(11.0)),
                                     )
                                     .child(view().flex_1())
-                                    .child(small_button("Open", move || {
+                                    .child(small_button(i18n::t(language, Key::Open), move || {
                                         open_state.open_file(path.clone())
                                     })),
                             )
@@ -525,9 +594,15 @@ fn context_panel(state: AppState) -> impl IntoElement {
                     },
                 ))
                 .child(
-                    text(move || format!("Skills ({})", count_state.harness_skills.get().len()))
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::SEMIBOLD),
+                    text(move || {
+                        format!(
+                            "{} ({})",
+                            i18n::t(language, Key::SectionSkills),
+                            count_state.harness_skills.get().len()
+                        )
+                    })
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::SEMIBOLD),
                 )
                 .child(each(
                     {
@@ -556,7 +631,8 @@ fn context_panel(state: AppState) -> impl IntoElement {
                 .child(
                     text(move || {
                         format!(
-                            "Instruction files ({})",
+                            "{} ({})",
+                            i18n::t(language, Key::Instructions),
                             count_state.harness_instructions.get().len()
                         )
                     })
@@ -601,9 +677,15 @@ fn context_panel(state: AppState) -> impl IntoElement {
                     },
                     |assumption: &String| format!("assumption:{assumption}"),
                     move |assumption: ReadSignal<String>, _| {
-                        text(move || format!("Assumption: {}", assumption.get()))
-                            .text_size(px(11.0))
-                            .text_color(move || theme().muted_foreground)
+                        text(move || {
+                            format!(
+                                "{}: {}",
+                                i18n::t(language, Key::Assumption),
+                                assumption.get()
+                            )
+                        })
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground)
                     },
                 ))
                 .child(each(
@@ -658,7 +740,7 @@ fn context_panel(state: AppState) -> impl IntoElement {
                         .bg(move || theme().primary)
                         .on_press(move || review_state.review_with_context())
                         .child(
-                            text("Review with selected context")
+                            text(i18n::t(language, Key::ReviewWithContext))
                                 .text_size(px(12.0))
                                 .text_color(move || theme().primary_foreground),
                         ),
@@ -666,9 +748,11 @@ fn context_panel(state: AppState) -> impl IntoElement {
         )
 }
 
-fn welcome(state: AppState) -> impl IntoElement {
+fn welcome(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     let open_state = state.clone();
     let sample_state = state.clone();
+    let new_state = state.clone();
+    let paste_state = state.clone();
     view()
         .test_id("welcome")
         .flex_1()
@@ -678,11 +762,17 @@ fn welcome(state: AppState) -> impl IntoElement {
         .p_6()
         .child(
             text("MarkTurbo")
-                .text_size(px(22.0))
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            text(i18n::t(language, Key::WelcomeTitle))
+                .text_size(px(24.0))
                 .font_weight(FontWeight::SEMIBOLD),
         )
         .child(
-            text("Open a folder, then a Markdown file.")
+            text(i18n::t(language, Key::WelcomeSubtitle))
                 .text_size(px(13.0))
                 .text_color(move || theme().muted_foreground),
         )
@@ -690,14 +780,33 @@ fn welcome(state: AppState) -> impl IntoElement {
             view()
                 .flex_row()
                 .gap_2()
-                .child(small_button("Open folder", move || {
-                    choose_folder(open_state.clone())
+                .child(small_button(
+                    i18n::t(language, Key::NewDocument),
+                    move || new_state.new_document(),
+                ))
+                .child(small_button(i18n::t(language, Key::Paste), move || {
+                    paste_state.new_from_clipboard()
                 }))
+                .child(
+                    button()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(6.0))
+                        .bg(move || theme().primary)
+                        .on_press(move || choose_folder(open_state.clone()))
+                        .child(
+                            text(i18n::t(language, Key::OpenFolder))
+                                .text_size(px(12.0))
+                                .text_color(move || theme().primary_foreground),
+                        ),
+                )
                 .child(when(
                     crate::app_paths::bundled_sample_available,
                     move || {
                         let sample_state = sample_state.clone();
-                        small_button("Open sample", move || sample_state.open_bundled_sample())
+                        small_button(i18n::t(language, Key::OpenSample), move || {
+                            sample_state.open_bundled_sample()
+                        })
                     },
                 )),
         )
@@ -710,9 +819,9 @@ fn welcome(state: AppState) -> impl IntoElement {
                     view()
                         .flex_col()
                         .gap_1()
-                        .w(px(520.0))
+                        .w(px(if compact { 360.0 } else { 520.0 }))
                         .child(
-                            text("Recent")
+                            text(i18n::t(language, Key::Recent))
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(move || theme().muted_foreground),
@@ -724,8 +833,10 @@ fn welcome(state: AppState) -> impl IntoElement {
                                 let target = target.get();
                                 let state = state.clone();
                                 let kind = match target.kind {
-                                    RecentTargetKind::Workspace => "Workspace",
-                                    RecentTargetKind::File => "File",
+                                    RecentTargetKind::Workspace => {
+                                        i18n::t(language, Key::Workspace)
+                                    }
+                                    RecentTargetKind::File => i18n::t(language, Key::File),
                                 };
                                 let display_name = target.display_name.clone();
                                 let target_for_open = target.clone();
@@ -795,59 +906,112 @@ fn tab_bar(state: AppState) -> impl IntoElement {
         }))
 }
 
-fn toolbar(state: AppState) -> impl IntoElement {
+fn toolbar(state: AppState, language: Language, compact: bool) -> impl IntoElement {
+    let more = signal(false);
+    let save_state = state.clone();
+    let save_as_state = state.clone();
+    let translate_state = state.clone();
+    let path_state = state.clone();
+    let advanced_state = state.clone();
+    let more_for_close = more;
+    let more_for_open = more;
     view()
-        .h(px(40.0))
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .px_2()
+        .flex_col()
         .border_b_1()
         .border_color(move || theme().border)
         .child(
-            button()
+            view()
+                .h(px(40.0))
+                .flex_row()
+                .items_center()
+                .gap_2()
                 .px_2()
-                .py_1()
-                .rounded(px(5.0))
-                .bg(move || theme().secondary)
-                .on_press({
-                    let state = state.clone();
-                    move || state.save_active()
-                })
-                .child(text("Save").text_size(px(12.0))),
+                .child(small_button(i18n::t(language, Key::Save), move || {
+                    save_state.save_active()
+                }))
+                .child(pane_button(
+                    state.clone(),
+                    Pane::Source,
+                    i18n::t(language, Key::ModeSource),
+                ))
+                .child(pane_button(
+                    state.clone(),
+                    Pane::Preview,
+                    i18n::t(language, Key::ModeNative),
+                ))
+                .child(when(move || more_for_close.get(), {
+                    let more = more_for_close;
+                    move || {
+                        small_button(i18n::t(language, Key::FewerLayouts), move || {
+                            more.set(false)
+                        })
+                    }
+                }))
+                .child(when(move || !more_for_open.get(), {
+                    let more = more_for_open;
+                    move || {
+                        small_button(i18n::t(language, Key::MoreLayouts), move || more.set(true))
+                    }
+                }))
+                .child(view().flex_1())
+                .child(when(move || !compact, {
+                    move || {
+                        let path_state = path_state.clone();
+                        text(move || {
+                            path_state
+                                .active_tab()
+                                .map(|tab| tab.path.display().to_string())
+                                .unwrap_or_default()
+                        })
+                        .text_size(px(11.0))
+                        .text_color(move || theme().muted_foreground)
+                    }
+                })),
         )
-        .child(
-            button()
-                .px_2()
-                .py_1()
-                .rounded(px(5.0))
-                .bg(move || theme().secondary)
-                .on_press({
-                    let state = state.clone();
-                    move || state.save_as_active()
-                })
-                .child(text("Save As").text_size(px(12.0))),
-        )
-        .child(small_button("Translate", {
-            let state = state.clone();
-            move || state.translate_active()
+        .child(when(move || more.get(), {
+            let state = advanced_state;
+            move || {
+                let save_as = save_as_state.clone();
+                let translate = translate_state.clone();
+                view()
+                    .px_2()
+                    .pb_2()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_2()
+                            .child(small_button(
+                                i18n::t(language, Key::SaveAsPicker),
+                                move || save_as.save_as_active(),
+                            ))
+                            .child(small_button(i18n::t(language, Key::Translate), move || {
+                                translate.translate_active()
+                            })),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_2()
+                            .child(pane_button(
+                                state.clone(),
+                                Pane::Web,
+                                i18n::t(language, Key::ModeWeb),
+                            ))
+                            .child(pane_button(
+                                state.clone(),
+                                Pane::Split,
+                                i18n::t(language, Key::ModeSplitNative),
+                            ))
+                            .child(pane_button(
+                                state.clone(),
+                                Pane::SplitWeb,
+                                i18n::t(language, Key::ModeSplitWeb),
+                            )),
+                    )
+            }
         }))
-        .child(pane_button(state.clone(), Pane::Source, "Source"))
-        .child(pane_button(state.clone(), Pane::Preview, "Preview"))
-        .child(pane_button(state.clone(), Pane::Web, "Web"))
-        .child(pane_button(state.clone(), Pane::Split, "Split"))
-        .child(pane_button(state.clone(), Pane::SplitWeb, "Split+Web"))
-        .child(view().flex_1())
-        .child(
-            text(move || {
-                state
-                    .active_tab()
-                    .map(|tab| tab.path.display().to_string())
-                    .unwrap_or_default()
-            })
-            .text_size(px(11.0))
-            .text_color(move || theme().muted_foreground),
-        )
 }
 
 fn pane_button(state: AppState, pane: Pane, label: &'static str) -> impl IntoElement {
@@ -858,7 +1022,7 @@ fn pane_button(state: AppState, pane: Pane, label: &'static str) -> impl IntoEle
     })
 }
 
-fn document_surface(tab: Tab, state: AppState) -> impl IntoElement {
+fn document_surface(tab: Tab, state: AppState, language: Language) -> impl IntoElement {
     let tab_for_source = tab.clone();
     let tab_for_preview = tab.clone();
     let tab_for_web = tab.clone();
@@ -887,13 +1051,19 @@ fn document_surface(tab: Tab, state: AppState) -> impl IntoElement {
                     .border_b_1()
                     .border_color(move || theme().border)
                     .bg(move || theme().card)
-                    .child(small_button("Reload", move || reload.reload_active()))
-                    .child(small_button("Overwrite", move || {
+                    .child(small_button(
+                        i18n::t(language, Key::ReloadFromDisk),
+                        move || reload.reload_active(),
+                    ))
+                    .child(small_button(i18n::t(language, Key::Overwrite), move || {
                         overwrite.overwrite_active()
                     }))
-                    .child(small_button("Save As", move || save_as.save_as_active()))
+                    .child(small_button(
+                        i18n::t(language, Key::SaveAsPicker),
+                        move || save_as.save_as_active(),
+                    ))
                     .child(
-                        text("Save conflict")
+                        text(i18n::t(language, Key::SaveConflict))
                             .text_size(px(12.0))
                             .text_color(move || theme().destructive),
                     )
@@ -915,7 +1085,10 @@ fn document_surface(tab: Tab, state: AppState) -> impl IntoElement {
                 ))
                 .child(when(
                     move || matches!(tab.pane.get(), Pane::Web | Pane::SplitWeb),
-                    move || web_pane(tab_for_web.clone(), state_for_web.clone()).into_element(),
+                    move || {
+                        web_pane(tab_for_web.clone(), state_for_web.clone(), language)
+                            .into_element()
+                    },
                 )),
         )
 }
@@ -941,7 +1114,7 @@ fn source_pane(tab: Tab, state: AppState) -> impl IntoElement {
         })
 }
 
-fn web_pane(tab: Tab, state: AppState) -> impl IntoElement {
+fn web_pane(tab: Tab, state: AppState, language: Language) -> impl IntoElement {
     let trusted = tab.web_trusted;
     let html = computed(move || {
         let document = Document::new(Some(tab.path.clone()), tab.text.get().to_string());
@@ -968,9 +1141,9 @@ fn web_pane(tab: Tab, state: AppState) -> impl IntoElement {
                 .child(
                     text(move || {
                         if trusted.get() {
-                            "Trusted: scripts may run"
+                            i18n::t(language, Key::ScriptsTrusted)
                         } else {
-                            "Restricted: scripts disabled"
+                            i18n::t(language, Key::ScriptsRestricted)
                         }
                     })
                     .text_size(px(11.0))
@@ -981,7 +1154,9 @@ fn web_pane(tab: Tab, state: AppState) -> impl IntoElement {
                     let id = tab.id;
                     move || {
                         let state = state.clone();
-                        small_button("Trust scripts", move || state.request_web_trust(id))
+                        small_button(i18n::t(language, Key::TrustScripts), move || {
+                            state.request_web_trust(id)
+                        })
                     }
                 })),
         )
@@ -1009,9 +1184,9 @@ fn preview_pane(tab: Tab) -> impl IntoElement {
         )
 }
 
-fn review_panel(state: AppState) -> impl IntoElement {
+fn review_panel(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     view()
-        .w(px(380.0))
+        .w(px(if compact { 320.0 } else { 380.0 }))
         .h(relative(1.0))
         .flex_col()
         .bg(move || theme().card)
@@ -1026,7 +1201,7 @@ fn review_panel(state: AppState) -> impl IntoElement {
                 .justify_between()
                 .border_b_1()
                 .border_color(move || theme().border)
-                .child(text("Review").font_weight(FontWeight::SEMIBOLD))
+                .child(text(i18n::t(language, Key::Review)).font_weight(FontWeight::SEMIBOLD))
                 .child(
                     text("×")
                         .text_color(move || theme().muted_foreground)
@@ -1044,7 +1219,10 @@ fn review_panel(state: AppState) -> impl IntoElement {
                     .p_3()
                     .child(when(
                         move || state.review_busy.get(),
-                        || text("Reviewing…").text_color(move || theme().muted_foreground),
+                        move || {
+                            text(i18n::t(language, Key::Reviewing))
+                                .text_color(move || theme().muted_foreground)
+                        },
                     ))
                     .child(when(move || state.review_consent.get().is_some(), {
                         let state = state.clone();
@@ -1063,19 +1241,26 @@ fn review_panel(state: AppState) -> impl IntoElement {
                                     view()
                                         .flex_row()
                                         .gap_2()
-                                        .child(small_button("Send", move || send.send_review()))
-                                        .child(small_button("Cancel", move || {
-                                            cancel.cancel_review()
-                                        })),
+                                        .child(small_button(
+                                            i18n::t(language, Key::SendToModel),
+                                            move || send.send_review(),
+                                        ))
+                                        .child(small_button(
+                                            i18n::t(language, Key::Cancel),
+                                            move || cancel.cancel_review(),
+                                        )),
                                 )
                         }
                     }))
                     .child(when(move || state.review_view.get().is_some(), {
                         let state = state.clone();
-                        move || review_result(state.clone())
+                        move || review_result(state.clone(), language)
                     }))
                     .child(when(move || state.revision_busy.get(), {
-                        move || text("Revising…").text_color(move || theme().muted_foreground)
+                        move || {
+                            text(i18n::t(language, Key::Revising))
+                                .text_color(move || theme().muted_foreground)
+                        }
                     }))
                     .child(when(move || state.revision_consent.get().is_some(), {
                         let state = state.clone();
@@ -1094,12 +1279,14 @@ fn review_panel(state: AppState) -> impl IntoElement {
                                     view()
                                         .flex_row()
                                         .gap_2()
-                                        .child(small_button("Send revision", move || {
-                                            send.send_revision()
-                                        }))
-                                        .child(small_button("Cancel", move || {
-                                            cancel.cancel_revision()
-                                        })),
+                                        .child(small_button(
+                                            i18n::t(language, Key::SendRevision),
+                                            move || send.send_revision(),
+                                        ))
+                                        .child(small_button(
+                                            i18n::t(language, Key::Cancel),
+                                            move || cancel.cancel_revision(),
+                                        )),
                                 )
                         }
                     }))
@@ -1135,9 +1322,9 @@ fn review_panel(state: AppState) -> impl IntoElement {
                                     .on_press(move || state_for_press.toggle_revision_hunk(index))
                                     .child(text(move || {
                                         if accepted.get() {
-                                            "☑ Approved"
+                                            format!("☑ {}", i18n::t(language, Key::Approved))
                                         } else {
-                                            "☐ Rejected"
+                                            format!("☐ {}", i18n::t(language, Key::Rejected))
                                         }
                                     }))
                                     .child(
@@ -1162,14 +1349,16 @@ fn review_panel(state: AppState) -> impl IntoElement {
                         let state = state.clone();
                         move || {
                             let state = state.clone();
-                            small_button("Apply approved", move || state.apply_revision())
+                            small_button(i18n::t(language, Key::ApplyApproved), move || {
+                                state.apply_revision()
+                            })
                         }
                     })),
             ),
         )
 }
 
-fn review_result(state: AppState) -> impl IntoElement {
+fn review_result(state: AppState, language: Language) -> impl IntoElement {
     view()
         .flex_col()
         .gap_3()
@@ -1232,12 +1421,18 @@ fn review_result(state: AppState) -> impl IntoElement {
                     ))
             },
         ))
-        .child(review_list(state.clone(), "Findings", |view| {
-            view.findings.clone()
-        }))
-        .child(review_list(state.clone(), "Questions", |view| {
-            view.questions.clone()
-        }))
+        .child(review_list(
+            state.clone(),
+            language,
+            Key::ReviewFindings,
+            |view| view.findings.clone(),
+        ))
+        .child(review_list(
+            state.clone(),
+            language,
+            Key::ReviewQuestions,
+            |view| view.questions.clone(),
+        ))
         .child(each(
             move || state.revision_questions.get(),
             |question: &crate::state::RevisionQuestionView| question.ordinal,
@@ -1265,7 +1460,7 @@ fn review_result(state: AppState) -> impl IntoElement {
             },
         ))
         .child(
-            small_button("Prepare revision", {
+            small_button(i18n::t(language, Key::PrepareRevision), {
                 let state = state.clone();
                 move || state.start_revision()
             })
@@ -1275,7 +1470,8 @@ fn review_result(state: AppState) -> impl IntoElement {
 
 fn review_list(
     state: AppState,
-    title: &'static str,
+    language: Language,
+    title: Key,
     items: fn(&crate::state::ReviewView) -> Vec<String>,
 ) -> impl IntoElement {
     view()
@@ -1288,7 +1484,7 @@ fn review_list(
                     .get()
                     .is_some_and(|view| !items(&view).is_empty())
             },
-            move || text(title).font_weight(FontWeight::SEMIBOLD),
+            move || text(i18n::t(language, title)).font_weight(FontWeight::SEMIBOLD),
         ))
         .child(each(
             move || {
@@ -1317,9 +1513,9 @@ fn small_button(label: &'static str, on_press: impl Fn() + 'static) -> impl Into
         .child(text(label).text_size(px(12.0)))
 }
 
-fn settings_page(state: AppState) -> impl IntoElement {
-    let credential = signal(String::new());
-    let notice = signal(SharedString::from(""));
+fn settings_page(state: AppState, language: Language, compact: bool) -> impl IntoElement {
+    let credential = state.settings_credential;
+    let notice = state.settings_notice;
     let close = state.clone();
     let save = state.clone();
     let settings = state.settings.get();
@@ -1337,21 +1533,23 @@ fn settings_page(state: AppState) -> impl IntoElement {
         .flex_1()
         .flex_col()
         .gap_4()
-        .p_6()
+        .p(px(if compact { 16.0 } else { 24.0 }))
         .child(
             view()
                 .flex_row()
                 .items_center()
                 .justify_between()
                 .child(
-                    text("Settings")
+                    text(i18n::t(language, Key::Settings))
                         .text_size(px(20.0))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
-                .child(small_button("Close", move || close.close_settings())),
+                .child(small_button(i18n::t(language, Key::Close), move || {
+                    close.close_settings()
+                })),
         )
         .child(settings_field(
-            "Interface language",
+            i18n::t(language, Key::Language_),
             view()
                 .flex_row()
                 .gap_2()
@@ -1367,28 +1565,28 @@ fn settings_page(state: AppState) -> impl IntoElement {
                 )),
         ))
         .child(settings_field(
-            "Theme",
+            i18n::t(language, Key::Theme),
             view()
                 .flex_row()
                 .gap_2()
                 .child(choice_button(
-                    "System",
+                    i18n::t(language, Key::System),
                     settings.theme == mt_core::settings::ThemePreference::System,
                     move || theme_system.set_theme(mt_core::settings::ThemePreference::System),
                 ))
                 .child(choice_button(
-                    "Light",
+                    i18n::t(language, Key::Light),
                     settings.theme == mt_core::settings::ThemePreference::Light,
                     move || theme_light.set_theme(mt_core::settings::ThemePreference::Light),
                 ))
                 .child(choice_button(
-                    "Dark",
+                    i18n::t(language, Key::Dark),
                     settings.theme == mt_core::settings::ThemePreference::Dark,
                     move || theme_dark.set_theme(mt_core::settings::ThemePreference::Dark),
                 )),
         ))
         .child(settings_field(
-            "Provider",
+            i18n::t(language, Key::Provider),
             settings_input(settings.model_provider.clone(), move |value| {
                 provider_state
                     .settings
@@ -1396,7 +1594,7 @@ fn settings_page(state: AppState) -> impl IntoElement {
             }),
         ))
         .child(settings_field(
-            "Model",
+            i18n::t(language, Key::Model),
             settings_input(settings.model_name.clone(), move |value| {
                 model_state
                     .settings
@@ -1404,7 +1602,7 @@ fn settings_page(state: AppState) -> impl IntoElement {
             }),
         ))
         .child(settings_field(
-            "Base URL",
+            i18n::t(language, Key::BaseUrl),
             settings_input(settings.model_base_url.clone(), move |value| {
                 base_state
                     .settings
@@ -1412,7 +1610,7 @@ fn settings_page(state: AppState) -> impl IntoElement {
             }),
         ))
         .child(settings_field(
-            "Translation target",
+            i18n::t(language, Key::TargetLanguage),
             settings_input(settings.translate_to.clone(), move |value| {
                 translate_state
                     .settings
@@ -1420,13 +1618,14 @@ fn settings_page(state: AppState) -> impl IntoElement {
             }),
         ))
         .child(settings_field(
-            "API key (this session only)",
+            i18n::t(language, Key::ApiKey),
             view()
                 .flex_row()
                 .gap_2()
                 .items_center()
                 .child(
                     input()
+                        .test_id("api-key")
                         .masked(true)
                         .value(move || credential.get())
                         .on_change(move |value: &str| credential.set(value.to_owned()))
@@ -1437,17 +1636,23 @@ fn settings_page(state: AppState) -> impl IntoElement {
                         .border_1()
                         .border_color(move || theme().border),
                 )
-                .child(small_button("Use", {
+                .child(small_button(i18n::t(language, Key::Use), {
                     let credential_state = credential_state.clone();
                     move || match credential_state.store_session_credential(&credential.get()) {
-                        Ok(()) => notice.set(SharedString::from("Key stored for this session.")),
+                        Ok(()) => notice.set(SharedString::from(i18n::t(
+                            language,
+                            Key::KeyStoredForSession,
+                        ))),
                         Err(error) => notice.set(SharedString::from(error)),
                     }
                 }))
                 .child(small_button(
-                    "Store securely",
+                    i18n::t(language, Key::StoreCredentialSecurely),
                     move || match credential_state.store_persistent_credential(&credential.get()) {
-                        Ok(()) => notice.set(SharedString::from("Key stored securely.")),
+                        Ok(()) => notice.set(SharedString::from(i18n::t(
+                            language,
+                            Key::KeyStoredSecurely,
+                        ))),
                         Err(error) => notice.set(SharedString::from(error)),
                     },
                 )),
@@ -1457,7 +1662,10 @@ fn settings_page(state: AppState) -> impl IntoElement {
                 .text_size(px(12.0))
                 .text_color(move || theme().muted_foreground),
         )
-        .child(small_button("Save", move || save.save_settings()))
+        .child(small_button(
+            i18n::t(language, Key::SaveSettings),
+            move || save.save_settings(),
+        ))
 }
 
 fn settings_field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
@@ -1510,7 +1718,7 @@ fn choice_button(
         }))
 }
 
-fn status_bar(state: AppState) -> impl IntoElement {
+fn status_bar(state: AppState, _language: Language) -> impl IntoElement {
     view()
         .h(px(24.0))
         .px_2()

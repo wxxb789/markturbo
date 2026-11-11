@@ -75,3 +75,9 @@ GPUI IDs and source files; their unit tests are in `check native`, not the fast
 gate. Rewriting the selectors and cases is a bounded follow-up before native
 acceptance can pass on nsh; the absence of that evidence is recorded as pending,
 not converted into a passing result.
+
+Goal 09 also still needs its release-build screenshot matrix: the eleven states
+at minimum/default/wide widths in both effective modes, with revision, viewport,
+language and obstruction receipts. No `mt.py` command currently produces that
+matrix; headless hierarchy tests are implementation coverage, not visual
+acceptance.

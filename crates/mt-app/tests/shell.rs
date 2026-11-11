@@ -60,7 +60,7 @@ fn opens_a_markdown_file() {
         );
     }
 
-    app.press("text:Context").expect("open context");
+    app.press("text:Agent Context").expect("open context");
     app.wait_for("text:Effective Agent Context")
         .expect("context panel heading");
     app.wait_for("text:Workspace / ProjectAgents")

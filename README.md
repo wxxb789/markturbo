@@ -13,12 +13,13 @@ thresholds are defined in the owner-approved [Product Contract](PRODUCT.md).
 > **Native Shell migration in progress (2026-11-11).** Ported: workspace open,
 > source editor, native and Web preview, Save/Save As, tab-close protection and a
 > guarded in-app Quit, encrypted recovery checkpoints and startup restore,
-> explorer/content search, Welcome and bundled sample, Review with consent,
-> Effective Agent Context selection with Revision approval, explicit Web-script
-> trust, document Translation with consent, settings, session/secure credentials,
-> and Windows packaging. Pending: cancellable native window close, complete UI
-> localization and application keyboard shortcuts (Goal 09), native acceptance on
-> the nsh backends, and macOS/Linux clean-machine evidence.
+> explorer/content search, Welcome with new/paste documents and the bundled sample,
+> Review with consent, Effective Agent Context selection with Revision approval,
+> explicit Web-script trust, document Translation with consent, settings,
+> session/secure credentials, and Windows packaging. Pending: cancellable native
+> window close, remaining dynamic-status localization, application keyboard
+> shortcuts, the Goal 09 visual matrix, native acceptance on the nsh backends, and
+> macOS/Linux clean-machine evidence.
 
 The guarded in-app Quit applies Save all / Discard all to the buffers dirty when
 the dialog is confirmed, including translations completed while it is open.
@@ -30,6 +31,7 @@ on Linux. There is no GPUI or GPUI Kit dependency.
 ## What it does
 
 - Open a directory as a workspace; browse it in a native file tree.
+- Start a new document or paste Markdown from the clipboard without creating a file first.
 - Open Markdown, MDX, and agent artifacts in tabs.
 - Open the Context panel to inspect discovered Skills, instruction files, and
   the applicable Effective Agent Context chain for the active document.

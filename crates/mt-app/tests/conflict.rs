@@ -25,6 +25,11 @@ fn external_change_shows_conflict_resolution() {
 
     let mut app =
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
     app.wait_for("label:Markdown source")
         .expect("source editor");
     app.type_text("label:Markdown source", "\n\nLocal edit.")
@@ -33,12 +38,13 @@ fn external_change_shows_conflict_resolution() {
     std::fs::write(&path, "# External change\n").expect("replace the file");
     app.press("text:Save").expect("attempt save");
 
-    app.wait_for("text:Reload").expect("reload choice");
+    app.wait_for("text:Reload from disk")
+        .expect("reload choice");
     app.wait_for("text:Overwrite").expect("overwrite choice");
 
     app.on_dialog(|_| nsh_testing::DialogAnswer::Press("Overwrite".to_owned()));
     app.press("text:Overwrite").expect("choose overwrite");
-    app.wait_for_gone("text:Reload", std::time::Duration::from_secs(5))
+    app.wait_for_gone("text:Reload from disk", std::time::Duration::from_secs(5))
         .expect("conflict resolved");
     let saved = std::fs::read_to_string(&path).expect("read overwritten file");
     assert!(saved.contains("Local edit."));
