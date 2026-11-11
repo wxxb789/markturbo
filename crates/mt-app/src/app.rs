@@ -125,6 +125,16 @@ fn sidebar(state: AppState) -> impl IntoElement {
                     })),
             ),
         )
+        .child(
+            view()
+                .p_2()
+                .border_t_1()
+                .border_color(move || theme().border)
+                .child(small_button("Quit", {
+                    let state = state.clone();
+                    move || state.request_quit()
+                })),
+        )
 }
 
 fn search_row(state: AppState) -> impl IntoElement {
@@ -273,7 +283,7 @@ fn main(state: AppState) -> impl IntoElement {
 }
 
 fn document_area(state: AppState) -> impl IntoElement {
-    let state_for_when = state.clone();
+    let state_for_empty = state.clone();
     let state_for_review = state.clone();
     view()
         .flex_1()
@@ -281,13 +291,23 @@ fn document_area(state: AppState) -> impl IntoElement {
         .child(
             view()
                 .flex_1()
-                .child(when(move || state_for_when.active_tab().is_some(), {
+                .child(when(move || state_for_empty.active_tab().is_none(), {
                     let state = state.clone();
-                    move || match state.active_tab() {
-                        Some(tab) => document_surface(tab, state.clone()).into_element(),
-                        None => welcome(state.clone()).into_element(),
-                    }
-                })),
+                    move || welcome(state.clone()).into_element()
+                }))
+                .child(each(
+                    {
+                        let state = state.clone();
+                        move || state.active_tab().into_iter().collect::<Vec<_>>()
+                    },
+                    |tab: &Tab| tab.id,
+                    {
+                        let state = state.clone();
+                        move |tab: ReadSignal<Tab>, _| {
+                            document_surface(tab.get(), state.clone()).into_element()
+                        }
+                    },
+                )),
         )
         .child(when(move || state_for_review.review_open.get(), {
             let state = state.clone();
@@ -650,6 +670,7 @@ fn welcome(state: AppState) -> impl IntoElement {
     let open_state = state.clone();
     let sample_state = state.clone();
     view()
+        .test_id("welcome")
         .flex_1()
         .items_center()
         .justify_center()
@@ -775,7 +796,6 @@ fn tab_bar(state: AppState) -> impl IntoElement {
 }
 
 fn toolbar(state: AppState) -> impl IntoElement {
-    let tab = state.active_tab();
     view()
         .h(px(40.0))
         .flex_row()
@@ -808,26 +828,15 @@ fn toolbar(state: AppState) -> impl IntoElement {
                 })
                 .child(text("Save As").text_size(px(12.0))),
         )
-        .child(pane_button(
-            state.clone(),
-            tab.clone(),
-            Pane::Source,
-            "Source",
-        ))
-        .child(pane_button(
-            state.clone(),
-            tab.clone(),
-            Pane::Preview,
-            "Preview",
-        ))
-        .child(pane_button(state.clone(), tab.clone(), Pane::Web, "Web"))
-        .child(pane_button(
-            state.clone(),
-            tab.clone(),
-            Pane::Split,
-            "Split",
-        ))
-        .child(pane_button(state.clone(), tab, Pane::SplitWeb, "Split+Web"))
+        .child(small_button("Translate", {
+            let state = state.clone();
+            move || state.translate_active()
+        }))
+        .child(pane_button(state.clone(), Pane::Source, "Source"))
+        .child(pane_button(state.clone(), Pane::Preview, "Preview"))
+        .child(pane_button(state.clone(), Pane::Web, "Web"))
+        .child(pane_button(state.clone(), Pane::Split, "Split"))
+        .child(pane_button(state.clone(), Pane::SplitWeb, "Split+Web"))
         .child(view().flex_1())
         .child(
             text(move || {
@@ -841,30 +850,12 @@ fn toolbar(state: AppState) -> impl IntoElement {
         )
 }
 
-fn pane_button(
-    state: AppState,
-    tab: Option<Tab>,
-    pane: Pane,
-    label: &'static str,
-) -> impl IntoElement {
-    let tab_id = tab.as_ref().map(|tab| tab.id);
-    let pane_signal = tab.as_ref().map(|tab| tab.pane);
-    view()
-        .px_2()
-        .py_1()
-        .rounded(px(5.0))
-        .on_press(move || {
-            if let Some(id) = tab_id {
-                state.set_pane(id, pane);
-            }
-        })
-        .child(text(label).text_size(px(12.0)).text_color(move || {
-            if pane_signal.is_some_and(|pane_signal| pane_signal.get() == pane) {
-                theme().primary
-            } else {
-                theme().muted_foreground
-            }
-        }))
+fn pane_button(state: AppState, pane: Pane, label: &'static str) -> impl IntoElement {
+    small_button(label, move || {
+        if let Some(tab) = state.active_tab() {
+            state.set_pane(tab.id, pane);
+        }
+    })
 }
 
 fn document_surface(tab: Tab, state: AppState) -> impl IntoElement {
@@ -1335,6 +1326,7 @@ fn settings_page(state: AppState) -> impl IntoElement {
     let provider_state = state.clone();
     let model_state = state.clone();
     let base_state = state.clone();
+    let translate_state = state.clone();
     let credential_state = state.clone();
     let language_en = state.clone();
     let language_zh = state.clone();
@@ -1417,6 +1409,14 @@ fn settings_page(state: AppState) -> impl IntoElement {
                 base_state
                     .settings
                     .update(|settings| settings.model_base_url = value)
+            }),
+        ))
+        .child(settings_field(
+            "Translation target",
+            settings_input(settings.translate_to.clone(), move |value| {
+                translate_state
+                    .settings
+                    .update(|settings| settings.translate_to = value)
             }),
         ))
         .child(settings_field(
