@@ -1,5 +1,8 @@
 # Build output
 /target
+# nsh generates an app-local describe crate and packaging output.
+crates/*/.nsh/
+crates/*/target/
 /scripts/.venv/
 *.py[cod]
 # Anchored `/target` above only covers the workspace root. `vendor/ratex-parser`

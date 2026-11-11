@@ -7,17 +7,22 @@ use crate::mhchem::patterns::match_pattern;
 use crate::mhchem::RuntimeCtx;
 use serde_json::Value;
 
-fn normalize_input(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn normalize_input(s: &str, ctx: &RuntimeCtx) -> MhchemResult<String> {
+    let mut out = String::new();
     for c in s.chars() {
         match c {
-            '\n' => out.push(' '),
-            '\u{2212}' | '\u{2013}' | '\u{2014}' | '\u{2010}' => out.push('-'),
-            '\u{2026}' => out.push_str("..."),
-            _ => out.push(c),
+            '\n' => ctx.resources.append(&mut out, " ")?,
+            '\u{2212}' | '\u{2013}' | '\u{2014}' | '\u{2010}' => {
+                ctx.resources.append(&mut out, "-")?
+            }
+            '\u{2026}' => ctx.resources.append(&mut out, "...")?,
+            _ => {
+                let mut bytes = [0; 4];
+                ctx.resources.append(&mut out, c.encode_utf8(&mut bytes))?;
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn go_machine(
@@ -34,7 +39,8 @@ pub(crate) fn go_machine(
 }
 
 fn go_machine_impl(ctx: &RuntimeCtx<'_>, input: &str, machine: &str) -> MhchemResult<Vec<Value>> {
-    let mut input = normalize_input(input);
+    let normalized = normalize_input(input, ctx)?;
+    let mut input = normalized.as_str();
     if input.is_empty() {
         return Ok(vec![]);
     }
@@ -71,7 +77,7 @@ fn go_machine_impl(ctx: &RuntimeCtx<'_>, input: &str, machine: &str) -> MhchemRe
 
         let mut consumed_transition = false;
         'iter: for tr in transitions {
-            let Some(hit) = match_pattern(ctx.data, &tr.pattern, &input)? else {
+            let Some(hit) = match_pattern(ctx.data, &tr.pattern, input, &ctx.resources)? else {
                 continue;
             };
             consumed_transition = true;
@@ -88,7 +94,7 @@ fn go_machine_impl(ctx: &RuntimeCtx<'_>, input: &str, machine: &str) -> MhchemRe
                 return Ok(output);
             }
             if !tr.task.revisit {
-                input = hit.remainder.clone();
+                input = hit.remainder;
             }
             if !tr.task.to_continue {
                 break 'iter;

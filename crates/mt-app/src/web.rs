@@ -1,24 +1,18 @@
-//! The WebView compatibility path.
+//! The WebView compatibility path for browser-only document semantics.
 //!
-//! The native renderer is the fast path; this is where browser semantics are
-//! genuinely required: MDX component rendering, arbitrary HTML, Mermaid's
-//! browser ecosystem, and MathML.
+//! Markdown, MDX and HTML all use the authoritative [`Document`]; diagrams and
+//! math use the same [`RendererRegistry`] as the native preview. Generated
+//! markup is served as a self-contained `data:` URL with an opaque origin and
+//! a restrictive CSP, so restricted documents cannot run scripts or fetch
+//! workspace files or network resources.
 //!
-//! Content is served to the WebView as a self-contained `data:` URL. That is
-//! deliberate: a `data:` document has an opaque origin, so it cannot read local
-//! files, cannot reach `file://`, and has no ambient credentials. Combined with
-//! a restrictive CSP, this is the v0.1 trust boundary — untrusted MDX cannot
-//! silently exfiltrate the workspace.
-//!
-//! [`to_file_url`] is the one documented way out of that sandbox, and it is
-//! reachable only for an HTML file the user explicitly trusted — see
-//! `DocumentView`'s trust transition and `DocumentPreview::trust_changed`.
+//! [`to_file_url`] is the explicit escape from that sandbox for a local HTML
+//! file the user has trusted. Callers must gate that transition on [`Trust`].
 
 use std::path::Path;
 
-use mt_core::{Block, BlockKind, Document};
-
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
+use mt_core::{Block, BlockKind, Document};
 
 /// How much the WebView is allowed to execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,28 +41,14 @@ impl Trust {
 
 /// Build the HTML document shown in the WebView.
 ///
-/// Diagrams and math are pre-rendered by the same registry the native path
-/// uses, so both renderers are driven by one document model — the WebView is
-/// not a second, divergent pipeline.
-///
-/// Uses the system color scheme. [`build_html_themed`] is the one the app
-/// calls; this is for tests and any caller with no preset in hand.
-pub fn build_html(doc: &Document, registry: &RendererRegistry, trust: Trust) -> String {
-    build_html_themed(doc, registry, trust, None)
-}
-
-/// Build the HTML document, painted with a preset.
-///
-/// `None` leaves the document following the OS, which is right only when the
-/// app is too. Passing the app's own preset is what keeps Split mode from
-/// showing the same document in two palettes.
-pub fn build_html_themed(
-    doc: &Document,
-    registry: &RendererRegistry,
-    trust: Trust,
-    preset: Option<&crate::theme::Preset>,
-) -> String {
+/// The application supplies its current light/dark mode instead of relying on
+/// the browser's system preference. HTML files retain their own document shell
+/// and styling; Markdown and MDX use the application's reading palette.
+/// Diagrams and math are pre-rendered by the shared registry, not reparsed by
+/// an independent browser-side Markdown pipeline.
+pub fn build_html(doc: &Document, registry: &RendererRegistry, trust: Trust, dark: bool) -> String {
     let body = match doc.doc_type() {
+        mt_core::DocType::Html => return build_html_raw(doc, trust),
         mt_core::DocType::Mdx => render_mdx_body(doc, registry, trust),
         _ => render_markdown_body(doc, registry),
     };
@@ -76,54 +56,58 @@ pub fn build_html_themed(
     format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>{vars}\n{style}</style>\n</head><body>{banner}{body}</body></html>",
         csp = csp_meta(trust),
-        vars = css_variables(preset),
+        vars = css_variables(dark),
         style = STYLE,
         banner = trust_banner(doc, trust),
     )
 }
 
-/// The `:root` block: the preset's palette as CSS custom properties.
-///
-/// Variable names follow ColaMD's, which is what the palettes were authored
-/// against — so a preset transcribed from one of its stylesheets keeps meaning
-/// the same thing here.
-fn css_variables(preset: Option<&crate::theme::Preset>) -> String {
-    let Some(preset) = preset else {
-        // No preset: follow the OS, and let the stylesheet's `light-dark()`
-        // values resolve. Every `var()` below has a fallback for exactly this.
-        return ":root { color-scheme: light dark; }".to_string();
-    };
-    let t = preset.tokens;
-    let hex = |c: u32| format!("#{c:06x}");
-    format!(
-        ":root {{\n  color-scheme: {scheme};\n  --bg-color: {bg};\n  --text-color: {text};\n  \
-         --text-secondary: {secondary};\n  --text-muted: {muted};\n  --border-color: {border};\n  \
-         --link-color: {link};\n  --code-bg: {code_bg};\n  --code-block-bg: {code_block_bg};\n  \
-         --blockquote-border: {quote};\n  --table-header-bg: {table_head};\n  \
-         --selection-bg: {selection};\n  --highlight-bg: {highlight};\n  --accent-color: {accent};\n  \
-         --body-font: {font};\n  --body-line-height: {line_height};\n}}",
-        scheme = if preset.dark { "dark" } else { "light" },
-        bg = hex(t.bg),
-        text = hex(t.text),
-        secondary = hex(t.text_secondary),
-        muted = hex(t.text_muted),
-        border = hex(t.border),
-        link = hex(t.link),
-        code_bg = hex(t.code_bg),
-        code_block_bg = hex(t.code_block_bg),
-        quote = hex(t.blockquote_border),
-        table_head = hex(t.table_header_bg),
-        selection = hex(t.selection),
-        highlight = hex(t.highlight),
-        accent = hex(t.accent),
-        font = preset.font.css(),
-        line_height = preset.font.line_height(),
-    )
+/// The original Light and Dark reading palettes, independent of UI toolkit.
+fn css_variables(dark: bool) -> &'static str {
+    if dark {
+        r#":root {
+  color-scheme: dark;
+  --bg-color: #0d1117;
+  --text-color: #e6edf3;
+  --text-secondary: #aab3bd;
+  --text-muted: #8b949e;
+  --border-color: #30363d;
+  --link-color: #58a6ff;
+  --code-bg: #2c333c;
+  --code-block-bg: #161b22;
+  --blockquote-border: #30363d;
+  --table-header-bg: #161b22;
+  --selection-bg: #1f3f66;
+  --highlight-bg: #4a3a12;
+  --accent-color: #58a6ff;
+  --body-font: -apple-system, "Segoe UI", system-ui, "PingFang SC", "Noto Sans SC", sans-serif;
+  --body-line-height: 1.6;
+}"#
+    } else {
+        r#":root {
+  color-scheme: light;
+  --bg-color: #ffffff;
+  --text-color: #24292f;
+  --text-secondary: #656d76;
+  --text-muted: #656d76;
+  --border-color: #d0d7de;
+  --link-color: #0969da;
+  --code-bg: #eef1f4;
+  --code-block-bg: #f6f8fa;
+  --blockquote-border: #d0d7de;
+  --table-header-bg: #f6f8fa;
+  --selection-bg: #cfe3fb;
+  --highlight-bg: #fff3bf;
+  --accent-color: #0969da;
+  --body-font: -apple-system, "Segoe UI", system-ui, "PingFang SC", "Noto Sans SC", sans-serif;
+  --body-line-height: 1.6;
+}"#
+    }
 }
 
 /// The Content-Security-Policy for this trust level.
 ///
-/// Both levels forbid every network fetch (`default-src 'none'`), so a document
+/// Both generated-document levels forbid every network fetch (`default-src 'none'`), so a document
 /// can never phone home or leak what the user is reading. Restricted
 /// additionally forbids script execution.
 fn csp_meta(trust: Trust) -> String {
@@ -146,9 +130,9 @@ fn trust_banner(doc: &Document, trust: Trust) -> String {
         return String::new();
     }
     match doc.doc_type() {
-        // Only MDX can execute anything, so only MDX needs the scripting warning.
+        // MDX needs a scripting warning; HTML uses its own filesystem warning.
         mt_core::DocType::Mdx => "<div class=\"mt-banner\">This MDX document is not trusted. Components are shown as placeholders and no code runs. Use <b>Trust this document</b> to enable full rendering.</div>".to_string(),
-        // HTML executes nothing here; what Trust buys it is filesystem access,
+        // Restricted HTML executes nothing; trusting a local file also buys filesystem access,
         // so the warning is about the missing images and stylesheets rather
         // than about code.
         //
@@ -164,42 +148,37 @@ fn trust_banner(doc: &Document, trust: Trust) -> String {
             "<div style=\"background:rgba(240,173,78,.18);border:1px solid rgba(240,173,78,.6);\
              border-radius:8px;padding:10px 14px;margin:0 0 1.5em;font-size:.92em;\
              font-family:system-ui,sans-serif\">{}</div>",
-            crate::i18n::text(
+            crate::i18n::t(
+                mt_core::settings::Language::default(),
                 crate::i18n::Key::HtmlNeedsTrust,
-                mt_core::settings::Language::default()
             )
         ),
         _ => String::new(),
     }
 }
 
-/// Serve an HTML file's own text, with the sandbox's two additions.
+/// Serve an HTML file's own text without nesting it in another document.
 ///
-/// [`build_html_themed`] would wrap this in the app's `<html><head><style>`
-/// shell, nesting a complete document inside another one — the parser keeps
-/// only the first `<head>`, so the file's own stylesheet, `<title>` and
-/// `<meta charset>` silently stop applying.
-///
-/// Restricted still gets a CSP and a banner, because a verbatim document would
-/// otherwise carry no CSP at all and the module's "no document can phone home"
-/// invariant would hold for every path except this one. Both go in at the
-/// head/body seam so the file's own `<head>` survives ahead of them.
+/// Trusted HTML remains an explicit byte-for-byte passthrough. Restricted HTML
+/// gets its CSP before any author markup, because scripts earlier in a head
+/// would already have executed if the policy were inserted at `</head>`.
+/// A leading standards-mode doctype keeps that early insertion from putting
+/// an ordinary HTML page into quirks mode; the author's own doctype is ignored
+/// by the browser. The banner stays at the original head/body seam.
 pub fn build_html_raw(doc: &Document, trust: Trust) -> String {
     let source = doc.source();
     if trust.allows_scripts() {
-        // Trusted is the whole point of trusting: the file runs as its author
-        // wrote it, which is also why it is the only level allowed `file://`.
         return source.to_string();
     }
     let (head, body) = source.split_at(head_end(source));
     format!(
-        "{head}{}{}{body}",
+        "<!doctype html>\n{}\n{head}{}{body}",
         csp_meta(trust),
         trust_banner(doc, trust)
     )
 }
 
-/// Byte offset of the seam our additions go into: just before `</head>`.
+/// Byte offset of the banner seam: just before `</head>`.
 ///
 /// Inserting at the very top instead would reparent the file's own `<head>`
 /// children into `<body>` — the parser closes the head it built as soon as it
@@ -437,10 +416,8 @@ pub fn to_file_url(path: &Path) -> String {
 
 /// The document stylesheet.
 ///
-/// Every color reads a custom property with a fallback, so the same sheet works
-/// both when a preset supplied `:root` variables and when it did not (the
-/// system-following case, where the fallbacks are translucent grays that read on
-/// either page).
+/// Colors consume the light/dark variables above; translucent fallbacks keep
+/// individual rules legible if document-authored styles override a variable.
 const STYLE: &str = r#"
 body { font-family: var(--body-font, -apple-system, "Segoe UI", system-ui, sans-serif);
        line-height: var(--body-line-height, 1.6);
@@ -508,6 +485,7 @@ mod tests {
             &md("# Title\n\nSome *text*.\n"),
             &registry(),
             Trust::Restricted,
+            false,
         );
         assert!(html.contains("<h1>Title</h1>"), "got {html}");
         assert!(html.contains("<em>text</em>"));
@@ -515,14 +493,31 @@ mod tests {
 
     #[test]
     fn restricted_csp_blocks_scripts_and_network() {
-        let html = build_html(&md("# x\n"), &registry(), Trust::Restricted);
-        assert!(html.contains("default-src 'none'"));
-        assert!(html.contains("script-src 'none'"));
+        let html = build_html(
+            &md("<script>run()</script>\n\n# x\n"),
+            &registry(),
+            Trust::Restricted,
+            false,
+        );
+        for directive in [
+            "default-src 'none'",
+            "style-src 'unsafe-inline'",
+            "img-src data:",
+            "font-src data:",
+            "script-src 'none'",
+        ] {
+            assert!(html.contains(directive), "missing {directive}");
+        }
+        assert!(!html.contains("script-src 'unsafe-inline'"));
+        let policy = html.find("Content-Security-Policy").expect("policy");
+        // The Markdown parser escapes or drops a raw script; either way the
+        // policy is present and script execution is disabled.
+        assert!(policy < html.len());
     }
 
     #[test]
     fn trusted_allows_scripts_but_still_blocks_network() {
-        let html = build_html(&md("# x\n"), &registry(), Trust::Trusted);
+        let html = build_html(&md("# x\n"), &registry(), Trust::Trusted, false);
         assert!(html.contains("script-src 'unsafe-inline'"));
         assert!(
             html.contains("default-src 'none'"),
@@ -536,31 +531,25 @@ mod tests {
             &md("$$\n\\frac{a}{b}\n$$\n"),
             &registry(),
             Trust::Restricted,
+            false,
         );
         assert!(body(&html).contains("<svg"), "got {}", body(&html));
     }
 
     #[test]
     fn failed_render_shows_a_diagnostic_and_keeps_the_source() {
-        // `d2` is almost certainly not installed in CI; either way the source
-        // must survive and no panic may occur.
         let src = "```d2\nthis is the original source\n```\n";
-        let html = build_html(&md(src), &registry(), Trust::Restricted);
-        if body(&html).contains("mt-error") {
-            assert!(
-                html.contains("this is the original source"),
-                "source must be preserved on failure"
-            );
-        } else {
-            assert!(html.contains("<svg"), "either it rendered or it diagnosed");
-        }
+        let html = build_html(&md(src), &RendererRegistry::new(), Trust::Restricted, false);
+        assert!(body(&html).contains("mt-error"));
+        assert!(html.contains("this is the original source"));
+        assert!(html.contains("no renderer registered"));
     }
 
     #[test]
     fn mdx_shows_component_placeholders_and_an_untrusted_banner() {
         let src = "# Title\n\n<RevenueChart data={rows} />\n";
         let doc = Document::with_type(DocType::Mdx, src.to_string());
-        let html = build_html(&doc, &registry(), Trust::Restricted);
+        let html = build_html(&doc, &registry(), Trust::Restricted, false);
         assert!(
             body(&html).contains("mt-banner"),
             "untrusted MDX must be flagged"
@@ -575,13 +564,13 @@ mod tests {
     #[test]
     fn trusted_mdx_has_no_banner() {
         let doc = Document::with_type(DocType::Mdx, "<Chart />\n".to_string());
-        let html = build_html(&doc, &registry(), Trust::Trusted);
+        let html = build_html(&doc, &registry(), Trust::Trusted, false);
         assert!(!body(&html).contains("mt-banner"));
     }
 
     #[test]
     fn plain_markdown_never_shows_the_mdx_banner() {
-        let html = build_html(&md("# x\n"), &registry(), Trust::Restricted);
+        let html = build_html(&md("# x\n"), &registry(), Trust::Restricted, false);
         assert!(!body(&html).contains("mt-banner"));
     }
 
@@ -625,6 +614,7 @@ mod tests {
             &md("# Title\n\nText with \"quotes\", <tags>, #hashes & ampersands.\n"),
             &registry(),
             Trust::Restricted,
+            false,
         );
         let url = to_data_url(&html);
         for bad in ['"', '\'', '<', '>', '#', '&', ' ', '\n', '\r'] {
@@ -638,7 +628,7 @@ mod tests {
     #[test]
     fn cjk_and_tables_survive() {
         let src = "# 标题\n\n| 列一 | 列二 |\n|---|---|\n| 值 | 值 |\n";
-        let html = build_html(&md(src), &registry(), Trust::Restricted);
+        let html = build_html(&md(src), &registry(), Trust::Restricted, false);
         assert!(html.contains("标题"));
         assert!(html.contains("<table>"), "got {html}");
         assert!(
@@ -650,77 +640,28 @@ mod tests {
     }
 
     #[test]
-    fn the_color_scheme_follows_the_preset() {
+    fn the_color_scheme_and_palette_follow_the_app_mode() {
         let doc = md("# x\n");
-        // No preset: follow the OS, which is right only when the app does too.
-        assert!(
-            build_html(&doc, &registry(), Trust::Restricted).contains("color-scheme: light dark")
-        );
-
-        for (id, dark, expected) in [
-            ("light", false, "color-scheme: light"),
-            ("dark", true, "color-scheme: dark"),
+        for (dark, scheme, background, foreground) in [
+            (false, "light", "#ffffff", "#24292f"),
+            (true, "dark", "#0d1117", "#e6edf3"),
         ] {
-            let preset = crate::theme::by_id(id, dark);
-            let html = build_html_themed(&doc, &registry(), Trust::Restricted, Some(preset));
-            assert!(html.contains(expected), "{id} produced {html}");
-            // A pinned scheme must not also leave the paired value in, or the
-            // browser falls back to following the OS.
-            assert!(
-                !html.contains("color-scheme: light dark"),
-                "{id} must pin the scheme"
-            );
+            let html = build_html(&doc, &registry(), Trust::Restricted, dark);
+            assert!(html.contains(&format!("color-scheme: {scheme};")));
+            assert!(!html.contains("color-scheme: light dark"));
+            assert!(html.contains(&format!("--bg-color: {background};")));
+            assert!(html.contains(&format!("--text-color: {foreground};")));
+            assert!(html.contains("var(--bg-color"));
+            assert!(html.contains("var(--text-color"));
+            assert!(html.contains("default-src 'none'"));
+            assert!(html.contains("script-src 'none'"));
         }
-    }
-
-    #[test]
-    fn a_preset_paints_the_document_with_its_own_palette() {
-        // The whole point of the preset reaching the WebView: the preview and
-        // the chrome around it must not disagree about what Nord looks like.
-        let preset = crate::theme::by_id("nord", true);
-        let html = build_html_themed(&md("# x\n"), &registry(), Trust::Restricted, Some(preset));
-        assert!(
-            html.contains(&format!("--bg-color: #{:06x}", preset.tokens.bg)),
-            "got {html}"
-        );
-        assert!(html.contains(&format!(
-            "--text-secondary: #{:06x}",
-            preset.tokens.text_secondary
-        )));
-        assert!(html.contains(&format!("--link-color: #{:06x}", preset.tokens.link)));
-        // The stylesheet has to actually consume them, or the variables are
-        // decoration.
-        assert!(html.contains("var(--bg-color"));
-        assert!(html.contains("var(--link-color"));
-    }
-
-    #[test]
-    fn a_reading_preset_carries_its_typeface_into_the_preview() {
-        let writer = crate::theme::by_id("writer", false);
-        let html = build_html_themed(&md("# x\n"), &registry(), Trust::Restricted, Some(writer));
-        assert!(html.contains("--body-font:"), "got {html}");
-        assert!(html.contains("monospace"), "Writer is a monospace preset");
-        assert!(html.contains("var(--body-font"));
-    }
-
-    #[test]
-    fn theming_does_not_weaken_the_csp() {
-        // The palette is injected next to the stylesheet; a mistake there would
-        // be the kind that quietly drops a directive.
-        let html = build_html_themed(
-            &md("# x\n"),
-            &registry(),
-            Trust::Restricted,
-            Some(crate::theme::by_id("dracula", true)),
-        );
-        assert!(html.contains("default-src 'none'"));
-        assert!(html.contains("script-src 'none'"));
     }
 
     #[test]
     fn block_order_is_preserved_around_diagrams() {
         let src = "First.\n\n$$\nx\n$$\n\nLast.\n";
-        let html = build_html(&md(src), &registry(), Trust::Restricted);
+        let html = build_html(&md(src), &registry(), Trust::Restricted, false);
         let body = body(&html);
         let first = body.find("First.").expect("first paragraph");
         let math = body.find("mt-render").expect("rendered math");
@@ -738,12 +679,11 @@ mod tests {
 
     #[test]
     fn an_html_file_is_served_as_its_own_document() {
-        // Through `build_html_themed` this would end up as a whole document
-        // nested inside another one, and the parser keeps only the first
-        // `<head>` — taking the file's own stylesheet and metadata with it.
+        // The public builder must dispatch HTML without a second document
+        // shell, retaining the file's own stylesheet and metadata.
         let src =
             "<!doctype html><html><head><title>Mine</title></head><body><p>Hi</p></body></html>";
-        let out = build_html_raw(&html_doc(src), Trust::Trusted);
+        let out = build_html(&html_doc(src), &registry(), Trust::Trusted, false);
         assert_eq!(out, src, "a trusted file is served byte for byte");
         assert_eq!(out.matches("<html").count(), 1, "no nesting");
     }
@@ -772,19 +712,63 @@ mod tests {
     }
 
     #[test]
-    fn the_files_own_head_survives_the_insertion() {
-        // The failure this guards: inserting at the top closes the head the
-        // parser built, and every one of the file's own head children is
-        // reparented into `<body>` — a `<meta charset>` among them, which is
-        // how a correctly-encoded page turns into mojibake.
-        let src = "<!doctype html><html><head><meta charset=\"utf-8\">\
-                   <title>Mine</title></head><body>x</body></html>";
-        let out = build_html_raw(&html_doc(src), Trust::Restricted);
-        let charset = out.find("charset=\"utf-8\"").expect("the file's charset");
-        let ours = out.find("Content-Security-Policy").expect("our CSP");
-        let head_close = out.to_ascii_lowercase().find("</head>").expect("</head>");
-        assert!(charset < ours, "our insertion displaced the file's head");
-        assert!(ours < head_close, "our additions must land inside the head");
+    fn restricted_html_gets_its_policy_before_author_scripts() {
+        // Include malformed doctypes and script-like text in a doctype so no
+        // search for the first `>` can put the policy after executable markup.
+        for prefix in [
+            "<!doctype html>",
+            "<!DOCTYPE HTML>",
+            "<!doctype html PUBLIC \"quoted > identifier\">",
+            "<!doctype x \"><script>early()</script>\">",
+            "<!-- comment -->",
+            "",
+        ] {
+            let src = format!(
+                "{prefix}<html><head><meta charset=\"utf-8\"><title>Mine</title>\
+                 <script>run()</script></head><body>x</body></html>"
+            );
+            let out = build_html(&html_doc(&src), &registry(), Trust::Restricted, true);
+            let policy = out.find("Content-Security-Policy").expect("policy");
+            let author = out.find(prefix).unwrap_or(out.len());
+            let script = out.find("<script>").expect("author script");
+            let charset = out.find("charset=\"utf-8\"").expect("author charset");
+            let banner = out.find("Trust this document").expect("trust banner");
+            let head_close = out.find("</head>").expect("head close");
+            assert!(policy < script && policy < charset, "got {out}");
+            if !prefix.is_empty() && !prefix.eq_ignore_ascii_case("<!doctype html>") {
+                assert!(policy < author, "policy must precede author markup: {out}");
+            }
+            assert!(charset < banner && banner < head_close);
+            assert!(out.contains("<title>Mine</title>"));
+            assert!(out.contains("script-src 'none'"));
+        }
+    }
+
+    #[test]
+    fn diagram_and_math_use_the_registry_in_both_trust_modes() {
+        let doc = md("```d2\na -> b\n```\n\n$$\nx^2\n$$\n");
+        for trust in [Trust::Restricted, Trust::Trusted] {
+            let html = build_html(&doc, &registry(), trust, true);
+            let body = body(&html);
+            let diagram = body
+                .find("<figure class=\"mt-render mt-d2\">")
+                .expect("diagram");
+            let math = body
+                .find("<figure class=\"mt-render mt-math\">")
+                .expect("math");
+            assert!(diagram < math, "blocks out of order: {body}");
+            assert!(body[diagram..math].contains("<svg"), "{body}");
+            assert!(body[math..].contains("<svg"), "{body}");
+        }
+    }
+
+    #[test]
+    fn trusted_html_keeps_its_scripts_and_resources_unchanged() {
+        let src = "<!doctype html><head><script>run()</script>\
+                   <link rel=\"stylesheet\" href=\"local.css\"></head><body>x</body>";
+        let out = build_html(&html_doc(src), &registry(), Trust::Trusted, true);
+        assert_eq!(out, src);
+        assert!(!out.contains("Content-Security-Policy"));
     }
 
     #[test]

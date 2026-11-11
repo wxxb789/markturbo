@@ -1,5 +1,25 @@
 # Architecture
 
+> **Migration status (2026-11-11):** `crates/mt-app` is now a Native Shell
+> (nsh 0.4) Rust app on the native Win32/Direct2D, AppKit and GTK 4 backends.
+> `mt-core` remains UI-framework-free. The GPUI-specific mechanisms below
+> describe the v0.1 shell and are retained as history; current UI boundaries are
+> the nsh modules under `crates/mt-app/src`.
+
+## Current nsh shell
+
+`crates/mt-app/src` is the live application boundary:
+
+|Module|Responsibility|
+|---|---|
+|`app.rs`|Window regions, toolbar/sidebar, tabs, document panes, Context/Review/Revision panels, recovery banner and conflict choices.|
+|`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore, Web trust.|
+|`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
+|`web.rs`, `theme.rs`, `i18n.rs`|HTML/CSP construction, theme tokens and localized disclosure strings.|
+
+The sections below describe the retired GPUI implementation and remain as
+history for the headless boundaries that `mt-core` still owns.
+
 The boundaries chosen for v0.1, and why. This records the architecture work
 requested by the [historical v0.1 product direction](history/v0.1-product-direction.md),
 after inspecting upstream source rather than relying on assumptions. Current

@@ -48,9 +48,10 @@ credential confidentiality, grounded findings, and user trust.
 
 ### Primary platform
 
-The first public-quality platform is Windows 11 x64. Windows 10 x64 may remain
-compatible, and macOS and Linux may continue to build, but none is described as
-public-quality until it receives its own clean-machine acceptance evidence.
+MarkTurbo supports three desktop platforms: Windows 11 x64, macOS 14+ and Linux
+with GTK 4.14+. The first public-quality platform remains Windows 11 x64;
+macOS and Linux are required supported targets and are described as
+public-quality only after their own clean-machine acceptance evidence.
 
 ### Artifact types
 
@@ -275,8 +276,9 @@ event summaries are deleted within 90 days after the `continue`, `revise`, or
 - hidden telemetry or uploading source/model content for product improvement;
 - automatic edits, whole-document replacement, or applying a model result
   without source-snapshot validation and explicit approval;
-- expanding platforms, providers, renderers, diagram types, themes, or harness
-  catalogs before recurring value is validated;
+- expanding beyond the three required desktop platforms, or expanding providers,
+  renderers, diagram types, themes, or harness catalogs before recurring value
+  is validated;
 - commercial validation as the near-term success gate.
 
 ## Approval Record

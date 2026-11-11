@@ -1,19 +1,21 @@
 //! Pattern matching (`mhchemParser.patterns`).
 
+use crate::expansion_budget::ExpansionBudget;
 use crate::mhchem::data::MhchemData;
 use crate::mhchem::error::{MhchemError, MhchemResult};
 use fancy_regex::Regex;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 #[derive(Clone, Debug)]
-pub enum MatchToken {
-    S(String),
-    A(Vec<String>),
+pub enum MatchToken<'a> {
+    S(Cow<'a, str>),
+    A(Vec<Cow<'a, str>>),
 }
 
-pub struct PatternHit {
-    pub token: MatchToken,
-    pub remainder: String,
+pub struct PatternHit<'a> {
+    pub token: MatchToken<'a>,
+    pub remainder: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -87,15 +89,16 @@ fn scan_end(input: &str, start: usize, end: End<'_>) -> MhchemResult<Option<(usi
 
 /// KaTeX `findObserveGroups`.
 #[allow(clippy::too_many_arguments)]
-pub fn find_observe_groups(
-    input: &str,
+pub fn find_observe_groups<'a>(
+    input: &'a str,
     beg_excl: &str,
     beg_incl: Beg<'_>,
     end_incl: &str,
     end_excl: End<'_>,
     part2: Option<(&str, Beg<'_>, &str, End<'_>)>,
     combine: bool,
-) -> MhchemResult<Option<PatternHit>> {
+    resources: &ExpansionBudget,
+) -> MhchemResult<Option<PatternHit<'a>>> {
     let ex = if beg_excl.is_empty() {
         0
     } else {
@@ -120,11 +123,11 @@ pub fn find_observe_groups(
     };
     let use_incl = !end_incl.is_empty();
     let cut = if use_incl { e.1 } else { e.0 };
-    let m1 = rest1[..cut].to_string();
-    let after = rest1[e.1..].to_string();
+    let m1 = Cow::Borrowed(&rest1[..cut]);
+    let after = &rest1[e.1..];
 
     if let Some((b2e, b2i, e2i, e2e)) = part2 {
-        let g2 = find_observe_groups(&after, b2e, b2i, e2i, e2e, None, false)?;
+        let g2 = find_observe_groups(after, b2e, b2i, e2i, e2e, None, false, resources)?;
         let Some(h2) = g2 else {
             return Ok(None);
         };
@@ -133,7 +136,7 @@ pub fn find_observe_groups(
             MatchToken::A(_) => return Err(MhchemError::msg("nested Fog pair")),
         };
         let tok = if combine {
-            MatchToken::S(format!("{m1}{m2}"))
+            MatchToken::S(Cow::Owned(resources.format(format_args!("{m1}{m2}"))?))
         } else {
             MatchToken::A(vec![m1, m2])
         };
@@ -149,7 +152,7 @@ pub fn find_observe_groups(
     }))
 }
 
-fn regex_match_token(re: &Regex, input: &str) -> Option<(MatchToken, usize)> {
+fn regex_match_token<'a>(re: &Regex, input: &'a str) -> Option<(MatchToken<'a>, usize)> {
     let caps = re.captures(input).ok().flatten()?;
     let m0 = caps.get(0)?;
     let end = m0.end();
@@ -157,15 +160,15 @@ fn regex_match_token(re: &Regex, input: &str) -> Option<(MatchToken, usize)> {
         if !g2.as_str().is_empty() {
             let g1 = caps
                 .get(1)
-                .map(|g| g.as_str().to_string())
+                .map(|g| Cow::Borrowed(g.as_str()))
                 .unwrap_or_default();
-            return Some((MatchToken::A(vec![g1, g2.as_str().to_string()]), end));
+            return Some((MatchToken::A(vec![g1, Cow::Borrowed(g2.as_str())]), end));
         }
     }
     if let Some(g1) = caps.get(1) {
-        return Some((MatchToken::S(g1.as_str().to_string()), end));
+        return Some((MatchToken::S(Cow::Borrowed(g1.as_str())), end));
     }
-    Some((MatchToken::S(m0.as_str().to_string()), end))
+    Some((MatchToken::S(Cow::Borrowed(m0.as_str())), end))
 }
 
 static RE_AGG_OPEN: LazyLock<Regex> =
@@ -205,22 +208,32 @@ static RE_FORMULA_MAIN: LazyLock<Regex> = LazyLock::new(|| {
     ).unwrap()
 });
 
-fn pattern_neg_pow(input: &str) -> MhchemResult<Option<PatternHit>> {
+fn pattern_neg_pow<'a>(
+    input: &'a str,
+    _resources: &ExpansionBudget,
+) -> MhchemResult<Option<PatternHit<'a>>> {
     let Some(c) = RE_NEG_POW.captures(input).ok().flatten() else {
         return Ok(None);
     };
     let full = c.get(0).unwrap();
     let mut v = Vec::new();
     for i in 1..c.len() {
-        v.push(c.get(i).map(|g| g.as_str().to_string()).unwrap_or_default());
+        v.push(
+            c.get(i)
+                .map(|g| Cow::Borrowed(g.as_str()))
+                .unwrap_or_default(),
+        );
     }
     Ok(Some(PatternHit {
         token: MatchToken::A(v),
-        remainder: input[full.end()..].to_string(),
+        remainder: &input[full.end()..],
     }))
 }
 
-fn pattern_sci(input: &str) -> MhchemResult<Option<PatternHit>> {
+fn pattern_sci<'a>(
+    input: &'a str,
+    _resources: &ExpansionBudget,
+) -> MhchemResult<Option<PatternHit<'a>>> {
     let Some(c) = RE_SCI.captures(input).ok().flatten() else {
         return Ok(None);
     };
@@ -230,15 +243,22 @@ fn pattern_sci(input: &str) -> MhchemResult<Option<PatternHit>> {
     }
     let mut v = Vec::new();
     for i in 1..c.len() {
-        v.push(c.get(i).map(|g| g.as_str().to_string()).unwrap_or_default());
+        v.push(
+            c.get(i)
+                .map(|g| Cow::Borrowed(g.as_str()))
+                .unwrap_or_default(),
+        );
     }
     Ok(Some(PatternHit {
         token: MatchToken::A(v),
-        remainder: input[full.end()..].to_string(),
+        remainder: &input[full.end()..],
     }))
 }
 
-fn pattern_state_of_agg(input: &str) -> MhchemResult<Option<PatternHit>> {
+fn pattern_state_of_agg<'a>(
+    input: &'a str,
+    resources: &ExpansionBudget,
+) -> MhchemResult<Option<PatternHit<'a>>> {
     if let Some(h) = find_observe_groups(
         input,
         "",
@@ -247,9 +267,10 @@ fn pattern_state_of_agg(input: &str) -> MhchemResult<Option<PatternHit>> {
         End::Str(""),
         None,
         false,
+        resources,
     )? {
         if RE_SOA_REMAINDER
-            .find(&h.remainder)
+            .find(h.remainder)
             .ok()
             .flatten()
             .filter(|m| m.start() == 0)
@@ -261,21 +282,33 @@ fn pattern_state_of_agg(input: &str) -> MhchemResult<Option<PatternHit>> {
     let re = &*RE_SOA_ALT;
     if let Some(m) = re.find(input).ok().flatten() {
         return Ok(Some(PatternHit {
-            token: MatchToken::S(m.as_str().to_string()),
-            remainder: input[m.end()..].to_string(),
+            token: MatchToken::S(Cow::Borrowed(m.as_str())),
+            remainder: &input[m.end()..],
         }));
     }
     Ok(None)
 }
 
-fn pattern_amount(input: &str) -> MhchemResult<Option<PatternHit>> {
+fn pattern_amount<'a>(
+    input: &'a str,
+    resources: &ExpansionBudget,
+) -> MhchemResult<Option<PatternHit<'a>>> {
     if let Some(m) = RE_AMOUNT_MAIN.find(input).ok().flatten() {
         return Ok(Some(PatternHit {
-            token: MatchToken::S(m.as_str().to_string()),
-            remainder: input[m.end()..].to_string(),
+            token: MatchToken::S(Cow::Borrowed(m.as_str())),
+            remainder: &input[m.end()..],
         }));
     }
-    let Some(h) = find_observe_groups(input, "", Beg::Str("$"), "$", End::Str(""), None, false)?
+    let Some(h) = find_observe_groups(
+        input,
+        "",
+        Beg::Str("$"),
+        "$",
+        End::Str(""),
+        None,
+        false,
+        resources,
+    )?
     else {
         return Ok(None);
     };
@@ -284,7 +317,7 @@ fn pattern_amount(input: &str) -> MhchemResult<Option<PatternHit>> {
     };
     if RE_AMOUNT_DOLLAR.find(s).ok().flatten().is_some() {
         Ok(Some(PatternHit {
-            token: MatchToken::S(s.clone()),
+            token: h.token,
             remainder: h.remainder,
         }))
     } else {
@@ -292,7 +325,10 @@ fn pattern_amount(input: &str) -> MhchemResult<Option<PatternHit>> {
     }
 }
 
-fn pattern_formula(input: &str) -> MhchemResult<Option<PatternHit>> {
+fn pattern_formula<'a>(
+    input: &'a str,
+    _resources: &ExpansionBudget,
+) -> MhchemResult<Option<PatternHit<'a>>> {
     if RE_FORMULA_PAREN_ONLY.is_match(input).unwrap_or(false) {
         return Ok(None);
     }
@@ -301,28 +337,43 @@ fn pattern_formula(input: &str) -> MhchemResult<Option<PatternHit>> {
         .ok()
         .flatten()
         .map(|m| PatternHit {
-            token: MatchToken::S(m.as_str().to_string()),
-            remainder: input[m.end()..].to_string(),
+            token: MatchToken::S(Cow::Borrowed(m.as_str())),
+            remainder: &input[m.end()..],
         }))
 }
 
-pub fn match_pattern(
+pub fn match_pattern<'a>(
     data: &MhchemData,
     pattern_name: &str,
-    input: &str,
-) -> MhchemResult<Option<PatternHit>> {
+    input: &'a str,
+    resources: &ExpansionBudget,
+) -> MhchemResult<Option<PatternHit<'a>>> {
     match pattern_name {
-        "(-)(9)^(-9)" => pattern_neg_pow(input),
-        "(-)(9.,9)(e)(99)" => pattern_sci(input),
-        "state of aggregation $" => pattern_state_of_agg(input),
-        "amount" | "amount2" => pattern_amount(input),
-        "formula$" => pattern_formula(input),
-        "^{(...)}" => {
-            find_observe_groups(input, "^{", Beg::Str(""), "", End::Str("}"), None, false)
-        }
-        "^($...$)" => {
-            find_observe_groups(input, "^", Beg::Str("$"), "$", End::Str(""), None, false)
-        }
+        "(-)(9)^(-9)" => pattern_neg_pow(input, resources),
+        "(-)(9.,9)(e)(99)" => pattern_sci(input, resources),
+        "state of aggregation $" => pattern_state_of_agg(input, resources),
+        "amount" | "amount2" => pattern_amount(input, resources),
+        "formula$" => pattern_formula(input, resources),
+        "^{(...)}" => find_observe_groups(
+            input,
+            "^{",
+            Beg::Str(""),
+            "",
+            End::Str("}"),
+            None,
+            false,
+            resources,
+        ),
+        "^($...$)" => find_observe_groups(
+            input,
+            "^",
+            Beg::Str("$"),
+            "$",
+            End::Str(""),
+            None,
+            false,
+            resources,
+        ),
         "^\\x{}{}" => find_observe_groups(
             input,
             "^",
@@ -331,6 +382,7 @@ pub fn match_pattern(
             End::Str(""),
             Some(("", Beg::Str("{"), "}", End::Str(""))),
             true,
+            resources,
         ),
         "^\\x{}" => find_observe_groups(
             input,
@@ -340,13 +392,28 @@ pub fn match_pattern(
             End::Str(""),
             None,
             false,
+            resources,
         ),
-        "_{(...)}" => {
-            find_observe_groups(input, "_{", Beg::Str(""), "", End::Str("}"), None, false)
-        }
-        "_($...$)" => {
-            find_observe_groups(input, "_", Beg::Str("$"), "$", End::Str(""), None, false)
-        }
+        "_{(...)}" => find_observe_groups(
+            input,
+            "_{",
+            Beg::Str(""),
+            "",
+            End::Str("}"),
+            None,
+            false,
+            resources,
+        ),
+        "_($...$)" => find_observe_groups(
+            input,
+            "_",
+            Beg::Str("$"),
+            "$",
+            End::Str(""),
+            None,
+            false,
+            resources,
+        ),
         "_\\x{}{}" => find_observe_groups(
             input,
             "_",
@@ -355,6 +422,7 @@ pub fn match_pattern(
             End::Str(""),
             Some(("", Beg::Str("{"), "}", End::Str(""))),
             true,
+            resources,
         ),
         "_\\x{}" => find_observe_groups(
             input,
@@ -364,14 +432,58 @@ pub fn match_pattern(
             End::Str(""),
             None,
             false,
+            resources,
         ),
-        "{...}" => find_observe_groups(input, "", Beg::Str("{"), "}", End::Str(""), None, false),
-        "{(...)}" => find_observe_groups(input, "{", Beg::Str(""), "", End::Str("}"), None, false),
-        "$...$" => find_observe_groups(input, "", Beg::Str("$"), "$", End::Str(""), None, false),
-        "${(...)}$" => {
-            find_observe_groups(input, "${", Beg::Str(""), "", End::Str("}$"), None, false)
-        }
-        "$(...)$" => find_observe_groups(input, "$", Beg::Str(""), "", End::Str("$"), None, false),
+        "{...}" => find_observe_groups(
+            input,
+            "",
+            Beg::Str("{"),
+            "}",
+            End::Str(""),
+            None,
+            false,
+            resources,
+        ),
+        "{(...)}" => find_observe_groups(
+            input,
+            "{",
+            Beg::Str(""),
+            "",
+            End::Str("}"),
+            None,
+            false,
+            resources,
+        ),
+        "$...$" => find_observe_groups(
+            input,
+            "",
+            Beg::Str("$"),
+            "$",
+            End::Str(""),
+            None,
+            false,
+            resources,
+        ),
+        "${(...)}$" => find_observe_groups(
+            input,
+            "${",
+            Beg::Str(""),
+            "",
+            End::Str("}$"),
+            None,
+            false,
+            resources,
+        ),
+        "$(...)$" => find_observe_groups(
+            input,
+            "$",
+            Beg::Str(""),
+            "",
+            End::Str("$"),
+            None,
+            false,
+            resources,
+        ),
         "\\bond{(...)}" => find_observe_groups(
             input,
             "\\bond{",
@@ -380,8 +492,18 @@ pub fn match_pattern(
             End::Str("}"),
             None,
             false,
+            resources,
         ),
-        "[(...)]" => find_observe_groups(input, "[", Beg::Str(""), "", End::Str("]"), None, false),
+        "[(...)]" => find_observe_groups(
+            input,
+            "[",
+            Beg::Str(""),
+            "",
+            End::Str("]"),
+            None,
+            false,
+            resources,
+        ),
         "\\x{}{}" => find_observe_groups(
             input,
             "",
@@ -390,6 +512,7 @@ pub fn match_pattern(
             End::Str(""),
             Some(("", Beg::Str("{"), "}", End::Str(""))),
             true,
+            resources,
         ),
         "\\x{}" => find_observe_groups(
             input,
@@ -399,6 +522,7 @@ pub fn match_pattern(
             End::Str(""),
             None,
             false,
+            resources,
         ),
         "\\frac{(...)}" => find_observe_groups(
             input,
@@ -408,6 +532,7 @@ pub fn match_pattern(
             End::Str("}"),
             Some(("{", Beg::Str(""), "", End::Str("}"))),
             false,
+            resources,
         ),
         "\\overset{(...)}" => find_observe_groups(
             input,
@@ -417,6 +542,7 @@ pub fn match_pattern(
             End::Str("}"),
             Some(("{", Beg::Str(""), "", End::Str("}"))),
             false,
+            resources,
         ),
         "\\underset{(...)}" => find_observe_groups(
             input,
@@ -426,6 +552,7 @@ pub fn match_pattern(
             End::Str("}"),
             Some(("{", Beg::Str(""), "", End::Str("}"))),
             false,
+            resources,
         ),
         "\\underbrace{(...)}" => find_observe_groups(
             input,
@@ -435,6 +562,7 @@ pub fn match_pattern(
             End::Str("}_"),
             Some(("{", Beg::Str(""), "", End::Str("}"))),
             false,
+            resources,
         ),
         "\\color{(...)}0" => find_observe_groups(
             input,
@@ -444,6 +572,7 @@ pub fn match_pattern(
             End::Str("}"),
             None,
             false,
+            resources,
         ),
         "\\color{(...)}{(...)}1" => find_observe_groups(
             input,
@@ -453,6 +582,7 @@ pub fn match_pattern(
             End::Str("}"),
             Some(("{", Beg::Str(""), "", End::Str("}"))),
             false,
+            resources,
         ),
         "\\color(...){(...)}2" => find_observe_groups(
             input,
@@ -462,10 +592,18 @@ pub fn match_pattern(
             End::Re(&RE_BEFORE_BRACE),
             Some(("{", Beg::Str(""), "", End::Str("}"))),
             false,
+            resources,
         ),
-        "\\ce{(...)}" => {
-            find_observe_groups(input, "\\ce{", Beg::Str(""), "", End::Str("}"), None, false)
-        }
+        "\\ce{(...)}" => find_observe_groups(
+            input,
+            "\\ce{",
+            Beg::Str(""),
+            "",
+            End::Str("}"),
+            None,
+            false,
+            resources,
+        ),
         _ => {
             let Some(re) = data.regexes.map.get(pattern_name) else {
                 return Err(MhchemError::msg(format!(
@@ -474,7 +612,7 @@ pub fn match_pattern(
             };
             Ok(regex_match_token(re, input).map(|(t, n)| PatternHit {
                 token: t,
-                remainder: input[n..].to_string(),
+                remainder: &input[n..],
             }))
         }
     }
@@ -488,7 +626,14 @@ mod fog_tests {
     fn x_double_brace_second_group_includes_nested_ce_close() {
         use crate::mhchem::data::data;
         let input = r"\underset{\mathrm{red}}{\ce{HgI2}}";
-        let hit = match_pattern(data(), r"\x{}{}", input).unwrap().unwrap();
+        let hit = match_pattern(
+            data(),
+            r"\x{}{}",
+            input,
+            &crate::expansion_budget::ExpansionBudget::default(),
+        )
+        .unwrap()
+        .unwrap();
         let MatchToken::S(s) = hit.token else {
             panic!("expected combined S");
         };
@@ -507,6 +652,7 @@ mod fog_tests {
             End::Str("}"),
             Some(("{", Beg::Str(""), "", End::Str("}"))),
             false,
+            &crate::expansion_budget::ExpansionBudget::default(),
         )
         .unwrap()
         .unwrap();

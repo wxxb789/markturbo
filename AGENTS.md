@@ -10,10 +10,12 @@
 - Rust module/crate moves: use `.agents/skills/rust-quality/SKILL.md` to trace
   ownership, affected callers and failure contracts before editing. Its pinned
   upstream guidance does not override product behavior or measured evidence.
-- UI: use the relevant checked-in GPUI Skill guidance, but verify APIs in the
-  source selected by Cargo.lock. Live upstream docs may describe a different
-  version. Project product/architecture decisions govern over generic library
-  examples; no upstream guide requires rewriting unrelated application code.
+- UI: `crates/mt-app` is a Native Shell (nsh) Rust app on the native Win32,
+  AppKit and GTK 4 backends; it has no GPUI or GPUI Kit dependency. Verify nsh
+  APIs in the crate source selected by Cargo.lock. Live upstream docs may
+  describe a different version. Project product/architecture decisions govern
+  over generic library examples; no upstream guide requires rewriting unrelated
+  application code.
 
 PRODUCT.md owns product scope, goals own acceptance, `docs/development.md` owns
 validation cadence, and source/tests establish current implementation. History
@@ -51,13 +53,16 @@ Use `uv run --locked --project scripts scripts/mt.py check <tier>`:
 | `fast` | Docs/tooling: whitespace and non-desktop Python tests |
 | `doc` | Headless core changes: fast, formatting and optimized mt-core tests |
 | `ci` | Settled Rust changes: fast, formatting, optimized Clippy/workspace tests |
+| `native` | Native acceptance harness code only: parallel harness unit tests; not acceptance |
 | `full` | Release artifacts: production-profile checks, build and privacy scan |
 
-For UI interactions, reuse GPUI Kit headless fixtures and stable element IDs
+For UI interactions, reuse `nsh_testing::Headless` and stable `testID` labels
 before adding native automation; see `docs/development.md` for a runnable example.
 During iteration, filter the affected Rust test or Python test module; see
 `docs/development.md`. Fast does not test Rust; doc does not compile mt-app.
-CI on the final proposed revision can supply the workspace gate. Do not repeat a
+Large-document timing probes are opt-in and excluded from `ci`; see
+`docs/verification.md`. CI on the final proposed revision can supply the
+workspace gate. Do not repeat a
 successful gate locally merely to open a PR, require a clean worktree while
 iterating, or run full/native suites for every small task. Re-run after relevant
 code/configuration/dependency changes or an unresolved failure, not arbitrarily.
@@ -75,15 +80,17 @@ Performance claims require production-profile measurements; consult existing
 
 ## Invariants and delivery
 
-- `mt-core` stays GPUI-free. Keep `panic = "unwind"` and the vendored RaTeX
-  allocation clamp. Content failures become diagnostics; preserve editable text.
+- `mt-core` stays UI-framework-free. Keep `panic = "unwind"` and the vendored
+  RaTeX allocation clamp (now 0.1.15, matching nsh-base). Content failures become
+  diagnostics; preserve editable text.
 - Never mutate a WebView from render; mark `web_dirty` and defer the update.
 - Preserve consent, credential confidentiality and content-free native evidence.
   Do not log test text, user documents, secrets or local paths into that evidence.
 - Ship required fonts/sample inside the executable. Windows 11 x64 is the only
   public-quality target; Linux/macOS CI provides compatibility coverage.
 - Read Cargo.toml dependency comments. Prefer crates.io, retain the sole local
-  patch, and keep the Kit/GPUI snapshot family on one registry source. Update manifests and
+  patch (`vendor/ratex-parser`, 0.1.15), and keep the nsh crates on the CLI's
+  version (0.4.0). Update manifests and
   locks together; changing dependency provenance requires explicit review.
 - Use English in code/docs/commits/PRs. Make cohesive PRs, link the goal for
   product work, format changed Rust code, and avoid unrelated formatting churn.

@@ -22,6 +22,7 @@ revision, not commands to rerun every time. CLAUDE.md links to AGENTS.md.
 | Change | Local default | Native verification |
 | --- | --- | --- |
 | Documentation or Python tooling | `check fast` | None unless native harness behavior changed |
+| Native acceptance harness code | `check native` | Harness unit tests only; acceptance stays milestone-bound |
 | `mt-core` logic | `check doc` | None for headless domain behavior alone |
 | App logic, Rust dependency or build configuration | Focused tests, then `check ci` | Only affected native boundaries |
 | Layout, strings or ordinary controls | Relevant logic/i18n tests; inspect the changed state | Focused manual smoke when available; full Goal 09 matrix at the visual milestone |
@@ -29,10 +30,17 @@ revision, not commands to rerun every time. CLAUDE.md links to AGENTS.md.
 | Integrated milestone/public-quality release | `check full` | Applicable native suites, clean-machine and product evidence on the final artifact |
 
 `check fast` does not validate Rust. `check doc` does not validate `mt-app`.
-Neither `check ci` nor `check full` launches a GUI. Cross-platform CI tests
-compatibility; the separate macOS arm64 PR job attempts a first-frame launch
-of a staged release executable, not native acceptance or an installable `.app`.
-Windows 11 x64 remains the public-quality target.
+`check native` validates only native acceptance harness code; it does not run a
+desktop or an executable. Neither `check ci` nor `check full` launches a GUI.
+Cross-platform CI compiles and tests the nsh app on Windows, macOS and Linux;
+the separate macOS arm64 PR job checks the arm64 slice and runs the headless
+suite, not native acceptance or an installable `.app`. Windows 11 x64 remains
+the public-quality target.
+
+The verification layering, invariant ownership and rules for adding tests live
+in [validation](verification.md). In short: current product/tooling contracts run
+in parallel shards in `check fast`; native harness unit tests moved to
+`check native`; large-document timing probes are opt-in and are not a PR gate.
 
 Focused examples (replace the filter with the behavior being changed):
 
@@ -45,49 +53,54 @@ uv run --locked --project scripts python -m unittest scripts.tests.test_checks
 
 The `ci` profile inherits release optimization and assertion behavior but turns
 off LTO and uses 16 codegen units. This avoids paying distribution-size link
-costs on every PR and keeps timing-sensitive tests optimized. It is not an
-artifact-size or runtime-performance baseline. `check full` runs production
-release validation directly, without first rebuilding a second test profile.
-The `mt-core` performance integration tests serialize their timing cases within
-the test binary so concurrent 100K-line parses cannot consume each other's
-wall-clock allowance; their 45-second bound remains unchanged.
-No measured speedup is claimed until comparable CI timings are available.
+costs on every PR. It is not an artifact-size or runtime-performance baseline.
+`check full` runs production release validation directly, without first
+rebuilding a second test profile.
+
+The default performance integration test keeps fast 10K-line guards and
+serializes its timing cases. The 100K-line parse, superlinear-overhead and
+background-parse-duration probes are `#[ignore]`d; run them explicitly with
+`cargo test --profile release -p mt-core --test performance -- --ignored`.
+Wall-clock thresholds are measurements for a release/milestone checkpoint, not
+per-PR correctness gates.
 The release privacy scan takes its executable path from Cargo's build artifact
 messages, including custom target directories and target triples; it never falls
 back to a potentially stale `target/release/markturbo` binary.
 
 ## Keep the test boundary honest
 
-Prefer these layers in order: pure domain/state tests, GPUI headless
+Prefer these layers in order: pure domain/state tests, `nsh_testing::Headless`
 interaction tests, then real Windows automation. A headless test can dispatch
 keyboard/pointer events and check component state/focus/layout; it cannot prove
 Windows IME composition, the OS clipboard, native dialogs, WebView2 focus or
 DPAPI/session behavior. Keep native coverage for those boundaries.
 
-GPUI Kit `test-support` is enabled only for dev-dependencies. Reuse
-`open_test_workspace*` in `crates/mt-app/src/views/workspace.rs`; ordinary UI
-iterations need no external desktop runner. First-use interaction tests live in
-`crates/mt-app/src/views/workspace/tests/welcome.rs`; for example:
+`nsh-engine` and `nsh-testing` are dev-dependencies. A headless test starts the
+real app (`Headless::start`), finds controls by `testID`, text or accessibility
+label, presses/types/scrolls, and reads the text and state on screen. The shell
+regression is `crates/mt-app/tests/shell.rs`; for example:
 
 ```sh
-cargo test --locked --profile ci -p mt-app kit_welcome_new_click
+cargo test --locked -p mt-app --test shell
 ```
 
-The regression renders the real welcome page, clicks its stable `ElementId`
-with `gpui_kit::test::TestWindowExt`, checks that welcome disappears and exactly
-one buffer opens, then types into the focused editor and checks its dirty text.
-Use `window.render_frame(app)` before snapshots after external state changes;
-Kit clicks also render frames. Kit/Base controls already expose observations;
+It opens a real Markdown fixture through `MARKTURBO_OPEN`, waits for the source
+editor and native preview, types into the editor, saves, and checks the file.
+First-use interaction tests and Welcome's recent-target behavior remain to be
+ported; the old GPUI Kit fixtures are not part of the nsh app.
 custom identified elements can use `TestSupportExt::test_support()` (inert in
 production). Prefer IDs over coordinates and import test types explicitly to
 avoid glob-importing Kit's `test` macro over Rust's built-in `#[test]`.
 
-`scripts/mt.py check fast` runs the explicit portable Python test manifest,
-including fake-UIA selectors, goal-specific source/privacy checks, and the
-Goal 07 loopback provider tests. It never launches the app or a Windows UIA
-session. Real desktop automation runs through `scripts/mt.py accept goal-02`,
-`goal-03`, `goal-06`, or `goal-07` with a final executable hash and full required
-case set; `--case` is a diagnostic run, not acceptance.
+`scripts/mt.py check fast` runs the explicit current-tooling manifest as
+deterministically partitioned subprocess shards. It includes CLI/privacy,
+evaluation, performance-fixture and recovery-capacity contracts. Native
+acceptance harness unit tests (including the retired GPUI selectors) moved to
+`scripts/mt.py check native`; run that only when changing the harness. Neither
+tier launches the app or a Windows UIA session. Real desktop automation runs
+through `scripts/mt.py accept goal-02`, `goal-03`, `goal-06`, or `goal-07` with a
+final executable hash and full required case set; `--case` is a diagnostic run,
+not acceptance.
 
 These helpers test events, state, focus and layout, not rendered pixels. Do not
 add screenshot/foreground automation for ordinary state changes, or replace
@@ -158,8 +171,9 @@ these are different questions from whether an implementation PR can merge.
 
 Prefer a small, reviewed compatible update over a workspace-wide `cargo update`.
 Keep Cargo.lock and scripts/uv.lock in the PR and use locked installs in CI.
-Update the GPUI/component/WebView group coherently; preserve its source identity,
-features and the RaTeX allocation clamp. Inspect upstream changes before major
+Update the nsh/runtime/WebView group coherently; keep the nsh crates on the
+CLI's version, preserve the platform features (including Linux `webview`) and
+the RaTeX allocation clamp. Inspect upstream changes before major
 updates, then test affected behavior. Ordinary tooling updates do not require
 GUI acceptance. Native stack upgrades require targeted Windows smoke at the
 integration checkpoint. See [the dependency review](dependency-review.md).
