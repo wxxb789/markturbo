@@ -1514,8 +1514,8 @@ fn small_button(label: &'static str, on_press: impl Fn() + 'static) -> impl Into
 }
 
 fn settings_page(state: AppState, language: Language, compact: bool) -> impl IntoElement {
-    let credential = signal(String::new());
-    let notice = signal(SharedString::from(""));
+    let credential = state.settings_credential;
+    let notice = state.settings_notice;
     let close = state.clone();
     let save = state.clone();
     let settings = state.settings.get();
@@ -1625,6 +1625,7 @@ fn settings_page(state: AppState, language: Language, compact: bool) -> impl Int
                 .items_center()
                 .child(
                     input()
+                        .test_id("api-key")
                         .masked(true)
                         .value(move || credential.get())
                         .on_change(move |value: &str| credential.set(value.to_owned()))

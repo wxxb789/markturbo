@@ -80,6 +80,7 @@ pub struct Tab {
     pub web_trusted: Signal<bool>,
     pub conflict: Signal<bool>,
     pub untitled: bool,
+    pub recovery_key: RecoveryKey,
     pub loaded: Rc<RefCell<LoadedFile>>,
 }
 
@@ -104,6 +105,8 @@ pub struct AppState {
     pub search_busy: Signal<bool>,
     pub settings: Signal<SettingsData>,
     pub settings_open: Signal<bool>,
+    pub settings_credential: Signal<String>,
+    pub settings_notice: Signal<SharedString>,
     pub recovery_records: Signal<Vec<RecoveredRecord>>,
     pub context_open: Signal<bool>,
     pub context_resolved: Signal<Option<ResolvedContext>>,
@@ -242,6 +245,8 @@ impl AppState {
             search_busy: signal(false),
             settings: signal(SettingsData::load()),
             settings_open: signal(false),
+            settings_credential: signal(String::new()),
+            settings_notice: signal(SharedString::from("")),
             recovery_records: signal(records),
             context_open: signal(false),
             context_resolved: signal(None),
@@ -375,6 +380,7 @@ impl AppState {
             self.settings.get().language,
             crate::i18n::Key::Untitled,
         ));
+        let recovery_key = RecoveryKey::new_memory();
         let text = signal(SharedString::from(text));
         self.tabs.update(|tabs| {
             tabs.push(Tab {
@@ -388,6 +394,7 @@ impl AppState {
                 web_trusted: signal(false),
                 conflict: signal(false),
                 untitled: true,
+                recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
             });
         });
@@ -413,6 +420,7 @@ impl AppState {
             .to_owned();
         let text = signal(SharedString::from(loaded.text.clone()));
         let path = loaded.path.clone();
+        let recovery_key = RecoveryKey::for_path(&path);
         self.record_recent(&path, RecentTargetKind::File);
         if dirty {
             self.note_edit(id);
@@ -429,6 +437,7 @@ impl AppState {
                 web_trusted: signal(false),
                 conflict: signal(false),
                 untitled: false,
+                recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
             });
         });
@@ -596,6 +605,32 @@ impl AppState {
             });
     }
 
+    /// The checkpoint identity and metadata for one tab. Untitled drafts use a
+    /// session-unique memory key and omit a source path so recovery never
+    /// invents a file that was never saved.
+    fn checkpoint_for_tab(tab: &Tab) -> RecoveryCheckpoint {
+        let loaded = tab.loaded.borrow();
+        let metadata = if tab.untitled {
+            RecoveryMetadata {
+                source_path: None,
+                encoding_name: loaded.encoding.name().to_owned(),
+                had_bom: loaded.had_bom,
+                newline: loaded.newline,
+                original_stamp: loaded.stamp.clone(),
+                source_identity: loaded.source_identity.clone(),
+                decode_had_errors: loaded.decode_had_errors,
+            }
+        } else {
+            RecoveryMetadata::from_loaded_file(&loaded)
+        };
+        RecoveryCheckpoint {
+            key: tab.recovery_key.clone(),
+            text: tab.text.get().to_string(),
+            metadata,
+            revision: None,
+        }
+    }
+
     /// Write idle or interval-due dirty buffers. Checkpoints are best effort:
     /// a failure is surfaced, never allowed to block editing or saving.
     pub fn checkpoint_tick(&self) {
@@ -606,16 +641,14 @@ impl AppState {
             .tabs
             .get()
             .iter()
-            .filter(|tab| tab.dirty.get() && !tab.untitled)
+            .filter(|tab| tab.dirty.get())
             .cloned()
             .collect();
         if tabs.is_empty() {
             return;
         }
-        let active_keys: HashSet<RecoveryKey> = tabs
-            .iter()
-            .map(|tab| RecoveryKey::for_path(&tab.path))
-            .collect();
+        let active_keys: HashSet<RecoveryKey> =
+            tabs.iter().map(|tab| tab.recovery_key.clone()).collect();
         let now = Instant::now();
         let mut failure = None;
         for tab in tabs {
@@ -639,12 +672,7 @@ impl AppState {
             if !should_write {
                 continue;
             }
-            let checkpoint = RecoveryCheckpoint {
-                key: RecoveryKey::for_path(&tab.path),
-                text: tab.text.get().to_string(),
-                metadata: RecoveryMetadata::from_loaded_file(&tab.loaded.borrow()),
-                revision: None,
-            };
+            let checkpoint = Self::checkpoint_for_tab(&tab);
             if let Err(error) = store.checkpoint(&checkpoint, &active_keys) {
                 failure = Some(error.to_string());
             }
@@ -671,40 +699,59 @@ impl AppState {
             .tabs
             .get()
             .iter()
-            .filter(|tab| tab.dirty.get() && !tab.untitled)
+            .filter(|tab| tab.dirty.get())
             .cloned()
             .collect();
         if tabs.is_empty() {
             return;
         }
-        let active_keys: HashSet<RecoveryKey> = tabs
-            .iter()
-            .map(|tab| RecoveryKey::for_path(&tab.path))
-            .collect();
+        let active_keys: HashSet<RecoveryKey> =
+            tabs.iter().map(|tab| tab.recovery_key.clone()).collect();
         for tab in tabs {
-            let checkpoint = RecoveryCheckpoint {
-                key: RecoveryKey::for_path(&tab.path),
-                text: tab.text.get().to_string(),
-                metadata: RecoveryMetadata::from_loaded_file(&tab.loaded.borrow()),
-                revision: None,
-            };
+            let checkpoint = Self::checkpoint_for_tab(&tab);
             let _ = store.checkpoint(&checkpoint, &active_keys);
         }
     }
 
-    /// Delete the checkpoint for a path once its text is saved or the tab is
-    /// closed deliberately.
-    fn retire_recovery(&self, path: &Path) {
+    /// Delete one checkpoint once its text is saved or the tab is closed
+    /// deliberately.
+    fn retire_recovery_key(&self, key: &RecoveryKey) {
         if let Some(store) = &self.recovery {
-            let _ = store.invalidate_and_delete(&RecoveryKey::for_path(path));
+            let _ = store.invalidate_and_delete(key);
         }
+    }
+
+    fn retire_tab_recovery(&self, tab: &Tab) {
+        self.retire_recovery_key(&tab.recovery_key);
     }
 
     /// Reopen a recovered buffer as a dirty tab. Its original stamp is kept so
     /// Save still refuses to overwrite a file changed since the checkpoint.
     pub fn restore_recovered(&self, record: &RecoveredRecord) {
         let key = record.record.key.clone();
-        self.add_tab_with(recovered_loaded(record), true);
+        let untitled = record.record.metadata.source_path.is_none();
+        let loaded = recovered_loaded(record);
+        let recovered_path = loaded.path.clone();
+        self.add_tab_with(loaded, true);
+        if untitled {
+            if let Some(id) = self.active.get() {
+                self.tabs.update(|tabs| {
+                    if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) {
+                        tab.untitled = true;
+                        tab.title = SharedString::from(crate::i18n::t(
+                            self.settings.get().language,
+                            crate::i18n::Key::Untitled,
+                        ));
+                        tab.recovery_key = key.clone();
+                    }
+                });
+            }
+            self.settings.update(|settings| {
+                settings
+                    .recent_targets
+                    .retain(|target| target.path != recovered_path);
+            });
+        }
         if record.source_conflicted {
             if let Some(tab) = self.active_tab() {
                 tab.conflict.set(true);
@@ -859,14 +906,8 @@ impl AppState {
     }
 
     fn close_tab_now(&self, id: u64) {
-        if let Some(path) = self
-            .tabs
-            .get()
-            .iter()
-            .find(|tab| tab.id == id)
-            .map(|tab| tab.path.clone())
-        {
-            self.retire_recovery(&path);
+        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() {
+            self.retire_tab_recovery(&tab);
         }
         self.recovery_tracks.borrow_mut().remove(&id);
         self.tabs.update(|tabs| tabs.retain(|tab| tab.id != id));
@@ -921,7 +962,7 @@ impl AppState {
             tab.dirty.set(false);
             tab.conflict.set(false);
             tab.revision.update(|revision| *revision += 1);
-            state.retire_recovery(&tab.path);
+            state.retire_tab_recovery(&tab);
             state.recovery_tracks.borrow_mut().remove(&tab.id);
             state.status.set(SharedString::from(format!(
                 "Reloaded {}",
@@ -959,7 +1000,7 @@ impl AppState {
                     tab.loaded.borrow_mut().stamp = stamp;
                     tab.dirty.set(false);
                     tab.conflict.set(false);
-                    state.retire_recovery(&tab.path);
+                    state.retire_tab_recovery(&tab);
                     state.recovery_tracks.borrow_mut().remove(&tab.id);
                     state
                         .status
@@ -978,38 +1019,56 @@ impl AppState {
         let Some(tab) = self.active_tab() else {
             return;
         };
-        let name = tab.title.to_string();
         let state = self.clone();
-        let picked = pick_save_path(SaveDialog::new().title("Save As").file_name(name).filter(
-            nsh_core::file_dialog::FileFilter::new("Markdown", ["md", "markdown"]),
-        ));
         self.spawn_task(async move {
-            match picked.await {
-                Ok(Some(path)) => {
-                    let text = tab.text.get().to_string();
-                    let (newline, had_bom) = {
-                        let loaded = tab.loaded.borrow();
-                        (loaded.newline, loaded.had_bom)
-                    };
-                    match io::save_as(&path, &text, newline, had_bom) {
-                        Ok(loaded) => {
-                            state.close_tab_now(tab.id);
-                            state.add_tab(loaded);
-                        }
-                        Err(SaveError::DestinationExists) => state.status.set(SharedString::from(
+            state.save_as_tab(tab).await;
+        });
+    }
+
+    async fn save_as_tab(&self, tab: Tab) -> bool {
+        let picked = pick_save_path(
+            SaveDialog::new()
+                .title("Save As")
+                .file_name(tab.title.to_string())
+                .filter(nsh_core::file_dialog::FileFilter::new(
+                    "Markdown",
+                    ["md", "markdown"],
+                )),
+        );
+        match picked.await {
+            Ok(Some(path)) => {
+                let text = tab.text.get().to_string();
+                let (newline, had_bom) = {
+                    let loaded = tab.loaded.borrow();
+                    (loaded.newline, loaded.had_bom)
+                };
+                match io::save_as(&path, &text, newline, had_bom) {
+                    Ok(loaded) => {
+                        self.close_tab_now(tab.id);
+                        self.add_tab(loaded);
+                        true
+                    }
+                    Err(SaveError::DestinationExists) => {
+                        self.status.set(SharedString::from(
                             "Save As refused: that file exists. Choose a new name.",
-                        )),
-                        Err(error) => state
-                            .status
-                            .set(SharedString::from(format!("Save As failed: {error:?}"))),
+                        ));
+                        false
+                    }
+                    Err(error) => {
+                        self.status
+                            .set(SharedString::from(format!("Save As failed: {error:?}")));
+                        false
                     }
                 }
-                Ok(None) => {}
-                Err(error) => state.status.set(SharedString::from(format!(
-                    "Save As picker failed: {error}"
-                ))),
             }
-        });
+            Ok(None) => false,
+            Err(error) => {
+                self.status.set(SharedString::from(format!(
+                    "Save As picker failed: {error}"
+                )));
+                false
+            }
+        }
     }
 
     pub fn set_pane(&self, id: u64, pane: Pane) {
@@ -1072,7 +1131,7 @@ impl AppState {
                 tab.loaded.borrow_mut().stamp = stamp;
                 tab.dirty.set(false);
                 tab.conflict.set(false);
-                self.retire_recovery(&tab.path);
+                self.retire_tab_recovery(&tab);
                 self.recovery_tracks.borrow_mut().remove(&tab.id);
                 self.status
                     .set(SharedString::from(format!("Saved {}", tab.path.display())));
@@ -1123,10 +1182,27 @@ impl AppState {
                 .cancel("cancel", "Cancel")
                 .show()
                 .await;
+            // Translation can dirty another tab while the dialog is open.
+            let dirty: Vec<u64> = state
+                .tabs
+                .get()
+                .iter()
+                .filter(|tab| tab.dirty.get())
+                .map(|tab| tab.id)
+                .collect();
             match answer {
                 Ok(answer) if answer.action.as_deref() == Some("save") => {
                     for &id in &dirty {
-                        if !state.save_tab(id) {
+                        let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id).cloned()
+                        else {
+                            continue;
+                        };
+                        let saved = if tab.untitled {
+                            state.save_as_tab(tab).await
+                        } else {
+                            state.save_tab(id)
+                        };
+                        if !saved {
                             state.status.set(SharedString::from(
                                 "Quit cancelled: a document could not be saved.",
                             ));
@@ -1137,9 +1213,9 @@ impl AppState {
                 }
                 Ok(answer) if answer.action.as_deref() == Some("discard") => {
                     state.quit_discarded.set(true);
-                    for id in &dirty {
-                        if let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == *id) {
-                            state.retire_recovery(&tab.path);
+                    for &id in &dirty {
+                        if let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id) {
+                            state.retire_tab_recovery(tab);
                         }
                     }
                     nsh_core::element::desktop::close_window();
