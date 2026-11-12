@@ -32,7 +32,7 @@ has not been recorded.
 ```sh
 uv run --locked --project scripts scripts/mt.py visual -- \
     --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
-    --out .scratch/goal-09/matrix
+    --out docs/evidence/goal-09/matrix
 ```
 
 Each cell launches the packaged app on an isolated profile, drives the real
@@ -56,8 +56,8 @@ portrait RDP desktop the landscape viewports are placed off-screen with
 - Source: `883a5f3` with a dirty worktree tree `72e660d`; executable
   `MarkTurbo.exe` (61,475,328 bytes) SHA-256
   `2d2abdd91b71199e6494e4a4dc52714bd0c213a85c19c01a07c9c3c92c21679c`.
-- Output: `.scratch/goal-09/final4/matrix.json` and
-  `.scratch/goal-09/final4/cells/` (132 receipts: 120 `PrintWindow`, 12
+- Output: `docs/evidence/goal-09/final4/matrix.json` and
+  `docs/evidence/goal-09/final4/cells/` (132 receipts: 120 `PrintWindow`, 12
   `PrintWindow+CDP`). The automated accessibility snapshot counted 2,972
   actionable controls and 128 document task checkboxes; no compact control was
   unnamed.
@@ -69,7 +69,7 @@ Representative images were inspected for the welcome, new document, Edit,
 native Preview, compatibility preview, Review loading/result/stale, Effective
 Agent Context, conflict, and Settings states in both languages and modes. A full
 owner review of all eleven states has not happened; the reviewer must inspect
-`.scratch/goal-09/final4/cells/`.
+`docs/evidence/goal-09/final4/cells/`.
 
 ## Remaining acceptance gates
 

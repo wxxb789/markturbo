@@ -50,7 +50,7 @@ Protect model credentials and request privacy.
   boolean. Review semantics remain deferred to Goal 06.
 - The privacy gate scans Git index blobs by object ID, tracked worktree entries,
   non-ignored untracked entries, secret-bearing paths, and the packaged executable in
-  UTF-8, UTF-16LE, and UTF-16BE forms. Tracked `.scratch` evidence is included;
+  UTF-8, UTF-16LE, and UTF-16BE forms. Tracked `docs/evidence` evidence is included;
   symlink text is scanned without following a target outside the repository,
   gitlink paths remain covered, overlapping candidate ranges are fully redacted,
   and candidate path text never enters `git cat-file` process arguments.
@@ -70,13 +70,13 @@ Protect model credentials and request privacy.
 | Consent cancellation and material changes | `views::workspace::tests::cancelling_translation_consent_sends_no_request`; `changing_the_document_invalidates_pending_translation_consent`; `approving_translation_consent_sends_one_frozen_request`; model authorization mismatch tests |
 | Agent Skill inventory and partial state | `model::tests::agent_skill_request_keeps_disclosure_and_payload_exactly_aligned` drives the production `AgentSkillProviderAdapter` seam with a recording fake, proves mismatched authorization or adapter endpoint sends nothing, and compares every adapter path, byte size, reason, and byte payload with the displayed inventory; explicit omission records derive partial state; `agent_skill_request_rejects_unsafe_or_ambiguous_paths`; bilingual disclosure tests |
 | Content remains inert and diagnostics remain content-free | the loopback request inspection includes instruction-like text and no tools; `translate::tests::errors_and_debug_output_exclude_credentials_and_request_or_response_bodies`; `main::tests::tracing_cannot_bridge_provider_response_bodies_into_application_logs`; credential redaction tests |
-| Repository and packaged-file sentinel scan | `scripts.tests.test_privacy` covers index-only and worktree content, UTF-8/UTF-16, tracked `target` and `.scratch`, symlinks and gitlinks, fully overlapping values, secret-bearing paths without argv disclosure, and release-binary cases; the final `check full` ran with random `MARKTURBO_PRIVACY_SENTINEL` and `MARKTURBO_PRIVATE_REQUEST_SENTINEL` values |
+| Repository and packaged-file sentinel scan | `scripts.tests.test_privacy` covers index-only and worktree content, UTF-8/UTF-16, tracked `target` and `docs/evidence`, symlinks and gitlinks, fully overlapping values, secret-bearing paths without argv disclosure, and release-binary cases; the final `check full` ran with random `MARKTURBO_PRIVACY_SENTINEL` and `MARKTURBO_PRIVATE_REQUEST_SENTINEL` values |
 
 The explicit DirectX screenshot proof renders the production Translation settings
 page, its real masked credential controls, and an actual GPUI model-consent prompt.
 Two equal-length but different credential and request-body sentinels produce
 pixel-identical, nonblank images; the encoded PNG contains none of the four values.
-The local evidence is `.scratch/goal-05a-settings-privacy.png`: 1422x735, 149,971
+The local evidence is `docs/evidence/goal-05a-settings-privacy.png`: 1422x735, 149,971
 bytes, SHA-256
 `b92011c739cbe64e4fac932f3b18dbc07ad7e49797a020665849ae68fbdf828d`.
 The transport is in-process, so credentials and request bodies are never placed in

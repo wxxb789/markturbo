@@ -1,0 +1,44 @@
+{
+  "cases": [
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_document",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_selection",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    }
+  ],
+  "completed_at_utc": "2026-09-29T14:38:45.823Z",
+  "environment": {},
+  "executable": {
+    "byte_count": null,
+    "copied_sha256": null,
+    "copy_hash_verified": false,
+    "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "format": null,
+    "hash_verified": false,
+    "machine": null,
+    "sha256": null
+  },
+  "mode": "missing_credential_diagnostic",
+  "schema": "markturbo.goal-06-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-29T14:38:45.660Z",
+  "status": "FAIL",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 0,
+    "not_run_case_count": 2,
+    "passed_case_count": 0,
+    "required_case_count": 2
+  }
+}

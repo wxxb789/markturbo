@@ -1,0 +1,85 @@
+{
+  "accepted_production_case_set_reduced": {
+    "errors": 1,
+    "failures": 0,
+    "mutation_killed": true,
+    "output": "test_native_acceptance_requires_the_exact_goal07_case_set (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_native_acceptance_requires_the_exact_goal07_case_set) ... ERROR\n\n======================================================================\nERROR: test_native_acceptance_requires_the_exact_goal07_case_set (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_native_acceptance_requires_the_exact_goal07_case_set)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\markturbo_tools\\revision_evaluation.py\", line 1492, in load_native_acceptance\n    native_goal07.validate_evidence(dict(payload))\n  File \"Q:\\repos\\markturbo\\scripts\\markturbo_tools\\native\\goal07.py\", line 970, in validate_evidence\n    raise ValueError(\"top-level transport request count is not synchronized\")\nValueError: top-level transport request count is not synchronized\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_revision_evaluation.py\", line 448, in setUp\n    self.fixtures = Goal07Fixtures(Path(self.temp.name))\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_revision_evaluation.py\", line 59, in __init__\n    self.native = revision.load_native_acceptance(\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"Q:\\repos\\markturbo\\scripts\\markturbo_tools\\revision_evaluation.py\", line 1494, in load_native_acceptance\n    raise RevisionEvaluationError(\"native acceptance evidence failed full harness validation\") from error\nscripts.markturbo_tools.revision_evaluation.RevisionEvaluationError: native acceptance evidence failed full harness validation\n\n----------------------------------------------------------------------\nRan 1 test in 0.478s\n\nFAILED (errors=1)\n",
+    "removed_case": [
+      "trusted_executable_apply_revokes_trust"
+    ],
+    "skipped": 0,
+    "successful": false,
+    "tests_run": 1
+  },
+  "approved_manifest_anchor_removed": {
+    "errors": 0,
+    "failures": 1,
+    "mutation_killed": true,
+    "output": "test_recomputed_tampered_manifest_is_rejected_by_approved_trust_anchor (scripts.tests.test_evaluation.ManifestTests.test_recomputed_tampered_manifest_is_rejected_by_approved_trust_anchor) ... FAIL\n\n======================================================================\nFAIL: test_recomputed_tampered_manifest_is_rejected_by_approved_trust_anchor (scripts.tests.test_evaluation.ManifestTests.test_recomputed_tampered_manifest_is_rejected_by_approved_trust_anchor)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_evaluation.py\", line 119, in test_recomputed_tampered_manifest_is_rejected_by_approved_trust_anchor\n    with self.assertRaisesRegex(evaluation.EvaluationError, \"approved immutable trust anchor\"):\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: EvaluationError not raised\n\n----------------------------------------------------------------------\nRan 1 test in 1.319s\n\nFAILED (failures=1)\n",
+    "skipped": 0,
+    "successful": false,
+    "tests_run": 1
+  },
+  "exact_file_set_comparison_removed": {
+    "errors": 0,
+    "failures": 1,
+    "mutation_killed": true,
+    "output": "test_scaffold_rechecks_manifest_exact_file_set (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_scaffold_rechecks_manifest_exact_file_set) ... FAIL\n\n======================================================================\nFAIL: test_scaffold_rechecks_manifest_exact_file_set (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_scaffold_rechecks_manifest_exact_file_set)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_revision_evaluation.py\", line 851, in test_scaffold_rechecks_manifest_exact_file_set\n    with self.assertRaisesRegex(\n         ^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RevisionEvaluationError not raised\n\n----------------------------------------------------------------------\nRan 1 test in 2.047s\n\nFAILED (failures=1)\n",
+    "skipped": 0,
+    "successful": false,
+    "tests_run": 1
+  },
+  "full_native_validator_bypassed": {
+    "errors": 0,
+    "failures": 1,
+    "mutation_killed": true,
+    "output": "test_native_acceptance_runs_full_validator_without_legacy_request_key (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_native_acceptance_runs_full_validator_without_legacy_request_key) ... FAIL\n\n======================================================================\nFAIL: test_native_acceptance_runs_full_validator_without_legacy_request_key (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_native_acceptance_runs_full_validator_without_legacy_request_key)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_revision_evaluation.py\", line 1125, in test_native_acceptance_runs_full_validator_without_legacy_request_key\n    with self.assertRaisesRegex(revision.RevisionEvaluationError, \"full harness validation\"):\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RevisionEvaluationError not raised\n\n----------------------------------------------------------------------\nRan 1 test in 0.496s\n\nFAILED (failures=1)\n",
+    "skipped": 0,
+    "successful": false,
+    "tests_run": 1
+  },
+  "native_receipt_case_matrix_baseline": {
+    "errors": 0,
+    "failures": 0,
+    "output": "test_native_acceptance_requires_the_exact_goal07_case_set (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_native_acceptance_requires_the_exact_goal07_case_set) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.466s\n\nOK\n",
+    "receipt_variants": [
+      "missing",
+      "duplicate",
+      "invented"
+    ],
+    "skipped": 0,
+    "successful": true,
+    "tests_run": 1
+  },
+  "native_receipt_schema_observation_baseline": {
+    "errors": 0,
+    "failures": 0,
+    "output": "test_native_schema_version_and_unhashable_case_id_fail_closed (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_native_schema_version_and_unhashable_case_id_fail_closed) ... ok\n\n----------------------------------------------------------------------\nRan 1 test in 0.488s\n\nOK\n",
+    "receipt_variants": [
+      "wrong_schema_version",
+      "altered_required_observation",
+      "unhashable_id"
+    ],
+    "skipped": 0,
+    "successful": true,
+    "tests_run": 1
+  },
+  "per_file_hash_comparison_removed": {
+    "errors": 0,
+    "failures": 1,
+    "mutation_killed": true,
+    "output": "test_manifest_hash_mismatch_is_rejected (scripts.tests.test_evaluation.ManifestTests.test_manifest_hash_mismatch_is_rejected) ... FAIL\n\n======================================================================\nFAIL: test_manifest_hash_mismatch_is_rejected (scripts.tests.test_evaluation.ManifestTests.test_manifest_hash_mismatch_is_rejected)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_evaluation.py\", line 100, in test_manifest_hash_mismatch_is_rejected\n    with self.assertRaisesRegex(evaluation.EvaluationError, \"hash mismatch\"):\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: EvaluationError not raised\n\n----------------------------------------------------------------------\nRan 1 test in 0.769s\n\nFAILED (failures=1)\n",
+    "skipped": 0,
+    "successful": false,
+    "tests_run": 1
+  },
+  "revision_scaffold_fresh_verifier_call_removed": {
+    "errors": 0,
+    "failures": 1,
+    "mutation_killed": true,
+    "output": "test_scaffold_rechecks_manifest_exact_file_set (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_scaffold_rechecks_manifest_exact_file_set) ... FAIL\n\n======================================================================\nFAIL: test_scaffold_rechecks_manifest_exact_file_set (scripts.tests.test_revision_evaluation.RevisionEvaluationV2Tests.test_scaffold_rechecks_manifest_exact_file_set)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_revision_evaluation.py\", line 851, in test_scaffold_rechecks_manifest_exact_file_set\n    with self.assertRaisesRegex(\n         ^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: RevisionEvaluationError not raised\n\n----------------------------------------------------------------------\nRan 1 test in 1.400s\n\nFAILED (failures=1)\n",
+    "skipped": 0,
+    "successful": false,
+    "tests_run": 1
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "SP-03",
+    "path": "evaluation/goal-01/snapshots/goals/05a-protect-model-credentials-and-request-privacy.md",
+    "lens": "Specification / plan",
+    "sha256": "d5a2e6ac96ebbb7d31130ca014b6bbdd5364ae910c423f318277632d33e6d88b",
+    "byte_count": 9331,
+    "files": [
+      {
+        "path": "evaluation/goal-01/snapshots/goals/05a-protect-model-credentials-and-request-privacy.md",
+        "sha256": "40ebda30be68ab46e18cfb51308540acb26da72ca3673ddbb1c3d28fb51b6890",
+        "byte_count": 9331
+      }
+    ]
+  },
+  "request": {
+    "lens": "specification",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Goal 05A — Protect model credentials and request privacy\n\n## Objective\n\nBefore semantic Review is enabled, stop persisting model API keys as plaintext\napplication settings by using Windows Credential Manager on Windows 11 x64 or\nan explicit environment/session-only fallback, separate reusable non-secret\nmodel configuration from Translation-specific settings, require an informed\nuser action before any document or context content is sent, and verify that real\ncredentials and private user request bodies never appear in settings files,\nrecovery data, logs, process arguments, errors, screenshots, metrics, or\ncommitted evaluation fixtures; synthetic sentinel fixtures remain allowed for\ntesting.\n\n## Why this goal was added during final review\n\nThe initial ordered goals protected text integrity and worker IPC but missed the\nexisting plain-text `translate_api_key` setting. Prompt and instruction documents\nmay contain sensitive product or repository information, so a public Review\nfeature needs both credential protection and a precise outbound-data contract\nregardless of whether Goal 05 chose a worker or retained in-process transport.\n\n## Product contract alignment\n\n**Disposition:** Retained and revised on 2026-08-29.\n\nThis goal implements `PRODUCT.md`'s local-first model-data policy on Windows 11\nx64: configured credentials are confidential, model traffic is always explicit,\nand local editing, rendering, search, Skill discovery, context resolution, and\nrecovery send no document or context content. It preserves configured endpoint\nand Translation support without adding providers or background telemetry.\n\n## In scope\n\n- Inventory every current path by which model credentials enter, persist, move\n  through, or leave the application.\n- On Windows 11 x64, store persistent credentials in Windows Credential Manager.\n  The credential identity contains the application, provider wire format,\n  scheme, normalized host, effective port, and normalized API base path, so a\n  secret for one identity cannot silently be reused by another.\n- Restrict vendor environment variables such as `OPENAI_API_KEY` and\n  `ANTHROPIC_API_KEY` to their vendor-default endpoint identities unless the user\n  explicitly authorizes that credential for a custom host; changing `base_url`\n  must never redirect an ambient vendor key silently.\n- Define cross-host redirect behavior so authentication cannot follow a response\n  to a different endpoint identity.\n- Parse every API base URL before use and reject userinfo, query, and fragment\n  components. A non-loopback endpoint must use HTTPS with certificate\n  validation. HTTP is allowed only for a verified loopback endpoint and is\n  disclosed as unencrypted with no proxy. Never automatically follow a redirect;\n  any redirect response is a diagnostic.\n- When a supported secure store is unavailable, offer only explicitly described\n  environment or session-memory behavior; never silently fall back to plaintext\n  persistence.\n- Migrate an existing plaintext key only after explicit user approval and a\n  verified secure write. Remove the plaintext value only after that succeeds;\n  preserve it and report the failure if migration cannot complete.\n- Let the user replace, test, and delete a stored credential without displaying\n  its value after storage.\n- Generalize reusable non-secret configuration—wire format, model, base URL, and\n  endpoint identity—so Review and Translation do not maintain divergent provider\n  settings. Keep operation-specific settings, such as translation target\n  language, separate.\n- Define consent by endpoint identity and operation. Before sending, the UI must\n  disclose whether the endpoint is local or remote, the provider wire format and\n  normalized endpoint identity, whether the scope is a selection, document, or\n  document plus named Effective Agent Context sources, and that protocol framing\n  plus the disclosed source content cross the boundary. Consent applies only to\n  that operation, endpoint identity, and displayed content scope.\n- Treat an Agent Skill package as a first-class outbound scope. Before sending,\n  enumerate every included package file by normalized relative path, byte size,\n  and inclusion reason. A file absent from that list must not be sent. If a\n  normally in-scope supporting file is omitted, label the Review result partial.\n- Re-confirm when the endpoint identity or request scope materially changes; do\n  not treat consent for one provider or one selected document as consent for an\n  entire workspace.\n- Make every model request user-initiated. Opening, previewing, indexing,\n  discovering, or resolving context must not send content.\n- Do not make background model requests, upload content for training, emit\n  content-bearing telemetry, or perform hidden workspace scans. Content may not\n  be sent for crash reporting, evaluation, or product improvement.\n- Treat document text as untrusted request data: it cannot alter endpoint or\n  credential configuration, request tools, start another operation, or bypass\n  response validation merely by containing instructions.\n- Redact secrets and request bodies from transport errors and diagnostic logs\n  while retaining enough endpoint/provider information to troubleshoot safely.\n- Use fake credential-store and transport implementations for keyless tests.\n\n## Out of scope\n\n- Accounts, cloud secret synchronization, organization policy, billing, or a\n  hosted markturbo proxy.\n- Bundling a local model or downloading model weights.\n- Choosing worker versus in-process transport; Goal 05 owns that measured\n  architecture decision.\n- Defining Review findings, questions, or revision behavior; Goals 06 and 07 own\n  semantic product behavior.\n- Sending filesystem contents for telemetry, evaluation, crash reporting, or\n  background quality improvement.\n- Permitting HTTP except to a verified loopback endpoint, claiming that it is\n  encrypted, or following a redirect automatically.\n\n## Required proof cases\n\nAutomated tests must cover at least:\n\n1. A newly entered persistent key is absent from serialized settings.\n2. Environment and session-only keys never become persistent implicitly.\n3. Successful legacy-key migration writes secure storage before removing\n   plaintext; failed migration leaves the original recoverable and reports why.\n4. Replacing and deleting a key affect only the selected provider/endpoint.\n5. Switching endpoint host cannot silently reuse a host-bound credential; a\n   vendor environment key is not sent to a custom host without explicit consent,\n   authentication does not follow any redirect, base URLs with userinfo, query,\n   or fragments are rejected, non-loopback HTTP is rejected, and a verified\n   loopback HTTP disclosure says unencrypted with no proxy.\n6. Opening a document, scanning Skills, and resolving context send zero requests.\n7. Selection consent sends only the displayed selection and required protocol\n   framing, not the whole document or workspace.\n8. Changing to document or Effective Context scope requires the corresponding\n   explicit disclosure.\n9. Agent Skill package disclosure lists each normalized relative path, byte size,\n   and inclusion reason; request inspection proves that exactly and only those\n   listed files are supplied to the provider adapter, and an omitted supporting\n   file makes the result partial.\n10. Logs, errors, process arguments, recovery records, and screenshots contain\n   neither a sentinel API key nor a sentinel request body.\n11. Document content that imitates system instructions, tool requests, protocol\n    fields, or endpoint URLs remains inert data and cannot alter transport state.\n\n## Completion evidence\n\n- The Windows 11 x64 Credential Manager behavior and environment/session-only\n  fallback policy are documented and approved by the project owner.\n- A settings file written after configuration contains all required non-secret\n  fields and no credential value.\n- A migration acceptance run covers success, user cancellation, secure-store\n  failure, replacement, and deletion without losing the only copy silently.\n- A request-inspection test proves the displayed outbound scope equals exactly\n  the bytes supplied as user content to the provider adapter, excluding\n  documented protocol framing. For an Agent Skill package, it proves the\n  displayed path, byte-size, and inclusion-reason inventory exactly matches the\n  included files and that no unlisted file crosses the boundary.\n- Repository and packaged-file scans using sentinel secrets find zero unintended\n  occurrences.\n- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`, focused\n  credential/privacy tests, and `cargo test --release --workspace` pass; the pass\n  count is recorded.\n\n## Stop and ask\n\nStop if Windows Credential Manager cannot bind a credential to the approved\napplication/provider/endpoint identity, or if provider routing cannot preserve\nthat identity across requests and redirects. Use only the approved environment\nor session-memory fallback; never preserve the existing plaintext setting.\n\n## Boundary for the next goal\n\nThis goal establishes secure model configuration and informed request transport.\nGoal 06 consumes that boundary to implement non-mutating Review; it must not add\nanother credential store, consent model, or provider configuration path.\n",
+      "path": "evaluation/goal-01/snapshots/goals/05a-protect-model-credentials-and-request-privacy.md"
+    },
+    "snapshot": {
+      "revision": 7,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Protect model credentials and require an explicit, scope-bound user action before document or context content is sent.",
+      "relevant_context": [
+        "Credential identity includes provider wire format, scheme, normalized host, effective port, and normalized API base path."
+      ],
+      "constraints": [
+        "Never persist plaintext credentials, follow redirects automatically, send private content in diagnostics, or reuse a vendor key across endpoint identities without authorization."
+      ],
+      "non_goals": [
+        "Do not add accounts, cloud secret synchronization, a hosted proxy, or hidden model traffic."
+      ],
+      "expected_deliverable": "A secure model configuration and informed request boundary that Review can reuse.",
+      "success_evidence": [
+        "Settings, logs, errors, recovery records, screenshots, and fixtures contain no unintended key or request-body material."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "Can changing base_url to a custom host carry an ambient vendor API key to that host automatically?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "Can changing base_url to a custom host carry an ambient vendor API key to that host automatically?",
+        "priority": "high",
+        "impact": "The answer determines whether credential reuse follows configuration convenience or endpoint-bound authorization."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "No. A custom host requires separate explicit authorization bound to its normalized endpoint identity before the vendor key can be sent."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Make the answered endpoint-bound credential rule explicit at the configuration transition.\",\"edits\":[{\"range\":{\"start\":9331,\"end\":9331},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified custom-host credential boundary\\n\\nChanging base_url to a custom host must never carry an ambient vendor key with it. Sending that credential requires a separate explicit authorization bound to the custom endpoint identity.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"86d3800336163960fc981d6c0b92727376ebd8211982b75f801c42b9f79af4a1\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "TP-04",
+    "path": "evaluation/goal-01/task-prompts/04-measure-release-profile-on-quiet-host.md",
+    "lens": "Task prompt",
+    "sha256": "40e155b251959f1840d23c030625383b8167b42d9534d790c9b0ad7c68bc670a",
+    "byte_count": 441,
+    "files": [
+      {
+        "path": "evaluation/goal-01/task-prompts/04-measure-release-profile-on-quiet-host.md",
+        "sha256": "5740bf9a3cf4efa87bbf88802d345cba43482afa66daf38078c5c6635312625e",
+        "byte_count": 441
+      }
+    ]
+  },
+  "request": {
+    "lens": "prompt",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Measure The Release Profile On A Quiet Host\n\nCompare the current release profile with an `opt-level = \"s\"` candidate using\nlow-overhead CPU and disk quietness checks and an A-B-B-A sequence for startup\nand first-formula measurements.\n\nDo not adopt the smaller profile from binary size alone. If the machine does not\nmeet the pre-registered quietness gate, record the runtime comparison as deferred\nand leave the release profile unchanged.\n",
+      "path": "evaluation/goal-01/task-prompts/04-measure-release-profile-on-quiet-host.md"
+    },
+    "snapshot": {
+      "revision": 4,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Compare the current release profile with opt-level = \"s\" using a quiet-host A-B-B-A measurement.",
+      "relevant_context": [
+        "Binary-size evidence and runtime evidence answer different questions, and runtime data is eligible only after the quietness gate passes."
+      ],
+      "constraints": [
+        "Do not adopt the smaller profile from binary size alone or report runtime conclusions from a noisy host."
+      ],
+      "non_goals": [
+        "Do not change the release profile when the runtime comparison is deferred."
+      ],
+      "expected_deliverable": "A measured keep-or-change decision, or an explicit deferral when the host is not quiet.",
+      "success_evidence": [
+        "The quietness gate and A-B-B-A startup and first-formula comparison are recorded separately from binary size."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "How should the revision handle a smaller binary when the quiet-host runtime gate does not pass?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "How should the revision handle a smaller binary when the quiet-host runtime gate does not pass?",
+        "priority": "high",
+        "impact": "The answer determines whether the profile may change from size evidence alone."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "Keep the current release profile, record size separately, and defer the runtime decision until a quiet host completes the A-B-B-A comparison."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Encode the answered evidence hierarchy so binary size cannot substitute for valid runtime evidence.\",\"edits\":[{\"range\":{\"start\":441,\"end\":441},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified decision rule\\n\\nRecord binary-size and runtime evidence separately. A smaller binary does not justify adopting opt-level = \\\"s\\\" unless the pre-registered quietness gate passes and the A-B-B-A runtime comparison supports the change.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"06cab0d8e2ba2357beb77e2f2c95d1338d962747dd7fc581f9e51c8bb1b60324\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

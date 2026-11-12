@@ -19,3 +19,7 @@ fixtures/** -text
 *.ttf binary
 *.webp binary
 *.zip binary
+
+# Historical evidence preserves the captured bytes exactly; those files are
+# records, not source text to normalize.
+docs/evidence/** -text whitespace=-trailing-space

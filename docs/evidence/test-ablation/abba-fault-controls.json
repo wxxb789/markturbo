@@ -1,0 +1,42 @@
+[
+  {
+    "exit_code": 1,
+    "fault": "wrong_schedule_abab",
+    "killed": true,
+    "output": "test_shared_scheduler_keeps_structured_samples_separated_in_abba_order (scripts.tests.test_probe.AbbaMeasurementTests.test_shared_scheduler_keeps_structured_samples_separated_in_abba_order) ... FAIL\n\n======================================================================\nFAIL: test_shared_scheduler_keeps_structured_samples_separated_in_abba_order (scripts.tests.test_probe.AbbaMeasurementTests.test_shared_scheduler_keeps_structured_samples_separated_in_abba_order)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_probe.py\", line 900, in test_shared_scheduler_keeps_structured_samples_separated_in_abba_order\n    self.assertEqual(order, [\"A\", \"B\", \"B\", \"A\", \"A\", \"B\", \"B\", \"A\"])\nAssertionError: Lists differ: ['A', 'B', 'A', 'B', 'A', 'B', 'A', 'B'] != ['A', 'B', 'B', 'A', 'A', 'B', 'B', 'A']\n\nFirst differing element 2:\n'A'\n'B'\n\n- ['A', 'B', 'A', 'B', 'A', 'B', 'A', 'B']\n?                      -----        -----\n\n+ ['A', 'B', 'B', 'A', 'A', 'B', 'B', 'A']\n?            +++++     +++++\n\n\n----------------------------------------------------------------------\nRan 1 test in 0.010s\n\nFAILED (failures=1)\n",
+    "output_sha256": "37420e15773af64e4d80e84d9267f1b062ef4cac1a394b96889bafda64eb1abc",
+    "test": "scripts.tests.test_probe.AbbaMeasurementTests.test_shared_scheduler_keeps_structured_samples_separated_in_abba_order"
+  },
+  {
+    "exit_code": 1,
+    "fault": "cross_pair_indexes",
+    "killed": true,
+    "output": "test_structured_comparison_uses_adjacent_pairs_and_pair_medians (scripts.tests.test_probe.AbbaMeasurementTests.test_structured_comparison_uses_adjacent_pairs_and_pair_medians) ... FAIL\n\n======================================================================\nFAIL: test_structured_comparison_uses_adjacent_pairs_and_pair_medians (scripts.tests.test_probe.AbbaMeasurementTests.test_structured_comparison_uses_adjacent_pairs_and_pair_medians)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_probe.py\", line 939, in test_structured_comparison_uses_adjacent_pairs_and_pair_medians\n    self.assertEqual(\nAssertionError: {'paired_a': [55.0, 550.0, 505.0], 'paired_b': [21.0, 9[202 chars]8181} != {'paired_a': [12.0, 102.0, 1002.0], 'paired_b': [21.0, [184 chars]9681}\nDiff is 678 characters long. Set self.maxDiff to None to see it.\n\n----------------------------------------------------------------------\nRan 1 test in 0.004s\n\nFAILED (failures=1)\n",
+    "output_sha256": "ecb5debec92c591a3c95bf9cfbdab048385ab54405cad35a368d6730a9e4075b",
+    "test": "scripts.tests.test_probe.AbbaMeasurementTests.test_structured_comparison_uses_adjacent_pairs_and_pair_medians"
+  },
+  {
+    "exit_code": 1,
+    "fault": "reversed_delta",
+    "killed": true,
+    "output": "test_metrics_keeps_paired_statistics_for_abba_samples (scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_keeps_paired_statistics_for_abba_samples) ... FAIL\n\n======================================================================\nFAIL: test_metrics_keeps_paired_statistics_for_abba_samples (scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_keeps_paired_statistics_for_abba_samples)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_probe.py\", line 924, in test_metrics_keeps_paired_statistics_for_abba_samples\n    self.assertEqual(comparison.deltas, (9.0,))\nAssertionError: Tuples differ: (-9.0,) != (9.0,)\n\nFirst differing element 0:\n-9.0\n9.0\n\n- (-9.0,)\n?  -\n\n+ (9.0,)\n\n----------------------------------------------------------------------\nRan 1 test in 0.002s\n\nFAILED (failures=1)\n",
+    "output_sha256": "fbdc16a1a4f4b7005a49c8260a0c4e9569e407baa44c9827c3b0f661ce6c520a",
+    "test": "scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_keeps_paired_statistics_for_abba_samples"
+  },
+  {
+    "exit_code": 1,
+    "fault": "allow_zero_baseline",
+    "killed": true,
+    "output": "test_metrics_rejects_a_zero_paired_baseline (scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_rejects_a_zero_paired_baseline) ... FAIL\n\n======================================================================\nFAIL: test_metrics_rejects_a_zero_paired_baseline (scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_rejects_a_zero_paired_baseline)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_probe.py\", line 956, in test_metrics_rejects_a_zero_paired_baseline\n    with self.assertRaisesRegex(ValueError, \"baseline samples must be non-zero\"):\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ValueError not raised\n\n----------------------------------------------------------------------\nRan 1 test in 0.002s\n\nFAILED (failures=1)\n",
+    "output_sha256": "ecfc12deffc255405fb073423d8b7f22c6d183504400e5cb174b38a772e24374",
+    "test": "scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_rejects_a_zero_paired_baseline"
+  },
+  {
+    "exit_code": 1,
+    "fault": "raw_median_delta",
+    "killed": true,
+    "output": "test_structured_comparison_uses_adjacent_pairs_and_pair_medians (scripts.tests.test_probe.AbbaMeasurementTests.test_structured_comparison_uses_adjacent_pairs_and_pair_medians) ... FAIL\n\n======================================================================\nFAIL: test_structured_comparison_uses_adjacent_pairs_and_pair_medians (scripts.tests.test_probe.AbbaMeasurementTests.test_structured_comparison_uses_adjacent_pairs_and_pair_medians)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"Q:\\repos\\markturbo\\scripts\\tests\\test_probe.py\", line 939, in test_structured_comparison_uses_adjacent_pairs_and_pair_medians\n    self.assertEqual(\nAssertionError: {'pai[178 chars]minus_a': -11.0, 'median_b_minus_a_percent': 9.980039920159681} != {'pai[178 chars]minus_a': 9.0, 'median_b_minus_a_percent': 9.980039920159681}\n  {'b_minus_a': [9.0, -11.0, 100.0],\n   'b_minus_a_percent': [75.0, -10.784313725490197, 9.980039920159681],\n-  'median_b_minus_a': -11.0,\n?                      ^^^\n\n+  'median_b_minus_a': 9.0,\n?                      ^\n\n   'median_b_minus_a_percent': 9.980039920159681,\n   'paired_a': [12.0, 102.0, 1002.0],\n   'paired_b': [21.0, 91.0, 1102.0]}\n\n----------------------------------------------------------------------\nRan 1 test in 0.020s\n\nFAILED (failures=1)\n",
+    "output_sha256": "629b84646d76a404a0af49d2067ca9c2cec093e804d328edd0c78e00e9870996",
+    "test": "scripts.tests.test_probe.AbbaMeasurementTests.test_structured_comparison_uses_adjacent_pairs_and_pair_medians"
+  }
+]

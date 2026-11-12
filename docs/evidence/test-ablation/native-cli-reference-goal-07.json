@@ -1,0 +1,83 @@
+{
+  "cases": [
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "reject_all_byte_identity",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "selective_apply_one_undo",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "accept_all_preview",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "stale_proposal_blocks_apply",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "safe_save_conflict",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "trusted_executable_apply_revokes_trust",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    }
+  ],
+  "completed_at_utc": "2026-09-29T14:38:48.101Z",
+  "environment": {},
+  "executable": {
+    "byte_count": null,
+    "copied_sha256": null,
+    "copy_hash_verified": false,
+    "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "format": null,
+    "hash_verified": false,
+    "machine": null,
+    "machine_code": null,
+    "optional_magic": null,
+    "sha256": null
+  },
+  "schema": "markturbo.goal-07-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-29T14:38:47.843Z",
+  "status": "FAIL",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 0,
+    "not_run_case_count": 6,
+    "passed_case_count": 0,
+    "required_case_count": 6
+  },
+  "transport": {
+    "deterministic": true,
+    "mode": "keyless_loopback",
+    "provider": "openai-responses",
+    "request_count": 0
+  }
+}

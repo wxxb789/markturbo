@@ -1,0 +1,83 @@
+{
+  "cases": [
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "welcome_no_argument",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "new_and_paste_unicode",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "save_as_create_and_reopen",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "save_as_cancel_and_overwrite",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "bundled_sample",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "recent_bound_restart_stale",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "explicit_cli_targets",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    }
+  ],
+  "completed_at_utc": "2026-09-29T14:38:42.644Z",
+  "environment": {},
+  "executable": {
+    "byte_count": null,
+    "copied_sha256": null,
+    "copy_hash_verified": false,
+    "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "format": null,
+    "hash_verified": false,
+    "machine": null,
+    "sha256": null
+  },
+  "schema": "markturbo.goal-03-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-29T14:38:42.376Z",
+  "status": "FAIL",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 0,
+    "not_run_case_count": 7,
+    "passed_case_count": 0,
+    "required_case_count": 7
+  }
+}

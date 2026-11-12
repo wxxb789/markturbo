@@ -1,0 +1,1 @@
++ C:\ProgramData\Tools\Python\3.12.10\x64\python.exe -m scripts.markturbo_tools.native.goal02 --exe Q:\repos\markturbo\.scratch\test-ablation\nonexistent-native.exe --expect-exe-sha256 0000000000000000000000000000000000000000000000000000000000000000 --evidence Q:\repos\markturbo\.scratch\test-ablation\native-cli-goal-02.json

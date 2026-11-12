@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "TP-02",
+    "path": "evaluation/goal-01/task-prompts/02-keep-web-preview-in-one-window.md",
+    "lens": "Task prompt",
+    "sha256": "0a2aef34caa32d502d602fe0c0269088053616d7313c51a1793026a3721d8c41",
+    "byte_count": 476,
+    "files": [
+      {
+        "path": "evaluation/goal-01/task-prompts/02-keep-web-preview-in-one-window.md",
+        "sha256": "bb58f6d1e14fd2b861176e162c108ec86711f73f843a746d0b49c9f77909b502",
+        "byte_count": 476
+      }
+    ]
+  },
+  "request": {
+    "lens": "prompt",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Keep Web Preview In One Window\n\nKeep Windows WebView previews inside the GPUI application window. Move WebView2\nwork to a dedicated STA worker that owns a private child-window host inside the\nmain window, and prevent native floating surfaces from competing with that child\nwindow.\n\nThe result must retain one application top-level window across resize and close\ntransitions. Reject approaches that create a companion window or blank the\npreview whenever an overlay appears.\n",
+      "path": "evaluation/goal-01/task-prompts/02-keep-web-preview-in-one-window.md"
+    },
+    "snapshot": {
+      "revision": 2,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Keep Windows WebView previews inside one GPUI application window.",
+      "relevant_context": [
+        "The design uses a dedicated Windows STA worker and a private child-window host inside the main window."
+      ],
+      "constraints": [
+        "A companion window, overlay-triggered blanking, or a second top-level application window violates the prompt."
+      ],
+      "non_goals": [
+        "Do not split the preview into a companion window."
+      ],
+      "expected_deliverable": "A single-window WebView design that remains stable through resize and close transitions.",
+      "success_evidence": [
+        "One application top-level window survives resize and close transitions without blanking the active preview."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "Should native visual integration around the active WebView be stated as an explicit revision requirement?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "Should native visual integration around the active WebView be stated as an explicit revision requirement?",
+        "priority": "high",
+        "impact": "The answer determines whether overlay-free native chrome becomes part of the proposed wording."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "Yes. Require the WebView to remain inside the single GPUI window and appear integrated with native, overlay-free chrome."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Reflect the answered native-integration decision while preserving the single-window architecture.\",\"edits\":[{\"range\":{\"start\":476,\"end\":476},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified native integration\\n\\nThe active WebView must remain inside the single GPUI top-level window and appear integrated with native, overlay-free chrome; overlays must neither create a companion window nor blank the preview.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"b7da054e7c18bf8fb5ceca081fac3d0e5fd3fd444e358aecee93c79db9e6d931\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

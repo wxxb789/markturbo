@@ -1,0 +1,465 @@
+{
+  "cases": [
+    {
+      "duration_ms": 14000.822,
+      "failure_type": null,
+      "id": "reject_all_byte_identity",
+      "observations": {
+        "dirty_after": false,
+        "dirty_before": false,
+        "editor_after": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "editor_before": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "flow": "Review -> Revision -> reject all -> exact editor and source identity",
+        "foreground_verified": true,
+        "loopback_provider": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "proposal_received": true,
+        "provider_no_request_before_consent_click": true,
+        "provider_paths_exact": true,
+        "provider_request_count": 2,
+        "provider_review_before_revision": true,
+        "provider_review_count": 1,
+        "provider_review_source_sha256_match": true,
+        "provider_revision_answer_sentinel_present": true,
+        "provider_revision_count": 1,
+        "provider_revision_snapshot_match": true,
+        "provider_revision_source_sha256_match": true,
+        "reject_all_byte_identity": true,
+        "reject_all_dirty_unchanged": true,
+        "reviewed_source_match": true,
+        "runtime_scan": {
+          "answer_sentinel_utf16le_absent": true,
+          "answer_sentinel_utf8_absent": true,
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 5,
+          "raw_response_sentinel_utf16le_absent": true,
+          "raw_response_sentinel_utf8_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "server_deterministic": true,
+        "server_loopback": true,
+        "source_after": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        },
+        "source_before": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        }
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 13478.679,
+      "failure_type": null,
+      "id": "selective_apply_one_undo",
+      "observations": {
+        "editor_after_apply": {
+          "byte_count": 150,
+          "sha256": "fc99c4c9b4f8176610f33d1878c4b7030e73b624353f3b257957d2db81ff318a"
+        },
+        "editor_after_undo": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "editor_before": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "flow": "Review -> Revision -> one hunk -> Apply -> one undo",
+        "foreground_verified": true,
+        "loopback_provider": true,
+        "one_undo_transaction": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "provider_no_request_before_consent_click": true,
+        "provider_paths_exact": true,
+        "provider_request_count": 2,
+        "provider_review_before_revision": true,
+        "provider_review_count": 1,
+        "provider_review_source_sha256_match": true,
+        "provider_revision_answer_sentinel_present": true,
+        "provider_revision_count": 1,
+        "provider_revision_snapshot_match": true,
+        "provider_revision_source_sha256_match": true,
+        "runtime_scan": {
+          "answer_sentinel_utf16le_absent": true,
+          "answer_sentinel_utf8_absent": true,
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 5,
+          "raw_response_sentinel_utf16le_absent": true,
+          "raw_response_sentinel_utf8_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "selective_matches_editor": true,
+        "selective_matches_expected": true,
+        "selective_preview": {
+          "byte_count": 150,
+          "sha256": "fc99c4c9b4f8176610f33d1878c4b7030e73b624353f3b257957d2db81ff318a"
+        },
+        "server_deterministic": true,
+        "server_loopback": true,
+        "source_after": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        },
+        "source_before": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        },
+        "undo_count": 1
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 10162.695,
+      "failure_type": null,
+      "id": "accept_all_preview",
+      "observations": {
+        "accept_all_matches_expected": true,
+        "copy_dirty_after": false,
+        "copy_dirty_before": false,
+        "copy_dirty_unchanged": true,
+        "copy_editor_after": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "copy_editor_before": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "copy_editor_unchanged": true,
+        "copy_preview_exact": true,
+        "copy_preview_fingerprint": {
+          "byte_count": 151,
+          "sha256": "eaed04a5892fe4dd13186eaa9a8f5f4e8272096f1cd8e64ad941f405714d05cf"
+        },
+        "copy_source_after": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        },
+        "copy_source_before": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        },
+        "copy_source_unchanged": true,
+        "editor_after_preview": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "editor_before_apply": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "final_preview": {
+          "byte_count": 151,
+          "sha256": "eaed04a5892fe4dd13186eaa9a8f5f4e8272096f1cd8e64ad941f405714d05cf"
+        },
+        "flow": "Review -> Revision -> accept all -> exact final preview before Apply",
+        "foreground_verified": true,
+        "loopback_provider": true,
+        "preview_fingerprint": {
+          "byte_count": 151,
+          "sha256": "eaed04a5892fe4dd13186eaa9a8f5f4e8272096f1cd8e64ad941f405714d05cf"
+        },
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "provider_no_request_before_consent_click": true,
+        "provider_paths_exact": true,
+        "provider_request_count": 2,
+        "provider_review_before_revision": true,
+        "provider_review_count": 1,
+        "provider_review_source_sha256_match": true,
+        "provider_revision_answer_sentinel_present": true,
+        "provider_revision_count": 1,
+        "provider_revision_snapshot_match": true,
+        "provider_revision_source_sha256_match": true,
+        "runtime_scan": {
+          "answer_sentinel_utf16le_absent": true,
+          "answer_sentinel_utf8_absent": true,
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 4,
+          "raw_response_sentinel_utf16le_absent": true,
+          "raw_response_sentinel_utf8_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "server_deterministic": true,
+        "server_loopback": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 13992.329,
+      "failure_type": null,
+      "id": "stale_proposal_blocks_apply",
+      "observations": {
+        "apply_accessibility_reported_enabled": true,
+        "apply_activation_attempted": true,
+        "apply_control_observed": true,
+        "apply_disabled_source_contract": true,
+        "editor_after_activation_attempt": {
+          "byte_count": 41,
+          "sha256": "47fb3fe2e33abe9ae2df72212484412cdbee71e24160d594d02eb8f58706ffdc"
+        },
+        "editor_after_edit": {
+          "byte_count": 41,
+          "sha256": "47fb3fe2e33abe9ae2df72212484412cdbee71e24160d594d02eb8f58706ffdc"
+        },
+        "editor_before": {
+          "byte_count": 150,
+          "sha256": "a93d9c9fb68005f5b6f559026b3620f1e069bf92d6c6ae0ced15d05b19afffa5"
+        },
+        "flow": "Revision -> edit source -> stale visible -> Apply disabled",
+        "foreground_verified": true,
+        "loopback_provider": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "provider_no_request_before_consent_click": true,
+        "provider_paths_exact": true,
+        "provider_request_count": 2,
+        "provider_review_before_revision": true,
+        "provider_review_count": 1,
+        "provider_review_source_sha256_match": true,
+        "provider_revision_answer_sentinel_present": true,
+        "provider_revision_count": 1,
+        "provider_revision_snapshot_match": true,
+        "provider_revision_source_sha256_match": true,
+        "runtime_scan": {
+          "answer_sentinel_utf16le_absent": true,
+          "answer_sentinel_utf8_absent": true,
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 5,
+          "raw_response_sentinel_utf16le_absent": true,
+          "raw_response_sentinel_utf8_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "server_deterministic": true,
+        "server_loopback": true,
+        "source_after": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        },
+        "source_before": {
+          "byte_count": 164,
+          "sha256": "53550c35e6024558a066ed482921e1265c22b85fc6bca8d8172141058ad55908"
+        },
+        "stale_no_mutation": true,
+        "stale_proposal_received": true,
+        "stale_visible": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 12636.606,
+      "failure_type": null,
+      "id": "safe_save_conflict",
+      "observations": {
+        "conflict_visible_before_save": true,
+        "editor_after_apply": {
+          "byte_count": 151,
+          "sha256": "eaed04a5892fe4dd13186eaa9a8f5f4e8272096f1cd8e64ad941f405714d05cf"
+        },
+        "external_source_after": {
+          "byte_count": 21,
+          "sha256": "6a00035862316d189ea7d008351852dfb10ac7b139b643c7d9f006800c6529eb"
+        },
+        "external_source_before": {
+          "byte_count": 21,
+          "sha256": "6a00035862316d189ea7d008351852dfb10ac7b139b643c7d9f006800c6529eb"
+        },
+        "flow": "Revision -> Apply -> external write -> safe Save conflict",
+        "foreground_verified": true,
+        "loopback_provider": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "provider_no_request_before_consent_click": true,
+        "provider_paths_exact": true,
+        "provider_request_count": 2,
+        "provider_review_before_revision": true,
+        "provider_review_count": 1,
+        "provider_review_source_sha256_match": true,
+        "provider_revision_answer_sentinel_present": true,
+        "provider_revision_count": 1,
+        "provider_revision_snapshot_match": true,
+        "provider_revision_source_sha256_match": true,
+        "runtime_scan": {
+          "answer_sentinel_utf16le_absent": true,
+          "answer_sentinel_utf8_absent": true,
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 5,
+          "raw_response_sentinel_utf16le_absent": true,
+          "raw_response_sentinel_utf8_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "safe_save_conflict_visible": true,
+        "safe_save_no_overwrite": true,
+        "save_shortcut_sent": true,
+        "server_deterministic": true,
+        "server_loopback": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 15302.413,
+      "failure_type": null,
+      "id": "trusted_executable_apply_revokes_trust",
+      "observations": {
+        "editor_after_apply": {
+          "byte_count": 123,
+          "sha256": "f28e26591ca731ff7eb841c957a1245ff9e6ff1be126939b865c79a1a82f233e"
+        },
+        "editor_before_apply": {
+          "byte_count": 123,
+          "sha256": "87b6871e12c48d22859f3f5935225643904f6c5c4ed00fe19881d54046edbc98"
+        },
+        "executable_change": true,
+        "executable_expected": {
+          "byte_count": 123,
+          "sha256": "f28e26591ca731ff7eb841c957a1245ff9e6ff1be126939b865c79a1a82f233e"
+        },
+        "executable_matches_expected": true,
+        "flow": "trusted HTML -> executable Apply -> Restricted trust",
+        "foreground_verified": true,
+        "loopback_provider": true,
+        "preview_contains_executable_text": true,
+        "preview_fingerprint": {
+          "byte_count": 123,
+          "sha256": "f28e26591ca731ff7eb841c957a1245ff9e6ff1be126939b865c79a1a82f233e"
+        },
+        "preview_inert_source_contract": true,
+        "preview_matches_expected": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "provider_no_request_before_consent_click": true,
+        "provider_paths_exact": true,
+        "provider_request_count": 2,
+        "provider_review_before_revision": true,
+        "provider_review_count": 1,
+        "provider_review_source_sha256_match": true,
+        "provider_revision_answer_sentinel_present": true,
+        "provider_revision_count": 1,
+        "provider_revision_snapshot_match": true,
+        "provider_revision_source_sha256_match": true,
+        "restricted_after_apply": true,
+        "runtime_scan": {
+          "answer_sentinel_utf16le_absent": true,
+          "answer_sentinel_utf8_absent": true,
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 123,
+          "raw_response_sentinel_utf16le_absent": true,
+          "raw_response_sentinel_utf8_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "server_deterministic": true,
+        "server_loopback": true,
+        "trust_before": true,
+        "trust_revocation_order_source_contract": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    }
+  ],
+  "completed_at_utc": "2026-09-29T16:28:18.020Z",
+  "environment": {
+    "active_console_session_id": 1,
+    "architecture": "x86_64",
+    "harness_is_console_session": false,
+    "harness_process": {
+      "integrity": "medium",
+      "integrity_rid": 8192,
+      "session_id": 2
+    },
+    "input_desktop": "Default",
+    "native_machine_code": 34404,
+    "platform": "Windows 11",
+    "python_pointer_bits": 64,
+    "thread_desktop": "Default",
+    "windows_build": 26300,
+    "windows_major": 10,
+    "windows_minor": 0,
+    "wts_state": "WTSActive"
+  },
+  "executable": {
+    "byte_count": 50295296,
+    "copied_sha256": "f1ec266cc3dece1172402a5b35aadc64a8fc8c31223ec6294ff0c8834dc6f076",
+    "copy_hash_verified": true,
+    "expected_sha256": "f1ec266cc3dece1172402a5b35aadc64a8fc8c31223ec6294ff0c8834dc6f076",
+    "format": "PE32+",
+    "hash_verified": true,
+    "machine": "x86_64",
+    "machine_code": 34404,
+    "optional_magic": 523,
+    "sha256": "f1ec266cc3dece1172402a5b35aadc64a8fc8c31223ec6294ff0c8834dc6f076"
+  },
+  "schema": "markturbo.goal-07-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-29T16:26:56.881Z",
+  "status": "PASS",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 0,
+    "not_run_case_count": 0,
+    "passed_case_count": 6,
+    "required_case_count": 6
+  },
+  "transport": {
+    "deterministic": true,
+    "mode": "keyless_loopback",
+    "provider": "openai-responses",
+    "request_count": 12
+  }
+}

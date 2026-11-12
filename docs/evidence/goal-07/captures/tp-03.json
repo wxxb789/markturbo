@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "TP-03",
+    "path": "evaluation/goal-01/task-prompts/03-diagnose-duplicate-git-crates.md",
+    "lens": "Task prompt",
+    "sha256": "bc19915c16461dcdee484a4cffc76c183b5fe9bedec214901b08e7c2f7a9ae58",
+    "byte_count": 573,
+    "files": [
+      {
+        "path": "evaluation/goal-01/task-prompts/03-diagnose-duplicate-git-crates.md",
+        "sha256": "7344bc999e91ec0c8472c557d4261c19e5cd02fe7b3801d47c06b3cfdd9755d1",
+        "byte_count": 573
+      }
+    ]
+  },
+  "request": {
+    "lens": "prompt",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Diagnose Duplicate Git Crates\n\nDocument and diagnose a Cargo failure where a direct git dependency is pinned by\n`rev` while another dependency declares the same repository without that source\nselector. The resulting duplicate crates make trait implementations appear to\nbe missing even though the APIs exist.\n\nLead with the recognizable compiler symptom, identify the dependency-tree\nevidence that distinguishes the two sources, and state the source-selector fix.\nDo not recommend unrelated trait imports or feature flags after the duplicate\nsource has been established.\n",
+      "path": "evaluation/goal-01/task-prompts/03-diagnose-duplicate-git-crates.md"
+    },
+    "snapshot": {
+      "revision": 3,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Document and diagnose duplicate Cargo git sources that make existing trait implementations appear missing.",
+      "relevant_context": [
+        "A dependency declared with only git = \"URL\" is a different Cargo source from the same URL declared with an explicit rev selector."
+      ],
+      "constraints": [
+        "Once duplicate-source evidence is established, do not recommend trait imports, feature toggles, or a tighter manual revision pin."
+      ],
+      "non_goals": [
+        "Do not treat the compiler symptom as an API or trait-import defect."
+      ],
+      "expected_deliverable": "A diagnosis that leads from the compiler symptom to dependency-tree evidence and the shared source-selector fix.",
+      "success_evidence": [
+        "All shared git dependencies use one URL and source selector, Cargo.lock carries the resolved revision, and gpui appears once."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "Should the proposed fix explicitly remove mixed git source selectors and leave the resolved revision to Cargo.lock?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "Should the proposed fix explicitly remove mixed git source selectors and leave the resolved revision to Cargo.lock?",
+        "priority": "high",
+        "impact": "The answer determines whether the revision states the exact dependency normalization instead of a generic deduplication step."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "Yes. Align every shared git dependency on the same URL and source selector, and let Cargo.lock record the resolved revision."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"State the answered source-selector fix directly and rule out misleading trait-level remedies.\",\"edits\":[{\"range\":{\"start\":573,\"end\":573},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified source-selector fix\\n\\nTreat git = \\\"URL\\\" and git = \\\"URL\\\", rev = \\\"...\\\" as distinct Cargo sources. Align every shared git dependency on the same URL and source selector, and let Cargo.lock record the resolved revision.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"4c8014a9c444d441f2ded21290fdca4645624026f550de9e9c095617b7d8f19c\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

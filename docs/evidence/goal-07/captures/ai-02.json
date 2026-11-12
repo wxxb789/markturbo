@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "AI-02",
+    "path": "evaluation/goal-01/snapshots/agent-instructions/sample-workspace-AGENTS.md",
+    "lens": "Agent instructions",
+    "sha256": "d862bf86c7e9e8e6793e0406c488ea37b182f08f075c8847144da9646bc96484",
+    "byte_count": 1082,
+    "files": [
+      {
+        "path": "evaluation/goal-01/snapshots/agent-instructions/sample-workspace-AGENTS.md",
+        "sha256": "bd37088139ca2a628326776c42f27c2c00453dc7304c562e59e9645d91d64a05",
+        "byte_count": 1082
+      }
+    ]
+  },
+  "request": {
+    "lens": "agent_instructions",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Agent instructions\n\nThis file exists so you can see how markturbo treats agent artifacts. Open it\nand look at the toolbar: it is labelled **Agent Instructions**, not \"Markdown\".\n\nThat labelling is deliberate. `AGENTS.md`, `CLAUDE.md`, `SKILL.md`, and\n`.cursor/rules/*` are the source code of human–agent collaboration, and a\nworkspace for them should know what they are.\n\n## Why this matters later\n\nRecognition is the foundation for a feature markturbo does not have yet:\n\n```text\nEffective Agent Context\n\nrepo/AGENTS.md\n        ↓\nsrc/AGENTS.md\n        ↓\ncurrent file\n```\n\nResolving which instructions actually apply to a given file requires knowing\nwhich files are instructions in the first place. v0.1 stops at recognition —\nthe architecture just doesn't prevent the rest.\n\n## Example content\n\nBelow is the sort of thing a real `AGENTS.md` holds, so the file is not empty.\n\n### Build\n\n```sh\ncargo build --release\n```\n\n### Conventions\n\n- Keep changes scoped to what was asked.\n- Run the tests before claiming something works.\n- Prefer the existing helper over a new one.\n",
+      "path": "evaluation/goal-01/snapshots/agent-instructions/sample-workspace-AGENTS.md"
+    },
+    "snapshot": {
+      "revision": 10,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Demonstrate that agent-instruction files are recognized as collaboration artifacts rather than ordinary Markdown.",
+      "relevant_context": [
+        "The Effective Agent Context diagram describes a future capability while v0.1 stops at recognition."
+      ],
+      "constraints": [
+        "Keep sample changes scoped, use existing helpers, and do not treat future context resolution as implemented behavior."
+      ],
+      "non_goals": [
+        "Do not expand the sample into a new context-resolution subsystem."
+      ],
+      "expected_deliverable": "A bounded sample that demonstrates artifact recognition and ordinary build conventions.",
+      "success_evidence": [
+        "The relevant tests pass and the sample continues to use existing helpers."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "Does the Effective Agent Context diagram authorize implementing inheritance resolution in this sample now?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "Does the Effective Agent Context diagram authorize implementing inheritance resolution in this sample now?",
+        "priority": "high",
+        "impact": "The answer determines whether the revision stays explanatory or expands the sample into a new subsystem."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "No. Keep the diagram explicitly future-facing; v0.1 owns recognition only."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Make the answered scope boundary explicit so the example cannot be read as implementation authority.\",\"edits\":[{\"range\":{\"start\":1082,\"end\":1082},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified diagram status\\n\\nThe Effective Agent Context diagram is explanatory future context only. It does not authorize implementing inheritance resolution or a new subsystem in this sample.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"0da6f5db48a399ed5cac15ed183fac45a33f0302409d4d88404d8fc5910a906a\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

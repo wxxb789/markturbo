@@ -30,8 +30,8 @@ test edits remain on the existing branch without commits or publication.
   ignored tests. Python's explicit 18-module manifest and discovery both
   enumerate the same 386 IDs, with no missing or extra registrations.
 - The complete machine-readable baseline is
-  `.scratch/test-ablation/inventory.json`; recovery evidence is summarized in
-  `.scratch/resumed-work-status.md`.
+  `docs/evidence/test-ablation/inventory.json`; recovery evidence is summarized
+  in the result tables below.
 - Five pre-existing Clippy warnings remain in unrelated implementation/test
   logic. Passing exit codes do not mean zero warnings.
 - Windows GUI acceptance was blocked at baseline by an unavailable foreground
@@ -44,10 +44,10 @@ test edits remain on the existing branch without commits or publication.
 
 | Family | Inventory and proof boundary | Status |
 | --- | --- | --- |
-| Core units, integration, evaluation binaries, ignored probes | `.scratch/ablation-core-inventory.md`: 38 test-bearing/support files; library doctests are disabled. | Complete; E1 executed. |
-| App units, GPUI interaction, integration and cost probes | `.scratch/ablation-app-inventory.md`: 27 files, 370 declarations before platform filtering. | Complete; E6-E7 executed. |
-| Non-native Python tooling and evaluation/verification CLIs | `.scratch/ablation-tooling-inventory.md`: 9 test modules, 170 methods, all supporting commands. | Complete; E3-E5 executed. |
-| Native fake-UIA, evidence validators, runtime and provider harnesses | `.scratch/ablation-native-inventory.md`: all 18 scoped files. | Complete; E2 executed. |
+| Core units, integration, evaluation binaries, ignored probes | `docs/evidence/ablation-core-inventory.md`: 38 test-bearing/support files; library doctests are disabled. | Complete; E1 executed. |
+| App units, GPUI interaction, integration and cost probes | `docs/evidence/ablation-app-inventory.md`: 27 files, 370 declarations before platform filtering. | Complete; E6-E7 executed. |
+| Non-native Python tooling and evaluation/verification CLIs | `docs/evidence/ablation-tooling-inventory.md`: 9 test modules, 170 methods, all supporting commands. | Complete; E3-E5 executed. |
+| Native fake-UIA, evidence validators, runtime and provider harnesses | `docs/evidence/ablation-native-inventory.md`: all 18 scoped files. | Complete; E2 executed. |
 | CI and platform smoke | `.github/workflows/pull-request.yml`, `release.yml`, and `version-bump.yml` | Complete; E8 retains distinct platform/build/release boundaries. |
 | Vendored parser tests | `vendor/ratex-parser/src/{lib,mhchem/mod,mhchem/patterns,mhchem/texify,parse_node,parser,stack_safety,tests}.rs`, `tests/ce_line91_brace.rs` | Retain upstream snapshot and local allocation-clamp contract. |
 | Fixture/sample shell scripts | `fixtures/skills/skills/valid-skill/scripts/run.sh`, `sample/.claude/skills/hello-diagrams/scripts/render.sh` | Artifact content, not development test runners; retain. |
@@ -73,7 +73,7 @@ boundaries, not substitutes.
 | E8 | Native startup smoke readiness | Running the workflow's actual readiness function accepts the valid trace and rejects seven missing/foreign/incomplete/malformed cases. Ablating the guard accepts all seven invalid inputs. | Retain native startup readiness and identity checks; this local experiment is not a macOS launch PASS. |
 
 Detailed commands, matrices and restoration evidence live in
-`.scratch/test-ablation/{core,native,revision,abba,perf,app,ignored,smoke}-results.md`.
+`docs/evidence/test-ablation/{core,native,revision,abba,perf,app,ignored,smoke}-results.md`.
 These results do not establish universal mutation coverage or replace OS
 acceptance. All identified candidates have been decided and final combined
 validation passed.
@@ -126,18 +126,18 @@ The foreground desktop became available at the closing checkpoint, so native
 verification resumed against the final hash above:
 
 - Full Goal02 passed **5/5**, with no blocked, failed or unrun cases:
-  `.scratch/goal-02-final-ablation-f1ec266c.json`.
+  `docs/evidence/goal-02-final-ablation-f1ec266c.json`.
 - The original trusted-HTML Goal07 regression case passed, including trust
   revocation, consent ordering and the complete privacy scan of 119 artifacts:
-  `.scratch/goal-07-post-ablation-trust-f1ec266c.json`. Its top-level result is
+  `docs/evidence/goal-07-post-ablation-trust-f1ec266c.json`. Its top-level result is
   deliberately `PARTIAL_CASE_RUN`, not full acceptance.
 - Full Goal07 passed its first two cases, then blocked at `accept_all_preview`
   with `CLIPBOARD_CONTAINS_NON_TEXT`; the remaining three cases were skipped
   after that block. The receipt has 2 passed, 4 blocked and 0 failed cases:
-  `.scratch/goal-07-final-ablation-f1ec266c.json`. It is not a PASS receipt.
+  `docs/evidence/goal-07-final-ablation-f1ec266c.json`. It is not a PASS receipt.
 - After the user continued and the existing non-destructive clipboard guard
   confirmed restorable text, full Goal07 passed **6/6**, with no blocked,
-  failed or unrun cases: `.scratch/goal-07-final-ablation-f1ec266c-r2.json`.
+  failed or unrun cases: `docs/evidence/goal-07-final-ablation-f1ec266c-r2.json`.
   Its 12 loopback requests match the six Review/Revision flows. Every case's
   complete artifact scan reports absence of document, answer, raw-response and
   ephemeral-credential sentinels in both UTF-8 and UTF-16LE; the trusted-HTML

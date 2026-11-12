@@ -1,0 +1,101 @@
+{
+  "cases": [
+    {
+      "duration_ms": 20736.477,
+      "failure_type": "HarnessFailure",
+      "id": "reject_all_byte_identity",
+      "observations": {},
+      "reason_code": "REVIEW_RESULT_UIA_TIMEOUT",
+      "status": "FAIL"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "selective_apply_one_undo",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_FAILURE",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "accept_all_preview",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_FAILURE",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "stale_proposal_blocks_apply",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_FAILURE",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "safe_save_conflict",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_FAILURE",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "trusted_executable_apply_revokes_trust",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_FAILURE",
+      "status": "NOT_RUN"
+    }
+  ],
+  "completed_at_utc": "2026-09-19T11:46:23.260Z",
+  "environment": {
+    "active_console_session_id": 1,
+    "architecture": "x86_64",
+    "harness_is_console_session": false,
+    "harness_process": {
+      "integrity": "medium",
+      "integrity_rid": 8192,
+      "session_id": 2
+    },
+    "input_desktop": "Default",
+    "native_machine_code": 34404,
+    "platform": "Windows 11",
+    "python_pointer_bits": 64,
+    "thread_desktop": "Default",
+    "windows_build": 26200,
+    "windows_major": 10,
+    "windows_minor": 0,
+    "wts_state": "WTSActive"
+  },
+  "executable": {
+    "byte_count": 51262464,
+    "copied_sha256": "0e9c33691362a80e78c4ed6ade009e4c5986a641dd921bbb3f8b90de35940053",
+    "copy_hash_verified": true,
+    "expected_sha256": "0e9c33691362a80e78c4ed6ade009e4c5986a641dd921bbb3f8b90de35940053",
+    "format": "PE32+",
+    "hash_verified": true,
+    "machine": "x86_64",
+    "machine_code": 34404,
+    "optional_magic": 523,
+    "sha256": "0e9c33691362a80e78c4ed6ade009e4c5986a641dd921bbb3f8b90de35940053"
+  },
+  "schema": "markturbo.goal-07-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-19T11:46:00.981Z",
+  "status": "FAIL",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 1,
+    "not_run_case_count": 5,
+    "passed_case_count": 0,
+    "required_case_count": 6
+  },
+  "transport": {
+    "deterministic": true,
+    "mode": "keyless_loopback",
+    "provider": "openai-responses",
+    "request_count": 0
+  }
+}

@@ -1,0 +1,6 @@
+wrong_schedule_abab: exit=1 killed=True
+cross_pair_indexes: exit=1 killed=True
+reversed_delta: exit=1 killed=True
+allow_zero_baseline: exit=1 killed=True
+raw_median_delta: exit=1 killed=True
+EXIT_CODE=0

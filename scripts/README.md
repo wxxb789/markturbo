@@ -65,10 +65,10 @@ uv run --project scripts scripts/mt.py fixtures
 uv run --project scripts scripts/mt.py probe -- memory
 uv run --project scripts scripts/mt.py capacity
 uv run --project scripts scripts/mt.py evaluation verify-manifest
-uv run --project scripts scripts/mt.py evaluation scaffold --evidence .scratch/goal-06/evaluation.json
-uv run --project scripts scripts/mt.py evaluation record --owner-input-dir <owner-local-dir> --evidence .scratch/goal-06/evaluation.json
-uv run --project scripts scripts/mt.py revision-evaluation scaffold --evidence .scratch/goal-07-revision.json
-uv run --project scripts scripts/mt.py revision-evaluation record --owner-input-dir <owner-local-dir> --evidence .scratch/goal-07-revision.json
+uv run --project scripts scripts/mt.py evaluation scaffold --evidence docs/evidence/goal-06/evaluation.json
+uv run --project scripts scripts/mt.py evaluation record --owner-input-dir <owner-local-dir> --evidence docs/evidence/goal-06/evaluation.json
+uv run --project scripts scripts/mt.py revision-evaluation scaffold --evidence docs/evidence/goal-07-revision.json
+uv run --project scripts scripts/mt.py revision-evaluation record --owner-input-dir <owner-local-dir> --evidence docs/evidence/goal-07-revision.json
 uv run --project scripts scripts/mt.py accept goal-02 -- --help
 uv run --project scripts scripts/mt.py accept goal-03 -- --help
 uv run --project scripts scripts/mt.py accept goal-06 -- --help
@@ -83,6 +83,12 @@ fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence.
+
+Goal 02/03/06/07 acceptance defaults write working receipts under the ignored
+`target/native-acceptance/` directory, including failed and single-case runs.
+Use `--evidence` to choose another output path. Review a completed receipt before
+copying it into `docs/evidence/` under a distinct name for retention; do not use
+an existing historical receipt as a routine run destination.
 
 `evaluation verify-manifest` verifies the immutable `goal-01-v1` corpus and
 prints only paths, byte counts, and SHA-256 values. `evaluation scaffold`
@@ -156,13 +162,13 @@ owner-local inputs; the receipt and final evidence must remain outside
 
 ```powershell
 $runner = "target\release\markturbo-goal07-evaluate.exe"
-$captureDir = ".scratch\goal-07\captures"
-$decisionDir = ".scratch\goal-07\composition-decisions"
-$machineReceipt = ".scratch\goal-07\machine-receipt.json"
-$registry = ".scratch\goal-07\eligibility.json"
-$ownerDir = ".scratch\goal-07\owner-input"
-$nativeEvidence = ".scratch\goal-07\goal-07-native-acceptance-v1.json"
-$evidence = ".scratch\goal-07\revision-evaluation.json"
+$captureDir = "docs/evidence/goal-07\captures"
+$decisionDir = "docs/evidence/goal-07\composition-decisions"
+$machineReceipt = "docs/evidence/goal-07\machine-receipt.json"
+$registry = "docs/evidence/goal-07\eligibility.json"
+$ownerDir = "docs/evidence/goal-07\owner-input"
+$nativeEvidence = "docs/evidence/goal-07\goal-07-native-acceptance-v1.json"
+$evidence = "docs/evidence/goal-07\revision-evaluation.json"
 
 cargo build --release --locked -p mt-core --bin markturbo-goal07-evaluate
 $runnerSha = (Get-FileHash $runner -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -211,11 +217,11 @@ non-model features rather than falsely claiming Tokio disappears:
 
 ```sh
 uv run --project scripts scripts/mt.py probe -- build-goal04 \
-  --variant full --target-dir .scratch/goal-04/full \
-  --evidence .scratch/goal-04/full-build.json
+  --variant full --target-dir target/goal-04/full \
+  --evidence docs/evidence/goal-04/full-build.json
 uv run --project scripts scripts/mt.py probe -- build-goal04 \
-  --variant no-model --target-dir .scratch/goal-04/no-model \
-  --evidence .scratch/goal-04/no-model-build.json
+  --variant no-model --target-dir target/goal-04/no-model \
+  --evidence docs/evidence/goal-04/no-model-build.json
 ```
 
 The `no-model` build is measurement apparatus, not a supported product
@@ -230,20 +236,20 @@ before each comparison:
 ```sh
 uv run --project scripts scripts/mt.py probe -- quiet \
   --wait-seconds 3600 \
-  --evidence .scratch/goal-04/quiet.json
+  --evidence docs/evidence/goal-04/quiet.json
 uv run --project scripts scripts/mt.py probe -- startup \
   --milestones \
-  --exe .scratch/goal-04/full/x86_64-pc-windows-msvc/release/markturbo.exe \
-  --compare .scratch/goal-04/no-model/x86_64-pc-windows-msvc/release/markturbo.exe \
+  --exe target/goal-04/full/x86_64-pc-windows-msvc/release/markturbo.exe \
+  --compare target/goal-04/no-model/x86_64-pc-windows-msvc/release/markturbo.exe \
   --label full \
   --compare-label no-model \
-  --build-evidence .scratch/goal-04/full-build.json \
-  --compare-build-evidence .scratch/goal-04/no-model-build.json \
-  --threshold-evidence .scratch/goal-04/threshold.json \
+  --build-evidence docs/evidence/goal-04/full-build.json \
+  --compare-build-evidence docs/evidence/goal-04/no-model-build.json \
+  --threshold-evidence docs/evidence/goal-04/threshold.json \
   --cache-state warm \
   --rounds 10 \
-  --quiet-evidence .scratch/goal-04/quiet.json \
-  --evidence .scratch/goal-04/full-vs-no-model-warm.json
+  --quiet-evidence docs/evidence/goal-04/quiet.json \
+  --evidence docs/evidence/goal-04/full-vs-no-model-warm.json
 ```
 
 Every milestone sample also records idle working set, private bytes, peak
@@ -251,17 +257,17 @@ working set, page faults, and thread count after `--idle-settle`. The default
 `warm` mode reuses one isolated data/config profile per variant across warmups
 and measured launches. Repeat the command after a new quiet gate with
 `--cache-state fresh-profile` and write
-`.scratch/goal-04/full-vs-no-model-fresh-profile.json`. This creates fresh
+`docs/evidence/goal-04/full-vs-no-model-fresh-profile.json`. This creates fresh
 isolated profiles but explicitly does not claim to flush the Windows file cache.
 After both runs, bind the owner's final decision to both evidence files:
 
 ```sh
 uv run --project scripts scripts/mt.py probe -- decide-goal04 \
-  --warm-evidence .scratch/goal-04/full-vs-no-model-warm.json \
-  --fresh-profile-evidence .scratch/goal-04/full-vs-no-model-fresh-profile.json \
+  --warm-evidence docs/evidence/goal-04/full-vs-no-model-warm.json \
+  --fresh-profile-evidence docs/evidence/goal-04/full-vs-no-model-fresh-profile.json \
   --decision "keep in-process" \
   --owner-approved \
-  --evidence .scratch/goal-04/model-transport-decision.json
+  --evidence docs/evidence/goal-04/model-transport-decision.json
 ```
 
 Build and measure the model first-use test against a deterministic loopback
@@ -271,16 +277,16 @@ warmups affect only the Windows file cache, which is not flushed:
 
 ```sh
 uv run --project scripts scripts/mt.py probe -- build-goal04 \
-  --variant model-first-use --target-dir .scratch/goal-04/model-first-use \
-  --evidence .scratch/goal-04/model-first-use-build.json
+  --variant model-first-use --target-dir target/goal-04/model-first-use \
+  --evidence docs/evidence/goal-04/model-first-use-build.json
 uv run --project scripts scripts/mt.py probe -- model-first-use \
-  --exe .scratch/goal-04/model-first-use/goal04-artifacts/model-first-use.exe \
-  --build-evidence .scratch/goal-04/model-first-use-build.json \
-  --app-exe .scratch/goal-04/full/x86_64-pc-windows-msvc/release/markturbo.exe \
-  --app-build-evidence .scratch/goal-04/full-build.json \
-  --quiet-evidence .scratch/goal-04/quiet.json \
+  --exe target/goal-04/model-first-use/goal04-artifacts/model-first-use.exe \
+  --build-evidence docs/evidence/goal-04/model-first-use-build.json \
+  --app-exe target/goal-04/full/x86_64-pc-windows-msvc/release/markturbo.exe \
+  --app-build-evidence docs/evidence/goal-04/full-build.json \
+  --quiet-evidence docs/evidence/goal-04/quiet.json \
   --rounds 10 \
-  --evidence .scratch/goal-04/model-first-use.json
+  --evidence docs/evidence/goal-04/model-first-use.json
 ```
 
 Forward an underlying script's options after `--`. For example:
@@ -290,17 +296,17 @@ uv run --project scripts scripts/mt.py probe -- startup --rounds 10
 uv run --project scripts scripts/mt.py accept goal-03 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence .scratch/goal-03-native-acceptance-v1.json
+  --evidence docs/evidence/goal-03-native-acceptance-v1.json
 
 uv run --project scripts scripts/mt.py accept goal-06 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence .scratch/goal-06-native-acceptance-v1.json
+  --evidence docs/evidence/goal-06-native-acceptance-v1.json
 
 uv run --project scripts scripts/mt.py accept goal-07 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence .scratch/goal-07-native-acceptance-v1.json
+  --evidence docs/evidence/goal-07-native-acceptance-v1.json
 ```
 
 Delegated commands run from the repository root. Therefore paths supplied to
@@ -337,7 +343,8 @@ not from module-global state. Goal 03 preflight checks both the Workspace shell
 and its Welcome production module; source checks are structural safeguards, not
 proof that the shipped executable exposed those controls.
 
-## Scratch data
+## Evidence data
 
-`.scratch/` is disposable by default. Keep measured performance evidence under
-`.scratch/perf-and-size/` when it is intended to be versioned.
+`docs/evidence/` holds versioned acceptance and measurement evidence. Generated
+working output belongs in an OS temp directory; add it here only when it is meant
+to be retained.

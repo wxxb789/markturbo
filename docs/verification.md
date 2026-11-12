@@ -67,6 +67,9 @@ hash-bound milestone action and may be BLOCKED by the desktop/session.
 6. **One failing invariant is enough.** Do not add a second test with the same
    oracle and same failure mode to raise a count.
 
+Retained acceptance, ablation, and measurement evidence is indexed in
+[`evidence/`](evidence/README.md).
+
 ## Native harness status
 
 The nsh app has stable headless test IDs but not yet a complete native
@@ -81,7 +84,7 @@ Goal 09's release-build screenshot matrix is produced by:
 ```sh
 uv run --locked --project scripts scripts/mt.py visual -- \
     --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
-    --out .scratch/goal-09/matrix
+    --out docs/evidence/goal-09/matrix
 ```
 
 It records each cell's source revision, executable hash, DPI, DIP and pixel

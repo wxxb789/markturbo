@@ -1,0 +1,71 @@
+{
+  "cases": [
+    {
+      "duration_ms": 18349.822,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_document",
+      "observations": {
+        "bring_to_top_return": true,
+        "foreground_attempts": 592,
+        "foreground_hwnd": 0,
+        "requested_hwnd": 264571150,
+        "set_foreground_return": false,
+        "show_window_return": true
+      },
+      "reason_code": "FOREGROUND_PERMISSION_DENIED",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_selection",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_BLOCKED",
+      "status": "BLOCKED"
+    }
+  ],
+  "completed_at_utc": "2026-09-08T16:21:02.064Z",
+  "environment": {
+    "active_console_session_id": 1,
+    "architecture": "x86_64",
+    "harness_is_console_session": false,
+    "harness_process": {
+      "integrity": "medium",
+      "integrity_rid": 8192,
+      "session_id": 2
+    },
+    "input_desktop": "Default",
+    "native_machine_code": 34404,
+    "platform": "Windows 11",
+    "python_pointer_bits": 64,
+    "thread_desktop": "Default",
+    "windows_build": 26200,
+    "windows_major": 10,
+    "windows_minor": 0,
+    "wts_state": "WTSActive"
+  },
+  "executable": {
+    "byte_count": 50060288,
+    "copied_sha256": "ecc801c3b4228c49e2b547c03687fd2591857f4f704ed7913f4a542476e32de7",
+    "copy_hash_verified": true,
+    "expected_sha256": "ecc801c3b4228c49e2b547c03687fd2591857f4f704ed7913f4a542476e32de7",
+    "format": "PE32+",
+    "hash_verified": true,
+    "machine": "x86_64",
+    "machine_code": 34404,
+    "optional_magic": 523,
+    "sha256": "ecc801c3b4228c49e2b547c03687fd2591857f4f704ed7913f4a542476e32de7"
+  },
+  "mode": "configured_provider_success",
+  "schema": "markturbo.goal-06-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-08T16:20:42.359Z",
+  "status": "BLOCKED",
+  "summary": {
+    "blocked_case_count": 2,
+    "failed_case_count": 0,
+    "not_run_case_count": 0,
+    "passed_case_count": 0,
+    "required_case_count": 2
+  }
+}

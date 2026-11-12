@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "SP-04",
+    "path": "evaluation/goal-01/snapshots/goals/06-deliver-read-only-intent-review.md",
+    "lens": "Specification / plan",
+    "sha256": "6dc46d0821d27572dd4fbd857525c5e6437b446820b2885dfdfab19ee170615d",
+    "byte_count": 9014,
+    "files": [
+      {
+        "path": "evaluation/goal-01/snapshots/goals/06-deliver-read-only-intent-review.md",
+        "sha256": "49293b1d59ec23b7c5253acaa6021c818f1e94e6c3a6f2a987bbfb915549f89e",
+        "byte_count": 9014
+      }
+    ]
+  },
+  "request": {
+    "lens": "specification",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Goal 06 — Deliver read-only Review\n\n## Objective\n\nLet a user review the active document or selection without changing one document\nsource byte: present a validated structured account of understood intent,\nsource-grounded findings, assumptions, and no more than five prioritized\nclarification questions through the artifact lenses in `PRODUCT.md`; process all\n12 artifacts in `evaluation/goal-01/CORPUS.md` under a recorded model,\nmodel-version, Review prompt-version, and sampling configuration, meet the fixed\nusefulness threshold, and degrade explicitly when no model is configured or a\nresponse is stale, malformed, cancelled, or unavailable.\n\n## Product behavior\n\nReview is an inspection before it is an editor. It should help the user compare\nwhat they meant with what another reasoner understood.\n\n## Product contract alignment\n\n**Disposition:** Retained and revised on 2026-08-29.\n\nThis is the document-only intermediate Review promised by `PRODUCT.md`, not the\nfirst public-quality context-aware release. It keeps source text unchanged,\nsupports an Agent Skill as its `SKILL.md` plus supporting directory artifact, and\nrenders generated output in the selected interface language (English or\nSimplified Chinese) while quoted source remains byte-exact. Until Goal 08,\nReview must neither resolve nor include Effective Agent Context.\n\nA successful result distinguishes:\n\n- stated goal;\n- relevant document-derived context and inputs;\n- constraints and non-goals;\n- expected deliverable;\n- success evidence;\n- inferred assumptions;\n- unresolved or contradictory decisions.\n\nIt asks only questions whose answers could materially change the requested\noutcome. It does not reward length, inject generic prompt boilerplate, or claim a\nuniversal prompt score.\n\nAn Agent Skill package has deterministic request semantics. Include regular\nfiles below the selected Skill root only, ordered by normalized UTF-8 relative\npath in byte order, and never follow a symbolic link. Every source frame must\nunambiguously contain the path length and path bytes followed by the content\nlength and raw content bytes. Binary or non-UTF-8 content contributes only its\npath, byte size, and SHA-256 metadata unless the user explicitly selects its raw\ncontent. The Review source limit is 512 KiB per file and 4 MiB in aggregate;\nwhen either limit is exceeded, report it and do not silently truncate. These\nsource limits preserve the 8 MiB worker-frame compatibility established by Goal\n05.\n\n## In scope\n\n- A Review command for the whole active document and the current selection.\n- An explicit artifact lens, with a sensible inferred default and a visible way\n  to correct it. Support the lens set approved by `PRODUCT.md`: Prompt,\n  Specification/Plan, Agent Instructions, and Agent Skill. An Agent Skill is a\n  `SKILL.md` plus its supporting directory treated as one artifact, not only a\n  single Markdown file. It uses the deterministic package rules above and, before\n  sending, displays every included file's normalized relative path, byte size,\n  and inclusion reason. A file not listed must not be sent; omitting a normally\n  in-scope supporting file labels the resulting Review partial.\n- Provider-independent Review request and result types that do not introduce\n  GPUI, HTTP, or a model SDK into `mt-doc`.\n- A structured “What I understand” presentation plus findings and up to five\n  ranked clarification questions.\n- Present generated prose in the selected interface language, English or\n  Simplified Chinese, while preserving quoted source text exactly; do not\n  silently couple it to the Translation target language.\n- Render model output as inert structured text. It must not execute HTML, MDX,\n  script, command links, tool calls, or model-supplied UI actions.\n- A stable source anchor for every localized finding: a relative path plus byte\n  range or line reference for a package file, or the active document's byte\n  range or line reference. Document-wide findings must say that they are\n  document-wide rather than inventing a line.\n- Explicit labels separating source statements from model inferences.\n- Use Goal 05A's credential, endpoint-identity, consent, and outbound-scope\n  boundary. Request inspection must prove that the displayed outbound inventory\n  exactly equals the user-content bytes provided to the adapter, excluding\n  documented protocol framing. Review must show whether it is sending a\n  selection, whole document, or Agent Skill package; selection-only analysis\n  must identify its missing surrounding document context rather than pretending\n  to describe the complete artifact. Do not resolve, display, or send Effective\n  Agent Context before Goal 08.\n- Treat document content as delimited, untrusted data. Text that asks the reviewer\n  to ignore its contract, emit protocol fields, invoke tools, or change endpoints\n  cannot alter transport/configuration or bypass structured validation.\n- Source-snapshot identity. If the user edits while Review runs, retain the\n  result only as stale inspection and never present it as describing the current\n  revision.\n- Cancellation, request-size limits, timeout behavior, and validated structured\n  decoding. Invalid output becomes a diagnostic, never partially trusted UI.\n- Useful local-only behavior when no model is configured: existing syntax,\n  frontmatter, Skill, and document diagnostics remain available, and the semantic\n  Review clearly explains what configuration is missing.\n- Recorded or deterministic provider fixtures sufficient to test all UI states\n  without a network key.\n\n## Out of scope\n\n- Rewriting text, answering questions inside the app, generating patches, showing\n  a diff, or applying edits. Goal 07 owns all mutation.\n- Resolving, displaying, or including inherited agent instructions or Effective\n  Agent Context. Goal 08 alone owns that input, disclosure, and request scope.\n- Running the reviewed prompt, comparing model outputs, or acting as an agent.\n- A generic chat transcript, prompt marketplace, template library, numerical\n  quality score, or hidden model memory.\n- Adding a second transport architecture if Goal 05 was correctly skipped.\n\n## Evaluation standard\n\nRun Review over every artifact in immutable corpus version `goal-01-v1` under\nthe fixed [Review Evaluation Contract](../PRODUCT.md#review-evaluation-contract).\nBefore sending a corpus artifact or scoring a result as threshold evidence,\nverify `evaluation/goal-01/MANIFEST.sha256`. Record the corpus version and\nmanifest digest with every evaluation result. A hash mismatch disqualifies the\nartifact and result from threshold evidence. The contract is the sole authority\nfor the reference configuration and acceptance thresholds; this goal must not\nweaken or duplicate them.\n\nFor each artifact, record:\n\n- whether the structured result decoded completely;\n- which annotated high-impact findings or questions were surfaced;\n- unsupported claims or false source anchors;\n- low-value boilerplate questions;\n- project-owner usefulness judgment.\n\nDo not weaken the contract after seeing results. Exact prose is not compared;\ngrounded meaning and question usefulness are.\n\n## Completion evidence\n\n1. Document and selection Review both work from a clean profile after explicit\n   provider configuration through Goal 05A's secure path.\n2. No success, error, cancellation, timeout, stale result, or malformed response\n   changes editor text or dirty state.\n3. Every localized finding navigates to the source range it claims; package\n   findings identify a relative path plus byte range or line reference, and\n   selection Review visibly states that surrounding document context was omitted.\n4. No result displays more than five clarification questions, and their priority\n   is represented explicitly.\n5. All 12 corpus artifacts have recorded model/configuration metadata, corpus\n   version, and verified manifest digest, and meet the fixed Review Evaluation\n   Contract. No result with a manifest mismatch is counted as threshold evidence.\n6. Keyless tests cover success, no provider, local endpoint label, remote\n   disclosure, cancellation, timeout, malformed fields, oversized payload, stale\n   source, CJK, empty selection, and prompt-like instructions embedded in the\n   reviewed document.\n7. `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`, focused\n   Review tests, and `cargo test --release --workspace` pass; the pass count is\n   recorded. Focused tests include an exact request-inspection proof for an Agent\n   Skill with a supporting file and an omitted-supporting-file partial result.\n\n## Stop and ask\n\nStop if Goal 05A has not established the approved credential/request path, or if\nno artifact lens can be selected without changing the intended first user. Do\nnot send corpus or user content to an endpoint merely to make a test pass.\n\n## Boundary for the next goal\n\nThis goal ends with a useful, entirely non-mutating Review. Goal 07 alone adds\nanswers, generated revisions, diff acceptance, and editor mutation.\n",
+      "path": "evaluation/goal-01/snapshots/goals/06-deliver-read-only-intent-review.md"
+    },
+    "snapshot": {
+      "revision": 8,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Provide source-byte-neutral structured Review across the supported artifact lenses and immutable evaluation corpus.",
+      "relevant_context": [
+        "Review distinguishes stated intent, constraints, evidence, assumptions, and unresolved decisions, with at most five material questions."
+      ],
+      "constraints": [
+        "Generated output remains inert, source anchors are derived locally, and Effective Agent Context is excluded until Goal 08."
+      ],
+      "non_goals": [
+        "Do not rewrite source, generate patches, apply edits, run prompts, or introduce a generic score."
+      ],
+      "expected_deliverable": "A validated, non-mutating Review result that degrades explicitly and meets the fixed corpus threshold.",
+      "success_evidence": [
+        "All 12 corpus artifacts have manifest-bound evaluation records and source remains byte-identical in every Review state."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "Should Review return boilerplate questions merely to fill the five-question allowance when no material decision is unresolved?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "Should Review return boilerplate questions merely to fill the five-question allowance when no material decision is unresolved?",
+        "priority": "high",
+        "impact": "The answer determines whether the question cap is treated as a target or a strict maximum."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "No. Return no question when none could materially change the outcome; the five-question rule is a maximum, not a quota."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Apply the answered materiality rule so the Review contract cannot reward filler questions.\",\"edits\":[{\"range\":{\"start\":9014,\"end\":9014},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified question materiality\\n\\nIf no clarification question could materially change the outcome, return no question rather than filling the five-question limit with boilerplate. The limit is a maximum, not a quota.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"cf8e2c515fc21ad8eef7487fc39a83994bf70ec2c4e17da6b2f269a527a8d636\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

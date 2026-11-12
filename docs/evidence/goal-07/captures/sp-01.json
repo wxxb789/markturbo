@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "SP-01",
+    "path": "evaluation/goal-01/snapshots/goals/02-guarantee-user-text-safety.md",
+    "lens": "Specification / plan",
+    "sha256": "bd94f5b4e3f1d77163e4b103918fb0e75d9004a783d469edd5806ead46b6e2c1",
+    "byte_count": 7714,
+    "files": [
+      {
+        "path": "evaluation/goal-01/snapshots/goals/02-guarantee-user-text-safety.md",
+        "sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776",
+        "byte_count": 7714
+      }
+    ]
+  },
+  "request": {
+    "lens": "specification",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Goal 02 — Guarantee user-text safety\n\n## Objective\n\nFor every destructive lifecycle path owned by markturbo, prevent a normal UI\naction, asynchronous operation, or external file change from silently discarding\nnewer user-authored text, and recover the latest successfully persisted checkpoint\nafter interruption; verify the enumerated paths with automated tests and a\nWindows 11 x64 acceptance run while preserving ordinary files as the source of\ntruth.\n\n## Product invariant\n\nWhen markturbo must choose between convenience and preserving text, it preserves\nthe text or asks the user. A model result, watcher event, close action, or crash\nmust never become implicit permission to replace a newer buffer.\n\n## Product contract alignment\n\n**Disposition:** Retained and revised on 2026-08-29.\n\nThis goal preserves the local-first Markdown source-of-truth promise in\n`PRODUCT.md` on the first public-quality platform, Windows 11 x64. It retains\nrecovery only as optional local protection for a dirty buffer, never as a\nworkspace format or a replacement for explicit Save and Discard decisions.\n\n## In scope\n\n- Handle dirty-tab closure from its button and keyboard command with an explicit\n  Save / Discard / Cancel decision.\n- Apply the same decision to window close and any action that would dispose of a\n  dirty document or replace the active workspace.\n- Make the lifecycle contract work for a dirty buffer with no disk path and\n  prove that case with an in-memory document, so Goal 03 can introduce new\n  documents without redesigning or bypassing the safety boundary.\n- Give every asynchronous transformation a source revision, hash, or equivalent\n  snapshot identity. This includes the current Translation operation.\n- Refuse to apply a result when the editor no longer matches its source snapshot;\n  retain the result for inspection or offer a rerun, but never overwrite.\n- Preserve and strengthen external-change behavior: a dirty document is not\n  auto-reloaded, and overwrite or recreation remains an explicit action after a\n  rewrite, deletion, rename, or replacement.\n- Detect content changes even when file length and observable modification time\n  match the loaded values; a stamp optimization may avoid unnecessary reads but\n  must not be the sole authority to overwrite.\n- Track decoding errors and encoding representability. Invalid original bytes or\n  newly typed characters that cannot round-trip through the original encoding\n  must cause an explicit preserve/convert/Save As decision, never silent U+FFFD\n  replacement or numeric character-reference rewriting of source text.\n- Preserve a symbolic link or other explicitly supported shared-file identity on\n  Save, or refuse with an actionable choice; atomic replacement must not silently\n  turn `CLAUDE.md -> AGENTS.md` into two divergent regular files.\n- On Windows 11 x64, maintain optional local recovery checkpoints for dirty\n  buffers under application data, protected for the current user with DPAPI and\n  written atomically. Checkpoint after two seconds without an edit and at least\n  every ten seconds while dirty; acknowledge a maximum ten-second loss window;\n  retain at most 50 records, 32 MiB per record, and 128 MiB in total; and expire\n  records after seven days. Delete a record after intentional Save or Discard,\n  prune expired records at startup and after a completed checkpoint, evict the\n  oldest inactive record first when a bound is reached, and never discard the\n  newest checkpoint for an open dirty buffer without a visible warning. Report\n  unavailable, failed, or oversized recovery without blocking editing or\n  damaging the source file.\n- Retain enough load metadata to preserve encoding, BOM, line endings, source\n  path, and the original conflict stamp. If the disk file changed while the app\n  was not running, restore the buffer as conflicted rather than authorizing an\n  overwrite.\n- Ensure recovery storage does not modify the workspace, become required to open\n  files, or create a proprietary document format.\n- Avoid logging document contents, recovery contents, API keys, or model payloads.\n\n## Out of scope\n\n- The Review workflow, clarification questions, generated revisions, or\n  per-hunk diff acceptance.\n- General cloud sync, collaborative editing, version history, or continuous\n  autosave to the source file.\n- Session restoration for clean tabs, panel positions, or window geometry.\n- A redesign of tabs, banners, or the complete application visual hierarchy.\n- Changing renderer, WebView, or harness behavior except where a lifecycle action\n  would otherwise lose text.\n\n## Required cases\n\nAutomated coverage must prove at least these cases:\n\n1. Closing a clean tab closes immediately.\n2. A successful Save on dirty close writes safely and then closes; a cancelled or\n   failed Save keeps the document and window open with exact text intact.\n3. Discard on dirty close closes without writing.\n4. Cancel on dirty close preserves the tab and exact editor text.\n5. Window close with one or multiple dirty documents cannot bypass the decision.\n6. A transformation result over revision N cannot replace revision N+1.\n7. An external write cannot replace a dirty editor through auto-refresh.\n8. A same-length rewrite with an unchanged/coarsened mtime is detected before\n   Save and cannot be overwritten without explicit confirmation.\n9. External deletion or rename produces an explicit recreate/Save As decision\n   rather than silently resurrecting the old path.\n10. Saving through a symbolic link preserves the documented shared identity or\n    refuses safely; it never silently replaces the link with a regular file.\n11. A file containing undecodable original bytes cannot be rewritten through a\n    lossy editor round trip without an explicit conversion decision.\n12. Adding text unrepresentable in the original legacy encoding cannot silently\n    become replacement text or numeric character references; explicit conversion\n    or Save As preserves the editor's exact source.\n13. Recovery restores the latest completed checkpoint after simulated interruption\n    within the approved ten-second maximum loss window, including CJK and emoji.\n14. Recovery of legacy-encoded, BOM-bearing, or CRLF content retains the original\n    save metadata; if its disk file changed while closed, the recovered buffer is\n    conflicted and cannot overwrite implicitly.\n15. Saving or explicitly discarding clears the corresponding recovery record.\n16. A malformed, oversized, expired, or unreadable recovery record cannot prevent\n    startup and is reported without damaging source files.\n\n## Completion evidence\n\n- Focused lifecycle, stale-result, filesystem-conflict, and recovery tests pass.\n- A Windows 11 x64 run exercises tab close, keyboard close, window close,\n  external modification, and interrupted-session recovery with the expected\n  decisions and exact text retained.\n- `cargo fmt --all -- --check` passes.\n- `cargo clippy --workspace --all-targets` introduces no new warnings.\n- `cargo test --release --workspace` passes and the completion report records the\n  pass count.\n- The completion report names where recovery data lives, when it is deleted, and\n  demonstrates that no workspace file is required to use it.\n\n## Stop and ask\n\nStop and ask if Windows 11 x64 cannot provide current-user DPAPI protection and\natomic application-data writes that satisfy the approved recovery contract. Do\nnot silently weaken the bounds, omit recovery, persist plaintext, or invent\ncloud storage.\n\n## Boundary for the next goal\n\nThis goal owns preservation and destructive-operation interlocks only. Goal 03\nowns creating and saving a first document; Goals 06 and 07 own semantic Review\nand its proposed-change UI.\n",
+      "path": "evaluation/goal-01/snapshots/goals/02-guarantee-user-text-safety.md"
+    },
+    "snapshot": {
+      "revision": 5,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Prevent normal actions, asynchronous results, and external changes from silently discarding newer user-authored text.",
+      "relevant_context": [
+        "The goal permits stamp optimizations while requiring content-sensitive conflict protection and bounded local recovery."
+      ],
+      "constraints": [
+        "Preserve exact text or obtain an explicit decision; do not add continuous source-file autosave or weaken the recovery bounds."
+      ],
+      "non_goals": [
+        "Do not turn recovery into cloud sync, a workspace format, or a replacement for Save and Discard."
+      ],
+      "expected_deliverable": "A Windows 11 text-safety lifecycle with explicit destructive-operation interlocks and recoverable dirty state.",
+      "success_evidence": [
+        "Every enumerated destructive path is tested, including same-size and same-mtime external rewrites."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "May matching file length and modification time alone authorize an overwrite to avoid extra I/O?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "May matching file length and modification time alone authorize an overwrite to avoid extra I/O?",
+        "priority": "high",
+        "impact": "The answer determines whether the revision preserves a fast stamp check while requiring content verification before destructive writes."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "No. A matching stamp may avoid an eager read, but it cannot authorize overwrite; verify content before the destructive save decision."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Resolve the answered performance-versus-safety boundary without weakening the source-of-truth invariant.\",\"edits\":[{\"range\":{\"start\":7714,\"end\":7714},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified conflict check\\n\\nA matching file length and modification time may avoid an eager read, but it cannot authorize an overwrite. Verify content before any destructive save decision while preserving the documented recovery cadence.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"7756b0d85a319d3a3373e5b8af110070f3c0645951900f1e20c5f34dd35ee4f9\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

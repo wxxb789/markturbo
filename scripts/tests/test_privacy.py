@@ -249,7 +249,7 @@ class PrivacyScanTests(unittest.TestCase):
     def test_scans_tracked_dot_scratch_evidence(self) -> None:
         root = self.repository()
         sentinel = "tracked-evidence-" + "secret-value"
-        track(root, ".scratch/evidence/private.bin", sentinel.encode())
+        track(root, "docs/evidence/evidence/private.bin", sentinel.encode())
         binary = root / "target" / "release" / "markturbo.exe"
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b"clean binary")
@@ -257,7 +257,7 @@ class PrivacyScanTests(unittest.TestCase):
         with self.assertRaises(privacy.PrivacyScanError) as raised:
             privacy.scan(root, binary, environment={"OPENAI_API_KEY": sentinel})
 
-        self.assertIn("OPENAI_API_KEY: .scratch/evidence/private.bin", str(raised.exception))
+        self.assertIn("OPENAI_API_KEY: docs/evidence/evidence/private.bin", str(raised.exception))
 
     def test_does_not_follow_a_symlink_to_a_file_outside_the_repository(self) -> None:
         root = self.repository()

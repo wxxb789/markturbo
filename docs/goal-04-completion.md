@@ -30,10 +30,10 @@ Each target directory was absent before its build.
 
 | Variant | Evidence | Executable | Result |
 |---|---|---|---|
-| Full application | `.scratch/goal-04/final-v6/full-build.json` | 49,090,048 bytes; SHA-256 `dd194d9a6d423dcc03032066b022fc7bd2f3d3bec1288b4c9cd05ee2f65e924e` | Default `model-transport` feature; current PE sections, dependency features, and `cargo-bloat 0.12.1` attribution recorded |
-| No-model upper bound | `.scratch/goal-04/final-v6/no-model-build.json` | 44,372,480 bytes; SHA-256 `6dd5f0c3d8653e3078a6b9fc2bd03e2f3777841c41b44d7e22db336f9642dee9` | `genai`, `reqwest`, `rustls`, `hyper`, and `tokio-rustls` absent; exact unavailable-diagnostic test passed 1/1 |
-| Bare GPUI shell | `.scratch/goal-04/final-v6/bare-build.json` | 12,511,744 bytes; SHA-256 `62141e3dd7e2e2a9466fb7c71b4428a1fa8b54e4649e8545f0008121828c0327` | Reuses product identity, assets, DirectComposition setting, component initialization, and window options |
-| Model first-use test | `.scratch/goal-04/final-v6/model-first-use-build.json` | 7,519,232 bytes; SHA-256 `b9513df0c9a8cb43e981c3238a8f75e12171d8171baa2e8bba7ddf84bb8f355d` | Matching-source loopback transport executable built; runtime measurement blocked |
+| Full application | `docs/evidence/goal-04/final-v6/full-build.json` | 49,090,048 bytes; SHA-256 `dd194d9a6d423dcc03032066b022fc7bd2f3d3bec1288b4c9cd05ee2f65e924e` | Default `model-transport` feature; current PE sections, dependency features, and `cargo-bloat 0.12.1` attribution recorded |
+| No-model upper bound | `docs/evidence/goal-04/final-v6/no-model-build.json` | 44,372,480 bytes; SHA-256 `6dd5f0c3d8653e3078a6b9fc2bd03e2f3777841c41b44d7e22db336f9642dee9` | `genai`, `reqwest`, `rustls`, `hyper`, and `tokio-rustls` absent; exact unavailable-diagnostic test passed 1/1 |
+| Bare GPUI shell | `docs/evidence/goal-04/final-v6/bare-build.json` | 12,511,744 bytes; SHA-256 `62141e3dd7e2e2a9466fb7c71b4428a1fa8b54e4649e8545f0008121828c0327` | Reuses product identity, assets, DirectComposition setting, component initialization, and window options |
+| Model first-use test | `docs/evidence/goal-04/final-v6/model-first-use-build.json` | 7,519,232 bytes; SHA-256 `b9513df0c9a8cb43e981c3238a8f75e12171d8171baa2e8bba7ddf84bb8f355d` | Matching-source loopback transport executable built; runtime measurement blocked |
 
 Compile-time removal reduced the executable by 4,717,568 bytes, or 9.61% of
 the full executable. This is a size upper bound, not evidence of launch or
@@ -56,7 +56,7 @@ Command:
 ```sh
 uv run --project scripts scripts/mt.py probe -- quiet \
   --wait-seconds 3600 \
-  --evidence .scratch/goal-04/final-v6/quiet.json
+  --evidence docs/evidence/goal-04/final-v6/quiet.json
 ```
 
 The current-source command was blocked before sampling with
@@ -73,7 +73,7 @@ is retained only as a non-current diagnostic:
 | Disk median | 2.34% | 2.00% |
 | Disk p95 | 9.53% | 10.00% |
 
-Diagnostic artifact: `.scratch/goal-04/final-v5/quiet.json`. It is not current
+Diagnostic artifact: `docs/evidence/goal-04/final-v5/quiet.json`. It is not current
 evidence and is not used to authorize a decision.
 
 ## Runtime disposition

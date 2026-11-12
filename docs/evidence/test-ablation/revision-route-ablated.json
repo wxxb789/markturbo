@@ -1,0 +1,79 @@
+{
+  "fixtures": {
+    "changed_snapshot": {
+      "canonical": {
+        "exit": 1,
+        "stderr_bytes": 38,
+        "stderr_sha256": "f05a9b57cb1dca7f6d75933a9a81f834ab402284c1b8e7fb548cea614d271a1b",
+        "stdout_bytes": 197,
+        "stdout_sha256": "5db5224de63bb3fd0cea2404834c9db4bea42614723649127447eaf4d039edf7"
+      },
+      "decision_match": true,
+      "revision_scaffold": {
+        "exit": 1,
+        "stderr_bytes": 764,
+        "stderr_sha256": "f70db1a7217178e7d4b642ab036b28b1451564ee67cac16209d355aa45c586da",
+        "stdout_bytes": 233,
+        "stdout_sha256": "59054f5dc8aaf3aea4aedbb6a8b11866d610e78a2baf84c504d51f0eb31a2ee5"
+      }
+    },
+    "extra_file": {
+      "canonical": {
+        "exit": 1,
+        "stderr_bytes": 69,
+        "stderr_sha256": "05a5f0b96ad0fff3c6c890497dfed08d2b72c01b6bbe37575d3acd9799131b10",
+        "stdout_bytes": 191,
+        "stdout_sha256": "00e414f81b5e0df47b03d20dbd75435ecfe9f23b2a28ee2c5e90403384db4c4f"
+      },
+      "decision_match": true,
+      "revision_scaffold": {
+        "exit": 1,
+        "stderr_bytes": 826,
+        "stderr_sha256": "92dfc49052e6b25321603b1ce15905e7504370eb1ecb3d62952cad6d918e96ad",
+        "stdout_bytes": 227,
+        "stdout_sha256": "9421d07862dea618c12b4bcb79ca8ff5c5718bdf3cf402dc00e28ad736c09bc0"
+      }
+    },
+    "recomputed_manifest": {
+      "canonical": {
+        "exit": 1,
+        "stderr_bytes": 75,
+        "stderr_sha256": "a112206ef4314bdc36c6da7089de61b0441d08797ebb36660eca5bfd8cd710c5",
+        "stdout_bytes": 200,
+        "stdout_sha256": "2049a080433526f7f7a86ccb6ab4af343580cb35ac4156dd13cc26a5c6bc26b6"
+      },
+      "decision_match": true,
+      "revision_scaffold": {
+        "exit": 1,
+        "stderr_bytes": 838,
+        "stderr_sha256": "312add80009e5a29c2e2c8012e73bc2c04409fa677af39bb794d3468c0b9d0ca",
+        "stdout_bytes": 236,
+        "stdout_sha256": "a54aaeae8aca0d32a57e62d11fcf1360a31d7efa236a4a3b33402e1c53068eca"
+      }
+    },
+    "untouched": {
+      "canonical": {
+        "exit": 0,
+        "stderr_bytes": 0,
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 13253,
+        "stdout_sha256": "4f76dddd8f75548cad6b29fa3d7747230b6c9f163ead5fb3b2275fe551172ea4"
+      },
+      "decision_match": true,
+      "revision_scaffold": {
+        "exit": 0,
+        "stderr_bytes": 0,
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 10697,
+        "stdout_sha256": "6f077b766f87657ad994f9548707c32f19fe07353a68b1c31f65cec92c67f149"
+      }
+    }
+  },
+  "removed_alias": {
+    "exit": 2,
+    "stderr_bytes": 167,
+    "stderr_sha256": "2925c9243e32f668383e456500f4f5a0d52d0da9bc055b02d5927d87b1e9b383",
+    "stdout_bytes": 117,
+    "stdout_sha256": "4ba51d993f5cab0fdb86f55569d657f9eb2ed45fbc74207535afac1eb5bd2c88"
+  }
+}

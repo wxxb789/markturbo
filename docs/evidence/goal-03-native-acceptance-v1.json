@@ -1,0 +1,103 @@
+{
+  "cases": [
+    {
+      "duration_ms": 33153.176,
+      "failure_type": null,
+      "id": "welcome_no_argument",
+      "observations": {},
+      "reason_code": "FOREGROUND_PERMISSION_DENIED",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "new_and_paste_unicode",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_BLOCKED",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "save_as_create_and_reopen",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_BLOCKED",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "save_as_cancel_and_overwrite",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_BLOCKED",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "bundled_sample",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_BLOCKED",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "recent_bound_restart_stale",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_BLOCKED",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "explicit_cli_targets",
+      "observations": {},
+      "reason_code": "SKIPPED_AFTER_BLOCKED",
+      "status": "BLOCKED"
+    }
+  ],
+  "completed_at_utc": "2026-09-01T13:21:19.359Z",
+  "environment": {
+    "active_console_session_id": 1,
+    "architecture": "x86_64",
+    "harness_is_console_session": false,
+    "harness_process": {
+      "integrity": "medium",
+      "integrity_rid": 8192,
+      "session_id": 2
+    },
+    "input_desktop": "Default",
+    "native_machine_code": 34404,
+    "platform": "Windows 11",
+    "python_pointer_bits": 64,
+    "thread_desktop": "Default",
+    "windows_build": 26200,
+    "windows_major": 10,
+    "windows_minor": 0,
+    "wts_state": "WTSActive"
+  },
+  "executable": {
+    "byte_count": 48616448,
+    "copied_sha256": "7fa8e66808cd9e59561fd088dd153ec9e9634e331e534ff4bf0b964279e45524",
+    "copy_hash_verified": true,
+    "expected_sha256": "7fa8e66808cd9e59561fd088dd153ec9e9634e331e534ff4bf0b964279e45524",
+    "format": "PE32+",
+    "hash_verified": true,
+    "machine": "x86_64",
+    "machine_code": 34404,
+    "optional_magic": 523,
+    "sha256": "7fa8e66808cd9e59561fd088dd153ec9e9634e331e534ff4bf0b964279e45524"
+  },
+  "schema": "markturbo.goal-03-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-01T13:20:45.381Z",
+  "status": "BLOCKED",
+  "summary": {
+    "blocked_case_count": 7,
+    "failed_case_count": 0,
+    "not_run_case_count": 0,
+    "passed_case_count": 0,
+    "required_case_count": 7
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "SP-02",
+    "path": "evaluation/goal-01/snapshots/goals/03-create-first-use-document-flow.md",
+    "lens": "Specification / plan",
+    "sha256": "c4ad80b8240cdc7986fa46c54b627bb4ac43dced9934e5e8c98d28bfb53b8608",
+    "byte_count": 4813,
+    "files": [
+      {
+        "path": "evaluation/goal-01/snapshots/goals/03-create-first-use-document-flow.md",
+        "sha256": "952a813707aa899575af60924152bf49de91177cb302a12c67457bc13ae36e59",
+        "byte_count": 4813
+      }
+    ]
+  },
+  "request": {
+    "lens": "specification",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Goal 03 — Create a complete first-use document flow\n\n## Objective\n\nOn a clean Windows 11 x64 profile and a no-argument desktop launch, let a new\nuser reach an editable Markdown buffer by pasting text, opening a file or\nworkspace, or opening the bundled sample, then save it through Save As as an\nordinary `.md` file and reopen it from a recent-target list capped at 10 entries;\nverify the complete flow without depending on Review.\n\n## User outcome\n\nA person with a rough prompt must not need another editor, a pre-existing file,\nor terminal knowledge before markturbo becomes useful.\n\n## Product contract alignment\n\n**Disposition:** Retained and revised on 2026-08-29.\n\nThis goal retains ordinary local Markdown as the first-use artifact and serves\nthe `PRODUCT.md` promise that a developer can prepare agent-ready work without a\npre-existing file or account. It does not add semantic Review, model traffic, or\na proprietary workspace format.\n\n## In scope\n\n- Replace an accidental installation/current-directory first screen with a\n  deliberate welcome state for a no-argument desktop launch.\n- Offer these explicit entry points, using terminology settled by `PRODUCT.md`:\n  - create or paste into a new Markdown artifact;\n  - open a file;\n  - open a workspace folder;\n  - open the bundled sample;\n  - reopen a recent workspace or file.\n- Support an unsaved buffer with a useful title derived from its first meaningful\n  line and a clear unsaved indicator.\n- Route that buffer through Goal 02's dirty-close and recovery contract; a new\n  document must not introduce a second or weaker lifecycle path.\n- Implement Save As for a new buffer and for an existing document when invoked\n  explicitly, including overwrite confirmation, tab/path identity updates,\n  watcher/conflict-stamp updates, and collision handling when the destination is\n  already open.\n- Make cancellation of Open, overwrite confirmation, and Save As a no-op that\n  preserves the current workspace, buffer, and focus.\n- Persist at most 10 recent file or workspace paths and presentation metadata in\n  application settings; do not copy document contents or create workspace\n  metadata. Evict the least recently used entry when the list is full.\n- Remove or clearly disable stale recent entries without preventing startup.\n- Keep path arguments working: opening `markturbo PATH` still opens the requested\n  file or directory directly.\n- Make drag-and-drop consistent with the same file/folder/new-workspace rules.\n\n## Out of scope\n\n- Reviewing, scoring, rewriting, translating, or executing the pasted text.\n- Effective Agent Context resolution.\n- Crash recovery and destructive-close policy, which belong to Goal 02.\n- Installer, signing, auto-update, or public release documentation.\n- New proprietary file types, templates, cloud storage, or an account system.\n- Broad session restoration of every clean tab and UI position.\n\n## Completion evidence\n\nA clean-profile acceptance run must demonstrate all of the following:\n\n1. A no-argument desktop launch shows an intentional welcome state.\n2. “New” or “Paste” creates an editable buffer without first choosing a folder.\n3. Save As writes through the existing safe filesystem path and produces a normal\n   file another editor can open.\n4. Confirming overwrite replaces only the chosen destination; cancelling Save As\n   or overwrite leaves the unsaved buffer and destination byte-identical.\n5. After Save As, tab identity, watcher state, subsequent Save, relative path,\n   conflict detection, and recent entries all use the new path.\n6. Saving to a path already open does not create two editors that can silently\n   overwrite each other.\n7. Closing or interrupting an unsaved buffer follows Goal 02's decision and\n   recovery behavior with its exact text preserved.\n8. Reopening the saved file displays the same text, including CJK and emoji.\n9. The bundled sample opens from the welcome state without a terminal.\n10. The at-most-10 recent-path bound survives restart; a missing recent entry\n    degrades visibly and safely.\n11. A direct command-line path still bypasses the welcome state and opens the\n    requested target.\n\nAutomated tests cover state transitions and path persistence. In addition:\n\n- `cargo fmt --all -- --check` passes.\n- `cargo clippy --workspace --all-targets` introduces no new warnings.\n- `cargo test --release --workspace` passes and the pass count is recorded.\n\n## Stop and ask\n\nStop and ask if preserving no-argument terminal behavior conflicts with the\napproved Windows 11 x64 desktop first-run contract. Do not implement platform\ndetection based on an unverified heuristic.\n\n## Boundary for the next goal\n\nThis goal ends when a user can begin, save, and reopen ordinary Markdown. It does\nnot make that Markdown clearer; semantic Review begins at Goal 06.\n",
+      "path": "evaluation/goal-01/snapshots/goals/03-create-first-use-document-flow.md"
+    },
+    "snapshot": {
+      "revision": 6,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Let a clean-profile user create, save, and reopen ordinary Markdown without another editor, a pre-existing file, or terminal knowledge.",
+      "relevant_context": [
+        "An unsaved buffer must reuse Goal 02 lifecycle protection and Save As must use the established safe filesystem path."
+      ],
+      "constraints": [
+        "Do not require a workspace before paste, add a proprietary file type, or pull Review, accounts, or cloud storage into first use."
+      ],
+      "non_goals": [
+        "Do not add semantic Review or Effective Agent Context to this first-use goal."
+      ],
+      "expected_deliverable": "A complete no-argument Windows first-use flow for ordinary Markdown.",
+      "success_evidence": [
+        "A clean-profile user can create or paste, Save As, reopen identical bytes, and use the bundled sample without a terminal."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "Must New or Paste work before the user selects a workspace?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "Must New or Paste work before the user selects a workspace?",
+        "priority": "high",
+        "impact": "The answer determines whether workspace selection is a prerequisite for the first editable buffer."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "Yes. New and Paste must create an editable unsaved Markdown buffer before any workspace is selected and reuse Goal 02 lifecycle handling."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Make the answered first-use prerequisite explicit without adding a second document lifecycle.\",\"edits\":[{\"range\":{\"start\":4813,\"end\":4813},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified first-use prerequisite\\n\\nNew and Paste must create an editable unsaved Markdown buffer before any workspace is selected, and that buffer must use Goal 02's existing dirty-close and recovery path.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"94a3e94af368c27c3109a5337a9975bfeaa11b1d9b1fa2fd9a874633084522c9\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

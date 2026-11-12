@@ -7,7 +7,7 @@
 > - **§2.1 and F6 — MathJax's warm-up.** MathJax is gone. `renderer::warm_up()`
 >   and its ~870ms are deleted; RaTeX's first formula costs 10.1ms once, so
 >   there is nothing left to warm. See
->   `.scratch/perf-and-size/issues/02-ratex-replaces-mathjax.md`.
+>   `docs/evidence/perf-and-size/issues/02-ratex-replaces-mathjax.md`.
 > - **§3.5 — "Only by dropping MathJax … Keep."** That is exactly what happened.
 >   `boa_engine`, `boa_parser`, `boa_ast` and the 1.5MB JS bundle are all out of
 >   the graph, and the binary went 54,310,400 → 46,766,080 bytes.
