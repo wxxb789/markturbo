@@ -45,6 +45,9 @@ pub enum Key {
     Approved,
     Rejected,
     SaveConflict,
+    SaveConflictDetail,
+    Opened,
+    SettingsSaved,
     TrustScripts,
     ScriptsTrusted,
     ScriptsRestricted,
@@ -813,6 +816,11 @@ fn english(key: Key) -> &'static str {
         Key::Approved => "Approved",
         Key::Rejected => "Rejected",
         Key::SaveConflict => "Save conflict",
+        Key::SaveConflictDetail => {
+            "Save refused: the file changed on disk. Reload, overwrite, or save as a new file."
+        }
+        Key::Opened => "Opened",
+        Key::SettingsSaved => "Settings saved.",
         Key::TrustScripts => "Trust scripts",
         Key::ScriptsTrusted => "Trusted: scripts may run",
         Key::ScriptsRestricted => "Restricted: scripts disabled",
@@ -1242,6 +1250,11 @@ fn chinese(key: Key) -> &'static str {
         Key::Approved => "已批准",
         Key::Rejected => "已拒绝",
         Key::SaveConflict => "保存冲突",
+        Key::SaveConflictDetail => {
+            "保存被拒绝：磁盘上的文件已更改。请重新加载、覆盖或另存为新文件。"
+        }
+        Key::Opened => "已打开",
+        Key::SettingsSaved => "设置已保存。",
         Key::TrustScripts => "信任脚本",
         Key::ScriptsTrusted => "已信任：允许运行脚本",
         Key::ScriptsRestricted => "受限：脚本已禁用",

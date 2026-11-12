@@ -124,7 +124,7 @@ fn sidebar(state: AppState, language: Language, compact: bool) -> impl IntoEleme
         )
         .child(search_row(state.clone(), language))
         .child(
-            scroll().flex_1().child(
+            scroll().flex_1().min_h(px(0.0)).child(
                 view()
                     .flex_col()
                     .child(when(move || state.search_ran.get(), {
@@ -172,6 +172,7 @@ fn search_row(state: AppState, language: Language) -> impl IntoElement {
         .child(
             input()
                 .test_id("search-input")
+                .label(SharedString::from(i18n::t(language, Key::SearchFiles)))
                 .value(move || state.search_query.get())
                 .placeholder(i18n::t(language, Key::SearchFiles))
                 .on_change(move |value: &str| change_state.search_query.set(value.to_owned()))
@@ -349,16 +350,24 @@ fn header(state: AppState, language: Language) -> impl IntoElement {
 fn document_area(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     let state_for_empty = state.clone();
     let state_for_review = state.clone();
+    let state_for_context = state.clone();
     view()
         .flex_1()
-        .flex_row()
+        .when(compact, |area| area.flex_col())
+        .when(!compact, |area| area.flex_row())
         .child(
             view()
                 .flex_1()
-                .child(when(move || state_for_empty.active_tab().is_none(), {
-                    let state = state.clone();
-                    move || welcome(state.clone(), language, compact).into_element()
-                }))
+                .child(when(
+                    {
+                        let state_for_empty = state_for_empty.clone();
+                        move || state_for_empty.active_tab().is_none()
+                    },
+                    {
+                        let state = state.clone();
+                        move || welcome(state.clone(), language, compact).into_element()
+                    },
+                ))
                 .child(each(
                     {
                         let state = state.clone();
@@ -377,16 +386,10 @@ fn document_area(state: AppState, language: Language, compact: bool) -> impl Int
             let state = state.clone();
             move || review_panel(state.clone(), language, compact).into_element()
         }))
-        .child(when(
-            {
-                let state = state.clone();
-                move || state.context_open.get()
-            },
-            {
-                let state = state.clone();
-                move || context_panel(state.clone(), language, compact).into_element()
-            },
-        ))
+        .child(when(move || state_for_context.context_open.get(), {
+            let state = state.clone();
+            move || context_panel(state.clone(), language, compact).into_element()
+        }))
 }
 
 fn recovery_banner(state: AppState, language: Language) -> impl IntoElement {
@@ -437,8 +440,8 @@ fn context_panel(state: AppState, language: Language, compact: bool) -> impl Int
     let rows_state = state.clone();
     let error_state = state.clone();
     view()
-        .w(px(if compact { 320.0 } else { 420.0 }))
-        .h(relative(1.0))
+        .when(compact, |panel| panel.flex_1())
+        .when(!compact, |panel| panel.w(px(420.0)).h(relative(1.0)))
         .flex_col()
         .bg(move || theme().card)
         .border_l_1()
@@ -1162,6 +1165,7 @@ fn web_pane(tab: Tab, state: AppState, language: Language) -> impl IntoElement {
         )
         .child(
             web_view_html(move || html.get(), None)
+                .label(SharedString::from(i18n::t(language, Key::ModeWeb)))
                 .java_script_enabled(move || trusted.get())
                 .flex_1(),
         )
@@ -1186,8 +1190,8 @@ fn preview_pane(tab: Tab) -> impl IntoElement {
 
 fn review_panel(state: AppState, language: Language, compact: bool) -> impl IntoElement {
     view()
-        .w(px(if compact { 320.0 } else { 380.0 }))
-        .h(relative(1.0))
+        .when(compact, |panel| panel.flex_1())
+        .when(!compact, |panel| panel.w(px(380.0)).h(relative(1.0)))
         .flex_col()
         .bg(move || theme().card)
         .border_l_1()
@@ -1439,16 +1443,18 @@ fn review_result(state: AppState, language: Language) -> impl IntoElement {
             move |question: ReadSignal<crate::state::RevisionQuestionView>, _| {
                 let question = question.get();
                 let answer = question.answer;
+                let prompt = format!("{} · {}", question.priority, question.question);
                 view()
                     .flex_col()
                     .gap_1()
                     .child(
-                        text(format!("{} · {}", question.priority, question.question))
+                        text(prompt.clone())
                             .text_size(px(11.0))
                             .text_color(move || theme().muted_foreground),
                     )
                     .child(
                         input()
+                            .label(SharedString::from(prompt))
                             .value(move || answer.get())
                             .on_change(move |value: &str| answer.set(value.to_owned()))
                             .px_2()
@@ -1529,7 +1535,7 @@ fn settings_page(state: AppState, language: Language, compact: bool) -> impl Int
     let theme_system = state.clone();
     let theme_light = state.clone();
     let theme_dark = state.clone();
-    view()
+    scroll()
         .flex_1()
         .flex_col()
         .gap_4()
@@ -1587,35 +1593,51 @@ fn settings_page(state: AppState, language: Language, compact: bool) -> impl Int
         ))
         .child(settings_field(
             i18n::t(language, Key::Provider),
-            settings_input(settings.model_provider.clone(), move |value| {
-                provider_state
-                    .settings
-                    .update(|settings| settings.model_provider = value)
-            }),
+            settings_input(
+                i18n::t(language, Key::Provider),
+                settings.model_provider.clone(),
+                move |value| {
+                    provider_state
+                        .settings
+                        .update(|settings| settings.model_provider = value)
+                },
+            ),
         ))
         .child(settings_field(
             i18n::t(language, Key::Model),
-            settings_input(settings.model_name.clone(), move |value| {
-                model_state
-                    .settings
-                    .update(|settings| settings.model_name = value)
-            }),
+            settings_input(
+                i18n::t(language, Key::Model),
+                settings.model_name.clone(),
+                move |value| {
+                    model_state
+                        .settings
+                        .update(|settings| settings.model_name = value)
+                },
+            ),
         ))
         .child(settings_field(
             i18n::t(language, Key::BaseUrl),
-            settings_input(settings.model_base_url.clone(), move |value| {
-                base_state
-                    .settings
-                    .update(|settings| settings.model_base_url = value)
-            }),
+            settings_input(
+                i18n::t(language, Key::BaseUrl),
+                settings.model_base_url.clone(),
+                move |value| {
+                    base_state
+                        .settings
+                        .update(|settings| settings.model_base_url = value)
+                },
+            ),
         ))
         .child(settings_field(
             i18n::t(language, Key::TargetLanguage),
-            settings_input(settings.translate_to.clone(), move |value| {
-                translate_state
-                    .settings
-                    .update(|settings| settings.translate_to = value)
-            }),
+            settings_input(
+                i18n::t(language, Key::TargetLanguage),
+                settings.translate_to.clone(),
+                move |value| {
+                    translate_state
+                        .settings
+                        .update(|settings| settings.translate_to = value)
+                },
+            ),
         ))
         .child(settings_field(
             i18n::t(language, Key::ApiKey),
@@ -1626,6 +1648,7 @@ fn settings_page(state: AppState, language: Language, compact: bool) -> impl Int
                 .child(
                     input()
                         .test_id("api-key")
+                        .label(SharedString::from(i18n::t(language, Key::ApiKey)))
                         .masked(true)
                         .value(move || credential.get())
                         .on_change(move |value: &str| credential.set(value.to_owned()))
@@ -1680,8 +1703,13 @@ fn settings_field(label: &'static str, control: impl IntoElement) -> impl IntoEl
         .child(control)
 }
 
-fn settings_input(value: String, update: impl Fn(String) + 'static) -> impl IntoElement {
+fn settings_input(
+    label: &'static str,
+    value: String,
+    update: impl Fn(String) + 'static,
+) -> impl IntoElement {
     input()
+        .label(SharedString::from(label))
         .value(value)
         .on_change(move |value: &str| update(value.to_owned()))
         .px_2()

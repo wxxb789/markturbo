@@ -76,8 +76,34 @@ gate. Rewriting the selectors and cases is a bounded follow-up before native
 acceptance can pass on nsh; the absence of that evidence is recorded as pending,
 not converted into a passing result.
 
-Goal 09 also still needs its release-build screenshot matrix: the eleven states
-at minimum/default/wide widths in both effective modes, with revision, viewport,
-language and obstruction receipts. No `mt.py` command currently produces that
-matrix; headless hierarchy tests are implementation coverage, not visual
-acceptance.
+Goal 09's release-build screenshot matrix is produced by:
+
+```sh
+uv run --locked --project scripts scripts/mt.py visual -- \
+    --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+    --out .scratch/goal-09/matrix
+```
+
+It records each cell's source revision, executable hash, DPI, DIP and pixel
+viewport, language, effective theme, obstruction observations, control names and
+roles, PNG hash and status. All eleven states are exercised end to end through
+the real packaged app at minimum/default/wide widths in both modes and
+languages.
+
+WebView2 renders through a DirectComposition visual that `PrintWindow` omits.
+For the compatibility-preview state the harness starts the app with
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<free port>` and
+captures the page through CDP `Page.captureScreenshot`, then composites it into
+the UIA-reported pane rectangle over the PrintWindow chrome. It rejects a blank
+page as `WEBVIEW_CONTENT_MISSING`; it does not record an empty pane as a pass.
+The capture is release-build visual evidence, not owner approval. Headless
+hierarchy tests remain implementation coverage, not visual acceptance.
+
+Every cell also enumerates the actionable UIA controls and fails as
+`ACCESSIBILITY_UNNAMED_CONTROL` when a compact button, field, link, or menu item
+has no accessible name. Pane-sized pressable containers exposed by the text
+engine and the WebView document are structural and are not counted. Markdown
+task checkboxes are also excluded because the nsh text engine exposes them
+beside, not with, their task text; the receipt counts them separately. This is
+automated assertion coverage; keyboard traversal and a screen-reader smoke still
+need a person on an active Windows 11 desktop.

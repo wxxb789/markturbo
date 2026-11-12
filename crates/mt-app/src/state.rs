@@ -129,6 +129,7 @@ pub struct AppState {
     vault: CredentialVault,
     pending_review: Rc<RefCell<Option<PreparedDocumentReviewRequest>>>,
     review_origin: Rc<RefCell<Option<ReviewOrigin>>>,
+    review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
     pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
     revision_proposal: Rc<RefCell<Option<RevisionProposal>>>,
@@ -205,6 +206,12 @@ pub struct SearchHit {
 
 impl AppState {
     pub fn new() -> Self {
+        let settings = SettingsData::load();
+        set_color_scheme(match settings.theme {
+            ThemePreference::System => nsh_core::platform::Appearance::System,
+            ThemePreference::Light => nsh_core::platform::Appearance::Light,
+            ThemePreference::Dark => nsh_core::platform::Appearance::Dark,
+        });
         let (recovery, records, notice) = match RecoveryStore::open() {
             Ok((store, _maintenance)) => match store.recover() {
                 Ok(scan) => {
@@ -228,9 +235,12 @@ impl AppState {
                 Some(SharedString::from(format!("Recovery unavailable: {error}"))),
             ),
         };
-        let status = notice
-            .clone()
-            .unwrap_or_else(|| SharedString::from("Open a folder to begin."));
+        let status = notice.clone().unwrap_or_else(|| {
+            SharedString::from(crate::i18n::t(
+                settings.language,
+                crate::i18n::Key::OpenFolderToBegin,
+            ))
+        });
         Self {
             owner: Owner::current(),
             root: signal(None),
@@ -243,7 +253,7 @@ impl AppState {
             search_ran: signal(false),
             search_truncated: signal(false),
             search_busy: signal(false),
-            settings: signal(SettingsData::load()),
+            settings: signal(settings),
             settings_open: signal(false),
             settings_credential: signal(String::new()),
             settings_notice: signal(SharedString::from("")),
@@ -268,6 +278,7 @@ impl AppState {
             vault: CredentialVault::production(),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
+            review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
             pending_revision: Rc::new(RefCell::new(None)),
             revision_proposal: Rc::new(RefCell::new(None)),
@@ -289,8 +300,11 @@ impl AppState {
                 self.entries.set(entries);
                 self.reset_context();
                 self.record_recent(&path, RecentTargetKind::Workspace);
-                self.status
-                    .set(SharedString::from(format!("Opened {}", path.display())));
+                self.status.set(SharedString::from(format!(
+                    "{} {}",
+                    crate::i18n::t(self.settings.get().language, crate::i18n::Key::Opened),
+                    path.display()
+                )));
             }
             Err(error) => self
                 .status
@@ -603,6 +617,21 @@ impl AppState {
                 last_edit: now,
                 last_checkpoint: None,
             });
+        let changed = self.review_binding.borrow().is_some_and(|binding| {
+            binding.tab_id == id
+                && self
+                    .tabs
+                    .get()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .is_none_or(|tab| tab.revision.get() != binding.snapshot.revision)
+        });
+        if changed && let Some(mut view) = self.review_view.get() {
+            view.status =
+                crate::i18n::t(self.settings.get().language, crate::i18n::Key::ReviewStale)
+                    .to_owned();
+            self.review_view.set(Some(view));
+        }
     }
 
     /// The checkpoint identity and metadata for one tab. Untitled drafts use a
@@ -1139,9 +1168,10 @@ impl AppState {
             }
             Err(SaveError::Conflict) => {
                 tab.conflict.set(true);
-                self.status.set(SharedString::from(
-                    "Save refused: the file changed on disk. Reload, overwrite, or save as a new file.",
-                ));
+                self.status.set(SharedString::from(crate::i18n::t(
+                    self.settings.get().language,
+                    crate::i18n::Key::SaveConflictDetail,
+                )));
                 false
             }
             Err(error) => {
@@ -1368,6 +1398,7 @@ impl AppState {
         self.review_view.set(None);
         self.review_consent.set(None);
         *self.review_origin.borrow_mut() = None;
+        *self.review_binding.borrow_mut() = None;
         self.reset_revision();
 
         let settings = self.settings.get();
@@ -1455,6 +1486,7 @@ impl AppState {
         let Some(origin) = self.review_origin.borrow_mut().take() else {
             return;
         };
+        let binding = origin;
         let revision_request = bound.request().clone();
         let revision_language = bound.language();
         let disclosure = bound.disclosure().clone();
@@ -1493,11 +1525,16 @@ impl AppState {
                             revision_language,
                         );
                     }
-                    ReviewView::from_result(&transport.result, stale)
+                    *state.review_binding.borrow_mut() = Some(binding);
+                    ReviewView::from_result(&transport.result, stale, state.settings.get().language)
                 }
-                Ok(Err(error)) => ReviewView::from_error(&error),
+                Ok(Err(error)) => ReviewView::from_error(&error, state.settings.get().language),
                 Err(error) => ReviewView {
-                    status: "Review failed".to_owned(),
+                    status: crate::i18n::t(
+                        state.settings.get().language,
+                        crate::i18n::Key::ReviewFailed,
+                    )
+                    .to_owned(),
                     diagnostic: Some(error.to_string()),
                     ..ReviewView::default()
                 },
@@ -1765,7 +1802,10 @@ impl AppState {
 
     pub fn save_settings(&self) {
         self.settings.get().save();
-        self.status.set(SharedString::from("Settings saved."));
+        self.status.set(SharedString::from(crate::i18n::t(
+            self.settings.get().language,
+            crate::i18n::Key::SettingsSaved,
+        )));
     }
 
     pub fn set_language(&self, language: Language) {
@@ -1818,15 +1858,21 @@ impl AppState {
 }
 
 impl ReviewView {
-    fn from_result(result: &ReviewResult, stale: bool) -> Self {
+    fn from_result(result: &ReviewResult, stale: bool, language: Language) -> Self {
         let mut view = Self {
             status: if stale {
-                "Stale".to_owned()
+                crate::i18n::t(language, crate::i18n::Key::ReviewStale).to_owned()
             } else {
                 match result.status {
-                    ReviewStatus::Ready => "Ready".to_owned(),
-                    ReviewStatus::Stale => "Stale".to_owned(),
-                    ReviewStatus::Diagnostic => "Diagnostic".to_owned(),
+                    ReviewStatus::Ready => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewReady).to_owned()
+                    }
+                    ReviewStatus::Stale => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewStale).to_owned()
+                    }
+                    ReviewStatus::Diagnostic => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewMalformed).to_owned()
+                    }
                 }
             },
             diagnostic: result
@@ -1838,14 +1884,18 @@ impl ReviewView {
         let Some(output) = &result.output else {
             return view;
         };
-        view.sections = sections(&output.understood_intent);
+        view.sections = sections(&output.understood_intent, language);
         view.findings = output
             .findings
             .iter()
             .map(|finding| {
                 let kind = match finding.kind {
-                    FindingKind::Source | FindingKind::SourceStatement => "Source",
-                    FindingKind::Inference => "Inference",
+                    FindingKind::Source | FindingKind::SourceStatement => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewSourceStatement)
+                    }
+                    FindingKind::Inference => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewInference)
+                    }
                 };
                 format!("{kind}: {}", finding.text.as_str())
             })
@@ -1855,10 +1905,18 @@ impl ReviewView {
             .iter()
             .map(|question| {
                 let priority = match question.priority {
-                    ClarificationPriority::Critical => "Critical",
-                    ClarificationPriority::High => "High",
-                    ClarificationPriority::Medium => "Medium",
-                    ClarificationPriority::Low => "Low",
+                    ClarificationPriority::Critical => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewPriorityCritical)
+                    }
+                    ClarificationPriority::High => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewPriorityHigh)
+                    }
+                    ClarificationPriority::Medium => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewPriorityMedium)
+                    }
+                    ClarificationPriority::Low => {
+                        crate::i18n::t(language, crate::i18n::Key::ReviewPriorityLow)
+                    }
                 };
                 match &question.impact {
                     Some(impact) => format!(
@@ -1873,35 +1931,50 @@ impl ReviewView {
         view
     }
 
-    fn from_error(error: &ReviewError) -> Self {
+    fn from_error(error: &ReviewError, language: Language) -> Self {
         Self {
-            status: "Review failed".to_owned(),
+            status: crate::i18n::t(language, crate::i18n::Key::ReviewFailed).to_owned(),
             diagnostic: Some(error.to_string()),
             ..Self::default()
         }
     }
 }
 
-fn sections(intent: &mt_core::review::ReviewSections) -> Vec<ReviewSection> {
-    let list = |title: &str, items: &[mt_core::review::StructuredText]| ReviewSection {
-        title: title.to_owned(),
+fn sections(intent: &mt_core::review::ReviewSections, language: Language) -> Vec<ReviewSection> {
+    let list = |title: crate::i18n::Key, items: &[mt_core::review::StructuredText]| ReviewSection {
+        title: crate::i18n::t(language, title).to_owned(),
         items: items.iter().map(|item| item.as_str().to_owned()).collect(),
     };
     [
         Some(ReviewSection {
-            title: "Goal".to_owned(),
+            title: crate::i18n::t(language, crate::i18n::Key::ReviewStatedGoal).to_owned(),
             items: vec![intent.stated_goal.as_str().to_owned()],
         }),
-        Some(list("Context", &intent.relevant_context)),
-        Some(list("Constraints", &intent.constraints)),
-        Some(list("Non-goals", &intent.non_goals)),
+        Some(list(
+            crate::i18n::Key::ReviewContext,
+            &intent.relevant_context,
+        )),
+        Some(list(
+            crate::i18n::Key::ReviewConstraints,
+            &intent.constraints,
+        )),
+        Some(list(crate::i18n::Key::ReviewNonGoals, &intent.non_goals)),
         Some(ReviewSection {
-            title: "Deliverable".to_owned(),
+            title: crate::i18n::t(language, crate::i18n::Key::ReviewDeliverable).to_owned(),
             items: vec![intent.expected_deliverable.as_str().to_owned()],
         }),
-        Some(list("Success evidence", &intent.success_evidence)),
-        Some(list("Assumptions", &intent.inferred_assumptions)),
-        Some(list("Open decisions", &intent.unresolved_decisions)),
+        Some(list(
+            crate::i18n::Key::ReviewSuccessEvidence,
+            &intent.success_evidence,
+        )),
+        Some(list(
+            crate::i18n::Key::ReviewAssumptions,
+            &intent.inferred_assumptions,
+        )),
+        Some(list(
+            crate::i18n::Key::ReviewDecisions,
+            &intent.unresolved_decisions,
+        )),
     ]
     .into_iter()
     .flatten()
