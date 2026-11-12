@@ -21,3 +21,9 @@ cited paths remain unambiguous.
 Native acceptance receipts are content-free; visual and owner-review artifacts
 are named explicitly. Do not add credentials, user document text, or local
 absolute paths to new evidence.
+
+Goal 02/03/06/07 acceptance runs write working receipts to the ignored
+`target/native-acceptance/` directory by default, not to this historical archive.
+Review new receipts before copying them here under distinct names and updating
+their citations. An explicit `--evidence` path replaces its destination, even
+when acceptance fails; do not point routine or debug runs at retained records.

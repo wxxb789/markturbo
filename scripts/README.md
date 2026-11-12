@@ -84,6 +84,12 @@ process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence.
 
+Goal 02/03/06/07 acceptance defaults write working receipts under the ignored
+`target/native-acceptance/` directory, including failed and single-case runs.
+Use `--evidence` to choose another output path. Review a completed receipt before
+copying it into `docs/evidence/` under a distinct name for retention; do not use
+an existing historical receipt as a routine run destination.
+
 `evaluation verify-manifest` verifies the immutable `goal-01-v1` corpus and
 prints only paths, byte counts, and SHA-256 values. `evaluation scaffold`
 creates a 12-artifact, content-free Goal 06 evidence record. `evaluation

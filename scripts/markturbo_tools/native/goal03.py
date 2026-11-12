@@ -59,7 +59,7 @@ from .runtime import (
 
 REPO = Path(__file__).resolve().parents[3]
 DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
-DEFAULT_EVIDENCE = REPO / "docs/evidence" / "goal-03-native-acceptance-v1.json"
+DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-03-native-acceptance-v1.json"
 
 SCHEMA = "markturbo.goal-03-native-acceptance"
 SCHEMA_VERSION = 1

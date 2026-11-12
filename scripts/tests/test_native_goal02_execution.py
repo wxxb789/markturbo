@@ -1,6 +1,7 @@
 """Goal 02 native harness tests without launching a UI."""
 
 from ._native_goal02_support import *
+from scripts.markturbo_tools.native import goal03, goal06, goal07
 
 
 class PrivacyAndCliTests(unittest.TestCase):
@@ -110,6 +111,39 @@ class PrivacyAndCliTests(unittest.TestCase):
         self.assertEqual(args.expect_exe_sha256, HASH)
         self.assertEqual(args.evidence, evidence)
         self.assertEqual(NORMALIZE_EXPECTED_HASH(HASH.upper()), HASH)
+
+    def test_default_failure_receipts_preserve_retained_evidence(self) -> None:
+        for module in (HARNESS, goal03, goal06, goal07):
+            with self.subTest(goal=module.SCHEMA), tempfile.TemporaryDirectory() as temporary:
+                args = module.parse_args(["--expect-exe-sha256", HASH])
+                relative = Path("target") / "native-acceptance" / f"{module.SCHEMA.removeprefix('markturbo.')}-v1.json"
+                self.assertEqual(args.evidence, module.REPO / relative)
+                root = Path(temporary)
+                retained = root / "docs" / "evidence" / relative.name
+                retained.parent.mkdir(parents=True)
+                original = b'{"status": "PASS"}\n'
+                retained.write_bytes(original)
+                output = root / relative
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(module, "DEFAULT_EVIDENCE", output),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = module.main(
+                        ["--exe", str(root / "missing.exe"), "--expect-exe-sha256", HASH]
+                    )
+
+                self.assertEqual(returncode, 1)
+                self.assertIn("FAIL: EXECUTABLE_MISSING", stderr.getvalue())
+                self.assertEqual(retained.read_bytes(), original)
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["status"], "FAIL")
+                explicit = root / "chosen-receipt.json"
+                self.assertEqual(
+                    module.parse_args(
+                        ["--expect-exe-sha256", HASH, "--evidence", str(explicit)]
+                    ).evidence,
+                    explicit,
+                )
 
     def test_parser_exposes_debug_case_and_workdir_retention(self) -> None:
         case = REQUIRED_CASE_IDS[0]
