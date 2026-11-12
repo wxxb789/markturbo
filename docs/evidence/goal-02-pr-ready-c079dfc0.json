@@ -1,0 +1,299 @@
+{
+  "cases": [
+    {
+      "duration_ms": 5611.222,
+      "failure_type": null,
+      "id": "pointer-dirty-tab-close-cancel",
+      "observations": {
+        "cancel_kept_tab": true,
+        "editor": {
+          "byte_count": 41,
+          "sha256": "dd7f555853293adfb087d1444d2e43810e1bc18902416966914bd61678e074c9"
+        },
+        "flow": "pointer tab-close -> Cancel -> SendInput Ctrl+S",
+        "foreground_verified": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "runtime_scan": {
+          "app_logs_scanned": 1,
+          "canonical_recovery_records_scanned": 0,
+          "files_scanned": 3,
+          "panic_absent": true,
+          "recovery_artifacts_scanned": 1,
+          "recovery_leases_scanned": 1,
+          "refcell_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "source_after_cancel_save": {
+          "byte_count": 41,
+          "sha256": "dd7f555853293adfb087d1444d2e43810e1bc18902416966914bd61678e074c9"
+        },
+        "source_before": {
+          "byte_count": 26,
+          "sha256": "42b00e0209574e6ab9783f27d530ee6dfc55efe1faf01c6e4fa1a476a797527e"
+        }
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 3720.87,
+      "failure_type": null,
+      "id": "sendinput-ctrl-w-discard",
+      "observations": {
+        "discard_closed_tab": true,
+        "discarded_editor": {
+          "byte_count": 42,
+          "sha256": "452298b9d14414c116651701a0ad1a4221ae35cf773cff7666e5c3e8df944420"
+        },
+        "flow": "SendInput Ctrl+W -> Discard",
+        "foreground_verified": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "runtime_scan": {
+          "app_logs_scanned": 1,
+          "canonical_recovery_records_scanned": 0,
+          "files_scanned": 3,
+          "panic_absent": true,
+          "recovery_artifacts_scanned": 1,
+          "recovery_leases_scanned": 1,
+          "refcell_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "source_after_discard": {
+          "byte_count": 26,
+          "sha256": "42b00e0209574e6ab9783f27d530ee6dfc55efe1faf01c6e4fa1a476a797527e"
+        },
+        "source_before": {
+          "byte_count": 26,
+          "sha256": "42b00e0209574e6ab9783f27d530ee6dfc55efe1faf01c6e4fa1a476a797527e"
+        }
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 2956.814,
+      "failure_type": null,
+      "id": "wm-close-save-exact-bytes",
+      "observations": {
+        "editor": {
+          "byte_count": 40,
+          "sha256": "2e6dc0db5cb682999676d7b0f934a1039933cfda64eab16887e83d2b6273af3b"
+        },
+        "flow": "WM_CLOSE -> Save",
+        "foreground_verified": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "runtime_scan": {
+          "app_logs_scanned": 1,
+          "canonical_recovery_records_scanned": 0,
+          "files_scanned": 3,
+          "panic_absent": true,
+          "recovery_artifacts_scanned": 1,
+          "recovery_leases_scanned": 1,
+          "refcell_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "saved_source": {
+          "byte_count": 40,
+          "sha256": "2e6dc0db5cb682999676d7b0f934a1039933cfda64eab16887e83d2b6273af3b"
+        },
+        "window_exited": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 3989.719,
+      "failure_type": null,
+      "id": "same-length-mtime-external-conflict",
+      "observations": {
+        "dirty_editor": {
+          "byte_count": 42,
+          "sha256": "a5d6790ef5baab63cb03b5be322f47a66fafc07c52de21c5fb2d9e381bdb38c4"
+        },
+        "explicit_overwrite_used": true,
+        "external_source": {
+          "byte_count": 26,
+          "sha256": "cea337fde39c90df30dfabd06431fc09ea063434a40b67e278d96f9b0454ff2b"
+        },
+        "flow": "watcher conflict -> explicit Overwrite",
+        "foreground_verified": true,
+        "loaded_source": {
+          "byte_count": 26,
+          "sha256": "42b00e0209574e6ab9783f27d530ee6dfc55efe1faf01c6e4fa1a476a797527e"
+        },
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "runtime_scan": {
+          "app_logs_scanned": 1,
+          "canonical_recovery_records_scanned": 0,
+          "files_scanned": 3,
+          "panic_absent": true,
+          "recovery_artifacts_scanned": 1,
+          "recovery_leases_scanned": 1,
+          "refcell_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "same_length": true,
+        "same_mtime_ns": true,
+        "saved_after_explicit_overwrite": {
+          "byte_count": 42,
+          "sha256": "a5d6790ef5baab63cb03b5be322f47a66fafc07c52de21c5fb2d9e381bdb38c4"
+        },
+        "watcher_conflict_before_save": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 10071.825,
+      "failure_type": null,
+      "id": "cjk-emoji-interruption-recovery-retirement",
+      "observations": {
+        "checkpoint_log_seen": true,
+        "checkpoint_signal": "content-free checkpoint success log",
+        "discard_restart_absent_ms": 173.195,
+        "discarded_recovery_absent": true,
+        "edit_to_signal_ms": 2219.032,
+        "edited_text": {
+          "byte_count": 42,
+          "sha256": "e2112e5d93124155dc1d30e54b8172c5a0932f5d86591239e5162abb300c7ae7"
+        },
+        "flow": "edit -> checkpoint log -> TerminateProcess -> restart -> Discard -> restart after startup log",
+        "foreground_verified": true,
+        "live_recovery_scan": {
+          "canonical_record_count": 1,
+          "canonical_records": [
+            {
+              "byte_count": 1014,
+              "sha256": "32c0e5bb22d58dc333d9172cf3d2050c2398143bdec2f91969077a53141ca2ce"
+            }
+          ],
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "live_runtime_scan": {
+          "app_logs_scanned": 1,
+          "canonical_recovery_records_scanned": 1,
+          "files_scanned": 4,
+          "panic_absent": true,
+          "recovery_artifacts_scanned": 2,
+          "recovery_leases_scanned": 1,
+          "refcell_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "process_contexts": [
+          {
+            "integrity": "medium",
+            "integrity_rid": 8192,
+            "session_id": 2
+          },
+          {
+            "integrity": "medium",
+            "integrity_rid": 8192,
+            "session_id": 2
+          },
+          {
+            "integrity": "medium",
+            "integrity_rid": 8192,
+            "session_id": 2
+          }
+        ],
+        "recovery_restored_exact": true,
+        "restart_count": 2,
+        "restart_editor": {
+          "byte_count": 26,
+          "sha256": "42b00e0209574e6ab9783f27d530ee6dfc55efe1faf01c6e4fa1a476a797527e"
+        },
+        "restore_ms": 166.034,
+        "restored_editor": {
+          "byte_count": 42,
+          "sha256": "e2112e5d93124155dc1d30e54b8172c5a0932f5d86591239e5162abb300c7ae7"
+        },
+        "runtime_scan": {
+          "app_logs_scanned": 3,
+          "canonical_recovery_records_scanned": 0,
+          "files_scanned": 5,
+          "panic_absent": true,
+          "recovery_artifacts_scanned": 1,
+          "recovery_leases_scanned": 1,
+          "refcell_absent": true,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "source_after_recovery_discard": {
+          "byte_count": 26,
+          "sha256": "42b00e0209574e6ab9783f27d530ee6dfc55efe1faf01c6e4fa1a476a797527e"
+        },
+        "startup_finished_log_seen": true,
+        "startup_observed_before_restart_editor": true,
+        "startup_signal": "content-free recovery startup finished log",
+        "termination": "TerminateProcess"
+      },
+      "reason_code": null,
+      "status": "PASS"
+    }
+  ],
+  "completed_at_utc": "2026-09-29T10:47:56.597Z",
+  "environment": {
+    "active_console_session_id": 1,
+    "architecture": "x86_64",
+    "harness_is_console_session": false,
+    "harness_process": {
+      "integrity": "medium",
+      "integrity_rid": 8192,
+      "session_id": 2
+    },
+    "input_desktop": "Default",
+    "native_machine_code": 34404,
+    "platform": "Windows 11",
+    "python_pointer_bits": 64,
+    "thread_desktop": "Default",
+    "windows_build": 26300,
+    "windows_major": 10,
+    "windows_minor": 0,
+    "wts_state": "WTSActive"
+  },
+  "executable": {
+    "byte_count": 50292736,
+    "copied_sha256": "c079dfc085ab0386bbc6683e120f65049385627c73fb88113b5d111e8182519f",
+    "copy_hash_verified": true,
+    "expected_sha256": "c079dfc085ab0386bbc6683e120f65049385627c73fb88113b5d111e8182519f",
+    "format": "PE32+",
+    "hash_verified": true,
+    "machine": "x86_64",
+    "machine_code": 34404,
+    "optional_magic": 523,
+    "sha256": "c079dfc085ab0386bbc6683e120f65049385627c73fb88113b5d111e8182519f"
+  },
+  "schema": "markturbo.goal-02-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-29T10:47:26.032Z",
+  "status": "PASS",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 0,
+    "not_run_case_count": 0,
+    "passed_case_count": 5,
+    "required_case_count": 5
+  }
+}

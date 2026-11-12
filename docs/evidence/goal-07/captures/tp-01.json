@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "TP-01",
+    "path": "evaluation/goal-01/task-prompts/01-upgrade-gpui-without-regression.md",
+    "lens": "Task prompt",
+    "sha256": "302d3e24d3004953a7b4dabd9e8b916585c574f98c752044cee5aa06d24f4f08",
+    "byte_count": 626,
+    "files": [
+      {
+        "path": "evaluation/goal-01/task-prompts/01-upgrade-gpui-without-regression.md",
+        "sha256": "e75055c10e684d4c92f5a4a5c63692ff481b26c5cf74590088c81d5ba3b89264",
+        "byte_count": 626
+      }
+    ]
+  },
+  "request": {
+    "lens": "prompt",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Upgrade GPUI Without Preview Regression\n\nUpgrade the pinned Zed/GPUI revision and the `gpui-component` dependency family.\nKeep recursive layout stack safety explicit now that `stacker` is opt-in, and\nalign Web table headers with the Native secondary foreground token.\n\nAlso update `notify-debouncer-full`, `toml`, and `log`. Do not update the\n`windows` crate while `lb-wry` still shares the older source boundary.\n\nVerify the release-profile workspace tests, Python harness, Windows WebView\nacceptance, Clippy, and the intended GPUI feature graph. An upgrade that compiles\nbut destabilizes preview behavior is not complete.\n",
+      "path": "evaluation/goal-01/task-prompts/01-upgrade-gpui-without-regression.md"
+    },
+    "snapshot": {
+      "revision": 1,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Upgrade the pinned GPUI dependency family without regressing preview behavior or recursive layout stack safety.",
+      "relevant_context": [
+        "The source keeps stacker explicit after it became opt-in and constrains the windows crate at the lb-wry source boundary."
+      ],
+      "constraints": [
+        "Compilation alone cannot establish success; release tests, the Python harness, Clippy, the expected feature graph, and Windows WebView acceptance remain required."
+      ],
+      "non_goals": [
+        "Do not upgrade the windows crate across the existing lb-wry source boundary."
+      ],
+      "expected_deliverable": "A dependency upgrade whose feature graph and preview behavior remain intact.",
+      "success_evidence": [
+        "All named automated gates pass and the Windows WebView acceptance path remains stable."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "Should the prompt make the compile-versus-preview acceptance boundary explicit in one normative statement?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "Should the prompt make the compile-versus-preview acceptance boundary explicit in one normative statement?",
+        "priority": "high",
+        "impact": "The answer determines whether the revision adds a direct rule that compilation alone is insufficient."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "Yes. State that compilation alone is insufficient unless the expected GPUI feature graph and Windows WebView acceptance also pass."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Make the answered acceptance boundary explicit without changing the requested dependency scope.\",\"edits\":[{\"range\":{\"start\":626,\"end\":626},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified acceptance boundary\\n\\nCompilation alone is not success. The expected GPUI feature graph, release-profile workspace tests, Python harness, Clippy, and Windows WebView acceptance must all pass without preview regression.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"726d2bf0059d2caa0ff0fcc3758bb07cd96fe622bd21a40a92de11681301cc94\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

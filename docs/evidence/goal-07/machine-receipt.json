@@ -1,0 +1,921 @@
+{
+  "schema": "markturbo-goal-07-machine-receipt-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "runner_schema": "markturbo-local-diff-receipt-v2",
+  "runner_executable_sha256": "e2ee079f8e955406b46d997c03c30f6e16f0f03168986b5ee10e140427581d27",
+  "cases": {
+    "AI-01": {
+      "artifact_id": "AI-01",
+      "corpus_artifact_lens": "Agent instructions",
+      "corpus_artifact_sha256": "d2cfc86c0e5cd695b5bc11e1fa0d0ea336a28f57567815988dfbee22ae4ef725",
+      "corpus_artifact_byte_count": 3291,
+      "request_artifact_sha256": "d2cfc86c0e5cd695b5bc11e1fa0d0ea336a28f57567815988dfbee22ae4ef725",
+      "request_artifact_byte_count": 3291,
+      "review_scope_sha256": "1a00708d94953fa7f0fb0ead046dd71a154019fd993469cd75fbbf6e0a16ad17",
+      "review_scope_byte_count": 3589,
+      "editable_source_sha256": "a986fe39a99098cadab3f114bf792e46752b42bc94a5bd0abb46a3d831f310ff",
+      "editable_source_byte_count": 3291,
+      "source_binding_sha256": "a986fe39a99098cadab3f114bf792e46752b42bc94a5bd0abb46a3d831f310ff",
+      "review_context_sha256": "f8644a6eb6813f2d2f66a835d15eecee9188a7809efc0296823b02c290d878c0",
+      "answers_sha256": "b567a154584bb3290f5114f70c63b6a9ee09c4b0d578547385053204060ea148",
+      "raw_revision_response_sha256": "8134333177e50124a91a0096dfb9c3389453d01c0be820aaa52f2bb0a545f8e6",
+      "proposal_sha256": "762dbeeb7435b8583ec393bca076c77cd5ff3e5dc089064abc84c4a28610c400",
+      "source_revision": 9,
+      "source_generation": 1,
+      "artifact_lens_sha256": "9374fdf3a8ad173fa131d586d841c16437a37aedbdee936db0fffdf38c6d8f58",
+      "displayed_diff_sha256": "0ba1745f0d978af0c2458a884571e09c8fe661d48d6fcb8ce85c3f8ffe260a99",
+      "changes": [
+        {
+          "change_id": "AI-01-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "AI-01-CH-01-H-01",
+              "source_start": 3291,
+              "source_end": 3291,
+              "replacement_sha256": "88ab9003e436f06b9e78565289905a35f2bf36092f863cfa36ef1389f72d2afe",
+              "replacement_byte_count": 181,
+              "rationale_sha256": "522dd661d6dd34972ea4b91c63090314d2ac1ea32ec0cd127007a53924b4cf46",
+              "rationale_byte_count": 73,
+              "displayed_diff_sha256": "3f05dfbe3587954423817c4a95563d7cc4a12ce51e578026b57167544c9d81b4",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "5556da11292a85240e9d3896f2cf0571415fd12cbd09fb7cd68bf0929143b8ca"
+      ],
+      "represented_question_ids": [
+        "5556da11292a85240e9d3896f2cf0571415fd12cbd09fb7cd68bf0929143b8ca"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "5556da11292a85240e9d3896f2cf0571415fd12cbd09fb7cd68bf0929143b8ca",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "a986fe39a99098cadab3f114bf792e46752b42bc94a5bd0abb46a3d831f310ff",
+        "result_sha256": "a986fe39a99098cadab3f114bf792e46752b42bc94a5bd0abb46a3d831f310ff",
+        "source_byte_count": 3291,
+        "result_byte_count": 3291
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "fe52becc05705772d3292aea367e3add531d2d3f91df8beae94ea3ea2340ead8",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "762dbeeb7435b8583ec393bca076c77cd5ff3e5dc089064abc84c4a28610c400",
+        "decision_count": 1,
+        "result_sha256": "5094f661152c87d900a8a428b7d3db14747f47d68fcba75ac4b3c6bfa6ef2981",
+        "result_byte_count": 3472
+      }
+    },
+    "AI-02": {
+      "artifact_id": "AI-02",
+      "corpus_artifact_lens": "Agent instructions",
+      "corpus_artifact_sha256": "d862bf86c7e9e8e6793e0406c488ea37b182f08f075c8847144da9646bc96484",
+      "corpus_artifact_byte_count": 1082,
+      "request_artifact_sha256": "d862bf86c7e9e8e6793e0406c488ea37b182f08f075c8847144da9646bc96484",
+      "request_artifact_byte_count": 1082,
+      "review_scope_sha256": "c6064257ffa10dca85e75a83af3041d1be14ca6b9508fd3f6ea2d3d3961eaafd",
+      "review_scope_byte_count": 1355,
+      "editable_source_sha256": "bd37088139ca2a628326776c42f27c2c00453dc7304c562e59e9645d91d64a05",
+      "editable_source_byte_count": 1082,
+      "source_binding_sha256": "bd37088139ca2a628326776c42f27c2c00453dc7304c562e59e9645d91d64a05",
+      "review_context_sha256": "3fb65972348cb4587432d1a19b48be074c7ed261a73c9aff614d23e258bc831f",
+      "answers_sha256": "578162340a24c7a59cb173be456f389f8216d99858511491a3d2f68f8a368abb",
+      "raw_revision_response_sha256": "404d5713523abdc6394e18fa4674e1c8d9c5c3a519d658d4787ca1edb0d4a13e",
+      "proposal_sha256": "f1db190c352f0d2a941101d65492c71eca31fcb1f9a3c0b74fba55228785cfdc",
+      "source_revision": 10,
+      "source_generation": 1,
+      "artifact_lens_sha256": "9374fdf3a8ad173fa131d586d841c16437a37aedbdee936db0fffdf38c6d8f58",
+      "displayed_diff_sha256": "f429fe398e341b654ad922ed77beea35dbeedf6ccdc73aba19baf1871d3650fa",
+      "changes": [
+        {
+          "change_id": "AI-02-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "AI-02-CH-01-H-01",
+              "source_start": 1082,
+              "source_end": 1082,
+              "replacement_sha256": "0f3f4f2832ba71d2e4d719e96afb1aa8d3ac2c6fbd313d166a8bf2651e352c8b",
+              "replacement_byte_count": 194,
+              "rationale_sha256": "ed296f603e6c5c6287e03a9fb869919714471624a389eaa424e36c47c0322fc9",
+              "rationale_byte_count": 100,
+              "displayed_diff_sha256": "fd7ff35658b3fe9cb3f1b21160347cda2f8505de1a09eaa670e035f887366529",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "0da6f5db48a399ed5cac15ed183fac45a33f0302409d4d88404d8fc5910a906a"
+      ],
+      "represented_question_ids": [
+        "0da6f5db48a399ed5cac15ed183fac45a33f0302409d4d88404d8fc5910a906a"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "0da6f5db48a399ed5cac15ed183fac45a33f0302409d4d88404d8fc5910a906a",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "bd37088139ca2a628326776c42f27c2c00453dc7304c562e59e9645d91d64a05",
+        "result_sha256": "bd37088139ca2a628326776c42f27c2c00453dc7304c562e59e9645d91d64a05",
+        "source_byte_count": 1082,
+        "result_byte_count": 1082
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "21c0b255c08d9b4af1a0cdaab3e4a81d399e3492a1d017e5d8f0bc05554176fc",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "f1db190c352f0d2a941101d65492c71eca31fcb1f9a3c0b74fba55228785cfdc",
+        "decision_count": 1,
+        "result_sha256": "6d7554418f6ff34b0d38c0960705e75da0759172b924682b2a59f7606f229b10",
+        "result_byte_count": 1276
+      }
+    },
+    "AS-01": {
+      "artifact_id": "AS-01",
+      "corpus_artifact_lens": "Agent Skill",
+      "corpus_artifact_sha256": "7f4da57edf4797c9a965efdfd9fe687350c28d462dd728f92dc141aa7146b2b1",
+      "corpus_artifact_byte_count": 201410,
+      "request_artifact_sha256": "7f4da57edf4797c9a965efdfd9fe687350c28d462dd728f92dc141aa7146b2b1",
+      "request_artifact_byte_count": 201410,
+      "review_scope_sha256": "677a44a698b7c31dc8a5a05c347f075e42fc383970fa01ce4c38aaad8bcf64ce",
+      "review_scope_byte_count": 213595,
+      "editable_source_sha256": "fadc5bfcf4d0511c523eaa967cd3bd3954488cf27efe30b893f69f40463918e0",
+      "editable_source_byte_count": 3091,
+      "source_binding_sha256": "baba8593b89c415a7a7bcb47a465776cc60caae5416138929880799209bf3708",
+      "review_context_sha256": "e342d82ba1409ce7219eb661e1e78c1271c98bb47cd82e6244a66f61ee8ac121",
+      "answers_sha256": "b739617c52b5503f85dfcafd39ceeba3279217ab224b111da39f2f11b7e7d68c",
+      "raw_revision_response_sha256": "069c7ae927ed8ac2acfede567fcbc9d75adee5c38dcaf6ffa2fd8da665dc5ef1",
+      "proposal_sha256": "8adbc9aece6612fa46133635490d7751047ba5658ceb13141e93ec19e025360c",
+      "source_revision": 11,
+      "source_generation": 1,
+      "artifact_lens_sha256": "454e293c95d7f4d4fda6355f56075c7983f9cf0ed9946eb9a48b4558e1b68ef8",
+      "displayed_diff_sha256": "b7e8454149dca1fab0ad085312288cdaa68297643334edcd3632314ac01d217e",
+      "changes": [
+        {
+          "change_id": "AS-01-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "AS-01-CH-01-H-01",
+              "source_start": 3091,
+              "source_end": 3091,
+              "replacement_sha256": "f61cac5f390737cdbf0e50e0510ecb4da7652e08e707c59f0c94b4d51163d3d5",
+              "replacement_byte_count": 192,
+              "rationale_sha256": "19b02b075ff2a85e8a7acdf4ed70b4ed942dd7de0b462ece7447325cb69c8336",
+              "rationale_byte_count": 79,
+              "displayed_diff_sha256": "fefc8a7ba2c5dbe43c6d48261fc821f29661290b2bb457488397442db59a7a6f",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "1818758dac1a327d8b38b96e374ac2ebbfe95c134f99c1d90e11e1387a7a85df"
+      ],
+      "represented_question_ids": [
+        "1818758dac1a327d8b38b96e374ac2ebbfe95c134f99c1d90e11e1387a7a85df"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "1818758dac1a327d8b38b96e374ac2ebbfe95c134f99c1d90e11e1387a7a85df",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "fadc5bfcf4d0511c523eaa967cd3bd3954488cf27efe30b893f69f40463918e0",
+        "result_sha256": "fadc5bfcf4d0511c523eaa967cd3bd3954488cf27efe30b893f69f40463918e0",
+        "source_byte_count": 3091,
+        "result_byte_count": 3091
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "62f4bc4e112890fbae0438f96a8a3301f3512802cac88d0d3851a03145966bbe",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "8adbc9aece6612fa46133635490d7751047ba5658ceb13141e93ec19e025360c",
+        "decision_count": 1,
+        "result_sha256": "6053e0c7ff2916d787adb386270308d82b27a9c7a5ee458dcb223fbc27d7c554",
+        "result_byte_count": 3283
+      }
+    },
+    "AS-02": {
+      "artifact_id": "AS-02",
+      "corpus_artifact_lens": "Agent Skill",
+      "corpus_artifact_sha256": "a8bf153ef556cf514e9255476acfdc9364164d3425224480b96e7bdd46793fbc",
+      "corpus_artifact_byte_count": 116555,
+      "request_artifact_sha256": "a8bf153ef556cf514e9255476acfdc9364164d3425224480b96e7bdd46793fbc",
+      "request_artifact_byte_count": 116555,
+      "review_scope_sha256": "6215bb4346caeaaa9f85add02863f27c59e27db7feb7e61bf292b04594318e7b",
+      "review_scope_byte_count": 120513,
+      "editable_source_sha256": "2902632900ca8df7411006ce7fad30cca38a7b54771a8bfd87850365173cc542",
+      "editable_source_byte_count": 8682,
+      "source_binding_sha256": "3d95e16dfc992f5190b40db1522285c011c8fb5062eaac618df58411de305845",
+      "review_context_sha256": "3ed03c581f524374e77933a9f3945754360f92911c03cce018a93a4215752c21",
+      "answers_sha256": "e8649cc4fd3e04c159550e207c88c9f5406eef304cf3397f7ec10095f1e07ea8",
+      "raw_revision_response_sha256": "4d33427a3e4efcbcbec8129aeae0bcac62ab021adf1c2c3582b3d8ce1b6c95b9",
+      "proposal_sha256": "5957e785f8e891ed0fc40d6a05a0185c712df3d89acaba1a5b62c6d770d19c24",
+      "source_revision": 12,
+      "source_generation": 1,
+      "artifact_lens_sha256": "454e293c95d7f4d4fda6355f56075c7983f9cf0ed9946eb9a48b4558e1b68ef8",
+      "displayed_diff_sha256": "952401d00e724a711f5374f7f3d78136bb4c0aa63d3b80ba70113ee4223592a8",
+      "changes": [
+        {
+          "change_id": "AS-02-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "AS-02-CH-01-H-01",
+              "source_start": 8682,
+              "source_end": 8682,
+              "replacement_sha256": "8d889ccd0885b17c994bb753a192b0f8480df97220d0abb95fb76a09283deee8",
+              "replacement_byte_count": 199,
+              "rationale_sha256": "8fddbf2228890ed7ab95d3d92facac18df691f8822c94d9348d160b424e52950",
+              "rationale_byte_count": 82,
+              "displayed_diff_sha256": "daf3995845117a2ba233ac4722a1c3a2c3c785e75ea34a76d9ef1a61456f5f5b",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "6728d53bfb241ff262fdbdcd8772222188a302cf316c0de9603a0d387840fad6"
+      ],
+      "represented_question_ids": [
+        "6728d53bfb241ff262fdbdcd8772222188a302cf316c0de9603a0d387840fad6"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "6728d53bfb241ff262fdbdcd8772222188a302cf316c0de9603a0d387840fad6",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "2902632900ca8df7411006ce7fad30cca38a7b54771a8bfd87850365173cc542",
+        "result_sha256": "2902632900ca8df7411006ce7fad30cca38a7b54771a8bfd87850365173cc542",
+        "source_byte_count": 8682,
+        "result_byte_count": 8682
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "13fc4858e5fe82bfb4e21931cde0c2bce939f1719924a2d51641ccc503a5e352",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "5957e785f8e891ed0fc40d6a05a0185c712df3d89acaba1a5b62c6d770d19c24",
+        "decision_count": 1,
+        "result_sha256": "3464bb17917e97907a0c949ca97c856ae42bdff4fbeb1df66bc65fb163a6481a",
+        "result_byte_count": 8881
+      }
+    },
+    "SP-01": {
+      "artifact_id": "SP-01",
+      "corpus_artifact_lens": "Specification / plan",
+      "corpus_artifact_sha256": "bd94f5b4e3f1d77163e4b103918fb0e75d9004a783d469edd5806ead46b6e2c1",
+      "corpus_artifact_byte_count": 7714,
+      "request_artifact_sha256": "bd94f5b4e3f1d77163e4b103918fb0e75d9004a783d469edd5806ead46b6e2c1",
+      "request_artifact_byte_count": 7714,
+      "review_scope_sha256": "5ce8d824f246d94a94ca27f6a38176683b1a2127bf2b61695a61b496d9b3fcd2",
+      "review_scope_byte_count": 8069,
+      "editable_source_sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776",
+      "editable_source_byte_count": 7714,
+      "source_binding_sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776",
+      "review_context_sha256": "b0c2167c1b3f5453a695015078ce97bf13a23e2f8b711d599e639d2ef49e10e4",
+      "answers_sha256": "b109d7e9484ba1883828e9d30a8bbed0bf2353325d322e63543141bc868f2cb0",
+      "raw_revision_response_sha256": "98220e52a7160bc6522013ff40d244d2fb254531b612b0d0edca628e10b1f29f",
+      "proposal_sha256": "ca246ad3ab0939d8c5394e586fd032037d7ea8edc867476d5970ac6b66def132",
+      "source_revision": 5,
+      "source_generation": 1,
+      "artifact_lens_sha256": "1bda48a40a6893c3ca20741c81aa6fb0e7d847546f7cb98c924cbdbaa6f68959",
+      "displayed_diff_sha256": "d9db8ead72a286947333a81e76dc08650d07bc471295e958e0a6bd977be538af",
+      "changes": [
+        {
+          "change_id": "SP-01-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "SP-01-CH-01-H-01",
+              "source_start": 7714,
+              "source_end": 7714,
+              "replacement_sha256": "6ca7d75e9ce93f6a92e2520a8eec066ce116f1863762abc5e4f16669d3d1baa4",
+              "replacement_byte_count": 239,
+              "rationale_sha256": "ace6ba2646826e53b24e6400fccc6fc2311f1c70c5c1334684de52fafc33bdea",
+              "rationale_byte_count": 104,
+              "displayed_diff_sha256": "d1429f10723af221645dabc599b6b1a68602a75888595901f40388e519fdbdb1",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "7756b0d85a319d3a3373e5b8af110070f3c0645951900f1e20c5f34dd35ee4f9"
+      ],
+      "represented_question_ids": [
+        "7756b0d85a319d3a3373e5b8af110070f3c0645951900f1e20c5f34dd35ee4f9"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "7756b0d85a319d3a3373e5b8af110070f3c0645951900f1e20c5f34dd35ee4f9",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776",
+        "result_sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776",
+        "source_byte_count": 7714,
+        "result_byte_count": 7714
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "4d997640268200cc1ffc6ad5dc33fd5274fac6fd2a448a392c294fdf4900e891",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "ca246ad3ab0939d8c5394e586fd032037d7ea8edc867476d5970ac6b66def132",
+        "decision_count": 1,
+        "result_sha256": "625bd5189e60f26973e0e6e8677b53751ef7a977ffc4a0e7cc686666cbc857d2",
+        "result_byte_count": 7953
+      }
+    },
+    "SP-02": {
+      "artifact_id": "SP-02",
+      "corpus_artifact_lens": "Specification / plan",
+      "corpus_artifact_sha256": "c4ad80b8240cdc7986fa46c54b627bb4ac43dced9934e5e8c98d28bfb53b8608",
+      "corpus_artifact_byte_count": 4813,
+      "request_artifact_sha256": "c4ad80b8240cdc7986fa46c54b627bb4ac43dced9934e5e8c98d28bfb53b8608",
+      "request_artifact_byte_count": 4813,
+      "review_scope_sha256": "b6a3ab9ba4b8635964fc995815d18de91341c5406a8251db443890bb9ec9080c",
+      "review_scope_byte_count": 5133,
+      "editable_source_sha256": "952a813707aa899575af60924152bf49de91177cb302a12c67457bc13ae36e59",
+      "editable_source_byte_count": 4813,
+      "source_binding_sha256": "952a813707aa899575af60924152bf49de91177cb302a12c67457bc13ae36e59",
+      "review_context_sha256": "13a7b92b9c1090ae27caeb2b03ad1f8b07155a011cee6a3db20e984679d2e136",
+      "answers_sha256": "f406857b5e21a21b3f5e6b533956ba944bef002dc50557a1569e49ddb3d43312",
+      "raw_revision_response_sha256": "16d12d26f6d21377819d864f9abed09b638691f3af5f773dbe7158cd23849cd0",
+      "proposal_sha256": "d42ae143bc6651e6076e1b53290f330ee79cdb299c18067d06bdbf393dbeba56",
+      "source_revision": 6,
+      "source_generation": 1,
+      "artifact_lens_sha256": "1bda48a40a6893c3ca20741c81aa6fb0e7d847546f7cb98c924cbdbaa6f68959",
+      "displayed_diff_sha256": "a7fb9a36f12ffe00f96f960bce96f7e15f0bd582e0220236c8598888a8338adc",
+      "changes": [
+        {
+          "change_id": "SP-02-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "SP-02-CH-01-H-01",
+              "source_start": 4813,
+              "source_end": 4813,
+              "replacement_sha256": "c3865c48f78223a6a0ccb41b7c08f5b352e4eeb4ffd489349b5ae182d1fdda0d",
+              "replacement_byte_count": 208,
+              "rationale_sha256": "9dadc56e514e961e45051c883e562467b6f566705caf01c871c44024d7a38bc2",
+              "rationale_byte_count": 93,
+              "displayed_diff_sha256": "f98ee881b7cd127ba8657a937536283fbb9800f83b140800a9305f39cc398302",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "94a3e94af368c27c3109a5337a9975bfeaa11b1d9b1fa2fd9a874633084522c9"
+      ],
+      "represented_question_ids": [
+        "94a3e94af368c27c3109a5337a9975bfeaa11b1d9b1fa2fd9a874633084522c9"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "94a3e94af368c27c3109a5337a9975bfeaa11b1d9b1fa2fd9a874633084522c9",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "952a813707aa899575af60924152bf49de91177cb302a12c67457bc13ae36e59",
+        "result_sha256": "952a813707aa899575af60924152bf49de91177cb302a12c67457bc13ae36e59",
+        "source_byte_count": 4813,
+        "result_byte_count": 4813
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "b0272b2d3f7c7997d7920c2be259848d672f7c99ec0cc5cea35b9eb0b6c98831",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "d42ae143bc6651e6076e1b53290f330ee79cdb299c18067d06bdbf393dbeba56",
+        "decision_count": 1,
+        "result_sha256": "85f1a185152d04930b3129395265a9b2c98475bb81b06c4dd3f164287c69a0b2",
+        "result_byte_count": 5021
+      }
+    },
+    "SP-03": {
+      "artifact_id": "SP-03",
+      "corpus_artifact_lens": "Specification / plan",
+      "corpus_artifact_sha256": "d5a2e6ac96ebbb7d31130ca014b6bbdd5364ae910c423f318277632d33e6d88b",
+      "corpus_artifact_byte_count": 9331,
+      "request_artifact_sha256": "d5a2e6ac96ebbb7d31130ca014b6bbdd5364ae910c423f318277632d33e6d88b",
+      "request_artifact_byte_count": 9331,
+      "review_scope_sha256": "d39948c7dacacb2884c410fa4c49444360a87623811ee7870bb2a906547ec825",
+      "review_scope_byte_count": 9728,
+      "editable_source_sha256": "40ebda30be68ab46e18cfb51308540acb26da72ca3673ddbb1c3d28fb51b6890",
+      "editable_source_byte_count": 9331,
+      "source_binding_sha256": "40ebda30be68ab46e18cfb51308540acb26da72ca3673ddbb1c3d28fb51b6890",
+      "review_context_sha256": "6deba47d800bd3d93b38a1ccd7380bb4f8d9825c097648983f8b3ea6dd03eda8",
+      "answers_sha256": "020411781760cc46a6fbf28c0ab629461f8b1c7d34bb6ca151d444efa886e875",
+      "raw_revision_response_sha256": "d45a64f5c3735140de4d95e673fa71a7f95d4c79435913493424e8d02102a67e",
+      "proposal_sha256": "72e4534010a00f9033c7213922f542ff1915ee1db0f934b32206d67b8a0e2e12",
+      "source_revision": 7,
+      "source_generation": 1,
+      "artifact_lens_sha256": "1bda48a40a6893c3ca20741c81aa6fb0e7d847546f7cb98c924cbdbaa6f68959",
+      "displayed_diff_sha256": "bffa72593ca616434ffbc1ea9f3a0b7b7e582b8d09ba917923947ded621a2223",
+      "changes": [
+        {
+          "change_id": "SP-03-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "SP-03-CH-01-H-01",
+              "source_start": 9331,
+              "source_end": 9331,
+              "replacement_sha256": "9a1e8d82768f042890210d64b11a86444d6a16a63a252685ac38f3f0adedb2b7",
+              "replacement_byte_count": 235,
+              "rationale_sha256": "5d0bf8014d02fe1927798fa1a77671376f61bf0371ca90930497f5f1f02cc0ba",
+              "rationale_byte_count": 90,
+              "displayed_diff_sha256": "ad851a11c152190f0bbfac9574d9bb40f679506bec103a9c0f59f05dbb57ac2d",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "86d3800336163960fc981d6c0b92727376ebd8211982b75f801c42b9f79af4a1"
+      ],
+      "represented_question_ids": [
+        "86d3800336163960fc981d6c0b92727376ebd8211982b75f801c42b9f79af4a1"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "86d3800336163960fc981d6c0b92727376ebd8211982b75f801c42b9f79af4a1",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "40ebda30be68ab46e18cfb51308540acb26da72ca3673ddbb1c3d28fb51b6890",
+        "result_sha256": "40ebda30be68ab46e18cfb51308540acb26da72ca3673ddbb1c3d28fb51b6890",
+        "source_byte_count": 9331,
+        "result_byte_count": 9331
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "4ca14ee88c8b251ffe89f9062086b50eb54390e8a51b108039d9b4d6cb15b452",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "72e4534010a00f9033c7213922f542ff1915ee1db0f934b32206d67b8a0e2e12",
+        "decision_count": 1,
+        "result_sha256": "1cdc599d12dd54246103101eb1c58a88dbd4350f36ecf86613fa03a89030c008",
+        "result_byte_count": 9566
+      }
+    },
+    "SP-04": {
+      "artifact_id": "SP-04",
+      "corpus_artifact_lens": "Specification / plan",
+      "corpus_artifact_sha256": "6dc46d0821d27572dd4fbd857525c5e6437b446820b2885dfdfab19ee170615d",
+      "corpus_artifact_byte_count": 9014,
+      "request_artifact_sha256": "6dc46d0821d27572dd4fbd857525c5e6437b446820b2885dfdfab19ee170615d",
+      "request_artifact_byte_count": 9014,
+      "review_scope_sha256": "3e3ad44b7422648df5d78f79f41219b784da72f64c7970e203a9c257fb437b03",
+      "review_scope_byte_count": 9402,
+      "editable_source_sha256": "49293b1d59ec23b7c5253acaa6021c818f1e94e6c3a6f2a987bbfb915549f89e",
+      "editable_source_byte_count": 9014,
+      "source_binding_sha256": "49293b1d59ec23b7c5253acaa6021c818f1e94e6c3a6f2a987bbfb915549f89e",
+      "review_context_sha256": "dbf89cdcf5acc447212caa646d8a3587f28c35106cae838638eea5b2715b1383",
+      "answers_sha256": "54c3d3bdb1b8d0e4e353f7a8035af67e71013f7808c8493976e86bfbd766f3e2",
+      "raw_revision_response_sha256": "d609615ed69816f7d780c0dc8fcea029d86ddc5257e1923187ccf303556240a6",
+      "proposal_sha256": "7fe0fd0e4486b04c766167e8259908b57f7d13ad3f2934ea48c4aff45074d3b6",
+      "source_revision": 8,
+      "source_generation": 1,
+      "artifact_lens_sha256": "1bda48a40a6893c3ca20741c81aa6fb0e7d847546f7cb98c924cbdbaa6f68959",
+      "displayed_diff_sha256": "cebd4dcb77e83e20474ca113b1c49eaa989e03995bbf6b0abfd3e439d265761a",
+      "changes": [
+        {
+          "change_id": "SP-04-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "SP-04-CH-01-H-01",
+              "source_start": 9014,
+              "source_end": 9014,
+              "replacement_sha256": "a177820a38dbeb4a35803d78f040b23693a80ce10ea8c630ff2bb9ce6292dc0b",
+              "replacement_byte_count": 219,
+              "rationale_sha256": "7824589cc3a0245924d6eb75ca8dcc3a67436e2f65561d1a2ea2237fab6b8604",
+              "rationale_byte_count": 90,
+              "displayed_diff_sha256": "ce66824eafcf3da26fdfa4f243571206949849ae92a5a1b5ba30b8a1986ba0c7",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "cf8e2c515fc21ad8eef7487fc39a83994bf70ec2c4e17da6b2f269a527a8d636"
+      ],
+      "represented_question_ids": [
+        "cf8e2c515fc21ad8eef7487fc39a83994bf70ec2c4e17da6b2f269a527a8d636"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "cf8e2c515fc21ad8eef7487fc39a83994bf70ec2c4e17da6b2f269a527a8d636",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "49293b1d59ec23b7c5253acaa6021c818f1e94e6c3a6f2a987bbfb915549f89e",
+        "result_sha256": "49293b1d59ec23b7c5253acaa6021c818f1e94e6c3a6f2a987bbfb915549f89e",
+        "source_byte_count": 9014,
+        "result_byte_count": 9014
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "64b8879f4da1b6eace98d6c5cf02293e29a485bb634f7e1fb0ac2dbab8793c45",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "7fe0fd0e4486b04c766167e8259908b57f7d13ad3f2934ea48c4aff45074d3b6",
+        "decision_count": 1,
+        "result_sha256": "c7469f3f7cfc528739eae46bb4ffbda8686f4e890434df648f5f5570d24378af",
+        "result_byte_count": 9233
+      }
+    },
+    "TP-01": {
+      "artifact_id": "TP-01",
+      "corpus_artifact_lens": "Task prompt",
+      "corpus_artifact_sha256": "302d3e24d3004953a7b4dabd9e8b916585c574f98c752044cee5aa06d24f4f08",
+      "corpus_artifact_byte_count": 626,
+      "request_artifact_sha256": "302d3e24d3004953a7b4dabd9e8b916585c574f98c752044cee5aa06d24f4f08",
+      "request_artifact_byte_count": 626,
+      "review_scope_sha256": "13c2f25b0a799339add1dce73a9ad6cd210cb1a95cbb7107ad8a068a60007f6f",
+      "review_scope_byte_count": 849,
+      "editable_source_sha256": "e75055c10e684d4c92f5a4a5c63692ff481b26c5cf74590088c81d5ba3b89264",
+      "editable_source_byte_count": 626,
+      "source_binding_sha256": "e75055c10e684d4c92f5a4a5c63692ff481b26c5cf74590088c81d5ba3b89264",
+      "review_context_sha256": "74b13e31855cccab317c426b89db5fa03885ba4ffad5c6eb200785b8fc289ce8",
+      "answers_sha256": "b7e148d6488798efb2f22d97d911318abb4487a57ca0a26a5bb451d796bc4e99",
+      "raw_revision_response_sha256": "3c7ad7ea914e9f417e6df110b80416167904463e458b8d4559f0d3f039286f9d",
+      "proposal_sha256": "45fa92173d8f503ea1cf474886892c731a31a70c6112105705f83104993f73b7",
+      "source_revision": 1,
+      "source_generation": 1,
+      "artifact_lens_sha256": "d5c35dc42880af8ea51f2aed62e8aa32127127a3354052e17726ff172b2e38a5",
+      "displayed_diff_sha256": "53520696f484cd33ae3f3425825b1cef70fe3216a7a6547aec910c3f33abd113",
+      "changes": [
+        {
+          "change_id": "TP-01-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "TP-01-CH-01-H-01",
+              "source_start": 626,
+              "source_end": 626,
+              "replacement_sha256": "1b8e10013b656d853f2289964321e419e9a5e6d3592dbd9e500185780138e7b0",
+              "replacement_byte_count": 231,
+              "rationale_sha256": "6e483285e58b107cbf3aa2a5f96da691278e933f26546a6da02c725a4e594bce",
+              "rationale_byte_count": 95,
+              "displayed_diff_sha256": "9bf235b1028c46db29c5f666b9fbd89a0a263a82c974438711483811a077e2a2",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "726d2bf0059d2caa0ff0fcc3758bb07cd96fe622bd21a40a92de11681301cc94"
+      ],
+      "represented_question_ids": [
+        "726d2bf0059d2caa0ff0fcc3758bb07cd96fe622bd21a40a92de11681301cc94"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "726d2bf0059d2caa0ff0fcc3758bb07cd96fe622bd21a40a92de11681301cc94",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "e75055c10e684d4c92f5a4a5c63692ff481b26c5cf74590088c81d5ba3b89264",
+        "result_sha256": "e75055c10e684d4c92f5a4a5c63692ff481b26c5cf74590088c81d5ba3b89264",
+        "source_byte_count": 626,
+        "result_byte_count": 626
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "a1f46ef94b74c5f96f19b352b16c43e544666cf6418cc32e9eb6764516cd6544",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "45fa92173d8f503ea1cf474886892c731a31a70c6112105705f83104993f73b7",
+        "decision_count": 1,
+        "result_sha256": "d46475c030136ddbaa02ccea54ed12f98068e2df07a133623e86656c2c13ae6a",
+        "result_byte_count": 857
+      }
+    },
+    "TP-02": {
+      "artifact_id": "TP-02",
+      "corpus_artifact_lens": "Task prompt",
+      "corpus_artifact_sha256": "0a2aef34caa32d502d602fe0c0269088053616d7313c51a1793026a3721d8c41",
+      "corpus_artifact_byte_count": 476,
+      "request_artifact_sha256": "0a2aef34caa32d502d602fe0c0269088053616d7313c51a1793026a3721d8c41",
+      "request_artifact_byte_count": 476,
+      "review_scope_sha256": "72d4da8dd4d4f32e06f1400a77caf8dd494c25d057e8f45bbe205103f157c620",
+      "review_scope_byte_count": 696,
+      "editable_source_sha256": "bb58f6d1e14fd2b861176e162c108ec86711f73f843a746d0b49c9f77909b502",
+      "editable_source_byte_count": 476,
+      "source_binding_sha256": "bb58f6d1e14fd2b861176e162c108ec86711f73f843a746d0b49c9f77909b502",
+      "review_context_sha256": "c70806f80f9ae3cb33d3d054478923145dce72fc47fdd4f9511ff674b2e17c18",
+      "answers_sha256": "388cb78f61d83409a850c613a2cd7ec2675220df7227a5210897a73da3b1ca3c",
+      "raw_revision_response_sha256": "90da893aa241572c3348892d7393a0e55b08b98b0833a886077e0bb5073361c9",
+      "proposal_sha256": "0cc7992a7fe2f2e5bbabaf3a15c729a07d5196ca9ba96adbb45417ea54d5ef99",
+      "source_revision": 2,
+      "source_generation": 1,
+      "artifact_lens_sha256": "d5c35dc42880af8ea51f2aed62e8aa32127127a3354052e17726ff172b2e38a5",
+      "displayed_diff_sha256": "97e8820dca2ff4b0a9504ef7abb8c4fb82b679eb1938c666748c479c073558f2",
+      "changes": [
+        {
+          "change_id": "TP-02-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "TP-02-CH-01-H-01",
+              "source_start": 476,
+              "source_end": 476,
+              "replacement_sha256": "a464229c9aa46d2c9c3fcc19caae0fef2fb8a45d888c204a95929c4cbdaf4b50",
+              "replacement_byte_count": 231,
+              "rationale_sha256": "95febfba828e83c25d3b4255b31d0f33694178e148a1ed82ebb9a7e1765388c1",
+              "rationale_byte_count": 97,
+              "displayed_diff_sha256": "e65c670e64af7ae1533e5b6a99396396a0263ab91b1d78a40fd7f977737dfcf2",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "b7da054e7c18bf8fb5ceca081fac3d0e5fd3fd444e358aecee93c79db9e6d931"
+      ],
+      "represented_question_ids": [
+        "b7da054e7c18bf8fb5ceca081fac3d0e5fd3fd444e358aecee93c79db9e6d931"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "b7da054e7c18bf8fb5ceca081fac3d0e5fd3fd444e358aecee93c79db9e6d931",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "bb58f6d1e14fd2b861176e162c108ec86711f73f843a746d0b49c9f77909b502",
+        "result_sha256": "bb58f6d1e14fd2b861176e162c108ec86711f73f843a746d0b49c9f77909b502",
+        "source_byte_count": 476,
+        "result_byte_count": 476
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "6018063d3164e3207ffc5b3225a05aaf52cf4e96ece94bf310f3812c05f6b9c8",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "0cc7992a7fe2f2e5bbabaf3a15c729a07d5196ca9ba96adbb45417ea54d5ef99",
+        "decision_count": 1,
+        "result_sha256": "f196ec4d0097ea3f6d4b25a7470887f48909ba8aefce1e00ad062e226a99453e",
+        "result_byte_count": 707
+      }
+    },
+    "TP-03": {
+      "artifact_id": "TP-03",
+      "corpus_artifact_lens": "Task prompt",
+      "corpus_artifact_sha256": "bc19915c16461dcdee484a4cffc76c183b5fe9bedec214901b08e7c2f7a9ae58",
+      "corpus_artifact_byte_count": 573,
+      "request_artifact_sha256": "bc19915c16461dcdee484a4cffc76c183b5fe9bedec214901b08e7c2f7a9ae58",
+      "request_artifact_byte_count": 573,
+      "review_scope_sha256": "98cfd3c704f92679b1504ce3532be97401a8af5979e954e72ebe961c8adc1776",
+      "review_scope_byte_count": 793,
+      "editable_source_sha256": "7344bc999e91ec0c8472c557d4261c19e5cd02fe7b3801d47c06b3cfdd9755d1",
+      "editable_source_byte_count": 573,
+      "source_binding_sha256": "7344bc999e91ec0c8472c557d4261c19e5cd02fe7b3801d47c06b3cfdd9755d1",
+      "review_context_sha256": "76bc0b901842c7e7ac59c05e253a6be99b941d80e669dcf31e9f37b5bce220c6",
+      "answers_sha256": "658a7940ac4ae3a4c503c5802a854b8c18dbba2dc85164aefc679afea0e4bc78",
+      "raw_revision_response_sha256": "86fa0263311013d4ed71a54fc586d0ddfe29d36468b9d66832d6931b76baafb1",
+      "proposal_sha256": "acae44f5e5097343f0573b725bd61892d0a83597d67df4d077f6495fae25c978",
+      "source_revision": 3,
+      "source_generation": 1,
+      "artifact_lens_sha256": "d5c35dc42880af8ea51f2aed62e8aa32127127a3354052e17726ff172b2e38a5",
+      "displayed_diff_sha256": "50421d6c6f3cbdfd4fdabf248c0c0b4d8708968e163f6b9d86eef128d74faadd",
+      "changes": [
+        {
+          "change_id": "TP-03-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "TP-03-CH-01-H-01",
+              "source_start": 573,
+              "source_end": 573,
+              "replacement_sha256": "8883d9fb3aaecfef5048a93d6bd1b5b287dc8bcb15ae29f463a49b4ef9797004",
+              "replacement_byte_count": 228,
+              "rationale_sha256": "a4660d6482b34b2da764afe227b896cab6bc7bc667a80a53e4d269abd8748a33",
+              "rationale_byte_count": 93,
+              "displayed_diff_sha256": "eb10d22d00ec6773c814eeb296fb9bb86b2ddc05c70676a21eef493e848cebac",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "4c8014a9c444d441f2ded21290fdca4645624026f550de9e9c095617b7d8f19c"
+      ],
+      "represented_question_ids": [
+        "4c8014a9c444d441f2ded21290fdca4645624026f550de9e9c095617b7d8f19c"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "4c8014a9c444d441f2ded21290fdca4645624026f550de9e9c095617b7d8f19c",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "7344bc999e91ec0c8472c557d4261c19e5cd02fe7b3801d47c06b3cfdd9755d1",
+        "result_sha256": "7344bc999e91ec0c8472c557d4261c19e5cd02fe7b3801d47c06b3cfdd9755d1",
+        "source_byte_count": 573,
+        "result_byte_count": 573
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "8015a30e6d4ed46483ac8d2c82c875bb4fa1117aa297a9d974acdbefcf0283ca",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "acae44f5e5097343f0573b725bd61892d0a83597d67df4d077f6495fae25c978",
+        "decision_count": 1,
+        "result_sha256": "0f177d9994280568e9f7b776c27ad5441cab0a26812aee82d9cbb3ccef345910",
+        "result_byte_count": 801
+      }
+    },
+    "TP-04": {
+      "artifact_id": "TP-04",
+      "corpus_artifact_lens": "Task prompt",
+      "corpus_artifact_sha256": "40e155b251959f1840d23c030625383b8167b42d9534d790c9b0ad7c68bc670a",
+      "corpus_artifact_byte_count": 441,
+      "request_artifact_sha256": "40e155b251959f1840d23c030625383b8167b42d9534d790c9b0ad7c68bc670a",
+      "request_artifact_byte_count": 441,
+      "review_scope_sha256": "5fe18006bea650ca827fb67827bc279be7a9cce0aca8bd6105f077955c20edc7",
+      "review_scope_byte_count": 669,
+      "editable_source_sha256": "5740bf9a3cf4efa87bbf88802d345cba43482afa66daf38078c5c6635312625e",
+      "editable_source_byte_count": 441,
+      "source_binding_sha256": "5740bf9a3cf4efa87bbf88802d345cba43482afa66daf38078c5c6635312625e",
+      "review_context_sha256": "c2f8325802d14de2d6eab084a6f8df233a71dd49190e5027d255fbb5d9fd461e",
+      "answers_sha256": "5efa7331420cf7928dcef86a016236d4aa99e54a246db60661760f6d6671309a",
+      "raw_revision_response_sha256": "8ca85f697fc67df4105cd17441b9262c8fa1d784dae48438bccb6e45348ffc51",
+      "proposal_sha256": "c8b1a8f1144897aa1f3bccc00ebbe8340544a87b156746918fd91a30ec930dc1",
+      "source_revision": 4,
+      "source_generation": 1,
+      "artifact_lens_sha256": "d5c35dc42880af8ea51f2aed62e8aa32127127a3354052e17726ff172b2e38a5",
+      "displayed_diff_sha256": "6784f82db51f49ec12861715e6bd1e7dfe8a4809c57b916e69b28b6262b43953",
+      "changes": [
+        {
+          "change_id": "TP-04-CH-01",
+          "intent_change_ids": [],
+          "hunks": [
+            {
+              "hunk_id": "TP-04-CH-01-H-01",
+              "source_start": 441,
+              "source_end": 441,
+              "replacement_sha256": "dc36c7033446f886d95c291ed46a16fdc5bbc301fcb35fae704b26dbfa21003b",
+              "replacement_byte_count": 243,
+              "rationale_sha256": "b5a5b652858ff64fc8abec9eb1ec60400009f5423a3a0387f2defda4860d6220",
+              "rationale_byte_count": 99,
+              "displayed_diff_sha256": "521a0b0fb57b24bc25f3871242a8b569f893e1131d9e843493d543176220e1b2",
+              "runner_schema": "markturbo-local-diff-receipt-v2",
+              "local_diff_verified": true,
+              "utf8_boundaries_verified": true
+            }
+          ]
+        }
+      ],
+      "answered_material_question_ids": [
+        "06cab0d8e2ba2357beb77e2f2c95d1338d962747dd7fc581f9e51c8bb1b60324"
+      ],
+      "represented_question_ids": [
+        "06cab0d8e2ba2357beb77e2f2c95d1338d962747dd7fc581f9e51c8bb1b60324"
+      ],
+      "intentionally_omitted_question_ids": [],
+      "question_coverage": [
+        {
+          "question_index": 0,
+          "question_id": "06cab0d8e2ba2357beb77e2f2c95d1338d962747dd7fc581f9e51c8bb1b60324",
+          "status": {
+            "kind": "represented",
+            "change_ids": [
+              0
+            ]
+          }
+        }
+      ],
+      "reject_all": {
+        "source_sha256": "5740bf9a3cf4efa87bbf88802d345cba43482afa66daf38078c5c6635312625e",
+        "result_sha256": "5740bf9a3cf4efa87bbf88802d345cba43482afa66daf38078c5c6635312625e",
+        "source_byte_count": 441,
+        "result_byte_count": 441
+      },
+      "approved_output": {
+        "status": "composed",
+        "decision_file_sha256": "fc37b08f0f1eb31a3b4560f1b9c6d8d7cf9c6a18964b46226e701b1d345358ba",
+        "decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+        "proposal_sha256": "c8b1a8f1144897aa1f3bccc00ebbe8340544a87b156746918fd91a30ec930dc1",
+        "decision_count": 1,
+        "result_sha256": "f84d4305d64b704c932b959dda28179fc938534a100708ad38f7c2fa38c831b9",
+        "result_byte_count": 684
+      }
+    }
+  }
+}

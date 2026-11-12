@@ -1,0 +1,30 @@
+Goal 02 Case 10 symlink evidence
+Date: 2026-08-31
+Platform: Windows x64
+Branch: codex/goal-02-user-text-safety
+
+COMMAND: C:/Users/lhan/.cargo/bin/cargo.exe test --release --locked -p mt-app --lib fs::tests::saving_through_a_symbolic_link_preserves_the_link -- --exact --nocapture --test-threads=1
+STARTED_AT: 2026-08-31T14:23:44.4495754+08:00
+    Finished `release` profile [optimized] target(s) in 26.55s
+     Running unittests src\lib.rs (target\release\deps\mt_app-83131348163e5e40.exe)
+
+running 1 test
+test fs::tests::saving_through_a_symbolic_link_preserves_the_link ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 556 filtered out; finished in 0.02s
+
+EXIT_CODE: 0
+FINISHED_AT: 2026-08-31T14:24:16.3606907+08:00
+
+COMMAND: C:/Users/lhan/.cargo/bin/cargo.exe test --release --locked -p mt-app --lib views::workspace::tests::save_action_refuses_retargeted_symlink_without_overwriting_either_target -- --exact --nocapture --test-threads=1
+STARTED_AT: 2026-08-31T14:24:16.3651217+08:00
+    Finished `release` profile [optimized] target(s) in 3.00s
+     Running unittests src\lib.rs (target\release\deps\mt_app-83131348163e5e40.exe)
+
+running 1 test
+test views::workspace::tests::save_action_refuses_retargeted_symlink_without_overwriting_either_target ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 556 filtered out; finished in 1.37s
+
+EXIT_CODE: 0
+FINISHED_AT: 2026-08-31T14:24:21.5463392+08:00

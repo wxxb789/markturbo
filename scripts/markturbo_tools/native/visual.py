@@ -12,7 +12,7 @@ packaged `MarkTurbo.exe` built from the same source revision::
 
     uv run --locked --project scripts scripts/mt.py visual \\
         --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \\
-        --out .scratch/goal-09/matrix
+        --out docs/evidence/goal-09/matrix
 
 This is capture tooling, not owner approval or first-time-user evidence.
 """

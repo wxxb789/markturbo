@@ -1,0 +1,10 @@
+{"errors": 0, "failures": 3, "mutation": "partial_pass", "suite": "baseline", "survived": false, "tests_run": 3}
+{"errors": 0, "failures": 2, "mutation": "partial_pass", "suite": "ablated", "survived": false, "tests_run": 2}
+{"errors": 0, "failures": 2, "mutation": "cleanup_noop", "suite": "baseline", "survived": false, "tests_run": 2}
+{"errors": 0, "failures": 1, "mutation": "cleanup_noop", "suite": "ablated", "survived": false, "tests_run": 1}
+{"errors": 0, "failures": 2, "mutation": "retention_delete", "suite": "baseline", "survived": false, "tests_run": 2}
+{"errors": 0, "failures": 1, "mutation": "retention_delete", "suite": "ablated", "survived": false, "tests_run": 1}
+{"errors": 0, "failures": 0, "mutation": "scenario_swap", "suite": "baseline", "survived": true, "tests_run": 2}
+{"errors": 0, "failures": 1, "mutation": "scenario_swap", "suite": "ablated", "survived": false, "tests_run": 1}
+{"errors": 0, "failures": 0, "mutation": "scenario_duplicate", "suite": "baseline", "survived": true, "tests_run": 2}
+{"errors": 0, "failures": 1, "mutation": "scenario_duplicate", "suite": "ablated", "survived": false, "tests_run": 1}

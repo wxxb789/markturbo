@@ -1,0 +1,5 @@
+original_metrics_pair=OverflowError: intermediate overflow in fsum
+original_goal04_pair=inf
+refactored_metrics_pair=OverflowError: intermediate overflow in fsum
+refactored_goal04_pair=inf
+EXIT_CODE=0

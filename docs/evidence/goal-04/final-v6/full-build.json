@@ -1,0 +1,1704 @@
+{
+  "artifact_kind": "application",
+  "behavior": {
+    "lost_behavior": null,
+    "model_transport": "compiled in and available when configured",
+    "translation_scopes": [
+      "selection",
+      "block",
+      "document"
+    ]
+  },
+  "behavior_verification": null,
+  "build": {
+    "command": [
+      "cargo",
+      "build",
+      "--release",
+      "--locked",
+      "--target",
+      "x86_64-pc-windows-msvc",
+      "-p",
+      "mt-app",
+      "--bin",
+      "markturbo"
+    ],
+    "environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_RELEASE_OPT_LEVEL": null,
+      "CARGO_TARGET_DIR": "<redacted-path>"
+    }
+  },
+  "cargo_bloat": {
+    "command": [
+      "cargo",
+      "bloat",
+      "--release",
+      "--locked",
+      "--target",
+      "x86_64-pc-windows-msvc",
+      "-p",
+      "mt-app",
+      "--bin",
+      "markturbo",
+      "--crates",
+      "-n",
+      "0",
+      "--message-format",
+      "json"
+    ],
+    "crates": [
+      {
+        "name": "gpui",
+        "size": 5088121
+      },
+      {
+        "name": "[Other MSVC attribution]",
+        "size": 4213129
+      },
+      {
+        "name": "d2-little",
+        "size": 2265258
+      },
+      {
+        "name": "gpui-component",
+        "size": 2172262
+      },
+      {
+        "name": "mermaid-svg",
+        "size": 1526601
+      },
+      {
+        "name": "mt-app",
+        "size": 1349332
+      },
+      {
+        "name": "gpui-base",
+        "size": 928711
+      },
+      {
+        "name": "usvg",
+        "size": 896192
+      },
+      {
+        "name": "[Unknown]",
+        "size": 612979
+      },
+      {
+        "name": "genai",
+        "size": 601758
+      },
+      {
+        "name": "image-webp",
+        "size": 546576
+      },
+      {
+        "name": "ratex-parser",
+        "size": 505008
+      },
+      {
+        "name": "image",
+        "size": 488142
+      },
+      {
+        "name": "rustls",
+        "size": 463927
+      },
+      {
+        "name": "zune-jpeg",
+        "size": 438168
+      },
+      {
+        "name": "regex-automata",
+        "size": 431602
+      },
+      {
+        "name": "gpui_windows",
+        "size": 354237
+      },
+      {
+        "name": "h2",
+        "size": 321462
+      },
+      {
+        "name": "markdown",
+        "size": 308486
+      },
+      {
+        "name": "exr",
+        "size": 303298
+      },
+      {
+        "name": "taffy",
+        "size": 281415
+      },
+      {
+        "name": "ratex-layout",
+        "size": 264268
+      },
+      {
+        "name": "resvg",
+        "size": 263880
+      },
+      {
+        "name": "rustybuzz",
+        "size": 256374
+      },
+      {
+        "name": "regex-syntax",
+        "size": 233246
+      },
+      {
+        "name": "tiny-skia",
+        "size": 203450
+      },
+      {
+        "name": "ttf-parser",
+        "size": 195853
+      },
+      {
+        "name": "reqwest",
+        "size": 192056
+      },
+      {
+        "name": "hyper-util",
+        "size": 175350
+      },
+      {
+        "name": "serde_core",
+        "size": 174931
+      },
+      {
+        "name": "mt-doc",
+        "size": 168473
+      },
+      {
+        "name": "aho-corasick",
+        "size": 167914
+      },
+      {
+        "name": "html5ever",
+        "size": 157573
+      },
+      {
+        "name": "hyper",
+        "size": 148573
+      },
+      {
+        "name": "accesskit_windows",
+        "size": 147516
+      },
+      {
+        "name": "tokio",
+        "size": 138783
+      },
+      {
+        "name": "tree-sitter-bash",
+        "size": 135355
+      },
+      {
+        "name": "accesskit_consumer",
+        "size": 133634
+      },
+      {
+        "name": "tiff",
+        "size": 133330
+      },
+      {
+        "name": "ring",
+        "size": 127059
+      },
+      {
+        "name": "hashbrown",
+        "size": 111046
+      },
+      {
+        "name": "async-task",
+        "size": 103396
+      },
+      {
+        "name": "roxmltree",
+        "size": 103067
+      },
+      {
+        "name": "serde_json",
+        "size": 98131
+      },
+      {
+        "name": "png",
+        "size": 95966
+      },
+      {
+        "name": "svgtypes",
+        "size": 93827
+      },
+      {
+        "name": "sum_tree",
+        "size": 89417
+      },
+      {
+        "name": "toml",
+        "size": 80244
+      },
+      {
+        "name": "futures-util",
+        "size": 80060
+      },
+      {
+        "name": "http",
+        "size": 77637
+      },
+      {
+        "name": "fancy-regex",
+        "size": 73139
+      },
+      {
+        "name": "tree-sitter",
+        "size": 65925
+      },
+      {
+        "name": "lb-wry",
+        "size": 64955
+      },
+      {
+        "name": "notify",
+        "size": 64260
+      },
+      {
+        "name": "lyon_tessellation",
+        "size": 60681
+      },
+      {
+        "name": "smallvec",
+        "size": 60231
+      },
+      {
+        "name": "ropey",
+        "size": 54583
+      },
+      {
+        "name": "unsafe-libyaml",
+        "size": 53633
+      },
+      {
+        "name": "regex-lite",
+        "size": 52044
+      },
+      {
+        "name": "fontdb",
+        "size": 51283
+      },
+      {
+        "name": "url",
+        "size": 49562
+      },
+      {
+        "name": "scheduler",
+        "size": 49306
+      },
+      {
+        "name": "toml_parser",
+        "size": 47584
+      },
+      {
+        "name": "tiny-skia-path",
+        "size": 47415
+      },
+      {
+        "name": "anyhow",
+        "size": 43844
+      },
+      {
+        "name": "miniz_oxide",
+        "size": 36272
+      },
+      {
+        "name": "imagesize",
+        "size": 33641
+      },
+      {
+        "name": "serde_yaml",
+        "size": 33609
+      },
+      {
+        "name": "value-ext",
+        "size": 32710
+      },
+      {
+        "name": "notify-debouncer-full",
+        "size": 32112
+      },
+      {
+        "name": "idna",
+        "size": 29900
+      },
+      {
+        "name": "mio",
+        "size": 26344
+      },
+      {
+        "name": "rayon-core",
+        "size": 25936
+      },
+      {
+        "name": "memchr",
+        "size": 25559
+      },
+      {
+        "name": "weezl",
+        "size": 24417
+      },
+      {
+        "name": "fdeflate",
+        "size": 23733
+      },
+      {
+        "name": "zed-sum-tree",
+        "size": 23340
+      },
+      {
+        "name": "chardetng",
+        "size": 21795
+      },
+      {
+        "name": "hyper-rustls",
+        "size": 20969
+      },
+      {
+        "name": "schemars",
+        "size": 20535
+      },
+      {
+        "name": "gpui_util",
+        "size": 19128
+      },
+      {
+        "name": "tendril",
+        "size": 18903
+      },
+      {
+        "name": "webview2-com",
+        "size": 18169
+      },
+      {
+        "name": "simplecss",
+        "size": 18110
+      },
+      {
+        "name": "indexmap",
+        "size": 18028
+      },
+      {
+        "name": "stacksafe",
+        "size": 17191
+      },
+      {
+        "name": "parking_lot",
+        "size": 16970
+      },
+      {
+        "name": "encoding_rs",
+        "size": 16210
+      },
+      {
+        "name": "windows",
+        "size": 15808
+      },
+      {
+        "name": "flate2",
+        "size": 15761
+      },
+      {
+        "name": "rustls-pki-types",
+        "size": 15095
+      },
+      {
+        "name": "env_logger",
+        "size": 13342
+      },
+      {
+        "name": "which",
+        "size": 13264
+      },
+      {
+        "name": "sha2",
+        "size": 12836
+      },
+      {
+        "name": "zune-inflate",
+        "size": 12374
+      },
+      {
+        "name": "markup5ever_rcdom",
+        "size": 12311
+      },
+      {
+        "name": "data-url",
+        "size": 12272
+      },
+      {
+        "name": "gif",
+        "size": 11354
+      },
+      {
+        "name": "ab_glyph",
+        "size": 11180
+      },
+      {
+        "name": "bytes",
+        "size": 11167
+      },
+      {
+        "name": "http-body-util",
+        "size": 10598
+      },
+      {
+        "name": "zune-core",
+        "size": 10474
+      },
+      {
+        "name": "rust-i18n-support",
+        "size": 10313
+      },
+      {
+        "name": "tower",
+        "size": 10270
+      },
+      {
+        "name": "icu_normalizer",
+        "size": 10249
+      },
+      {
+        "name": "unicode-segmentation",
+        "size": 10032
+      },
+      {
+        "name": "env_filter",
+        "size": 9800
+      },
+      {
+        "name": "http_client",
+        "size": 9654
+      },
+      {
+        "name": "async-channel",
+        "size": 9555
+      },
+      {
+        "name": "regex",
+        "size": 9507
+      },
+      {
+        "name": "unicode-bidi",
+        "size": 8958
+      },
+      {
+        "name": "webview2-com-sys",
+        "size": 8709
+      },
+      {
+        "name": "kurbo",
+        "size": 8591
+      },
+      {
+        "name": "anstream",
+        "size": 8288
+      },
+      {
+        "name": "lyon_algorithms",
+        "size": 8175
+      },
+      {
+        "name": "windows-core",
+        "size": 8016
+      },
+      {
+        "name": "rustls-platform-verifier",
+        "size": 7899
+      },
+      {
+        "name": "heapless",
+        "size": 7658
+      },
+      {
+        "name": "lsp-types",
+        "size": 7657
+      },
+      {
+        "name": "event-listener",
+        "size": 7461
+      },
+      {
+        "name": "tokio-rustls",
+        "size": 7181
+      },
+      {
+        "name": "rand_chacha",
+        "size": 6980
+      },
+      {
+        "name": "tempfile",
+        "size": 6959
+      },
+      {
+        "name": "flume",
+        "size": 6913
+      },
+      {
+        "name": "ratex-font",
+        "size": 5865
+      },
+      {
+        "name": "globset",
+        "size": 5666
+      },
+      {
+        "name": "ratex-types",
+        "size": 5605
+      },
+      {
+        "name": "mime",
+        "size": 5456
+      },
+      {
+        "name": "slotmap",
+        "size": 5358
+      },
+      {
+        "name": "futures-channel",
+        "size": 5314
+      },
+      {
+        "name": "sha1_smol",
+        "size": 5310
+      },
+      {
+        "name": "toml_datetime",
+        "size": 5307
+      },
+      {
+        "name": "ipnet",
+        "size": 5103
+      },
+      {
+        "name": "httparse",
+        "size": 5026
+      },
+      {
+        "name": "crossbeam-epoch",
+        "size": 4858
+      },
+      {
+        "name": "accesskit",
+        "size": 4814
+      },
+      {
+        "name": "unicode-ccc",
+        "size": 4792
+      },
+      {
+        "name": "tree-sitter-html",
+        "size": 4725
+      },
+      {
+        "name": "compression-codecs",
+        "size": 4609
+      },
+      {
+        "name": "lyon_path",
+        "size": 4336
+      },
+      {
+        "name": "xmlwriter",
+        "size": 4224
+      },
+      {
+        "name": "stacker",
+        "size": 4178
+      },
+      {
+        "name": "windows-strings",
+        "size": 4141
+      },
+      {
+        "name": "chrono",
+        "size": 4057
+      },
+      {
+        "name": "windows-result",
+        "size": 3891
+      },
+      {
+        "name": "etagere",
+        "size": 3792
+      },
+      {
+        "name": "jiff",
+        "size": 3698
+      },
+      {
+        "name": "arc-swap",
+        "size": 3581
+      },
+      {
+        "name": "anstyle-wincon",
+        "size": 3551
+      },
+      {
+        "name": "ratex-lexer",
+        "size": 3433
+      },
+      {
+        "name": "anstyle-parse",
+        "size": 3374
+      },
+      {
+        "name": "markup5ever",
+        "size": 3326
+      },
+      {
+        "name": "ignore",
+        "size": 3297
+      },
+      {
+        "name": "proc-macro2",
+        "size": 3281
+      },
+      {
+        "name": "tower-http",
+        "size": 3079
+      },
+      {
+        "name": "log",
+        "size": 2967
+      },
+      {
+        "name": "windows-registry",
+        "size": 2950
+      },
+      {
+        "name": "pulp",
+        "size": 2854
+      },
+      {
+        "name": "simd-adler32",
+        "size": 2781
+      },
+      {
+        "name": "ryu",
+        "size": 2721
+      },
+      {
+        "name": "parking_lot_core",
+        "size": 2685
+      },
+      {
+        "name": "tree-sitter-python",
+        "size": 2486
+      },
+      {
+        "name": "toml_writer",
+        "size": 2458
+      },
+      {
+        "name": "tokio-util",
+        "size": 2449
+      },
+      {
+        "name": "string_cache",
+        "size": 2405
+      },
+      {
+        "name": "tracing-core",
+        "size": 2377
+      },
+      {
+        "name": "percent-encoding",
+        "size": 2350
+      },
+      {
+        "name": "unicode-vo",
+        "size": 2302
+      },
+      {
+        "name": "crossbeam-deque",
+        "size": 2298
+      },
+      {
+        "name": "anstyle",
+        "size": 2255
+      },
+      {
+        "name": "base64",
+        "size": 2113
+      },
+      {
+        "name": "tracing",
+        "size": 2112
+      },
+      {
+        "name": "notify-types",
+        "size": 2099
+      },
+      {
+        "name": "event-listener-strategy",
+        "size": 2090
+      },
+      {
+        "name": "dunce",
+        "size": 2084
+      },
+      {
+        "name": "str_indices",
+        "size": 2082
+      },
+      {
+        "name": "parking",
+        "size": 1999
+      },
+      {
+        "name": "gpui-component-assets",
+        "size": 1910
+      },
+      {
+        "name": "owned_ttf_parser",
+        "size": 1906
+      },
+      {
+        "name": "once_cell",
+        "size": 1731
+      },
+      {
+        "name": "crc32fast",
+        "size": 1730
+      },
+      {
+        "name": "qoi",
+        "size": 1714
+      },
+      {
+        "name": "seahash",
+        "size": 1698
+      },
+      {
+        "name": "lyon_geom",
+        "size": 1613
+      },
+      {
+        "name": "syn",
+        "size": 1590
+      },
+      {
+        "name": "base32",
+        "size": 1507
+      },
+      {
+        "name": "icu_collections",
+        "size": 1499
+      },
+      {
+        "name": "memmap2",
+        "size": 1368
+      },
+      {
+        "name": "smol_str",
+        "size": 1326
+      },
+      {
+        "name": "zmij",
+        "size": 1205
+      },
+      {
+        "name": "tinyvec",
+        "size": 1060
+      },
+      {
+        "name": "async-compression",
+        "size": 1011
+      },
+      {
+        "name": "slab",
+        "size": 953
+      },
+      {
+        "name": "phf_shared",
+        "size": 928
+      },
+      {
+        "name": "itoa",
+        "size": 910
+      },
+      {
+        "name": "rust-i18n",
+        "size": 887
+      },
+      {
+        "name": "uuid",
+        "size": 813
+      },
+      {
+        "name": "tree-sitter-rust",
+        "size": 733
+      },
+      {
+        "name": "moxcms",
+        "size": 685
+      },
+      {
+        "name": "serde",
+        "size": 674
+      },
+      {
+        "name": "tree-sitter-javascript",
+        "size": 661
+      },
+      {
+        "name": "digest",
+        "size": 650
+      },
+      {
+        "name": "unicode-normalization",
+        "size": 648
+      },
+      {
+        "name": "gpui_platform",
+        "size": 645
+      },
+      {
+        "name": "foldhash",
+        "size": 598
+      },
+      {
+        "name": "itertools",
+        "size": 586
+      },
+      {
+        "name": "serde_fmt",
+        "size": 521
+      },
+      {
+        "name": "fastrand",
+        "size": 517
+      },
+      {
+        "name": "utf8_iter",
+        "size": 516
+      },
+      {
+        "name": "tree-sitter-md",
+        "size": 507
+      },
+      {
+        "name": "toml_edit",
+        "size": 481
+      },
+      {
+        "name": "jiff-core",
+        "size": 442
+      },
+      {
+        "name": "euclid",
+        "size": 436
+      },
+      {
+        "name": "tree-sitter-css",
+        "size": 430
+      },
+      {
+        "name": "fax",
+        "size": 406
+      },
+      {
+        "name": "unicode-script",
+        "size": 398
+      },
+      {
+        "name": "unicode-width",
+        "size": 398
+      },
+      {
+        "name": "unicode-properties",
+        "size": 395
+      },
+      {
+        "name": "socket2",
+        "size": 394
+      },
+      {
+        "name": "unicode-bidi-mirroring",
+        "size": 359
+      },
+      {
+        "name": "winnow",
+        "size": 356
+      },
+      {
+        "name": "want",
+        "size": 339
+      },
+      {
+        "name": "anstyle-query",
+        "size": 300
+      },
+      {
+        "name": "tree-sitter-toml-ng",
+        "size": 282
+      },
+      {
+        "name": "tree-sitter-yaml",
+        "size": 270
+      },
+      {
+        "name": "arrayvec",
+        "size": 258
+      },
+      {
+        "name": "generic-array",
+        "size": 223
+      },
+      {
+        "name": "gpui_shared_string",
+        "size": 220
+      },
+      {
+        "name": "futures-task",
+        "size": 215
+      },
+      {
+        "name": "getrandom",
+        "size": 186
+      },
+      {
+        "name": "unicode-id",
+        "size": 169
+      },
+      {
+        "name": "sharded-slab",
+        "size": 140
+      },
+      {
+        "name": "synstructure",
+        "size": 107
+      },
+      {
+        "name": "psm",
+        "size": 98
+      },
+      {
+        "name": "color_quant",
+        "size": 89
+      },
+      {
+        "name": "untrusted",
+        "size": 81
+      },
+      {
+        "name": "windows-sys",
+        "size": 81
+      },
+      {
+        "name": "crossbeam-utils",
+        "size": 79
+      },
+      {
+        "name": "bytemuck",
+        "size": 61
+      },
+      {
+        "name": "half",
+        "size": 44
+      },
+      {
+        "name": "annotate-snippets",
+        "size": 22
+      },
+      {
+        "name": "tree-sitter-typescript",
+        "size": 16
+      },
+      {
+        "name": "perf",
+        "size": 8
+      },
+      {
+        "name": "tree-sitter-json",
+        "size": 8
+      },
+      {
+        "name": "tree-sitter-make",
+        "size": 8
+      }
+    ],
+    "file_size": 49090048,
+    "text_section_size": 30772736,
+    "version": "0.12.1"
+  },
+  "cargo_lock": {
+    "byte_count": 271911,
+    "sha256": "c8f3d08ae7916587cad6f6d3423102fbf28299524edcaa7aed458883afe33383"
+  },
+  "created_at": "2026-09-02T18:02:45.570267+00:00",
+  "dependency_graph": {
+    "command": [
+      "cargo",
+      "tree",
+      "--locked",
+      "--target",
+      "x86_64-pc-windows-msvc",
+      "-p",
+      "mt-app",
+      "--edges",
+      "normal",
+      "--prefix",
+      "none",
+      "--format",
+      "{p}|{f}"
+    ],
+    "packages": [
+      "ab_glyph",
+      "ab_glyph_rasterizer",
+      "accesskit",
+      "accesskit_consumer",
+      "accesskit_windows",
+      "adler2",
+      "ahash",
+      "aho-corasick",
+      "annotate-snippets",
+      "anstream",
+      "anstyle",
+      "anstyle-parse",
+      "anstyle-query",
+      "anstyle-wincon",
+      "anyhow",
+      "arc-swap",
+      "arraydeque",
+      "arrayref",
+      "arrayvec",
+      "async-channel",
+      "async-compression",
+      "async-executor",
+      "async-fs",
+      "async-io",
+      "async-lock",
+      "async-net",
+      "async-process",
+      "async-task",
+      "atomic",
+      "atomic-waker",
+      "backtrace",
+      "base32",
+      "base62",
+      "base64",
+      "bincode",
+      "bit-set",
+      "bit-vec",
+      "bit_field",
+      "bitflags",
+      "block-buffer",
+      "blocking",
+      "bstr",
+      "bytemuck",
+      "byteorder",
+      "byteorder-lite",
+      "bytes",
+      "bzip2",
+      "cfg-if",
+      "chardetng",
+      "chrono",
+      "collections",
+      "color_quant",
+      "colorchoice",
+      "compression-codecs",
+      "compression-core",
+      "concurrent-queue",
+      "const-oid",
+      "convert_case",
+      "cookie",
+      "core_maths",
+      "cpufeatures",
+      "crc32fast",
+      "crossbeam-deque",
+      "crossbeam-epoch",
+      "crossbeam-queue",
+      "crossbeam-utils",
+      "crypto-common",
+      "ctor",
+      "d2-little",
+      "darling",
+      "darling_core",
+      "darling_macro",
+      "data-url",
+      "deranged",
+      "derive_more",
+      "derive_more-impl",
+      "derive_refineable",
+      "digest",
+      "dirs",
+      "dirs-sys",
+      "displaydoc",
+      "dpi",
+      "dunce",
+      "dyn-clone",
+      "either",
+      "encoding_rs",
+      "encoding_rs_io",
+      "enum-iterator",
+      "enum-iterator-derive",
+      "enumn",
+      "env_filter",
+      "env_logger",
+      "equivalent",
+      "erased-serde",
+      "errno",
+      "etagere",
+      "euclid",
+      "event-listener",
+      "event-listener-strategy",
+      "eventsource-stream",
+      "exr",
+      "fancy-regex",
+      "fastrand",
+      "fax",
+      "fdeflate",
+      "file-id",
+      "filetime",
+      "fixedbitset",
+      "flate2",
+      "float-cmp",
+      "float_next_after",
+      "fluent-uri",
+      "flume",
+      "fnv",
+      "foldhash",
+      "fontdb",
+      "form_urlencoded",
+      "futf",
+      "futures",
+      "futures-channel",
+      "futures-concurrency",
+      "futures-core",
+      "futures-executor",
+      "futures-io",
+      "futures-lite",
+      "futures-macro",
+      "futures-sink",
+      "futures-task",
+      "futures-util",
+      "genai",
+      "generic-array",
+      "getrandom",
+      "gif",
+      "glob",
+      "globset",
+      "globwalk",
+      "gpui",
+      "gpui-base",
+      "gpui-component",
+      "gpui-component-assets",
+      "gpui-component-macros",
+      "gpui-wry",
+      "gpui_macros",
+      "gpui_platform",
+      "gpui_shared_string",
+      "gpui_util",
+      "gpui_windows",
+      "granit-parser",
+      "h2",
+      "half",
+      "hash32",
+      "hashbrown",
+      "heapless",
+      "heck",
+      "html5ever",
+      "http",
+      "http-body",
+      "http-body-util",
+      "http_client",
+      "httparse",
+      "hybrid-array",
+      "hyper",
+      "hyper-rustls",
+      "hyper-util",
+      "icu_collections",
+      "icu_locale_core",
+      "icu_normalizer",
+      "icu_normalizer_data",
+      "icu_properties",
+      "icu_properties_data",
+      "icu_provider",
+      "ident_case",
+      "idna",
+      "idna_adapter",
+      "ignore",
+      "image",
+      "image-webp",
+      "imagesize",
+      "indexmap",
+      "instant",
+      "inventory",
+      "ipnet",
+      "is_terminal_polyfill",
+      "itertools",
+      "itoa",
+      "jiff",
+      "jiff-core",
+      "kurbo",
+      "lazy_static",
+      "lb-wry",
+      "lebe",
+      "libbz2-rs-sys",
+      "libc",
+      "libm",
+      "link-section",
+      "linktime-proc-macro",
+      "litemap",
+      "lock_api",
+      "log",
+      "lsp-types",
+      "lyon",
+      "lyon_algorithms",
+      "lyon_geom",
+      "lyon_path",
+      "lyon_tessellation",
+      "mac",
+      "markdown",
+      "markup5ever",
+      "markup5ever_rcdom",
+      "memchr",
+      "memmap2",
+      "mermaid-svg",
+      "mime",
+      "mime_guess",
+      "minimal-lexical",
+      "miniz_oxide",
+      "mio",
+      "moxcms",
+      "mt-app",
+      "mt-doc",
+      "nanorand",
+      "new_debug_unreachable",
+      "nohash-hasher",
+      "nom",
+      "normpath",
+      "notify",
+      "notify-debouncer-full",
+      "notify-types",
+      "nu-ansi-term",
+      "num-complex",
+      "num-conv",
+      "num-traits",
+      "num_cpus",
+      "once_cell",
+      "once_cell_polyfill",
+      "option-ext",
+      "owned_ttf_parser",
+      "parking",
+      "parking_lot",
+      "parking_lot_core",
+      "paste",
+      "percent-encoding",
+      "perf",
+      "phf",
+      "phf_generator",
+      "phf_macros",
+      "phf_shared",
+      "pico-args",
+      "pin-project",
+      "pin-project-internal",
+      "pin-project-lite",
+      "piper",
+      "png",
+      "polling",
+      "pollster",
+      "polycool",
+      "postage",
+      "potential_utf",
+      "powerfmt",
+      "ppv-lite86",
+      "precomputed-hash",
+      "proc-macro2",
+      "profiling",
+      "profiling-procmacros",
+      "psm",
+      "pulp",
+      "pulp-wasm-simd-flag",
+      "pxfm",
+      "qoi",
+      "quick-error",
+      "quote",
+      "rand",
+      "rand_chacha",
+      "rand_core",
+      "ratex-font",
+      "ratex-layout",
+      "ratex-lexer",
+      "ratex-parser",
+      "ratex-types",
+      "raw-cpuid",
+      "raw-window-handle",
+      "rayon",
+      "rayon-core",
+      "reborrow",
+      "ref-cast",
+      "ref-cast-impl",
+      "refineable",
+      "regex",
+      "regex-automata",
+      "regex-lite",
+      "regex-syntax",
+      "reqwest",
+      "resvg",
+      "rgb",
+      "ring",
+      "ropey",
+      "roxmltree",
+      "rust-embed",
+      "rust-embed-impl",
+      "rust-embed-utils",
+      "rust-i18n",
+      "rust-i18n-macro",
+      "rust-i18n-support",
+      "rustc-demangle",
+      "rustc-hash",
+      "rustix",
+      "rustls",
+      "rustls-pki-types",
+      "rustls-platform-verifier",
+      "rustls-webpki",
+      "rustversion",
+      "rustybuzz",
+      "ryu",
+      "same-file",
+      "scheduler",
+      "schemars",
+      "schemars_derive",
+      "scopeguard",
+      "seahash",
+      "serde",
+      "serde-saphyr",
+      "serde_core",
+      "serde_derive",
+      "serde_derive_internals",
+      "serde_fmt",
+      "serde_json",
+      "serde_repr",
+      "serde_spanned",
+      "serde_urlencoded",
+      "serde_with",
+      "serde_with_macros",
+      "serde_yaml",
+      "sha1_smol",
+      "sha2",
+      "sharded-slab",
+      "shellexpand",
+      "simd-adler32",
+      "simplecss",
+      "siphasher",
+      "slab",
+      "slotmap",
+      "smallvec",
+      "smol",
+      "smol_str",
+      "socket2",
+      "spin",
+      "stable_deref_trait",
+      "stacker",
+      "stacksafe",
+      "stacksafe-macro",
+      "static_assertions",
+      "str_indices",
+      "streaming-iterator",
+      "strict-num",
+      "string_cache",
+      "strsim",
+      "strum",
+      "strum_macros",
+      "subtle",
+      "sum_tree",
+      "supramark-diagram-core",
+      "supramark-font-metrics",
+      "svg_fmt",
+      "svgtypes",
+      "syn",
+      "sync_wrapper",
+      "synstructure",
+      "syntect",
+      "taffy",
+      "tempfile",
+      "tendril",
+      "thiserror",
+      "thiserror-impl",
+      "thread_local",
+      "tiff",
+      "time",
+      "time-core",
+      "time-macros",
+      "tiny-skia",
+      "tiny-skia-path",
+      "tinystr",
+      "tinyvec",
+      "tinyvec_macros",
+      "tokio",
+      "tokio-macros",
+      "tokio-rustls",
+      "tokio-stream",
+      "tokio-util",
+      "toml",
+      "toml_datetime",
+      "toml_edit",
+      "toml_parser",
+      "toml_write",
+      "toml_writer",
+      "tower",
+      "tower-http",
+      "tower-layer",
+      "tower-service",
+      "tracing",
+      "tracing-attributes",
+      "tracing-core",
+      "tracing-log",
+      "tracing-subscriber",
+      "tree-sitter",
+      "tree-sitter-bash",
+      "tree-sitter-css",
+      "tree-sitter-html",
+      "tree-sitter-javascript",
+      "tree-sitter-json",
+      "tree-sitter-language",
+      "tree-sitter-make",
+      "tree-sitter-md",
+      "tree-sitter-python",
+      "tree-sitter-rust",
+      "tree-sitter-toml-ng",
+      "tree-sitter-typescript",
+      "tree-sitter-yaml",
+      "triomphe",
+      "try-lock",
+      "ttf-parser",
+      "typeid",
+      "typenum",
+      "unicase",
+      "unicode-bidi",
+      "unicode-bidi-mirroring",
+      "unicode-ccc",
+      "unicode-id",
+      "unicode-ident",
+      "unicode-normalization",
+      "unicode-properties",
+      "unicode-script",
+      "unicode-segmentation",
+      "unicode-vo",
+      "unicode-width",
+      "unicode-xid",
+      "unsafe-libyaml",
+      "untrusted",
+      "url",
+      "usvg",
+      "utf-8",
+      "utf8_iter",
+      "utf8parse",
+      "util_macros",
+      "uuid",
+      "value-bag",
+      "value-bag-serde1",
+      "value-ext",
+      "waker-fn",
+      "walkdir",
+      "want",
+      "web-time",
+      "webview2-com",
+      "webview2-com-macros",
+      "webview2-com-sys",
+      "weezl",
+      "which",
+      "winapi-util",
+      "windows",
+      "windows-collections",
+      "windows-core",
+      "windows-future",
+      "windows-implement",
+      "windows-interface",
+      "windows-link",
+      "windows-numerics",
+      "windows-registry",
+      "windows-result",
+      "windows-strings",
+      "windows-sys",
+      "windows-targets",
+      "windows-threading",
+      "windows-version",
+      "windows_x86_64_msvc",
+      "winnow",
+      "workspace-hack",
+      "writeable",
+      "xml5ever",
+      "xmlwriter",
+      "yoke",
+      "yoke-derive",
+      "zed-sum-tree",
+      "zerocopy",
+      "zerocopy-derive",
+      "zerofrom",
+      "zerofrom-derive",
+      "zeroize",
+      "zerotrie",
+      "zerovec",
+      "zerovec-derive",
+      "zlog",
+      "zmij",
+      "ztracing",
+      "ztracing_macro",
+      "zune-core",
+      "zune-inflate",
+      "zune-jpeg"
+    ],
+    "selected_features": {
+      "genai": [],
+      "hyper": [
+        "client",
+        "default",
+        "http1",
+        "http2"
+      ],
+      "reqwest": [
+        "__rustls",
+        "__tls",
+        "charset",
+        "gzip",
+        "http2",
+        "json",
+        "rustls-no-provider",
+        "stream",
+        "system-proxy"
+      ],
+      "rustls": [
+        "log",
+        "logging",
+        "ring",
+        "std",
+        "tls12"
+      ],
+      "tokio": [
+        "bytes",
+        "default",
+        "fs",
+        "io-std",
+        "io-util",
+        "libc",
+        "macros",
+        "mio",
+        "net",
+        "rt",
+        "rt-multi-thread",
+        "socket2",
+        "sync",
+        "test-util",
+        "time",
+        "tokio-macros",
+        "windows-sys"
+      ],
+      "tokio-rustls": [
+        "tls12"
+      ]
+    },
+    "tokio_disposition": "present with the unified application and model-transport feature set"
+  },
+  "executable": {
+    "byte_count": 49090048,
+    "sha256": "dd194d9a6d423dcc03032066b022fc7bd2f3d3bec1288b4c9cd05ee2f65e924e"
+  },
+  "features": {
+    "default_features": true,
+    "model_transport": true
+  },
+  "pe_sections": [
+    {
+      "characteristics": 1610612768,
+      "name": ".text",
+      "raw_size": 30772736,
+      "virtual_size": 30772446
+    },
+    {
+      "characteristics": 1073741888,
+      "name": ".rdata",
+      "raw_size": 16793600,
+      "virtual_size": 16793284
+    },
+    {
+      "characteristics": 3221225536,
+      "name": ".data",
+      "raw_size": 160256,
+      "virtual_size": 161120
+    },
+    {
+      "characteristics": 1073741888,
+      "name": ".pdata",
+      "raw_size": 1017344,
+      "virtual_size": 1017012
+    },
+    {
+      "characteristics": 1073741888,
+      "name": ".rsrc",
+      "raw_size": 206336,
+      "virtual_size": 205872
+    },
+    {
+      "characteristics": 1107296320,
+      "name": ".reloc",
+      "raw_size": 138752,
+      "virtual_size": 138316
+    }
+  ],
+  "platform_setup": {
+    "app_identity": "io.github.wxxb789.markturbo",
+    "assets": "embedded Assets provider",
+    "direct_composition": "disabled on Windows",
+    "gpui_component": "initialized",
+    "window": "same title, bounds, minimum size, kind and TitleBar options"
+  },
+  "profile": {
+    "codegen_units": 1,
+    "lto": "thin",
+    "name": "release",
+    "opt_level": "3",
+    "panic": "unwind",
+    "strip": "symbols"
+  },
+  "role": "decision",
+  "schema": "markturbo-goal-04-build-v1",
+  "source": {
+    "dirty": true,
+    "revision": "9c8ff0966ed42c47bdc348f708ceb5d482d9992f",
+    "worktree_sha256": "c5d7780ffd64edb69a5ddc9d866a41b62bcb447b90df5f4705631fff9d08f533"
+  },
+  "target": "x86_64-pc-windows-msvc",
+  "target_name": "markturbo",
+  "toolchain": {
+    "cargo": {
+      "command": [
+        "cargo",
+        "-Vv"
+      ],
+      "commit_date": "2026-08-05",
+      "commit_hash": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+      "host": "x86_64-pc-windows-msvc",
+      "release": "1.98.0"
+    },
+    "cargo_config": {
+      "cargo_home_overridden": false,
+      "files": []
+    },
+    "rustc": {
+      "command": [
+        "rustc",
+        "-vV"
+      ],
+      "commit_date": "2026-08-18",
+      "commit_hash": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
+      "host": "x86_64-pc-windows-msvc",
+      "llvm_version": "22.1.8",
+      "release": "1.98.0"
+    }
+  },
+  "variant": "full"
+}

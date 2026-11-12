@@ -1,0 +1,13 @@
+test_each_caller_retains_its_pair_mean_overflow_behavior (scripts.tests.test_probe.AbbaMeasurementTests.test_each_caller_retains_its_pair_mean_overflow_behavior) ... ok
+test_metrics_keeps_paired_statistics_for_abba_samples (scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_keeps_paired_statistics_for_abba_samples) ... ok
+test_metrics_rejects_a_zero_paired_baseline (scripts.tests.test_probe.AbbaMeasurementTests.test_metrics_rejects_a_zero_paired_baseline) ... ok
+test_shared_scheduler_keeps_structured_samples_separated_in_abba_order (scripts.tests.test_probe.AbbaMeasurementTests.test_shared_scheduler_keeps_structured_samples_separated_in_abba_order) ... ok
+test_structured_comparison_uses_adjacent_pairs_and_pair_medians (scripts.tests.test_probe.AbbaMeasurementTests.test_structured_comparison_uses_adjacent_pairs_and_pair_medians) ... ok
+test_validate_startup_evidence_rejects_forged_summary_or_comparison (scripts.tests.test_probe.StartupEvidenceContractTests.test_validate_startup_evidence_rejects_forged_summary_or_comparison) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.019s
+
+OK
+
+EXIT_CODE=0

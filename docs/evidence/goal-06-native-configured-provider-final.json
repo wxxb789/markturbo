@@ -1,0 +1,46 @@
+{
+  "cases": [
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_document",
+      "observations": {},
+      "reason_code": "WTS_SESSION_NOT_ACTIVE",
+      "status": "BLOCKED"
+    },
+    {
+      "duration_ms": 0.0,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_selection",
+      "observations": {},
+      "reason_code": "WTS_SESSION_NOT_ACTIVE",
+      "status": "BLOCKED"
+    }
+  ],
+  "completed_at_utc": "2026-09-08T17:07:29.070Z",
+  "environment": {},
+  "executable": {
+    "byte_count": 50060288,
+    "copied_sha256": null,
+    "copy_hash_verified": false,
+    "expected_sha256": "8a4221a411d92c209ce1f63e155db4dc63a642a01be9b0dea87f59bd12af36c3",
+    "format": "PE32+",
+    "hash_verified": true,
+    "machine": "x86_64",
+    "machine_code": 34404,
+    "optional_magic": 523,
+    "sha256": "8a4221a411d92c209ce1f63e155db4dc63a642a01be9b0dea87f59bd12af36c3"
+  },
+  "mode": "configured_provider_success",
+  "schema": "markturbo.goal-06-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-08T17:07:28.873Z",
+  "status": "BLOCKED",
+  "summary": {
+    "blocked_case_count": 2,
+    "failed_case_count": 0,
+    "not_run_case_count": 0,
+    "passed_case_count": 0,
+    "required_case_count": 2
+  }
+}

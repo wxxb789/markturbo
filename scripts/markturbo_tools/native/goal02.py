@@ -49,7 +49,7 @@ from .runtime import (
 
 REPO = Path(__file__).resolve().parents[3]
 DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
-DEFAULT_EVIDENCE = REPO / ".scratch" / "goal-02-native-acceptance-v1.json"
+DEFAULT_EVIDENCE = REPO / "docs/evidence" / "goal-02-native-acceptance-v1.json"
 
 SCHEMA = "markturbo.goal-02-native-acceptance"
 SCHEMA_VERSION = 1
@@ -1006,7 +1006,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--evidence",
         type=Path,
         default=DEFAULT_EVIDENCE,
-        help="versioned JSON evidence path (default: .scratch)",
+        help="versioned JSON evidence path (default: docs/evidence)",
     )
     parser.add_argument(
         "--ui-timeout",

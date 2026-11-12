@@ -1,0 +1,67 @@
+{
+  "cases": [
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "pointer-dirty-tab-close-cancel",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "sendinput-ctrl-w-discard",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "wm-close-save-exact-bytes",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "same-length-mtime-external-conflict",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    },
+    {
+      "duration_ms": null,
+      "failure_type": null,
+      "id": "cjk-emoji-interruption-recovery-retirement",
+      "observations": {},
+      "reason_code": "EXECUTABLE_MISSING",
+      "status": "NOT_RUN"
+    }
+  ],
+  "completed_at_utc": "2026-09-29T14:38:13.487Z",
+  "environment": {},
+  "executable": {
+    "byte_count": null,
+    "copied_sha256": null,
+    "copy_hash_verified": false,
+    "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "format": null,
+    "hash_verified": false,
+    "machine": null,
+    "sha256": null
+  },
+  "schema": "markturbo.goal-02-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-29T14:38:13.487Z",
+  "status": "FAIL",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 0,
+    "not_run_case_count": 5,
+    "passed_case_count": 0,
+    "required_case_count": 5
+  }
+}

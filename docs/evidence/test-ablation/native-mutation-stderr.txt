@@ -1,0 +1,203 @@
+======================================================================
+FAIL: test_single_case_run_never_claims_acceptance_pass (scripts.tests.test_native_goal02_execution.PrivacyAndCliTests.test_single_case_run_never_claims_acceptance_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal02_execution.py", line 170, in test_single_case_run_never_claims_acceptance_pass
+    self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "PARTIAL_CASE_RUN"))
+AssertionError: Tuples differ: (0, 'FAIL', 'ALL_REQUIRED_CASES') != (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+First differing element 0:
+0
+1
+
+- (0, 'FAIL', 'ALL_REQUIRED_CASES')
++ (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+======================================================================
+FAIL: test_partial_case_counts_only_the_selected_observation (scripts.tests.test_native_goal07.EvidenceFinalizationTests.test_partial_case_counts_only_the_selected_observation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal07.py", line 684, in test_partial_case_counts_only_the_selected_observation
+    self.assertEqual((returncode, evidence["status"], reason), (1, "FAIL", "PARTIAL_CASE_RUN"))
+AssertionError: Tuples differ: (0, 'FAIL', 'ALL_REQUIRED_CASES') != (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+First differing element 0:
+0
+1
+
+- (0, 'FAIL', 'ALL_REQUIRED_CASES')
++ (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+======================================================================
+FAIL: test_single_case_run_never_claims_acceptance_pass (native_baseline_goal03.ParserAndIsolationTests.test_single_case_run_never_claims_acceptance_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\.scratch\test-ablation\native-baseline-goal03.py", line 504, in test_single_case_run_never_claims_acceptance_pass
+    self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "PARTIAL_CASE_RUN"))
+AssertionError: Tuples differ: (0, 'FAIL', 'ALL_REQUIRED_CASES') != (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+First differing element 0:
+0
+1
+
+- (0, 'FAIL', 'ALL_REQUIRED_CASES')
++ (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.045s
+
+FAILED (failures=3)
+======================================================================
+FAIL: test_single_case_run_never_claims_acceptance_pass (scripts.tests.test_native_goal02_execution.PrivacyAndCliTests.test_single_case_run_never_claims_acceptance_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal02_execution.py", line 170, in test_single_case_run_never_claims_acceptance_pass
+    self.assertEqual((returncode, evidence["status"], code), (1, "FAIL", "PARTIAL_CASE_RUN"))
+AssertionError: Tuples differ: (0, 'FAIL', 'ALL_REQUIRED_CASES') != (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+First differing element 0:
+0
+1
+
+- (0, 'FAIL', 'ALL_REQUIRED_CASES')
++ (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+======================================================================
+FAIL: test_partial_case_counts_only_the_selected_observation (scripts.tests.test_native_goal07.EvidenceFinalizationTests.test_partial_case_counts_only_the_selected_observation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal07.py", line 684, in test_partial_case_counts_only_the_selected_observation
+    self.assertEqual((returncode, evidence["status"], reason), (1, "FAIL", "PARTIAL_CASE_RUN"))
+AssertionError: Tuples differ: (0, 'FAIL', 'ALL_REQUIRED_CASES') != (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+First differing element 0:
+0
+1
+
+- (0, 'FAIL', 'ALL_REQUIRED_CASES')
++ (1, 'FAIL', 'PARTIAL_CASE_RUN')
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.040s
+
+FAILED (failures=2)
+======================================================================
+FAIL: test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs (scripts.tests.test_native_goal02_execution.PrivacyAndCliTests.test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal02_execution.py", line 224, in test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs
+    self.assertFalse(roots[0].exists())
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs (native_baseline_goal03.ParserAndIsolationTests.test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\.scratch\test-ablation\native-baseline-goal03.py", line 562, in test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs
+    self.assertFalse(roots[0].exists())
+AssertionError: True is not false
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.056s
+
+FAILED (failures=2)
+======================================================================
+FAIL: test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs (scripts.tests.test_native_goal02_execution.PrivacyAndCliTests.test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal02_execution.py", line 224, in test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs
+    self.assertFalse(roots[0].exists())
+AssertionError: True is not false
+
+----------------------------------------------------------------------
+Ran 1 test in 0.038s
+
+FAILED (failures=1)
+======================================================================
+FAIL: test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs (scripts.tests.test_native_goal02_execution.PrivacyAndCliTests.test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal02_execution.py", line 227, in test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs
+    self.assertTrue(partial_args.debug_workdir.exists())
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs (native_baseline_goal03.ParserAndIsolationTests.test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\.scratch\test-ablation\native-baseline-goal03.py", line 565, in test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs
+    self.assertTrue(partial_args.debug_workdir.exists())
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.060s
+
+FAILED (failures=2)
+======================================================================
+FAIL: test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs (scripts.tests.test_native_goal02_execution.PrivacyAndCliTests.test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal02_execution.py", line 227, in test_run_lifecycle_cleans_success_and_keeps_failure_or_partial_workdirs
+    self.assertTrue(partial_args.debug_workdir.exists())
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 1 test in 0.047s
+
+FAILED (failures=1)
+----------------------------------------------------------------------
+Ran 2 tests in 0.069s
+
+OK
+======================================================================
+FAIL: test_native_run_plan_wires_each_required_case_to_its_scenario_in_order (scripts.tests.test_native_goal03.ParserAndIsolationTests.test_native_run_plan_wires_each_required_case_to_its_scenario_in_order)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal03.py", line 461, in test_native_run_plan_wires_each_required_case_to_its_scenario_in_order
+    self.assertEqual(
+AssertionError: Tuples differ: (<fun[24 chars]ario_new_paste at 0x000001DF6CFC89A0>, <functi[390 chars]CC0>) != (<fun[24 chars]ario_welcome at 0x000001DF6CFC8900>, <function[390 chars]CC0>)
+
+First differing element 0:
+<function Goal03Harness.scenario_new_paste at 0x000001DF6CFC89A0>
+<function Goal03Harness.scenario_welcome at 0x000001DF6CFC8900>
+
++ (<function Goal03Harness.scenario_welcome at 0x000001DF6CFC8900>,
+- (<function Goal03Harness.scenario_new_paste at 0x000001DF6CFC89A0>,
+? ^
+
++  <function Goal03Harness.scenario_new_paste at 0x000001DF6CFC89A0>,
+? ^
+
+-  <function Goal03Harness.scenario_welcome at 0x000001DF6CFC8900>,
+   <function Goal03Harness.scenario_save_create at 0x000001DF6CFC8A40>,
+   <function Goal03Harness.scenario_save_cancel_overwrite at 0x000001DF6CFC8AE0>,
+   <function Goal03Harness.scenario_sample at 0x000001DF6CFC8B80>,
+   <function Goal03Harness.scenario_recents at 0x000001DF6CFC8C20>,
+   <function Goal03Harness.scenario_cli at 0x000001DF6CFC8CC0>)
+
+----------------------------------------------------------------------
+Ran 1 test in 0.002s
+
+FAILED (failures=1)
+----------------------------------------------------------------------
+Ran 2 tests in 0.122s
+
+OK
+======================================================================
+FAIL: test_native_run_plan_wires_each_required_case_to_its_scenario_in_order (scripts.tests.test_native_goal03.ParserAndIsolationTests.test_native_run_plan_wires_each_required_case_to_its_scenario_in_order)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "Q:\repos\markturbo\scripts\tests\test_native_goal03.py", line 461, in test_native_run_plan_wires_each_required_case_to_its_scenario_in_order
+    self.assertEqual(
+AssertionError: Tuples differ: (<fun[406 chars]function Goal03Harness.scenario_welcome at 0x000001985D2B8900>) != (<fun[406 chars]function Goal03Harness.scenario_cli at 0x000001985D2B8CC0>)
+
+First differing element 6:
+<function Goal03Harness.scenario_welcome at 0x000001985D2B8900>
+<function Goal03Harness.scenario_cli at 0x000001985D2B8CC0>
+
+Diff is 687 characters long. Set self.maxDiff to None to see it.
+
+----------------------------------------------------------------------
+Ran 1 test in 0.002s
+
+FAILED (failures=1)

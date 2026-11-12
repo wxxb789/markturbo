@@ -1,0 +1,75 @@
+{
+  "schema": "markturbo-goal-07-revision-capture-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "corpus_artifact": {
+    "artifact_id": "AI-01",
+    "path": "evaluation/goal-01/snapshots/agent-instructions/repository-AGENTS.md",
+    "lens": "Agent instructions",
+    "sha256": "d2cfc86c0e5cd695b5bc11e1fa0d0ea336a28f57567815988dfbee22ae4ef725",
+    "byte_count": 3291,
+    "files": [
+      {
+        "path": "evaluation/goal-01/snapshots/agent-instructions/repository-AGENTS.md",
+        "sha256": "a986fe39a99098cadab3f114bf792e46752b42bc94a5bd0abb46a3d831f310ff",
+        "byte_count": 3291
+      }
+    ]
+  },
+  "request": {
+    "lens": "agent_instructions",
+    "scope": {
+      "kind": "document"
+    },
+    "source": {
+      "kind": "document",
+      "text": "# Agent instructions\n\nRead the relevant source before working:\n\n- `PRODUCT.md`: current owner-approved product contract and success thresholds.\n- `goals/`: ordered delivery goals and acceptance evidence.\n- `docs/architecture.md`: architecture and decisions.\n- `CONCEPTS.md`: project vocabulary.\n\nRead `docs/history/v0.1-product-direction.md` only when tracing the original\nimplementation brief. Its feature list is historical, not current product scope.\n\n`CLAUDE.md` links to this file. On Windows without symlink support it may contain\nonly `AGENTS.md`; read this file instead.\n\n## Workflow\n\n- Inspect relevant code and documentation first. Keep changes scoped and\n  preserve unrelated work.\n- For numbered product work, read the goal and its prerequisites. Its scope,\n  evidence, stop conditions, and next-goal boundary are binding; later goals do\n  not bypass earlier gates.\n- Keep each goal canonical. Link to it from tickets, plans, commits, and PRs\n  instead of duplicating it.\n- Update `CONCEPTS.md` only when project vocabulary changes.\n\n## Evidence and validation\n\n- Every reported number must come from a cited command or harness. State when it\n  was not measured.\n- Use `scripts/` for measurements; see `scripts/README.md`. Repeat performance\n  runs on this noisy machine and avoid concurrent release builds.\n- Consult `.scratch/perf-and-size/` before revisiting its recorded decisions.\n- Run `cargo fmt --all` once before committing.\n- Run `cargo clippy --workspace --all-targets`; add no warnings.\n- Run `cargo test --release --workspace` on a clean tree before pushing and\n  report the pass count. Let slow release builds finish.\n- Report validation that could not run and why.\n\n## Tests\n\n- Prove each regression test fails without the fix, then passes with it.\n- Explain every skip on stderr.\n- Source-scanning tests protect behavior requiring a real window, WebView2, or\n  GPU. Preserve equivalent coverage when moving named code.\n\n## Structural invariants\n\n- `mt-doc` has no GPUI dependency.\n- Keep `panic = \"unwind\"` so renderer panics become diagnostics. Retain the\n  allocation clamp in `vendor/ratex-parser`.\n- Never mutate the WebView from `render`. Set `web_dirty` and use `cx.defer`; see\n  `crates/mt-app/src/views/workspace/web_surface.rs`.\n- Content problems become diagnostics, not UI-level errors. Preserve the source\n  and keep broken documents editable.\n- Ship installable fonts beside the binary. Only the two GPUI-required fonts in\n  `assets.rs` are embedded; KaTeX fonts remain under `fonts/katex/`.\n\n## Dependencies\n\n- Prefer crates.io and read the workspace `Cargo.toml` comments before changing\n  dependencies or features.\n- `vendor/ratex-parser` is the only local patch; its README defines removal.\n- Dependencies sharing a git source must use the same source selector. This\n  applies to `gpui` and `gpui-component`.\n\n## Code and commits\n\n- Use English for code, comments, documentation, tickets, commits, and PRs.\n- Comments explain evidence, non-obvious behavior, failure prevention, or\n  rejected alternatives; omit code narration.\n- Use one bounded ticket and one commit. Name the user-visible impact in the\n  subject; put mechanism, evidence, and rejected alternatives in the body.\n- Product commits name the exact file under `goals/` they advance.\n",
+      "path": "evaluation/goal-01/snapshots/agent-instructions/repository-AGENTS.md"
+    },
+    "snapshot": {
+      "revision": 9,
+      "source_generation": 1
+    }
+  },
+  "review_output": {
+    "schema_version": "review-v1",
+    "scope": {
+      "kind": "document"
+    },
+    "understood_intent": {
+      "stated_goal": "Guide repository work through the current product contract, ordered goals, architecture, vocabulary, and measured validation.",
+      "relevant_context": [
+        "The instructions protect scoped changes, numbered-goal prerequisites, structural invariants, and evidence-backed reporting."
+      ],
+      "constraints": [
+        "Do not bypass earlier goal gates, mutate unrelated work, report unmeasured numbers, or weaken named structural invariants."
+      ],
+      "non_goals": [
+        "Do not duplicate canonical goal requirements into commits or PRs."
+      ],
+      "expected_deliverable": "A bounded repository change with exact validation evidence and preserved architecture constraints.",
+      "success_evidence": [
+        "The agent reports the exact commands that ran, the pass count, and every check that could not run."
+      ],
+      "inferred_assumptions": [],
+      "unresolved_decisions": [
+        "When a validation command cannot run, must the report name both that exact command and the concrete reason?"
+      ]
+    },
+    "findings": [],
+    "clarification_questions": [
+      {
+        "question": "When a validation command cannot run, must the report name both that exact command and the concrete reason?",
+        "priority": "high",
+        "impact": "The answer determines whether omitted validation can be mistaken for a passing gate."
+      }
+    ]
+  },
+  "answers": [
+    {
+      "state": "answered",
+      "answer": "Yes. Name each unavailable command and its concrete reason, and never describe an unrun check as passing."
+    }
+  ],
+  "raw_revision_response": "{\"schema_version\":\"revision-v1\",\"groups\":[{\"rationale\":\"Turn the answered evidence rule into an unambiguous reporting obligation.\",\"edits\":[{\"range\":{\"start\":3291,\"end\":3291},\"expected_source\":\"\",\"replacement\":\"\\n## Clarified unavailable-validation reporting\\n\\nEach unavailable validation must be reported by exact command and concrete reason. An unrun check must never be described as passing.\"}]}],\"question_coverage\":[{\"question_index\":0,\"question_id\":\"5556da11292a85240e9d3896f2cf0571415fd12cbd09fb7cd68bf0929143b8ca\",\"status\":{\"kind\":\"represented\",\"change_ids\":[0]}}]}"
+}

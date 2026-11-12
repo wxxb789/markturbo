@@ -27,8 +27,4 @@ Thumbs.db
 /.plans
 /.omo/
 
-# Scratch is disposable by default. Versioned performance evidence is an
-# explicit exception.
-/.scratch/*
-!/.scratch/perf-and-size/
-!/.scratch/perf-and-size/**
+# Acceptance and measured evidence is versioned under docs/evidence.

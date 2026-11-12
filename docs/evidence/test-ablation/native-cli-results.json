@@ -1,0 +1,467 @@
+[
+  {
+    "case_ids": [
+      "pointer-dirty-tab-close-cancel",
+      "sendinput-ctrl-w-discard",
+      "wm-close-save-exact-bytes",
+      "same-length-mtime-external-conflict",
+      "cjk-emoji-interruption-recovery-retirement"
+    ],
+    "case_reason_codes": [
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING"
+    ],
+    "case_statuses": [
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN"
+    ],
+    "command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-02",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-02.json"
+    ],
+    "evidence": "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-02.json",
+    "exit_code": 1,
+    "goal": "goal-02",
+    "normalized_receipt": {
+      "cases": [
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "pointer-dirty-tab-close-cancel",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "sendinput-ctrl-w-discard",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "wm-close-save-exact-bytes",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "same-length-mtime-external-conflict",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "cjk-emoji-interruption-recovery-retirement",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        }
+      ],
+      "environment": {},
+      "executable": {
+        "byte_count": null,
+        "copied_sha256": null,
+        "copy_hash_verified": false,
+        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "format": null,
+        "hash_verified": false,
+        "machine": null,
+        "sha256": null
+      },
+      "schema": "markturbo.goal-02-native-acceptance",
+      "schema_version": 1,
+      "status": "FAIL",
+      "summary": {
+        "blocked_case_count": 0,
+        "failed_case_count": 0,
+        "not_run_case_count": 5,
+        "passed_case_count": 0,
+        "required_case_count": 5
+      }
+    },
+    "status": "FAIL",
+    "stderr_outcome": "FAIL: EXECUTABLE_MISSING",
+    "summary": {
+      "blocked_case_count": 0,
+      "failed_case_count": 0,
+      "not_run_case_count": 5,
+      "passed_case_count": 0,
+      "required_case_count": 5
+    },
+    "transport_request_count": null
+  },
+  {
+    "case_ids": [
+      "welcome_no_argument",
+      "new_and_paste_unicode",
+      "save_as_create_and_reopen",
+      "save_as_cancel_and_overwrite",
+      "bundled_sample",
+      "recent_bound_restart_stale",
+      "explicit_cli_targets"
+    ],
+    "case_reason_codes": [
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING"
+    ],
+    "case_statuses": [
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN"
+    ],
+    "command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-03",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-03.json"
+    ],
+    "evidence": "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-03.json",
+    "exit_code": 1,
+    "goal": "goal-03",
+    "normalized_receipt": {
+      "cases": [
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "welcome_no_argument",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "new_and_paste_unicode",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "save_as_create_and_reopen",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "save_as_cancel_and_overwrite",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "bundled_sample",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "recent_bound_restart_stale",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "explicit_cli_targets",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        }
+      ],
+      "environment": {},
+      "executable": {
+        "byte_count": null,
+        "copied_sha256": null,
+        "copy_hash_verified": false,
+        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "format": null,
+        "hash_verified": false,
+        "machine": null,
+        "sha256": null
+      },
+      "schema": "markturbo.goal-03-native-acceptance",
+      "schema_version": 1,
+      "status": "FAIL",
+      "summary": {
+        "blocked_case_count": 0,
+        "failed_case_count": 0,
+        "not_run_case_count": 7,
+        "passed_case_count": 0,
+        "required_case_count": 7
+      }
+    },
+    "status": "FAIL",
+    "stderr_outcome": "FAIL: EXECUTABLE_MISSING",
+    "summary": {
+      "blocked_case_count": 0,
+      "failed_case_count": 0,
+      "not_run_case_count": 7,
+      "passed_case_count": 0,
+      "required_case_count": 7
+    },
+    "transport_request_count": null
+  },
+  {
+    "case_ids": [
+      "configured_provider_missing_credential_document",
+      "configured_provider_missing_credential_selection"
+    ],
+    "case_reason_codes": [
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING"
+    ],
+    "case_statuses": [
+      "NOT_RUN",
+      "NOT_RUN"
+    ],
+    "command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-06",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-06.json"
+    ],
+    "evidence": "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-06.json",
+    "exit_code": 1,
+    "goal": "goal-06",
+    "normalized_receipt": {
+      "cases": [
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "configured_provider_missing_credential_document",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "configured_provider_missing_credential_selection",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        }
+      ],
+      "environment": {},
+      "executable": {
+        "byte_count": null,
+        "copied_sha256": null,
+        "copy_hash_verified": false,
+        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "format": null,
+        "hash_verified": false,
+        "machine": null,
+        "sha256": null
+      },
+      "mode": "missing_credential_diagnostic",
+      "schema": "markturbo.goal-06-native-acceptance",
+      "schema_version": 1,
+      "status": "FAIL",
+      "summary": {
+        "blocked_case_count": 0,
+        "failed_case_count": 0,
+        "not_run_case_count": 2,
+        "passed_case_count": 0,
+        "required_case_count": 2
+      }
+    },
+    "status": "FAIL",
+    "stderr_outcome": "FAIL: EXECUTABLE_MISSING",
+    "summary": {
+      "blocked_case_count": 0,
+      "failed_case_count": 0,
+      "not_run_case_count": 2,
+      "passed_case_count": 0,
+      "required_case_count": 2
+    },
+    "transport_request_count": null
+  },
+  {
+    "case_ids": [
+      "reject_all_byte_identity",
+      "selective_apply_one_undo",
+      "accept_all_preview",
+      "stale_proposal_blocks_apply",
+      "safe_save_conflict",
+      "trusted_executable_apply_revokes_trust"
+    ],
+    "case_reason_codes": [
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING",
+      "EXECUTABLE_MISSING"
+    ],
+    "case_statuses": [
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN",
+      "NOT_RUN"
+    ],
+    "command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-07",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-07.json"
+    ],
+    "evidence": "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-goal-07.json",
+    "exit_code": 1,
+    "goal": "goal-07",
+    "normalized_receipt": {
+      "cases": [
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "reject_all_byte_identity",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "selective_apply_one_undo",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "accept_all_preview",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "stale_proposal_blocks_apply",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "safe_save_conflict",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        },
+        {
+          "duration_ms": null,
+          "failure_type": null,
+          "id": "trusted_executable_apply_revokes_trust",
+          "observations": {},
+          "reason_code": "EXECUTABLE_MISSING",
+          "status": "NOT_RUN"
+        }
+      ],
+      "environment": {},
+      "executable": {
+        "byte_count": null,
+        "copied_sha256": null,
+        "copy_hash_verified": false,
+        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "format": null,
+        "hash_verified": false,
+        "machine": null,
+        "machine_code": null,
+        "optional_magic": null,
+        "sha256": null
+      },
+      "schema": "markturbo.goal-07-native-acceptance",
+      "schema_version": 1,
+      "status": "FAIL",
+      "summary": {
+        "blocked_case_count": 0,
+        "failed_case_count": 0,
+        "not_run_case_count": 6,
+        "passed_case_count": 0,
+        "required_case_count": 6
+      },
+      "transport": {
+        "deterministic": true,
+        "mode": "keyless_loopback",
+        "provider": "openai-responses",
+        "request_count": 0
+      }
+    },
+    "status": "FAIL",
+    "stderr_outcome": "FAIL: EXECUTABLE_MISSING",
+    "summary": {
+      "blocked_case_count": 0,
+      "failed_case_count": 0,
+      "not_run_case_count": 6,
+      "passed_case_count": 0,
+      "required_case_count": 6
+    },
+    "transport_request_count": 0
+  }
+]

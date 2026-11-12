@@ -31,7 +31,7 @@ Commands below preserve the exact historical evidence. Use
 | `py -3 -m py_compile scripts/goal-03-native-acceptance.py scripts/test_goal_03_native_acceptance.py` | PASS |
 | `py -3 scripts/test_goal_03_native_acceptance.py` | 33 passed |
 | `py -3 scripts/test_platform_packaging.py` | 5 passed |
-| `.scratch/goal-03-native-acceptance-v1.json` | BLOCKED: `FOREGROUND_PERMISSION_DENIED`; no case ran against the listed executable hash |
+| `docs/evidence/goal-03-native-acceptance-v1.json` | BLOCKED: `FOREGROUND_PERMISSION_DENIED`; no case ran against the listed executable hash |
 | `target/release/markturbo.exe` | AMD64; 48,616,448 bytes; SHA-256 `7fa8e66808cd9e59561fd088dd153ec9e9634e331e534ff4bf0b964279e45524` |
 
 ## Post-review corrections

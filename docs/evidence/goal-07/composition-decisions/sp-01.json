@@ -1,0 +1,20 @@
+{
+  "schema": "markturbo-goal-07-owner-composition-v2",
+  "artifact_id": "SP-01",
+  "proposal_sha256": "ca246ad3ab0939d8c5394e586fd032037d7ea8edc867476d5970ac6b66def132",
+  "editable_source_sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776",
+  "editable_source_byte_count": 7714,
+  "source_binding_sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776",
+  "source_revision": 5,
+  "source_generation": 1,
+  "artifact_lens_sha256": "1bda48a40a6893c3ca20741c81aa6fb0e7d847546f7cb98c924cbdbaa6f68959",
+  "review_context_sha256": "b0c2167c1b3f5453a695015078ce97bf13a23e2f8b711d599e639d2ef49e10e4",
+  "answers_sha256": "b109d7e9484ba1883828e9d30a8bbed0bf2353325d322e63543141bc868f2cb0",
+  "decisions": [
+    {
+      "change_id": 0,
+      "accepted": true,
+      "intent_change_ids": []
+    }
+  ]
+}

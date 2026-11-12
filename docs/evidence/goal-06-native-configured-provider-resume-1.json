@@ -1,0 +1,140 @@
+{
+  "cases": [
+    {
+      "duration_ms": 10324.138,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_document",
+      "observations": {
+        "document_shortcut": true,
+        "editor_after": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "editor_before": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "flow": "configured provider with ephemeral credential -> document review -> explicit consent -> structured success",
+        "foreground_verified": true,
+        "no_dirty_interlock": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "review_consent_approved": true,
+        "runtime_scan": {
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 4,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "selection_shortcut": false,
+        "source_after": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "source_before": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "structured_success": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    },
+    {
+      "duration_ms": 7237.756,
+      "failure_type": null,
+      "id": "configured_provider_missing_credential_selection",
+      "observations": {
+        "document_shortcut": false,
+        "editor_after": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "editor_before": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "flow": "configured provider with ephemeral credential -> selection review -> explicit consent -> structured success",
+        "foreground_verified": true,
+        "no_dirty_interlock": true,
+        "process_context": {
+          "integrity": "medium",
+          "integrity_rid": 8192,
+          "session_id": 2
+        },
+        "review_consent_approved": true,
+        "runtime_scan": {
+          "app_logs_scanned": 1,
+          "config_files_scanned": 1,
+          "ephemeral_credential_utf16le_absent": true,
+          "ephemeral_credential_utf8_absent": true,
+          "files_scanned": 4,
+          "utf16le_sentinel_absent": true,
+          "utf8_sentinel_absent": true
+        },
+        "selection_shortcut": true,
+        "source_after": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "source_before": {
+          "byte_count": 98,
+          "sha256": "d4e42312050e9b127c70429978d4cfde316e95e1b1a24895123fc1959374b689"
+        },
+        "structured_success": true
+      },
+      "reason_code": null,
+      "status": "PASS"
+    }
+  ],
+  "completed_at_utc": "2026-09-09T03:56:51.593Z",
+  "environment": {
+    "active_console_session_id": 1,
+    "architecture": "x86_64",
+    "harness_is_console_session": false,
+    "harness_process": {
+      "integrity": "medium",
+      "integrity_rid": 8192,
+      "session_id": 2
+    },
+    "input_desktop": "Default",
+    "native_machine_code": 34404,
+    "platform": "Windows 11",
+    "python_pointer_bits": 64,
+    "thread_desktop": "Default",
+    "windows_build": 26200,
+    "windows_major": 10,
+    "windows_minor": 0,
+    "wts_state": "WTSActive"
+  },
+  "executable": {
+    "byte_count": 50076160,
+    "copied_sha256": "2458c7c075a317afa8743c719fb9504ac1ad123cea9a6380f65c5d13d3480964",
+    "copy_hash_verified": true,
+    "expected_sha256": "2458c7c075a317afa8743c719fb9504ac1ad123cea9a6380f65c5d13d3480964",
+    "format": "PE32+",
+    "hash_verified": true,
+    "machine": "x86_64",
+    "machine_code": 34404,
+    "optional_magic": 523,
+    "sha256": "2458c7c075a317afa8743c719fb9504ac1ad123cea9a6380f65c5d13d3480964"
+  },
+  "mode": "configured_provider_success",
+  "schema": "markturbo.goal-06-native-acceptance",
+  "schema_version": 1,
+  "started_at_utc": "2026-09-09T03:56:32.738Z",
+  "status": "PASS",
+  "summary": {
+    "blocked_case_count": 0,
+    "failed_case_count": 0,
+    "not_run_case_count": 0,
+    "passed_case_count": 2,
+    "required_case_count": 2
+  }
+}

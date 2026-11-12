@@ -1,0 +1,4 @@
+byte_identical=true
+original_bytes=3686
+refactored_bytes=3686
+EXIT_CODE=0

@@ -1,0 +1,668 @@
+{
+  "artifact_metadata": [
+    {
+      "artifact_id": "TP-01",
+      "byte_count": 626,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 626,
+          "path": "evaluation/goal-01/task-prompts/01-upgrade-gpui-without-regression.md",
+          "sha256": "e75055c10e684d4c92f5a4a5c63692ff481b26c5cf74590088c81d5ba3b89264"
+        }
+      ],
+      "lens": "Task prompt",
+      "path": "evaluation/goal-01/task-prompts/01-upgrade-gpui-without-regression.md",
+      "sha256": "302d3e24d3004953a7b4dabd9e8b916585c574f98c752044cee5aa06d24f4f08"
+    },
+    {
+      "artifact_id": "TP-02",
+      "byte_count": 476,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 476,
+          "path": "evaluation/goal-01/task-prompts/02-keep-web-preview-in-one-window.md",
+          "sha256": "bb58f6d1e14fd2b861176e162c108ec86711f73f843a746d0b49c9f77909b502"
+        }
+      ],
+      "lens": "Task prompt",
+      "path": "evaluation/goal-01/task-prompts/02-keep-web-preview-in-one-window.md",
+      "sha256": "0a2aef34caa32d502d602fe0c0269088053616d7313c51a1793026a3721d8c41"
+    },
+    {
+      "artifact_id": "TP-03",
+      "byte_count": 573,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 573,
+          "path": "evaluation/goal-01/task-prompts/03-diagnose-duplicate-git-crates.md",
+          "sha256": "7344bc999e91ec0c8472c557d4261c19e5cd02fe7b3801d47c06b3cfdd9755d1"
+        }
+      ],
+      "lens": "Task prompt",
+      "path": "evaluation/goal-01/task-prompts/03-diagnose-duplicate-git-crates.md",
+      "sha256": "bc19915c16461dcdee484a4cffc76c183b5fe9bedec214901b08e7c2f7a9ae58"
+    },
+    {
+      "artifact_id": "TP-04",
+      "byte_count": 441,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 441,
+          "path": "evaluation/goal-01/task-prompts/04-measure-release-profile-on-quiet-host.md",
+          "sha256": "5740bf9a3cf4efa87bbf88802d345cba43482afa66daf38078c5c6635312625e"
+        }
+      ],
+      "lens": "Task prompt",
+      "path": "evaluation/goal-01/task-prompts/04-measure-release-profile-on-quiet-host.md",
+      "sha256": "40e155b251959f1840d23c030625383b8167b42d9534d790c9b0ad7c68bc670a"
+    },
+    {
+      "artifact_id": "SP-01",
+      "byte_count": 7714,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 7714,
+          "path": "evaluation/goal-01/snapshots/goals/02-guarantee-user-text-safety.md",
+          "sha256": "5a096ee80ebc9996e7d9c7a47fd6645504266413d5de6fca8bd967298e244776"
+        }
+      ],
+      "lens": "Specification / plan",
+      "path": "evaluation/goal-01/snapshots/goals/02-guarantee-user-text-safety.md",
+      "sha256": "bd94f5b4e3f1d77163e4b103918fb0e75d9004a783d469edd5806ead46b6e2c1"
+    },
+    {
+      "artifact_id": "SP-02",
+      "byte_count": 4813,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 4813,
+          "path": "evaluation/goal-01/snapshots/goals/03-create-first-use-document-flow.md",
+          "sha256": "952a813707aa899575af60924152bf49de91177cb302a12c67457bc13ae36e59"
+        }
+      ],
+      "lens": "Specification / plan",
+      "path": "evaluation/goal-01/snapshots/goals/03-create-first-use-document-flow.md",
+      "sha256": "c4ad80b8240cdc7986fa46c54b627bb4ac43dced9934e5e8c98d28bfb53b8608"
+    },
+    {
+      "artifact_id": "SP-03",
+      "byte_count": 9331,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 9331,
+          "path": "evaluation/goal-01/snapshots/goals/05a-protect-model-credentials-and-request-privacy.md",
+          "sha256": "40ebda30be68ab46e18cfb51308540acb26da72ca3673ddbb1c3d28fb51b6890"
+        }
+      ],
+      "lens": "Specification / plan",
+      "path": "evaluation/goal-01/snapshots/goals/05a-protect-model-credentials-and-request-privacy.md",
+      "sha256": "d5a2e6ac96ebbb7d31130ca014b6bbdd5364ae910c423f318277632d33e6d88b"
+    },
+    {
+      "artifact_id": "SP-04",
+      "byte_count": 9014,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 9014,
+          "path": "evaluation/goal-01/snapshots/goals/06-deliver-read-only-intent-review.md",
+          "sha256": "49293b1d59ec23b7c5253acaa6021c818f1e94e6c3a6f2a987bbfb915549f89e"
+        }
+      ],
+      "lens": "Specification / plan",
+      "path": "evaluation/goal-01/snapshots/goals/06-deliver-read-only-intent-review.md",
+      "sha256": "6dc46d0821d27572dd4fbd857525c5e6437b446820b2885dfdfab19ee170615d"
+    },
+    {
+      "artifact_id": "AI-01",
+      "byte_count": 3291,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 3291,
+          "path": "evaluation/goal-01/snapshots/agent-instructions/repository-AGENTS.md",
+          "sha256": "a986fe39a99098cadab3f114bf792e46752b42bc94a5bd0abb46a3d831f310ff"
+        }
+      ],
+      "lens": "Agent instructions",
+      "path": "evaluation/goal-01/snapshots/agent-instructions/repository-AGENTS.md",
+      "sha256": "d2cfc86c0e5cd695b5bc11e1fa0d0ea336a28f57567815988dfbee22ae4ef725"
+    },
+    {
+      "artifact_id": "AI-02",
+      "byte_count": 1082,
+      "file_count": 1,
+      "files": [
+        {
+          "byte_count": 1082,
+          "path": "evaluation/goal-01/snapshots/agent-instructions/sample-workspace-AGENTS.md",
+          "sha256": "bd37088139ca2a628326776c42f27c2c00453dc7304c562e59e9645d91d64a05"
+        }
+      ],
+      "lens": "Agent instructions",
+      "path": "evaluation/goal-01/snapshots/agent-instructions/sample-workspace-AGENTS.md",
+      "sha256": "d862bf86c7e9e8e6793e0406c488ea37b182f08f075c8847144da9646bc96484"
+    },
+    {
+      "artifact_id": "AS-01",
+      "byte_count": 201410,
+      "file_count": 23,
+      "files": [
+        {
+          "byte_count": 3091,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/SKILL.md",
+          "sha256": "fadc5bfcf4d0511c523eaa967cd3bd3954488cf27efe30b893f69f40463918e0"
+        },
+        {
+          "byte_count": 3775,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/action.md",
+          "sha256": "52016b736dc2d15e9859dd4b79fa47c570097e649e7bc728c6a7b99c0916fcf1"
+        },
+        {
+          "byte_count": 6158,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/async.md",
+          "sha256": "9f4f24b8e156a4424094c22458ba480ccd69b3de10b08a93197384326af9979b"
+        },
+        {
+          "byte_count": 6254,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/context.md",
+          "sha256": "dd5a89e9c58c71655aafeb16ae72f7f3371d39e414a92c3c889a1117c23ce075"
+        },
+        {
+          "byte_count": 20530,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/element-advanced.md",
+          "sha256": "008b71c775bbf174af091314ed6f9af2dd5edd20ab8042b731e7b979074e3ba6"
+        },
+        {
+          "byte_count": 11279,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/element-api.md",
+          "sha256": "769cc2e10160c6c28666e3ffda394eec226354c5f126407b0dd600319895be8f"
+        },
+        {
+          "byte_count": 13476,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/element-best-practices.md",
+          "sha256": "8789fb5fabb43a8290348cf068b7bcd363536106e08c07a63a87f865c58fcf92"
+        },
+        {
+          "byte_count": 18087,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/element-examples.md",
+          "sha256": "1763b92912a180fe7fc2af36dc62cadc555d46655c28b6ad69884e4ad06db580"
+        },
+        {
+          "byte_count": 2433,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/element-id.md",
+          "sha256": "3a976f0055fdaf39d05894a867b7df6cab291709c30a840d0fc87d2243598e2d"
+        },
+        {
+          "byte_count": 15041,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/element-patterns.md",
+          "sha256": "4f7f23af5a402b462e24055631ff31ea76c4fa4d98c0e01aab72d75ed106cc62"
+        },
+        {
+          "byte_count": 3796,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/element.md",
+          "sha256": "401e8d970981951287c3c7a56e6dfed2fa440efee2237fd5ac175e4a27fd2fac"
+        },
+        {
+          "byte_count": 12924,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/entity-advanced.md",
+          "sha256": "9c566a9f494e52a93653dcccb706b59e3853d02ba5ff9a6ece1d804ec8e4d9f2"
+        },
+        {
+          "byte_count": 8739,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/entity-api.md",
+          "sha256": "70fdce9314e06643012afa42df742489fd50e5abaa3aaa659f9a5d4e67712867"
+        },
+        {
+          "byte_count": 15083,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/entity-best-practices.md",
+          "sha256": "47c3d0dbf77b3d53582df32382d3d1ae9f93d6f958428b89d5b5de909d64e876"
+        },
+        {
+          "byte_count": 13209,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/entity-patterns.md",
+          "sha256": "f595d9ee8d7f6eb9b6e4bb8dee9f490745ad9d4013cae9f8905a945d9d2cfee8"
+        },
+        {
+          "byte_count": 7413,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/entity.md",
+          "sha256": "ed95e14711447b1d34c579ee9752ad1de7d50fa305092478e109b7e22bd4ab5f"
+        },
+        {
+          "byte_count": 5714,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/event.md",
+          "sha256": "e057203adad925e1fcd853c9590092e8bebf3e16b0efd148f7f49f8655fe7f47"
+        },
+        {
+          "byte_count": 5048,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/focus-handle.md",
+          "sha256": "4a60a37387f0d3df4a8839b1264d5a93de7f4549b96e86a8920d24c33780da47"
+        },
+        {
+          "byte_count": 3943,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/global.md",
+          "sha256": "67a3065c253f3d0fc4e15765adad870b6ef41d0623846d165a2be044270036a8"
+        },
+        {
+          "byte_count": 6387,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/layout-style.md",
+          "sha256": "457c43fded2d4fac7740ab036068dc6f4fd4168b8bbcf333af24dc4602280d3a"
+        },
+        {
+          "byte_count": 3351,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/test-examples.md",
+          "sha256": "412dc4be52dcb9b001ceed51cf7def2657f0d06e319d0be1ee6e66daa16bc2a3"
+        },
+        {
+          "byte_count": 13353,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/test-reference.md",
+          "sha256": "0a9983bdaa13987c226a47f88d6ca157a9c7cf1de9d20f389a36a162e61b1d63"
+        },
+        {
+          "byte_count": 2326,
+          "path": "evaluation/goal-01/snapshots/skills/gpui/references/test.md",
+          "sha256": "fceaab0feada6ec60aac753a040bb6168e060fbfd7c6d107955d254131eca540"
+        }
+      ],
+      "lens": "Agent Skill",
+      "path": "evaluation/goal-01/snapshots/skills/gpui",
+      "sha256": "7f4da57edf4797c9a965efdfd9fe687350c28d462dd728f92dc141aa7146b2b1"
+    },
+    {
+      "artifact_id": "AS-02",
+      "byte_count": 116555,
+      "file_count": 5,
+      "files": [
+        {
+          "byte_count": 8682,
+          "path": "evaluation/goal-01/snapshots/skills/gpui-component/SKILL.md",
+          "sha256": "2902632900ca8df7411006ce7fad30cca38a7b54771a8bfd87850365173cc542"
+        },
+        {
+          "byte_count": 41010,
+          "path": "evaluation/goal-01/snapshots/skills/gpui-component/references/coding-guides.md",
+          "sha256": "e665d0b76fa5add58cd6b678a092fcfaaaa2fb292497d017fe209e905186c605"
+        },
+        {
+          "byte_count": 47131,
+          "path": "evaluation/goal-01/snapshots/skills/gpui-component/references/design-guides.md",
+          "sha256": "2fc9dafa8f3b85ec7a79a0ea4a4f9a42b48460c864c0a7825dc55619c598ee42"
+        },
+        {
+          "byte_count": 9485,
+          "path": "evaluation/goal-01/snapshots/skills/gpui-component/references/style-guide.md",
+          "sha256": "c1d06b5f131906f91fe01ec05823c849cf68b37788384131963d76e1c0a3001f"
+        },
+        {
+          "byte_count": 10247,
+          "path": "evaluation/goal-01/snapshots/skills/gpui-component/references/usage.md",
+          "sha256": "ed8545325197ffdb0b421f7ab9a7fbbadda8e44277f3c338fa89bd571102a401"
+        }
+      ],
+      "lens": "Agent Skill",
+      "path": "evaluation/goal-01/snapshots/skills/gpui-component",
+      "sha256": "a8bf153ef556cf514e9255476acfdc9364164d3425224480b96e7bdd46793fbc"
+    }
+  ],
+  "configuration": {
+    "agent_actions": false,
+    "browsing": false,
+    "memory": false,
+    "model_requested": "gpt-5.6-terra",
+    "prompt_version": "review-v1",
+    "provider_wire_format": "openai-responses",
+    "reasoning_effort": "medium",
+    "sampling": "provider-defaults-omitted",
+    "tools": false
+  },
+  "corpus": {
+    "artifact_count": 12,
+    "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+    "version": "goal-01-v1"
+  },
+  "created_at": "2026-09-08T17:43:56Z",
+  "evaluation": {
+    "contract_reference": "PRODUCT.md#review-evaluation-contract",
+    "decoded_complete_count": 12,
+    "eligible_for_threshold": true,
+    "false_source_anchor_count": 0,
+    "materially_misleading_count": 0,
+    "max_question_count": 5,
+    "status": "recorded",
+    "surfaced_item_count": 47,
+    "surfaced_item_ids": [
+      "AI-01-HI-01",
+      "AI-01-HI-02",
+      "AI-01-HI-03",
+      "AI-01-HI-04",
+      "AI-01-HI-05",
+      "AI-01-HI-06",
+      "AI-01-HI-07",
+      "AI-02-HI-01",
+      "AI-02-HI-02",
+      "AI-02-HI-03",
+      "AI-02-HI-04",
+      "AS-02-HI-01",
+      "AS-02-HI-02",
+      "AS-02-HI-04",
+      "SP-01-HI-01",
+      "SP-01-HI-02",
+      "SP-01-HI-03",
+      "SP-01-HI-04",
+      "SP-01-HI-05",
+      "SP-01-HI-06",
+      "SP-02-HI-01",
+      "SP-02-HI-02",
+      "SP-02-HI-03",
+      "SP-02-HI-04",
+      "SP-02-HI-05",
+      "SP-03-HI-02",
+      "SP-03-HI-03",
+      "SP-03-HI-04",
+      "SP-03-HI-05",
+      "SP-03-HI-06",
+      "SP-04-HI-01",
+      "SP-04-HI-02",
+      "SP-04-HI-03",
+      "SP-04-HI-04",
+      "SP-04-HI-05",
+      "SP-04-HI-06",
+      "SP-04-HI-07",
+      "SP-04-HI-08",
+      "TP-01-HI-01",
+      "TP-01-HI-02",
+      "TP-02-HI-01",
+      "TP-02-HI-02",
+      "TP-02-HI-03",
+      "TP-03-HI-02",
+      "TP-04-HI-01",
+      "TP-04-HI-02",
+      "TP-04-HI-03"
+    ],
+    "useful_count": 12
+  },
+  "results": [
+    {
+      "artifact_byte_count": 626,
+      "artifact_id": "TP-01",
+      "artifact_sha256": "302d3e24d3004953a7b4dabd9e8b916585c574f98c752044cee5aa06d24f4f08",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 3,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "TP-01-HI-01",
+        "TP-01-HI-02"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 476,
+      "artifact_id": "TP-02",
+      "artifact_sha256": "0a2aef34caa32d502d602fe0c0269088053616d7313c51a1793026a3721d8c41",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 3,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "TP-02-HI-01",
+        "TP-02-HI-02",
+        "TP-02-HI-03"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 573,
+      "artifact_id": "TP-03",
+      "artifact_sha256": "bc19915c16461dcdee484a4cffc76c183b5fe9bedec214901b08e7c2f7a9ae58",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 0,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "TP-03-HI-02"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 441,
+      "artifact_id": "TP-04",
+      "artifact_sha256": "40e155b251959f1840d23c030625383b8167b42d9534d790c9b0ad7c68bc670a",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 3,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "TP-04-HI-01",
+        "TP-04-HI-02",
+        "TP-04-HI-03"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 7714,
+      "artifact_id": "SP-01",
+      "artifact_sha256": "bd94f5b4e3f1d77163e4b103918fb0e75d9004a783d469edd5806ead46b6e2c1",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 5,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "SP-01-HI-01",
+        "SP-01-HI-02",
+        "SP-01-HI-03",
+        "SP-01-HI-04",
+        "SP-01-HI-05",
+        "SP-01-HI-06"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 4813,
+      "artifact_id": "SP-02",
+      "artifact_sha256": "c4ad80b8240cdc7986fa46c54b627bb4ac43dced9934e5e8c98d28bfb53b8608",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 5,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "SP-02-HI-01",
+        "SP-02-HI-02",
+        "SP-02-HI-03",
+        "SP-02-HI-04",
+        "SP-02-HI-05"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 9331,
+      "artifact_id": "SP-03",
+      "artifact_sha256": "d5a2e6ac96ebbb7d31130ca014b6bbdd5364ae910c423f318277632d33e6d88b",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 5,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "SP-03-HI-02",
+        "SP-03-HI-03",
+        "SP-03-HI-04",
+        "SP-03-HI-05",
+        "SP-03-HI-06"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 9014,
+      "artifact_id": "SP-04",
+      "artifact_sha256": "6dc46d0821d27572dd4fbd857525c5e6437b446820b2885dfdfab19ee170615d",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 4,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "SP-04-HI-01",
+        "SP-04-HI-02",
+        "SP-04-HI-03",
+        "SP-04-HI-04",
+        "SP-04-HI-05",
+        "SP-04-HI-06",
+        "SP-04-HI-07",
+        "SP-04-HI-08"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 3291,
+      "artifact_id": "AI-01",
+      "artifact_sha256": "d2cfc86c0e5cd695b5bc11e1fa0d0ea336a28f57567815988dfbee22ae4ef725",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 3,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "AI-01-HI-01",
+        "AI-01-HI-02",
+        "AI-01-HI-03",
+        "AI-01-HI-04",
+        "AI-01-HI-05",
+        "AI-01-HI-06",
+        "AI-01-HI-07"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 1082,
+      "artifact_id": "AI-02",
+      "artifact_sha256": "d862bf86c7e9e8e6793e0406c488ea37b182f08f075c8847144da9646bc96484",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 1,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "AI-02-HI-01",
+        "AI-02-HI-02",
+        "AI-02-HI-03",
+        "AI-02-HI-04"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 201410,
+      "artifact_id": "AS-01",
+      "artifact_sha256": "7f4da57edf4797c9a965efdfd9fe687350c28d462dd728f92dc141aa7146b2b1",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 2,
+      "status": "recorded",
+      "surfaced_item_ids": [],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    },
+    {
+      "artifact_byte_count": 116555,
+      "artifact_id": "AS-02",
+      "artifact_sha256": "a8bf153ef556cf514e9255476acfdc9364164d3425224480b96e7bdd46793fbc",
+      "boilerplate_question_count": 0,
+      "corpus_version": "goal-01-v1",
+      "decoded_completely": true,
+      "false_source_anchor_count": 0,
+      "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+      "materially_misleading": false,
+      "model_reported_id": "gpt-5.6-terra",
+      "question_count": 3,
+      "status": "recorded",
+      "surfaced_item_ids": [
+        "AS-02-HI-01",
+        "AS-02-HI-02",
+        "AS-02-HI-04"
+      ],
+      "unsupported_claim_count": 0,
+      "unsupported_claim_ids": [],
+      "usefulness": "useful"
+    }
+  ],
+  "schema": "markturbo-goal-06-evaluation-v1"
+}

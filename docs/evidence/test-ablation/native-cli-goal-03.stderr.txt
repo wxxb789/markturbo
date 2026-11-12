@@ -1,0 +1,2 @@
+FAIL: EXECUTABLE_MISSING
+evidence: Q:\repos\markturbo\.scratch\test-ablation\native-cli-goal-03.json

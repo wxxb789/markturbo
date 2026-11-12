@@ -1,0 +1,104 @@
+{
+  "schema": "markturbo-goal-07-eligibility-v2",
+  "corpus_version": "goal-01-v1",
+  "manifest_sha256": "290a0421753974dabb0cef1552f158cba4ddf2cafd3d91f0ea256d406f561f7c",
+  "owner_annotations_sha256": "502a905db10be764d49344f3528eff238d5813d47a330bee628b61060ccec0ae",
+  "cases": [
+    {
+      "artifact_id": "TP-01",
+      "eligible": true,
+      "material_question_ids": [
+        "726d2bf0059d2caa0ff0fcc3758bb07cd96fe622bd21a40a92de11681301cc94"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "TP-02",
+      "eligible": true,
+      "material_question_ids": [
+        "b7da054e7c18bf8fb5ceca081fac3d0e5fd3fd444e358aecee93c79db9e6d931"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "TP-03",
+      "eligible": true,
+      "material_question_ids": [
+        "4c8014a9c444d441f2ded21290fdca4645624026f550de9e9c095617b7d8f19c"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "TP-04",
+      "eligible": true,
+      "material_question_ids": [
+        "06cab0d8e2ba2357beb77e2f2c95d1338d962747dd7fc581f9e51c8bb1b60324"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "SP-01",
+      "eligible": true,
+      "material_question_ids": [
+        "7756b0d85a319d3a3373e5b8af110070f3c0645951900f1e20c5f34dd35ee4f9"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "SP-02",
+      "eligible": true,
+      "material_question_ids": [
+        "94a3e94af368c27c3109a5337a9975bfeaa11b1d9b1fa2fd9a874633084522c9"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "SP-03",
+      "eligible": true,
+      "material_question_ids": [
+        "86d3800336163960fc981d6c0b92727376ebd8211982b75f801c42b9f79af4a1"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "SP-04",
+      "eligible": true,
+      "material_question_ids": [
+        "cf8e2c515fc21ad8eef7487fc39a83994bf70ec2c4e17da6b2f269a527a8d636"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "AI-01",
+      "eligible": true,
+      "material_question_ids": [
+        "5556da11292a85240e9d3896f2cf0571415fd12cbd09fb7cd68bf0929143b8ca"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "AI-02",
+      "eligible": true,
+      "material_question_ids": [
+        "0da6f5db48a399ed5cac15ed183fac45a33f0302409d4d88404d8fc5910a906a"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "AS-01",
+      "eligible": true,
+      "material_question_ids": [
+        "1818758dac1a327d8b38b96e374ac2ebbfe95c134f99c1d90e11e1387a7a85df"
+      ],
+      "intent_violating_change_ids": []
+    },
+    {
+      "artifact_id": "AS-02",
+      "eligible": true,
+      "material_question_ids": [
+        "6728d53bfb241ff262fdbdcd8772222188a302cf316c0de9603a0d387840fad6"
+      ],
+      "intent_violating_change_ids": []
+    }
+  ]
+}

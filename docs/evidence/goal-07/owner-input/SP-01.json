@@ -1,0 +1,21 @@
+{
+  "artifact_id": "SP-01",
+  "change_decisions": [
+    {
+      "change_id": "SP-01-CH-01",
+      "decision": "accept"
+    }
+  ],
+  "intent_judgment": "preserved",
+  "question_coverage": [
+    {
+      "question_id": "7756b0d85a319d3a3373e5b8af110070f3c0645951900f1e20c5f34dd35ee4f9",
+      "status": "represented"
+    }
+  ],
+  "clearer_due_to_answered_question": false,
+  "approved_output_sha256": "625bd5189e60f26973e0e6e8677b53751ef7a977ffc4a0e7cc686666cbc857d2",
+  "approved_proposal_sha256": "ca246ad3ab0939d8c5394e586fd032037d7ea8edc867476d5970ac6b66def132",
+  "approved_decision_set_sha256": "df54400664c72d1ede5da3b0ae0cb2b5bd2f76ecd0447d83d85428257ace7b3f",
+  "approved_decision_file_sha256": "4d997640268200cc1ffc6ad5dc33fd5274fac6fd2a448a392c294fdf4900e891"
+}

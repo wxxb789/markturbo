@@ -1,0 +1,110 @@
+[
+  {
+    "ablated_exit_code": 1,
+    "content_free_observations": true,
+    "exact_case_ids_equal": true,
+    "exact_reason_codes_equal": true,
+    "goal": "goal-02",
+    "goal07_request_count": null,
+    "normalized_receipts_equal": true,
+    "reference_command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-02",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-reference-goal-02.json"
+    ],
+    "reference_exit_code": 1,
+    "utc_fields_removed": [
+      "started_at_utc",
+      "completed_at_utc"
+    ]
+  },
+  {
+    "ablated_exit_code": 1,
+    "content_free_observations": true,
+    "exact_case_ids_equal": true,
+    "exact_reason_codes_equal": true,
+    "goal": "goal-03",
+    "goal07_request_count": null,
+    "normalized_receipts_equal": true,
+    "reference_command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-03",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-reference-goal-03.json"
+    ],
+    "reference_exit_code": 1,
+    "utc_fields_removed": [
+      "started_at_utc",
+      "completed_at_utc"
+    ]
+  },
+  {
+    "ablated_exit_code": 1,
+    "content_free_observations": true,
+    "exact_case_ids_equal": true,
+    "exact_reason_codes_equal": true,
+    "goal": "goal-06",
+    "goal07_request_count": null,
+    "normalized_receipts_equal": true,
+    "reference_command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-06",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-reference-goal-06.json"
+    ],
+    "reference_exit_code": 1,
+    "utc_fields_removed": [
+      "started_at_utc",
+      "completed_at_utc"
+    ]
+  },
+  {
+    "ablated_exit_code": 1,
+    "content_free_observations": true,
+    "exact_case_ids_equal": true,
+    "exact_reason_codes_equal": true,
+    "goal": "goal-07",
+    "goal07_request_count": 0,
+    "normalized_receipts_equal": true,
+    "reference_command": [
+      "C:\\ProgramData\\Tools\\Python\\3.12.10\\x64\\python.exe",
+      "scripts/mt.py",
+      "accept",
+      "goal-07",
+      "--",
+      "--exe",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\nonexistent-native.exe",
+      "--expect-exe-sha256",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "--evidence",
+      "Q:\\repos\\markturbo\\.scratch\\test-ablation\\native-cli-reference-goal-07.json"
+    ],
+    "reference_exit_code": 1,
+    "utc_fields_removed": [
+      "started_at_utc",
+      "completed_at_utc"
+    ]
+  }
+]
