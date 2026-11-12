@@ -39,6 +39,7 @@ TOOLING_TESTS = (
     "scripts.tests.test_perf_fixtures",
     "scripts.tests.test_recovery_capacity",
     "scripts.tests.test_probe",
+    "scripts.tests.test_native_visual",
 )
 
 # Native harness unit tests describe a Windows automation path that does not run

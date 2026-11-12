@@ -8,6 +8,8 @@ uv run --project scripts scripts/mt.py <command>
 
 `scripts/pyproject.toml` declares the small Python environment used by the
 tooling, and `scripts/uv.lock` pins its complete resolved dependency graph.
+Pillow is installed on every platform for the portable visual-matrix tests;
+`pywinauto` remains Windows-only for native automation.
 
 ## Validation
 
@@ -71,10 +73,13 @@ uv run --project scripts scripts/mt.py accept goal-02 -- --help
 uv run --project scripts scripts/mt.py accept goal-03 -- --help
 uv run --project scripts scripts/mt.py accept goal-06 -- --help
 uv run --project scripts scripts/mt.py accept goal-07 -- --help
+uv run --project scripts scripts/mt.py visual -- --help
 ```
 
-`icons` regenerates the platform icon outputs. `fixtures` deterministically
-regenerates committed performance fixtures. `probe` measures a real Windows
+`visual` captures the Goal 09 release-build state matrix on Windows; see
+[verification](../docs/verification.md). `icons` regenerates the platform icon
+outputs. `fixtures` deterministically regenerates committed performance
+fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence.

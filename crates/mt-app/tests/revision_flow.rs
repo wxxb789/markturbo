@@ -99,7 +99,7 @@ fn review_then_revision_applies_only_approved_change() {
     app.press("text:Review").expect("start review");
     app.wait_for("text:Send").expect("review disclosure");
     app.press("text:Send").expect("send review");
-    app.wait_for_within("text:Ready", Duration::from_secs(20))
+    app.wait_for_within("text:Review ready", Duration::from_secs(20))
         .expect("review ready");
 
     app.press("text:Prepare revision")
