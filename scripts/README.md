@@ -8,6 +8,8 @@ uv run --project scripts scripts/mt.py <command>
 
 `scripts/pyproject.toml` declares the small Python environment used by the
 tooling, and `scripts/uv.lock` pins its complete resolved dependency graph.
+Pillow is installed on every platform for the portable visual-matrix tests;
+`pywinauto` remains Windows-only for native automation.
 
 ## Validation
 
