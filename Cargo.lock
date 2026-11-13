@@ -3142,6 +3142,7 @@ dependencies = [
  "dirs",
  "encoding_rs",
  "env_logger",
+ "log",
  "markdown",
  "mt-core",
  "nsh-base",

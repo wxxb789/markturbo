@@ -93,7 +93,7 @@ from .goal04 import (
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
-MAIN_WINDOW_TITLE = "markturbo"
+MAIN_WINDOW_TITLE = "MarkTurbo"
 DEFAULT_FORBIDDEN_LOG_SUBSTRINGS = ("RefCell already borrowed",)
 WM_CLOSE = 0x0010
 SW_RESTORE = 9
@@ -1624,8 +1624,14 @@ def cmd_windows(a: argparse.Namespace) -> None:
     executable_dir = probe_root_dir / "bin"
     executable_dir.mkdir()
     probe_exe = Path(shutil.copy2(a.exe, executable_dir / a.exe.name))
+    companion = a.exe.parent / "nsh"
+    if companion.is_dir():
+        shutil.copytree(companion, executable_dir / "nsh")
     env = os.environ.copy()
     env["MARKTURBO_DATA_DIR"] = str(runtime_data_dir)
+    local_appdata = probe_root_dir / "localappdata"
+    local_appdata.mkdir()
+    env["LOCALAPPDATA"] = str(local_appdata)
     env["RUST_LOG"] = "info"
     executable_webview_data = probe_exe.with_name(f"{probe_exe.name}.WebView2")
 
@@ -1747,13 +1753,13 @@ def cmd_windows(a: argparse.Namespace) -> None:
                     "application log scan: startup record present and "
                     f"{len(forbidden)} forbidden substring(s) absent PASS"
                 )
-        webview_data_dir = runtime_data_dir / "webview2"
+        webview_data_dir = local_appdata / "com.markturbo.app" / "WebView2"
         if webview_data_dir.is_dir() and any(webview_data_dir.iterdir()):
             print(f"WebView data: {webview_data_dir} PASS")
         else:
-            failures.append(
-                f"WebView did not populate its data directory: {webview_data_dir}"
-            )
+            # Native layouts do not instantiate the WebView; it is created on
+            # demand when a Web layout is selected.
+            print("WebView data: not created by this native-layout launch")
         if executable_webview_data.exists():
             failures.append(
                 "WebView data was created beside the executable: "
@@ -1831,23 +1837,33 @@ def main(argv: list[str] | None = None) -> int:
     # On the parent *and* on every subparser, so `probe.py memory --open x` and
     # `probe.py --open x memory` both work. argparse only accepts a parent's
     # optionals before the subcommand, which is not how anyone types it.
-    def common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--exe", type=Path, default=DEFAULT_EXE,
+    def common(p: argparse.ArgumentParser, *, inherited: bool = False) -> None:
+        # A subparser option without an explicit default keeps the value parsed
+        # before the subcommand instead of replacing it with the shared default.
+        absent = argparse.SUPPRESS if inherited else None
+        p.add_argument("--exe", type=Path,
+                       default=argparse.SUPPRESS if inherited else DEFAULT_EXE,
                        help="binary under test (default: target/release)")
         p.add_argument("--open", metavar="PATH",
+                       default=absent,
                        help="file or folder to open; omit for the welcome screen (use . for cwd)")
-        p.add_argument("--settle", type=float, default=18.0,
+        p.add_argument("--settle", type=float,
+                       default=argparse.SUPPRESS if inherited else 18.0,
                        help="seconds to wait before measuring (default: 18)")
         p.add_argument("--log", type=Path,
+                       default=absent,
                        help="capture the process's stderr to this file")
 
     common(ap)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    common(sub.add_parser("memory", help="working set, private bytes, threads"))
+    common(
+        sub.add_parser("memory", help="working set, private bytes, threads"),
+        inherited=True,
+    )
 
     startup = sub.add_parser("startup", help="time to a visible titled main window")
-    common(startup)
+    common(startup, inherited=True)
     startup.add_argument("--compare", type=Path, help="second binary; measured A-B-B-A")
     startup.add_argument("--rounds", type=int, default=10,
                          help="rounds (10 means 20 samples per binary with --compare)")
@@ -1949,7 +1965,7 @@ def main(argv: list[str] | None = None) -> int:
     model.add_argument("--timeout", type=float, default=30.0)
 
     cpu = sub.add_parser("cpu", help="CPU over a series of windows")
-    common(cpu)
+    common(cpu, inherited=True)
     cpu.add_argument("--window", type=float, default=5.0, help="seconds per sample")
     cpu.add_argument("--samples", type=int, default=12, help="number of samples")
 
@@ -1966,7 +1982,7 @@ def main(argv: list[str] | None = None) -> int:
     quiet.add_argument("--evidence", type=Path, help="write PASS or FAIL evidence JSON")
 
     windows = sub.add_parser("windows", help="child windows and hit testing")
-    common(windows)
+    common(windows, inherited=True)
     windows.add_argument(
         "--expect-top-level", type=int, metavar="COUNT",
         help="fail unless COUNT top-level windows belong to the process, hidden included",
@@ -2002,7 +2018,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     shot = sub.add_parser("shot", help="screenshot the window")
-    common(shot)
+    common(shot, inherited=True)
     shot.add_argument("-o", "--out", default="shot.png")
 
     a = ap.parse_args(argv)

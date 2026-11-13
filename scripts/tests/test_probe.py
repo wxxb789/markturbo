@@ -723,6 +723,22 @@ class StartupTraceTests(unittest.TestCase):
         self.assertIn("full", command)
 
 
+class ProbeArgumentTests(unittest.TestCase):
+    @unittest.skipUnless(probe.sys.platform == "win32", "probe requires Win32")
+    def test_shared_options_keep_their_value_on_either_side_of_the_subcommand(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "markturbo.exe"
+            executable.write_bytes(b"")
+            for arguments in (
+                ["--exe", str(executable), "startup"],
+                ["startup", "--exe", str(executable)],
+            ):
+                with self.subTest(arguments=arguments):
+                    with mock.patch.object(probe, "cmd_startup") as startup:
+                        self.assertEqual(probe.main(arguments), 0)
+                    self.assertEqual(startup.call_args.args[0].exe, executable)
+
+
 class StartupQuietEvidenceTests(unittest.TestCase):
     def test_validate_startup_quiet_evidence_rejects_invalid_states(self) -> None:
         checked_at = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)

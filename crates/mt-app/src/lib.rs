@@ -16,6 +16,7 @@ pub mod app;
 pub mod app_paths;
 pub mod assets;
 pub mod i18n;
+pub mod logging;
 pub mod state;
 pub mod web;
 
