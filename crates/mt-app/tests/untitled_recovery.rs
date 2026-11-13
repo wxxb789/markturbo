@@ -32,19 +32,23 @@ fn untitled_draft_is_checkpointed() {
     app.type_text("label:Markdown source", "Recover me")
         .expect("edit draft");
 
-    let mut checkpointed = false;
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    // Pump the app's frames: sleeping in this thread never advances it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
         if recovery_entries(&recovery)
             .difference(&baseline)
             .next()
             .is_some()
         {
-            checkpointed = true;
             break;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "draft never reached recovery store"
+        );
+        app.next_change(std::time::Duration::from_millis(25))
+            .expect("settle while the checkpoint lands");
     }
-    assert!(checkpointed, "draft never reached recovery store");
     drop(app);
 
     let (store, _maintenance) =
