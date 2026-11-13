@@ -1,11 +1,24 @@
 # Goal 09 acceptance evidence
 
-**Status: implementation complete; owner, first-time-user, and native
-keyboard/screen-reader acceptance pending.** The release-build visual matrix and
-its automated accessibility assertions are reproducible and are now bound to the
-current revision, but the remaining evidence required by
-[Goal 09](goals/archive/09-refine-product-hierarchy-and-visuals.md#completion-evidence)
-needs an owner review, a person at a Windows desktop, and five target users.
+**Status: accepted on 2026-11-13 and archived as
+[Goal 09](goals/archive/09-refine-product-hierarchy-and-visuals.md).** The
+release-build matrix and its automated accessibility assertions are bound to the
+accepted revision; the two evidence items the completion list also names are
+carried forward in [TODO](TODO.md).
+
+## Completion
+
+- Accepted on 2026-11-13 by the project owner, who reviewed the product manually
+  and recorded no intentional exception.
+- Accepted revision `eeb3b30` with a clean worktree; executable `MarkTurbo.exe`
+  (61,664,768 bytes) SHA-256
+  `927d8238e56f89b38b13c736dae4399c29c8a5639ce0b5df86e5e97534fc2bbd`.
+- Evidence: `docs/evidence/goal-09/final5/` - one review sheet per viewport and
+  the 132 cells and receipts behind them.
+- Not recorded, and therefore carried into Goal 10's clean-machine acceptance:
+  native keyboard traversal with visible focus and a Windows 11 x64
+  screen-reader smoke, and the five first-time target-user sessions PRODUCT.md
+  requires before public-quality visual acceptance.
 
 ## Implemented corrections
 
@@ -60,20 +73,20 @@ portrait RDP desktop the landscape viewports are placed off-screen with
 - Captured: 132 cells = 11 states × 3 viewports × 2 modes × 2 languages.
 - Viewports: 720×480 DIP (900×600 px), 1400×900 DIP (1750×1125 px), and
   1920×1080 DIP (2400×1350 px) at 120 DPI.
-- Source: `0f3f41e` with a clean worktree; executable `MarkTurbo.exe`
-  (61,660,160 bytes) SHA-256
-  `1c1d594cfca4912b96a76cf15fe9e586f5c044dede1d5d1f60b400258a1a181b`.
+- Source: `eeb3b30` with a clean worktree; executable `MarkTurbo.exe`
+  (61,664,768 bytes) SHA-256
+  `927d8238e56f89b38b13c736dae4399c29c8a5639ce0b5df86e5e97534fc2bbd`.
 - Output: `docs/evidence/goal-09/final5/matrix.json`, `final5/cells/` (132
   receipts: 120 `PrintWindow`, 12 `PrintWindow+CDP`), and one review sheet per
   viewport (`final5/contact-{minimum,default,wide}.png`, 4-column grids of the
   eleven states labelled with their cell IDs). The sheets are review aids; the
   cells and receipts are the evidence.
-- The capture keeps each cell's isolated profile (settings, logs, recovery
-  payloads and the fixture workspace) in a temporary directory that is deleted
-  with the cell, so an output tree holds only `capture.png` and `receipt.json`.
+- The capture keeps each cell's profile (settings, logs, recovery payloads) in a
+  system temporary directory that is deleted with the cell, so a cell holds the
+  fixture workspace its capture shows, `capture.png`, and `receipt.json`.
 - Result: 132/132 cells captured with no obstruction and no viewport mismatch;
   every cell's measured background matched its requested mode. The automated
-  accessibility snapshot counted 2,970 actionable controls and 126 document task
+  accessibility snapshot counted 2,980 actionable controls and 136 document task
   checkboxes; no compact control was unnamed.
 - Earlier capture `docs/evidence/goal-09/final4/` pinned `883a5f3` with a dirty
   worktree `72e660d` and predates the hierarchy, logging, and version commits
@@ -175,18 +188,16 @@ number only.
 
 ## Verification run
 
-On `0f3f41e` with a clean worktree and the executable above:
+On `eeb3b30` with a clean worktree and the executable above:
 
-- `mt.py check fast`: 214 tooling tests passed in 10.7 s across 8 shards;
+- `mt.py check fast`: 214 tooling tests passed in 11.2 s across 8 shards;
   `git diff --check` reported nothing for the working tree and the index.
-- `mt.py check full`: passed. Production-profile `cargo fmt --all -- --check`,
-  `cargo clippy --profile release --workspace --all-targets --locked`, 853
-  workspace tests across 29 test binaries with 0 failures and 7 ignored opt-in
-  probes, the locked `-p mt-app --bin markturbo` build, and the binary privacy
-  scan. The run includes `review_stale` and the i18n coverage tests.
-- `mt.py visual`: 132/132 cells captured in 298 s.
-- The only workspace-manifest warning is a pre-existing unused `tracing`
-  workspace dependency (`Cargo.toml:21`); it is recorded in [TODO](TODO.md).
-
-The earlier `mt.py check fast` (183 tooling tests) and `mt.py check ci` records
-belonged to `883a5f3`; the numbers above supersede them.
+- `mt.py visual`: 132/132 cells captured.
+- `cargo test --release -p mt-app --lib logging::tests::`: 2 passed, including
+  the guard regression, which fails when the guard call is removed.
+- `cargo test --release -p mt-app --test translation_flow`: 1 passed.
+- `mt.py check full` passed on `0f3f41e` before these fixes: production-profile
+  formatting and Clippy, 853 workspace tests across 29 test binaries with 0
+  failures and 7 ignored opt-in probes, the locked `-p mt-app --bin markturbo`
+  build, and the binary privacy scan. The workspace gate for this revision is
+  the pull-request CI run.

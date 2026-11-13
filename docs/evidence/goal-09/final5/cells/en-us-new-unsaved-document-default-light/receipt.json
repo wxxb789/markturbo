@@ -17,7 +17,7 @@
     "viewport": "default"
   },
   "cell_id": "en-us-new-unsaved-document-default-light",
-  "completed_at": "2026-11-13T10:22:46.253Z",
+  "completed_at": "2026-11-13T14:07:41.954Z",
   "effective_mode": {
     "background_rgb": [
       255,
@@ -33,9 +33,9 @@
     "requested": "light"
   },
   "executable": {
-    "byte_count": 61660160,
+    "byte_count": 61664768,
     "name": "MarkTurbo.exe",
-    "sha256": "1c1d594cfca4912b96a76cf15fe9e586f5c044dede1d5d1f60b400258a1a181b"
+    "sha256": "927d8238e56f89b38b13c736dae4399c29c8a5639ce0b5df86e5e97534fc2bbd"
   },
   "image": {
     "byte_count": 25952,
@@ -44,7 +44,7 @@
     "width": 1750
   },
   "obstruction": {
-    "foreground_window_matches": true,
+    "foreground_window_matches": false,
     "point_hits_app": {
       "bottom_left": true,
       "bottom_right": true,
@@ -59,11 +59,11 @@
   "schema": "markturbo.goal-09-visual-cell",
   "source": {
     "dirty": false,
-    "head": "0f3f41ed51c357d4f79561a132514089c1aaa97d",
-    "tree": "5a4f95061914f6ec7474e80609c30a0afcc65052",
+    "head": "eeb3b300feb3b80823d36658d8344766e587a061",
+    "tree": "372b9801ac25a6024fc0dfb1a4586d3c43264b8b",
     "worktree_tree": null
   },
-  "started_at": "2026-11-13T10:22:43.500Z",
+  "started_at": "2026-11-13T14:07:38.247Z",
   "state_markers": [
     "new-unsaved-document"
   ],
