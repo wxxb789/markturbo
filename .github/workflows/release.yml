@@ -222,7 +222,8 @@ jobs:
 
   draft-release:
     needs: [build, install-smoke]
-    runs-on: ubuntu-latest
+    # Downloaded Authenticode artifacts must be checked against Windows trust.
+    runs-on: windows-2022
     permissions:
       contents: write
     defaults:
@@ -331,6 +332,10 @@ jobs:
           fi
 
           if release="$(gh release view "$TAG" --json isDraft,assets)"; then
+            if [[ "$(jq -r '.isDraft' <<< "$release")" != "true" ]]; then
+              echo "error: refusing to replace assets of published release $TAG" >&2
+              exit 1
+            fi
             gh release upload "$TAG" "${assets[@]}" --clobber
             while IFS= read -r asset; do
               case "$asset" in

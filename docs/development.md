@@ -132,6 +132,12 @@ writes the SHA-256 sidecar and `release.json`. Signing reads
 `MARKTURBO_SIGN_PFX` and `MARKTURBO_SIGN_PASSWORD`; stable releases require it,
 and an unsigned prerelease is allowed only when its release page says so.
 `release verify` rechecks the checksum, manifest inventory and signing policy.
+An `authenticode` manifest also requires Windows SDK `signtool verify /pa`
+to validate the signature digest and Windows certificate trust; verification
+fails if the verifier is unavailable or rejects the signature. A PE certificate
+header alone is not proof of signing. The draft-release job runs on Windows
+to perform the same trust check after downloading the artifact, and refuses
+to replace assets of an already published release.
 
 `--self-signed` builds a test-only Authenticode signature from a throwaway
 code-signing certificate and publishes the matching `.cer`. The workflow

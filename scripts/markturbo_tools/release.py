@@ -654,6 +654,7 @@ def verify_artifact(
     if signing == "authenticode":
         if not signed:
             raise ReleaseError("release manifest claims a signature the artifact lacks")
+        verify_authenticode(artifact)
     elif signing == "self-signed":
         if not signed:
             raise ReleaseError("release manifest claims a self-signed signature the artifact lacks")

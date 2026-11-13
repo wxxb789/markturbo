@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -337,6 +338,72 @@ class ArtifactVerificationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(release.ReleaseError, "lacks"):
                 release.verify_artifact(claimed)
+
+    def test_authenticode_requires_a_trusted_signature_not_just_a_pe_header(self) -> None:
+        for require_signature in (False, True):
+            with self.subTest(require_signature=require_signature):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    manifest = write_manifest(
+                        root, artifact_bytes=pe_image(signed=True), signing="authenticode"
+                    )
+                    result = subprocess.CompletedProcess(
+                        [], 1, stdout="", stderr="signature digest is invalid"
+                    )
+                    with (
+                        mock.patch.object(release, "signtool", return_value="signtool"),
+                        mock.patch.object(release.subprocess, "run", return_value=result) as run,
+                        self.assertRaisesRegex(release.ReleaseError, "digest is invalid"),
+                    ):
+                        release.verify_artifact(manifest, require_signature=require_signature)
+                    self.assertEqual(
+                        run.call_args.args[0],
+                        ["signtool", "verify", "/pa", "/v", str(root / "MarkTurbo-Setup-1.2.3.exe")],
+                    )
+
+    def test_authenticode_rejects_an_untrusted_certificate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = write_manifest(
+                root, artifact_bytes=pe_image(signed=True), signing="authenticode"
+            )
+            result = subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="0x800B0109: certificate is not trusted"
+            )
+            with (
+                mock.patch.object(release, "signtool", return_value="signtool"),
+                mock.patch.object(release.subprocess, "run", return_value=result),
+                self.assertRaisesRegex(release.ReleaseError, "not trusted"),
+            ):
+                release.verify_artifact(manifest, require_signature=True)
+
+    def test_authenticode_verifies_when_windows_trust_verification_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = write_manifest(
+                root, artifact_bytes=pe_image(signed=True), signing="authenticode"
+            )
+            result = subprocess.CompletedProcess([], 0, stdout="verified", stderr="")
+            with (
+                mock.patch.object(release, "signtool", return_value="signtool"),
+                mock.patch.object(release.subprocess, "run", return_value=result),
+            ):
+                document = release.verify_artifact(manifest, require_signature=True)
+            self.assertEqual(document["signing"], "authenticode")
+
+    def test_authenticode_fails_if_trust_verification_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = write_manifest(
+                root, artifact_bytes=pe_image(signed=True), signing="authenticode"
+            )
+            with (
+                mock.patch.object(
+                    release, "signtool", side_effect=release.ReleaseError("signtool unavailable")
+                ),
+                self.assertRaisesRegex(release.ReleaseError, "signtool unavailable"),
+            ):
+                release.verify_artifact(manifest, require_signature=True)
 
     def test_manifest_rejects_payload_paths_outside_the_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
