@@ -30,4 +30,3 @@
   40-node flow 638 µs vs 436 µs) with larger SVG output. Revisit with a
   benchmark against `mermaid-svg` on representative documents, a measured
   improvement threshold, and no new JS/script-execution requirement.
-
