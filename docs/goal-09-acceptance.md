@@ -46,8 +46,16 @@ carried forward in [TODO](TODO.md).
 ```sh
 uv run --locked --project scripts scripts/mt.py visual -- \
     --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
-    --out docs/evidence/goal-09/final5
+    --out target/native-acceptance/goal-09
 ```
+
+The capture has no existing-output guard: it rewrites every cell it writes, and
+a failed run still replaces that cell's receipt. `--out` therefore names a
+scratch or fresh directory (the ignored `target/native-acceptance/`, as the
+other harnesses use). `docs/evidence/goal-09/final5/` is the archived capture
+bound to the revision and executable hash below - re-running the command does
+not update it or its review sheets, and nothing points `--out` at retained
+evidence.
 
 The packaged executable comes from the same revision:
 

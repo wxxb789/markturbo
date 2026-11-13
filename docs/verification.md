@@ -84,8 +84,12 @@ Goal 09's release-build screenshot matrix is produced by:
 ```sh
 uv run --locked --project scripts scripts/mt.py visual -- \
     --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
-    --out docs/evidence/goal-09/final5
+    --out target/native-acceptance/goal-09
 ```
+
+`--out` is a scratch directory: the capture overwrites the cells it writes and
+has no existing-output guard, so it never points at the retained matrix under
+`docs/evidence/`.
 
 It records each cell's source revision, executable hash, DPI, DIP and pixel
 viewport, language, effective theme, obstruction observations, control names and

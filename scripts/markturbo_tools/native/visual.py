@@ -14,7 +14,10 @@ packaged `MarkTurbo.exe` built from the same source revision::
 
     uv run --locked --project scripts scripts/mt.py visual \\
         --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \\
-        --out docs/evidence/goal-09/matrix
+        --out target/native-acceptance/goal-09
+
+`--out` names a scratch directory: the capture rewrites the cells it writes and
+has no existing-output guard, so it never points at retained evidence.
 
 This is capture tooling, not owner approval or first-time-user evidence.
 """
