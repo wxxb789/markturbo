@@ -104,7 +104,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("translation target editor");
     app.answer_dialogs_myself();
     app.press("text:Quit").expect("request quit");
-    assert!(app.pending_dialog().is_some(), "Quit must await a decision");
+    wait_for_pending_dialog(&mut app, Duration::from_secs(20));
 
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:你好，再见", Duration::from_secs(20))
@@ -123,6 +123,22 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         saved.contains("Unsaved edit."),
         "Quit lost the original dirty tab"
     );
+}
+
+/// Waits for the app to show a dialog while pumping its frames: `request_quit`
+/// opens the decision from a task, so a slow machine can deliver it after
+/// `press` returned.
+fn wait_for_pending_dialog(app: &mut Headless, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while app.pending_dialog().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Quit must await a decision: {:?}",
+            app.screen().texts()
+        );
+        app.next_change(Duration::from_millis(25))
+            .expect("settle while Quit awaits a decision");
+    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
