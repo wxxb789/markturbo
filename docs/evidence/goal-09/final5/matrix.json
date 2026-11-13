@@ -1,0 +1,684 @@
+{
+  "cells": [
+    {
+      "cell_id": "en-us-clean-profile-welcome-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-clean-profile-welcome-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-clean-profile-welcome-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-clean-profile-welcome-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-clean-profile-welcome-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-clean-profile-welcome-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-clean-profile-welcome-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-clean-profile-welcome-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-clean-profile-welcome-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-clean-profile-welcome-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-clean-profile-welcome-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-clean-profile-welcome-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-new-unsaved-document-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-new-unsaved-document-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-new-unsaved-document-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-new-unsaved-document-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-new-unsaved-document-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-new-unsaved-document-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-new-unsaved-document-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-new-unsaved-document-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-new-unsaved-document-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-new-unsaved-document-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-new-unsaved-document-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-new-unsaved-document-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-ordinary-edit-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-ordinary-edit-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-ordinary-edit-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-ordinary-edit-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-ordinary-edit-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-ordinary-edit-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-ordinary-edit-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-ordinary-edit-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-ordinary-edit-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-ordinary-edit-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-ordinary-edit-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-ordinary-edit-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-native-preview-or-split-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-native-preview-or-split-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-native-preview-or-split-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-native-preview-or-split-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-native-preview-or-split-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-native-preview-or-split-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-native-preview-or-split-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-native-preview-or-split-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-native-preview-or-split-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-native-preview-or-split-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-native-preview-or-split-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-native-preview-or-split-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-web-compatibility-preview-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-web-compatibility-preview-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-web-compatibility-preview-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-web-compatibility-preview-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-web-compatibility-preview-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-web-compatibility-preview-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-web-compatibility-preview-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-web-compatibility-preview-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-web-compatibility-preview-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-web-compatibility-preview-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-web-compatibility-preview-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-web-compatibility-preview-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-loading-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-loading-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-loading-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-loading-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-loading-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-loading-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-loading-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-loading-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-loading-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-loading-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-loading-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-loading-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-result-questions-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-result-questions-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-result-questions-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-result-questions-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-result-questions-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-result-questions-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-result-questions-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-result-questions-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-result-questions-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-result-questions-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-result-questions-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-result-questions-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-stale-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-stale-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-stale-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-stale-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-stale-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-review-stale-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-stale-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-stale-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-stale-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-stale-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-stale-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-review-stale-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-effective-agent-context-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-effective-agent-context-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-effective-agent-context-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-effective-agent-context-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-effective-agent-context-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-effective-agent-context-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-effective-agent-context-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-effective-agent-context-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-effective-agent-context-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-effective-agent-context-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-effective-agent-context-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-effective-agent-context-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-external-change-conflict-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-external-change-conflict-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-external-change-conflict-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-external-change-conflict-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-external-change-conflict-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-external-change-conflict-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-external-change-conflict-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-external-change-conflict-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-external-change-conflict-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-external-change-conflict-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-external-change-conflict-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-external-change-conflict-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-settings-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-settings-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-settings-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-settings-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-settings-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "en-us-settings-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-settings-minimum-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-settings-minimum-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-settings-default-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-settings-default-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-settings-wide-light",
+      "reason_code": null,
+      "status": "CAPTURED"
+    },
+    {
+      "cell_id": "zh-cn-settings-wide-dark",
+      "reason_code": null,
+      "status": "CAPTURED"
+    }
+  ],
+  "completed_at": "2026-11-13T10:26:58.120Z",
+  "executable": {
+    "byte_count": 61660160,
+    "name": "MarkTurbo.exe",
+    "sha256": "1c1d594cfca4912b96a76cf15fe9e586f5c044dede1d5d1f60b400258a1a181b"
+  },
+  "schema": "markturbo.goal-09-visual-matrix",
+  "source": {
+    "dirty": false,
+    "head": "0f3f41ed51c357d4f79561a132514089c1aaa97d",
+    "tree": "5a4f95061914f6ec7474e80609c30a0afcc65052",
+    "worktree_tree": null
+  },
+  "started_at": "2026-11-13T10:22:06.070Z",
+  "status": "PASS",
+  "summary": {
+    "captured_count": 132,
+    "cell_count": 132,
+    "failed_count": 0
+  }
+}

@@ -84,7 +84,7 @@ Goal 09's release-build screenshot matrix is produced by:
 ```sh
 uv run --locked --project scripts scripts/mt.py visual -- \
     --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
-    --out docs/evidence/goal-09/matrix
+    --out docs/evidence/goal-09/final5
 ```
 
 It records each cell's source revision, executable hash, DPI, DIP and pixel

@@ -136,9 +136,9 @@ process arguments, errors, screenshots, fixtures, and metrics.
 ## Screenshots
 
 Goal 09 release-build visual matrix contact sheets show the app at
-[default](docs/evidence/goal-09/final4/contact-default.png),
-[minimum](docs/evidence/goal-09/final4/contact-minimum.png), and
-[wide](docs/evidence/goal-09/final4/contact-wide.png) viewports. These are
+[default](docs/evidence/goal-09/final5/contact-default.png),
+[minimum](docs/evidence/goal-09/final5/contact-minimum.png), and
+[wide](docs/evidence/goal-09/final5/contact-wide.png) viewports. These are
 screenshots, not a Review demonstration recording or clean-machine acceptance
 evidence. See the [visual acceptance status](docs/goal-09-acceptance.md).
 

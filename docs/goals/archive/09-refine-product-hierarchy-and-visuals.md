@@ -14,9 +14,9 @@ product capability or regression in keyboard and accessibility behavior.
 
 **Disposition:** Retained and revised on 2026-08-29.
 
-The hierarchy is defined by the [Capability roles](../../PRODUCT.md#capability-roles).
+The hierarchy is defined by the [Capability roles](../../../PRODUCT.md#capability-roles).
 Visual acceptance must satisfy the [First-Time-User
-Evidence](../../PRODUCT.md#first-time-user-evidence); this goal adds only the UI and
+Evidence](../../../PRODUCT.md#first-time-user-evidence); this goal adds only the UI and
 state evidence needed to show that hierarchy works in the product.
 
 ## Design standard
@@ -29,7 +29,7 @@ users who need them.
 ## In scope
 
 - Derive one explicit action hierarchy from the
-  [Capability roles](../../PRODUCT.md#capability-roles).
+  [Capability roles](../../../PRODUCT.md#capability-roles).
 - Replace implementation vocabulary with user-task vocabulary where owner review
   confirms it improves comprehension. Candidates to test include:
   - `Source` → `Edit`;
@@ -95,7 +95,7 @@ be automated; platform-specific WebView states require their real runtime.
 
 ## Validation cadence
 
-Follow [development validation](../development.md). Focused tests and PR CI gate
+Follow [development validation](../../development.md). Focused tests and PR CI gate
 implementation changes; native checks, owner evaluation and broad visual matrices
 are collected at the relevant integrated milestone, not after every small task.
 Report implementation and acceptance separately. The completion evidence below
@@ -105,7 +105,7 @@ still gates full goal acceptance and public-quality delivery.
 
 - The project owner approves one state matrix produced from a release build and
   records any intentional exceptions.
-- The [First-Time-User Evidence](../../PRODUCT.md#first-time-user-evidence) passes.
+- The [First-Time-User Evidence](../../../PRODUCT.md#first-time-user-evidence) passes.
   In those sessions, participants also identify the primary action, open/paste
   path, active artifact, and current safety state without being taught internal
   terms.

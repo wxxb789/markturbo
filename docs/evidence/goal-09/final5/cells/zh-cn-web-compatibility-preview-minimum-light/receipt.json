@@ -1,0 +1,98 @@
+{
+  "accessibility": {
+    "control_count": 26,
+    "document_checkboxes": 0,
+    "roles": {
+      "Button": 24,
+      "Edit": 1,
+      "MenuItem": 1
+    },
+    "unnamed": []
+  },
+  "capture_method": "PrintWindow+CDP",
+  "cell": {
+    "language": "zh-cn",
+    "mode": "light",
+    "state": "web-compatibility-preview",
+    "viewport": "minimum"
+  },
+  "cell_id": "zh-cn-web-compatibility-preview-minimum-light",
+  "completed_at": "2026-11-13T10:24:04.757Z",
+  "effective_mode": {
+    "background_rgb": [
+      255,
+      255,
+      255
+    ],
+    "expected_rgb": [
+      255,
+      255,
+      255
+    ],
+    "max_channel_distance": 0,
+    "requested": "light"
+  },
+  "executable": {
+    "byte_count": 61660160,
+    "name": "MarkTurbo.exe",
+    "sha256": "1c1d594cfca4912b96a76cf15fe9e586f5c044dede1d5d1f60b400258a1a181b"
+  },
+  "image": {
+    "byte_count": 47611,
+    "height": 600,
+    "sha256": "99f891b1bb14d78c72e6a0b271a25cacfbdb4992d33a6d06671c30884c18c4a6",
+    "width": 900
+  },
+  "obstruction": {
+    "foreground_window_matches": true,
+    "point_hits_app": {
+      "bottom_left": true,
+      "bottom_right": true,
+      "center": true,
+      "top_left": true,
+      "top_right": true
+    },
+    "session_foreground": true,
+    "topmost_requested": false,
+    "visible": true
+  },
+  "schema": "markturbo.goal-09-visual-cell",
+  "source": {
+    "dirty": false,
+    "head": "0f3f41ed51c357d4f79561a132514089c1aaa97d",
+    "tree": "5a4f95061914f6ec7474e80609c30a0afcc65052",
+    "worktree_tree": null
+  },
+  "started_at": "2026-11-13T10:24:01.643Z",
+  "state_markers": [
+    "web-compatibility-preview"
+  ],
+  "status": "CAPTURED",
+  "viewport": {
+    "client_px": [
+      900,
+      600
+    ],
+    "dip": [
+      720,
+      480
+    ],
+    "dpi": 120,
+    "name": "minimum",
+    "window_px": [
+      918,
+      647
+    ]
+  },
+  "web_capture": {
+    "method": "WebView2 CDP Page.captureScreenshot",
+    "page_byte_count": 13988,
+    "page_sha256": "0ebf4ac11b874f6391aabda2fc7025cde695eb395e579b43de1f33b4661075bd",
+    "rect_client_px": [
+      250,
+      271,
+      900,
+      571
+    ]
+  }
+}

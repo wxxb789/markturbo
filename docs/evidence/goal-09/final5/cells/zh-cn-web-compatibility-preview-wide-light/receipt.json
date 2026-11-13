@@ -1,0 +1,99 @@
+{
+  "accessibility": {
+    "control_count": 28,
+    "document_checkboxes": 2,
+    "roles": {
+      "Button": 24,
+      "Edit": 1,
+      "ListItem": 2,
+      "MenuItem": 1
+    },
+    "unnamed": []
+  },
+  "capture_method": "PrintWindow+CDP",
+  "cell": {
+    "language": "zh-cn",
+    "mode": "light",
+    "state": "web-compatibility-preview",
+    "viewport": "wide"
+  },
+  "cell_id": "zh-cn-web-compatibility-preview-wide-light",
+  "completed_at": "2026-11-13T10:24:16.067Z",
+  "effective_mode": {
+    "background_rgb": [
+      255,
+      255,
+      255
+    ],
+    "expected_rgb": [
+      255,
+      255,
+      255
+    ],
+    "max_channel_distance": 0,
+    "requested": "light"
+  },
+  "executable": {
+    "byte_count": 61660160,
+    "name": "MarkTurbo.exe",
+    "sha256": "1c1d594cfca4912b96a76cf15fe9e586f5c044dede1d5d1f60b400258a1a181b"
+  },
+  "image": {
+    "byte_count": 65875,
+    "height": 1350,
+    "sha256": "93c58b5d39aadb82f67e3d4e59654328afe335ea9efd505cad898f8835c55621",
+    "width": 2400
+  },
+  "obstruction": {
+    "foreground_window_matches": true,
+    "point_hits_app": {
+      "bottom_left": true,
+      "bottom_right": true,
+      "center": true,
+      "top_left": true,
+      "top_right": true
+    },
+    "session_foreground": true,
+    "topmost_requested": false,
+    "visible": true
+  },
+  "schema": "markturbo.goal-09-visual-cell",
+  "source": {
+    "dirty": false,
+    "head": "0f3f41ed51c357d4f79561a132514089c1aaa97d",
+    "tree": "5a4f95061914f6ec7474e80609c30a0afcc65052",
+    "worktree_tree": null
+  },
+  "started_at": "2026-11-13T10:24:13.214Z",
+  "state_markers": [
+    "web-compatibility-preview"
+  ],
+  "status": "CAPTURED",
+  "viewport": {
+    "client_px": [
+      2400,
+      1350
+    ],
+    "dip": [
+      1920,
+      1080
+    ],
+    "dpi": 120,
+    "name": "wide",
+    "window_px": [
+      2418,
+      1397
+    ]
+  },
+  "web_capture": {
+    "method": "WebView2 CDP Page.captureScreenshot",
+    "page_byte_count": 21517,
+    "page_sha256": "2db66775daba63852e014ab03773ac26983ad535ce82b704a01318ace8902f15",
+    "rect_client_px": [
+      325,
+      271,
+      2400,
+      1321
+    ]
+  }
+}
