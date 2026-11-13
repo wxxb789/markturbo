@@ -188,11 +188,15 @@ system certificate *paths* and links nothing.
 
 ### Windows CD artifact
 
-The release workflow produces exactly `markturbo-windows-x64.exe`. It contains its icon,
-KaTeX font resources, and bundled sample; it does not upload archives, docs,
-installers, or auxiliary payloads. This is a portable executable artifact, not
-an installer and not a signed distribution. Installation and OS registration
-are reserved for Goal 10.
+The release workflow produces one per-user Inno Setup installer,
+`MarkTurbo-Setup-<version>.exe`, with a `sha256sum`-format sidecar and a
+`release.json` manifest. The installer places `MarkTurbo.exe` and its `nsh/`
+metadata under `%LOCALAPPDATA%\Programs\MarkTurbo`, creates a Start menu
+shortcut, registers Shell App Paths, and ships the project license and
+third-party notices. It does not include archives, docs, or auxiliary
+payloads. Windows 11 x64 is the only public-quality target; installation,
+signing, upgrade and uninstall policy belong to
+[Goal 10](goals/10-ship-primary-platform-release.md).
 
 ## Where settings live
 
@@ -212,10 +216,9 @@ for finding, backing up, or migrating application data.
 
 ## Where runtime data and logs live
 
-Application logs on every platform, plus the Windows WebView2 profile, use
-`dirs::data_local_dir()`, separate from the settings above. They are local,
-potentially growing data and should neither roam between machines nor be
-created beside the executable:
+Application logs on every platform use `dirs::data_local_dir()`, separate from
+the settings above. They are local, potentially growing data and should neither
+roam between machines nor be created beside the executable:
 
 | Platform | Runtime data root |
 |---|---|
@@ -223,12 +226,12 @@ created beside the executable:
 | macOS | `~/Library/Application Support/markturbo` |
 | Linux | `$XDG_DATA_HOME/markturbo`, else `~/.local/share/markturbo` |
 
-On Windows, all MarkTurbo instances share the persistent WebView2 profile at
-`webview2/` under that root. macOS continues to use WKWebView's system-managed
-browser storage. Every platform writes application logs under `logs/`, using
-one append-only `markturbo-<pid>.log` file per process so concurrent instances
-do not contend for one file. `$MARKTURBO_DATA_DIR` overrides this log root on
-every platform and the WebView2 profile root on Windows.
+Every platform writes application logs under `logs/`, using one append-only
+`markturbo-<pid>.log` file per process so concurrent instances do not contend
+for one file. `$MARKTURBO_DATA_DIR` overrides this log root on every platform.
+The nsh runtime keeps the Windows WebView2 profile at
+`%LOCALAPPDATA%\com.markturbo.app\WebView2`, which `$MARKTURBO_DATA_DIR` does
+not redirect; macOS uses WKWebView's system-managed browser storage.
 
 ## Optional per-platform tooling
 

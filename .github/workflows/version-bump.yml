@@ -72,6 +72,19 @@ jobs:
         run: |
           cargo release version "$BUMP" --workspace --execute --no-confirm
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          python3 - "$version" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          version = sys.argv[1]
+          path = pathlib.Path("crates/mt-app/nsh.json")
+          document = json.loads(path.read_text(encoding="utf-8"))
+          document["version"] = version
+          path.write_text(
+              json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="\n"
+          )
+          PY
           tag="v$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -86,7 +99,7 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          unexpected="$(git diff --name-only | grep -Ev '^(Cargo\.toml|Cargo\.lock)$' || true)"
+          unexpected="$(git diff --name-only | grep -Ev '^(Cargo\.toml|Cargo\.lock|crates/mt-app/nsh\.json)$' || true)"
           if [[ -n "$unexpected" ]]; then
             echo "error: version bump changed unexpected files:" >&2
             echo "$unexpected" >&2
@@ -95,7 +108,7 @@ jobs:
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock crates/mt-app/nsh.json
           git commit -m "chore(release): bump version to $VERSION"
           git tag -a "$TAG" -m "markturbo $VERSION"
           gh auth setup-git
@@ -105,6 +118,7 @@ jobs:
     needs: bump
     permissions:
       contents: write
+    secrets: inherit
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.bump.outputs.tag }}

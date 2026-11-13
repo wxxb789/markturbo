@@ -1,5 +1,6 @@
 # Build output
 /target
+/dist
 # nsh generates an app-local describe crate and packaging output.
 crates/*/.nsh/
 crates/*/target/

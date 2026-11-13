@@ -12,10 +12,11 @@ carry no separate licence of their own.
 
 ## Distribution
 
-The Windows release embeds the KaTeX faces in `markturbo-windows-x64.exe`, alongside its
-bundled sample. The raw executable is the only CD artifact, so the renderer may
-not depend on a sidecar `fonts/` directory. These source files remain in the
-repository for licensing, reproducible builds, and development validation.
+The Windows release embeds the KaTeX faces in `MarkTurbo.exe`, alongside its
+bundled sample. The installer also ships [THIRD-PARTY-NOTICES.md](../../THIRD_PARTY_NOTICES.md)
+with this license text, so the renderer may not depend on a sidecar `fonts/`
+directory. These source files remain in the repository for licensing,
+reproducible builds, and development validation.
 
 ## Updating
 

@@ -112,6 +112,42 @@ lint/test/build is not environmental merely because a GUI was unavailable.
 After a repair, rerun the failed test plus its affected suite; avoid rebuilding
 unrelated profiles or redoing manual acceptance without a changed dependency.
 
+## Release artifact
+
+Build and check the Windows installer only through the release tooling:
+
+```sh
+uv run --locked --project scripts scripts/mt.py release versions --tag v0.1.4-alpha.2
+uv run --locked --project scripts scripts/mt.py release package --out dist --no-sign
+uv run --locked --project scripts scripts/mt.py release package --out dist --self-signed
+uv run --locked --project scripts scripts/mt.py release verify --manifest dist/release.json
+```
+
+`release versions` requires `Cargo.toml`, `crates/mt-app/nsh.json` and the
+release tag to name one version. `release package` runs
+`nsh package --target windows`, fails when the executable does not embed every
+required KaTeX face or bundled sample entry, stages the project license and
+third-party notices, compiles `installer/markturbo.iss` with Inno Setup, and
+writes the SHA-256 sidecar and `release.json`. Signing reads
+`MARKTURBO_SIGN_PFX` and `MARKTURBO_SIGN_PASSWORD`; stable releases require it,
+and an unsigned prerelease is allowed only when its release page says so.
+`release verify` rechecks the checksum, manifest inventory and signing policy.
+
+`--self-signed` builds a test-only Authenticode signature from a throwaway
+code-signing certificate and publishes the matching `.cer`. The workflow
+dispatch input `self_signed` selects the same path for a prerelease. Windows
+does not trust that certificate by default, so the result is labeled
+`self-signed`, is never accepted as a stable publication signature, and
+`--require-signature` rejects it.
+
+The packaging commands require the `nsh` CLI and Inno Setup 6 (`ISCC.exe`);
+the release workflow installs the pinned Inno Setup version and nsh before
+running them.
+
+`check full` does not build the installer. The release workflow runs it first,
+then packages that same revision, and creates a draft release. The draft gate
+keeps clean-machine acceptance and owner approval separate from CI success.
+
 ## Implementation and acceptance are separate
 
 Use two fields in the existing PR or goal report, not a new tracking system:
