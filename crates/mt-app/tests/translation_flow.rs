@@ -8,6 +8,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::{DialogAnswer, Headless};
 
+mod support;
+
 #[test]
 fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialog() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -83,7 +85,13 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     );
 
     app.press("text:Save").expect("save translation");
-    wait_for_saved_document(&mut app, &document, "你好", Duration::from_secs(20));
+    support::wait_for_file(
+        &mut app,
+        &document,
+        |text| text.contains("你好"),
+        "the saved document carries the translation",
+        Duration::from_secs(20),
+    );
 
     if app.shows("More layouts") {
         app.press("text:More layouts")
@@ -103,7 +111,11 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("translation target editor");
     app.answer_dialogs_myself();
     app.press("text:Quit").expect("request quit");
-    wait_for_pending_dialog(&mut app, Duration::from_secs(20));
+    support::wait_for_pending_dialog(
+        &mut app,
+        "Quit must await a decision",
+        Duration::from_secs(20),
+    );
 
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:你好，再见", Duration::from_secs(20))
@@ -112,49 +124,20 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
         .expect("save all and quit");
 
-    wait_for_saved_document(&mut app, &document, "你好，再见", Duration::from_secs(20));
-    wait_for_saved_document(&mut app, &other, "Unsaved edit.", Duration::from_secs(20));
-}
-
-/// Waits until the document on disk carries `needle` while pumping frames: a
-/// press can reach its button, and a save can land, after the assertion would
-/// have read the file.
-fn wait_for_saved_document(
-    app: &mut Headless,
-    document: &std::path::Path,
-    needle: &str,
-    timeout: Duration,
-) {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let saved = std::fs::read_to_string(document).expect("read saved file");
-        if saved.contains(needle) {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Save never wrote {needle:?}: {saved:?} with {:?} on screen",
-            app.screen().texts()
-        );
-        app.next_change(Duration::from_millis(25))
-            .expect("settle while the save lands");
-    }
-}
-
-/// Waits for the app to show a dialog while pumping its frames: `request_quit`
-/// opens the decision from a task, so a slow machine can deliver it after
-/// `press` returned.
-fn wait_for_pending_dialog(app: &mut Headless, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    while app.pending_dialog().is_none() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Quit must await a decision: {:?}",
-            app.screen().texts()
-        );
-        app.next_change(Duration::from_millis(25))
-            .expect("settle while Quit awaits a decision");
-    }
+    support::wait_for_file(
+        &mut app,
+        &document,
+        |text| text.contains("你好，再见"),
+        "Quit saves the translation it received",
+        Duration::from_secs(20),
+    );
+    support::wait_for_file(
+        &mut app,
+        &other,
+        |text| text.contains("Unsaved edit."),
+        "Quit saves the other dirty tab",
+        Duration::from_secs(20),
+    );
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
