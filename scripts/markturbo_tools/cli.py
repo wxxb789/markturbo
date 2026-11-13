@@ -18,6 +18,7 @@ UTILITY_COMMANDS = {
     "probe": "scripts.markturbo_tools.probe",
     "capacity": "scripts.markturbo_tools.recovery_capacity",
     "evaluation": "scripts.markturbo_tools.evaluation",
+    "release": "scripts.markturbo_tools.release",
     "revision-evaluation": "scripts.markturbo_tools.revision_evaluation",
     "visual": "scripts.markturbo_tools.native.visual",
 }

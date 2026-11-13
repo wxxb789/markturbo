@@ -10,12 +10,29 @@ on:
         description: Existing version tag to release
         required: true
         type: string
+      self_signed:
+        description: Sign a prerelease with a throwaway self-signed certificate
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      MARKTURBO_SIGN_PFX_BASE64:
+        description: Base64-encoded Authenticode PFX used for stable releases
+        required: false
+      MARKTURBO_SIGN_PFX_PASSWORD:
+        description: Password for the Authenticode PFX
+        required: false
   workflow_dispatch:
     inputs:
       tag:
         description: Existing version tag to release
         required: true
         type: string
+      self_signed:
+        description: Sign a prerelease with a throwaway self-signed certificate
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -26,7 +43,6 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-  RELEASE_ASSET: markturbo-windows-x64.zip
 
 jobs:
   contract:
@@ -57,17 +73,23 @@ jobs:
             exit 1
           fi
 
-      - name: Verify tag version
-        run: |
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
-          if [[ "$RELEASE_TAG" != "v$version" ]]; then
-            echo "error: tag $RELEASE_TAG does not match Cargo version $version" >&2
-            exit 1
-          fi
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            scripts/pyproject.toml
+            scripts/uv.lock
+
+      - name: Verify tag, Cargo and nsh versions agree
+        run: uv run --locked --project scripts scripts/mt.py release versions --tag "$RELEASE_TAG"
 
   build:
     needs: contract
     runs-on: windows-2022
+    env:
+      SIGNING_PFX_BASE64: ${{ secrets.MARKTURBO_SIGN_PFX_BASE64 }}
+      SIGNING_PFX_PASSWORD: ${{ secrets.MARKTURBO_SIGN_PFX_PASSWORD }}
+      SELF_SIGNED_INPUT: ${{ inputs.self_signed }}
     defaults:
       run:
         shell: pwsh
@@ -96,68 +118,237 @@ jobs:
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 
+      - name: Install Inno Setup
+        run: choco install innosetup --version=6.7.3 --no-progress -y --force
+
       - name: Check
         run: uv run --locked --project scripts scripts/mt.py check full
 
       - name: Install nsh
         run: irm https://nsh.dev/install.ps1 | iex
 
-      - name: Package the nsh app
-        working-directory: crates/mt-app
+      - name: Stage signing credentials
+        if: env.SIGNING_PFX_BASE64 != '' && env.SIGNING_PFX_PASSWORD != ''
+        env:
+          SIGNING_PFX_BASE64: ${{ env.SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ env.SIGNING_PFX_PASSWORD }}
         run: |
-          $nsh = Join-Path $env:LOCALAPPDATA "nsh\bin\nsh.exe"
-          & $nsh package --target windows
-          New-Item -ItemType Directory -Force -Path $env:GITHUB_WORKSPACE\release | Out-Null
-          Copy-Item -LiteralPath .nsh\out\MarkTurbo.zip -Destination "$env:GITHUB_WORKSPACE\release\$env:RELEASE_ASSET"
+          $certificate = Join-Path $env:RUNNER_TEMP "markturbo-codesign.pfx"
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+          "MARKTURBO_SIGN_PFX=$certificate" >> $env:GITHUB_ENV
+          "MARKTURBO_SIGN_PASSWORD=$env:SIGNING_PFX_PASSWORD" >> $env:GITHUB_ENV
+
+      - name: Require signing for stable releases
+        run: |
+          $require = -not $env:RELEASE_TAG.Contains("-")
+          "MARKTURBO_REQUIRE_SIGNATURE=$($require.ToString().ToLower())" >> $env:GITHUB_ENV
+          $selfSigned = "$env:SELF_SIGNED_INPUT" -eq "true"
+          "MARKTURBO_SELF_SIGNED=$($selfSigned.ToString().ToLower())" >> $env:GITHUB_ENV
+
+      - name: Package the Windows installer
+        run: |
+          $arguments = @("release", "package", "--out", "release")
+          if ($env:MARKTURBO_REQUIRE_SIGNATURE -eq "true") {
+            $arguments += "--require-signature"
+          } elseif ($env:MARKTURBO_SELF_SIGNED -eq "true") {
+            $arguments += "--self-signed"
+          }
+          uv run --locked --project scripts scripts/mt.py @arguments
+
+      - name: Verify the packaged artifact
+        run: |
+          $arguments = @("release", "verify", "--manifest", "release/release.json")
+          if ($env:MARKTURBO_REQUIRE_SIGNATURE -eq "true") {
+            $arguments += "--require-signature"
+          }
+          uv run --locked --project scripts scripts/mt.py @arguments
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: markturbo-windows-x64
           if-no-files-found: error
           compression-level: 0
-          path: release/${{ env.RELEASE_ASSET }}
+          path: release
 
-  publish:
+  install-smoke:
     needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    runs-on: windows-2022
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     steps:
       - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
           name: markturbo-windows-x64
           path: release
 
-      - name: Publish executable
+      - name: Install, verify layout, and uninstall
+        run: |
+          $installer = Get-ChildItem release -Filter "MarkTurbo-Setup-*.exe" | Select-Object -First 1
+          if (-not $installer) { throw "release artifact is missing" }
+          $expected = ((Get-Content "$($installer.FullName).sha256") -split "\s+")[0]
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "checksum mismatch for $($installer.Name)" }
+
+          $directory = Join-Path $env:RUNNER_TEMP "MarkTurboInstall"
+          $config = Join-Path $env:APPDATA "markturbo"
+          $marker = Join-Path $config "ci-install-smoke-marker.txt"
+          New-Item -ItemType Directory -Force -Path $config | Out-Null
+          Set-Content -Path $marker -Value "preserve"
+
+          $install = Start-Process -FilePath $installer.FullName `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$directory" `
+            -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "installer exited $($install.ExitCode)" }
+
+          foreach ($relative in @("MarkTurbo.exe", "nsh/app.json", "LICENSE", "THIRD-PARTY-NOTICES.md")) {
+            if (-not (Test-Path (Join-Path $directory $relative))) { throw "installed payload is missing $relative" }
+          }
+          $shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "MarkTurbo\MarkTurbo.lnk"
+          if (-not (Test-Path $shortcut)) { throw "Start menu shortcut is missing" }
+          $appPath = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\MarkTurbo.exe"
+          if ($appPath."(default)" -ne (Join-Path $directory "MarkTurbo.exe")) { throw "App Paths is not registered" }
+
+          $uninstall = Start-Process -FilePath (Join-Path $directory "unins000.exe") `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "uninstaller exited $($uninstall.ExitCode)" }
+          Start-Sleep -Seconds 3
+
+          if (Test-Path (Join-Path $directory "MarkTurbo.exe")) { throw "uninstall left the application executable" }
+          if (Test-Path $shortcut) { throw "uninstall left the Start menu shortcut" }
+          if (Get-Process -Name MarkTurbo -ErrorAction SilentlyContinue) { throw "a product process is still running" }
+          if (-not (Test-Path $marker)) { throw "uninstall removed user data outside the install directory" }
+          Remove-Item -Path $marker -Force
+
+  draft-release:
+    needs: [build, install-smoke]
+    # Downloaded Authenticode artifacts must be checked against Windows trust.
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 1
+
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            scripts/pyproject.toml
+            scripts/uv.lock
+
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: markturbo-windows-x64
+          path: release
+
+      - name: Verify the downloaded artifact
+        run: |
+          arguments=(release verify --manifest release/release.json)
+          if [[ "$RELEASE_TAG" != *-* ]]; then
+            arguments+=(--require-signature)
+          fi
+          uv run --locked --project scripts scripts/mt.py "${arguments[@]}"
+
+      - name: Render the user-first release notes
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          "$(command -v python3 || command -v python)" - "$TAG" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          tag = sys.argv[1]
+          version = tag.removeprefix("v")
+          manifest = json.loads(pathlib.Path("release/release.json").read_text(encoding="utf-8"))
+          if manifest["signing"] == "authenticode":
+              signing = (
+                  "This installer is Authenticode-signed. Verify the publisher, "
+                  "checksum, and release page before running it."
+              )
+          elif manifest["signing"] == "self-signed":
+              signing = (
+                  "**Self-signed test build.** This installer is signed with a "
+                  "throwaway self-signed certificate, not a publicly trusted "
+                  "Authenticode certificate. Windows does not trust it by "
+                  "default. The certificate is published as "
+                  f"`{manifest['certificate']}`; install it only on a test "
+                  "machine that should trust this build."
+              )
+          else:
+              signing = (
+                  "**Unsigned prerelease.** This installer is not "
+                  "Authenticode-signed. Treat it as a development prerelease, "
+                  "not a signed stable release."
+              )
+          replacements = {
+              "__VERSION__": version,
+              "__CHANNEL__": manifest["channel"],
+              "__SIGNING_STATE__": signing,
+              "__ARTIFACT__": manifest["artifact"],
+              "__CHECKSUM__": manifest["sha256"],
+              "__PLATFORM_STATE__": (
+                  "Windows 11 x64 is the only public-quality target. Windows 10 "
+                  "x64, macOS, and Linux remain compatibility-only, not "
+                  "public-quality platforms, and this release has no "
+                  "public-quality download for them."
+              ),
+              "__ACCEPTANCE_STATE__": (
+                  "pending. This workflow creates a draft release; clean-machine "
+                  "acceptance and owner approval are required before publication."
+              ),
+          }
+          notes = pathlib.Path(".github/release-notes.md").read_text(encoding="utf-8")
+          for placeholder, value in replacements.items():
+              notes = notes.replace(placeholder, value)
+          if "__" in notes:
+              raise SystemExit("release notes still contain an unreplaced placeholder")
+          pathlib.Path("release-notes.md").write_text(notes, encoding="utf-8")
+          PY
+
+      - name: Create or update the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ env.RELEASE_TAG }}
-          ASSET: release/${{ env.RELEASE_ASSET }}
         run: |
           VERSION="${TAG#v}"
           prerelease=()
           if [[ "$VERSION" == *-* ]]; then
             prerelease=(--prerelease --latest=false)
           fi
+          assets=(release/MarkTurbo-Setup-"$VERSION".exe release/MarkTurbo-Setup-"$VERSION".exe.sha256 release/release.json)
+          certificate="$(jq -r '.certificate // empty' release/release.json)"
+          if [[ -n "$certificate" ]]; then
+            assets+=("release/$certificate")
+          fi
 
           if release="$(gh release view "$TAG" --json isDraft,assets)"; then
-            is_draft="$(jq -r '.isDraft' <<< "$release")"
-            gh release upload "$TAG" "$ASSET" --clobber
-            while IFS= read -r asset; do
-              if [[ -n "$asset" && "$asset" != "$RELEASE_ASSET" ]]; then
-                gh release delete-asset "$TAG" "$asset" --yes
-              fi
-            done < <(jq -r '.assets[]?.name' <<< "$release")
-            if [[ "$is_draft" == "true" ]]; then
-              gh release edit "$TAG" --draft=false
+            if [[ "$(jq -r '.isDraft' <<< "$release")" != "true" ]]; then
+              echo "error: refusing to replace assets of published release $TAG" >&2
+              exit 1
             fi
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            while IFS= read -r asset; do
+              case "$asset" in
+                MarkTurbo-Setup-"$VERSION".exe|MarkTurbo-Setup-"$VERSION".exe.sha256|release.json|MarkTurbo-Setup-"$VERSION".cer) ;;
+                *) gh release delete-asset "$TAG" "$asset" --yes ;;
+              esac
+            done < <(jq -r '.assets[]?.name' <<< "$release")
+            gh release edit "$TAG" --title "MarkTurbo $VERSION" --notes-file release-notes.md
           else
-            gh release create "$TAG" "$ASSET" \
+            gh release create "$TAG" "${assets[@]}" \
+              --draft \
               --verify-tag \
-              --generate-notes \
+              --title "MarkTurbo $VERSION" \
+              --notes-file release-notes.md \
               "${prerelease[@]}"
           fi

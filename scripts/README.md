@@ -69,6 +69,10 @@ uv run --project scripts scripts/mt.py evaluation scaffold --evidence docs/evide
 uv run --project scripts scripts/mt.py evaluation record --owner-input-dir <owner-local-dir> --evidence docs/evidence/goal-06/evaluation.json
 uv run --project scripts scripts/mt.py revision-evaluation scaffold --evidence docs/evidence/goal-07-revision.json
 uv run --project scripts scripts/mt.py revision-evaluation record --owner-input-dir <owner-local-dir> --evidence docs/evidence/goal-07-revision.json
+uv run --project scripts scripts/mt.py release versions --tag v<version>
+uv run --project scripts scripts/mt.py release package --out dist --no-sign
+uv run --project scripts scripts/mt.py release package --out dist --self-signed
+uv run --project scripts scripts/mt.py release verify --manifest dist/release.json
 uv run --project scripts scripts/mt.py accept goal-02 -- --help
 uv run --project scripts scripts/mt.py accept goal-03 -- --help
 uv run --project scripts scripts/mt.py accept goal-06 -- --help
@@ -83,6 +87,17 @@ fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence.
+
+`release` owns the Windows installer contract. `versions` requires Cargo,
+`crates/mt-app/nsh.json` and the release tag to agree; `package` runs
+`nsh package --target windows`, verifies embedded fonts and sample entries,
+stages the license and third-party notices, and compiles
+`installer/markturbo.iss` with Inno Setup; `verify` rechecks the checksum,
+manifest inventory and signing policy. Stable releases require Authenticode
+credentials; an unsigned prerelease is allowed and labeled. These commands do
+not launch the app or prove clean-machine acceptance. `--self-signed` creates a
+throwaway test certificate and publishes its `.cer`; it is not trusted
+Authenticode and cannot satisfy stable publication.
 
 Goal 02/03/06/07 acceptance defaults write working receipts under the ignored
 `target/native-acceptance/` directory, including failed and single-case runs.

@@ -18,6 +18,7 @@ use crate::state::{AppState, Pane, Tab, language_for_path};
 /// The application's root component.
 #[component]
 pub fn App() -> impl IntoElement {
+    crate::logging::init();
     let state = AppState::new();
     if let Some(path) = std::env::var_os("MARKTURBO_OPEN").map(PathBuf::from) {
         if path.is_dir() {

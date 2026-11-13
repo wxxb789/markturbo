@@ -303,8 +303,8 @@ which is what lets one rendered formula serve twelve themes and follow the OS
 light/dark switch without re-rendering.
 
 **The release executable embeds its resources.** The nineteen KaTeX faces and
-bundled sample are compiled into `markturbo-windows-x64.exe`, which is the sole
-CD artifact. Source files remain under `fonts/katex/` and `sample/` for
+bundled sample are compiled into `MarkTurbo.exe`, which the Windows installer
+packages. Source files remain under `fonts/katex/` and `sample/` for
 reproducible builds, licensing, and development. A release runtime must not
 depend on a sibling fonts directory or workspace checkout. PlantUML remains the
 one optional external renderer and reports `Missing` with an install hint.

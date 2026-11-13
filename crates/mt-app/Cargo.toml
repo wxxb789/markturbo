@@ -25,6 +25,7 @@ model-transport = ["mt-core/model-transport"]
 mt-core.workspace = true
 
 env_logger.workspace = true
+log.workspace = true
 markdown.workspace = true
 encoding_rs.workspace = true
 dirs.workspace = true
