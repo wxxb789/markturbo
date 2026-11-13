@@ -83,8 +83,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     );
 
     app.press("text:Save").expect("save translation");
-    let saved = std::fs::read_to_string(&document).expect("read saved file");
-    assert!(saved.contains("你好"), "translation not saved: {saved:?}");
+    wait_for_saved_document(&mut app, &document, "你好", Duration::from_secs(20));
 
     if app.shows("More layouts") {
         app.press("text:More layouts")
@@ -113,16 +112,33 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
         .expect("save all and quit");
 
-    let saved = std::fs::read_to_string(&document).expect("read translated file");
-    assert!(
-        saved.contains("你好，再见"),
-        "Quit lost the translation received during its dialog: {saved:?}"
-    );
-    let saved = std::fs::read_to_string(&other).expect("read other file");
-    assert!(
-        saved.contains("Unsaved edit."),
-        "Quit lost the original dirty tab"
-    );
+    wait_for_saved_document(&mut app, &document, "你好，再见", Duration::from_secs(20));
+    wait_for_saved_document(&mut app, &other, "Unsaved edit.", Duration::from_secs(20));
+}
+
+/// Waits until the document on disk carries `needle` while pumping frames: a
+/// press can reach its button, and a save can land, after the assertion would
+/// have read the file.
+fn wait_for_saved_document(
+    app: &mut Headless,
+    document: &std::path::Path,
+    needle: &str,
+    timeout: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let saved = std::fs::read_to_string(document).expect("read saved file");
+        if saved.contains(needle) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Save never wrote {needle:?}: {saved:?} with {:?} on screen",
+            app.screen().texts()
+        );
+        app.next_change(Duration::from_millis(25))
+            .expect("settle while the save lands");
+    }
 }
 
 /// Waits for the app to show a dialog while pumping its frames: `request_quit`
