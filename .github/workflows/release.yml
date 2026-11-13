@@ -260,7 +260,7 @@ jobs:
         env:
           TAG: ${{ env.RELEASE_TAG }}
         run: |
-          python3 - "$TAG" <<'PY'
+          "$(command -v python3 || command -v python)" - "$TAG" <<'PY'
           import json
           import os
           import pathlib
