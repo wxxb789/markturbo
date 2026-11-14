@@ -108,6 +108,13 @@ Implemented migration boundary:
 See `docs/development.md` for the targeted command and testing boundary. No
 application performance or production binary-size improvement is claimed.
 
+The GPUI shell and its acceptance adapters are retired (see the Goal 09
+acceptance record), so the native items this section still records as pending —
+the Kit native acceptance and the focused Windows CJK/IME, selection/undo,
+clipboard, save-dialog and WebView-focus acceptance against that artifact — can
+no longer be produced. They are carried by the retired-native-acceptance-adapter
+entry in [TODO.md](TODO.md) instead of staying open here.
+
 Sources: [published Kit 0.6.6](https://docs.rs/crate/gpui-kit/0.6.6),
 [registry metadata](https://crates.io/api/v1/crates/gpui-kit),
 [published Kit source](https://docs.rs/crate/gpui-kit/0.6.6/source/), and the
