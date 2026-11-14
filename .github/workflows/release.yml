@@ -132,7 +132,26 @@ jobs:
 
       - name: Verify the nsh CLI matches the pinned runtime
         run: |
-          $installed = (nsh --version) -replace '^nsh\s+', '' -replace '\s.*$'
+          # Mirror `nsh_executable()` in mt.py release: NSH, then PATH, then the
+          # installer's directory, because the installer only updates PATH for
+          # shells started after it.
+          $nsh = $env:NSH
+          if ($nsh -and -not (Test-Path $nsh)) {
+            throw "NSH points at a missing executable: $nsh"
+          }
+          if (-not $nsh) {
+            $nsh = (Get-Command nsh -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $nsh) {
+            $candidate = Join-Path $env:LOCALAPPDATA 'nsh\bin\nsh.exe'
+            if (Test-Path $candidate) {
+              $nsh = $candidate
+            }
+          }
+          if (-not $nsh) {
+            throw "the nsh CLI was not found after installation"
+          }
+          $installed = (& $nsh --version) -replace '^nsh\s+', '' -replace '\s.*$'
           $pinned = (Select-String -Path crates/mt-app/Cargo.toml -Pattern '^nsh-core = "([^"]+)"').Matches[0].Groups[1].Value
           if (-not $installed -or $installed -ne $pinned) {
             throw "nsh CLI '$installed' does not match the pinned nsh-core '$pinned'; packaging would compile a different runtime"
