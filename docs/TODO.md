@@ -41,7 +41,10 @@
   unit-tests them. Decide per adapter whether to rebuild on the nsh UIA surface
   or delete the adapter, its module, and its `ACCEPTANCE_GOALS` entry, so the
   CLI stops advertising an acceptance path that cannot pass. Revalidate the
-  candidate before removing anything.
+  candidate before removing anything. This entry also owns the stale pending
+  native items in [dependency-review.md](dependency-review.md): the GPUI/Kit
+  artifact's native acceptance and its focused Windows CJK/IME, selection/undo,
+  clipboard, save-dialog and WebView-focus acceptance can no longer be produced.
 - [ ] **Release renewal after the archived Goal 10/11 sequence** — On
   2026-11-14 the owner archived Goals 10 and 11 as execution deferred, not
   accepted: the product is not considered ready, no target users are available
@@ -62,3 +65,47 @@
   See [goal-10-acceptance.md](goal-10-acceptance.md) and the archived
   [Goal 10](goals/archive/10-ship-primary-platform-release.md) and
   [Goal 11](goals/archive/11-validate-recurring-user-value.md).
+- [ ] **Collapsed Source pane for every document** — Measured on 2026-11-14 on
+  the packaged runner and on the installed `0.1.4-alpha.5`: the editor reports a
+  **0×25** rectangle with an empty UIA value even after the Edit/Markdown-source
+  toggle and after maximizing, for both a file-backed open and a `New`
+  document, so it is not specific to the file-open path. `ValuePattern` still
+  accepted and stored 44 UTF-8 bytes and the buffer was checkpointed, so the
+  editing path works and the failure is layout/accessibility. Deciding whether
+  it is a disconnected-session artifact or a real defect needs an **active,
+  unlocked desktop**; do that before any future release, keeping the installed
+  executable, document and profile unchanged, and record the result without
+  converting the recorded failure into a pass. Evidence:
+  [goal-10-acceptance.md](goal-10-acceptance.md) environment dispositions 2, 3
+  and 7 plus its post-acceptance fixes section.
+- [ ] **Finish verifying the uninstall close helper** — `close-instances.ps1`
+  aborts the uninstall while an instance still responds and force-closes only
+  pinned, path-checked unresponsive survivors. Measured: a run with no instance
+  exits 0, and a silent uninstall with a running instance completed with exit 0
+  without a force-kill while that instance's recovery checkpoints survived.
+  Still unexercised: the **abort** path (the app closes on `WM_CLOSE` without
+  the interactive save/discard guard, so nothing in the disconnected session
+  refused the close) and the kill path for an unresponsive survivor. Exercise
+  both on a live session; if the app should prompt on a close request, fix the
+  app rather than the helper.
+- [ ] **Unattended native acceptance runner** — the Goal 10 sessions ran in a
+  disconnected desktop where `SendInput` inserts zero events, `SetCursorPos`
+  fails, `GetForegroundWindow` is None, the clipboard is unavailable and the
+  visual matrix returns blank cells for low-content states, while the harness
+  itself requires an active, unlocked input desktop
+  (`scripts/markturbo_tools/native/runtime.py:973-998,1393`). Measured on
+  2026-11-14: Windows **virtual desktops do not isolate input** (`EnumDesktops`
+  returns only `Default`), `tscon <id> /dest:console` needs administrator rights
+  (Error 5 on this machine), `Get-VM` is permission-denied and this account has
+  no admin rights. The realistic unattended arrangement is a dedicated Hyper-V
+  Windows 11 x64 guest whose own logged-in desktop runs the app, UIA, input and
+  capture, with fresh baseline restores for install acceptance; it needs
+  one-time elevation to provision and cannot replace the human items
+  (keyboard/Narrator smoke, five first-time users, owner approval).
+- [ ] **Decide whether installer support files belong in `release.json`** —
+  `installer/close-instances.ps1` is installed into `{app}\installer-support\`
+  from a direct `[Files]` source outside the staged payload directory, so it is
+  part of the installed application files but absent from the manifest payload
+  inventory (`scripts/markturbo_tools/release.py:281-285,771`). Either stage it
+  with the payload so the inventory covers every installed file, or document the
+  exclusion in the release-notes template; decide before the next candidate.
