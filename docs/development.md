@@ -32,10 +32,55 @@ revision, not commands to rerun every time. CLAUDE.md links to AGENTS.md.
 `check fast` does not validate Rust. `check doc` does not validate `mt-app`.
 `check native` validates only native acceptance harness code; it does not run a
 desktop or an executable. Neither `check ci` nor `check full` launches a GUI.
-Cross-platform CI compiles and tests the nsh app on Windows, macOS and Linux;
-the separate macOS arm64 PR job checks the arm64 slice and runs the headless
-suite, not native acceptance or an installable `.app`. Windows 11 x64 remains
-the public-quality target.
+
+Per-PR CI runs one platform per tier instead of the workspace suite on every
+platform, and it splits `check ci` into parallel shards. Linux keeps the
+authoritative Rust gate, now as four jobs that run the same commands `check ci`
+runs locally: `preflight` (`check fast` plus `cargo fmt --all -- --check`),
+`clippy` (`cargo clippy --profile ci --workspace --all-targets --locked`),
+`mt-core tests` (`cargo test --profile ci -p mt-core --features
+model-transport,test-support --locked`) and `mt-app tests` (`cargo test
+--profile ci -p mt-app --locked`). Every heavier job needs `preflight`, so a
+whitespace or formatting error fails in about two minutes instead of after the
+workspace has compiled. Windows 11 x64 runs the app/UI suite (`cargo test
+--locked --profile ci -p mt-app -p mt-core`); the separate `macos-15` arm64 job
+builds the release executable, verifies the Mach-O arm64 slice and runs
+`cargo test --locked --profile ci -p mt-core`. The macOS workspace suite and the
+release-profile app suite no longer run per PR: `.github/workflows/nightly.yml`
+(schedule plus manual dispatch) reruns the combined `check ci` on
+`ubuntu-24.04`, `cargo test --locked --profile ci --workspace` and
+`cargo test --release --locked -p mt-app` on `macos-15` and `windows-2022`, as a
+non-blocking safety net rather than a PR gate. It is also what saves the
+rust-cache entries the PR jobs restore; PR jobs only restore. The PR workflow
+classifies the diff before it spends runner time, in two steps. When every
+changed path is under `docs/**` or is a Markdown file, only `preflight` runs and
+the Rust jobs are skipped; a draft pull request stops at `preflight` as well.
+Among code changes, the expensive app suites and the cross-platform builds
+additionally require a path that can change what a Rust build produces
+(`crates/**`, `vendor/**`, a Cargo manifest or lock, `rust-toolchain*`), so a
+script-, installer- or workflow-only change runs only `preflight`, `clippy` and
+the `mt-core` shard while the nightly workflow keeps the full combinations
+covered. None of these jobs is native acceptance, and none produces an
+installable `.app`. Windows 11 x64 remains the public-quality target.
+
+### Local-first loop
+
+This machine is several times faster than a CI runner, so the fast path is to
+run the affected tier before pushing and let CI confirm it. Measured on the
+development desktop (Windows 11 x64, 16 cores, warm `target/ci`):
+
+```sh
+cargo test --locked --profile ci -p mt-app        # ~1 min, app/UI behavior
+cargo test --locked --profile ci -p mt-core       # core behavior
+cargo test --locked --profile ci --workspace      # whole workspace, ~3.5 min
+uv run --locked --project scripts scripts/mt.py check ci   # the PR gate
+```
+
+For comparison, a code pull request spends roughly 15-18 minutes in CI and a
+documentation-only one about 2-3. `.githooks/pre-push` is an opt-in guard for the
+cheap failures; enable it per clone with `git config core.hooksPath .githooks`.
+It runs `check fast` and the formatting check only, and the push can still be
+forced with `--no-verify`.
 
 The verification layering, invariant ownership and rules for adding tests live
 in [validation](verification.md). In short: current product/tooling contracts run

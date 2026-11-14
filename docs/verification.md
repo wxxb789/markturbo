@@ -32,13 +32,59 @@ wiring, while `mt-core` tests proposal validation and consent semantics.
 | Static | `cargo fmt --check`, `cargo clippy` | compile/lint | settled Rust change |
 | Tooling contracts | `mt.py check fast` | current Python validation tooling in deterministic shards | docs/tooling |
 | Headless core | `mt.py check doc` | fast + optimized `mt-core` tests | core logic |
-| Workspace | `mt.py check ci` | fast + fmt/clippy + workspace tests, including headless app tests | settled product change |
+| Workspace | `mt.py check ci` | fast + fmt/clippy + workspace tests, including headless app tests | settled product change; Ubuntu per PR |
 | Native-harness unit tests | `mt.py check native` | native acceptance tooling only; no desktop or executable | native harness change |
 | Release | `mt.py check full` | release profile + build + privacy scan | release candidate |
 | Native acceptance | `mt.py accept <goal> -- ...` | active Windows desktop, final executable hash | milestone |
 
 `check native` is not acceptance. Native acceptance remains a separate,
 hash-bound milestone action and may be BLOCKED by the desktop/session.
+
+### Per-PR pipeline
+
+`.github/workflows/pull-request.yml` classifies the diff before it spends runner
+time: a changed path is documentation only when it is under `docs/**` or ends in
+`.md`, and everything else (`.github/**`, `crates/**`, `scripts/**`,
+`installer/**`, the Cargo manifests) is code. Within code changes it also marks
+whether anything can change what a Rust build produces (`crates/**`,
+`vendor/**`, a Cargo manifest or lock, `rust-toolchain*`); the app suites and the
+cross-platform builds require that second flag, so script-, installer- and
+workflow-only changes keep the cheap Linux checks and leave the expensive
+combinations to the nightly workflow. An unresolvable range falls back to
+running everything.
+
+| Job | Trigger | Command |
+| --- | --- | --- |
+| Classify changed paths | every pull request | `git fetch --no-tags --depth=1 origin "$BASE_SHA"` then name-only base..head classification |
+| preflight (fast + format) | every pull request | `check fast` over the same base..head range, then `cargo fmt --all -- --check` |
+| clippy (Linux) | code changes, not a draft | `cargo clippy --profile ci --workspace --all-targets --locked` |
+| mt-core tests (Linux) | code changes, not a draft | `cargo test --profile ci -p mt-core --features model-transport,test-support --locked` |
+| mt-app tests (Linux) | Rust changes, not a draft | `cargo test --profile ci -p mt-app --locked` |
+| macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, `cargo test --profile ci -p mt-core --locked`, `lipo -archs` |
+| release-tests (windows-2022) | Rust changes, not a draft | `cargo test --locked --profile ci -p mt-app -p mt-core` |
+
+The three Linux Rust jobs are the pieces of `check ci`, split so the wall clock
+is the slowest shard instead of the sum: `check fast` and formatting in
+`preflight`, clippy, then the workspace suite as `mt-core` plus `mt-app`. The
+`mt-core` shard names `model-transport,test-support` because `--workspace`
+resolves that feature set for it through mt-app; a bare `-p mt-core` would skip
+its model-transport tests and its `required-features` evaluation binary. Every
+heavier job needs `preflight`, so a whitespace or formatting error fails in
+about two minutes instead of after the workspace has compiled. A
+documentation-only pull request pays only for the classifier and `preflight`,
+and a draft pull request stops there too; the skipped jobs still report success,
+so a required-check list keeps working.
+
+Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
+app/UI headless suite on the public-quality platform, and macOS the arm64
+release build plus headless `mt-core` behavior under default features. The
+combinations that used to repeat on every platform run once a day in
+`.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
+`cargo test --locked --profile ci --workspace` and
+`cargo test --release --locked -p mt-app` on `macos-15` and `windows-2022`);
+the scheduled run is a non-blocking safety net and never gates a merge. It is
+also the only writer of the rust-cache entries the pull-request jobs restore, so
+per-PR jobs restore from the default branch instead of each paying a cache save.
 
 ## Rules for adding verification
 
