@@ -1,0 +1,113 @@
+name: Nightly
+
+# The pull-request pipeline runs one platform per tier, and its jobs restore
+# caches without saving them, so this workflow is also what keeps the default
+# branch's rust-cache entries warm for every pull request. The combinations
+# that no longer run per pull request run here once a day as a non-blocking
+# safety net: they are not a pull-request check and never gate a merge.
+# It is also the plain `cargo test` backstop: the per-pull-request app suites
+# use `cargo nextest`, which does not run doctests.
+on:
+  schedule:
+    # Off-peak and off the top of the hour, away from GitHub's cron peak.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: nightly-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Re-runs the combined tier the pull-request pipeline splits into the clippy,
+  # mt-core and mt-app shards, and saves `markturbo-linux` for them.
+  linux-check:
+    name: check ci (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            scripts/pyproject.toml
+            scripts/uv.lock
+
+      - name: Install Rust, rustfmt and clippy
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-linux
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            clang \
+            libclang-dev \
+            libgtk-4-dev \
+            libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good
+
+      - name: Check
+        run: uv run --locked --project scripts scripts/mt.py check ci
+
+  # The workspace suite and the release-profile app suite on the two platforms
+  # that no longer run them per pull request. The shared keys are the ones the
+  # pull-request jobs restore, so this job also warms the release artifacts the
+  # macOS arm64 job would otherwise rebuild.
+  heavy-tests:
+    name: heavy tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            cache: macos-arm64
+          - runner: windows-2022
+            cache: windows
+    runs-on: ${{ matrix.runner }}
+    # The release-profile suite alone measured 3082 s on macOS, so the 20-45
+    # minute pull-request bounds do not apply here; this only stops a hang.
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-${{ matrix.cache }}
+
+      - name: Test the workspace
+        run: cargo test --locked --profile ci --workspace
+
+      - name: Test the app in the release profile
+        run: cargo test --release --locked -p mt-app

@@ -109,3 +109,28 @@
   inventory (`scripts/markturbo_tools/release.py:281-285,771`). Either stage it
   with the payload so the inventory covers every installed file, or document the
   exclusion in the release-notes template; decide before the next candidate.
+- [ ] **Merge the mt-app integration test binaries** — `crates/mt-app/tests/`
+  holds roughly twenty one- or two-test files, and each links the whole app, so
+  link time and per-process startup dominate the suite rather than the
+  assertions (measured 2026-11-15: the warm `--profile ci -p mt-app` run takes
+  about a minute locally, and the Windows per-PR job spends most of its time in
+  compilation and linking). Consolidating them behind one `tests/all.rs` with
+  `autotests = false`, or adopting `cargo nextest` for cross-binary parallelism,
+  would cut both costs. Treat it as its own small goal inside the upcoming UI
+  iteration, and keep `cargo test` as the local command either way.
+- [ ] **The `mt-core` `skill_save_*` tests fail when `mt-core` runs alone on
+  macOS** — `cargo test --profile ci -p mt-core` failed eight
+  `document::io::tests::skill_save_*` / `relocated_skill_root` /
+  `skill_recreation` concurrent-save tests on the macOS arm64 job with default
+  features (run 43630038928: 627 passed, 8 failed) **and** with
+  `--features model-transport,test-support` (run 43631880761: 672 passed, 8
+  failed), reporting `ConcurrentCommit … Indeterminate` and mismatched preserved
+  bytes. The same tests pass in the Linux shard and passed on that same runner in
+  the `--workspace` form (job 132527749238 printed `skill_save_preserves_in_place_
+  writer_bytes_after_the_final_precheck ... ok`). They inject the writer race
+  through `install_skill_before_exchange_hook`, so this is not timing luck: the
+  invocation shape changes the outcome. Reproduce both commands on one macOS
+  machine and either make the family invocation-independent or find the real
+  difference in the shared commit path. The per-pull-request macOS job now runs
+  only the arm64 build, and the nightly `--workspace` run owns macOS behavior, so
+  nothing hides behind this gap.

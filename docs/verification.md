@@ -32,13 +32,86 @@ wiring, while `mt-core` tests proposal validation and consent semantics.
 | Static | `cargo fmt --check`, `cargo clippy` | compile/lint | settled Rust change |
 | Tooling contracts | `mt.py check fast` | current Python validation tooling in deterministic shards | docs/tooling |
 | Headless core | `mt.py check doc` | fast + optimized `mt-core` tests | core logic |
-| Workspace | `mt.py check ci` | fast + fmt/clippy + workspace tests, including headless app tests | settled product change |
+| Workspace | `mt.py check ci` | fast + fmt/clippy + workspace tests, including headless app tests | settled product change; Ubuntu per PR |
 | Native-harness unit tests | `mt.py check native` | native acceptance tooling only; no desktop or executable | native harness change |
 | Release | `mt.py check full` | release profile + build + privacy scan | release candidate |
 | Native acceptance | `mt.py accept <goal> -- ...` | active Windows desktop, final executable hash | milestone |
 
 `check native` is not acceptance. Native acceptance remains a separate,
 hash-bound milestone action and may be BLOCKED by the desktop/session.
+
+### Per-PR pipeline
+
+`.github/workflows/pull-request.yml` classifies the diff before it spends runner
+time: a changed path is documentation only when it is under `docs/**` or is a
+Markdown file at the repository root, because `sample/` is embedded into the
+executable and `fixtures/` is read by tests; everything else (`.github/**`,
+`crates/**`, `scripts/**`, `installer/**`, `sample/**`, `fixtures/**`, the Cargo
+manifests) is code. Within code changes it also marks whether anything can
+change what a Rust build produces (`crates/**`, `vendor/**`, `sample/**`,
+`.github/workflows/**`, a Cargo manifest or lock, `rust-toolchain*`); the app
+suites and the cross-platform builds require that second flag, so changes to
+scripts, the installer or other workflow files keep the cheap Linux checks and
+leave the expensive combinations to the nightly workflow. A workflow change
+counts as Rust work on purpose: it alters how the suite runs, so it must exercise
+the pipeline it changes. An unresolvable range falls back to running everything.
+The workflow also listens for `ready_for_review`, so marking a pull request ready
+runs the Rust checks that its draft pushes skipped.
+
+| Job | Trigger | Command |
+| --- | --- | --- |
+| Classify changed paths | every pull request | `git fetch --no-tags --depth=1 origin "$BASE_SHA"` then name-only base..head classification |
+| preflight (fast + format) | every pull request | `check fast` over the same base..head range, then `cargo fmt --all -- --check` |
+| clippy (Linux) | code changes, not a draft | `cargo clippy --profile ci --workspace --all-targets --locked` |
+| mt-core tests (Linux) | code changes, not a draft | `cargo test --profile ci -p mt-core --features model-transport,test-support --locked` |
+| mt-app tests (Linux) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app` |
+| macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, then `lipo -archs target/release/markturbo` must list arm64 |
+| release-tests (windows-2022) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core` |
+
+The app suites run under `cargo nextest`, which starts the twenty-odd test
+binaries in parallel instead of one process at a time (measured 22 s against
+57 s for the app suite on the development desktop). nextest does not run
+doctests; the workspace has none today (the CI log shows no `Doc-tests` harness
+and `cargo test --doc --workspace` compiles a separate unit set for zero tests,
+measured 11m33s), so the nightly `check ci` run keeps the plain `cargo test` path
+as the backstop for any doctest added later instead of paying that compile in
+every pull request. The `mt-core` shard keeps plain `cargo test`, so mt-core
+doctests would still run per pull request if any were added.
+
+The three Linux Rust jobs are the pieces of `check ci`, split so the wall clock
+is the slowest shard instead of the sum: `check fast` and formatting in
+`preflight`, clippy, then the workspace suite as `mt-core` plus `mt-app`. The
+`mt-core` shard names `model-transport,test-support` because `--workspace`
+resolves that feature set for it through mt-app; a bare `-p mt-core` would skip
+its model-transport tests and its `required-features` evaluation binary. Every
+heavier job needs `preflight`, so a whitespace or formatting error fails in
+about two minutes instead of after the workspace has compiled. A
+documentation-only pull request pays only for the classifier and `preflight`,
+and a draft pull request stops there too; the skipped jobs still report success,
+so a required-check list keeps working.
+
+Linking is not the bottleneck, so the toolchain stays default: relinking every
+mt-app test binary with the MSVC linker takes 29.5 s on the development desktop
+(16 cores, warm cache), and pointing `CARGO_TARGET_*_LINKER` at `rust-lld` both
+invalidated the build fingerprint and produced no comparable measurement.
+
+Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
+app/UI headless suite on the public-quality platform, and macOS the arm64 release
+artifact. macOS behavior runs in the nightly instead of per pull request: a
+per-pull-request `cargo test -p mt-core` on that runner failed eight
+`document::io::tests::skill_save_*` concurrent-save tests in both feature
+configurations (runs 43630038928 and 43631880761) while the nightly-form
+`cargo test --workspace` run passed the same tests (job 132527749238 printed
+`... ok`). That difference is recorded in `docs/TODO.md` as a question about the
+tests and the shared commit path, not as a platform flake, and the per-pull-request
+job keeps only the evidence its name claims. The
+combinations that used to repeat on every platform run once a day in
+`.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
+`cargo test --locked --profile ci --workspace` and
+`cargo test --release --locked -p mt-app` on `macos-15` and `windows-2022`);
+the scheduled run is a non-blocking safety net and never gates a merge. It is
+also the only writer of the rust-cache entries the pull-request jobs restore, so
+per-PR jobs restore from the default branch instead of each paying a cache save.
 
 ## Rules for adding verification
 

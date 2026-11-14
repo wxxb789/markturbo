@@ -29,27 +29,32 @@ deferred in [TODO](TODO.md).
 
 ### macOS arm64 PR compatibility check
 
-The pull-request workflow has a dedicated `macos-15` arm64 job. It builds the
-locked `mt-app` release executable and runs the nsh headless acceptance suite
-(`cargo test -p mt-app`), then verifies the Mach-O arm64 slice. The old
-GPUI startup-trace launch check was removed with the GPUI shell; a native
-first-frame check on the nsh backend remains a pending acceptance step.
+The pull-request workflow has a dedicated `macos-15` arm64 job, skipped for a
+documentation-only pull request. It builds the locked `mt-app` release
+executable, verifies the Mach-O arm64 slice, and runs the headless `mt-core`
+suite (`cargo test --locked --profile ci -p mt-core`). The headless `mt-app`
+suite runs per pull request on Linux (`check ci`) and Windows
+(`release-tests`), and on macOS in the nightly workflow, which also runs the
+release-profile `mt-app` suite on Windows. The old GPUI startup-trace launch
+check was removed with the GPUI shell; a native first-frame check on the nsh
+backend remains a pending acceptance step.
 
-This is evidence only that a source-built executable reached its own
-first-frame milestone on the hosted CI runner. It is not a screenshot or a
-general usability check, and does not verify the binary reported by a user,
-other macOS versions or Macs, a `.app` bundle, Developer ID signing,
-notarization, or a published macOS artifact. The Windows executable remains
-the only public release asset; this check does not add a macOS release
-contract. The reported failure to run a macOS arm64 binary on a user's Mac
-remains undiagnosed; even a passing first-frame check would not identify that
-artifact's failure.
+This is evidence only that a locked source build produces an arm64 Mach-O
+executable and that the headless `mt-core` suite passes on the hosted CI
+runner. It is not a screenshot or a general usability check, and does not
+verify the binary reported by a user, other macOS versions or Macs, a `.app`
+bundle, Developer ID signing, notarization, or a published macOS artifact. The
+Windows executable remains the only public release asset; this check does not
+add a macOS release contract. The reported failure to run a macOS arm64 binary
+on a user's Mac remains undiagnosed; even a passing architecture check would
+not identify that artifact's failure.
 
-The startup check opens no document, so it does not construct or navigate a
-WKWebView. On macOS, failure to obtain the window handle or create the child
-WKWebView is shown persistently in the affected Web pane with an explicit Retry
-button, without exposing document content or paths. A replacement document
-has its own failure identity. Errors are also handled if the pinned Wry API
+The headless `mt-app` start used by the nightly macOS run opens no document, so
+it does not construct or navigate a WKWebView. On macOS, failure to obtain
+the window handle or create the child WKWebView is shown persistently in the
+affected Web pane with an explicit Retry button, without exposing document
+content or paths. A replacement document has its own failure identity. Errors
+are also handled if the pinned Wry API
 returns an immediate `Err`, but its `load_url` returns `Ok` after dispatching
 the request, and script evaluation does not report its asynchronous `NSError`;
 `PageLoadEvent` has no failure variant. A navigation that fails after dispatch
@@ -58,9 +63,11 @@ Web-preview interaction on a Mac remains unverified by this CI check.
 
 Apple silicon requires a valid executable signature, but the ad-hoc signature
 normally created by the linker is not a Developer ID distribution signature.
-The CI check validates signature integrity without re-signing; it does not
-establish Gatekeeper approval for a downloaded file. macOS bundle staging,
-Developer ID signing, notarization and Finder launch are not implemented by
+The PR job only reads the Mach-O architecture and never executes the binary, so
+signature integrity is exercised by the macOS app tests the nightly workflow
+runs headlessly and without re-signing; nothing in CI establishes Gatekeeper
+approval for a downloaded file. macOS bundle staging, Developer ID signing,
+notarization and Finder launch are not implemented by
 this Windows-only release pipeline. See [Apple's signing requirement](https://developer.apple.com/documentation/macos-release-notes/macos-big-sur-11_0_1-universal-apps-release-notes)
 and [notarization contract](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
 

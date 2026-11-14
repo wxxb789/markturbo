@@ -1,7 +1,11 @@
 name: Pull request
 
 on:
-  pull_request: {}
+  pull_request:
+    # `ready_for_review` matters: without it a pull request whose last push
+    # happened while it was a draft would keep the Rust checks skipped forever,
+    # because the default activity types are only opened/synchronize/reopened.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: pull-request-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -11,9 +15,281 @@ permissions:
   contents: read
 
 jobs:
+  # The only job whose result decides whether the Rust jobs are needed. It must
+  # never downgrade a code change to a documentation-only one, so a range it
+  # cannot resolve falls back to `code=true`; the checking jobs repeat the same
+  # fetch and fail the run when the range is genuinely broken.
+  classify:
+    name: Classify changed paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      rust: ${{ steps.classify.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Classify the diff
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # `git diff --no-renames` lists both sides of a rename, so a rename
+          # across the documentation boundary cannot hide a code path.
+          # Documentation is `docs/**` and Markdown files at the repository
+          # root, nothing else: `sample/` is embedded into the executable and
+          # `fixtures/` is read by tests, so a Markdown file under them is a
+          # build or test input rather than documentation.
+          #
+          # `code` keeps the cheap Linux checks (clippy, core tests) for every
+          # non-documentation change; `rust` additionally requires a path that
+          # can change what a Rust build produces, so the expensive app suites
+          # and the cross-platform builds stay off script-, installer- and
+          # workflow-only changes. The nightly run covers those combinations.
+          code=true
+          rust=true
+          if git fetch --no-tags --depth=1 origin "$BASE_SHA" &&
+             git cat-file -e "$BASE_SHA^{commit}" &&
+             test "$(git rev-parse HEAD)" = "$HEAD_SHA" &&
+             paths="$(git -c core.quotepath=false diff --no-renames --name-only "$BASE_SHA" HEAD)"; then
+            code=false
+            rust=false
+            while IFS= read -r path; do
+              [[ -z "$path" ]] && continue
+              # Documentation is docs/** plus Markdown at the repository root.
+              # Everything else - .github/, crates/, scripts/, installer/,
+              # sample/, fixtures/, the Cargo manifests - is code and keeps the
+              # full cross-platform gate.
+              case "$path" in
+                docs/*) continue ;;
+                *.md) [[ "$path" == */* ]] || continue ;;
+                *) code=true ;;
+              esac
+              case "$path" in
+                # A workflow change alters how the Rust suite runs, so it must
+                # exercise the pipeline it changes; the rest can change what a
+                # build produces.
+                .github/workflows/* | crates/* | vendor/* | sample/* | Cargo.toml | Cargo.lock | */Cargo.toml | rust-toolchain*) rust=true ;;
+              esac
+            done <<< "$paths"
+            printf 'changed paths:\n%s\n' "$paths"
+          else
+            echo "::warning::could not resolve $BASE_SHA..$HEAD_SHA; running the full code gate"
+          fi
+
+          echo "changed-path classification: code=$code rust=$rust"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+
+  # Always-on and cheap: whitespace and the tooling suite over base..head plus
+  # the formatting check (`check ci` runs both before it compiles anything).
+  # Every heavier job needs this job, so a whitespace or formatting error fails
+  # in about two minutes instead of after the workspace has compiled, and a
+  # draft pull request costs only this far. It is also the whole gate a
+  # documentation-only pull request pays for.
+  preflight:
+    name: preflight (fast + format)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            scripts/pyproject.toml
+            scripts/uv.lock
+
+      - name: Install Rust and rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add rustfmt
+
+      - name: Prepare check range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git cat-file -e "$BASE_SHA^{commit}"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+
+      - name: Check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: uv run --locked --project scripts scripts/mt.py check fast
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # `mt.py check ci` runs fast, formatting, clippy and the workspace suite in
+  # one process. CI splits those same commands into parallel jobs - no check is
+  # dropped and no tier inside `scripts/` is relaxed - so the Linux wall clock is
+  # the slowest shard instead of the sum. `check ci` remains the combined local
+  # command. The three shards share one cache key, so the nightly run on the
+  # default branch warms all of them.
+  clippy:
+    name: clippy (Linux)
+    needs: [classify, preflight]
+    if: needs.classify.outputs.code == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Install Rust and clippy
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-linux
+          # Pull requests restore the default branch's cache; only the branch
+          # that owns it saves, so every PR does not pay the cache save.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            clang \
+            libclang-dev \
+            libgtk-4-dev \
+            libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good
+
+      - name: Check
+        run: cargo clippy --profile ci --workspace --all-targets --locked
+
+  core-tests:
+    name: mt-core tests (Linux)
+    needs: [classify, preflight]
+    if: needs.classify.outputs.code == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `mt-core` is the headless crate: no GTK/WebKit system libraries.
+      - name: Test
+        # Mirrors the feature set `--workspace` resolves for this crate: mt-app's
+        # default enables `mt-core/model-transport` and its dev-dependencies add
+        # `test-support`. A bare `-p mt-core` would silently skip every
+        # model-transport test and the `required-features` evaluation binary.
+        run: cargo test --profile ci -p mt-core --features model-transport,test-support --locked
+
+  app-tests:
+    name: mt-app tests (Linux)
+    needs: [classify, preflight]
+    if: needs.classify.outputs.rust == 'true' && github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: markturbo-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            clang \
+            libclang-dev \
+            libgtk-4-dev \
+            libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest
+
+      - name: Test
+        # nextest runs the twenty-odd mt-app test binaries in parallel instead of
+        # one process at a time: measured 22 s against 57 s for this suite on the
+        # development desktop, and the same order on a runner.
+        run: cargo nextest run --locked --cargo-profile ci -p mt-app
+
+  # Compatibility evidence for the arm64 build: the release binary and its Mach-O
+  # arm64 slice. Behavior on macOS runs in the nightly workflow, whose
+  # `--workspace` form is the configuration with passing evidence on that runner
+  # (a per-pull-request `-p mt-core` variant failed eight concurrent-save tests:
+  # runs 43630038928 and 43631880761, recorded in docs/TODO.md). The nightly also
+  # keeps this job's cache warm.
   macos-arm64-compatibility:
     name: macOS arm64 compatibility
+    needs: [classify, preflight]
+    if: needs.classify.outputs.rust == 'true' && github.event.pull_request.draft == false
     runs-on: macos-15
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -32,11 +308,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: markturbo-macos-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build the macOS arm64 executable
         run: cargo build --release --locked -p mt-app --bin markturbo
 
-      - name: Headless acceptance and arm64 slice
+      - name: Verify the arm64 slice
         run: |
           set -euo pipefail
           machine="$(uname -m)"
@@ -45,76 +322,17 @@ jobs:
             echo "Expected an arm64 runner; got $machine" >&2
             exit 1
           fi
-          cargo test --release --locked -p mt-app
           lipo -archs target/release/markturbo | grep -qw arm64
 
-  quality:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
-
-      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
-        with:
-          enable-cache: true
-          cache-dependency-glob: |
-            scripts/pyproject.toml
-            scripts/uv.lock
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: markturbo-linux
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            clang \
-            libclang-dev \
-            libgtk-4-dev \
-            libwebkitgtk-6.0-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-good
-
-      - name: Prepare check range
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          git cat-file -e "$BASE_SHA^{commit}"
-          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-
-      - name: Check
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: uv run --locked --project scripts scripts/mt.py check ci
-
+  # The app/UI suite on the only public-quality platform. The name is kept from
+  # the former release-profile matrix so the check stays recognizable; the
+  # workspace and release-profile runs now live in the nightly workflow.
   release-tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            cache: macos
-          - runner: windows-2022
-            cache: windows
-    runs-on: ${{ matrix.runner }}
+    name: release-tests (windows-2022)
+    needs: [classify, preflight]
+    if: needs.classify.outputs.rust == 'true' && github.event.pull_request.draft == false
+    runs-on: windows-2022
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -132,7 +350,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: markturbo-${{ matrix.cache }}
+          shared-key: markturbo-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest
 
       - name: Test
-        run: cargo test --locked --profile ci --workspace
+        # Same parallel runner; the nightly plain `cargo test` run is the
+        # doctest backstop, so no extra compile pass is needed here.
+        run: cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core

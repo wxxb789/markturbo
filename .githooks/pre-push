@@ -1,0 +1,32 @@
+#!/bin/sh
+# Opt-in pre-push guard: catches the cheap failures (whitespace, tooling tests)
+# before a pull request pays for a CI run.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# It intentionally stays fast (seconds). The Rust tiers are the developer's
+# choice locally, because this machine is several times faster than a CI runner
+# (see the local-first loop in docs/development.md):
+#   cargo test --locked --profile ci -p mt-core    # core behavior
+#   cargo test --locked --profile ci -p mt-app     # app/UI behavior
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "pre-push: running mt.py check fast"
+if ! uv run --locked --project scripts scripts/mt.py check fast; then
+    echo "pre-push: check fast failed; push aborted (use --no-verify to override)" >&2
+    exit 1
+fi
+
+if command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: checking Rust formatting"
+    if ! cargo fmt --all -- --check; then
+        echo "pre-push: cargo fmt --all -- --check failed; push aborted" >&2
+        exit 1
+    fi
+fi
+
+echo "pre-push: ok"
