@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "mt-app"
-version = "0.1.4-alpha.4"
+version = "0.1.4-alpha.5"
 dependencies = [
  "dirs",
  "encoding_rs",
@@ -3160,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "mt-core"
-version = "0.1.4-alpha.4"
+version = "0.1.4-alpha.5"
 dependencies = [
  "ab_glyph",
  "anyhow",
