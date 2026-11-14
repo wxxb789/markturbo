@@ -6,8 +6,10 @@
   09 was accepted on 2026-11-13 without the five first-time-target-user sessions
   and the Windows 11 x64 keyboard/screen-reader smoke its completion evidence
   lists. PRODUCT.md still requires the first-time-user evidence before
-  public-quality visual acceptance, so record both against the shipped artifact
-  during Goal 10's clean-machine acceptance; see
+  public-quality visual acceptance, so record both against the eventual
+  published artifact before any future public-quality release; the Goal 10
+  sequence was archived execution-deferred on 2026-11-14, so the renewal entry
+  below carries these prerequisites. See
   [goal-09-acceptance.md](goal-09-acceptance.md).
 - [ ] **Downloadable macOS arm64 app** — Build a `.app`, sign it with an Apple
   Developer ID, notarize and staple it, publish the artifact, and verify a
@@ -40,3 +42,23 @@
   or delete the adapter, its module, and its `ACCEPTANCE_GOALS` entry, so the
   CLI stops advertising an acceptance path that cannot pass. Revalidate the
   candidate before removing anything.
+- [ ] **Release renewal after the archived Goal 10/11 sequence** — On
+  2026-11-14 the owner archived Goals 10 and 11 as execution deferred, not
+  accepted: the product is not considered ready, no target users are available
+  to try it, and further UI adjustments are intended. Renewal prerequisites, in
+  order: owner authorization for a bounded UI iteration (none is recorded yet);
+  resolve the observed behavioral failures, including the collapsed Source pane
+  decided on an active desktop session; decide the signing route for the stable
+  channel; produce a new candidate with its own installer, CI, clean-machine and
+  owner-run evidence — including the keyboard/Narrator smoke, the five
+  first-time-user sessions, the credential-path four-lens Review with the Agent
+  Skill disclosure-versus-transmitted comparison, named Effective Agent Context
+  selection and the installed mixed accepted/rejected revision; publish only
+  after owner approval of the artifact, screenshots, demonstration and release
+  copy; and run Goal 11 only with a compliant cohort once the approved window
+  starts. `v0.1.4-alpha.4` and `v0.1.4-alpha.5` are retained as historical
+  unpublished candidates and must not be published, rebuilt or asset-replaced;
+  any future candidate uses a new version/tag with its own acceptance evidence.
+  See [goal-10-acceptance.md](goal-10-acceptance.md) and the archived
+  [Goal 10](goals/archive/10-ship-primary-platform-release.md) and
+  [Goal 11](goals/archive/11-validate-recurring-user-value.md).

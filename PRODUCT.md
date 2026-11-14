@@ -296,3 +296,23 @@ event summaries are deleted within 90 days after the `continue`, `revise`, or
   SHA-256 `c3deed707528c84107c55061ac069830b489e481811aac86afa9c10490bc6a8c`
   retained in `evaluation/goal-01/MIGRATION-EXCEPTION.md`; immutability resumed
   after the migrated corpus and scoring registry were fixed.
+- **Owner direction on release and validation closure, 2026-11-14, verbatim:**
+  “我们现在没有目标用户可以拿来试用，而且我觉得我们现在还完全没有 ready 的地步。我后面还希望对这个 UI 做一些调整。但是目前所有 feature 方面的功能如果完了，就把这些 goal 全部都 archive 掉。”
+  Recorded from the owner's direction to the operator on 2026-11-14; Goals 10
+  and 11 are archived as **execution deferred, not accepted** — not completed,
+  not withdrawn.
+- **Deferred:** release acceptance and publication for this sequence, including
+  any public-quality release artifact, and Goal 11's validation execution.
+- **Not waived:** user-text preservation, informed outbound-data consent,
+  credential and privacy boundaries, and the release and user-evidence
+  requirements any future public-quality release must still meet. The
+  Post-Release Validation criteria above are unchanged.
+- **Approved window reading:** the 42-day Goal 11 observation window starts at
+  the first publicly available Windows 11 x64 installer release that has
+  completed Goal 10 acceptance, received owner approval, and ships on the stable
+  channel with trusted Authenticode signatures. No such release exists today:
+  **qualifying window not started.** `v0.1.3` (portable archives, auto-generated
+  notes, no installer acceptance claim) and the `v0.1.4-alpha.*` prereleases do
+  not qualify.
+- **No UI-iteration authorization is recorded here.** The intended further UI
+  work requires its own future bounded goal; this record does not approve it.

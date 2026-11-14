@@ -1,5 +1,33 @@
 # Goal 10 — Ship a primary-platform public-quality release
 
+## Disposition
+
+**Disposition: Archived by owner direction; execution deferred, not accepted.**
+
+- **Implementation:** implemented. The candidate-specific CI, packaging and
+  native observations are recorded in
+  [goal-10-acceptance.md](../../goal-10-acceptance.md).
+- **Acceptance: not achieved.** Public-quality publication and the
+  interactive/user evidence remain unmet. Every result, failure and limitation
+  recorded in the acceptance evidence stays recorded exactly as it is.
+- In the owner's own terms, the product is not considered ready, no target users
+  are available to try it, and further UI adjustments are intended; archiving
+  closes the execution sequence and does **not** approve an artifact, authorize
+  publication, waive any criterion, or establish public-quality delivery.
+- **Owner statement, verbatim, 2026-11-14:** “我们现在没有目标用户可以拿来试用，而且我觉得我们现在还完全没有 ready 的地步。我后面还希望对这个 UI 做一些调整。但是目前所有 feature 方面的功能如果完了，就把这些 goal 全部都 archive 掉。”
+- **Provenance:** owner direction given to the operator on 2026-11-14 and
+  recorded in this archive decision the same day. This block is the archive
+  decision; the goal text below is retained unchanged, and none of its
+  requirements is checked off.
+- **Residual obligations handed to any future release:** publication and
+  published-artifact identity confirmation; keyboard/focus/Narrator smoke; five
+  first-time-user sessions; controlled credential-path four-lens Review with
+  Agent Skill disclosure/transmission equality; named Effective Agent Context
+  selection and disclosure; installed mixed accepted/rejected revision;
+  bundled-sample renderer appearance; fresh screenshots, demonstration and owner
+  approval; and the startup-guardrail clause, which remains “not assessable
+  against an approved Goal 04 guardrail; not PASS”.
+
 ## Objective
 
 Produce one publicly installable Windows 11 x64 release that installs and

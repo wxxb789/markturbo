@@ -13,10 +13,15 @@ thresholds are defined in the owner-approved [Product Contract](PRODUCT.md).
 ## Download and install
 
 Windows 11 x64 is the only public-quality release target. Windows 10 x64,
-macOS, and Linux remain compatibility-only and experimental; this release does
-not offer a public-quality download for them.
-Clean-machine acceptance and a short Review demonstration recording are pending;
-the instructions below describe the release path, not completed acceptance.
+macOS, and Linux remain compatibility-only and experimental; there is no
+public-quality download for them.
+Release status is **deferred**: on 2026-11-14 the owner archived the release
+sequence as execution deferred, not accepted — see the archived
+[Goal 10](docs/goals/archive/10-ship-primary-platform-release.md) — so no
+public-quality release is approved or published. Clean-machine acceptance and a
+short Review demonstration recording remain pending; the instructions below
+describe the release path for a future approved release, not completed or
+approved acceptance.
 
 ### Download
 
@@ -194,14 +199,17 @@ suffix, while `patch` on a prerelease promotes that core version to stable,
 matching `cargo-release` semantics. The **Release** workflow can also be run for
 an existing tag, and a manually pushed `v*` tag triggers it.
 
-The Goal 10 release path requires the locked validation gate, then packages the
-Windows installer, checksum sidecar, and `release.json` described above. The
-workflow creates or updates a **draft** release; clean-machine acceptance and
-owner approval happen before publication. Versions with a prerelease suffix
-become GitHub prereleases, and an unsigned prerelease is labeled as such.
-Stable versions require Authenticode signing, and missing signing credentials
-block publication. Packaging or CI success alone does not establish
-clean-machine acceptance; see the [release contract](docs/goals/10-ship-primary-platform-release.md).
+The archived
+[Goal 10](docs/goals/archive/10-ship-primary-platform-release.md) release path
+requires the locked validation gate, then packages the Windows installer,
+checksum sidecar, and `release.json` described above. The workflow creates or
+updates a **draft** release; clean-machine acceptance and owner approval happen
+before publication. Publication is deferred by owner direction: the goal is
+archived as execution deferred, not accepted, so the draft candidates stay
+unpublished. Versions with a prerelease suffix become GitHub prereleases, and an
+unsigned prerelease is labeled as such. Stable versions require Authenticode
+signing, and missing signing credentials block publication. Packaging or CI
+success alone does not establish clean-machine acceptance.
 
 Install the pinned release tool to use the same version logic locally:
 

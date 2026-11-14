@@ -221,3 +221,46 @@ The two operator-approved candidates from `local://goal10-todo-entry.md` are app
 - `target/native-acceptance/goal10-final/b-visual/matrix.json` and cell receipts/PNGs — emitted FAIL and independently inspected uniform failure images; synthetic fixture workspace files are also retained there.
 - `target/goal10-work/b-phase-plan.md` — ordered planned commands, not execution evidence.
 - Operator source records: `local://goal10-owner-decisions.md`, `goal10-acceptance-rehearsal.md`, `goal10-visual-blank-captures.md`, `goal10-a-baseline.md`, `goal11-metrics-verification.md`.
+
+## Owner-directed deferral addendum (2026-11-14)
+
+The project owner deferred release acceptance and publication for this evidence
+set and directed that Goals 10 and 11 be archived as **execution deferred, not
+accepted** — not completed, not withdrawn. The owner statement and its
+provenance are recorded in
+[Goal 10](goals/archive/10-ship-primary-platform-release.md) and
+[Goal 11](goals/archive/11-validate-recurring-user-value.md).
+
+This addendum changes no candidate identity, PASS/FAIL result, recorded failure,
+environment disposition, limitation or pending item above. `v0.1.4-alpha.4` and
+`v0.1.4-alpha.5` remain historical unpublished candidates: they must not be
+published, rebuilt or asset-replaced, and any future candidate uses a new
+version/tag with its own acceptance evidence. Deferral is not acceptance and not
+a waiver of any clause.
+
+## Post-acceptance fixes (measured after the acceptance run, 2026-11-14)
+
+These changes were made after the acceptance evidence was recorded above. They
+do not alter it, and they do not constitute acceptance of any clause.
+
+- **Uninstall no longer force-kills by image name.** `installer/markturbo.iss` no
+  longer carries the image-wide `taskkill`; it runs
+  `installer/close-instances.ps1`, which closes only processes whose executable
+  path is inside the installation directory, aborts the uninstall while an
+  instance still responds, and kills only pinned unresponsive survivors.
+  Verified on this machine: a silent uninstall with a running instance completed
+  with exit 0 and no force-kill; the instance's recovery checkpoints survived the
+  uninstall (3 entries in an isolated data directory); a run with no instance
+  exited 0. The app closes on `WM_CLOSE` without the interactive save/discard
+  guard and preserves recovery checkpoints; the guard path itself was not
+  exercised in the disconnected session.
+- **The plain `cargo run --release -p mt-app` entry point starts again.** After
+  theme tokens pass through `Root::tokens` instead of the reactive `set_tokens`
+  before `run_app`, the window opens with the welcome controls. This resolves the
+  "Carried forward" plain-cargo-binary startup-panic entry above; the
+  corresponding `docs/TODO.md` entry was removed.
+- **Collapsed Source pane: new measurement.** UIA `ValuePattern.SetValue` still
+  **succeeded** on the reported 0×25 editor (44 UTF-8 bytes accepted) and the
+  buffer was checkpointed, so the failure is layout/accessibility rather than a
+  broken editing path. The decisive check still needs an active desktop session
+  and is carried to the deferred-renewal entry in `docs/TODO.md`.
