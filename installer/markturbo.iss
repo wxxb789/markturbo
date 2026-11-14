@@ -72,6 +72,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RepoRoot}\installer\close-instances.ps1"; DestDir: "{app}\installer-support"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\MarkTurbo"; Filename: "{app}\MarkTurbo.exe"
@@ -86,7 +87,23 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\MarkTur
 Filename: "{app}\MarkTurbo.exe"; Description: "Launch MarkTurbo"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; The uninstaller must not leave a running instance behind. Setup's Restart
-; Manager close path is not used by Uninstall, so end the app (and its WebView2
-; children) before the installer-owned files are removed.
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM MarkTurbo.exe"; RunOnceId: "StopMarkTurbo"; Flags: runhidden
+; Recheck this installation immediately before removing owned files. Retain
+; StopMarkTurbo so an upgrade supersedes the old image-wide taskkill entry.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer-support\close-instances.ps1"" -InstallDir ""{app}"""; RunOnceId: "StopMarkTurbo"; Flags: runhidden
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+begin
+  if CurUninstallStep = usUninstall then begin
+    // UninstallRun waits for its child but does not abort on a nonzero exit.
+    // Gate removal here so a failed close leaves files and registrations intact.
+    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      ExpandConstant('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{app}\installer-support\close-instances.ps1" -InstallDir "{app}"'),
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      RaiseException('Could not start the MarkTurbo close helper: ' + SysErrorMessage(ResultCode))
+    else if ResultCode <> 0 then
+      RaiseException('MarkTurbo could not be closed safely. Finish any Save or Discard prompt, close its windows, and run Uninstall again. No application-owned files have been removed.');
+  end;
+end;
