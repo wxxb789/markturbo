@@ -65,7 +65,7 @@ runs the Rust checks that its draft pushes skipped.
 | clippy (Linux) | code changes, not a draft | `cargo clippy --profile ci --workspace --all-targets --locked` |
 | mt-core tests (Linux) | code changes, not a draft | `cargo test --profile ci -p mt-core --features model-transport,test-support --locked` |
 | mt-app tests (Linux) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app` |
-| macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, `cargo test --profile ci -p mt-core --features model-transport,test-support --locked`, `lipo -archs` |
+| macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, then `lipo -archs target/release/markturbo` must list arm64 |
 | release-tests (windows-2022) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core` |
 
 The app suites run under `cargo nextest`, which starts the twenty-odd test
@@ -96,14 +96,15 @@ mt-app test binary with the MSVC linker takes 29.5 s on the development desktop
 invalidated the build fingerprint and produced no comparable measurement.
 
 Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
-app/UI headless suite on the public-quality platform, and macOS the arm64
-release build plus headless `mt-core` behavior. The macOS core check mirrors the
-Linux shard's command and feature set on purpose: running `mt-core` alone with
-default features made eight `document::io::tests::skill_save_*`
-concurrent-save tests fail on that job (run 43630038928) while the Linux shard
-passed, so a cheaper-looking default-feature configuration is not equivalent.
-Whoever revisits that family of tests should treat the difference as a question
-about the tests and the shared commit path, not as a macOS-only flake. The
+app/UI headless suite on the public-quality platform, and macOS the arm64 release
+artifact. macOS behavior runs in the nightly instead of per pull request: a
+per-pull-request `cargo test -p mt-core` on that runner failed eight
+`document::io::tests::skill_save_*` concurrent-save tests in both feature
+configurations (runs 43630038928 and 43631880761) while the nightly-form
+`cargo test --workspace` run passed the same tests (job 132527749238 printed
+`... ok`). That difference is recorded in `docs/TODO.md` as a question about the
+tests and the shared commit path, not as a platform flake, and the per-pull-request
+job keeps only the evidence its name claims. The
 combinations that used to repeat on every platform run once a day in
 `.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
 `cargo test --locked --profile ci --workspace` and

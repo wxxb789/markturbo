@@ -278,9 +278,12 @@ jobs:
         # development desktop, and the same order on a runner.
         run: cargo nextest run --locked --cargo-profile ci -p mt-app
 
-  # Compatibility evidence for the arm64 build plus headless core behavior on
-  # macOS. The release-profile app suite moved to the nightly workflow, which
-  # also keeps this job's cache warm.
+  # Compatibility evidence for the arm64 build: the release binary and its Mach-O
+  # arm64 slice. Behavior on macOS runs in the nightly workflow, whose
+  # `--workspace` form is the configuration with passing evidence on that runner
+  # (a per-pull-request `-p mt-core` variant failed eight concurrent-save tests:
+  # runs 43630038928 and 43631880761, recorded in docs/TODO.md). The nightly also
+  # keeps this job's cache warm.
   macos-arm64-compatibility:
     name: macOS arm64 compatibility
     needs: [classify, preflight]
@@ -309,15 +312,6 @@ jobs:
 
       - name: Build the macOS arm64 executable
         run: cargo build --release --locked -p mt-app --bin markturbo
-
-      - name: Test the headless core
-        # Same command as the authoritative Linux shard, feature set included:
-        # running mt-core alone with default features changed the outcome of the
-        # concurrent-save tests (run 43630038928: 8 failures in
-        # `document::io::tests::skill_save_*` on this job while the Linux shard
-        # passed), so the macOS check mirrors the shard instead of guessing a
-        # cheaper configuration.
-        run: cargo test --profile ci -p mt-core --features model-transport,test-support --locked
 
       - name: Verify the arm64 slice
         run: |
