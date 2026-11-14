@@ -101,7 +101,12 @@ pending.
 
 - Windows 11 x64 is the only public-quality target. Windows 10 x64, macOS, and
   Linux remain compatibility-only, not public-quality platforms.
-- Clean-machine acceptance: __ACCEPTANCE_STATE__
+- Release status: **deferred, not published.** The owner archived the release
+  sequence as execution deferred, not accepted, on 2026-11-14, so no
+  public-quality release is approved or published and this note describes an
+  unpublished draft candidate.
+- Clean-machine acceptance: __ACCEPTANCE_STATE__ Deferral waives none of those
+  requirements.
 - Packaging or CI success alone does not establish clean-machine acceptance.
   The exact installer hash must match the artifact used for acceptance.
 - Semantic Review and Translation require a configured model endpoint; local
@@ -112,6 +117,8 @@ pending.
   math fonts, and the sample are embedded in release builds.
 
 The [Product Contract](https://github.com/wxxb789/markturbo/blob/v__VERSION__/PRODUCT.md)
-defines the product scope; the [release contract](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/goals/10-ship-primary-platform-release.md)
-defines the acceptance gates. A pending acceptance status is not a claim that
-this release passed them.
+defines the product scope; the archived
+[release contract](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/goals/archive/10-ship-primary-platform-release.md)
+retains the acceptance gates as execution deferred, not accepted. A pending
+acceptance status is not a claim that this release passed them, and no
+public-quality release is approved or published.

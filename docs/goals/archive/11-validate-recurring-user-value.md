@@ -1,8 +1,35 @@
 # Goal 11 — Validate recurring user value
 
+## Disposition
+
+**Disposition: Archived by owner direction; validation execution deferred, not accepted.**
+
+- **Implementation:** the optional local content-free measurement support
+  approved for this goal was delivered — coarse counters with inspect, disable
+  and deliberate export, recorded in
+  [goal-10-acceptance.md](../../goal-10-acceptance.md). Delivering that support
+  is not execution of the validation program.
+- **Acceptance: pending.** No cohort was recruited or measured, the observation
+  window never opened, and no product outcome is claimed for or against the
+  product.
+- **Owner's reasons, 2026-11-14:** no target users are available to try the
+  product, the product is not considered ready, and further UI adjustments are
+  intended; the feature goals are archived on owner direction.
+- **Owner statement, verbatim, 2026-11-14:** “我们现在没有目标用户可以拿来试用，而且我觉得我们现在还完全没有 ready 的地步。我后面还希望对这个 UI 做一些调整。但是目前所有 feature 方面的功能如果完了，就把这些 goal 全部都 archive 掉。”
+- **Approved window reading:** the 42-day observation window starts at the first
+  publicly available Windows 11 x64 installer release that has completed Goal 10
+  acceptance, has received owner approval, and ships on the stable channel with
+  trusted Authenticode signatures. No such release exists today, so the status
+  is **qualifying window not started.** `v0.1.3` (portable archives,
+  auto-generated notes, no installer acceptance claim) and the
+  `v0.1.4-alpha.*` prereleases are explicitly excluded from qualifying.
+- The criteria in
+  [Post-Release Validation](../../../PRODUCT.md#post-release-validation) are
+  unchanged: this archive neither weakens nor reinterprets them.
+
 ## Objective
 
-Run the [Post-Release Validation](../../PRODUCT.md#post-release-validation) program
+Run the [Post-Release Validation](../../../PRODUCT.md#post-release-validation) program
 for the first public-quality Windows 11 x64 release: collect privacy-compliant
 activation, Review usefulness, approved-revision, trust, and repeat-use evidence
 without collecting document or model content; produce one owner-approved
@@ -15,7 +42,7 @@ product capability merely to improve the measurement.
 
 This goal executes the target-user cohort, observation window, success criteria,
 guardrails, evidence mechanisms, and retention policy fixed in
-[Post-Release Validation](../../PRODUCT.md#post-release-validation). It owns the
+[Post-Release Validation](../../../PRODUCT.md#post-release-validation). It owns the
 collection, analysis, and continue/revise/stop workflow, not a second set of
 product thresholds.
 
@@ -29,7 +56,7 @@ roadmap expands again.
 ## In scope
 
 - Use the target user, observation window, cohort, and fixed criteria in
-  [Post-Release Validation](../../PRODUCT.md#post-release-validation). Do not choose
+  [Post-Release Validation](../../../PRODUCT.md#post-release-validation). Do not choose
   or weaken a criterion after seeing results.
 - Observe the complete activation path:
   - install and first launch;
@@ -42,7 +69,7 @@ roadmap expands again.
   question exposed an assumption, changed a decision, narrowed scope, clarified
   evidence, or correctly confirmed that no revision was needed.
 - Measure retention only under the separate-day repeat-use definition in
-  [Post-Release Validation](../../PRODUCT.md#post-release-validation); several
+  [Post-Release Validation](../../../PRODUCT.md#post-release-validation); several
   actions in one session are not retention.
 - Record safety and trust outcomes: abandoned setup, provider/credential failure,
   stale-result blocks, recovery use, accidental-loss reports, privacy concerns,
@@ -99,7 +126,7 @@ days after the final decision.
    report honestly records why recruitment was inconclusive and does not claim
    product validation.
 2. Results report every success criterion and guardrail in
-   [Post-Release Validation](../../PRODUCT.md#post-release-validation). A missing
+   [Post-Release Validation](../../../PRODUCT.md#post-release-validation). A missing
    criterion prevents `continue`.
 3. Every quantitative result includes its denominator, missing/unknown count, and
    collection method.
@@ -121,7 +148,7 @@ days after the final decision.
 ## Stop and ask
 
 Stop if the observation window, cohort, fixed criteria, or consented evidence
-method in [Post-Release Validation](../../PRODUCT.md#post-release-validation) cannot
+method in [Post-Release Validation](../../../PRODUCT.md#post-release-validation) cannot
 be followed. Do not infer success from repository popularity, an inadequate
 cohort, or the project owner's own sessions alone.
 

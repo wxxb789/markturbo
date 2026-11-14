@@ -16,13 +16,16 @@ names Windows 11 x64 as the only first public-quality platform.
 
 Windows 11 x64 is the only platform with a public release contract. The app is
 built and packaged by `nsh package --target windows|macos|linux` from
-`crates/mt-app`; the executable and `nsh/` assets form the distributable. The
-release workflow's single-file Windows asset is pending migration to this
-packaging output. Other platforms remain useful for compile and compatibility
-coverage until their own clean-machine acceptance runs. The Windows
-installer and release-channel signing belong to Goal 10. A downloadable macOS
-`.app` with Developer ID signing and notarization remains deferred in
-[TODO](TODO.md).
+`crates/mt-app`; the executable and `nsh/` assets form the distributable, and
+the release workflow packages the per-user Windows installer, checksum sidecar
+and `release.json` described under [Windows CD
+artifact](#windows-cd-artifact). Other platforms remain useful for compile and
+compatibility coverage until their own clean-machine acceptance runs. Release
+status is **deferred**: the owner archived the release sequence as execution
+deferred, not accepted, on 2026-11-14, so no public-quality release is approved
+or published and nothing on this page claims an approved artifact. A
+downloadable macOS `.app` with Developer ID signing and notarization remains
+deferred in [TODO](TODO.md).
 
 ### macOS arm64 PR compatibility check
 
@@ -195,8 +198,9 @@ metadata under `%LOCALAPPDATA%\Programs\MarkTurbo`, creates a Start menu
 shortcut, registers Shell App Paths, and ships the project license and
 third-party notices. It does not include archives, docs, or auxiliary
 payloads. Windows 11 x64 is the only public-quality target; installation,
-signing, upgrade and uninstall policy belong to
-[Goal 10](goals/10-ship-primary-platform-release.md).
+signing, upgrade and uninstall policy belong to the archived
+[Goal 10](goals/archive/10-ship-primary-platform-release.md), retained as
+**execution deferred, not accepted** by owner direction on 2026-11-14.
 
 ## Where settings live
 

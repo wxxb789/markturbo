@@ -19,6 +19,9 @@ carried forward in [TODO](TODO.md).
   native keyboard traversal with visible focus and a Windows 11 x64
   screen-reader smoke, and the five first-time target-user sessions PRODUCT.md
   requires before public-quality visual acceptance.
+- Still not recorded as of 2026-11-14: Goal 10 was archived as deferred without
+  those sessions, so the obligation is now carried by the release-renewal entry
+  in [TODO.md](TODO.md) rather than by an active goal.
 
 ## Implemented corrections
 
@@ -175,7 +178,7 @@ of this gate. With the packaged build running and Narrator enabled:
 ### First-time-user sessions
 
 Five first-time target users follow the
-[First-Time-User Evidence](../docs/PRODUCT.md#first-time-user-evidence) contract
+[First-Time-User Evidence](../PRODUCT.md#first-time-user-evidence) contract
 on a clean Windows 11 profile with a real or rights-cleared artifact, without
 facilitator instruction after the task brief. Record one row per session and
 report the aggregate against the contract thresholds:

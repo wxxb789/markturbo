@@ -210,9 +210,12 @@ not be edited into a passing result.
   per-goal harness, screenshot framework, evidence schema or benchmark apparatus
   by default. Reuse the shared native runtime and content-free evidence rules.
 
-Goal 09 owns the broad visual/usability matrix. Goal 10 owns final clean-machine
-integration and public-quality release evidence. Goal 11 owns recurring value;
-these are different questions from whether an implementation PR can merge.
+Goal 09 owns the broad visual/usability matrix. Goals 10 and 11 were archived on
+2026-11-14 as deferred, not accepted, so final clean-machine integration,
+public-quality release evidence and recurring value currently have no active
+goal; the renewal entry in [TODO.md](TODO.md) carries the prerequisites until a
+future release-renewal goal is authorized. These remain different questions
+from whether an implementation PR can merge.
 
 ## Dependency maintenance
 
