@@ -14,6 +14,7 @@ pub mod review;
 pub mod runtime_paths;
 pub mod settings;
 pub mod translate;
+pub mod usage;
 pub mod workspace;
 
 pub use agent_artifacts::harness::{GlobalRoot, Harness};

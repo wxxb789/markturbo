@@ -39,7 +39,7 @@ fn editing_the_reviewed_document_marks_the_result_stale() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = tempfile::tempdir().expect("config dir");
     let document = dir.path().join("plan.md");
-    std::fs::write(&document, "# Plan\n").expect("write fixture");
+    std::fs::write(&document, "# Plan\nPRIVATE-REVIEW-DOCUMENT-SENTINEL\n").expect("write fixture");
     let endpoint = mt_core::model::EndpointIdentity::parse(
         mt_core::model::Provider::OpenAiChat,
         Some(&base_url),
@@ -49,7 +49,7 @@ fn editing_the_reviewed_document_marks_the_result_stale() {
     std::fs::write(
         config.path().join("settings.toml"),
         format!(
-            "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\n"
+            "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
         ),
     )
     .expect("write settings");
@@ -84,6 +84,31 @@ fn editing_the_reviewed_document_marks_the_result_stale() {
         Duration::from_secs(5),
     )
     .expect("Review result marked stale");
+
+    let store = config.path().join("data/usage.json");
+    let stored = std::fs::read_to_string(&store).expect("usage aggregate");
+    let json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    let day = json["days"].as_object().unwrap().values().next().unwrap();
+    assert_eq!(day["events"]["review_started"], 1);
+    assert_eq!(day["events"]["review_completed"], 1);
+    assert_eq!(day["review_started"]["document"]["plan"], 1);
+    let usage = mt_core::usage::UsageStore::open(true);
+    let exported =
+        String::from_utf8(usage.export_json(std::time::SystemTime::now()).unwrap()).unwrap();
+    for text in [&stored, &exported] {
+        for sentinel in [
+            "PRIVATE-REVIEW-DOCUMENT-SENTINEL",
+            "plan.md",
+            "loopback-test-key",
+            &base_url,
+            &document.to_string_lossy(),
+        ] {
+            assert!(
+                !text.contains(sentinel),
+                "prohibited content entered usage data"
+            );
+        }
+    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

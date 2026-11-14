@@ -10,7 +10,8 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{Duration, Instant},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant, SystemTime},
 };
 
 use mt_core::{
@@ -30,15 +31,16 @@ use mt_core::{
         ReviewResult, ReviewStatus, SourceSnapshot,
         provider::{
             PreparedDocumentReviewRequest, PreparedReview, PreparedRevisionRequest, ReviewError,
-            ReviewLanguage, RevisionAnswer, RevisionAnswers,
+            ReviewLanguage, RevisionAnswer, RevisionAnswers, RevisionError,
         },
         revision::{ChangeId, RevisionProposal},
     },
     settings::{Language, RecentTarget, RecentTargetKind, SettingsData, ThemePreference},
     translate::{
         Scope, TranslationRequest,
-        provider::{PreparedTranslation, PreparedTranslationRequest},
+        provider::{PreparedTranslation, PreparedTranslationRequest, TranslationError},
     },
+    usage::{ReviewDurationBucket, UsageAggregate, UsageEvent, UsageEventKind, UsageStore},
     workspace::{
         search::{self, Query},
         tree::{self, FileNode},
@@ -46,6 +48,8 @@ use mt_core::{
 };
 use nsh_base::alert_dialog;
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
+
+static FIRST_LAUNCH_CHECKED: AtomicBool = AtomicBool::new(false);
 
 /// Which panes a document shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -107,6 +111,8 @@ pub struct AppState {
     pub settings_open: Signal<bool>,
     pub settings_credential: Signal<String>,
     pub settings_notice: Signal<SharedString>,
+    pub usage_counts: Signal<UsageAggregate>,
+    pub usage_inspection_open: Signal<bool>,
     pub recovery_records: Signal<Vec<RecoveredRecord>>,
     pub context_open: Signal<bool>,
     pub context_resolved: Signal<Option<ResolvedContext>>,
@@ -127,6 +133,7 @@ pub struct AppState {
     pub revision_busy: Signal<bool>,
     owner: Owner,
     vault: CredentialVault,
+    usage: Rc<RefCell<UsageStore>>,
     pending_review: Rc<RefCell<Option<PreparedDocumentReviewRequest>>>,
     review_origin: Rc<RefCell<Option<ReviewOrigin>>>,
     review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
@@ -241,7 +248,8 @@ impl AppState {
                 crate::i18n::Key::OpenFolderToBegin,
             ))
         });
-        Self {
+        let usage = UsageStore::open(settings.usage_metrics_enabled);
+        let state = Self {
             owner: Owner::current(),
             root: signal(None),
             entries: signal(Vec::new()),
@@ -257,6 +265,8 @@ impl AppState {
             settings_open: signal(false),
             settings_credential: signal(String::new()),
             settings_notice: signal(SharedString::from("")),
+            usage_counts: signal(UsageAggregate::default()),
+            usage_inspection_open: signal(false),
             recovery_records: signal(records),
             context_open: signal(false),
             context_resolved: signal(None),
@@ -276,6 +286,7 @@ impl AppState {
             revision_status: signal(None),
             revision_busy: signal(false),
             vault: CredentialVault::production(),
+            usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
@@ -286,6 +297,163 @@ impl AppState {
             recovery_tracks: Rc::new(RefCell::new(HashMap::new())),
             quit_discarded: Rc::new(Cell::new(false)),
             next_id: Rc::new(Cell::new(1)),
+        };
+        state.record_first_launch();
+        state
+    }
+
+    fn record_first_launch(&self) {
+        if !self.usage.borrow().enabled() || FIRST_LAUNCH_CHECKED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        match self.usage.borrow().inspect(SystemTime::now()) {
+            Ok(counts) => {
+                if !counts
+                    .days()
+                    .values()
+                    .any(|day| day.events.contains_key(&UsageEventKind::FirstLaunch))
+                {
+                    self.record_usage(UsageEvent::FirstLaunch);
+                }
+            }
+            Err(_) => self.usage_notice(crate::i18n::Key::UsageUnavailable),
+        }
+    }
+
+    fn record_usage(&self, event: UsageEvent) {
+        if self
+            .usage
+            .borrow()
+            .record(event, SystemTime::now())
+            .is_err()
+        {
+            self.usage_notice(crate::i18n::Key::UsageUnavailable);
+        }
+        if self.settings_open.get() {
+            self.refresh_usage_counts();
+        }
+    }
+
+    fn usage_notice(&self, key: crate::i18n::Key) {
+        self.settings_notice.set(SharedString::from(crate::i18n::t(
+            self.settings.get().language,
+            key,
+        )));
+    }
+
+    fn refresh_usage_counts(&self) {
+        match self.usage.borrow().inspect(SystemTime::now()) {
+            Ok(counts) => self.usage_counts.set(counts),
+            Err(_) => self.usage_notice(crate::i18n::Key::UsageUnavailable),
+        }
+    }
+
+    pub fn set_usage_enabled(&self, enabled: bool) {
+        let mut settings = self.settings.get();
+        settings.usage_metrics_enabled = enabled;
+        // A failed persistence attempt must never leave collection running
+        // after a user asks to disable it, or enable it without durable consent.
+        self.usage.borrow_mut().set_enabled(false);
+        self.settings
+            .update(|settings| settings.usage_metrics_enabled = false);
+        match settings.try_save_usage_metrics_consent() {
+            Ok(settings) => {
+                self.usage
+                    .borrow_mut()
+                    .set_enabled(settings.usage_metrics_enabled);
+                self.settings.set(settings);
+                self.usage_notice(crate::i18n::Key::UsageConsentSaved);
+            }
+            Err(_) => self.usage_notice(crate::i18n::Key::UsageConsentSaveFailed),
+        }
+        self.refresh_usage_counts();
+    }
+
+    pub fn inspect_usage(&self) {
+        self.refresh_usage_counts();
+        self.usage_inspection_open
+            .set(!self.usage_inspection_open.get());
+    }
+
+    pub fn clear_usage(&self) {
+        match self.usage.borrow().clear() {
+            Ok(()) => {
+                self.usage_counts.set(UsageAggregate::default());
+                self.usage_notice(crate::i18n::Key::UsageCleared);
+            }
+            Err(_) => self.usage_notice(crate::i18n::Key::UsageUnavailable),
+        }
+    }
+
+    pub fn export_usage(&self) {
+        let state = self.clone();
+        let language = self.settings.get().language;
+        self.spawn_task(async move {
+            let picked = pick_save_path(
+                SaveDialog::new()
+                    .title(crate::i18n::t(language, crate::i18n::Key::UsageExport))
+                    .file_name(crate::i18n::t(
+                        language,
+                        crate::i18n::Key::UsageExportFileName,
+                    ))
+                    .filter(nsh_core::file_dialog::FileFilter::new(
+                        crate::i18n::t(language, crate::i18n::Key::UsageExportFormat),
+                        ["json"],
+                    )),
+            )
+            .await;
+            match picked {
+                Ok(Some(path)) => {
+                    let result = state.usage.borrow().export_to(&path, SystemTime::now());
+                    state.usage_notice(if result.is_ok() {
+                        crate::i18n::Key::UsageExported
+                    } else {
+                        crate::i18n::Key::UsageExportFailed
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => state.usage_notice(crate::i18n::Key::UsageExportFailed),
+            }
+        });
+    }
+
+    fn record_review_failure(&self, error: &ReviewError) {
+        match error {
+            ReviewError::CredentialAccess { .. }
+            | ReviewError::MissingCredential { .. }
+            | ReviewError::NoAvailableCredential => {
+                self.record_usage(UsageEvent::CredentialFailure)
+            }
+            ReviewError::UnsupportedConfiguredProvider
+            | ReviewError::InvalidEndpoint { .. }
+            | ReviewError::Timeout { .. }
+            | ReviewError::TransportUnavailable { .. }
+            | ReviewError::RequestFailed { .. }
+            | ReviewError::MissingResponseText { .. }
+            | ReviewError::ResponseTooLarge { .. }
+            | ReviewError::MalformedResponse { .. } => {
+                self.record_usage(UsageEvent::ProviderFailure)
+            }
+            _ => {}
+        }
+    }
+
+    fn record_translation_failure(&self, error: &TranslationError) {
+        match error {
+            TranslationError::CredentialAccess { .. }
+            | TranslationError::MissingCredential { .. }
+            | TranslationError::NoAvailableCredential => {
+                self.record_usage(UsageEvent::CredentialFailure)
+            }
+            TranslationError::UnsupportedConfiguredProvider
+            | TranslationError::InvalidEndpoint { .. }
+            | TranslationError::TransportUnavailable { .. }
+            | TranslationError::RequestFailed { .. }
+            | TranslationError::MissingResponseText { .. }
+            | TranslationError::InvalidTranslationResponse { .. } => {
+                self.record_usage(UsageEvent::ProviderFailure)
+            }
+            _ => {}
         }
     }
 
@@ -337,6 +505,7 @@ impl AppState {
                 }
             };
             state.add_tab(loaded);
+            state.record_usage(UsageEvent::ArtifactOpened);
         });
     }
 
@@ -361,6 +530,7 @@ impl AppState {
                 return;
             }
             state.add_untitled(text);
+            state.record_usage(UsageEvent::ArtifactPasted);
         });
     }
 
@@ -791,6 +961,7 @@ impl AppState {
         }
         self.recovery_records
             .update(|records| records.retain(|record| record.record.key != key));
+        self.record_usage(UsageEvent::RecoveryRestored);
     }
 
     pub fn discard_recovered(&self, record: &RecoveredRecord) {
@@ -1031,6 +1202,7 @@ impl AppState {
                     tab.conflict.set(false);
                     state.retire_tab_recovery(&tab);
                     state.recovery_tracks.borrow_mut().remove(&tab.id);
+                    state.record_usage(UsageEvent::ArtifactSaved);
                     state
                         .status
                         .set(SharedString::from(format!("Saved {}", tab.path.display())));
@@ -1075,6 +1247,7 @@ impl AppState {
                     Ok(loaded) => {
                         self.close_tab_now(tab.id);
                         self.add_tab(loaded);
+                        self.record_usage(UsageEvent::ArtifactSaved);
                         true
                     }
                     Err(SaveError::DestinationExists) => {
@@ -1162,6 +1335,7 @@ impl AppState {
                 tab.conflict.set(false);
                 self.retire_tab_recovery(&tab);
                 self.recovery_tracks.borrow_mut().remove(&tab.id);
+                self.record_usage(UsageEvent::ArtifactSaved);
                 self.status
                     .set(SharedString::from(format!("Saved {}", tab.path.display())));
                 true
@@ -1290,6 +1464,7 @@ impl AppState {
         let prepared = match PreparedTranslation::from_settings(&settings, &self.vault) {
             Ok(prepared) => prepared,
             Err(error) => {
+                self.record_translation_failure(&error);
                 self.status.set(SharedString::from(format!(
                     "Translation unavailable: {error}"
                 )));
@@ -1352,6 +1527,7 @@ impl AppState {
                         .find(|tab| tab.id == origin.tab_id)
                         .cloned()
                     else {
+                        state.record_usage(UsageEvent::StaleResultBlocked);
                         state.status.set(SharedString::from(
                             crate::i18n::t(language, crate::i18n::Key::ModelRequestDocumentClosed)
                                 .to_owned(),
@@ -1359,6 +1535,7 @@ impl AppState {
                         return;
                     };
                     if origin.snapshot.revision != tab.revision.get() {
+                        state.record_usage(UsageEvent::StaleResultBlocked);
                         state.status.set(SharedString::from(
                             crate::i18n::t(language, crate::i18n::Key::ModelRequestDocumentChanged)
                                 .to_owned(),
@@ -1373,9 +1550,16 @@ impl AppState {
                         "Translated {segments} segment(s) into {target}."
                     )));
                 }
-                Ok(Err(error)) => state
-                    .status
-                    .set(SharedString::from(format!("Translation failed: {error}"))),
+                Ok(Err(error)) => {
+                    if let Some(error) = error.downcast_ref::<TranslationError>() {
+                        state.record_translation_failure(error);
+                    } else {
+                        state.record_usage(UsageEvent::ProviderFailure);
+                    }
+                    state
+                        .status
+                        .set(SharedString::from(format!("Translation failed: {error}")));
+                }
                 Err(error) => state.status.set(SharedString::from(format!(
                     "Translation task failed: {error}"
                 ))),
@@ -1409,6 +1593,7 @@ impl AppState {
         let prepared = match PreparedReview::from_settings(&settings, &self.vault) {
             Ok(prepared) => prepared,
             Err(error) => {
+                self.record_review_failure(&error);
                 self.status
                     .set(SharedString::from(format!("Review unavailable: {error}")));
                 return;
@@ -1503,6 +1688,8 @@ impl AppState {
 
         self.review_consent.set(None);
         self.review_busy.set(true);
+        self.record_usage(UsageEvent::review_started(&revision_request));
+        let started = Instant::now();
         let state = self.clone();
         let revision = self
             .tabs
@@ -1516,6 +1703,9 @@ impl AppState {
             state.review_busy.set(false);
             let view = match result {
                 Ok(Ok(transport)) => {
+                    state.record_usage(UsageEvent::ReviewCompleted(
+                        ReviewDurationBucket::from_duration(started.elapsed()),
+                    ));
                     let stale = transport.result.snapshot.revision != revision.get();
                     if let Some(output) = transport.result.output.clone() {
                         state.set_revision_context(
@@ -1528,7 +1718,10 @@ impl AppState {
                     *state.review_binding.borrow_mut() = Some(binding);
                     ReviewView::from_result(&transport.result, stale, state.settings.get().language)
                 }
-                Ok(Err(error)) => ReviewView::from_error(&error, state.settings.get().language),
+                Ok(Err(error)) => {
+                    state.record_review_failure(&error);
+                    ReviewView::from_error(&error, state.settings.get().language)
+                }
                 Err(error) => ReviewView {
                     status: crate::i18n::t(
                         state.settings.get().language,
@@ -1628,6 +1821,7 @@ impl AppState {
         let prepared = match PreparedReview::from_settings(&settings, &self.vault) {
             Ok(prepared) => prepared,
             Err(error) => {
+                self.record_review_failure(&error);
                 self.revision_status.set(Some(SharedString::from(format!(
                     "Revision unavailable: {error}"
                 ))));
@@ -1675,6 +1869,11 @@ impl AppState {
         };
         self.revision_consent.set(None);
         self.revision_busy.set(true);
+        for answer in bound.answers().as_slice() {
+            if matches!(answer, RevisionAnswer::Answered(_)) {
+                self.record_usage(UsageEvent::ClarificationAnswered);
+            }
+        }
         let state = self.clone();
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
@@ -1704,9 +1903,22 @@ impl AppState {
                         "Revision ready. Approve individual changes, then apply.",
                     )));
                 }
-                Ok(Err(error)) => state.revision_status.set(Some(SharedString::from(format!(
-                    "Revision failed: {error}"
-                )))),
+                Ok(Err(error)) => {
+                    if matches!(
+                        error,
+                        RevisionError::Timeout
+                            | RevisionError::TransportUnavailable
+                            | RevisionError::RequestFailed
+                            | RevisionError::MissingResponseText
+                            | RevisionError::ResponseTooLarge
+                            | RevisionError::MalformedResponse
+                    ) {
+                        state.record_usage(UsageEvent::ProviderFailure);
+                    }
+                    state.revision_status.set(Some(SharedString::from(format!(
+                        "Revision failed: {error}"
+                    ))));
+                }
                 Err(error) => state.revision_status.set(Some(SharedString::from(format!(
                     "Revision task failed: {error}"
                 )))),
@@ -1723,6 +1935,9 @@ impl AppState {
     /// Compose only explicitly approved changes and apply them to the buffer.
     pub fn apply_revision(&self) {
         let Some(proposal) = self.revision_proposal.borrow().clone() else {
+            self.revision_status.set(Some(SharedString::from(
+                "Run Review first to prepare a Revision.",
+            )));
             return;
         };
         let Some((tab_id, snapshot)) = self
@@ -1741,6 +1956,7 @@ impl AppState {
         };
         let current_snapshot = SourceSnapshot::new(tab.revision.get(), 0);
         if tab.id != tab_id || !snapshot.matches(current_snapshot) {
+            self.record_usage(UsageEvent::StaleResultBlocked);
             self.revision_status.set(Some(SharedString::from(
                 "This Revision belongs to another document or source state. Run Review again before applying.",
             )));
@@ -1760,15 +1976,28 @@ impl AppState {
                 return;
             }
         };
+        let hunks = self.revision_hunks.get();
         if text == tab.text.get().as_str() {
+            self.record_usage(UsageEvent::RevisionDecision {
+                accepted_hunks: 0,
+                rejected_hunks: hunks.len() as u64,
+            });
+            *self.revision_proposal.borrow_mut() = None;
+            self.revision_hunks.set(Vec::new());
             self.revision_status
                 .set(Some(SharedString::from("No changes approved.")));
             return;
         }
+        let accepted_hunks = hunks.iter().filter(|hunk| hunk.accepted.get()).count() as u64;
+        self.record_usage(UsageEvent::RevisionDecision {
+            accepted_hunks,
+            rejected_hunks: hunks.len() as u64 - accepted_hunks,
+        });
         tab.text.set(SharedString::from(text));
         tab.dirty.set(true);
         tab.revision.update(|revision| *revision += 1);
         self.note_edit(tab.id);
+        self.record_usage(UsageEvent::RevisionApplied);
         *self.revision_proposal.borrow_mut() = None;
         self.revision_hunks.set(Vec::new());
         self.revision_status.set(Some(SharedString::from(
@@ -1792,6 +2021,7 @@ impl AppState {
     }
 
     pub fn open_settings(&self) {
+        self.refresh_usage_counts();
         self.settings_open.set(true);
     }
 
@@ -1830,19 +2060,26 @@ impl AppState {
         let target = self.credential_target()?;
         self.vault
             .replace_session(target, value.to_owned())
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                self.record_usage(UsageEvent::CredentialFailure);
+                error.to_string()
+            })
     }
 
     /// Store a key in the platform's secure store. Refused where the platform
     /// provides none, rather than falling back to plaintext.
     pub fn store_persistent_credential(&self, value: &str) -> Result<(), String> {
         if !self.vault.secure_store_supported() {
+            self.record_usage(UsageEvent::CredentialFailure);
             return Err("Secure storage is unavailable on this platform; use a session key or an environment variable.".to_owned());
         }
         let target = self.credential_target()?;
         self.vault
             .replace_persistent(&target, value.to_owned())
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                self.record_usage(UsageEvent::CredentialFailure);
+                error.to_string()
+            })
     }
 
     fn credential_target(&self) -> Result<String, String> {

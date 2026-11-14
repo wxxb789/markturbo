@@ -37,7 +37,7 @@ pub const MAX_SKILL_FILE_BYTES: u64 = 512 * 1024;
 pub const MAX_SKILL_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The kind of artifact the reviewer should understand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactLens {
     Prompt,
