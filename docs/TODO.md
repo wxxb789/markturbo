@@ -118,3 +118,15 @@
   `autotests = false`, or adopting `cargo nextest` for cross-binary parallelism,
   would cut both costs. Treat it as its own small goal inside the upcoming UI
   iteration, and keep `cargo test` as the local command either way.
+- [ ] **The `mt-core` `skill_save_*` tests behave differently by configuration** —
+  `cargo test --profile ci -p mt-core` with default features failed eight
+  `document::io::tests::skill_save_*` concurrent-save tests on the macOS arm64
+  job (run 43630038928: 627 passed, 8 failed, reported as `ConcurrentCommit …
+  Indeterminate` and mismatched preserved bytes), while the same tests pass in
+  the Linux shard with `--features model-transport,test-support` and passed in
+  the earlier macOS `--workspace` runs. The tests inject the writer race through
+  `install_skill_before_exchange_hook`, so this is not timing luck: reproduce
+  both commands on one machine and either make the family
+  configuration-independent or state the required feature set in the module. The
+  CI job now mirrors the Linux shard's feature set so it cannot hide behind the
+  cheaper configuration.

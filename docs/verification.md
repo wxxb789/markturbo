@@ -65,7 +65,7 @@ runs the Rust checks that its draft pushes skipped.
 | clippy (Linux) | code changes, not a draft | `cargo clippy --profile ci --workspace --all-targets --locked` |
 | mt-core tests (Linux) | code changes, not a draft | `cargo test --profile ci -p mt-core --features model-transport,test-support --locked` |
 | mt-app tests (Linux) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app` |
-| macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, `cargo test --profile ci -p mt-core --locked`, `lipo -archs` |
+| macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, `cargo test --profile ci -p mt-core --features model-transport,test-support --locked`, `lipo -archs` |
 | release-tests (windows-2022) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core` |
 
 The app suites run under `cargo nextest`, which starts the twenty-odd test
@@ -97,7 +97,13 @@ invalidated the build fingerprint and produced no comparable measurement.
 
 Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
 app/UI headless suite on the public-quality platform, and macOS the arm64
-release build plus headless `mt-core` behavior under default features. The
+release build plus headless `mt-core` behavior. The macOS core check mirrors the
+Linux shard's command and feature set on purpose: running `mt-core` alone with
+default features made eight `document::io::tests::skill_save_*`
+concurrent-save tests fail on that job (run 43630038928) while the Linux shard
+passed, so a cheaper-looking default-feature configuration is not equivalent.
+Whoever revisits that family of tests should treat the difference as a question
+about the tests and the shared commit path, not as a macOS-only flake. The
 combinations that used to repeat on every platform run once a day in
 `.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
 `cargo test --locked --profile ci --workspace` and
