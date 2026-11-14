@@ -13,7 +13,8 @@ cited paths remain unambiguous.
 | `goal-05a-settings-privacy.png` | Goal 05a settings privacy visual evidence |
 | `goal-06/`, `goal-06-native-*.json` | Goal 06 evaluation and native acceptance evidence |
 | `goal-07/`, `goal-07-*.json` | Goal 07 accepted review, receipt, and ablation evidence |
-| `goal-09/final4/` | Goal 09 release-build visual matrix (132 cells) |
+| `goal-09/final5/` | Goal 09 release-build visual matrix bound to `0f3f41e` (132 cells + review sheets) |
+| `goal-09/final4/` | Goal 09 earlier release-build visual matrix bound to `883a5f3` |
 | `perf-and-size/` | Versioned performance and size issue notes |
 | `test-ablation/` | Test-ablation inventories, result tables, and experiment scripts |
 | `ablation-*-inventory.md` | Per-layer test inventories |

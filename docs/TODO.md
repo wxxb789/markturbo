@@ -2,6 +2,13 @@
 
 ## Deferred
 
+- [ ] **First-time-user and screen-reader evidence for the shipped UI** — Goal
+  09 was accepted on 2026-11-13 without the five first-time-target-user sessions
+  and the Windows 11 x64 keyboard/screen-reader smoke its completion evidence
+  lists. PRODUCT.md still requires the first-time-user evidence before
+  public-quality visual acceptance, so record both against the shipped artifact
+  during Goal 10's clean-machine acceptance; see
+  [goal-09-acceptance.md](goal-09-acceptance.md).
 - [ ] **Downloadable macOS arm64 app** — Build a `.app`, sign it with an Apple
   Developer ID, notarize and staple it, publish the artifact, and verify a
   downloaded copy launches from Finder on a clean Mac. Requires Apple Developer

@@ -42,22 +42,23 @@ fn opens_a_markdown_file() {
     // A dirty buffer is checkpointed after a short idle window. DPAPI only
     // exists on Windows; other targets report recovery unavailable.
     if cfg!(windows) {
-        let mut checkpointed = false;
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+        // Pump the app's frames: sleeping in this thread never advances it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
             if recovery_entries(&recovery)
                 .difference(&baseline)
                 .next()
                 .is_some()
             {
-                checkpointed = true;
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected a recovery checkpoint for the dirty buffer"
+            );
+            app.next_change(std::time::Duration::from_millis(25))
+                .expect("settle while the checkpoint lands");
         }
-        assert!(
-            checkpointed,
-            "expected a recovery checkpoint for the dirty buffer"
-        );
     }
 
     app.press("text:Agent Context").expect("open context");

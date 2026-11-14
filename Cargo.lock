@@ -3155,6 +3155,7 @@ dependencies = [
  "rust-embed",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

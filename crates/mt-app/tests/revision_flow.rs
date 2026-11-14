@@ -9,6 +9,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 #[test]
 fn review_then_revision_applies_only_approved_change() {
     let source = "Original\n";
@@ -114,6 +116,13 @@ fn review_then_revision_applies_only_approved_change() {
     app.wait_for("text:Approved changes applied to the buffer.")
         .expect("apply status");
     app.press("text:Save").expect("save applied revision");
+    support::wait_for_file(
+        &mut app,
+        &document,
+        |text| text == "Revised\n",
+        "the applied revision is saved",
+        Duration::from_secs(20),
+    );
     assert_eq!(
         std::fs::read_to_string(&document).expect("read saved file"),
         "Revised\n"

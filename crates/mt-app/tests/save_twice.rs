@@ -3,6 +3,8 @@
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 #[test]
 fn saving_twice_does_not_report_its_own_first_save_as_a_conflict() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -29,16 +31,18 @@ fn saving_twice_does_not_report_its_own_first_save_as_a_conflict() {
     app.type_text("label:Markdown source", "\nSecond edit.")
         .expect("second edit");
     app.press("text:Save").expect("second save");
-    app.settle();
+    support::wait_for_file(
+        &mut app,
+        &path,
+        |text| text.contains("Second edit."),
+        "the second save lands instead of reporting a conflict",
+        std::time::Duration::from_secs(20),
+    );
 
     let saved = std::fs::read_to_string(&path).expect("read saved file");
     assert!(
         saved.contains("First edit."),
         "first edit was lost: {saved:?}"
-    );
-    assert!(
-        saved.contains("Second edit."),
-        "second save was refused: {saved:?}"
     );
     assert!(!app.shows("Save conflict"));
 }

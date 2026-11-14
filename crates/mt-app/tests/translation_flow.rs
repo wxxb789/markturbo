@@ -8,6 +8,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::{DialogAnswer, Headless};
 
+mod support;
+
 #[test]
 fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialog() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -83,8 +85,13 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     );
 
     app.press("text:Save").expect("save translation");
-    let saved = std::fs::read_to_string(&document).expect("read saved file");
-    assert!(saved.contains("你好"), "translation not saved: {saved:?}");
+    support::wait_for_file(
+        &mut app,
+        &document,
+        |text| text.contains("你好"),
+        "the saved document carries the translation",
+        Duration::from_secs(20),
+    );
 
     if app.shows("More layouts") {
         app.press("text:More layouts")
@@ -104,7 +111,11 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("translation target editor");
     app.answer_dialogs_myself();
     app.press("text:Quit").expect("request quit");
-    assert!(app.pending_dialog().is_some(), "Quit must await a decision");
+    support::wait_for_pending_dialog(
+        &mut app,
+        "Quit must await a decision",
+        Duration::from_secs(20),
+    );
 
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:你好，再见", Duration::from_secs(20))
@@ -113,15 +124,19 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
         .expect("save all and quit");
 
-    let saved = std::fs::read_to_string(&document).expect("read translated file");
-    assert!(
-        saved.contains("你好，再见"),
-        "Quit lost the translation received during its dialog: {saved:?}"
+    support::wait_for_file(
+        &mut app,
+        &document,
+        |text| text.contains("你好，再见"),
+        "Quit saves the translation it received",
+        Duration::from_secs(20),
     );
-    let saved = std::fs::read_to_string(&other).expect("read other file");
-    assert!(
-        saved.contains("Unsaved edit."),
-        "Quit lost the original dirty tab"
+    support::wait_for_file(
+        &mut app,
+        &other,
+        |text| text.contains("Unsaved edit."),
+        "Quit saves the other dirty tab",
+        Duration::from_secs(20),
     );
 }
 

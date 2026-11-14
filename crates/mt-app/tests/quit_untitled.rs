@@ -32,15 +32,24 @@ fn quit_save_all_saves_an_untitled_draft() {
     app.on_dialog(|_| DialogAnswer::Press("Save all".to_owned()));
     app.press("text:Quit").expect("quit");
 
-    let mut saved = false;
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if destination.exists() {
-            saved = true;
-            break;
+    // Quit shows its decision from a task and writes the draft from another:
+    // pump the app's frames and answer the dialog instead of sleeping in this
+    // thread, which never advances the app.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !destination.exists() {
+        if app.pending_dialog().is_some() {
+            app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
+                .expect("answer the quit dialog");
+            continue;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "quit did not save the untitled draft: {:?}",
+            app.screen().texts()
+        );
+        app.next_change(std::time::Duration::from_millis(25))
+            .expect("settle while quitting");
     }
-    assert!(saved, "quit did not save the untitled draft");
     assert_eq!(
         std::fs::read_to_string(&destination).expect("read saved draft"),
         "Quit draft"

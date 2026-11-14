@@ -8,6 +8,8 @@
 use std::io::Write as _;
 use std::sync::Once;
 
+use tracing::subscriber::NoSubscriber;
+
 /// Writes logger output to both stderr and the per-process application log.
 struct LogTee {
     file: std::fs::File,
@@ -28,8 +30,23 @@ impl std::io::Write for LogTee {
 
 static INIT: Once = Once::new();
 
+/// Claims tracing's dispatcher so dependency events can never reach the log.
+///
+/// `genai` traces complete provider response bodies. Where a dependency enables
+/// tracing's optional `log` bridge (the UI stack has done so on Linux), an
+/// unclaimed dispatcher would forward those events to `env_logger` as soon as
+/// `RUST_LOG` is raised. A no-op subscriber discards them, and the claim is
+/// skipped when a runner already installed its own subscriber.
+fn claim_tracing_dispatcher() {
+    if tracing::dispatcher::has_been_set() {
+        return;
+    }
+    let _ = tracing::subscriber::set_global_default(NoSubscriber::new());
+}
+
 /// Installs file logging when possible and records this process's start.
 pub fn init() {
+    claim_tracing_dispatcher();
     INIT.call_once(|| {
         let Some(path) = mt_core::runtime_paths::log_path() else {
             let _ = env_logger::try_init();
@@ -71,6 +88,54 @@ pub fn init() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dependency_traces_never_reach_the_application_log() {
+        const CHILD_CASE: &str = "MARKTURBO_TRACING_GUARD_TEST";
+        const CANARY: &str = "MARKTURBO_TRACING_CANARY";
+        if std::env::var_os(CHILD_CASE).is_some() {
+            super::init();
+            assert!(
+                tracing::dispatcher::has_been_set(),
+                "the tracing privacy guard must claim the dispatcher"
+            );
+            // A dropped guard only leaks once a dependency enables tracing's
+            // `log` bridge; the canary then names the response body in the log.
+            tracing::error!(target: "genai", "{CANARY} provider response body");
+            return;
+        }
+
+        let temporary = tempfile::tempdir().expect("test data directory");
+        let data_dir = temporary.path().join("data");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "logging::tests::dependency_traces_never_reach_the_application_log",
+                "--nocapture",
+            ])
+            .env(CHILD_CASE, "1")
+            .env("MARKTURBO_DATA_DIR", &data_dir)
+            .output()
+            .expect("run tracing guard child");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let logs = data_dir.join("logs");
+        let log = std::fs::read_dir(&logs)
+            .expect("the child wrote its log directory")
+            .map(|entry| {
+                std::fs::read_to_string(entry.expect("log entry").path()).expect("read the log")
+            })
+            .collect::<String>();
+        assert!(
+            !log.contains(CANARY),
+            "dependency traces reached the application log: {log:?}"
+        );
+    }
+
     #[test]
     fn logging_fallbacks_preserve_an_existing_logger() {
         const CHILD_CASE: &str = "MARKTURBO_LOGGING_TEST_CASE";

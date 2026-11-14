@@ -2,17 +2,22 @@
 
 The matrix is eleven product states at the configured minimum, default and wide
 DIP viewports in the two effective color modes and both interface languages.
-Each cell launches the packaged app on an isolated profile, drives the real
-controls, refuses an obstructed or off-screen window, verifies the effective
-background against the shipped theme, and writes one PNG plus a content-free
-JSON receipt.
+Each cell launches the packaged app on an isolated profile under the system
+temporary directory, drives the real controls, refuses an obstructed or
+off-screen window, verifies the effective background against the shipped theme,
+and writes one PNG plus a content-free JSON receipt. The profile - settings,
+logs and recovery payloads - is deleted with the cell, so an output tree never
+carries the local paths it recorded.
 
 Run from the repository root, on an active Windows 11 x64 desktop, with a
 packaged `MarkTurbo.exe` built from the same source revision::
 
     uv run --locked --project scripts scripts/mt.py visual \\
         --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \\
-        --out docs/evidence/goal-09/matrix
+        --out target/native-acceptance/goal-09
+
+`--out` names a scratch directory: the capture rewrites the cells it writes and
+has no existing-output guard, so it never points at retained evidence.
 
 This is capture tooling, not owner approval or first-time-user evidence.
 """
@@ -29,6 +34,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -1147,10 +1153,12 @@ def capture_cell(
     case_root = out / "cells" / cell.cell_id
     case_root.mkdir(parents=True, exist_ok=True)
     workspace = case_root / "workspace"
-    config = case_root / "config"
-    data = case_root / "data"
-    for directory in (workspace, config, data):
-        directory.mkdir(exist_ok=True)
+    workspace.mkdir(exist_ok=True)
+    profile = Path(tempfile.mkdtemp(prefix=f"markturbo-{cell.cell_id}-"))
+    config = profile / "config"
+    data = profile / "data"
+    for directory in (config, data):
+        directory.mkdir(parents=True, exist_ok=True)
     plan = fixture(workspace)
     server = ReviewServer(hold=cell.state == "review-loading") if cell.state in REVIEW_STATES else None
     if server is not None:
@@ -1307,6 +1315,7 @@ def capture_cell(
                 pass
         if server is not None:
             server.close()
+        shutil.rmtree(profile, ignore_errors=True)
         receipt.setdefault("completed_at", utc_now())
         (case_root / "receipt.json").write_text(
             json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=True) + "\n",

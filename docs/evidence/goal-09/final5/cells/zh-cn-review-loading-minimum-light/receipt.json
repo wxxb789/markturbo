@@ -1,0 +1,88 @@
+{
+  "accessibility": {
+    "control_count": 21,
+    "document_checkboxes": 2,
+    "roles": {
+      "Button": 18,
+      "Edit": 2,
+      "MenuItem": 1
+    },
+    "unnamed": []
+  },
+  "capture_method": "PrintWindow",
+  "cell": {
+    "language": "zh-cn",
+    "mode": "light",
+    "state": "review-loading",
+    "viewport": "minimum"
+  },
+  "cell_id": "zh-cn-review-loading-minimum-light",
+  "completed_at": "2026-11-13T14:11:50.485Z",
+  "effective_mode": {
+    "background_rgb": [
+      255,
+      255,
+      255
+    ],
+    "expected_rgb": [
+      255,
+      255,
+      255
+    ],
+    "max_channel_distance": 0,
+    "requested": "light"
+  },
+  "executable": {
+    "byte_count": 61664768,
+    "name": "MarkTurbo.exe",
+    "sha256": "927d8238e56f89b38b13c736dae4399c29c8a5639ce0b5df86e5e97534fc2bbd"
+  },
+  "image": {
+    "byte_count": 40877,
+    "height": 600,
+    "sha256": "da8721467a86c2bd9f15b2265290207d223d9ec52ae1944dc3db78b636a66f7c",
+    "width": 900
+  },
+  "obstruction": {
+    "foreground_window_matches": false,
+    "point_hits_app": {
+      "bottom_left": true,
+      "bottom_right": true,
+      "center": true,
+      "top_left": true,
+      "top_right": true
+    },
+    "session_foreground": false,
+    "topmost_requested": false,
+    "visible": true
+  },
+  "schema": "markturbo.goal-09-visual-cell",
+  "source": {
+    "dirty": false,
+    "head": "eeb3b300feb3b80823d36658d8344766e587a061",
+    "tree": "372b9801ac25a6024fc0dfb1a4586d3c43264b8b",
+    "worktree_tree": null
+  },
+  "started_at": "2026-11-13T14:11:44.491Z",
+  "state_markers": [
+    "review-loading"
+  ],
+  "status": "CAPTURED",
+  "viewport": {
+    "client_px": [
+      900,
+      600
+    ],
+    "dip": [
+      720,
+      480
+    ],
+    "dpi": 120,
+    "name": "minimum",
+    "window_px": [
+      918,
+      647
+    ]
+  },
+  "web_capture": null
+}

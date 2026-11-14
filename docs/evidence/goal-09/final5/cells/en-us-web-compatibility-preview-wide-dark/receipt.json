@@ -1,0 +1,98 @@
+{
+  "accessibility": {
+    "control_count": 26,
+    "document_checkboxes": 0,
+    "roles": {
+      "Button": 24,
+      "Edit": 1,
+      "MenuItem": 1
+    },
+    "unnamed": []
+  },
+  "capture_method": "PrintWindow+CDP",
+  "cell": {
+    "language": "en-us",
+    "mode": "dark",
+    "state": "web-compatibility-preview",
+    "viewport": "wide"
+  },
+  "cell_id": "en-us-web-compatibility-preview-wide-dark",
+  "completed_at": "2026-11-13T14:10:24.490Z",
+  "effective_mode": {
+    "background_rgb": [
+      13,
+      17,
+      23
+    ],
+    "expected_rgb": [
+      13,
+      17,
+      23
+    ],
+    "max_channel_distance": 0,
+    "requested": "dark"
+  },
+  "executable": {
+    "byte_count": 61664768,
+    "name": "MarkTurbo.exe",
+    "sha256": "927d8238e56f89b38b13c736dae4399c29c8a5639ce0b5df86e5e97534fc2bbd"
+  },
+  "image": {
+    "byte_count": 60684,
+    "height": 1350,
+    "sha256": "603a0ed59b954c77fd00f64a1b5134fd2ebbdc8385a257c634d8057466381877",
+    "width": 2400
+  },
+  "obstruction": {
+    "foreground_window_matches": false,
+    "point_hits_app": {
+      "bottom_left": true,
+      "bottom_right": true,
+      "center": true,
+      "top_left": true,
+      "top_right": true
+    },
+    "session_foreground": false,
+    "topmost_requested": false,
+    "visible": true
+  },
+  "schema": "markturbo.goal-09-visual-cell",
+  "source": {
+    "dirty": false,
+    "head": "eeb3b300feb3b80823d36658d8344766e587a061",
+    "tree": "372b9801ac25a6024fc0dfb1a4586d3c43264b8b",
+    "worktree_tree": null
+  },
+  "started_at": "2026-11-13T14:10:17.580Z",
+  "state_markers": [
+    "web-compatibility-preview"
+  ],
+  "status": "CAPTURED",
+  "viewport": {
+    "client_px": [
+      2400,
+      1350
+    ],
+    "dip": [
+      1920,
+      1080
+    ],
+    "dpi": 120,
+    "name": "wide",
+    "window_px": [
+      2418,
+      1397
+    ]
+  },
+  "web_capture": {
+    "method": "WebView2 CDP Page.captureScreenshot",
+    "page_byte_count": 20869,
+    "page_sha256": "b9272d4d9052c41fd41c7d727477ccbd402c4b2909acb638d2740ff18a28babe",
+    "rect_client_px": [
+      325,
+      271,
+      2400,
+      1321
+    ]
+  }
+}
