@@ -53,8 +53,12 @@ release-profile app suite no longer run per PR: `.github/workflows/nightly.yml`
 non-blocking safety net rather than a PR gate. It is also what saves the
 rust-cache entries the PR jobs restore; PR jobs only restore. The PR workflow
 classifies the diff before it spends runner time, in two steps. When every
-changed path is under `docs/**` or is a Markdown file, only `preflight` runs and
-the Rust jobs are skipped; a draft pull request stops at `preflight` as well.
+changed path is under `docs/**` or is a Markdown file at the repository root,
+only `preflight` runs and the Rust jobs are skipped; a draft pull request stops
+at `preflight` as well, and marking it ready for review re-runs the workflow so
+the Rust checks still happen. Markdown under `sample/` or `fixtures/` counts as
+code, because the sample is embedded into the executable and the fixtures are
+read by tests.
 Among code changes, the expensive app suites and the cross-platform builds
 additionally require a path that can change what a Rust build produces
 (`crates/**`, `vendor/**`, a Cargo manifest or lock, `rust-toolchain*`), so a

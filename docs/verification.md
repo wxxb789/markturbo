@@ -43,15 +43,18 @@ hash-bound milestone action and may be BLOCKED by the desktop/session.
 ### Per-PR pipeline
 
 `.github/workflows/pull-request.yml` classifies the diff before it spends runner
-time: a changed path is documentation only when it is under `docs/**` or ends in
-`.md`, and everything else (`.github/**`, `crates/**`, `scripts/**`,
-`installer/**`, the Cargo manifests) is code. Within code changes it also marks
-whether anything can change what a Rust build produces (`crates/**`,
-`vendor/**`, a Cargo manifest or lock, `rust-toolchain*`); the app suites and the
-cross-platform builds require that second flag, so script-, installer- and
-workflow-only changes keep the cheap Linux checks and leave the expensive
-combinations to the nightly workflow. An unresolvable range falls back to
-running everything.
+time: a changed path is documentation only when it is under `docs/**` or is a
+Markdown file at the repository root, because `sample/` is embedded into the
+executable and `fixtures/` is read by tests; everything else (`.github/**`,
+`crates/**`, `scripts/**`, `installer/**`, `sample/**`, `fixtures/**`, the Cargo
+manifests) is code. Within code changes it also marks whether anything can
+change what a Rust build produces (`crates/**`, `vendor/**`, `sample/**`, a
+Cargo manifest or lock, `rust-toolchain*`); the app suites and the cross-platform
+builds require that second flag, so script-, installer- and workflow-only
+changes keep the cheap Linux checks and leave the expensive combinations to the
+nightly workflow. An unresolvable range falls back to running everything. The
+workflow also listens for `ready_for_review`, so marking a pull request ready
+runs the Rust checks that its draft pushes skipped.
 
 | Job | Trigger | Command |
 | --- | --- | --- |

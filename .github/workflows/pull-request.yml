@@ -1,7 +1,11 @@
 name: Pull request
 
 on:
-  pull_request: {}
+  pull_request:
+    # `ready_for_review` matters: without it a pull request whose last push
+    # happened while it was a draft would keep the Rust checks skipped forever,
+    # because the default activity types are only opened/synchronize/reopened.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: pull-request-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -42,6 +46,11 @@ jobs:
 
           # `git diff --no-renames` lists both sides of a rename, so a rename
           # across the documentation boundary cannot hide a code path.
+          # Documentation is `docs/**` and Markdown files at the repository
+          # root, nothing else: `sample/` is embedded into the executable and
+          # `fixtures/` is read by tests, so a Markdown file under them is a
+          # build or test input rather than documentation.
+          #
           # `code` keeps the cheap Linux checks (clippy, core tests) for every
           # non-documentation change; `rust` additionally requires a path that
           # can change what a Rust build produces, so the expensive app suites
@@ -57,15 +66,17 @@ jobs:
             rust=false
             while IFS= read -r path; do
               [[ -z "$path" ]] && continue
-              # Documentation is only docs/** and *.md anywhere. Everything
-              # else - .github/, crates/, scripts/, installer/, the Cargo
-              # manifests - is code and keeps the full cross-platform gate.
+              # Documentation is docs/** plus Markdown at the repository root.
+              # Everything else - .github/, crates/, scripts/, installer/,
+              # sample/, fixtures/, the Cargo manifests - is code and keeps the
+              # full cross-platform gate.
               case "$path" in
-                docs/* | *.md) continue ;;
+                docs/*) continue ;;
+                *.md) [[ "$path" == */* ]] || continue ;;
                 *) code=true ;;
               esac
               case "$path" in
-                crates/* | vendor/* | Cargo.toml | Cargo.lock | */Cargo.toml | rust-toolchain*) rust=true ;;
+                crates/* | vendor/* | sample/* | Cargo.toml | Cargo.lock | */Cargo.toml | rust-toolchain*) rust=true ;;
               esac
             done <<< "$paths"
             printf 'changed paths:\n%s\n' "$paths"
