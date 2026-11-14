@@ -73,13 +73,26 @@ See the [first-Review walkthrough](https://github.com/wxxb789/markturbo/blob/v__
 and [privacy explanation](https://github.com/wxxb789/markturbo/blob/v__VERSION__/README.md#privacy)
 for local operations, endpoint disclosure, credentials, recovery, and logs.
 
+## Local data
+
+Local usage counts are optional and **off by default**. When enabled in
+**Settings**, MarkTurbo keeps coarse daily counts (first launch, document opens
+and pastes, Review starts and completions with a coarse duration, submitted
+clarifications, revision decisions, applied revisions, saves, provider and
+credential failures, blocked stale applies, recovery restores) in `usage.json`
+under the runtime data root for up to 180 days. The counts contain no document,
+selection, answer or model text, no credentials, paths, file names or precise
+times, and they are never uploaded. Settings shows the summary and per-day
+counts and provides enable/disable, a deliberate JSON export, and Clear; see the
+[privacy explanation](https://github.com/wxxb789/markturbo/blob/v__VERSION__/README.md#privacy).
+
 ## Screenshots
 
 Goal 09 release-build visual matrix contact sheets:
 
-- [Default viewport](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/evidence/goal-09/final4/contact-default.png)
-- [Minimum viewport](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/evidence/goal-09/final4/contact-minimum.png)
-- [Wide viewport](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/evidence/goal-09/final4/contact-wide.png)
+- [Default viewport](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/evidence/goal-09/final5/contact-default.png)
+- [Minimum viewport](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/evidence/goal-09/final5/contact-minimum.png)
+- [Wide viewport](https://github.com/wxxb789/markturbo/blob/v__VERSION__/docs/evidence/goal-09/final5/contact-wide.png)
 
 These are screenshots, not a Review demonstration recording. That recording is
 pending.
