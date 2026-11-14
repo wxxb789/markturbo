@@ -30,3 +30,21 @@
   40-node flow 638 µs vs 436 µs) with larger SVG output. Revisit with a
   benchmark against `mermaid-svg` on representative documents, a measured
   improvement threshold, and no new JS/script-execution requirement.
+- [ ] **Retired native acceptance adapters** — `mt.py accept goal-02`,
+  `goal-03`, `goal-06`, `goal-07` and their `scripts/markturbo_tools/native/*`
+  modules still drive the retired GPUI shell (`crates/mt-app/src/views/` no
+  longer exists; `docs/goal-09-acceptance.md` states the selectors are retired
+  and that rebuilding them for nsh is not part of that gate). They cannot
+  produce acceptance for the current nsh app; `check native` still compiles and
+  unit-tests them. Decide per adapter whether to rebuild on the nsh UIA surface
+  or delete the adapter, its module, and its `ACCEPTANCE_GOALS` entry, so the
+  CLI stops advertising an acceptance path that cannot pass. Revalidate the
+  candidate before removing anything.
+- [ ] **`cargo run --release -p mt-app` panics at startup** — `README.md`
+  documents the plain binary as "the same app without the nsh CLI", but it exits
+  101 with `no reactive runtime: signals are used on the engine thread, while
+  components run` (`nsh-core` 0.4.0 `element/reactive.rs:164`) from
+  `markturbo::main`, while the `nsh package` runner binary from the same revision
+  starts and shows its window normally (measured 2026-11-14). Confirm whether it
+  predates the usage-counters change, then either fix the entry point or correct
+  the documentation so the documented dev path is not a panic.
