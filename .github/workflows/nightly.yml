@@ -5,6 +5,8 @@ name: Nightly
 # branch's rust-cache entries warm for every pull request. The combinations
 # that no longer run per pull request run here once a day as a non-blocking
 # safety net: they are not a pull-request check and never gate a merge.
+# It is also the plain `cargo test` backstop: the per-pull-request app suites
+# use `cargo nextest`, which does not run doctests.
 on:
   schedule:
     # Off-peak and off the top of the hour, away from GitHub's cron peak.

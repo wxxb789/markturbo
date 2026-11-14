@@ -62,9 +62,19 @@ runs the Rust checks that its draft pushes skipped.
 | preflight (fast + format) | every pull request | `check fast` over the same base..head range, then `cargo fmt --all -- --check` |
 | clippy (Linux) | code changes, not a draft | `cargo clippy --profile ci --workspace --all-targets --locked` |
 | mt-core tests (Linux) | code changes, not a draft | `cargo test --profile ci -p mt-core --features model-transport,test-support --locked` |
-| mt-app tests (Linux) | Rust changes, not a draft | `cargo test --profile ci -p mt-app --locked` |
+| mt-app tests (Linux) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app` |
 | macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, `cargo test --profile ci -p mt-core --locked`, `lipo -archs` |
-| release-tests (windows-2022) | Rust changes, not a draft | `cargo test --locked --profile ci -p mt-app -p mt-core` |
+| release-tests (windows-2022) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core` |
+
+The app suites run under `cargo nextest`, which starts the twenty-odd test
+binaries in parallel instead of one process at a time (measured 22 s against
+57 s for the app suite on the development desktop). nextest does not run
+doctests; the workspace has none today (the CI log shows no `Doc-tests` harness
+and `cargo test --doc --workspace` compiles a separate unit set for zero tests,
+measured 11m33s), so the nightly `check ci` run keeps the plain `cargo test` path
+as the backstop for any doctest added later instead of paying that compile in
+every pull request. The `mt-core` shard keeps plain `cargo test`, so mt-core
+doctests would still run per pull request if any were added.
 
 The three Linux Rust jobs are the pieces of `check ci`, split so the wall clock
 is the slowest shard instead of the sum: `check fast` and formatting in
@@ -77,6 +87,11 @@ about two minutes instead of after the workspace has compiled. A
 documentation-only pull request pays only for the classifier and `preflight`,
 and a draft pull request stops there too; the skipped jobs still report success,
 so a required-check list keeps working.
+
+Linking is not the bottleneck, so the toolchain stays default: relinking every
+mt-app test binary with the MSVC linker takes 29.5 s on the development desktop
+(16 cores, warm cache), and pointing `CARGO_TARGET_*_LINKER` at `rust-lld` both
+invalidated the build fingerprint and produced no comparable measurement.
 
 Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
 app/UI headless suite on the public-quality platform, and macOS the arm64

@@ -265,8 +265,15 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good
 
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest
+
       - name: Test
-        run: cargo test --profile ci -p mt-app --locked
+        # nextest runs the twenty-odd mt-app test binaries in parallel instead of
+        # one process at a time: measured 22 s against 57 s for this suite on the
+        # development desktop, and the same order on a runner.
+        run: cargo nextest run --locked --cargo-profile ci -p mt-app
 
   # Compatibility evidence for the arm64 build plus headless core behavior on
   # macOS. The release-profile app suite moved to the nightly workflow, which
@@ -345,5 +352,11 @@ jobs:
           shared-key: markturbo-windows
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest
+
       - name: Test
-        run: cargo test --locked --profile ci -p mt-app -p mt-core
+        # Same parallel runner; the nightly plain `cargo test` run is the
+        # doctest backstop, so no extra compile pass is needed here.
+        run: cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core

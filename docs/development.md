@@ -75,10 +75,18 @@ development desktop (Windows 11 x64, 16 cores, warm `target/ci`):
 
 ```sh
 cargo test --locked --profile ci -p mt-app        # ~1 min, app/UI behavior
+cargo nextest run --locked --cargo-profile ci -p mt-app   # ~22 s, same suite
 cargo test --locked --profile ci -p mt-core       # core behavior
 cargo test --locked --profile ci --workspace      # whole workspace, ~3.5 min
 uv run --locked --project scripts scripts/mt.py check ci   # the PR gate
 ```
+
+`cargo nextest` is the parallel runner CI uses for the app suites; install it
+once with `cargo install cargo-nextest --locked`. It runs the same tests ~2.5x
+faster here because the suite is dominated by per-process startup. `cargo test`
+stays valid for every command above; it is also the only one of the two that
+runs doctests, so keep using it for `--doc` (the workspace has none today, and
+the nightly `check ci` run covers them if that changes).
 
 For comparison, a code pull request spends roughly 15-18 minutes in CI and a
 documentation-only one about 2-3. `.githooks/pre-push` is an opt-in guard for the
