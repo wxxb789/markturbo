@@ -76,7 +76,10 @@ jobs:
                 *) code=true ;;
               esac
               case "$path" in
-                crates/* | vendor/* | sample/* | Cargo.toml | Cargo.lock | */Cargo.toml | rust-toolchain*) rust=true ;;
+                # A workflow change alters how the Rust suite runs, so it must
+                # exercise the pipeline it changes; the rest can change what a
+                # build produces.
+                .github/workflows/* | crates/* | vendor/* | sample/* | Cargo.toml | Cargo.lock | */Cargo.toml | rust-toolchain*) rust=true ;;
               esac
             done <<< "$paths"
             printf 'changed paths:\n%s\n' "$paths"
