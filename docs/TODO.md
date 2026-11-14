@@ -40,11 +40,3 @@
   or delete the adapter, its module, and its `ACCEPTANCE_GOALS` entry, so the
   CLI stops advertising an acceptance path that cannot pass. Revalidate the
   candidate before removing anything.
-- [ ] **`cargo run --release -p mt-app` panics at startup** — `README.md`
-  documents the plain binary as "the same app without the nsh CLI", but it exits
-  101 with `no reactive runtime: signals are used on the engine thread, while
-  components run` (`nsh-core` 0.4.0 `element/reactive.rs:164`) from
-  `markturbo::main`, while the `nsh package` runner binary from the same revision
-  starts and shows its window normally (measured 2026-11-14). Confirm whether it
-  predates the usage-counters change, then either fix the entry point or correct
-  the documentation so the documented dev path is not a panic.

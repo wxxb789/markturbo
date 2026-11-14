@@ -212,15 +212,19 @@ cargo release version patch --workspace --execute --no-confirm
 cargo release version alpha --workspace --execute --no-confirm
 ```
 
-Or build and run directly:
+Or build and run locally:
 
 ```sh
 nsh run crates/mt-app                         # this machine's native backend
 nsh run crates/mt-app --target macos          # macOS (AppKit)
 nsh run crates/mt-app --target linux          # Linux (GTK 4)
 nsh run crates/mt-app --target windows        # Windows (Win32/Direct2D)
-cargo run --release -p mt-app                 # the same app without the nsh CLI
+cargo run --release -p mt-app                 # native Rust entry point; no nsh CLI
 ```
+
+The Cargo entry point passes the embedded theme on the Rust root so nsh applies
+it on the engine thread before rendering. This local run does not replace the
+release packaging path below, which supplies the application icon and metadata.
 
 Package a standalone app with `nsh package --target windows|macos|linux` from
 `crates/mt-app`; the icon, theme and metadata come from `nsh.json`. The first

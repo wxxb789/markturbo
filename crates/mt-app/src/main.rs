@@ -19,9 +19,10 @@ fn main() -> impl std::process::Termination {
     }
     let tokens = nsh_base::tokens_of(Some(include_str!("../theme.json")))
         .expect("theme.json is a valid nsh theme");
-    nsh_core::prelude::set_tokens(tokens);
+    // Startup tokens travel with the root; reactive set_tokens requires the
+    // engine runtime, which run_app has not started yet.
     platform::run_app(
-        platform::AppSource::Rust(platform::Root::of::<mt_app::App>()),
+        platform::AppSource::Rust(platform::Root::of::<mt_app::App>().tokens(tokens)),
         platform::AppOptions {
             title: "MarkTurbo".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
