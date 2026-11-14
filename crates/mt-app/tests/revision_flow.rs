@@ -80,7 +80,7 @@ fn review_then_revision_applies_only_approved_change() {
     std::fs::write(
         config.path().join("settings.toml"),
         format!(
-            "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\n"
+            "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
         ),
     )
     .expect("write settings");
@@ -122,6 +122,24 @@ fn review_then_revision_applies_only_approved_change() {
         |text| text == "Revised\n",
         "the applied revision is saved",
         Duration::from_secs(20),
+    );
+    let counts = mt_core::usage::UsageStore::open(true)
+        .inspect(std::time::SystemTime::now())
+        .unwrap();
+    let day = counts.days().values().next().expect("daily usage counts");
+    assert_eq!(day.accepted_hunks, 1);
+    assert_eq!(day.rejected_hunks, 0);
+    assert_eq!(
+        day.events[&mt_core::usage::UsageEventKind::RevisionDecision],
+        1
+    );
+    assert_eq!(
+        day.events[&mt_core::usage::UsageEventKind::RevisionApplied],
+        1
+    );
+    assert_eq!(
+        day.events[&mt_core::usage::UsageEventKind::ArtifactSaved],
+        1
     );
     assert_eq!(
         std::fs::read_to_string(&document).expect("read saved file"),

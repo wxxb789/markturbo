@@ -1681,6 +1681,7 @@ fn settings_page(state: AppState, language: Language, compact: bool) -> impl Int
                     },
                 )),
         ))
+        .child(usage_settings(state.clone(), language))
         .child(
             text(move || notice.get())
                 .text_size(px(12.0))
@@ -1690,6 +1691,80 @@ fn settings_page(state: AppState, language: Language, compact: bool) -> impl Int
             i18n::t(language, Key::SaveSettings),
             move || save.save_settings(),
         ))
+}
+
+fn usage_settings(state: AppState, language: Language) -> impl IntoElement {
+    let settings = state.settings;
+    let counts = state.usage_counts;
+    let inspecting = state.usage_inspection_open;
+    let inspect = state.clone();
+    let export = state.clone();
+    let clear = state.clone();
+    settings_field(
+        i18n::t(language, Key::UsageCounters),
+        view()
+            .test_id("usage-counters")
+            .flex_col()
+            .gap_2()
+            .child(text(i18n::t(language, Key::UsageDisclosure)).text_size(px(12.0)))
+            .child(each(
+                move || vec![settings.get().usage_metrics_enabled],
+                |enabled: &bool| *enabled,
+                move |enabled: ReadSignal<bool>, _| {
+                    let on = state.clone();
+                    let off = state.clone();
+                    view()
+                        .flex_row()
+                        .gap_2()
+                        .child(choice_button(
+                            i18n::t(language, Key::UsageOff),
+                            !enabled.get(),
+                            move || off.set_usage_enabled(false),
+                        ))
+                        .child(choice_button(
+                            i18n::t(language, Key::UsageOn),
+                            enabled.get(),
+                            move || on.set_usage_enabled(true),
+                        ))
+                },
+            ))
+            .child(
+                text(move || i18n::usage_summary(language, &counts.get()))
+                    .test_id("usage-summary")
+                    .text_size(px(12.0)),
+            )
+            .child(
+                text(i18n::t(language, Key::UsageRetention))
+                    .test_id("usage-retention")
+                    .text_size(px(12.0))
+                    .text_color(move || theme().muted_foreground),
+            )
+            .child(
+                view()
+                    .flex_row()
+                    .gap_2()
+                    .child(small_button(
+                        i18n::t(language, Key::UsageInspect),
+                        move || inspect.inspect_usage(),
+                    ))
+                    .child(small_button(
+                        i18n::t(language, Key::UsageExport),
+                        move || export.export_usage(),
+                    ))
+                    .child(small_button(
+                        i18n::t(language, Key::UsageClear),
+                        move || clear.clear_usage(),
+                    )),
+            )
+            .child(when(
+                move || inspecting.get(),
+                move || {
+                    text(move || i18n::usage_details(language, &counts.get()))
+                        .test_id("usage-details")
+                        .text_size(px(12.0))
+                },
+            )),
+    )
 }
 
 fn settings_field(label: &'static str, control: impl IntoElement) -> impl IntoElement {

@@ -279,6 +279,9 @@ pub struct SettingsData {
     pub skills_group_by: GroupBy,
     /// Whether a no-argument launch begins in the welcome state.
     pub show_welcome_on_startup: bool,
+    /// Explicit consent to local, content-free usage counters. Never enables
+    /// an upload; export remains a separate deliberate user action.
+    pub usage_metrics_enabled: bool,
     /// Most-recently used paths shown by the welcome state.
     ///
     /// This must remain last so TOML writes all scalar fields before its array
@@ -307,6 +310,7 @@ impl Default for SettingsData {
             skills_include_internal: false,
             skills_group_by: GroupBy::default(),
             show_welcome_on_startup: true,
+            usage_metrics_enabled: false,
             recent_targets: Vec::new(),
         }
     }
@@ -424,6 +428,12 @@ impl SettingsData {
         self.try_save_with_intent(SettingsWriteIntent::EnvironmentCredentialAuthorization)
     }
 
+    /// Persist an explicit usage-counter enable/disable decision. Ordinary
+    /// settings saves cannot restore stale consent after collection is disabled.
+    pub fn try_save_usage_metrics_consent(&self) -> std::io::Result<Self> {
+        self.try_save_with_intent(SettingsWriteIntent::UsageMetricsConsent)
+    }
+
     /// Clear a legacy credential only if the current file still contains the
     /// verified snapshot's exact value and still identifies the verified
     /// endpoint. The write preserves every other field from the latest file.
@@ -511,6 +521,9 @@ impl SettingsData {
         if intent != SettingsWriteIntent::EnvironmentCredentialAuthorization {
             candidate.model_environment_key_identity = current.model_environment_key_identity;
         }
+        if intent != SettingsWriteIntent::UsageMetricsConsent {
+            candidate.usage_metrics_enabled = current.usage_metrics_enabled;
+        }
         candidate.write_to(path)?;
         Ok(candidate)
     }
@@ -530,6 +543,7 @@ impl SettingsData {
 enum SettingsWriteIntent {
     General,
     EnvironmentCredentialAuthorization,
+    UsageMetricsConsent,
 }
 
 #[derive(Debug)]
@@ -539,7 +553,7 @@ pub(crate) enum LegacyCredentialMigrationSaveError {
 }
 
 #[cfg(target_os = "windows")]
-struct SettingsWriteGuard {
+pub(crate) struct SettingsWriteGuard {
     handle: windows::Win32::Foundation::HANDLE,
 }
 
@@ -554,7 +568,7 @@ impl Drop for SettingsWriteGuard {
 }
 
 #[cfg(target_os = "windows")]
-fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
+pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes_named("Global\\markturbo-settings-write-v1")
 }
 
@@ -588,12 +602,12 @@ fn lock_settings_writes_named(name: &str) -> std::io::Result<SettingsWriteGuard>
 }
 
 #[cfg(not(target_os = "windows"))]
-struct SettingsWriteGuard {
+pub(crate) struct SettingsWriteGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(not(target_os = "windows"))]
-fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
+pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
     static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
     Ok(SettingsWriteGuard {
         _guard: WRITES
@@ -637,6 +651,37 @@ mod tests {
     #[test]
     fn defaults_follow_the_system_theme() {
         assert_eq!(SettingsData::default().theme, ThemePreference::System);
+    }
+
+    #[test]
+    fn usage_metrics_default_off_and_round_trip_explicit_consent() {
+        let _usage_guard = crate::usage::USAGE_TEST_LOCK.lock().unwrap();
+        assert!(!SettingsData::default().usage_metrics_enabled);
+        let legacy: SettingsData = toml::from_str("theme = 'dark'").unwrap();
+        assert!(!legacy.usage_metrics_enabled);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let enabled = SettingsData {
+            usage_metrics_enabled: true,
+            ..SettingsData::default()
+        };
+        enabled
+            .try_save_to_with_intent(&path, SettingsWriteIntent::UsageMetricsConsent)
+            .unwrap();
+        let mut stale = SettingsData::load_from(&path);
+        assert!(stale.usage_metrics_enabled);
+
+        let mut disabled = stale.clone();
+        disabled.usage_metrics_enabled = false;
+        disabled
+            .try_save_to_with_intent(&path, SettingsWriteIntent::UsageMetricsConsent)
+            .unwrap();
+        stale.theme = ThemePreference::Dark;
+        let saved = stale.try_save_general_to(&path).unwrap();
+        assert_eq!(saved.theme, ThemePreference::Dark);
+        assert!(!saved.usage_metrics_enabled);
+        assert!(!SettingsData::load_from(&path).usage_metrics_enabled);
     }
 
     #[test]
@@ -884,6 +929,7 @@ mod tests {
             skills_group_by: GroupBy::Status,
             translate_to: "de".into(),
             show_welcome_on_startup: false,
+            usage_metrics_enabled: true,
             recent_targets: vec![RecentTarget::new(
                 PathBuf::from("C:/work/notes.md"),
                 RecentTargetKind::File,

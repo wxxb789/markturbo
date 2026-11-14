@@ -379,6 +379,51 @@ pub enum Key {
     IncludeGlobalSkillsHelp,
     ShowInternalSkillsHelp,
     GroupByHelp,
+
+    // Optional local usage counters
+    UsageCounters,
+    UsageDisclosure,
+    UsageRetention,
+    UsageOff,
+    UsageOn,
+    UsageInspect,
+    UsageExport,
+    UsageClear,
+    UsageExportFileName,
+    UsageExportFormat,
+    UsageConsentSaved,
+    UsageConsentSaveFailed,
+    UsageUnavailable,
+    UsageExported,
+    UsageExportFailed,
+    UsageCleared,
+    UsageUtcDay,
+    UsageFirstLaunch,
+    UsageArtifactOpened,
+    UsageArtifactPasted,
+    UsageReviewStarted,
+    UsageReviewCompleted,
+    UsageClarificationAnswered,
+    UsageClarificationDeferred,
+    UsageClarificationRejected,
+    UsageRevisionDecision,
+    UsageRevisionApplied,
+    UsageArtifactSaved,
+    UsageArtifactCopied,
+    UsageProviderFailure,
+    UsageCredentialFailure,
+    UsageStaleResultBlocked,
+    UsageRecoveryRestored,
+    UsageAcceptedHunks,
+    UsageRejectedHunks,
+    UsageScopeDocument,
+    UsageScopeSelection,
+    UsageLensSpecification,
+    UsageLensPlan,
+    UsageDurationUnderOne,
+    UsageDurationOneToFive,
+    UsageDurationFiveToFifteen,
+    UsageDurationFifteenPlus,
 }
 
 /// The string for `key` in the language the user picked.
@@ -387,6 +432,100 @@ pub fn t(language: Language, key: Key) -> &'static str {
         Language::English => english(key),
         Language::Chinese => chinese(key),
     }
+}
+
+pub fn usage_summary(language: Language, counts: &mt_core::usage::UsageAggregate) -> String {
+    use mt_core::usage::UsageEventKind;
+    let total = |kind| {
+        counts.days().values().fold(0_u64, |sum, day| {
+            sum.saturating_add(day.events.get(&kind).copied().unwrap_or_default())
+        })
+    };
+    let days = counts.days().len();
+    let reviews = total(UsageEventKind::ReviewCompleted);
+    let decisions = total(UsageEventKind::RevisionDecision);
+    let events = counts
+        .days()
+        .values()
+        .flat_map(|day| day.events.values())
+        .fold(0_u64, |sum, count| sum.saturating_add(*count));
+    match language {
+        Language::English => format!(
+            "{days} retained UTC days · {reviews} Reviews completed · {decisions} revision decisions · {events} events"
+        ),
+        Language::Chinese => format!(
+            "保留 {days} 个 UTC 日 · 完成 {reviews} 次审查 · {decisions} 次修订决定 · {events} 个事件"
+        ),
+    }
+}
+
+pub fn usage_details(language: Language, counts: &mt_core::usage::UsageAggregate) -> String {
+    use mt_core::{
+        review::ArtifactLens,
+        usage::{ReviewDurationBucket, UsageEventKind, UsageReviewScope},
+    };
+    let mut lines = Vec::new();
+    for (day, counts) in counts.days() {
+        lines.push(format!("{} {day}", t(language, Key::UsageUtcDay)));
+        for (kind, count) in &counts.events {
+            let key = match kind {
+                UsageEventKind::FirstLaunch => Key::UsageFirstLaunch,
+                UsageEventKind::ArtifactOpened => Key::UsageArtifactOpened,
+                UsageEventKind::ArtifactPasted => Key::UsageArtifactPasted,
+                UsageEventKind::ReviewStarted => Key::UsageReviewStarted,
+                UsageEventKind::ReviewCompleted => Key::UsageReviewCompleted,
+                UsageEventKind::ClarificationAnswered => Key::UsageClarificationAnswered,
+                UsageEventKind::ClarificationDeferred => Key::UsageClarificationDeferred,
+                UsageEventKind::ClarificationRejected => Key::UsageClarificationRejected,
+                UsageEventKind::RevisionDecision => Key::UsageRevisionDecision,
+                UsageEventKind::RevisionApplied => Key::UsageRevisionApplied,
+                UsageEventKind::ArtifactSaved => Key::UsageArtifactSaved,
+                UsageEventKind::ArtifactCopied => Key::UsageArtifactCopied,
+                UsageEventKind::ProviderFailure => Key::UsageProviderFailure,
+                UsageEventKind::CredentialFailure => Key::UsageCredentialFailure,
+                UsageEventKind::StaleResultBlocked => Key::UsageStaleResultBlocked,
+                UsageEventKind::RecoveryRestored => Key::UsageRecoveryRestored,
+            };
+            lines.push(format!("{}: {count}", t(language, key)));
+        }
+        for (scope, lenses) in &counts.review_started {
+            let scope = match scope {
+                UsageReviewScope::Document => Key::UsageScopeDocument,
+                UsageReviewScope::Selection => Key::UsageScopeSelection,
+            };
+            for (lens, count) in lenses {
+                let lens = match lens {
+                    ArtifactLens::Prompt => Key::ReviewLensPrompt,
+                    ArtifactLens::Specification => Key::UsageLensSpecification,
+                    ArtifactLens::Plan => Key::UsageLensPlan,
+                    ArtifactLens::AgentInstructions => Key::ReviewLensAgentInstructions,
+                    ArtifactLens::AgentSkill => Key::ReviewLensAgentSkill,
+                };
+                lines.push(format!(
+                    "{} / {}: {count}",
+                    t(language, scope),
+                    t(language, lens)
+                ));
+            }
+        }
+        for (duration, count) in &counts.review_durations {
+            let key = match duration {
+                ReviewDurationBucket::UnderOneMinute => Key::UsageDurationUnderOne,
+                ReviewDurationBucket::OneToFiveMinutes => Key::UsageDurationOneToFive,
+                ReviewDurationBucket::FiveToFifteenMinutes => Key::UsageDurationFiveToFifteen,
+                ReviewDurationBucket::FifteenMinutesOrMore => Key::UsageDurationFifteenPlus,
+            };
+            lines.push(format!("{}: {count}", t(language, key)));
+        }
+        lines.push(format!(
+            "{}: {} · {}: {}",
+            t(language, Key::UsageAcceptedHunks),
+            counts.accepted_hunks,
+            t(language, Key::UsageRejectedHunks),
+            counts.rejected_hunks
+        ));
+    }
+    lines.join("\n")
 }
 
 pub(crate) fn quoted_path(path: &std::path::Path) -> String {
@@ -1217,6 +1356,61 @@ fn english(key: Key) -> &'static str {
              default."
         }
         Key::GroupByHelp => "How the Skills list is organized.",
+        Key::UsageCounters => "Local usage counters",
+        Key::UsageDisclosure => {
+            "Optional, local only: daily counts of opted-in first launch, artifact open/paste/save, Review starts (scope and lens), completed Reviews (duration bucket), submitted clarification answers, revision decisions (accepted/rejected hunk totals), applied revisions, provider/credential failures, stale-result blocks and recovery restores. No content, names, paths, credentials, identities or precise timestamps. Nothing is uploaded; export only when you choose."
+        }
+        Key::UsageRetention => {
+            "Retain counts for 180 days; prune older days on load/save. Day keys are UTC days since 1970-01-01. Off stops recording; Clear deletes local counts, not your exported copies."
+        }
+        Key::UsageOff => "Off",
+        Key::UsageOn => "On",
+        Key::UsageInspect => "Inspect counts",
+        Key::UsageExport => "Export counts…",
+        Key::UsageClear => "Clear counts",
+        Key::UsageExportFileName => "markturbo-usage.json",
+        Key::UsageExportFormat => "JSON",
+        Key::UsageConsentSaved => "Usage-counter preference saved.",
+        Key::UsageConsentSaveFailed => {
+            "Could not save the preference. Recording is off for this session; try again before restarting."
+        }
+        Key::UsageUnavailable => {
+            "Local usage counts could not be read or written. Editing and Review remain available."
+        }
+        Key::UsageExported => "Aggregate counts exported. Nothing was uploaded.",
+        Key::UsageExportFailed => {
+            "Counts could not be exported. Choose a writable path that does not already exist."
+        }
+        Key::UsageCleared => {
+            "Local counts deleted. Recording preference and exported copies are unchanged."
+        }
+        Key::UsageUtcDay => "UTC day since 1970-01-01:",
+        Key::UsageFirstLaunch => "First opted-in launch",
+        Key::UsageArtifactOpened => "Artifacts opened",
+        Key::UsageArtifactPasted => "Artifacts pasted",
+        Key::UsageReviewStarted => "Reviews started",
+        Key::UsageReviewCompleted => "Reviews completed",
+        Key::UsageClarificationAnswered => "Clarification answers submitted",
+        Key::UsageClarificationDeferred => "Clarifications deferred",
+        Key::UsageClarificationRejected => "Clarifications rejected",
+        Key::UsageRevisionDecision => "Revision decisions",
+        Key::UsageRevisionApplied => "Revisions applied",
+        Key::UsageArtifactSaved => "Artifacts saved",
+        Key::UsageArtifactCopied => "Artifacts copied",
+        Key::UsageProviderFailure => "Provider failures",
+        Key::UsageCredentialFailure => "Credential failures",
+        Key::UsageStaleResultBlocked => "Stale results blocked",
+        Key::UsageRecoveryRestored => "Recovery restores",
+        Key::UsageAcceptedHunks => "Accepted hunks",
+        Key::UsageRejectedHunks => "Rejected hunks",
+        Key::UsageScopeDocument => "Whole-artifact Review",
+        Key::UsageScopeSelection => "Selection Review",
+        Key::UsageLensSpecification => "Specification",
+        Key::UsageLensPlan => "Plan",
+        Key::UsageDurationUnderOne => "Review duration under 1 minute",
+        Key::UsageDurationOneToFive => "Review duration 1–5 minutes",
+        Key::UsageDurationFiveToFifteen => "Review duration 5–15 minutes",
+        Key::UsageDurationFifteenPlus => "Review duration 15 minutes or more",
     }
 }
 
@@ -1606,6 +1800,53 @@ fn chinese(key: Key) -> &'static str {
             "标记了 `metadata.internal: true` 的 skills，参考工具默认将其隐藏。"
         }
         Key::GroupByHelp => "Skills 列表的组织方式。",
+        Key::UsageCounters => "本地使用计数",
+        Key::UsageDisclosure => {
+            "可选且仅限本地：按日记录启用后的首次启动、工件打开/粘贴/保存、审查开始（范围及视角）、审查完成（耗时区间）、已提交的澄清回答、修订决定（接受/拒绝的修改块总数）、已应用的修订、服务商/凭据失败、过期结果拦截和恢复操作次数。不记录内容、名称、路径、凭据、身份或精确时间。不上传任何数据；仅由您主动导出。"
+        }
+        Key::UsageRetention => {
+            "计数保留 180 天，读取/保存时清理更早的日期。日期键为自 1970-01-01 起的 UTC 日数。关闭即停止记录；清除仅删除本地计数，不删除您导出的副本。"
+        }
+        Key::UsageOff => "关闭",
+        Key::UsageOn => "开启",
+        Key::UsageInspect => "查看计数",
+        Key::UsageExport => "导出计数…",
+        Key::UsageClear => "清除计数",
+        Key::UsageExportFileName => "markturbo-usage.json",
+        Key::UsageExportFormat => "JSON",
+        Key::UsageConsentSaved => "使用计数偏好已保存。",
+        Key::UsageConsentSaveFailed => "无法保存偏好。本次会话已停止记录；请在重启前重试。",
+        Key::UsageUnavailable => "无法读取或写入本地使用计数。编辑和审查仍然可用。",
+        Key::UsageExported => "已导出汇总计数，未上传任何数据。",
+        Key::UsageExportFailed => "无法导出计数。请选择可写且尚不存在的路径。",
+        Key::UsageCleared => "已删除本地计数。记录偏好和已导出的副本不变。",
+        Key::UsageUtcDay => "自 1970-01-01 起的 UTC 日数：",
+        Key::UsageFirstLaunch => "启用后的首次启动",
+        Key::UsageArtifactOpened => "工件打开次数",
+        Key::UsageArtifactPasted => "工件粘贴次数",
+        Key::UsageReviewStarted => "审查开始次数",
+        Key::UsageReviewCompleted => "审查完成次数",
+        Key::UsageClarificationAnswered => "已提交的澄清回答数",
+        Key::UsageClarificationDeferred => "暂缓的澄清数",
+        Key::UsageClarificationRejected => "拒绝的澄清数",
+        Key::UsageRevisionDecision => "修订决定次数",
+        Key::UsageRevisionApplied => "修订应用次数",
+        Key::UsageArtifactSaved => "工件保存次数",
+        Key::UsageArtifactCopied => "工件复制次数",
+        Key::UsageProviderFailure => "服务商失败次数",
+        Key::UsageCredentialFailure => "凭据失败次数",
+        Key::UsageStaleResultBlocked => "过期结果拦截次数",
+        Key::UsageRecoveryRestored => "恢复操作次数",
+        Key::UsageAcceptedHunks => "接受的修改块",
+        Key::UsageRejectedHunks => "拒绝的修改块",
+        Key::UsageScopeDocument => "完整工件审查",
+        Key::UsageScopeSelection => "选区审查",
+        Key::UsageLensSpecification => "规格",
+        Key::UsageLensPlan => "计划",
+        Key::UsageDurationUnderOne => "审查耗时不足 1 分钟",
+        Key::UsageDurationOneToFive => "审查耗时 1–5 分钟",
+        Key::UsageDurationFiveToFifteen => "审查耗时 5–15 分钟",
+        Key::UsageDurationFifteenPlus => "审查耗时至少 15 分钟",
     }
 }
 
@@ -1900,6 +2141,49 @@ mod tests {
         Key::IncludeGlobalSkillsHelp,
         Key::ShowInternalSkillsHelp,
         Key::GroupByHelp,
+        Key::UsageCounters,
+        Key::UsageDisclosure,
+        Key::UsageRetention,
+        Key::UsageOff,
+        Key::UsageOn,
+        Key::UsageInspect,
+        Key::UsageExport,
+        Key::UsageClear,
+        Key::UsageExportFileName,
+        Key::UsageExportFormat,
+        Key::UsageConsentSaved,
+        Key::UsageConsentSaveFailed,
+        Key::UsageUnavailable,
+        Key::UsageExported,
+        Key::UsageExportFailed,
+        Key::UsageCleared,
+        Key::UsageUtcDay,
+        Key::UsageFirstLaunch,
+        Key::UsageArtifactOpened,
+        Key::UsageArtifactPasted,
+        Key::UsageReviewStarted,
+        Key::UsageReviewCompleted,
+        Key::UsageClarificationAnswered,
+        Key::UsageClarificationDeferred,
+        Key::UsageClarificationRejected,
+        Key::UsageRevisionDecision,
+        Key::UsageRevisionApplied,
+        Key::UsageArtifactSaved,
+        Key::UsageArtifactCopied,
+        Key::UsageProviderFailure,
+        Key::UsageCredentialFailure,
+        Key::UsageStaleResultBlocked,
+        Key::UsageRecoveryRestored,
+        Key::UsageAcceptedHunks,
+        Key::UsageRejectedHunks,
+        Key::UsageScopeDocument,
+        Key::UsageScopeSelection,
+        Key::UsageLensSpecification,
+        Key::UsageLensPlan,
+        Key::UsageDurationUnderOne,
+        Key::UsageDurationOneToFive,
+        Key::UsageDurationFiveToFifteen,
+        Key::UsageDurationFifteenPlus,
     ];
 
     #[test]

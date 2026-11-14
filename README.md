@@ -303,6 +303,12 @@ reaches an endpoint that is not there.
 
 ## Settings
 
+- **Local usage counters** are optional and off by default. Settings discloses
+  exactly which content-free daily counts are recorded, shows a summary and
+  per-day inspection, and provides enable/disable, deliberate JSON export and
+  Clear. Counts stay in `usage.json` under the runtime data root for up to 180
+  days; nothing is uploaded. Clear deletes local counts, not exported copies.
+
 Settings are a TOML file, written when something changes:
 
 | Platform | Path |
@@ -324,7 +330,7 @@ Application-specific environment variables:
 | `MARKTURBO_MODEL` | Shared model id, if none is set in Settings |
 | `MARKTURBO_TRANSLATE_MODEL` | Legacy model-id fallback |
 | `MARKTURBO_CONFIG_DIR` | Overrides where `settings.toml` lives |
-| `MARKTURBO_DATA_DIR` | Absolute override for logs, recovery, and release-sample materialization (the nsh WebView2 profile stays at `%LOCALAPPDATA%\com.markturbo.app\WebView2`) |
+| `MARKTURBO_DATA_DIR` | Absolute override for logs, recovery, optional usage counts, and release-sample materialization (the nsh WebView2 profile stays at `%LOCALAPPDATA%\com.markturbo.app\WebView2`) |
 | `MT_MATH_FONT_DIR` | Optional complete KaTeX font-directory override for development; incomplete or absent overrides use embedded release fonts |
 | `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug` |
 

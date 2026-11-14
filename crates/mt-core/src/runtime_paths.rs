@@ -55,6 +55,12 @@ pub fn recovery_dir() -> Option<PathBuf> {
     Some(recovery_dir_in(&data_dir()?))
 }
 
+/// Optional content-free daily usage aggregates. Resolving the path performs
+/// no I/O; disabled recording must not create even an empty file or directory.
+pub fn usage_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("usage.json"))
+}
+
 /// This process's log file inside the shared log directory.
 ///
 /// One file per process avoids cross-process append and rotation races while

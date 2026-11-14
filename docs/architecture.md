@@ -17,6 +17,55 @@
 |`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
 |`web.rs`, `theme.rs`, `i18n.rs`|HTML/CSP construction, theme tokens and localized disclosure strings.|
 
+### Optional local usage counters
+
+`mt-core::usage` owns the closed event vocabulary, day bucketing, aggregate
+serialization and retention. Recording defaults off. Settings explicitly saves
+the `usage-metrics-enabled` consent field; ordinary saves preserve the latest
+consent. Each recording and retention-maintenance write rechecks persisted
+consent under the existing settings-write lock and fails closed for absent,
+unreadable or malformed settings. Disabling also stops the current session even
+if saving that preference fails, with a visible warning.
+
+The only store is `runtime_paths::data_dir()/usage.json`, including the existing
+absolute `MARKTURBO_DATA_DIR` override. Schema version 1 has `schema_version` and
+`days`, keyed by integer UTC days since 1970-01-01. Daily values contain closed
+`events` counts, `review_started` scope/lens counts, `review_durations` bucket
+counts, and `accepted_hunks`/`rejected_hunks` totals. Existing
+`ArtifactLens::infer_from_path` classification is reduced to its category before
+recording; names and paths never enter the store. Review duration means request
+dispatch to successful result, in under-1, 1–5, 5–15 or 15+-minute buckets.
+
+The live nsh transitions count the first opted-in launch present in the retained
+aggregate, file opens, clipboard pastes, Review starts/completions, submitted
+clarification answers, final revision hunk decisions, applied revisions,
+successful saves, provider/credential failures, blocked stale applications and
+recovery restores. The shell has no artifact-copy or explicit clarification
+defer/reject action, so those vocabulary entries are not emitted. Blank answers
+are not inferred to be deliberate deferrals. The counters contain no source,
+answers, proposed/model text, filenames, paths, endpoint identities, credentials,
+user/install identity or precise timestamps; they cannot establish activation
+timing or reported usefulness/trust without the separately consented research.
+
+Load/save removes days older than 180 days (the exact 180-day boundary remains)
+and future days. Disabled inspection/export prunes only in memory and never
+rewrites the store. Settings shows a localized summary, per-day inspection,
+retention disclosure, enable/disable, Export and Clear. Explicit export uses the
+Save As picker and adds only build-time `app_version`; it refuses an existing
+destination and never uploads. Clear deletes the aggregate and reserved
+`.markturbo-usage-<alphanumeric>.tmp` store-staging files, not unrelated files,
+consent or exported copies. The next store save also removes leftover staging
+files before atomically publishing the aggregate.
+
+Accepted inherited limits: the settings-write lock is cross-process on Windows
+but process-local on compatibility-only macOS/Linux, so their cross-process
+consent/update race remains. Consent persistence uses the existing non-atomic
+settings writer: a power loss can restore a prior preference; malformed or
+missing settings still disable collection. These counters do not extend either
+mechanism. The release privacy scanner already covers all tracked/untracked
+source files, and the unconditional core usage tests run with the workspace
+privacy/release test gates; there is no per-module scan allowlist to update.
+
 The sections below describe the retired GPUI implementation and remain as
 history for the headless boundaries that `mt-core` still owns.
 
