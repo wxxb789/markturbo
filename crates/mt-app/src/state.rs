@@ -1935,6 +1935,9 @@ impl AppState {
     /// Compose only explicitly approved changes and apply them to the buffer.
     pub fn apply_revision(&self) {
         let Some(proposal) = self.revision_proposal.borrow().clone() else {
+            self.revision_status.set(Some(SharedString::from(
+                "Run Review first to prepare a Revision.",
+            )));
             return;
         };
         let Some((tab_id, snapshot)) = self
@@ -1974,16 +1977,22 @@ impl AppState {
             }
         };
         let hunks = self.revision_hunks.get();
+        if text == tab.text.get().as_str() {
+            self.record_usage(UsageEvent::RevisionDecision {
+                accepted_hunks: 0,
+                rejected_hunks: hunks.len() as u64,
+            });
+            *self.revision_proposal.borrow_mut() = None;
+            self.revision_hunks.set(Vec::new());
+            self.revision_status
+                .set(Some(SharedString::from("No changes approved.")));
+            return;
+        }
         let accepted_hunks = hunks.iter().filter(|hunk| hunk.accepted.get()).count() as u64;
         self.record_usage(UsageEvent::RevisionDecision {
             accepted_hunks,
             rejected_hunks: hunks.len() as u64 - accepted_hunks,
         });
-        if text == tab.text.get().as_str() {
-            self.revision_status
-                .set(Some(SharedString::from("No changes approved.")));
-            return;
-        }
         tab.text.set(SharedString::from(text));
         tab.dirty.set(true);
         tab.revision.update(|revision| *revision += 1);
