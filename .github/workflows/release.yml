@@ -121,11 +121,26 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup --version=6.7.1 --no-progress -y --force
 
+      - name: Install nsh
+        # Packaging compiles the app against the runtime that ships with this
+        # CLI, so the CLI must stay on the version the crates pin. Installing
+        # the latest release is what broke the v0.1.4-alpha.3 tag: nsh 0.5.1
+        # no longer provides the API the pinned nsh-core 0.4.0 callers use.
+        env:
+          NSH_VERSION: v0.4.0
+        run: irm https://nsh.dev/install.ps1 | iex
+
+      - name: Verify the nsh CLI matches the pinned runtime
+        run: |
+          $installed = (nsh --version) -replace '^nsh\s+', '' -replace '\s.*$'
+          $pinned = (Select-String -Path crates/mt-app/Cargo.toml -Pattern '^nsh-core = "([^"]+)"').Matches[0].Groups[1].Value
+          if (-not $installed -or $installed -ne $pinned) {
+            throw "nsh CLI '$installed' does not match the pinned nsh-core '$pinned'; packaging would compile a different runtime"
+          }
+          "nsh CLI $installed matches the pinned nsh-core $pinned"
+
       - name: Check
         run: uv run --locked --project scripts scripts/mt.py check full
-
-      - name: Install nsh
-        run: irm https://nsh.dev/install.ps1 | iex
 
       - name: Stage signing credentials
         if: env.SIGNING_PFX_BASE64 != '' && env.SIGNING_PFX_PASSWORD != ''

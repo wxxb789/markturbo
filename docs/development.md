@@ -147,8 +147,13 @@ does not trust that certificate by default, so the result is labeled
 `--require-signature` rejects it.
 
 The packaging commands require the `nsh` CLI and Inno Setup 6 (`ISCC.exe`);
-the release workflow installs the pinned Inno Setup version and nsh before
-running them.
+the release workflow installs the pinned Inno Setup version and the nsh CLI
+release matching the pinned crates (currently `v0.4.0`, the version the
+packaging runtime comes from) before running them. It fails fast when the
+installed CLI and the pinned `nsh-core` disagree, because `nsh package`
+compiles the app against the CLI's runtime: installing the latest CLI broke the
+`v0.1.4-alpha.3` tag when nsh 0.5.1 no longer provided an API the pinned
+`nsh-core` 0.4.0 callers use.
 
 `check full` does not build the installer. The release workflow runs it first,
 then packages that same revision, and creates a draft release. The draft gate
