@@ -89,8 +89,10 @@ Performance claims require production-profile measurements; consult existing
 - Ship required fonts/sample inside the executable. Windows 11 x64 is the only
   public-quality target; Linux/macOS CI provides compatibility coverage.
 - Read Cargo.toml dependency comments. Prefer crates.io, retain the sole local
-  patch (`vendor/ratex-parser`, 0.1.15), and keep the nsh crates on the CLI's
-  version (0.4.0). Update manifests and
+  patch (`vendor/ratex-parser`, 0.1.15), and track the latest nsh release:
+  nsh ships features and fixes quickly, so upgrade every nsh crate and the nsh
+  CLI together to the newest version rather than holding an older pin; check
+  crates.io, not Cargo.lock, for the current version. Update manifests and
   locks together; changing dependency provenance requires explicit review.
 - Use English in code/docs/commits/PRs. Make cohesive PRs, link the goal for
   product work, format changed Rust code, and avoid unrelated formatting churn.

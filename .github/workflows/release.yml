@@ -127,7 +127,7 @@ jobs:
         # the latest release is what broke the v0.1.4-alpha.3 tag: nsh 0.5.1
         # no longer provides the API the pinned nsh-core 0.4.0 callers use.
         env:
-          NSH_VERSION: v0.4.0
+          NSH_VERSION: v0.5.1
         run: irm https://nsh.dev/install.ps1 | iex
 
       - name: Verify the nsh CLI matches the pinned runtime

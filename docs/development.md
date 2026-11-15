@@ -205,7 +205,7 @@ does not trust that certificate by default, so the result is labeled
 
 The packaging commands require the `nsh` CLI and Inno Setup 6 (`ISCC.exe`);
 the release workflow installs the pinned Inno Setup version and the nsh CLI
-release matching the pinned crates (currently `v0.4.0`, the version the
+release matching the pinned crates (currently `v0.5.1`, the version the
 packaging runtime comes from) before running them. It fails fast when the
 installed CLI and the pinned `nsh-core` disagree, because `nsh package`
 compiles the app against the CLI's runtime: installing the latest CLI broke the
@@ -278,9 +278,11 @@ from whether an implementation PR can merge.
 
 Prefer a small, reviewed compatible update over a workspace-wide `cargo update`.
 Keep Cargo.lock and scripts/uv.lock in the PR and use locked installs in CI.
-Update the nsh/runtime/WebView group coherently; keep the nsh crates on the
-CLI's version, preserve the platform features (including Linux `webview`) and
-the RaTeX allocation clamp. Inspect upstream changes before major
+Update the nsh/runtime/WebView group coherently. Track the latest nsh release:
+nsh ships features and fixes quickly, so upgrade every nsh crate and the nsh
+CLI together to the newest version promptly instead of holding an older pin;
+the crates and the CLI must always match. Preserve the platform features
+(including Linux `webview`) and the RaTeX allocation clamp. Inspect upstream changes before major
 updates, then test affected behavior. Ordinary tooling updates do not require
 GUI acceptance. Native stack upgrades require targeted Windows smoke at the
 integration checkpoint. See [the dependency review](dependency-review.md).

@@ -1371,7 +1371,7 @@ impl AppState {
             .map(|tab| tab.id)
             .collect();
         if dirty.is_empty() {
-            nsh_core::element::desktop::close_window();
+            nsh_core::element::desktop::current_window().close();
             return;
         }
         self.checkpoint_dirty_now();
@@ -1413,7 +1413,7 @@ impl AppState {
                             return;
                         }
                     }
-                    nsh_core::element::desktop::close_window();
+                    nsh_core::element::desktop::current_window().close();
                 }
                 Ok(answer) if answer.action.as_deref() == Some("discard") => {
                     state.quit_discarded.set(true);
@@ -1422,7 +1422,7 @@ impl AppState {
                             state.retire_tab_recovery(tab);
                         }
                     }
-                    nsh_core::element::desktop::close_window();
+                    nsh_core::element::desktop::current_window().close();
                 }
                 Ok(_) => {}
                 Err(error) => state
