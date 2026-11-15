@@ -51,6 +51,10 @@ pub fn is_open(state: &AppState) -> bool {
 /// The settings page, under the title row: the header, the form, and the app's
 /// own words at the foot.
 pub fn page(state: AppState, language: Language) -> impl IntoElement {
+    // The store can change under us — another instance storing or removing a
+    // key — and nothing in this process reports that, so every (re)build of the
+    // page reads the vault afresh. Within a page, the status is memoised.
+    state.forget_credential_status();
     let close_state = state.clone();
     let save_state = state.clone();
     view()
@@ -964,7 +968,7 @@ mod tests {
         collections::HashMap,
         sync::{
             Arc, LazyLock, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -972,11 +976,13 @@ mod tests {
 
     /// The vault a test drives: credentials live in this map and never in the
     /// platform's secure store, and every read is counted, so a test can prove
-    /// the page does not read the store per keystroke.
+    /// the page does not read the store per keystroke. `fail_read` makes the
+    /// next reads fail the way a contended store does.
     #[derive(Default)]
     struct CountingStore {
         values: Mutex<HashMap<String, Secret>>,
         reads: AtomicUsize,
+        fail_read: AtomicBool,
     }
 
     impl CountingStore {
@@ -996,6 +1002,22 @@ mod tests {
                 .get(target)
                 .map(|secret| secret.expose().to_owned())
         }
+
+        /// Store `secret` for `target` behind the page's back, as another
+        /// instance of the app would.
+        fn store_externally(&self, target: &str, secret: &str) {
+            self.values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(target.to_owned(), Secret::new(secret).expect("a secret"));
+        }
+
+        /// The one error a test can build with the public API: `Secret::new`
+        /// refuses an empty value, and the status cares only that the store
+        /// failed.
+        fn an_error() -> CredentialError {
+            Secret::new("").expect_err("an empty secret is refused")
+        }
     }
 
     impl SecureCredentialStore for CountingStore {
@@ -1005,6 +1027,9 @@ mod tests {
 
         fn read(&self, target: &str) -> Result<Option<Secret>, CredentialError> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.fail_read.load(Ordering::Relaxed) {
+                return Err(Self::an_error());
+            }
             Ok(self
                 .values
                 .lock()
@@ -1108,10 +1133,10 @@ mod tests {
         assert_eq!(provider_choice(&settings), ProviderChoice::Unsupported);
     }
 
-    /// The page on its own, without the shell: the probe test's root. The shell
-    /// is not the subject here — while the overlay layer takes pointer input
-    /// nothing above it is pressable in the harness either. Its vault is the
-    /// probe's own in-memory store, never the platform's.
+    /// The probe's root: the real shell around the page, so the probe opens
+    /// Settings the way a person does — through the title row and its menu — and
+    /// can close it again. Its vault is the probe's own in-memory store, never
+    /// the platform's.
     #[component]
     fn SettingsProbe() -> impl IntoElement {
         crate::ui::fonts::register();
@@ -1134,38 +1159,93 @@ mod tests {
             .font_family(FONT_UI)
             .text_size(px(TYPE_UI))
             .line_height(px(TYPE_UI_LINE))
-            .child(page(state, Language::English))
+            .child(crate::ui::shell::shell(
+                state,
+                Language::English,
+                tokens::Layout::of(1440.0),
+            ))
     }
 
-    /// Drives the page in the headless harness: the credential status follows
-    /// the wire format, the line under the base URL follows what is typed, the
-    /// secure store is read for an endpoint change and not for anything else,
-    /// and the stored and session keys are forgotten again. Kept because the
-    /// real window cannot be driven on this host (a disconnected session takes
-    /// no synthetic input).
+    /// The marker the process below passes to the one it spawns: every
+    /// `MARKTURBO_*` path variable is process-global, and the lib test binary
+    /// also runs consent's and context's app probes in parallel threads, so this
+    /// probe only ever touches a process it owns.
+    const PROBE_CHILD: &str = "MARKTURBO_SETTINGS_PROBE_CHILD";
+
+    /// Runs the probe in a process of its own, with the temp paths in that
+    /// process's environment. Nothing here calls `set_var`, so the shared test
+    /// binary never has its own environment rewritten under another test.
+    #[test]
+    fn the_settings_probe_runs_in_its_own_process() {
+        if std::env::var_os(PROBE_CHILD).is_some() {
+            // The child is running the probe below right now.
+            return;
+        }
+        let config = tempfile::tempdir().expect("config dir");
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "ui::settings::tests::the_page_follows_the_endpoint_and_manages_the_keys",
+            ])
+            .env_remove("MARKTURBO_OPEN")
+            .env(PROBE_CHILD, "1")
+            .env("MARKTURBO_CONFIG_DIR", config.path())
+            .env("MARKTURBO_DATA_DIR", config.path().join("data"))
+            .output()
+            .expect("run the settings probe");
+        assert!(
+            output.status.success(),
+            "the settings probe failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Drives the app in the headless harness: the status line follows the wire
+    /// format, the line under the base URL follows what is typed, the secure
+    /// store is read for an endpoint change and not for anything else, a failure
+    /// to read it is retried rather than remembered, the stored and session keys
+    /// are forgotten again, and a key another instance stores appears when the
+    /// page is opened again. Kept because the real window cannot be driven on
+    /// this host (a disconnected session takes no synthetic input).
     #[test]
     fn the_page_follows_the_endpoint_and_manages_the_keys() {
-        let config = tempfile::tempdir().expect("config dir");
-        // SAFETY: no other test in this binary starts the app or reads these
-        // variables.
-        unsafe {
-            std::env::remove_var("MARKTURBO_OPEN");
-            std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
-            std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        if std::env::var_os(PROBE_CHILD).is_none() {
+            // Only the process its sibling above spawns drives the app: run
+            // directly, this has no temp paths of its own to lay the app down
+            // in.
+            return;
         }
+        // The store fails until the probe has seen the failure: a contended
+        // store must show up and must not be remembered.
+        PROBE_STORE.fail_read.store(true, Ordering::Relaxed);
         let mut app =
             nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
                 SettingsProbe,
             >()))
-            .expect("start the page");
+            .expect("start the app");
         app.set_viewport(nsh_core::Size::new(
             nsh_core::Points(1440.0),
             nsh_core::Points(900.0),
         ))
         .expect("viewport");
+        // The gear opens the row's menu; its Settings row opens the page.
+        app.press("id:title-settings").expect("open the menu");
+        app.wait_for("id:title-menu-settings").expect("the menu");
+        app.press("id:title-menu-settings").expect("open settings");
         app.wait_for("id:settings-page").expect("the page");
+        app.wait_for("text:The secure credential could not be read.")
+            .expect("the failed read is shown");
+
+        // The failure was a moment, not a state: an unrelated change re-reads
+        // the vault and the status recovers without the endpoint moving.
+        PROBE_STORE.fail_read.store(false, Ordering::Relaxed);
+        app.clear("id:settings-model")
+            .expect("clear the model field");
+        app.type_text("id:settings-model", "probe-model")
+            .expect("type a model");
         app.wait_for("text:No key saved")
-            .expect("credential status");
+            .expect("the status recovered");
 
         // A remote HTTP endpoint is refused, and the line under the field says
         // why.
@@ -1215,9 +1295,11 @@ mod tests {
         // nothing else: typing in a field the status does not depend on, or
         // toggling the local counters, must not touch the secure store.
         PROBE_STORE.forget_reads();
-        app.type_text("id:settings-model", "probe-model")
+        app.clear("id:settings-model")
+            .expect("clear the model field");
+        app.type_text("id:settings-model", "reads-check")
             .expect("type a model");
-        app.wait_for("text:probe-model").expect("the model landed");
+        app.wait_for("text:reads-check").expect("the model landed");
         assert_eq!(
             PROBE_STORE.reads(),
             0,
@@ -1316,5 +1398,18 @@ mod tests {
         app.press("text:Remove").expect("forget the key");
         app.wait_for("text:No key saved")
             .expect("status after removal");
+
+        // A key another instance of the app stores appears when the page is
+        // opened again: the status is not remembered past the page.
+        app.press("text:Close").expect("close settings");
+        app.wait_for_gone("id:settings-page", std::time::Duration::from_secs(5))
+            .expect("the page closed");
+        PROBE_STORE.store_externally(&target, "external-key");
+        app.press("id:title-settings").expect("open the menu again");
+        app.wait_for("id:title-menu-settings").expect("the menu");
+        app.press("id:title-menu-settings")
+            .expect("open settings again");
+        app.wait_for("text:Key saved in Windows Credential Manager")
+            .expect("the status read the store afresh");
     }
 }
