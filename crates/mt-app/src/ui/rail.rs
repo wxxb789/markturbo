@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use mt_core::settings::Language;
 use nsh_base::input;
-use nsh_core::{Color, prelude::*};
+use nsh_core::{Color, element::KeyOptions, keymap::When, prelude::*};
 
 use crate::{
     i18n::{self, Key},
@@ -27,8 +27,8 @@ use crate::{
         motion::{RAIL_WIDEN_MS, rail_easing, reduced_motion},
         prims, shell,
         tokens::{
-            self, COLUMN_GAP, FONT_UI, RAIL_DOT, RAIL_HOVER_W, RAIL_W, SPACE_1, SPACE_2, SPACE_3,
-            SPACE_5, TYPE_UI, TYPE_UI_LINE,
+            self, COLUMN_GAP, FIELD_GAP, FONT_UI, HAIRLINE, Layout, RAIL_DOT, RAIL_HOVER_W, RAIL_W,
+            SPACE_1, SPACE_2, SPACE_3, SPACE_5, TYPE_UI, TYPE_UI_LINE,
         },
     },
 };
@@ -44,7 +44,7 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         open: signal(false),
         mode: signal(PaletteMode::Files),
         filter: signal(String::new()),
-        highlighted: signal(0),
+        highlighted: signal(None),
         submitted: signal(String::new()),
     };
 
@@ -58,6 +58,45 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
     on_key("shift+mod+f", move |_: &str| {
         palette.show(PaletteMode::Search, key_state.search_query.get())
     });
+    // The tab's own close, and the active tab's from the keyboard.
+    let close_state = state.clone();
+    on_key("mod+w", move |_: &str| {
+        if let Some(tab) = close_state.active_tab() {
+            close_state.request_close_tab(tab.id);
+        }
+    });
+    // The palette's rows, stepped from the keyboard while its input has the
+    // focus (an input keeps the arrows for its caret, hence `Always` + the
+    // key passed on: the caret still moves, and nothing is taken from a
+    // binding around it).
+    let down_state = state.clone();
+    on_key_with(
+        "down",
+        KeyOptions {
+            when: When::Always,
+            pass_through: true,
+            ..KeyOptions::default()
+        },
+        move |_: &str| {
+            if palette.open.get() {
+                palette.step(&down_state, 1);
+            }
+        },
+    );
+    let up_state = state.clone();
+    on_key_with(
+        "up",
+        KeyOptions {
+            when: When::Always,
+            pass_through: true,
+            ..KeyOptions::default()
+        },
+        move |_: &str| {
+            if palette.open.get() {
+                palette.step(&up_state, -1);
+            }
+        },
+    );
 
     view()
         .test_id("rail")
@@ -69,7 +108,7 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         .w(px(RAIL_W))
         .h(relative(1.0))
         .bg(move || tokens::palette().room)
-        .child(strip(state.clone(), hovered, slide, palette))
+        .child(strip(state.clone(), language, hovered, slide, palette))
         .child(when(move || palette.open.get(), {
             let state = state.clone();
             move || palette_line(state.clone(), language, palette).into_element()
@@ -80,6 +119,7 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
 /// that appear with it.
 fn strip(
     state: AppState,
+    language: Language,
     hovered: Signal<bool>,
     slide: AnimatedValue,
     palette: Palette,
@@ -97,6 +137,11 @@ fn strip(
         // While the strip is open its whole 240px listens, so the pointer on
         // a name keeps it open — as the widened strip would.
         .w(move || px(if hovered.get() { RAIL_HOVER_W } else { RAIL_W }))
+        // What the strip does not show it does not take either: 44px wide
+        // when it rests, the width of the whole strip while it is open. With
+        // no clip the widened layers under it would keep taking the pointer
+        // over the text column.
+        .overflow_hidden()
         .on_mouse_enter(move |_: &MouseEvent| {
             hovered.set(true);
             if reduced_motion() {
@@ -127,8 +172,10 @@ fn strip(
                 .bg(move || tokens::palette().room)
                 .bind_translate_x(&offset),
         )
-        .child(dots(state.clone(), palette))
-        .child(names(state, slide, palette))
+        // Painted over the invisible names, so a press in the 44px strip is
+        // always a press on a dot.
+        .child(names(state.clone(), language, slide, palette))
+        .child(dots(state, palette))
 }
 
 /// One 6px dot per open file, at the strip's left edge.
@@ -154,12 +201,17 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                 let live_dot_state = state.clone();
                 view()
                     .test_id("rail-file-row")
+                    .role(AccessibilityRole::Button)
+                    .optional_label(Some(tab.title.clone()))
                     .h(px(24.0))
                     .w(px(RAIL_W))
                     .pl(px(15.0))
                     .flex_row()
                     .items_center()
                     .cursor_pointer()
+                    .border(px(HAIRLINE))
+                    .border_color(Color::TRANSPARENT)
+                    .focus_visible(|s| s.border_color(tokens::palette().ink))
                     .on_press(move |event: &PressEvent| {
                         press_state.set_active(id);
                         if event.clicks >= 2 {
@@ -177,7 +229,7 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                             .items_center()
                             .justify_center()
                             .bg(move || {
-                                if holds_model_output(&live_state, id) {
+                                if live_state.holds_live_model_output(id) {
                                     tokens::palette().ember_bloom
                                 } else {
                                     Color::TRANSPARENT
@@ -189,7 +241,7 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                                     .h(px(RAIL_DOT))
                                     .rounded(px(RAIL_DOT / 2.0))
                                     .bg(move || {
-                                        if holds_model_output(&live_dot_state, id) {
+                                        if live_dot_state.holds_live_model_output(id) {
                                             tokens::palette().ember
                                         } else if active_state.active.get() == Some(id) {
                                             tokens::palette().ink
@@ -206,7 +258,12 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
 }
 
 /// The open files' names, at the widened strip's name column.
-fn names(state: AppState, slide: AnimatedValue, palette: Palette) -> impl IntoElement {
+fn names(
+    state: AppState,
+    language: Language,
+    slide: AnimatedValue,
+    palette: Palette,
+) -> impl IntoElement {
     let list_state = state.clone();
     view()
         .test_id("rail-names")
@@ -228,56 +285,93 @@ fn names(state: AppState, slide: AnimatedValue, palette: Palette) -> impl IntoEl
                 let title = tab.title.clone();
                 let active_state = state.clone();
                 let press_state = state.clone();
+                let close_state = state.clone();
                 view()
                     .test_id("rail-name-row")
+                    .role(AccessibilityRole::Button)
+                    .optional_label(Some(title.clone()))
+                    // The dot row is this tab's keyboard stop: the name row
+                    // is the pointer's way into the widened strip.
+                    .focusable(false)
                     .h(px(24.0))
                     .w_full()
                     .pl(px(44.0))
                     .pr(px(SPACE_2))
                     .flex_row()
                     .items_center()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(tokens::palette().ink))
-                    .on_press(move |event: &PressEvent| {
-                        press_state.set_active(id);
-                        if event.clicks >= 2 {
-                            press_state.pin_tab(id);
-                        }
-                        palette.close(&press_state);
-                    })
                     .child(
-                        text(title)
-                            .font_family(FONT_UI)
-                            .text_size(px(TYPE_UI))
-                            .line_height(px(TYPE_UI_LINE))
-                            .text_color(move || {
-                                if active_state.active.get() == Some(id) {
-                                    tokens::palette().ink
-                                } else {
-                                    tokens::palette().ink_rest
+                        view()
+                            .test_id("rail-name")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .py(px(SPACE_1))
+                            .flex_row()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_press(move |event: &PressEvent| {
+                                press_state.set_active(id);
+                                if event.clicks >= 2 {
+                                    press_state.pin_tab(id);
                                 }
+                                palette.close(&press_state);
                             })
-                            .truncate(),
+                            .child(
+                                text(title.clone())
+                                    .font_family(FONT_UI)
+                                    .text_size(px(TYPE_UI))
+                                    .line_height(px(TYPE_UI_LINE))
+                                    .text_color(move || {
+                                        if active_state.active.get() == Some(id) {
+                                            tokens::palette().ink
+                                        } else {
+                                            tokens::palette().ink_rest
+                                        }
+                                    })
+                                    .hover(|s| s.text_color(tokens::palette().ink))
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        view()
+                            .test_id("rail-close")
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .role(AccessibilityRole::Button)
+                            .optional_label(Some(SharedString::from(format!(
+                                "{} {}",
+                                s(S::Close, language),
+                                title
+                            ))))
+                            .border(px(HAIRLINE))
+                            .border_color(Color::TRANSPARENT)
+                            .focus_visible(|s| s.border_color(tokens::palette().ink))
+                            .on_press(move || close_state.request_close_tab(id))
+                            .child(
+                                text("\u{00D7}")
+                                    .font_family(FONT_UI)
+                                    .text_size(px(TYPE_UI))
+                                    .line_height(px(TYPE_UI_LINE))
+                                    .text_color(move || tokens::palette().ink_faint)
+                                    .hover(|s| s.text_color(tokens::palette().ink)),
+                            ),
                     )
             },
         ))
 }
 
-/// Whether `id` holds the model's live output: the tab the review or the
-/// revision on screen belongs to.
-fn holds_model_output(state: &AppState, id: u64) -> bool {
-    state.active.get() == Some(id)
-        && (state.review_open.get() || !state.revision_hunks.get().is_empty())
-}
-
 /// The palette's own state: whether it is up, which list it shows, the text
-/// being typed, the highlighted row and the query last sent to the search.
+/// being typed, the highlighted row (by its key, which filtering cannot move)
+/// and the query last sent to the search.
 #[derive(Clone, Copy)]
 struct Palette {
     open: Signal<bool>,
     mode: Signal<PaletteMode>,
     filter: Signal<String>,
-    highlighted: Signal<usize>,
+    highlighted: Signal<Option<String>>,
     submitted: Signal<String>,
 }
 
@@ -293,7 +387,7 @@ impl Palette {
     fn show(&self, mode: PaletteMode, text: String) {
         self.mode.set(mode);
         self.filter.set(text);
-        self.highlighted.set(0);
+        self.highlighted.set(None);
         self.submitted.set(String::new());
         self.open.set(true);
     }
@@ -303,7 +397,7 @@ impl Palette {
     fn close(&self, state: &AppState) {
         self.open.set(false);
         self.filter.set(String::new());
-        self.highlighted.set(0);
+        self.highlighted.set(None);
         self.submitted.set(String::new());
         state.clear_search();
     }
@@ -318,11 +412,38 @@ impl Palette {
     }
 
     fn set_text(&self, state: &AppState, text: &str) {
-        self.highlighted.set(0);
+        self.highlighted.set(None);
         match self.mode.get() {
             PaletteMode::Files => self.filter.set(text.to_owned()),
             PaletteMode::Search => state.search_query.set(text.to_owned()),
         }
+    }
+
+    /// The row the keyboard is on: the highlighted one while the list still
+    /// holds it, else the first.
+    fn current_row(&self, state: &AppState) -> Option<Row> {
+        let rows = self.rows(state);
+        let highlighted = self.highlighted.get();
+        rows.iter()
+            .find(|row| Some(row.key.as_str()) == highlighted.as_deref())
+            .or_else(|| rows.first())
+            .cloned()
+    }
+
+    /// Moves the highlight by `step` rows through the list it shows now.
+    fn step(&self, state: &AppState, step: isize) {
+        let rows = self.rows(state);
+        if rows.is_empty() {
+            return;
+        }
+        let at = self
+            .highlighted
+            .get()
+            .and_then(|key| rows.iter().position(|row| row.key == key))
+            .map_or(0, |at| at as isize);
+        let last = rows.len() as isize - 1;
+        let next = (at + step).clamp(0, last) as usize;
+        self.highlighted.set(Some(rows[next].key.clone()));
     }
 
     /// The rows it lists now.
@@ -403,11 +524,24 @@ fn search_rows(state: &AppState) -> Vec<Row> {
 fn palette_line(state: AppState, language: Language, palette: Palette) -> impl IntoElement {
     let scrim_state = state.clone();
     let count_state = state.clone();
+    // The line belongs to the field: its left edge follows the field's own
+    // (the overlay's, below 1040), and it is no wider than the field's
+    // reading measure.
+    let left = move || {
+        if Layout::of(shell::client_width_now()).field_overlays() {
+            shell::client_width_now() * (1.0 - Layout::OVERLAY_FRACTION)
+        } else {
+            RAIL_W + COLUMN_GAP + Layout::of(shell::client_width_now()).measure() + FIELD_GAP
+        }
+    };
     view()
         .test_id("palette")
         .child(
             view()
                 .test_id("palette-scrim")
+                // A backdrop closes a popover for the pointer; it is not a
+                // stop of the keyboard focus.
+                .focusable(false)
                 .absolute()
                 .top(px(0.0))
                 .bottom(px(0.0))
@@ -420,13 +554,12 @@ fn palette_line(state: AppState, language: Language, palette: Palette) -> impl I
                 .test_id("palette-line")
                 .absolute()
                 .top(px(SPACE_3))
-                .left(px(RAIL_W + COLUMN_GAP))
+                .left(move || px(left()))
                 .w(move || {
-                    px((shell::client_width_now()
-                        - RAIL_W
-                        - COLUMN_GAP
-                        - tokens::FIELD_RIGHT_INSET)
-                        .max(tokens::FIELD_READING_MAX_W))
+                    px(
+                        (shell::client_width_now() - left() - tokens::FIELD_RIGHT_INSET)
+                            .clamp(0.0, tokens::FIELD_READING_MAX_W),
+                    )
                 })
                 .flex_col()
                 .bg(move || tokens::palette().room)
@@ -509,12 +642,15 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
             .child(each(
                 move || palette.rows(&list_state),
                 |row: &Row| row.key.clone(),
-                move |row: ReadSignal<Row>, index| {
+                move |row: ReadSignal<Row>, _| {
                     let row = row.get();
                     let open_state = state.clone();
                     let path = row.path.clone();
                     let highlight = palette.highlighted;
-                    let index = index.get();
+                    // The key, not the index: filtering reuses a row's
+                    // element with its index read once, so an index would
+                    // point at whatever moved into that place.
+                    let key = row.key.clone();
                     view()
                         .test_id("palette-row")
                         .w_full()
@@ -526,14 +662,15 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
                         .cursor_pointer()
                         .hover(|s| s.text_color(tokens::palette().ink))
                         .on_press(move |event: &PressEvent| {
-                            if event.clicks >= 2 {
-                                if let Some(tab) = open_state.active_tab() {
-                                    open_state.pin_tab(tab.id);
-                                }
-                                return;
-                            }
                             palette.close(&open_state);
-                            open_state.open_preview(path.clone());
+                            // Shift keeps the tab: the plain press opens in
+                            // the preview slot, which the next plain press
+                            // replaces.
+                            if event.modifiers.shift {
+                                open_state.open_file(path.clone());
+                            } else {
+                                open_state.open_preview(path.clone());
+                            }
                         })
                         .child(
                             text(row.label.clone())
@@ -541,7 +678,7 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
                                 .text_size(px(TYPE_UI))
                                 .line_height(px(TYPE_UI_LINE))
                                 .text_color(move || {
-                                    if highlight.get() == index {
+                                    if highlight.get().as_deref() == Some(key.as_str()) {
                                         tokens::palette().ink
                                     } else {
                                         tokens::palette().ink_rest
@@ -584,8 +721,8 @@ fn notice(state: &AppState, palette: &Palette, language: Language) -> Option<Sha
     }
 }
 
-/// Enter in the palette: open the highlighted row; in the search, the first
-/// Enter sends the query and the next opens what it found.
+/// Enter in the palette: open the row the keyboard is on; in the search, the
+/// first Enter sends the query and the next opens what it found.
 fn submit(state: &AppState, palette: Palette) {
     let text = palette.text(state);
     if palette.mode.get() == PaletteMode::Search && palette.submitted.get() != text {
@@ -593,8 +730,7 @@ fn submit(state: &AppState, palette: Palette) {
         state.run_search(&text);
         return;
     }
-    let rows = palette.rows(state);
-    let Some(row) = rows.get(palette.highlighted.get()) else {
+    let Some(row) = palette.current_row(state) else {
         return;
     };
     let path = row.path.clone();
@@ -608,15 +744,18 @@ fn submit(state: &AppState, palette: Palette) {
 #[derive(Clone, Copy)]
 enum S {
     FindFile,
+    Close,
 }
 
 fn s(key: S, language: Language) -> &'static str {
     match language {
         Language::English => match key {
             S::FindFile => "Find a file",
+            S::Close => "Close",
         },
         Language::Chinese => match key {
             S::FindFile => "查找文件",
+            S::Close => "关闭",
         },
     }
 }

@@ -517,21 +517,28 @@ impl AppState {
     /// Opens `path` in the rail's preview slot (chrome lane): the tab the
     /// next single press replaces, unless a file it replaces was edited,
     /// saved as a new document or pinned. A tab already showing `path` is
-    /// activated and becomes the slot's.
+    /// activated where it is, and stays whatever it was.
     pub fn open_preview(&self, path: PathBuf) {
         if let Some(tab) = self.tabs.get().iter().find(|tab| tab.path == path) {
             self.set_active(tab.id);
-            self.preview_slot.set(Some(tab.id));
             return;
         }
         if let Some(slot) = self.preview_slot.get() {
+            // A request in flight for the slot's tab keeps it: its answer
+            // would land on a closed tab. The tab holding the model's live
+            // output keeps it too — replacing that tab would drop a reading
+            // nobody has seen.
+            let waiting = self.active.get() == Some(slot)
+                && (self.review_busy.get() || self.revision_busy.get());
             // Only an untouched slot tab may be replaced: its text is what
             // the file on disk holds, so nothing is lost.
-            let replaceable = self
-                .tabs
-                .get()
-                .iter()
-                .any(|tab| tab.id == slot && !tab.dirty.get() && !tab.untitled);
+            let replaceable = !waiting
+                && !self.holds_live_model_output(slot)
+                && self
+                    .tabs
+                    .get()
+                    .iter()
+                    .any(|tab| tab.id == slot && !tab.dirty.get() && !tab.untitled);
             if replaceable {
                 self.close_tab_now(slot);
             }
@@ -577,6 +584,32 @@ impl AppState {
                 *slot = None
             }
         });
+    }
+
+    /// Whether `id` is the tab the model's live output belongs to
+    /// (additive, chrome lane): a review that has come back and whose text
+    /// has not moved since, or a revision the model proposed. A request in
+    /// flight has produced nothing yet, so it does not count.
+    pub fn holds_live_model_output(&self, id: u64) -> bool {
+        if self.active.get() != Some(id) {
+            return false;
+        }
+        if !self.revision_hunks.get().is_empty() || !self.revision_questions.get().is_empty() {
+            return true;
+        }
+        let Some(binding) = *self.review_binding.borrow() else {
+            return false;
+        };
+        if binding.tab_id != id {
+            return false;
+        }
+        // The same test `note_edit` uses to call a review stale: the text has
+        // not moved on since the model read it.
+        self.tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == id)
+            .is_some_and(|tab| tab.revision.get() == binding.snapshot.revision)
     }
 
     /// Start an empty document that does not have a source file yet.

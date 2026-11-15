@@ -174,16 +174,25 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                 .child(prims::faint(i18n::t(language, Key::Recent))),
         )
         .child(each(
-            move || list_state.settings.get().recent_targets,
+            // The cap is applied to the list itself: a row's index is read
+            // when it is built, and the list moves under it as new targets
+            // are recorded.
+            move || {
+                list_state
+                    .settings
+                    .get()
+                    .recent_targets
+                    .into_iter()
+                    .take(RECENTS)
+                    .collect::<Vec<_>>()
+            },
             |target: &RecentTarget| target.path.clone(),
-            move |target: ReadSignal<RecentTarget>, index| {
+            move |target: ReadSignal<RecentTarget>, _| {
                 let target = target.get();
-                let index = index.get();
                 let state = state.clone();
                 let target_for_open = target.clone();
                 view()
                     .test_id("welcome-recent")
-                    .when(index >= RECENTS, |row| row.hidden())
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_2))
@@ -216,8 +225,8 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
 }
 
 /// Shows the system's folder picker and opens what the user picks; a cancel
-/// opens nothing.
-fn choose_folder(state: AppState) {
+/// opens nothing. The chrome lane's title menu shares this flow.
+pub(crate) fn choose_folder(state: AppState) {
     let picked = pick_paths(OpenDialog::folders().multiple(false));
     spawn(async move {
         match picked.await {

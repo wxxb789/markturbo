@@ -30,6 +30,7 @@ use crate::{
             self, COLUMN_GAP, FONT_SOURCE, HAIRLINE, Layout, RAIL_W, SPACE_1, SPACE_2, SPACE_3,
             TITLE_ROW_H, TYPE_UI, TYPE_UI_LINE,
         },
+        welcome,
     },
 };
 
@@ -58,6 +59,34 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     let height = TITLE_ROW_H.max(insets.top.0);
     let layout = Layout::of(shell::client_width_now());
     let menu = signal(false);
+
+    // The menu's document commands, reachable without it.
+    let open_state = state.clone();
+    on_key("mod+o", move |_: &str| {
+        welcome::choose_folder(open_state.clone())
+    });
+    let save_as_state = state.clone();
+    on_key("shift+mod+s", move |_: &str| {
+        if save_as_state.active.get().is_some() {
+            save_as_state.save_as_active();
+        }
+    });
+    // Escape closes the menu from anywhere. The binding passes the key on, so
+    // it takes nothing from the surfaces that bind Escape themselves.
+    on_key_with(
+        "escape",
+        KeyOptions {
+            when: When::Always,
+            pass_through: true,
+            ..KeyOptions::default()
+        },
+        move |_: &str| {
+            if menu.get() {
+                menu.set(false);
+            }
+        },
+    );
+
     view()
         .test_id("title-row")
         .relative()
@@ -283,7 +312,13 @@ fn mode_action(
             row_action(
                 test_id,
                 label,
-                Rc::new(move || if current() { Look::Ink } else { Look::Quiet }),
+                Rc::new(move || {
+                    if current() {
+                        Look::Current
+                    } else {
+                        Look::Quiet
+                    }
+                }),
                 move || {
                     if let Some(tab) = state.active_tab() {
                         state.set_pane(tab.id, pane);
@@ -334,6 +369,31 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
         .bg(move || tokens::palette().room)
         .border(px(HAIRLINE))
         .border_color(move || tokens::palette().hairline)
+        // A press anywhere opens the workspace it names, with or without a
+        // document on screen.
+        .child({
+            let open_state = state.clone();
+            // The keyboard comes to the first row as the menu appears. A
+            // platform that focuses only inputs leaves it where it was.
+            let first = element_ref();
+            effect(move || first.focus());
+            menu_row(
+                "title-menu-open-folder",
+                s(S::OpenFolder, language),
+                move || {
+                    menu.set(false);
+                    welcome::choose_folder(open_state.clone());
+                },
+            )
+            .element_ref(&first)
+        })
+        .child(
+            view()
+                .px(px(SPACE_3))
+                .py(px(SPACE_2))
+                .child(prims::hairline())
+                .into_element(),
+        )
         .child(when(document, {
             let state = state.clone();
             move || {
@@ -349,6 +409,12 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
                     .child(
                         row("title-menu-save", i18n::t(language, Key::Save), |state| {
                             state.save_active();
+                        })
+                        .into_element(),
+                    )
+                    .child(
+                        row("title-menu-save-as", s(S::SaveAs, language), |state| {
+                            state.save_as_active()
                         })
                         .into_element(),
                     )
@@ -382,6 +448,30 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
                                 state.set_pane(tab.id, Pane::Split);
                             }
                         })
+                        .into_element(),
+                    )
+                    .child(
+                        row("title-menu-web", s(S::WebPreview, language), |state| {
+                            if let Some(tab) = state.active_tab() {
+                                state.set_pane(tab.id, Pane::Web);
+                            }
+                        })
+                        .into_element(),
+                    )
+                    .child(
+                        row("title-menu-split-web", s(S::SplitWeb, language), |state| {
+                            if let Some(tab) = state.active_tab() {
+                                state.set_pane(tab.id, Pane::SplitWeb);
+                            }
+                        })
+                        .into_element(),
+                    )
+                    .child(
+                        row(
+                            "title-menu-translate",
+                            i18n::t(language, Key::Translate),
+                            |state| state.translate_active(),
+                        )
                         .into_element(),
                     )
                     .into_element()
@@ -437,6 +527,9 @@ fn menu_item(
 fn menu_scrim(menu: Signal<bool>) -> impl IntoElement {
     view()
         .test_id("title-menu-scrim")
+        // A backdrop closes a popover for the pointer; it is not a stop of
+        // the keyboard focus.
+        .focusable(false)
         .absolute()
         .top(px(0.0))
         .left(px(0.0))
@@ -476,12 +569,14 @@ fn menu_row(
 }
 
 /// How a title-row action reads at rest. [`Look::Ink`] is the app's one plain
-/// emphasis — body ink over a 34% underline (the prototype's `.act`) — and
-/// [`Look::Quiet`] rests at resting ink, underlining only on hover. No heat:
-/// it is local work, lit by ambient ink.
+/// emphasis — body ink over a 34% underline (the prototype's `.act`), for the
+/// state's one next action; [`Look::Current`] is body ink without the
+/// underline, for the mode in effect; [`Look::Quiet`] rests at resting ink.
+/// No heat: it is local work, lit by ambient ink.
 #[derive(Clone, Copy)]
 enum Look {
     Ink,
+    Current,
     Quiet,
 }
 
@@ -514,7 +609,7 @@ fn row_action(
         .underline_offset(px(4.0))
         .text_decoration_color(move || match decoration_look() {
             Look::Ink => tokens::palette().ink_at(0.34),
-            Look::Quiet => tokens::with_alpha(tokens::palette().ink, 0.0),
+            Look::Current | Look::Quiet => tokens::with_alpha(tokens::palette().ink, 0.0),
         })
         .transition_colors()
         .duration(HOVER_MS)
@@ -534,6 +629,7 @@ fn row_action(
                 .line_height(px(TYPE_UI_LINE))
                 .text_color(move || match text_look() {
                     Look::Ink => tokens::palette().ink,
+                    Look::Current => tokens::palette().ink,
                     Look::Quiet => tokens::palette().ink_rest,
                 }),
         )
@@ -570,18 +666,30 @@ fn shortcut(keys: &str) -> String {
 /// compile error.
 #[derive(Clone, Copy)]
 enum S {
+    OpenFolder,
+    SaveAs,
     Split,
+    WebPreview,
+    SplitWeb,
     Context,
 }
 
 fn s(key: S, language: Language) -> &'static str {
     match language {
         Language::English => match key {
+            S::OpenFolder => "Open folder\u{2026}",
+            S::SaveAs => "Save As\u{2026}",
             S::Split => "Split",
+            S::WebPreview => "Web preview",
+            S::SplitWeb => "Split \u{00B7} Web",
             S::Context => "Context",
         },
         Language::Chinese => match key {
+            S::OpenFolder => "打开文件夹\u{2026}",
+            S::SaveAs => "另存为\u{2026}",
             S::Split => "分栏",
+            S::WebPreview => "Web 预览",
+            S::SplitWeb => "分栏 \u{00B7} Web",
             S::Context => "上下文",
         },
     }
