@@ -138,9 +138,10 @@ pub struct AppState {
     pub conflict_compare: Signal<Option<u64>>,
     /// Which difference the open comparison shows (`ui::notices`).
     pub conflict_difference: Signal<usize>,
-    /// The file-on-disk text the conflict comparison reads (`ui::notices`),
-    /// refreshed whenever a document is marked as differing from disk.
-    pub conflict_disk: Signal<Option<String>>,
+    /// The file-on-disk text of each conflicted document (`ui::notices`),
+    /// keyed by its tab and read when the comparison opens. A tab's entry is
+    /// ignored while its `conflict` is false.
+    pub conflict_disks: Signal<Vec<(u64, String)>>,
     owner: Owner,
     vault: CredentialVault,
     usage: Rc<RefCell<UsageStore>>,
@@ -187,13 +188,21 @@ pub struct RevisionHunkView {
 pub struct GuardRequest {
     /// The tab being closed; `None` quits the window.
     pub tab: Option<u64>,
-    /// The dirty documents the decision covers, as they were when it opened.
-    pub dirty: Vec<u64>,
+    /// Which control the keyboard is on (`ui::notices`): `0` Save, `1`
+    /// Don't save, `2` Cancel (the default).
+    pub choice: Signal<usize>,
     /// A save is going on: the guard's controls wait for it.
     pub busy: Signal<bool>,
     /// Why the guard is still up (a save that could not finish).
     pub notice: Signal<Option<SharedString>>,
 }
+
+/// The guard's controls, in the order its card draws them (`ui::notices`).
+pub const GUARD_SAVE_CHOICE: usize = 0;
+pub const GUARD_DISCARD_CHOICE: usize = 1;
+pub const GUARD_CANCEL_CHOICE: usize = 2;
+/// How many controls the guard has.
+pub const GUARD_CHOICES: usize = 3;
 
 /// Immutable inputs retained after a successful Review for a later Revision.
 struct RevisionContext {
@@ -311,7 +320,7 @@ impl AppState {
             guard: signal(None),
             conflict_compare: signal(None),
             conflict_difference: signal(0),
-            conflict_disk: signal(None),
+            conflict_disks: signal(Vec::new()),
             vault: CredentialVault::production(),
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
@@ -629,20 +638,7 @@ impl AppState {
             .and_then(|name| name.to_str())
             .unwrap_or("Untitled")
             .to_owned();
-        // A tab's signals belong to the app, not to whatever element asked for
-        // the tab: a Restore pressed in a transient row (a recovered record
-        // that the press itself removes) would otherwise take the new
-        // document's text, dirty and conflict signals down with its owner.
-        let (text, dirty_signal, revision, pane, web_trusted, conflict) = self.owner.run(|| {
-            (
-                signal(SharedString::from(loaded.text.clone())),
-                signal(dirty),
-                signal(0),
-                signal(Pane::Split),
-                signal(false),
-                signal(false),
-            )
-        });
+        let text = signal(SharedString::from(loaded.text.clone()));
         let path = loaded.path.clone();
         let recovery_key = RecoveryKey::for_path(&path);
         self.record_recent(&path, RecentTargetKind::File);
@@ -655,11 +651,11 @@ impl AppState {
                 path,
                 title: SharedString::from(title),
                 text,
-                dirty: dirty_signal,
-                revision,
-                pane,
-                web_trusted,
-                conflict,
+                dirty: signal(dirty),
+                revision: signal(0),
+                pane: signal(Pane::Split),
+                web_trusted: signal(false),
+                conflict: signal(false),
                 untitled: false,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
@@ -993,7 +989,7 @@ impl AppState {
         }
         if record.source_conflicted {
             if let Some(tab) = self.active_tab() {
-                self.note_conflict(&tab);
+                tab.conflict.set(true);
             }
             self.status.set(SharedString::from(
                 "Recovered text differs from disk; reload, overwrite, or save as a new file.",
@@ -1112,34 +1108,69 @@ impl AppState {
         }
         // The in-app guard takes the decision (`ui::notices`): Save, Don't
         // save or Cancel, with Cancel the default.
-        self.open_guard(Some(id), vec![id]);
+        self.open_guard(Some(id));
     }
 
-    /// Show the destructive close or quit guard for `tab` (or the whole
-    /// window when it is `None`), covering `dirty`.
-    fn open_guard(&self, tab: Option<u64>, dirty: Vec<u64>) {
-        if dirty.is_empty() {
-            return;
-        }
+    /// Show the destructive close or quit guard for `tab` (`None` quits the
+    /// window).
+    fn open_guard(&self, tab: Option<u64>) {
         // The guard outlives the control that asked for it (the card replaces
         // the tab's own row), so its signals are the app's.
-        let (busy, notice) = self.owner.run(|| (signal(false), signal(None)));
+        let (choice, busy, notice) = self
+            .owner
+            .run(|| (signal(GUARD_CANCEL_CHOICE), signal(false), signal(None)));
         self.guard.set(Some(GuardRequest {
             tab,
-            dirty,
+            choice,
             busy,
             notice,
         }));
     }
 
-    /// Mark `tab` as differing from its file and read the file's text, so
-    /// the conflict banner can show the comparison (`ui::notices`). The
-    /// read is best-effort: a file that cannot be read leaves the
-    /// comparison empty and the other decisions in place.
-    fn note_conflict(&self, tab: &Tab) {
-        tab.conflict.set(true);
+    /// Read `tab`'s file for the conflict comparison (`ui::notices`),
+    /// replacing any earlier text for it. The read is best-effort: a file
+    /// that cannot be read leaves the comparison empty and the other
+    /// decisions in place.
+    pub fn refresh_conflict_disk(&self, tab: &Tab) {
         let disk = io::load(&tab.path).ok().map(|loaded| loaded.text);
-        self.conflict_disk.set(disk);
+        let id = tab.id;
+        self.conflict_disks.update(|disks| {
+            disks.retain(|(entry, _)| *entry != id);
+            if let Some(disk) = disk {
+                disks.push((id, disk));
+            }
+        });
+    }
+
+    /// Run `f` under the state's own owner: what it makes (a new tab's
+    /// signals, a new guard's) then belongs to the app, not to the element
+    /// whose handler asked. A handler in a row that the action itself
+    /// removes (a recovered record's Restore) would otherwise take the
+    /// document's signals down with its owner.
+    pub fn owned<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.owner.run(f)
+    }
+
+    /// The guard's selection: `delta` steps of [`GUARD_CHOICES`], wrapping.
+    pub fn guard_move(&self, delta: isize) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        let current = request.choice.get();
+        let next = (current as isize + delta).rem_euclid(GUARD_CHOICES as isize) as usize;
+        request.choice.set(next);
+    }
+
+    /// The guard's Enter: the selected control's decision.
+    pub fn guard_activate(&self) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        match request.choice.get() {
+            GUARD_DISCARD_CHOICE => self.guard_discard(),
+            GUARD_CANCEL_CHOICE => self.guard_cancel(),
+            _ => self.guard_save(),
+        }
     }
 
     /// The guard's Save: save every document it covers, then finish the
@@ -1237,7 +1268,16 @@ impl AppState {
             Some(id) => self.close_tab_now(id),
             None => {
                 self.quit_discarded.set(true);
-                for id in request.dirty {
+                // The same rule as Save, and the card lists the same
+                // documents: whatever is dirty when the decision is made.
+                let dirty: Vec<u64> = self
+                    .tabs
+                    .get()
+                    .iter()
+                    .filter(|tab| tab.dirty.get())
+                    .map(|tab| tab.id)
+                    .collect();
+                for id in dirty {
                     if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
                         self.retire_tab_recovery(tab);
                     }
@@ -1492,7 +1532,7 @@ impl AppState {
                 true
             }
             Err(SaveError::Conflict) => {
-                self.note_conflict(&tab);
+                tab.conflict.set(true);
                 self.status.set(SharedString::from(crate::i18n::t(
                     self.settings.get().language,
                     crate::i18n::Key::SaveConflictDetail,
@@ -1530,7 +1570,7 @@ impl AppState {
         }
         self.checkpoint_dirty_now();
         // The in-app guard takes the decision (`ui::notices`).
-        self.open_guard(None, dirty);
+        self.open_guard(None);
     }
 
     /// Translate the active document through the consent-bound provider path.

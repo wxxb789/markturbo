@@ -40,7 +40,10 @@ use nsh_core::{
 };
 
 use crate::{
-    state::{AppState, GuardRequest, Tab},
+    i18n::{self, Key},
+    state::{
+        AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest, Tab,
+    },
     ui::{
         motion::HOVER_MS,
         prims,
@@ -89,27 +92,63 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                 let label = recovered_line(&record, language);
                 let restore_state = state.clone();
                 let discard_state = state.clone();
+                let ring_state = state.clone();
                 let restored = record.clone();
                 let discarded = record;
-                view()
+                let restore_id = format!("recovery-restore-{index}");
+                let discard_id = format!("recovery-discard-{index}");
+                let restore = move || {
+                    // The restored document's signals must be the app's: this
+                    // row is removed by the press itself.
+                    restore_state.owned(|| restore_state.restore_recovered(&restored));
+                };
+                let mut row = view()
                     .test_id(&format!("recovery-row-{index}"))
                     .w_full()
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_3))
                     .pb(px(SPACE_3))
-                    .child(view().flex_1().child(prims::ink(label)))
-                    .child(prims::primary_action(
-                        &format!("recovery-restore-{index}"),
+                    .child(view().flex_1().child(prims::ink(label)));
+                // One ringed action at a time: the first record's Restore,
+                // unless the conflict banner owns the ring.
+                if index == 0 {
+                    let ringed = restore.clone();
+                    let ringed_id = restore_id.clone();
+                    row = row.child(
+                        when(
+                            move || !has_conflict(&ring_state),
+                            move || {
+                                prims::primary_action(
+                                    &ringed_id,
+                                    s(S::Restore, language),
+                                    ringed.clone(),
+                                )
+                                .into_element()
+                            },
+                        )
+                        .otherwise(move || {
+                            prims::quiet_action(
+                                &restore_id,
+                                s(S::Restore, language),
+                                restore.clone(),
+                            )
+                            .into_element()
+                        }),
+                    );
+                } else {
+                    row = row.child(prims::quiet_action(
+                        &restore_id,
                         s(S::Restore, language),
-                        move || restore_state.restore_recovered(&restored),
-                    ))
-                    .child(prims::quiet_action(
-                        &format!("recovery-discard-{index}"),
-                        s(S::Discard, language),
-                        move || discard_state.discard_recovered(&discarded),
-                    ))
-                    .into_element()
+                        restore,
+                    ));
+                }
+                row.child(prims::quiet_action(
+                    &discard_id,
+                    s(S::Discard, language),
+                    move || discard_state.discard_recovered(&discarded),
+                ))
+                .into_element()
             },
         ))
         .child(banner_rule())
@@ -228,11 +267,14 @@ pub fn has_conflict(state: &AppState) -> bool {
 }
 
 /// The external-change banner: your file is not what it was on disk. It offers
-/// the comparison, and the two decisions: keep your text, or take the disk's.
+/// the comparison and the three ways out: keep your text, take the disk's, or
+/// write your text to a new file (`save_as_active`, the way the status copy
+/// promises).
 pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement {
     let compare_state = state.clone();
     let keep_state = state.clone();
     let disk_state = state.clone();
+    let save_as_state = state.clone();
     let panel_state = state.clone();
     view()
         .test_id("conflict-banner")
@@ -264,6 +306,11 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
                     "conflict-use-disk",
                     s(S::UseDiskVersion, language),
                     move || disk_state.reload_active(),
+                ))
+                .child(prims::quiet_action(
+                    "conflict-save-as",
+                    i18n::t(language, Key::SaveAsPicker),
+                    move || save_as_state.save_as_active(),
                 )),
         )
         .child(when(
@@ -290,9 +337,21 @@ fn toggle_compare(state: &AppState) {
     if state.conflict_compare.get() == Some(tab.id) {
         state.conflict_compare.set(None);
     } else {
+        // The disk may have changed again since the conflict was noticed.
+        state.refresh_conflict_disk(&tab);
         state.conflict_difference.set(0);
         state.conflict_compare.set(Some(tab.id));
     }
+}
+
+/// `tab`'s file-on-disk text, as read for the comparison.
+fn disk_text(state: &AppState, tab: &Tab) -> Option<String> {
+    state
+        .conflict_disks
+        .get()
+        .into_iter()
+        .find(|(id, _)| *id == tab.id)
+        .map(|(_, text)| text)
 }
 
 /// Close the comparison, keeping the banner's decisions on screen.
@@ -305,7 +364,7 @@ fn step_difference(state: &AppState, delta: isize) {
     let Some(tab) = compare_open(state) else {
         return;
     };
-    let Some(disk) = state.conflict_disk.get() else {
+    let Some(disk) = disk_text(state, &tab) else {
         return;
     };
     let total = differences(&tab.text.get(), &disk).len();
@@ -444,7 +503,7 @@ fn counter_text(state: &AppState, language: Language) -> String {
 /// exists.
 fn compare_summary(state: &AppState) -> Option<(usize, usize)> {
     let tab = compare_open(state)?;
-    let disk = state.conflict_disk.get()?;
+    let disk = disk_text(state, &tab)?;
     let total = differences(&tab.text.get(), &disk).len();
     if total == 0 {
         return None;
@@ -472,7 +531,7 @@ fn compare_region(state: &AppState) -> (Vec<CompareLine>, usize) {
     let Some(tab) = compare_open(state) else {
         return (Vec::new(), 0);
     };
-    let Some(disk) = state.conflict_disk.get() else {
+    let Some(disk) = disk_text(state, &tab) else {
         return (Vec::new(), 0);
     };
     let mine = tab.text.get().to_string();
@@ -665,13 +724,15 @@ fn differing_lines(mine: &str, disk: &str) -> Vec<u32> {
 ///
 /// `ui::document` (or `ui::glow`) must merge these with the review's
 /// decorations — this module does not own the editor — and it must not apply
-/// them to a document whose `conflict` is false.
+/// them to a document whose `conflict` is false. The compared file's text is
+/// read when the comparison opens ([`crate::state::AppState::refresh_conflict_disk`]);
+/// until then there is nothing to mark.
 pub fn conflict_decorations(state: &AppState, tab: &Tab) -> Vec<EditorDecoration> {
     if !tab.conflict.get() {
         return Vec::new();
     }
     let mine = tab.text.get().to_string();
-    let Some(disk) = state.conflict_disk.get() else {
+    let Some(disk) = disk_text(state, tab) else {
         return Vec::new();
     };
     differing_lines(&mine, &disk)
@@ -693,6 +754,21 @@ pub fn conflict_decorations(state: &AppState, tab: &Tab) -> Vec<EditorDecoration
             decoration
         })
         .collect()
+}
+
+/// The buffer line the comparison is on, for the document lane to bring into
+/// view (`reveal_position`, centred) while `tab`'s comparison is open. The
+/// first differing line of the current difference; `None` when the
+/// comparison is closed or nothing differs.
+pub fn conflict_focus_line(state: &AppState, tab: &Tab) -> Option<u32> {
+    if !tab.conflict.get() {
+        return None;
+    }
+    let (index, _) = compare_summary(state)?;
+    let disk = disk_text(state, tab)?;
+    let diffs = differences(&tab.text.get(), &disk);
+    let difference = diffs.get(index)?;
+    u32::try_from(difference.mine.start).ok()
 }
 
 /// The style of a conflict line's row: a 1px dashed warm-grey underline.
@@ -802,7 +878,10 @@ pub fn guard_is_open(state: &AppState) -> bool {
 }
 
 /// The guard card, in the overlay layer: 'Close without saving?' with Save,
-/// Don't save and Cancel, Cancel drawn with the focus ring as the default.
+/// Don't save and Cancel. Cancel starts selected — the designed ring shows
+/// which control the keyboard is on — and Left/Right (or Tab/Shift+Tab) move
+/// the ring, so every decision is keyboard-reachable on Windows, where views
+/// take no keyboard focus.
 pub fn guard(state: AppState, language: Language) -> impl IntoElement {
     match state.guard.get() {
         Some(request) => guard_card(state, request, language).into_element(),
@@ -817,9 +896,9 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
     let save_state = state.clone();
     let discard_state = state.clone();
     let cancel_state = state.clone();
+    let choice = request.choice;
     let busy = request.busy;
     let notice = request.notice;
-    let covered = request.dirty;
     view()
         .test_id("guard-card")
         .w(px(GUARD_CARD_W))
@@ -831,7 +910,7 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .border_color(move || tokens::palette().hairline)
         .child(prims::ink(s(S::CloseWithoutSaving, language)))
         .child(
-            text(move || documents_line(&names_state, &covered, language))
+            text(move || documents_line(&names_state, request.tab, language))
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
@@ -855,7 +934,8 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
                 .child(card_action(
                     "guard-save",
                     s(S::Save, language),
-                    ActionLook::Borderless,
+                    false,
+                    move || choice.get() == GUARD_SAVE_CHOICE,
                     move || {
                         if !busy.get() {
                             save_state.guard_save();
@@ -865,7 +945,8 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
                 .child(card_action(
                     "guard-dont-save",
                     s(S::DontSave, language),
-                    ActionLook::Danger,
+                    true,
+                    move || choice.get() == GUARD_DISCARD_CHOICE,
                     move || {
                         if !busy.get() {
                             discard_state.guard_discard();
@@ -875,7 +956,8 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
                 .child(card_action(
                     "guard-cancel",
                     s(S::Cancel, language),
-                    ActionLook::Default,
+                    false,
+                    move || choice.get() == GUARD_CANCEL_CHOICE,
                     move || {
                         if !busy.get() {
                             cancel_state.guard_cancel();
@@ -886,9 +968,10 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .into_element()
 }
 
-/// Escape and Enter both take the default decision, Cancel: Windows gives the
-/// keyboard focus to text fields only (nsh 0.5.1), so the ring's control is
-/// what the keyboard reaches. Both bindings die with the card.
+/// The guard's keys, bound while the card is up (they die with it): Escape
+/// cancels whatever is selected, Enter takes the selected decision, and
+/// Left/Right or Tab/Shift+Tab move the selection. Windows gives the keyboard
+/// focus to text fields only (nsh 0.5.1), so the card carries its own ring.
 fn bind_guard_keys(state: &AppState) {
     let escape = state.clone();
     on_key_with(
@@ -906,19 +989,44 @@ fn bind_guard_keys(state: &AppState) {
             when: When::Always,
             ..KeyOptions::default()
         },
-        move |_| enter.guard_cancel(),
+        move |_| enter.guard_activate(),
     );
+    for (key, delta) in [
+        ("left", -1isize),
+        ("shift+tab", -1),
+        ("right", 1),
+        ("tab", 1),
+    ] {
+        let state = state.clone();
+        on_key_with(
+            key,
+            KeyOptions {
+                when: When::Always,
+                ..KeyOptions::default()
+            },
+            move |_| state.guard_move(delta),
+        );
+    }
 }
 
 /// The documents a guard covers, as one quiet line: their names, at most two
 /// of them, then how many more there are.
-fn documents_line(state: &AppState, covered: &[u64], language: Language) -> String {
+fn documents_line(state: &AppState, tab: Option<u64>, language: Language) -> String {
     let tabs = state.tabs.get();
-    let names: Vec<String> = covered
-        .iter()
-        .filter_map(|id| tabs.iter().find(|tab| tab.id == *id))
-        .map(|tab| tab.title.to_string())
-        .collect();
+    let names: Vec<String> = match tab {
+        Some(id) => tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| vec![tab.title.to_string()])
+            .unwrap_or_default(),
+        // Quitting covers whatever is dirty when the decision is made, so
+        // the card lists exactly that, as it changes.
+        None => tabs
+            .iter()
+            .filter(|tab| tab.dirty.get())
+            .map(|tab| tab.title.to_string())
+            .collect(),
+    };
     names_line(&names, language)
 }
 
@@ -935,36 +1043,30 @@ fn names_line(names: &[String], language: Language) -> String {
     }
 }
 
-/// How a card control reads.
-#[derive(Clone, Copy)]
-enum ActionLook {
-    /// The one default action: the designed ring.
-    Default,
-    /// A plain control: a hairline border that steps to ink on hover.
-    Borderless,
-    /// A destructive one: the danger colour.
-    Danger,
-}
-
 /// One control of the guard card: 164×36, square and flat, never warm — a
-/// local action is lit by ambient light only. `look` carries the ring, the
-/// danger ink or the plain border.
+/// local action is lit by ambient light only. `danger` is the destructive
+/// control's ink, and `selected` draws the designed ring on the control the
+/// keyboard is on.
 fn card_action(
     test_id: &str,
     label: &'static str,
-    look: ActionLook,
+    danger: bool,
+    selected: impl IntoReactive<bool> + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
-    let ringed = matches!(look, ActionLook::Default);
+    let selected = selected.into_reactive();
     view()
         .test_id(test_id)
         .p(px(FOCUS_RING_OFFSET))
         .border(px(FOCUS_RING))
-        .border_color(move || {
-            if ringed {
-                tokens::palette().ink
-            } else {
-                Color::TRANSPARENT
+        .border_color({
+            let selected = selected.clone();
+            move || {
+                if selected.get() {
+                    tokens::palette().ink
+                } else {
+                    Color::TRANSPARENT
+                }
             }
         })
         .child(
@@ -976,9 +1078,12 @@ fn card_action(
                 .justify_center()
                 .bg(Color::TRANSPARENT)
                 .border(px(HAIRLINE))
-                .border_color(move || match look {
-                    ActionLook::Danger => tokens::palette().hairline,
-                    _ => tokens::palette().ink_faint,
+                .border_color(move || {
+                    if danger {
+                        tokens::palette().hairline
+                    } else {
+                        tokens::palette().ink_faint
+                    }
                 })
                 .transition_colors()
                 .duration(HOVER_MS)
@@ -999,9 +1104,12 @@ fn card_action(
                                 .font_family(tokens::FONT_UI)
                                 .text_size(px(tokens::TYPE_UI))
                                 .line_height(px(tokens::TYPE_UI_LINE))
-                                .text_color(move || match look {
-                                    ActionLook::Danger => tokens::palette().danger,
-                                    _ => tokens::palette().ink,
+                                .text_color(move || {
+                                    if danger {
+                                        tokens::palette().danger
+                                    } else {
+                                        tokens::palette().ink
+                                    }
                                 }),
                         ),
                 ),
