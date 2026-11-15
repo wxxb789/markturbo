@@ -134,3 +134,25 @@
   difference in the shared commit path. The per-pull-request macOS job now runs
   only the arm64 build, and the nightly `--workspace` run owns macOS behavior, so
   nothing hides behind this gap.
+- [ ] **The mt-app integration tests still assert the pre-Afterglow shell** —
+  found on 2026-11-16 in the consent lane (`cargo test -p mt-app
+  --no-fail-fast`): 68 lib tests pass and ten test binaries fail, none of them
+  for consent reasons. Two causes, both from the shell rebuild in `61d2556`.
+  (1) Removed controls: `tests/conflict.rs`, `hierarchy_layouts.rs`,
+  `hierarchy_welcome.rs`, `language_switch.rs`, `paste_document.rs`,
+  `quit_guard.rs`, `quit_untitled.rs`, `untitled_recovery.rs`,
+  `untitled_save.rs` wait for `text:Save` or `text:Start a Markdown document`,
+  and neither `Key::Save` nor `Key::WelcomeTitle` (`crates/mt-app/src/i18n.rs`)
+  has a call site outside `i18n.rs` any more. (2) The shell's empty overlay
+  takes presses over the title row: `tests/review_stale.rs` and
+  `tests/revision_flow.rs::partial_accept_records_the_final_split_once` fail
+  with "`text:Review` is covered: a press there reaches `id:overlay`" before any
+  consent is open: the Headless hit-test makes `shell.rs`'s empty `overlay()`
+  (`.absolute().inset_0()`, no children while nothing is shown) take presses
+  over the whole window, so the Review entry point is unreachable in those
+  tests. Whether the live Windows backend hits the same way is unverified
+  (no desktop session run this round) — check that first, then decide whether
+  the overlay should be press-through while nothing is shown or the tests
+  should press the row's own control. Re-point each test at
+  the current selectors (or retire it) as the new UI settles; keep coverage for
+  the save-conflict, quit-guard and review-staleness flows.
