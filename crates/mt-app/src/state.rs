@@ -17,18 +17,23 @@ use std::{
 use mt_core::{
     Document,
     agent_artifacts::{
-        context::{CODEX_PROFILE_ID, ContextInput, ProjectTrust, ResolvedContext, resolve},
+        context::{
+            CODEX_PROFILE_ID, ContextInput, ProjectTrust, ResolvedContext, SelectedContext, resolve,
+        },
         instruction::{self, Instruction},
         package::{ReviewRequestBuildRequest, ReviewTarget, build_review_request},
         skill::{self, Discovery, Skill},
     },
     credentials::CredentialVault,
     document::io::{self, FileStamp, LoadedFile, Newline, SaveError, SourceIdentity},
-    model::{ConsentCapability, ConsentDecision},
+    model::{
+        ConsentCapability, ConsentDecision, ModelRequestDisclosure, OutboundScope,
+        OutboundScopeKind,
+    },
     recovery::{RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RecoveryStore},
     review::{
         ArtifactLens, ClarificationPriority, FindingKind, ReviewModelOutput, ReviewRequest,
-        ReviewResult, ReviewStatus, SourceAnchor, SourceLocation, SourceSnapshot,
+        ReviewResult, ReviewStatus, SkillFilePayload, SourceAnchor, SourceLocation, SourceSnapshot,
         provider::{
             PreparedDocumentReviewRequest, PreparedReview, PreparedRevisionRequest, ReviewError,
             ReviewLanguage, RevisionAnswer, RevisionAnswers, RevisionError,
@@ -130,6 +135,8 @@ pub struct AppState {
     pub harness_instructions: Signal<Vec<Instruction>>,
     pub review_open: Signal<bool>,
     pub review_consent: Signal<Option<SharedString>>,
+    /// The waiting Review consent's structured disclosure and manifest.
+    pub review_manifest: Signal<Option<OutboundConsent>>,
     pub review_view: Signal<Option<ReviewView>>,
     pub review_busy: Signal<bool>,
     /// The source column's camera ([`DocumentFocus`]): the line a docked
@@ -147,6 +154,8 @@ pub struct AppState {
     pub translation_busy: Signal<bool>,
     pub revision_questions: Signal<Vec<RevisionQuestionView>>,
     pub revision_consent: Signal<Option<SharedString>>,
+    /// The waiting Revision consent's structured disclosure and manifest.
+    pub revision_manifest: Signal<Option<OutboundConsent>>,
     pub revision_hunks: Signal<Vec<RevisionHunkView>>,
     pub revision_status: Signal<Option<SharedString>>,
     pub revision_busy: Signal<bool>,
@@ -226,6 +235,60 @@ pub const GUARD_DISCARD_CHOICE: usize = 1;
 pub const GUARD_CANCEL_CHOICE: usize = 2;
 /// How many controls the guard has.
 pub const GUARD_CHOICES: usize = 3;
+/// Where one outbound item came from, for the consent card to name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboundOrigin {
+    /// The reviewed document itself.
+    Document,
+    /// One named Effective Agent Context source.
+    NamedSource,
+    /// One Agent Skill package file, whose own reason travels with it.
+    PackageFile,
+    /// A file the package would normally include but does not send.
+    Omission,
+    /// A resolved Effective Agent Context source that is not in the scope.
+    ExcludedSource,
+    /// The Review a Revision request carries as context.
+    ReviewContext,
+    /// The clarification answers a Revision request carries.
+    Answers,
+}
+
+/// One item of a consent's outbound manifest: what leaves the device, why, and
+/// its own bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboundItem {
+    pub origin: OutboundOrigin,
+    /// The item's path, relative to the workspace root when it is inside it.
+    /// `None` for an item that is not a file (a request's framing).
+    pub path: Option<String>,
+    /// The package's own inclusion reason, when the item has one.
+    pub reason: Option<String>,
+    /// The item's own byte size.
+    pub bytes: u64,
+    /// Whether the raw content crosses the boundary. False for a package entry
+    /// that leaves as path, size and hash only.
+    pub content_leaves: bool,
+}
+
+/// What one waiting consent discloses: the structured disclosure the send will
+/// be bound to, plus the manifest the card's rows are built from.
+///
+/// Built where the request is bound and from the same objects that will
+/// authorize the send, so no number on the card is summarized or estimated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboundConsent {
+    pub disclosure: ModelRequestDisclosure,
+    /// The framed request's bytes, when mt-core computed them at bind time:
+    /// the canonical review frame for a document or a document with Effective
+    /// Agent Context, the framed payload for an Agent Skill package. `None`
+    /// when only the items are known (a Revision).
+    pub framed_bytes: Option<u64>,
+    /// What leaves and why, in display order.
+    pub items: Vec<OutboundItem>,
+    /// Normally in-scope items that do not leave, in display order.
+    pub stays: Vec<OutboundItem>,
+}
 
 /// Immutable inputs retained after a successful Review for a later Revision.
 struct RevisionContext {
@@ -421,6 +484,7 @@ impl AppState {
             harness_instructions: signal(Vec::new()),
             review_open: signal(false),
             review_consent: signal(None),
+            review_manifest: signal(None),
             review_view: signal(None),
             review_busy: signal(false),
             document_focus: signal(DocumentFocus::default()),
@@ -428,6 +492,7 @@ impl AppState {
             translation_busy: signal(false),
             revision_questions: signal(Vec::new()),
             revision_consent: signal(None),
+            revision_manifest: signal(None),
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
@@ -1955,6 +2020,7 @@ impl AppState {
         self.review_view.set(None);
         self.review_unavailable.set(None);
         self.review_consent.set(None);
+        self.review_manifest.set(None);
         *self.review_origin.borrow_mut() = None;
         *self.review_binding.borrow_mut() = None;
         self.reset_revision();
@@ -2028,6 +2094,7 @@ impl AppState {
                 };
             }
         }
+        let context_included = request.effective_agent_context.is_some();
         let bound = match prepared.bind_document_request(request, language) {
             Ok(bound) => bound,
             Err(error) => {
@@ -2039,11 +2106,362 @@ impl AppState {
         };
         let disclosure =
             crate::i18n::model_request_disclosure(settings.language, bound.disclosure());
+        let manifest = self.review_manifest_of(
+            &bound,
+            &tab.path,
+            self.excluded_sources(&tab.path, context_included),
+        );
         *self.pending_review.borrow_mut() = Some(bound);
         *self.review_origin.borrow_mut() = Some(origin);
         self.review_consent
             .set(Some(SharedString::from(disclosure)));
+        self.review_manifest.set(Some(manifest));
         self.review_open.set(true);
+    }
+
+    /// Whether the waiting Review consent may also be bound with its selected
+    /// Effective Agent Context (the `Document + context` scope).
+    pub fn review_consent_offers_context(&self) -> bool {
+        self.review_consent_target()
+            .is_some_and(|target| self.context_candidate(&target).is_some())
+    }
+
+    /// The file the waiting Review consent was bound for, while its tab is
+    /// still open.
+    fn review_consent_target(&self) -> Option<PathBuf> {
+        let origin = self.review_origin.borrow().as_ref().copied()?;
+        self.tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == origin.tab_id)
+            .map(|tab| tab.path.clone())
+    }
+
+    /// The selected Effective Agent Context a binding for `target` may carry,
+    /// when one is resolved and selected for that exact file. `Err` is the
+    /// selection the request boundary rejects: the caller says so.
+    fn context_selection(&self, target: &Path) -> Result<Option<SelectedContext>, String> {
+        let Some(context) = self.context_resolved.get() else {
+            return Ok(None);
+        };
+        if context.input.target != target {
+            return Ok(None);
+        }
+        let selected = self.context_selected.get();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        context
+            .select_sources(&selected)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    /// [`Self::context_selection`] without the error: what the UI polls to
+    /// know whether the other scope is bindable at all.
+    fn context_candidate(&self, target: &Path) -> Option<SelectedContext> {
+        self.context_selection(target).ok().flatten()
+    }
+
+    /// The frozen Review behind the waiting consent, stripped back to its
+    /// pre-context form, with the file it was bound for and its language.
+    fn review_base(&self) -> Option<(PathBuf, ReviewRequest, ReviewLanguage)> {
+        let target = self.review_consent_target()?;
+        let (mut request, language) = {
+            let bound = self.pending_review.borrow();
+            let bound = bound.as_ref()?;
+            (bound.request().clone(), bound.language())
+        };
+        request.effective_agent_context = None;
+        Some((target, request, language))
+    }
+
+    /// Re-arm the waiting Review consent for another outbound scope: rebuild
+    /// the same frozen request with or without the selected Effective Agent
+    /// Context and disclose the new scope. Nothing is authorized; the next
+    /// send needs a fresh hold.
+    pub fn set_review_consent_scope(&self, with_context: bool) {
+        let Some((target, base, language)) = self.review_base() else {
+            return;
+        };
+        let mut request = base;
+        if with_context {
+            let context = match self.context_selection(&target) {
+                Ok(Some(context)) => context,
+                Ok(None) => return,
+                Err(error) => {
+                    self.status.set(SharedString::from(format!(
+                        "Context selection rejected: {error}"
+                    )));
+                    return;
+                }
+            };
+            request = match request.with_effective_agent_context(context) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.status.set(SharedString::from(format!(
+                        "Context request rejected: {error}"
+                    )));
+                    return;
+                }
+            };
+        }
+        let settings = self.settings.get();
+        let prepared = match PreparedReview::from_settings(&settings, &self.vault) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.record_review_failure(&error);
+                self.status
+                    .set(SharedString::from(format!("Review unavailable: {error}")));
+                self.cancel_review();
+                return;
+            }
+        };
+        let context_included = request.effective_agent_context.is_some();
+        let bound = match prepared.bind_document_request(request, language) {
+            Ok(bound) => bound,
+            Err(error) => {
+                self.status.set(SharedString::from(format!(
+                    "Review request rejected: {error}"
+                )));
+                self.cancel_review();
+                return;
+            }
+        };
+        let disclosure =
+            crate::i18n::model_request_disclosure(settings.language, bound.disclosure());
+        let manifest = self.review_manifest_of(
+            &bound,
+            &target,
+            self.excluded_sources(&target, context_included),
+        );
+        *self.pending_review.borrow_mut() = Some(bound);
+        self.review_consent
+            .set(Some(SharedString::from(disclosure)));
+        self.review_manifest.set(Some(manifest));
+    }
+
+    /// The resolved Effective Agent Context sources that are not in the
+    /// scope: what stays behind, for the consent card's `Stays here`. With the
+    /// context left out of the binding, every resolved source stays, the
+    /// selected ones included.
+    fn excluded_sources(&self, target: &Path, context_included: bool) -> Vec<OutboundItem> {
+        let Some(context) = self.context_resolved.get() else {
+            return Vec::new();
+        };
+        if context.input.target != target {
+            return Vec::new();
+        }
+        let selected = self.context_selected.get();
+        context
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !context_included || !selected.contains(index))
+            .map(|(_, source)| OutboundItem {
+                origin: OutboundOrigin::ExcludedSource,
+                path: Some(self.display_path(&source.path)),
+                reason: None,
+                bytes: u64::try_from(source.included_bytes).unwrap_or(u64::MAX),
+                content_leaves: false,
+            })
+            .collect()
+    }
+
+    /// The manifest one bound Review discloses: the document and its named
+    /// sources, or every file of the Agent Skill package.
+    fn review_manifest_of(
+        &self,
+        bound: &PreparedDocumentReviewRequest,
+        path: &Path,
+        excluded: Vec<OutboundItem>,
+    ) -> OutboundConsent {
+        let disclosure = bound.disclosure().clone();
+        let (items, mut stays) = self.scope_items(bound.request(), disclosure.scope(), Some(path));
+        stays.extend(excluded);
+        OutboundConsent {
+            disclosure,
+            framed_bytes: bound
+                .inspection()
+                .ok()
+                .map(|inspection| inspection.canonical_byte_size()),
+            items,
+            stays,
+        }
+    }
+
+    /// What one bound scope discloses: the document and its named sources, or
+    /// every file of an Agent Skill package — plus the items that stay.
+    fn scope_items(
+        &self,
+        request: &ReviewRequest,
+        scope: &OutboundScope,
+        path: Option<&Path>,
+    ) -> (Vec<OutboundItem>, Vec<OutboundItem>) {
+        let mut items = Vec::new();
+        let mut stays = Vec::new();
+        if scope.kind() == OutboundScopeKind::AgentSkillPackage {
+            let inventory = scope
+                .agent_skill_inventory()
+                .expect("an Agent Skill scope owns an inventory");
+            let package = request.source.package();
+            for file in inventory.files() {
+                // A binary entry whose raw bytes were not explicitly selected
+                // leaves as path, size and hash only.
+                let content_leaves = package
+                    .and_then(|package| {
+                        package
+                            .files()
+                            .iter()
+                            .find(|entry| entry.path == file.normalized_relative_path())
+                    })
+                    .is_none_or(|entry| {
+                        matches!(
+                            entry.payload,
+                            SkillFilePayload::Utf8 { .. } | SkillFilePayload::RawBinary { .. }
+                        )
+                    });
+                items.push(OutboundItem {
+                    origin: OutboundOrigin::PackageFile,
+                    path: Some(file.normalized_relative_path().to_owned()),
+                    reason: Some(file.inclusion_reason().to_owned()),
+                    bytes: file.byte_size(),
+                    content_leaves,
+                });
+            }
+            if let Some(package) = package {
+                stays.extend(package.omissions().iter().map(|omission| OutboundItem {
+                    origin: OutboundOrigin::Omission,
+                    path: Some(omission.path.clone()),
+                    reason: Some(omission.reason.clone()),
+                    bytes: 0,
+                    content_leaves: false,
+                }));
+            }
+            // A package reviewed with Effective Agent Context leaves those
+            // sources too: they are named beside its files.
+            items.extend(self.context_items(request.effective_agent_context.as_ref()));
+        } else {
+            if let Some(path) = path {
+                items.push(OutboundItem {
+                    origin: OutboundOrigin::Document,
+                    path: Some(self.display_path(path)),
+                    reason: None,
+                    bytes: scope.primary_content_byte_size(),
+                    content_leaves: true,
+                });
+            }
+            items.extend(self.context_items(request.effective_agent_context.as_ref()));
+        }
+        (items, stays)
+    }
+
+    /// The named Effective Agent Context sources of a binding, in order.
+    /// Aliases of one content are counted once, on the first occurrence that
+    /// carries it.
+    fn context_items(&self, context: Option<&SelectedContext>) -> Vec<OutboundItem> {
+        let Some(context) = context else {
+            return Vec::new();
+        };
+        let mut counted: Vec<usize> = Vec::new();
+        context
+            .sources()
+            .iter()
+            .map(|source| {
+                let occurrence = source.occurrence();
+                let first = occurrence.content_index.is_some_and(|index| {
+                    if counted.contains(&index) {
+                        false
+                    } else {
+                        counted.push(index);
+                        true
+                    }
+                });
+                OutboundItem {
+                    origin: OutboundOrigin::NamedSource,
+                    path: Some(self.display_path(&occurrence.path)),
+                    reason: None,
+                    bytes: if first {
+                        u64::try_from(occurrence.included_bytes).unwrap_or(u64::MAX)
+                    } else {
+                        0
+                    },
+                    content_leaves: true,
+                }
+            })
+            .collect()
+    }
+
+    /// The manifest one bound Revision discloses: the reviewed document, the
+    /// Review it builds on and the answers it carries.
+    fn revision_manifest_of(
+        &self,
+        bound: &PreparedRevisionRequest,
+        tab_id: u64,
+    ) -> OutboundConsent {
+        let disclosure = bound.disclosure().clone();
+        let path = self
+            .tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.path.clone());
+        // A Revision of an Agent Skill package resends the whole package; an
+        // ordinary one resends the document the Review covered.
+        let mut items = match disclosure.scope().kind() {
+            OutboundScopeKind::AgentSkillPackage => {
+                self.scope_items(bound.request(), disclosure.scope(), path.as_deref())
+                    .0
+            }
+            _ => vec![OutboundItem {
+                origin: OutboundOrigin::Document,
+                path: path.as_deref().map(|path| self.display_path(path)),
+                reason: None,
+                bytes: disclosure.scope().primary_content_byte_size(),
+                content_leaves: true,
+            }],
+        };
+        if let Some(details) = disclosure.revision_details() {
+            items.push(OutboundItem {
+                origin: OutboundOrigin::ReviewContext,
+                path: None,
+                reason: None,
+                bytes: details.review_context_bytes(),
+                content_leaves: true,
+            });
+            items.push(OutboundItem {
+                origin: OutboundOrigin::Answers,
+                path: None,
+                reason: None,
+                bytes: details.answers_bytes(),
+                content_leaves: true,
+            });
+        }
+        OutboundConsent {
+            disclosure,
+            // The Revision payload's own framing is built at execute time and
+            // is not part of the disclosure, so only the items are known.
+            framed_bytes: None,
+            items,
+            stays: Vec::new(),
+        }
+    }
+
+    /// A path as a manifest row shows it: relative to the workspace root when
+    /// it is inside it, shortened under the home directory, else itself.
+    fn display_path(&self, path: &Path) -> String {
+        let slash = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        if let Some(root) = self.root.get()
+            && let Ok(relative) = path.strip_prefix(&root)
+        {
+            return slash(relative);
+        }
+        if let Some(home) = dirs::home_dir()
+            && let Ok(relative) = path.strip_prefix(&home)
+        {
+            return format!("~/{}", slash(relative));
+        }
+        slash(path)
     }
 
     /// Send the prepared request. Consent is one-shot and bound to the
@@ -2071,6 +2489,7 @@ impl AppState {
         };
 
         self.review_consent.set(None);
+        self.review_manifest.set(None);
         self.review_busy.set(true);
         self.record_usage(UsageEvent::review_started(&revision_request));
         let started = Instant::now();
@@ -2161,6 +2580,7 @@ impl AppState {
         *self.revision_proposal.borrow_mut() = None;
         self.revision_questions.set(questions);
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_hunks.set(Vec::new());
         self.revision_status.set(None);
     }
@@ -2171,6 +2591,7 @@ impl AppState {
         *self.revision_proposal.borrow_mut() = None;
         self.revision_questions.set(Vec::new());
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_hunks.set(Vec::new());
         self.revision_status.set(None);
         self.revision_busy.set(false);
@@ -2181,12 +2602,13 @@ impl AppState {
     pub fn start_revision(&self) {
         let context = self.revision_context.borrow().as_ref().map(|context| {
             (
+                context.tab_id,
                 context.request.clone(),
                 context.output.clone(),
                 context.language,
             )
         });
-        let Some((request, output, language)) = context else {
+        let Some((tab_id, request, output, language)) = context else {
             self.revision_status.set(Some(SharedString::from(
                 "Run Review first to prepare a Revision.",
             )));
@@ -2238,12 +2660,15 @@ impl AppState {
         self.revision_consent.set(Some(SharedString::from(
             crate::i18n::model_request_disclosure(settings.language, bound.disclosure()),
         )));
+        let manifest = self.revision_manifest_of(&bound, tab_id);
+        self.revision_manifest.set(Some(manifest));
         *self.pending_revision.borrow_mut() = Some(bound);
     }
 
     pub fn cancel_revision(&self) {
         *self.pending_revision.borrow_mut() = None;
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_busy.set(false);
     }
 
@@ -2265,6 +2690,7 @@ impl AppState {
             }
         };
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_busy.set(true);
         for answer in bound.answers().as_slice() {
             if matches!(answer, RevisionAnswer::Answered(_)) {
@@ -2428,6 +2854,7 @@ impl AppState {
         self.pending_review.borrow_mut().take();
         self.review_origin.borrow_mut().take();
         self.review_consent.set(None);
+        self.review_manifest.set(None);
         self.review_busy.set(false);
     }
 
