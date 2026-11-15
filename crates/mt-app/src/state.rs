@@ -131,6 +131,10 @@ pub struct AppState {
     pub revision_hunks: Signal<Vec<RevisionHunkView>>,
     pub revision_status: Signal<Option<SharedString>>,
     pub revision_busy: Signal<bool>,
+    /// The rail's preview slot (chrome lane): the tab a single press in the
+    /// rail's file list opened, which the next single press replaces, until a
+    /// double press pins it. `None` when nothing is slotted.
+    pub preview_slot: Signal<Option<u64>>,
     owner: Owner,
     vault: CredentialVault,
     usage: Rc<RefCell<UsageStore>>,
@@ -285,6 +289,7 @@ impl AppState {
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
+            preview_slot: signal(None),
             vault: CredentialVault::production(),
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
@@ -506,6 +511,71 @@ impl AppState {
             };
             state.add_tab(loaded);
             state.record_usage(UsageEvent::ArtifactOpened);
+        });
+    }
+
+    /// Opens `path` in the rail's preview slot (chrome lane): the tab the
+    /// next single press replaces, unless a file it replaces was edited,
+    /// saved as a new document or pinned. A tab already showing `path` is
+    /// activated and becomes the slot's.
+    pub fn open_preview(&self, path: PathBuf) {
+        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.path == path) {
+            self.set_active(tab.id);
+            self.preview_slot.set(Some(tab.id));
+            return;
+        }
+        if let Some(slot) = self.preview_slot.get() {
+            // Only an untouched slot tab may be replaced: its text is what
+            // the file on disk holds, so nothing is lost.
+            let replaceable = self
+                .tabs
+                .get()
+                .iter()
+                .any(|tab| tab.id == slot && !tab.dirty.get() && !tab.untitled);
+            if replaceable {
+                self.close_tab_now(slot);
+            }
+        }
+        self.preview_slot.set(None);
+        let state = self.clone();
+        self.spawn_task(async move {
+            let loaded = match blocking(move || io::load(&path)).await {
+                Ok(Ok(loaded)) => loaded,
+                Ok(Err(error)) => {
+                    state
+                        .status
+                        .set(SharedString::from(format!("Open failed: {error}")));
+                    return;
+                }
+                Err(error) => {
+                    state
+                        .status
+                        .set(SharedString::from(format!("Open failed: {error}")));
+                    return;
+                }
+            };
+            let known: Vec<u64> = state.tabs.get().iter().map(|tab| tab.id).collect();
+            state.add_tab(loaded);
+            state.record_usage(UsageEvent::ArtifactOpened);
+            let opened = state
+                .tabs
+                .get()
+                .iter()
+                .map(|tab| tab.id)
+                .find(|id| !known.contains(id));
+            if let Some(id) = opened {
+                state.preview_slot.set(Some(id));
+            }
+        });
+    }
+
+    /// Pins the preview slot's tab (a double press): the next single press
+    /// opens beside it instead of replacing it.
+    pub fn pin_tab(&self, id: u64) {
+        self.preview_slot.update(|slot| {
+            if *slot == Some(id) {
+                *slot = None
+            }
         });
     }
 
