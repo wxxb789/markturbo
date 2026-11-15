@@ -25,9 +25,8 @@ fn untitled_draft_is_checkpointed() {
         .expect("wide viewport");
     let recovery = config.path().join("data").join("recovery");
     let baseline = recovery_entries(&recovery);
-    app.wait_for("text:Start a Markdown document")
-        .expect("welcome");
-    app.press("text:New").expect("new draft");
+    app.wait_for("id:welcome").expect("welcome");
+    app.press("label:New file").expect("new draft");
     app.wait_for("label:Markdown source").expect("draft editor");
     app.type_text("label:Markdown source", "Recover me")
         .expect("edit draft");

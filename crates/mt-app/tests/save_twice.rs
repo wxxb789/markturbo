@@ -1,9 +1,9 @@
 //! A successful save must advance the loaded file's conflict stamp.
 
-use nsh_engine::{EngineConfig, Root};
-use nsh_testing::Headless;
+use std::time::{Duration, Instant};
 
-mod support;
+use nsh_engine::{EngineConfig, Points, Root};
+use nsh_testing::Headless;
 
 #[test]
 fn saving_twice_does_not_report_its_own_first_save_as_a_conflict() {
@@ -22,27 +22,57 @@ fn saving_twice_does_not_report_its_own_first_save_as_a_conflict() {
 
     let mut app =
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
+        .expect("wide viewport");
 
     app.wait_for("label:Markdown source")
         .expect("source editor");
+    app.wait_for("id:title-save").expect("save action");
     app.type_text("label:Markdown source", "\nFirst edit.")
         .expect("first edit");
-    app.press("text:Save").expect("first save");
+    app.press("id:title-save").expect("first save");
     app.type_text("label:Markdown source", "\nSecond edit.")
         .expect("second edit");
-    app.press("text:Save").expect("second save");
-    support::wait_for_file(
-        &mut app,
-        &path,
-        |text| text.contains("Second edit."),
-        "the second save lands instead of reporting a conflict",
-        std::time::Duration::from_secs(20),
-    );
+    app.press("id:title-save").expect("second save");
+
+    // Pump the app's frames while the second save lands instead of sleeping in
+    // this thread, which never advances the app.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .contains("Second edit.")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the second save never landed: {:?}",
+            app.screen().texts()
+        );
+        app.next_change(Duration::from_millis(25))
+            .expect("settle while saving");
+    }
 
     let saved = std::fs::read_to_string(&path).expect("read saved file");
     assert!(
         saved.contains("First edit."),
         "first edit was lost: {saved:?}"
     );
-    assert!(!app.shows("Save conflict"));
+    assert!(
+        saved.contains("Second edit."),
+        "second edit was lost: {saved:?}"
+    );
+    assert!(
+        !app.screen()
+            .matches("id:conflict-banner")
+            .expect("the conflict selector parses"),
+        "the second save was reported as a conflict: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Save refused")),
+        "the second save was refused: {:?}",
+        app.screen().texts()
+    );
 }
