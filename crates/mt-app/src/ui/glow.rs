@@ -140,7 +140,8 @@ fn ticker_step() -> Signal<Option<Spawned<()>>> {
 }
 
 /// Registers the result the field is showing: a new one starts the arrival
-/// sequence and resolves its anchors against `tab`'s text; a result that
+/// sequence and resolves its anchors against `tab`'s text — the tab the
+/// review was made from, and its text as it stands at arrival; a result that
 /// just went stale begins the afterimage drain; `None` ends everything.
 ///
 /// Called from an effect, never from a render: it writes the emission the
@@ -152,6 +153,7 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
     let Some(view) = view else {
         if current.view.is_some() {
             signal.set(Emission::default());
+            focus_watch().update(|step| *step += 1);
         }
         return;
     };
@@ -178,8 +180,15 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
         signal.set(Emission::default());
         return;
     };
-    let text = tab.text.get_untracked();
-    let anchors = resolve_anchors(view, &text, reduced);
+    // A result that arrives already stale was made from text that has since
+    // changed: its byte offsets cannot be trusted to the text in hand, and
+    // light placed on them would point the afterimage at the wrong words.
+    // The field still shows the result; the column shows no light for it.
+    let anchors = if view.stale {
+        vec![None; view.findings_anchored.len()]
+    } else {
+        resolve_anchors(view, &tab.text.get_untracked(), reduced)
+    };
     let motion_until = anchors
         .iter()
         .flatten()
@@ -206,6 +215,7 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
         pulse: false,
         now_ms: 0.0,
     });
+    focus_watch().update(|step| *step += 1);
     ensure_ticker();
 }
 
@@ -240,9 +250,30 @@ pub fn focus_finding(finding: Option<usize>) {
                 .max(at + ignition_ms(reduced) + cooling_ms(reduced));
         }
     });
+    focus_watch().update(|step| *step += 1);
     if heating {
         ensure_ticker();
     }
+}
+
+/// Bumped whenever the focused finding changes (or a new result takes the
+/// column): what the document lane reads to re-centre the column on
+/// [`focused_range`].
+pub fn focus_watch() -> Signal<u64> {
+    global::<u64>()
+}
+
+/// The focused finding's range in the editor, for the column's camera: the
+/// document lane calls `reveal_position(range.start, center)` when
+/// [`focus_watch`] changes. `None` when nothing is focused, or when the
+/// finding has no anchor in this document.
+pub fn focused_range() -> Option<EditorRange> {
+    let e = emission().get_untracked();
+    let index = e.focus?;
+    e.anchors
+        .get(index)
+        .and_then(|slot| slot.as_ref())
+        .map(|anchor| anchor.range)
 }
 
 /// The 1-based, inclusive line range `finding` is anchored to, against the

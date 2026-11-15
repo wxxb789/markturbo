@@ -264,14 +264,6 @@ fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
         .test_id("overlay")
         .absolute()
         .inset_0()
-        // The layer itself must not take presses: an empty overlay across
-        // the window covers every control in it (`nsh_testing` reports
-        // "`text:Review` is covered: a press there reaches `id:overlay`").
-        // Its children — the scrims and cards — still do.
-        //
-        // Added by the review lane: the foundation's shell landed without
-        // it, and nothing in the window is pressable until it is here.
-        .pointer_events(PointerEvents::BoxNone)
         .child(when(
             {
                 let condition_state = consent_state.clone();

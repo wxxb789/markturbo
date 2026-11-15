@@ -128,6 +128,11 @@ pub struct AppState {
     /// Why the last Review attempt could not be prepared, when it could not:
     /// the field explains it and offers Settings. `None` normally.
     pub review_unavailable: Signal<Option<ReviewUnavailable>>,
+    /// Which Review an in-flight request belongs to. Bumped when a review is
+    /// prepared and when one is withdrawn: a task whose generation is stale
+    /// writes nothing, so a cancelled (or replaced) run can never show its
+    /// result.
+    pub review_generation: Signal<u64>,
     pub translation_busy: Signal<bool>,
     pub revision_questions: Signal<Vec<RevisionQuestionView>>,
     pub revision_consent: Signal<Option<SharedString>>,
@@ -347,6 +352,7 @@ impl AppState {
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
+            review_generation: signal(0),
             vault: CredentialVault::production(),
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
@@ -1634,6 +1640,9 @@ impl AppState {
     /// configured endpoint and credential, and show the exact disclosure.
     /// Nothing leaves the machine until [`send_review`](Self::send_review).
     pub fn start_review(&self) {
+        // A review that is prepared replaces any review still in flight: its
+        // task writes nothing when it comes back.
+        self.review_generation.update(|generation| *generation += 1);
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -1765,6 +1774,7 @@ impl AppState {
         self.record_usage(UsageEvent::review_started(&revision_request));
         let started = Instant::now();
         let state = self.clone();
+        let generation = self.review_generation.get_untracked();
         let revision = self
             .tabs
             .get()
@@ -1774,6 +1784,12 @@ impl AppState {
             .unwrap_or_else(|| signal(0));
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
+            if state.review_generation.get_untracked() != generation {
+                // Withdrawn (or replaced) while the request was out: its
+                // answer is not this surface's to show, and it must not touch
+                // the view, the revision context or the busy flag.
+                return;
+            }
             state.review_busy.set(false);
             let view = match result {
                 Ok(Ok(transport)) => {
@@ -2091,6 +2107,15 @@ impl AppState {
         self.review_origin.borrow_mut().take();
         self.review_consent.set(None);
         self.review_busy.set(false);
+    }
+
+    /// Withdraw a review whose request is already in flight: the task's
+    /// generation becomes stale, so when the model answers it writes nothing
+    /// — no view, no revision context, no busy flag. What the user cancelled
+    /// stays cancelled.
+    pub fn cancel_review_in_flight(&self) {
+        self.review_generation.update(|generation| *generation += 1);
+        self.cancel_review();
     }
 
     pub fn close_review(&self) {

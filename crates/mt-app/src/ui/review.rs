@@ -22,17 +22,17 @@ use std::time::Duration;
 
 use mt_core::{
     model::{EndpointIdentity, Provider},
-    review::{ArtifactLens, ClarificationPriority},
+    review::{ArtifactLens, ClarificationPriority, provider::REVIEW_REQUEST_TIMEOUT},
     settings::Language,
 };
-use nsh_base::input;
+use nsh_base::{button, input};
 use nsh_core::{Color, EllipsizeMode, element::KeyOptions, keymap::When, prelude::*};
 
 use crate::{
     i18n::{self, Key},
     state::{
         AppState, ReviewFailure, ReviewFindingView, ReviewQuestionView, ReviewUnavailable,
-        ReviewView,
+        ReviewView, Tab,
     },
     ui::{
         glow,
@@ -106,6 +106,35 @@ struct Session {
     slow: bool,
 }
 
+/// What takes the keyboard focus once, when its state is entered: the field
+/// asks for it here rather than through `autoFocus`, which would take the
+/// focus back on every rebuild — and steal it from `J`/`K`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Focus {
+    /// The answer field of question `index`.
+    Answer(usize),
+    /// `Prepare revision`, once every question is answered or skipped.
+    Prepare,
+    /// `Review again`, on a result that is already stale.
+    ReviewAgain,
+}
+
+fn focus_request() -> Signal<Option<Focus>> {
+    global::<Option<Focus>>()
+}
+
+/// A one-shot focus, kept alive until it fires: an effect runs before the
+/// commit that carries the control is in, so the ref reaches it only at the
+/// next step of the executor.
+fn focus_step() -> Signal<Option<Spawned<()>>> {
+    global::<Option<Spawned<()>>>()
+}
+
+fn focus_soon(reference: ElementRef) {
+    let step = set_timeout(Duration::from_millis(0), move || reference.focus());
+    focus_step().set(Some(step));
+}
+
 fn session() -> Signal<Session> {
     global::<Session>()
 }
@@ -135,8 +164,12 @@ fn observe(state: &AppState, session: Signal<Session>) {
     let state = state.clone();
     effect(move || {
         let view = state.review_view.get();
-        let tab = state.active_tab();
-        glow::observe(view.as_ref(), tab.as_ref());
+        // The review belongs to the tab it was made from, whatever tab the
+        // user is on when it arrives: its anchors and its `lines N–M` are
+        // that document's, and another document's bytes never receive them.
+        // The tab list is read untracked — only the result re-runs this.
+        let reviewed = view.as_ref().and_then(|view| reviewed_tab(&state, view));
+        glow::observe(view.as_ref(), reviewed.as_ref());
         let known = session.get_untracked();
         let arrival = match (&known.view, &view) {
             (Some(known), Some(view)) => !known.same_result(view),
@@ -146,12 +179,8 @@ fn observe(state: &AppState, session: Signal<Session>) {
         if !arrival {
             return;
         }
-        let focus = view
-            .as_ref()
-            .and_then(|view| (!view.findings_anchored.is_empty()).then_some(0));
         let next = Session {
             view: view.clone(),
-            focus,
             ..Session::default()
         };
         let emitters = emitters();
@@ -159,7 +188,13 @@ fn observe(state: &AppState, session: Signal<Session>) {
             Some(view) => {
                 let order = priority_order(&view.questions_detail);
                 let current = current_question(&next, &order);
-                let built = Emitters {
+                // Under a detached owner: an emitter is a handle held by the
+                // owner it is made under, and this effect's owner dies with
+                // every re-run of it and with every rebuild of the field. A
+                // handle whose owner is gone does nothing, so the heats would
+                // stop moving — the field's own lines and the column's
+                // docked position alike.
+                let built = Owner::detached().run(|| Emitters {
                     goal: Heat::cold(),
                     questions: order.iter().map(|_| Heat::cold()).collect(),
                     findings: view
@@ -167,12 +202,12 @@ fn observe(state: &AppState, session: Signal<Session>) {
                         .iter()
                         .map(|_| Heat::cold())
                         .collect(),
-                };
+                });
                 emitters.set(built.clone());
                 // The reading order: the goal, then the question to answer —
-                // the one that stays HOT — then the rest of the questions,
-                // then the first finding, whose simultaneous ignition with
-                // the question is the link between the two.
+                // the one that stays HOT — then the rest of the questions.
+                // The column's findings ignite on the same clock, and exactly
+                // one thing is HOT by the time the sequence is done.
                 built.goal.ignite(stagger(0));
                 for (slot, index) in order.iter().enumerate() {
                     let Some(heat) = built.questions.get(slot).copied() else {
@@ -184,14 +219,19 @@ fn observe(state: &AppState, session: Signal<Session>) {
                         heat.ignite(stagger(2 + slot));
                     }
                 }
-                if let Some(heat) = focus.and_then(|index| built.findings.get(index).copied()) {
-                    ignite_hold(heat, stagger(1));
-                }
-                // The column's current finding is the first one: its words
-                // light up with the question, and `J`/`K` move from there.
-                glow::focus_finding(focus);
+                // Nothing is focused yet: the question is the one HOT item
+                // until `J`/`K` (or the stepper) steps to a finding.
+                glow::focus_finding(None);
+                focus_request().set(Some(match (view.stale, current) {
+                    (true, _) => Focus::ReviewAgain,
+                    (false, Some(index)) => Focus::Answer(index),
+                    (false, None) => Focus::Prepare,
+                }));
             }
-            None => emitters.set(Emitters::default()),
+            None => {
+                emitters.set(Emitters::default());
+                focus_request().set(None);
+            }
         }
         session.set(next);
     });
@@ -235,7 +275,7 @@ fn keys(state: &AppState, session: Signal<Session>) {
             move |_| {
                 if state.review_busy.get_untracked() {
                     session.update(|session| session.cancelled = true);
-                    state.cancel_review();
+                    state.cancel_review_in_flight();
                 } else if session.get_untracked().view.is_none()
                     && state.review_consent.get_untracked().is_none()
                 {
@@ -273,15 +313,24 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
         return;
     }
     let current = session.get_untracked();
-    let from = current.focus.unwrap_or(0).min(count as usize - 1);
-    let to = (from as i32 + delta).clamp(0, count - 1) as usize;
+    let last = count as usize - 1;
+    // From nothing focused, a step lands on the first (or, backwards, the
+    // last) finding: it must not step past the one it meant.
+    let (from, to) = match current.focus.map(|from| from.min(last)) {
+        Some(from) => (
+            Some(from),
+            (from as i32 + delta).clamp(0, last as i32) as usize,
+        ),
+        None => (None, if delta >= 0 { 0 } else { last }),
+    };
     session.update(|session| {
         session.focus = Some(to);
         session.showing_finding = true;
     });
     glow::focus_finding(Some(to));
     let heats = emitters().get_untracked().findings;
-    if from != to
+    if let Some(from) = from
+        && from != to
         && let Some(heat) = heats.get(from).copied()
     {
         heat.cool();
@@ -398,11 +447,7 @@ fn result(
 fn failure_block(state: AppState, language: Language, review: &ReviewView) -> impl IntoElement {
     let again = state.clone();
     let (headline, detail, action) = match review.failure {
-        Some(ReviewFailure::Timeout) => (
-            s(S::TimedOut, language).to_owned(),
-            None,
-            s(S::TryAgain, language),
-        ),
+        Some(ReviewFailure::Timeout) => (timed_out(language), None, s(S::TryAgain, language)),
         Some(ReviewFailure::Malformed) => (
             s(S::CouldNotRead, language).to_owned(),
             None,
@@ -442,6 +487,16 @@ fn spacer() -> impl IntoElement {
 /// 'Stale — edited after review' with `Review again`.
 fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
     let again = state.clone();
+    // 'Review again' takes the focus when the result goes stale: it is the
+    // state's one next action.
+    let reference = element_ref();
+    let focus_reference = reference;
+    effect(move || {
+        if focus_request().get() == Some(Focus::ReviewAgain) {
+            focus_request().set(None);
+            focus_soon(focus_reference);
+        }
+    });
     view()
         .test_id("review-stale")
         .w_full()
@@ -454,11 +509,12 @@ fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
                 .items_center()
                 .justify_between()
                 .child(prims::ink(s(S::Stale, language)))
-                .child(prims::primary_action(
-                    "review-again",
-                    s(S::ReviewAgain, language),
-                    move || again.start_review(),
-                )),
+                .child(
+                    prims::primary_action("review-again", s(S::ReviewAgain, language), move || {
+                        again.start_review()
+                    })
+                    .element_ref(&reference),
+                ),
         )
 }
 
@@ -470,12 +526,29 @@ fn lens_line(state: AppState, language: Language) -> impl IntoElement {
         .gap(px(SPACE_1))
         .child(prims::rest(format!("{}:", s(S::Lens, language))))
         .child(prims::ink(move || {
+            // The reviewed tab's, not whichever tab is open now: the lens is
+            // what the review was made of.
             let lens = state
-                .active_tab()
+                .review_view
+                .get_untracked()
+                .and_then(|view| reviewed_tab(&state, &view))
                 .map(|tab| ArtifactLens::infer_from_path(&tab.path))
                 .unwrap_or_else(ArtifactLens::default_lens);
             SharedString::from(lens_label(lens, language))
         }))
+}
+
+/// The tab a review belongs to, while it is open: the one it was made from,
+/// whatever tab the user is on. Untracked — a caller in a render pass must
+/// not rebuild with every keystroke in another document.
+fn reviewed_tab(state: &AppState, review: &ReviewView) -> Option<Tab> {
+    let id = review.tab_id?;
+    state
+        .tabs
+        .get_untracked()
+        .iter()
+        .find(|tab| tab.id == id)
+        .cloned()
 }
 
 /// The understood intent: the goal in the model's voice, then what the model
@@ -587,8 +660,9 @@ fn docked(
         .get(index)
         .copied()
         .unwrap_or_else(Heat::default);
-    let lines = state
-        .active_tab()
+    // The reviewed document's text: `lines N–M` is that document's, and
+    // another tab's text would name the wrong lines.
+    let lines = reviewed_tab(&state, review)
         .map(|tab| tab.text.get_untracked())
         .as_ref()
         .and_then(|text| glow::finding_lines(&finding, text))
@@ -663,22 +737,39 @@ fn questions(
                 let priority = question
                     .map(|question| priority_label(question.priority, language))
                     .unwrap_or_default();
-                let mut line = view()
+                let row = cooled_row(&text, priority, heat, language, stale, answered, skipped);
+                // A cooled question is not dead: pressing it (or reaching it
+                // with Tab) makes it the current one again, with its answer
+                // as it was left, so a typo is fixable without re-running
+                // the whole review. While the result is stale there is
+                // nothing to edit, and the line stays plain text.
+                if stale {
+                    return view()
+                        .test_id("review-question-line")
+                        .w_full()
+                        .child(row)
+                        .into_element();
+                }
+                let reopen = {
+                    let order = order.to_vec();
+                    move || reopen_question(session, &order, index)
+                };
+                view()
                     .test_id("review-question-line")
-                    .flex_row()
-                    .items_center()
-                    .gap(px(SPACE_3))
-                    .child(heat_line(priority, heat, language, stale, false))
-                    // One line per cooled question, and the state marker
-                    // stays in the row: the question's own words give way.
-                    .child(heat_line(text, heat, language, stale, true));
-                if answered {
-                    line = line.child(prims::rest(s(S::Answered, language)));
-                }
-                if skipped {
-                    line = line.child(prims::faint(s(S::Skipped, language)));
-                }
-                line.into_element()
+                    .w_full()
+                    .on_press(reopen.clone())
+                    .child(
+                        button()
+                            .accessibility_label(Some(SharedString::from(text.clone())))
+                            .w_full()
+                            .p(px(0.0))
+                            .bg(Color::TRANSPARENT)
+                            .cursor_pointer()
+                            .focus_visible(|style| style.text_color(tokens::palette().ink))
+                            .on_press(reopen)
+                            .child(row),
+                    )
+                    .into_element()
             })),
     );
     block
@@ -703,12 +794,14 @@ fn current_question_block(
         .get(index)
         .map(|question| question.answer);
     let submit = {
+        let state = state.clone();
         let order = order.to_vec();
-        move || answer_question(session, &order, index)
+        move || answer_question(state.clone(), session, &order, index)
     };
     let skip = {
+        let state = state.clone();
         let order = order.to_vec();
-        move || skip_question(session, &order, index)
+        move || skip_question(state.clone(), session, &order, index)
     };
     let question_text = question.question.clone();
     let impact = question.impact.clone();
@@ -747,9 +840,8 @@ fn current_question_block(
                 language,
                 SharedString::from(question.question),
                 answer,
-                session,
-                order,
                 index,
+                submit.clone(),
             ))
             .child(
                 view()
@@ -772,8 +864,62 @@ fn current_question_block(
     block
 }
 
+/// One cooled question's row: its priority, its words and its state marker —
+/// one line, the question's own words giving way when the room is short.
+fn cooled_row(
+    text: &str,
+    priority: &str,
+    heat: Heat,
+    language: Language,
+    stale: bool,
+    answered: bool,
+    skipped: bool,
+) -> impl IntoElement {
+    let mut row = view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_3))
+        .child(heat_line(priority.to_owned(), heat, language, stale, false))
+        .child(heat_line(text.to_owned(), heat, language, stale, true));
+    if answered {
+        row = row.child(prims::rest(s(S::Answered, language)));
+    }
+    if skipped {
+        row = row.child(prims::faint(s(S::Skipped, language)));
+    }
+    row
+}
+
+/// Makes a cooled question the current one again, its answer as it was left.
+fn reopen_question(session: Signal<Session>, order: &[usize], index: usize) {
+    let emitters = emitters().get_untracked();
+    let previous = current_question(&session.get_untracked(), order);
+    session.update(|session| {
+        session.answered.retain(|answered| *answered != index);
+        session.skipped.retain(|skipped| *skipped != index);
+        session.showing_finding = false;
+        session.focus = None;
+    });
+    if let Some(previous) = previous
+        && previous != index
+    {
+        question_heat(&emitters, order, previous).cool();
+    }
+    ignite_hold(question_heat(&emitters, order, index), 0.0);
+    // The question is the HOT item again, and the column's light goes back to
+    // the question's own finding.
+    glow::focus_finding(None);
+    focus_request().set(Some(Focus::Answer(index)));
+}
+
 /// Marks the question answered, cools it and ignites the next one.
-fn answer_question(session: Signal<Session>, order: &[usize], index: usize) {
+fn answer_question(state: AppState, session: Signal<Session>, order: &[usize], index: usize) {
+    if answer_of(&state, index).trim().is_empty() {
+        // An empty answer is what the state sends as `Unanswered`: it is a
+        // skip, and the row must not claim the question was answered.
+        skip_question(state, session, order, index);
+        return;
+    }
     session.update(|session| {
         if !session.answered.contains(&index) {
             session.answered.push(index);
@@ -783,8 +929,13 @@ fn answer_question(session: Signal<Session>, order: &[usize], index: usize) {
     advance_question(session, order, index);
 }
 
-/// Marks the question skipped, cools it and ignites the next one.
-fn skip_question(session: Signal<Session>, order: &[usize], index: usize) {
+/// Marks the question skipped, drops whatever was typed for it — a skip means
+/// no answer, and `start_revision` sends what the answer signal holds — cools
+/// it and ignites the next one.
+fn skip_question(state: AppState, session: Signal<Session>, order: &[usize], index: usize) {
+    if let Some(question) = state.revision_questions.get_untracked().get(index) {
+        question.answer.set(String::new());
+    }
     session.update(|session| {
         if !session.skipped.contains(&index) {
             session.skipped.push(index);
@@ -792,6 +943,16 @@ fn skip_question(session: Signal<Session>, order: &[usize], index: usize) {
         session.showing_finding = false;
     });
     advance_question(session, order, index);
+}
+
+/// What the user typed for question `index`, if the review has it at all.
+fn answer_of(state: &AppState, index: usize) -> String {
+    state
+        .revision_questions
+        .get_untracked()
+        .get(index)
+        .map(|question| question.answer.get_untracked())
+        .unwrap_or_default()
 }
 
 /// Cools `index` and ignites the question that becomes current.
@@ -802,6 +963,12 @@ fn advance_question(session: Signal<Session>, order: &[usize], index: usize) {
     if let Some(next) = next {
         ignite_hold(question_heat(&emitters, order, next), 0.0);
     }
+    // The next thing to do takes the focus: the next answer field, or
+    // `Prepare revision` once every question is done.
+    focus_request().set(Some(match next {
+        Some(index) => Focus::Answer(index),
+        None => Focus::Prepare,
+    }));
 }
 
 // ─── the footer ──────────────────────────────────────────────────────────
@@ -863,20 +1030,43 @@ fn footer(
                                 .child(prims::rest(s(S::InferredLegend, language))),
                         ),
                 )
-                .child(
+                .child({
+                    // The pointer's way to step through findings: `J`/`K`
+                    // fire only while no text input edits, and the answer
+                    // field holds the focus by design. A press (or Tab
+                    // and Enter) steps to the next finding.
+                    let step_state = state.clone();
+                    let step = move || step_finding(&step_state, session, 1);
                     view()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(SPACE_2))
-                        .child(prims::rest(step_hint(
-                            review.findings_anchored.len(),
-                            language,
-                        )))
-                        .child(prims::kbd("J"))
-                        .child(prims::rest("/"))
-                        .child(prims::kbd("K"))
-                        .child(prims::rest(s(S::StepThrough, language))),
-                ),
+                        .test_id("review-findings-step")
+                        .on_press(step.clone())
+                        .child(
+                            button()
+                                .accessibility_label(Some(SharedString::from(s(
+                                    S::StepFindings,
+                                    language,
+                                ))))
+                                .p(px(0.0))
+                                .bg(Color::TRANSPARENT)
+                                .cursor_pointer()
+                                .focus_visible(|style| style.text_color(tokens::palette().ink))
+                                .on_press(step)
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(SPACE_2))
+                                        .child(prims::rest(step_hint(
+                                            review.findings_anchored.len(),
+                                            language,
+                                        )))
+                                        .child(prims::kbd("J"))
+                                        .child(prims::rest("/"))
+                                        .child(prims::kbd("K"))
+                                        .child(prims::rest(s(S::StepThrough, language))),
+                                ),
+                        )
+                }),
         )
         .child(
             view()
@@ -884,11 +1074,22 @@ fn footer(
                 .items_center()
                 .justify_between()
                 .child(if done {
+                    // The state's one next action takes the focus once, when
+                    // every question is done.
+                    let reference = element_ref();
+                    let focus_reference = reference;
+                    effect(move || {
+                        if focus_request().get() == Some(Focus::Prepare) {
+                            focus_request().set(None);
+                            focus_soon(focus_reference);
+                        }
+                    });
                     prims::primary_action(
                         "review-prepare",
                         s(S::PrepareRevision, language),
                         move || prepare_state.start_revision(),
                     )
+                    .element_ref(&reference)
                     .into_element()
                 } else {
                     prims::quiet_action(
@@ -944,7 +1145,7 @@ fn loading_line(state: AppState, language: Language) -> impl IntoElement {
                     s(S::Cancel, language),
                     move || {
                         session().update(|session| session.cancelled = true);
-                        cancel_state.cancel_review();
+                        cancel_state.cancel_review_in_flight();
                     },
                 )),
         )
@@ -1055,7 +1256,7 @@ enum S {
     WordsSwatch,
     TypeYourAnswer,
     StepThrough,
-    TimedOut,
+    StepFindings,
     CouldNotRead,
 }
 
@@ -1091,7 +1292,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::WordsSwatch => "words",
             S::TypeYourAnswer => "Type your answer",
             S::StepThrough => "to step through",
-            S::TimedOut => "Timed out after 60 s — Try again",
+            S::StepFindings => "Next finding",
             S::CouldNotRead => "Couldn't read the response — Try again",
         },
         Language::Chinese => match key {
@@ -1122,7 +1323,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::WordsSwatch => "词语",
             S::TypeYourAnswer => "输入回答",
             S::StepThrough => "切换",
-            S::TimedOut => "60 秒后超时——请重试",
+            S::StepFindings => "下一个发现",
             S::CouldNotRead => "无法读取响应——请重试",
         },
     }
@@ -1150,6 +1351,17 @@ fn step_hint(findings: usize, language: Language) -> String {
             _ => format!("{findings} findings ·"),
         },
         Language::Chinese => format!("{findings} 个发现 ·"),
+    }
+}
+
+/// `Timed out after 120 s`: the seconds are the core's own request timeout,
+/// so the copy cannot drift from what actually happens. `Try again` is the
+/// button under it, not a second invitation in the sentence.
+fn timed_out(language: Language) -> String {
+    let seconds = REVIEW_REQUEST_TIMEOUT.as_secs();
+    match language {
+        Language::English => format!("Timed out after {seconds} s"),
+        Language::Chinese => format!("{seconds} 秒后超时"),
     }
 }
 
@@ -1291,12 +1503,20 @@ fn answer_field(
     language: Language,
     label: SharedString,
     answer: Signal<String>,
-    session: Signal<Session>,
-    order: &[usize],
     index: usize,
+    submit: impl Fn() + 'static,
 ) -> impl ParentElement {
-    let submit_session = session;
-    let submit_order = order.to_vec();
+    // The field takes the focus when its state is entered — never on a plain
+    // rebuild, which would take it from `J`/`K` (or the stepper) on every
+    // step.
+    let reference = element_ref();
+    let focus_reference = reference;
+    effect(move || {
+        if focus_request().get() == Some(Focus::Answer(index)) {
+            focus_request().set(None);
+            focus_soon(focus_reference);
+        }
+    });
     view()
         .test_id("review-answer")
         .w_full()
@@ -1308,9 +1528,10 @@ fn answer_field(
             input()
                 .test_id("review-answer-input")
                 .label(label)
+                .element_ref(&reference)
                 .value(answer)
                 .on_change(move |text: &str| answer.set(text.to_owned()))
-                .on_submit(move |_: &str| answer_question(submit_session, &submit_order, index))
+                .on_submit(move |_: &str| submit())
                 .placeholder(s(S::TypeYourAnswer, language))
                 .font_family(tokens::FONT_UI)
                 .text_size(px(TYPE_UI))
@@ -1320,8 +1541,7 @@ fn answer_field(
                 .bg(move || tokens::palette().room)
                 .border(px(tokens::HAIRLINE))
                 .border_color(move || with_alpha(tokens::palette().ink, 0.16))
-                .focus_visible(|style| style.border_color(tokens::palette().ink))
-                .auto_focus(true),
+                .focus_visible(|style| style.border_color(tokens::palette().ink)),
         )
 }
 
@@ -1410,7 +1630,7 @@ mod tests {
             S::WordsSwatch,
             S::TypeYourAnswer,
             S::StepThrough,
-            S::TimedOut,
+            S::StepFindings,
             S::CouldNotRead,
         ] {
             assert!(!s(key, Language::English).is_empty());
@@ -1422,5 +1642,26 @@ mod tests {
     fn the_line_label_reads_as_the_spec_writes_it() {
         assert_eq!(lines_label(14, 16), "lines 14–16");
         assert_eq!(lines_label(7, 7), "line 7");
+    }
+
+    #[test]
+    fn the_timeout_copy_is_the_core_request_timeout() {
+        let seconds = REVIEW_REQUEST_TIMEOUT.as_secs().to_string();
+        for language in [Language::English, Language::Chinese] {
+            let copy = timed_out(language);
+            assert!(copy.contains(&seconds), "{copy} names the timeout");
+            // `Try again` is the button under it, not a second invitation.
+            assert!(
+                !copy.contains("Try again") && !copy.contains("重试"),
+                "{copy}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_step_hint_counts_findings() {
+        assert_eq!(step_hint(0, Language::English), "No findings ·");
+        assert_eq!(step_hint(1, Language::English), "1 finding ·");
+        assert_eq!(step_hint(4, Language::English), "4 findings ·");
     }
 }
