@@ -144,7 +144,6 @@ pub struct AppState {
     vault: CredentialVault,
     usage: Rc<RefCell<UsageStore>>,
     pending_review: Rc<RefCell<Option<PreparedDocumentReviewRequest>>>,
-    review_scope_base: Rc<RefCell<Option<ReviewScopeBase>>>,
     review_origin: Rc<RefCell<Option<ReviewOrigin>>>,
     review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
@@ -243,19 +242,6 @@ struct RevisionContext {
     snapshot: SourceSnapshot,
     request: ReviewRequest,
     output: ReviewModelOutput,
-    language: ReviewLanguage,
-}
-
-/// The frozen Review request behind a waiting consent, before its Effective
-/// Agent Context was attached: the scope switch rebuilds from this, never from
-/// the tab, whose text may have moved on.
-#[derive(Clone)]
-struct ReviewScopeBase {
-    request: ReviewRequest,
-    /// The selected Effective Agent Context that may be attached, when one was
-    /// selected for this file.
-    context: Option<SelectedContext>,
-    path: PathBuf,
     language: ReviewLanguage,
 }
 
@@ -368,7 +354,6 @@ impl AppState {
             vault: CredentialVault::production(),
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
-            review_scope_base: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
@@ -1652,15 +1637,6 @@ impl AppState {
     /// configured endpoint and credential, and show the exact disclosure.
     /// Nothing leaves the machine until [`send_review`](Self::send_review).
     pub fn start_review(&self) {
-        self.prepare_review_consent(true);
-    }
-
-    /// Bind the Review request and disclose it, with the selected Effective
-    /// Agent Context when `include_context` asks for it. The frozen request
-    /// and the candidate context are kept so
-    /// [`set_review_consent_scope`](Self::set_review_consent_scope) can
-    /// re-arm the same review with the other scope.
-    fn prepare_review_consent(&self, include_context: bool) {
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -1672,7 +1648,6 @@ impl AppState {
         self.review_view.set(None);
         self.review_consent.set(None);
         self.review_manifest.set(None);
-        *self.review_scope_base.borrow_mut() = None;
         *self.review_origin.borrow_mut() = None;
         *self.review_binding.borrow_mut() = None;
         self.reset_revision();
@@ -1704,7 +1679,7 @@ impl AppState {
             )
             .with_skill_origin(tab.loaded.borrow().skill_origin.as_ref()),
         );
-        let request = match built {
+        let mut request = match built {
             Ok(built) => built.into_parts().0,
             Err(error) => {
                 self.status.set(SharedString::from(format!(
@@ -1713,40 +1688,31 @@ impl AppState {
                 return;
             }
         };
-        // The context the review may carry: resolved and selected for this
-        // exact file, whether or not this binding includes it.
-        let candidate_context = match self.context_resolved.get() {
-            Some(context) if context.input.target == tab.path => {
-                let selected = self.context_selected.get();
-                if selected.is_empty() {
-                    None
-                } else {
-                    match context.select_sources(&selected) {
-                        Ok(selected) => Some(selected),
-                        Err(error) => {
-                            self.status.set(SharedString::from(format!(
-                                "Context selection rejected: {error}"
-                            )));
-                            return;
-                        }
+        if let Some(context) = self.context_resolved.get() {
+            let selected = self.context_selected.get();
+            if !selected.is_empty() && context.input.target == tab.path {
+                let selected = match context.select_sources(&selected) {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        self.status.set(SharedString::from(format!(
+                            "Context selection rejected: {error}"
+                        )));
+                        return;
                     }
-                }
+                };
+                request = match request.with_effective_agent_context(selected) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.status.set(SharedString::from(format!(
+                            "Context request rejected: {error}"
+                        )));
+                        return;
+                    }
+                };
             }
-            _ => None,
-        };
-        let mut bound_request = request.clone();
-        if let Some(selected) = candidate_context.clone().filter(|_| include_context) {
-            bound_request = match bound_request.with_effective_agent_context(selected) {
-                Ok(request) => request,
-                Err(error) => {
-                    self.status.set(SharedString::from(format!(
-                        "Context request rejected: {error}"
-                    )));
-                    return;
-                }
-            };
         }
-        let bound = match prepared.bind_document_request(bound_request, language) {
+        let context_included = request.effective_agent_context.is_some();
+        let bound = match prepared.bind_document_request(request, language) {
             Ok(bound) => bound,
             Err(error) => {
                 self.status.set(SharedString::from(format!(
@@ -1757,14 +1723,12 @@ impl AppState {
         };
         let disclosure =
             crate::i18n::model_request_disclosure(settings.language, bound.disclosure());
-        let manifest = self.review_manifest_of(&bound, &tab.path, self.excluded_sources(&tab.path));
+        let manifest = self.review_manifest_of(
+            &bound,
+            &tab.path,
+            self.excluded_sources(&tab.path, context_included),
+        );
         *self.pending_review.borrow_mut() = Some(bound);
-        *self.review_scope_base.borrow_mut() = Some(ReviewScopeBase {
-            request,
-            context: candidate_context,
-            path: tab.path.clone(),
-            language,
-        });
         *self.review_origin.borrow_mut() = Some(origin);
         self.review_consent
             .set(Some(SharedString::from(disclosure)));
@@ -1775,10 +1739,58 @@ impl AppState {
     /// Whether the waiting Review consent may also be bound with its selected
     /// Effective Agent Context (the `Document + context` scope).
     pub fn review_consent_offers_context(&self) -> bool {
-        self.review_scope_base
-            .borrow()
-            .as_ref()
-            .is_some_and(|base| base.context.is_some())
+        self.review_consent_target()
+            .is_some_and(|target| self.context_candidate(&target).is_some())
+    }
+
+    /// The file the waiting Review consent was bound for, while its tab is
+    /// still open.
+    fn review_consent_target(&self) -> Option<PathBuf> {
+        let origin = self.review_origin.borrow().as_ref().copied()?;
+        self.tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == origin.tab_id)
+            .map(|tab| tab.path.clone())
+    }
+
+    /// The selected Effective Agent Context a binding for `target` may carry,
+    /// when one is resolved and selected for that exact file. `Err` is the
+    /// selection the request boundary rejects: the caller says so.
+    fn context_selection(&self, target: &Path) -> Result<Option<SelectedContext>, String> {
+        let Some(context) = self.context_resolved.get() else {
+            return Ok(None);
+        };
+        if context.input.target != target {
+            return Ok(None);
+        }
+        let selected = self.context_selected.get();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        context
+            .select_sources(&selected)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    /// [`Self::context_selection`] without the error: what the UI polls to
+    /// know whether the other scope is bindable at all.
+    fn context_candidate(&self, target: &Path) -> Option<SelectedContext> {
+        self.context_selection(target).ok().flatten()
+    }
+
+    /// The frozen Review behind the waiting consent, stripped back to its
+    /// pre-context form, with the file it was bound for and its language.
+    fn review_base(&self) -> Option<(PathBuf, ReviewRequest, ReviewLanguage)> {
+        let target = self.review_consent_target()?;
+        let (mut request, language) = {
+            let bound = self.pending_review.borrow();
+            let bound = bound.as_ref()?;
+            (bound.request().clone(), bound.language())
+        };
+        request.effective_agent_context = None;
+        Some((target, request, language))
     }
 
     /// Re-arm the waiting Review consent for another outbound scope: rebuild
@@ -1786,13 +1798,20 @@ impl AppState {
     /// Context and disclose the new scope. Nothing is authorized; the next
     /// send needs a fresh hold.
     pub fn set_review_consent_scope(&self, with_context: bool) {
-        let Some(base) = self.review_scope_base.borrow().clone() else {
+        let Some((target, base, language)) = self.review_base() else {
             return;
         };
-        let mut request = base.request;
+        let mut request = base;
         if with_context {
-            let Some(context) = base.context else {
-                return;
+            let context = match self.context_selection(&target) {
+                Ok(Some(context)) => context,
+                Ok(None) => return,
+                Err(error) => {
+                    self.status.set(SharedString::from(format!(
+                        "Context selection rejected: {error}"
+                    )));
+                    return;
+                }
             };
             request = match request.with_effective_agent_context(context) {
                 Ok(request) => request,
@@ -1815,7 +1834,8 @@ impl AppState {
                 return;
             }
         };
-        let bound = match prepared.bind_document_request(request, base.language) {
+        let context_included = request.effective_agent_context.is_some();
+        let bound = match prepared.bind_document_request(request, language) {
             Ok(bound) => bound,
             Err(error) => {
                 self.status.set(SharedString::from(format!(
@@ -1827,8 +1847,11 @@ impl AppState {
         };
         let disclosure =
             crate::i18n::model_request_disclosure(settings.language, bound.disclosure());
-        let manifest =
-            self.review_manifest_of(&bound, &base.path, self.excluded_sources(&base.path));
+        let manifest = self.review_manifest_of(
+            &bound,
+            &target,
+            self.excluded_sources(&target, context_included),
+        );
         *self.pending_review.borrow_mut() = Some(bound);
         self.review_consent
             .set(Some(SharedString::from(disclosure)));
@@ -1836,8 +1859,10 @@ impl AppState {
     }
 
     /// The resolved Effective Agent Context sources that are not in the
-    /// scope: what stays behind, for the consent card's `Stays here`.
-    fn excluded_sources(&self, target: &Path) -> Vec<OutboundItem> {
+    /// scope: what stays behind, for the consent card's `Stays here`. With the
+    /// context left out of the binding, every resolved source stays, the
+    /// selected ones included.
+    fn excluded_sources(&self, target: &Path, context_included: bool) -> Vec<OutboundItem> {
         let Some(context) = self.context_resolved.get() else {
             return Vec::new();
         };
@@ -1849,7 +1874,7 @@ impl AppState {
             .sources
             .iter()
             .enumerate()
-            .filter(|(index, _)| !selected.contains(index))
+            .filter(|(index, _)| !context_included || !selected.contains(index))
             .map(|(_, source)| OutboundItem {
                 origin: OutboundOrigin::ExcludedSource,
                 path: Some(self.display_path(&source.path)),
@@ -1930,6 +1955,9 @@ impl AppState {
                     content_leaves: false,
                 }));
             }
+            // A package reviewed with Effective Agent Context leaves those
+            // sources too: they are named beside its files.
+            items.extend(self.context_items(request.effective_agent_context.as_ref()));
         } else {
             if let Some(path) = path {
                 items.push(OutboundItem {
@@ -1940,35 +1968,45 @@ impl AppState {
                     content_leaves: true,
                 });
             }
-            if let Some(context) = request.effective_agent_context.as_ref() {
-                // Aliases of one content are counted once, on the first
-                // occurrence that carries it.
-                let mut counted: Vec<usize> = Vec::new();
-                for source in context.sources() {
-                    let occurrence = source.occurrence();
-                    let first = occurrence.content_index.is_some_and(|index| {
-                        if counted.contains(&index) {
-                            false
-                        } else {
-                            counted.push(index);
-                            true
-                        }
-                    });
-                    items.push(OutboundItem {
-                        origin: OutboundOrigin::NamedSource,
-                        path: Some(self.display_path(&occurrence.path)),
-                        reason: None,
-                        bytes: if first {
-                            u64::try_from(occurrence.included_bytes).unwrap_or(u64::MAX)
-                        } else {
-                            0
-                        },
-                        content_leaves: true,
-                    });
-                }
-            }
+            items.extend(self.context_items(request.effective_agent_context.as_ref()));
         }
         (items, stays)
+    }
+
+    /// The named Effective Agent Context sources of a binding, in order.
+    /// Aliases of one content are counted once, on the first occurrence that
+    /// carries it.
+    fn context_items(&self, context: Option<&SelectedContext>) -> Vec<OutboundItem> {
+        let Some(context) = context else {
+            return Vec::new();
+        };
+        let mut counted: Vec<usize> = Vec::new();
+        context
+            .sources()
+            .iter()
+            .map(|source| {
+                let occurrence = source.occurrence();
+                let first = occurrence.content_index.is_some_and(|index| {
+                    if counted.contains(&index) {
+                        false
+                    } else {
+                        counted.push(index);
+                        true
+                    }
+                });
+                OutboundItem {
+                    origin: OutboundOrigin::NamedSource,
+                    path: Some(self.display_path(&occurrence.path)),
+                    reason: None,
+                    bytes: if first {
+                        u64::try_from(occurrence.included_bytes).unwrap_or(u64::MAX)
+                    } else {
+                        0
+                    },
+                    content_leaves: true,
+                }
+            })
+            .collect()
     }
 
     /// The manifest one bound Revision discloses: the reviewed document, the
@@ -2069,7 +2107,6 @@ impl AppState {
 
         self.review_consent.set(None);
         self.review_manifest.set(None);
-        *self.review_scope_base.borrow_mut() = None;
         self.review_busy.set(true);
         self.record_usage(UsageEvent::review_started(&revision_request));
         let started = Instant::now();
@@ -2401,7 +2438,6 @@ impl AppState {
         self.review_origin.borrow_mut().take();
         self.review_consent.set(None);
         self.review_manifest.set(None);
-        *self.review_scope_base.borrow_mut() = None;
         self.review_busy.set(false);
     }
 

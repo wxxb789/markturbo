@@ -14,12 +14,16 @@
 //!   request — the endpoint, the items that leave with their own bytes and the
 //!   framed remainder — and when no manifest exists it shows the state's own
 //!   disclosure text verbatim, never summarized;
-//! * the rows and the Total add up: the Total line prints exactly the sum of
-//!   the rows above it (the framed bytes mt-core produced, when it produced
-//!   them);
+//! * the body follows that manifest: a scope switch replaces it, and the rows,
+//!   the total and the hold are re-made for the binding that is now waiting;
+//! * the rows add up: the content total prints exactly the sum of the rows
+//!   above it, and the framed remainder mt-core produced is listed below it,
+//!   never folded in (the wire request is larger still: nothing here claims
+//!   to know it);
 //! * Cancel has the default focus and equals the send's weight; Esc always
-//!   cancels; a held Space or Enter (or two presses in quick succession)
-//!   charges the hold, and a tap alone authorizes nothing;
+//!   cancels; `Enter` and `Space` charge the hold only while the hold control
+//!   itself has the focus — anywhere else they activate the default (Cancel) —
+//!   and a tap alone authorizes nothing;
 //! * a send needs a deliberate hold: a press-and-release, a keyboard tap, an
 //!   auto-repeat or a handler's second hand never authorize anything, and each
 //!   consent is single-use;
@@ -32,13 +36,17 @@
 //! therefore charges for one watchdog and cools back, while two presses in
 //! quick succession carry the charge on.
 //!
-//! On Windows nsh does not move the keyboard focus to a view that is not a
-//! text input, so the keyboard route cannot be conditioned on the hold
-//! control's focus: `Space` and `Enter` start the hold while the card is up
-//! and no text input has the focus (a keystroke that edits text never
-//! charges). Cancel is still where the card asks for the focus, so an
-//! assistive technology on a platform that focuses views activates the safe
-//! choice.
+//! The body is a `dynamic` region and `is_open` polls only the two consent
+//! strings: the shell's `when` re-makes its branch when *that* flips, never
+//! when a manifest inside it is replaced.
+//!
+//! The keyboard holds where the platform focuses views: Cancel takes the focus
+//! as the card opens, and Tab reaches the hold control, which then charges on
+//! `Space` or `Enter`. nsh 0.5.1 on Windows focuses text inputs only, and
+//! focuses nothing from code, so there the hold is out of the keyboard's
+//! reach and the two keys stay on the safe path; a text input that keeps the
+//! focus loses those two keys to the card (the keys that edit it still reach
+//! it: only the shell can block them).
 
 use std::{
     cell::{Cell, RefCell},
@@ -47,9 +55,13 @@ use std::{
 };
 
 use mt_core::{
-    model::{EndpointIdentity, OutboundScopeKind, TransportEncryption},
+    model::{
+        EndpointIdentity, EndpointLocation, OutboundScopeKind, ProxyDisclosure, TransportEncryption,
+    },
     settings::Language,
 };
+use nsh_base::button;
+use nsh_core::keymap::When;
 use nsh_core::{Color, TransformKind, prelude::*};
 
 use crate::{
@@ -83,18 +95,8 @@ const CARD_CHROME_H: f32 = 320.0;
 const _: () = assert!(KEY_ALIVE_MS < motion::FILAMENT_CHARGE_MS);
 
 /// Whether a consent is waiting: the shell dims the room and shows the card.
-///
-/// The manifests and the appearance are read here as well as the two consent
-/// strings: the card is built from the structured manifest, so the shell must
-/// re-key it when a scope switch replaces that manifest, and its few static
-/// colours (the shadow, the filament's ramp) follow the theme.
 pub fn is_open(state: &AppState) -> bool {
-    let review = state.review_consent.get().is_some();
-    let revision = state.revision_consent.get().is_some();
-    let _ = state.review_manifest.get();
-    let _ = state.revision_manifest.get();
-    let _ = tokens::palette();
-    review || revision
+    state.review_consent.get().is_some() || state.revision_consent.get().is_some()
 }
 
 /// The consent the card shows.
@@ -118,9 +120,10 @@ fn waiting(state: &AppState) -> Waiting {
 
 /// The consent card.
 pub fn card(state: AppState, language: Language) -> impl IntoElement {
-    let waiting = waiting(&state);
-    let is_revision = waiting.is_revision;
+    let is_revision = state.revision_consent.get().is_some();
     // The app's only shadow: sending is the one thing that breaks the room.
+    // It takes its colour adaptively, so the theme stays current without a
+    // rebuild.
     let shadow = shadow();
     // The 4px rise: a motion, so it is skipped under reduced motion.
     let rise = animated_value(tokens::CARD_RISE);
@@ -131,22 +134,16 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             rise.timing(0.0, CARD_RISE_MS, motion::rail_easing());
         }
     });
-    let rows = waiting.consent.as_ref().map(|consent| {
-        rows(
-            consent,
-            language,
-            row_budget(window().height.0 * CARD_MAX_FRACTION),
-        )
-    });
-    let total = rows.as_ref().map_or(0, |rows| rows.total);
-    let hold = Hold::new(state.clone(), is_revision, language, total);
-    // The state's own disclosure: shown verbatim when no manifest was kept.
-    let disclosure = state
-        .review_consent
-        .get()
-        .or_else(|| state.revision_consent.get())
-        .unwrap_or_default();
-    let mut card = view()
+    // One hold for as long as the card lives, shared with the keyboard
+    // bindings below: the body re-arms it whenever the manifest changes.
+    let hold = Hold::new(state.clone(), is_revision, language);
+    // The keyboard: Esc cancels; Enter and Space charge the hold while it has
+    // the focus and cancel anywhere else. The bindings live under the card's
+    // own owner (`run_owner`), so they go when the card does.
+    keyboard(state.clone(), is_revision, hold.clone());
+    let body_state = state.clone();
+    let body_hold = hold.clone();
+    view()
         .test_id("consent-card")
         .w(px(tokens::CONSENT_CARD_MAX_W))
         .flex_col()
@@ -154,6 +151,10 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
         .p(px(tokens::SPACE_5))
         .bg(move || tokens::palette().room)
         .shadow([shadow])
+        .shadow_color(AdaptiveColor::new(
+            Color::rgba(0, 0, 0, 36),
+            Color::rgba(0, 0, 0, 115),
+        ))
         .bind_translate_y(&rise)
         .child(
             text(if is_revision {
@@ -166,32 +167,63 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             .text_size(px(tokens::TYPE_UI))
             .line_height(px(tokens::TYPE_UI_LINE))
             .text_color(move || tokens::palette().ink),
-        );
-    card = match waiting.consent.as_ref() {
-        Some(consent) => card.child(disclosure_body(
-            &state,
-            language,
-            &waiting,
-            consent,
-            rows.as_ref().expect("a manifest has its rows"),
-        )),
-        None => card.child(
-            text(disclosure)
-                .font_family(tokens::FONT_UI)
-                .text_size(px(tokens::TYPE_UI))
-                .line_height(px(tokens::TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest),
-        ),
-    };
-    // The keyboard: Esc always cancels; Enter and Space charge the hold. The
-    // bindings live under the card's own owner (`run_owner`), so they go when
-    // the card does.
-    keyboard(state.clone(), is_revision, hold.clone());
-    card.child(buttons(state, is_revision, language, hold, total))
+        )
+        .child(dynamic(move || {
+            card_body(&body_state, language, &body_hold, is_revision)
+        }))
 }
 
-/// The card's body: destination, scope, the rows that leave, the total and the
-/// boundary statement.
+/// The card's body, as the manifest stands now: the rows, the total, the
+/// controls and the hold's bytes follow the binding that will actually leave.
+/// A `dynamic` region, so a scope switch redraws all of it.
+fn card_body(state: &AppState, language: Language, hold: &Hold, is_revision: bool) -> AnyElement {
+    let waiting = waiting(state);
+    let rows = waiting.consent.as_ref().map(|consent| {
+        rows(
+            consent,
+            language,
+            row_budget(window().height.0 * CARD_MAX_FRACTION),
+        )
+    });
+    let total = rows.as_ref().map_or(0, |rows| rows.total);
+    hold.rearm(waiting.consent.as_ref(), total);
+    match waiting.consent.as_ref() {
+        Some(consent) => view()
+            .flex_col()
+            .gap(px(tokens::SPACE_4))
+            .child(disclosure_body(
+                state,
+                language,
+                &waiting,
+                consent,
+                rows.as_ref().expect("a manifest has its rows"),
+            ))
+            .child(buttons(
+                state.clone(),
+                is_revision,
+                language,
+                hold.clone(),
+                total,
+            ))
+            .into_element(),
+        // No manifest was kept: the state's own disclosure, verbatim.
+        None => text(
+            state
+                .review_consent
+                .get()
+                .or_else(|| state.revision_consent.get())
+                .unwrap_or_default(),
+        )
+        .font_family(tokens::FONT_UI)
+        .text_size(px(tokens::TYPE_UI))
+        .line_height(px(tokens::TYPE_UI_LINE))
+        .text_color(move || tokens::palette().ink_rest)
+        .into_element(),
+    }
+}
+
+/// The card's body: destination, scope, the rows that leave, the content
+/// total, the framed remainder and the boundary statement.
 fn disclosure_body(
     state: &AppState,
     language: Language,
@@ -231,7 +263,8 @@ fn disclosure_body(
                                 .line_height(px(tokens::TYPE_UI_LINE))
                                 .text_color(move || tokens::palette().ink),
                         ),
-                ),
+                )
+                .child(framing_section(rows, loopback)),
         )
         .child(
             view()
@@ -248,7 +281,15 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
         .consent
         .as_ref()
         .map(|consent| consent.disclosure.scope().kind());
-    let with_context = kind == Some(OutboundScopeKind::DocumentWithEffectiveAgentContext);
+    // Whether the binding that waits carries context: a package can carry it
+    // too, and then `Document + context` is the one in force, not a switch.
+    let with_context = waiting.consent.as_ref().is_some_and(|consent| {
+        !consent
+            .disclosure
+            .scope()
+            .effective_context_sources()
+            .is_empty()
+    });
     let selection = kind == Some(OutboundScopeKind::Selection);
     let offered = !waiting.is_revision && state.review_consent_offers_context();
     let to_context = state.clone();
@@ -323,21 +364,19 @@ enum Tone {
     Unlit,
 }
 
-/// The rows that leave, the framing row, then the items that stay.
+/// The content rows that leave, then the items that stay. Every group obeys
+/// the height rule: what does not fit collapses into one summed row, so no
+/// manifest can push the total and the buttons past the window.
 fn rows_section(language: Language, rows: &Rows, loopback: bool) -> impl IntoElement {
-    let tone = if loopback {
-        Tone::Loopback
-    } else {
-        Tone::Leaving
-    };
+    let tone = tone_of(loopback);
     let mut section = view()
         .test_id("consent-rows")
         .flex_col()
         .w_full()
         .gap(px(tokens::SPACE_1));
-    if !rows.leaving.is_empty() || rows.framing.is_some() {
+    if !rows.leaving.is_empty() {
         section = section.child(prims::rest(S::LeavesThisDevice.text(language)));
-        for row in rows.leaving.iter().chain(rows.framing.iter()) {
+        for row in &rows.leaving {
             section = section.child(row_view(row, tone));
         }
     }
@@ -364,9 +403,35 @@ fn rows_section(language: Language, rows: &Rows, loopback: bool) -> impl IntoEle
     section
 }
 
+/// The framed remainder, below the sum the card prints and labelled for what
+/// it is, so the two figures are not read as one sum.
+fn framing_section(rows: &Rows, loopback: bool) -> AnyElement {
+    let Some(row) = rows.framing.as_ref() else {
+        return view().into_element();
+    };
+    view()
+        .test_id("consent-framing")
+        .flex_col()
+        .w_full()
+        .gap(px(tokens::SPACE_1))
+        .child(row_view(row, tone_of(loopback)))
+        .into_element()
+}
+
+/// The colour a row that leaves is drawn in: the loopback endpoint keeps it
+/// plain grey.
+fn tone_of(loopback: bool) -> Tone {
+    if loopback {
+        Tone::Loopback
+    } else {
+        Tone::Leaving
+    }
+}
+
 /// One manifest row: path, reason, bytes right-aligned, and the under-line —
 /// white-hot as outbound data, plain grey for a loopback endpoint, ambient for
-/// what stays.
+/// what stays. Only lit rows sit on the emitter plate: what stays behind is
+/// unlit and stays on the room.
 fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
     let label = SharedString::from(row.label.clone());
     let reason = SharedString::from(row.reason.clone());
@@ -386,44 +451,49 @@ fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
         OutboundOrigin::PackageFile => "consent-row-file",
         _ => "consent-row",
     };
-    view()
-        .test_id(test_id)
-        .flex_col()
-        .gap(px(tokens::SPACE_1))
-        .child(prims::emitter_plate(
-            view()
-                .flex_row()
-                .items_center()
-                .gap(px(tokens::SPACE_2))
-                .child(
-                    text(label)
-                        .font_family(tokens::FONT_UI)
-                        .text_size(px(tokens::TYPE_UI))
-                        .line_height(px(tokens::TYPE_UI_LINE))
-                        .text_color(move || gloss().0),
-                )
-                .child(
-                    text(reason)
-                        .font_family(tokens::FONT_UI)
-                        .text_size(px(tokens::TYPE_UI))
-                        .line_height(px(tokens::TYPE_UI_LINE))
-                        .text_color(move || gloss().1),
-                )
-                .child(view().flex_1())
-                .child(
-                    text(move || {
-                        if has_bytes {
-                            SharedString::from(bytes_label(bytes))
-                        } else {
-                            SharedString::from("")
-                        }
-                    })
+    let content = || {
+        view()
+            .flex_row()
+            .items_center()
+            .gap(px(tokens::SPACE_2))
+            .child(
+                text(label.clone())
                     .font_family(tokens::FONT_UI)
                     .text_size(px(tokens::TYPE_UI))
                     .line_height(px(tokens::TYPE_UI_LINE))
                     .text_color(move || gloss().0),
-                ),
-        ))
+            )
+            .child(
+                text(reason.clone())
+                    .font_family(tokens::FONT_UI)
+                    .text_size(px(tokens::TYPE_UI))
+                    .line_height(px(tokens::TYPE_UI_LINE))
+                    .text_color(move || gloss().1),
+            )
+            .child(view().flex_1())
+            .child(
+                text(move || {
+                    if has_bytes {
+                        SharedString::from(bytes_label(bytes))
+                    } else {
+                        SharedString::from("")
+                    }
+                })
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .text_color(move || gloss().0),
+            )
+    };
+    let content = match tone {
+        Tone::Leaving | Tone::Loopback => prims::emitter_plate(content()).into_element(),
+        Tone::Unlit => content().into_element(),
+    };
+    view()
+        .test_id(test_id)
+        .flex_col()
+        .gap(px(tokens::SPACE_1))
+        .child(content)
         .child(
             view()
                 .h(px(tokens::HAIRLINE))
@@ -453,20 +523,54 @@ fn buttons(
 fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl IntoElement {
     let reference = element_ref();
     // Cancel takes the keyboard focus as soon as the card is up, so Enter and
-    // Escape both land somewhere that authorizes nothing.
+    // Escape both land somewhere that authorizes nothing. The ref goes on the
+    // button itself: nsh focuses an input or a view that takes presses, and
+    // `prims::primary_action`'s wrapper takes none.
     effect(move || reference.focus());
     view()
         .test_id("consent-cancel")
         .w(px(tokens::CONSENT_BUTTON_W))
         .h(px(tokens::CONSENT_BUTTON_H))
+        .child(cancel_action(
+            i18n::t(language, Key::Cancel),
+            move || cancel(&state, is_revision),
+            reference,
+        ))
+}
+
+/// `prims::primary_action`'s chrome, as the Cancel control itself: the same
+/// hairline, ink and hover step as every other local action, filling the
+/// 164x36 box the send control fills, with the element ref on this button.
+fn cancel_action(
+    label: &'static str,
+    on_press: impl Fn() + 'static,
+    reference: ElementRef,
+) -> AnyElement {
+    button()
+        .w_full()
+        .h_full()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .bg(Color::TRANSPARENT)
+        .cursor_pointer()
+        .border(px(tokens::HAIRLINE))
+        .border_color(move || tokens::palette().ink_faint)
+        .transition_colors()
+        .duration(motion::HOVER_MS)
+        .hover(|s| s.border_color(tokens::palette().ink))
+        .focus_visible(|s| s.border_color(tokens::palette().ink))
+        .accessibility_label(Some(SharedString::from(label)))
+        .on_press(on_press)
+        .element_ref(&reference)
         .child(
-            prims::primary_action(
-                "consent-cancel-button",
-                i18n::t(language, Key::Cancel),
-                move || cancel(&state, is_revision),
-            )
-            .element_ref(&reference),
+            text(label)
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink),
         )
+        .into_element()
 }
 
 /// Hold to send: a full [`motion::FILAMENT_CHARGE_MS`] of charge authorizes;
@@ -474,6 +578,7 @@ fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl
 fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
     let heat = hold.heat;
     let blur = hold.clone();
+    let focused = hold.clone();
     let down = hold.clone();
     let up = hold.clone();
     let tap = hold.clone();
@@ -491,9 +596,15 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
         .focus_visible(|s| s.border_color(tokens::palette().ink))
         .cursor_pointer()
         .focusable(true)
-        .label(SharedString::from(S::HoldToSend.text(language)))
+        .label(SharedString::from(hold_accessibility(language, total)))
+        // Where the keyboard is decides what `Space` and `Enter` do: on this
+        // control they charge it, anywhere else they cancel.
+        .on_focus(move || focused.focused.set(true))
         // The window losing the keyboard ends any press in it.
-        .on_blur(move || blur.release())
+        .on_blur(move || {
+            blur.focused.set(false);
+            blur.release();
+        })
         // How long the platform calls a press on this control a hold: the
         // spec's ~1.2s, with the filament's [`motion::FILAMENT_CHARGE_MS`]
         // charge inside it.
@@ -505,8 +616,11 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
         .on_press(move |_: &PressEvent| tap.release())
         .child(
             text(move || match label_hold.label.get() {
-                HoldLabel::Idle => SharedString::from(hold_label(language, total)),
+                HoldLabel::Idle => SharedString::from(S::HoldToSend.text(language)),
                 HoldLabel::Holding => SharedString::from(S::KeepHolding.text(language)),
+                HoldLabel::StepOne => SharedString::from(S::StepOne.text(language)),
+                HoldLabel::StepTwo => SharedString::from(S::StepTwo.text(language)),
+                HoldLabel::StepThree => SharedString::from(S::Sending.text(language)),
                 HoldLabel::Released => SharedString::from(S::NothingWasSent.text(language)),
                 HoldLabel::Sent => SharedString::from(S::Sent.text(language)),
             })
@@ -542,7 +656,10 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
 }
 
 /// The keyboard routes: Esc always cancels; a held `Enter` or `Space` charges
-/// the hold (a keystroke that edits text never reaches these bindings).
+/// the hold while the hold control itself has the focus, and activates the
+/// card's default (Cancel) anywhere else. The two keys are consumed wherever
+/// the focus is, so a stray press can never edit the document behind the card
+/// or charge a control the user never reached.
 fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
     let escape_state = state.clone();
     let enter_state = state.clone();
@@ -563,13 +680,18 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
                 key,
                 KeyOptions {
                     repeat: true,
+                    when: When::Always,
                     ..KeyOptions::default()
                 },
                 move |_| {
                     if !is_open(&state) {
                         return;
                     }
-                    hold.key_press();
+                    if hold.focused.get() {
+                        hold.key_press();
+                    } else {
+                        cancel(&state, is_revision);
+                    }
                 },
             );
         }
@@ -609,69 +731,35 @@ struct Rows {
     framing: Option<Row>,
     /// Package entries that leave as path, size and hash only: listed with
     /// their file size, but not part of the total — what they contribute at the
-    /// boundary sits in the framing row.
+    /// boundary sits in the framing row. A collapse row closes the group.
     metadata: Vec<Row>,
-    /// The items that stay.
+    /// The items that stay. A collapse row closes the group.
     stays: Vec<Row>,
-    /// The framed bytes mt-core produced, else the sum of the listed content.
+    /// The content bytes the rows above the total line sum to: the framed
+    /// remainder is listed below it, never folded in.
     total: u64,
 }
 
-/// The rows of one consent, in the card's words. `budget` is how many content
-/// rows the height rule leaves; the rest collapse into one summed row.
-fn rows(consent: &OutboundConsent, language: Language, budget: usize) -> Rows {
-    let mut leaving = Vec::new();
-    let mut metadata = Vec::new();
+/// The rows of one consent, in the card's words. `cap` is how many rows the
+/// height rule leaves the whole table, captions included: a group that does
+/// not fit collapses its tail into one summed row, and every group reserves
+/// what the groups below it need, so the total and the buttons stay pinned.
+fn rows(consent: &OutboundConsent, language: Language, cap: usize) -> Rows {
     let mut content_bytes = 0_u64;
-    let (mut shown, mut hidden, mut hidden_bytes) = (0_usize, 0_usize, 0_u64);
-    // One more content row than the budget is cheaper than a collapse row for
-    // a single file; beyond that the collapse row takes one of the budget's
-    // rows.
-    let content_rows = consent
+    for item in consent.items.iter().filter(|item| item.content_leaves) {
+        content_bytes = content_bytes.saturating_add(item.bytes);
+    }
+    let content_items: Vec<&OutboundItem> = consent
         .items
         .iter()
         .filter(|item| item.content_leaves)
-        .count();
-    let budget = if content_rows > budget + 1 {
-        budget.saturating_sub(1)
-    } else {
-        budget
-    };
-    for item in &consent.items {
-        if item.content_leaves {
-            content_bytes = content_bytes.saturating_add(item.bytes);
-        }
-        let row = Row {
-            origin: item.origin,
-            label: item
-                .path
-                .clone()
-                .unwrap_or_else(|| name(language, item.origin).to_owned()),
-            reason: reason_of(language, item),
-            bytes: item.bytes,
-            has_bytes: item.bytes > 0,
-        };
-        if item.content_leaves {
-            if shown < budget {
-                leaving.push(row);
-                shown += 1;
-            } else {
-                hidden += 1;
-                hidden_bytes = hidden_bytes.saturating_add(item.bytes);
-            }
-        } else {
-            metadata.push(row);
-        }
-    }
-    if hidden > 0 {
-        leaving.push(Row {
-            origin: OutboundOrigin::PackageFile,
-            label: more_files(language, hidden),
-            reason: String::new(),
-            bytes: hidden_bytes,
-            has_bytes: true,
-        });
-    }
+        .collect();
+    let metadata_items: Vec<&OutboundItem> = consent
+        .items
+        .iter()
+        .filter(|item| !item.content_leaves)
+        .collect();
+    let stays_items: Vec<&OutboundItem> = consent.stays.iter().collect();
     let framing = consent
         .framed_bytes
         .filter(|framed| *framed > content_bytes)
@@ -682,27 +770,93 @@ fn rows(consent: &OutboundConsent, language: Language, budget: usize) -> Rows {
             bytes: framed - content_bytes,
             has_bytes: true,
         });
-    let total = consent.framed_bytes.unwrap_or(content_bytes);
-    let stays = consent
-        .stays
-        .iter()
-        .map(|item| Row {
-            origin: item.origin,
-            label: item
-                .path
-                .clone()
-                .unwrap_or_else(|| name(language, item.origin).to_owned()),
-            reason: reason_of(language, item),
-            bytes: item.bytes,
-            has_bytes: item.bytes > 0,
-        })
-        .collect();
+    let mut left = cap.max(2);
+    let mut leaving = Vec::new();
+    let caption = usize::from(!content_items.is_empty() || framing.is_some());
+    // What the groups below need whatever this one does: a caption and one
+    // row each.
+    let reserve =
+        2 * usize::from(!metadata_items.is_empty()) + 2 * usize::from(!stays_items.is_empty());
+    if !content_items.is_empty() {
+        let share = left
+            .saturating_sub(caption)
+            .saturating_sub(reserve)
+            .saturating_sub(usize::from(framing.is_some()))
+            .max(1);
+        leaving = fit(&content_items, share, language, OutboundOrigin::PackageFile);
+    }
+    left = left.saturating_sub(caption + leaving.len() + usize::from(framing.is_some()));
+    let mut metadata = Vec::new();
+    if !metadata_items.is_empty() {
+        let share = left
+            .saturating_sub(1)
+            .saturating_sub(2 * usize::from(!stays_items.is_empty()))
+            .max(1);
+        metadata = fit(
+            &metadata_items,
+            share,
+            language,
+            OutboundOrigin::PackageFile,
+        );
+        left = left.saturating_sub(1 + metadata.len());
+    }
+    let mut stays = Vec::new();
+    if !stays_items.is_empty() {
+        let share = left.saturating_sub(1).max(1);
+        stays = fit(
+            &stays_items,
+            share,
+            language,
+            OutboundOrigin::ExcludedSource,
+        );
+    }
     Rows {
         leaving,
         framing,
         metadata,
         stays,
-        total,
+        total: content_bytes,
+    }
+}
+
+/// One group under the height rule: at most `share` rows, with the ones that
+/// do not fit summed into one collapse row.
+fn fit(
+    items: &[&OutboundItem],
+    share: usize,
+    language: Language,
+    collapse: OutboundOrigin,
+) -> Vec<Row> {
+    let share = share.max(1);
+    if items.len() <= share {
+        return items.iter().map(|item| row_of(item, language)).collect();
+    }
+    let shown = share - 1;
+    let mut rows: Vec<Row> = items[..shown]
+        .iter()
+        .map(|item| row_of(item, language))
+        .collect();
+    rows.push(Row {
+        origin: collapse,
+        label: more_files(language, items.len() - shown),
+        reason: String::new(),
+        bytes: items[shown..].iter().map(|item| item.bytes).sum(),
+        has_bytes: true,
+    });
+    rows
+}
+
+/// One item as a row.
+fn row_of(item: &OutboundItem, language: Language) -> Row {
+    Row {
+        origin: item.origin,
+        label: item
+            .path
+            .clone()
+            .unwrap_or_else(|| name(language, item.origin).to_owned()),
+        reason: reason_of(language, item),
+        bytes: item.bytes,
+        has_bytes: item.bytes > 0,
     }
 }
 
@@ -750,22 +904,36 @@ fn reason_of(language: Language, item: &OutboundItem) -> String {
 /// The destination line: where, how, and in what wire format.
 fn destination(language: Language, endpoint: &EndpointIdentity) -> String {
     let path = endpoint.api_base_path().trim_end_matches('/');
+    // Whether the endpoint is local or remote, and what the transport does
+    // with proxies: both are disclosures of their own, never implied.
+    let location = match endpoint.location() {
+        EndpointLocation::Local => S::LocalModel.text(language),
+        EndpointLocation::Remote => S::Remote.text(language),
+    };
+    let proxy = match endpoint.transport().proxy() {
+        ProxyDisclosure::MayUseConfiguredProxy => S::ProxySystem.text(language),
+        ProxyDisclosure::Disabled => S::ProxyDisabled.text(language),
+    };
     let address = if endpoint.transport().encryption() == TransportEncryption::Encrypted {
         format!(
-            "{}:{} · HTTPS · {} {}",
+            "{} · {}:{} · HTTPS · {} {} · {}",
+            location,
             endpoint.host(),
             endpoint.effective_port(),
             endpoint.provider().label(),
-            path
+            path,
+            proxy
         )
     } else {
         format!(
-            "{}:{} · {} · {} {}",
+            "{} · {}:{} · {} · {} {} · {}",
+            location,
             endpoint.host(),
             endpoint.effective_port(),
             S::Unencrypted.text(language),
             endpoint.provider().label(),
-            path
+            path,
+            proxy
         )
     };
     format!("{} {}", S::To.text(language), address)
@@ -784,9 +952,24 @@ fn bytes_label(bytes: u64) -> String {
     format!("{grouped} B")
 }
 
-/// The hold control's label: how long to hold, and how much will leave.
-fn hold_label(language: Language, bytes: u64) -> String {
-    format!("{} {}", S::HoldToSend.text(language), bytes_label(bytes))
+/// What the hold control says it sends: the visible label stays the plain
+/// invitation, and the byte figure is the content the card lists, named as
+/// such (the framed request is larger, and the rows say so).
+fn hold_accessibility(language: Language, bytes: u64) -> String {
+    format!(
+        "{} {}",
+        S::HoldToSend.text(language),
+        sent_bytes(language, bytes)
+    )
+}
+
+/// The content figure with its unit: what the card's sum counts, named as
+/// content in the status a completed hold leaves.
+fn sent_bytes(language: Language, bytes: u64) -> String {
+    match language {
+        Language::English => format!("{} content bytes", bytes_label(bytes)),
+        Language::Chinese => format!("{} 内容字节", bytes_label(bytes)),
+    }
 }
 
 /// The collapse row: what did not fit, and its bytes.
@@ -798,18 +981,15 @@ fn more_files(language: Language, count: usize) -> String {
 }
 
 /// The card's shadow: the app's only one, 0 30px 80px at /.45 (dark) or /.14
-/// (light).
+/// (light). Its colour is adaptive (see the card), so it follows the theme
+/// without a rebuild.
 fn shadow() -> BoxShadow {
     BoxShadow {
         offset_x: Points(0.0),
         offset_y: Points(30.0),
         blur: Points(80.0),
         spread: Points(0.0),
-        color: if tokens::palette().is_dark {
-            Color::rgba(0, 0, 0, 115)
-        } else {
-            Color::rgba(0, 0, 0, 36)
-        },
+        color: Color::TRANSPARENT,
         inset: false,
     }
 }
@@ -821,6 +1001,10 @@ fn shadow() -> BoxShadow {
 enum HoldLabel {
     Idle,
     Holding,
+    /// Reduced motion: the filament's three discrete steps.
+    StepOne,
+    StepTwo,
+    StepThree,
     Released,
     Sent,
 }
@@ -841,6 +1025,14 @@ fn remaining_ms(charge: f32) -> f32 {
     (1.0 - charge).max(0.0) * motion::FILAMENT_CHARGE_MS
 }
 
+/// How many of reduced motion's three steps a charge has reached: 0 before the
+/// first third, 1 and 2 in the middle, and never 3 (the charge completing is
+/// the third step, drawn as `Sending`).
+fn reduced_step(charge: f32) -> u8 {
+    let reached = (charge * 3.0).floor();
+    reached.clamp(0.0, 2.0) as u8
+}
+
 /// One hold: the filament's charge, the timers that decide when the charge is
 /// full or a key was let go, and the single send it authorizes.
 #[derive(Clone)]
@@ -848,8 +1040,15 @@ struct Hold {
     state: AppState,
     is_revision: bool,
     language: Language,
-    /// What leaves, as the `Sent · N bytes` line reports it.
-    total: u64,
+    /// The card's content total, as the status a completed hold leaves
+    /// reports it (`Sent · N content bytes`).
+    total: Rc<Cell<u64>>,
+    /// The manifest the charge belongs to: a scope switch replaces it, and
+    /// [`Hold::rearm`] starts the hold over for the new bytes.
+    manifest: Rc<RefCell<Option<OutboundConsent>>>,
+    /// Whether the hold control has the keyboard focus: only there do `Enter`
+    /// and `Space` charge it.
+    focused: Rc<Cell<bool>>,
     /// What the control's label reads.
     label: Signal<HoldLabel>,
     /// The charge, 0..1, as the filament draws it.
@@ -862,6 +1061,8 @@ struct Hold {
     completion: Rc<RefCell<Option<Spawned<()>>>>,
     /// The watchdog that decides a held key was let go.
     key_alive: Rc<RefCell<Option<Spawned<()>>>>,
+    /// The reduced-motion steps of a charge in progress.
+    steps: Rc<RefCell<Vec<Spawned<()>>>>,
     /// The timer that ends the 'Nothing was sent.' notice.
     notice: Rc<RefCell<Option<Spawned<()>>>>,
     /// The send fired: this consent is spent.
@@ -869,21 +1070,50 @@ struct Hold {
 }
 
 impl Hold {
-    fn new(state: AppState, is_revision: bool, language: Language, total: u64) -> Self {
+    fn new(state: AppState, is_revision: bool, language: Language) -> Self {
         Self {
             state,
             is_revision,
             language,
-            total,
+            total: Rc::new(Cell::new(0)),
+            manifest: Rc::new(RefCell::new(None)),
+            focused: Rc::new(Cell::new(false)),
             label: signal(HoldLabel::Idle),
             heat: animated_value(0.0),
             charging: Rc::new(Cell::new(None)),
             released: Rc::new(Cell::new(None)),
             completion: Rc::new(RefCell::new(None)),
             key_alive: Rc::new(RefCell::new(None)),
+            steps: Rc::new(RefCell::new(Vec::new())),
             notice: Rc::new(RefCell::new(None)),
             spent: Rc::new(Cell::new(false)),
         }
+    }
+
+    /// Follow the manifest under the card: the label's bytes come from it, and
+    /// a *different* manifest (a scope switch) re-arms the hold, because the
+    /// charge it may have started belongs to the binding that just went away.
+    fn rearm(&self, manifest: Option<&OutboundConsent>, total: u64) {
+        let changed = {
+            let stored = self.manifest.borrow();
+            let stored: &Option<OutboundConsent> = &stored;
+            stored.as_ref() != manifest
+        };
+        self.total.set(total);
+        if !changed {
+            return;
+        }
+        *self.manifest.borrow_mut() = manifest.cloned();
+        self.cancel_completion();
+        self.cancel_key_alive();
+        self.cancel_steps();
+        self.end_notice();
+        self.charging.set(None);
+        self.released.set(None);
+        self.heat.stop();
+        self.heat.set(0.0);
+        self.spent.set(false);
+        self.label.set(HoldLabel::Idle);
     }
 
     /// The charge now: while charging, what the press has added; while
@@ -909,14 +1139,28 @@ impl Hold {
         let value = self.charge_now();
         self.charging.set(Some((value, Instant::now())));
         self.released.set(None);
-        if self.label.get() != HoldLabel::Holding {
-            self.label.set(HoldLabel::Holding);
-        }
         self.heat.stop();
         let remaining = remaining_ms(value);
         if remaining <= 0.0 {
             self.complete();
             return;
+        }
+        if motion::reduced_motion() {
+            // Reduced motion: the same charge, drawn in three discrete steps.
+            self.press_reduced(value);
+            let hold = self.clone();
+            let slot = self.completion.clone();
+            *slot.borrow_mut() = Some(set_timeout(
+                Duration::from_millis(remaining as u64),
+                move || {
+                    hold.completion.borrow_mut().take();
+                    hold.complete();
+                },
+            ));
+            return;
+        }
+        if self.label.get() != HoldLabel::Holding {
+            self.label.set(HoldLabel::Holding);
         }
         self.heat
             .timing_with(1.0, Timing::new(remaining, Easing::Linear));
@@ -931,6 +1175,44 @@ impl Hold {
         ));
     }
 
+    /// The reduced-motion charge: the filament jumps to a third and then two
+    /// thirds (labelled `1/3`, `2/3`), and [`Hold::complete`] reads `Sending`.
+    /// The charge itself is the same, so the hold length, the watchdogs and
+    /// every authorization are unchanged.
+    fn press_reduced(&self, value: f32) {
+        self.cancel_steps();
+        let third = motion::FILAMENT_CHARGE_MS / 3.0;
+        let elapsed = value * motion::FILAMENT_CHARGE_MS;
+        for step in [1_u8, 2] {
+            if step <= reduced_step(value) {
+                self.step_to(step);
+                continue;
+            }
+            let wait = f32::from(step) * third - elapsed;
+            let hold = self.clone();
+            let slot = self.steps.clone();
+            slot.borrow_mut()
+                .push(set_timeout(Duration::from_millis(wait as u64), move || {
+                    hold.step_to(step)
+                }));
+        }
+    }
+
+    /// One reduced-motion step: the filament jumps to its third and the label
+    /// says where the hold is.
+    fn step_to(&self, step: u8) {
+        if self.spent.get() || self.charging.get().is_none() {
+            return;
+        }
+        self.heat.stop();
+        self.heat.set(f32::from(step) / 3.0);
+        self.label.set(if step == 1 {
+            HoldLabel::StepOne
+        } else {
+            HoldLabel::StepTwo
+        });
+    }
+
     /// The press ended before the charge was full: cool back and say so.
     fn release(&self) {
         if self.spent.get() {
@@ -943,6 +1225,7 @@ impl Hold {
         self.released.set(Some((value, Instant::now())));
         self.cancel_completion();
         self.cancel_key_alive();
+        self.cancel_steps();
         self.cool(value);
         self.label.set(HoldLabel::Released);
         let hold = self.clone();
@@ -986,14 +1269,19 @@ impl Hold {
         self.released.set(None);
         self.cancel_completion();
         self.cancel_key_alive();
+        self.cancel_steps();
         self.end_notice();
         self.heat.stop();
         self.heat.set(1.0);
-        self.label.set(HoldLabel::Sent);
+        self.label.set(if motion::reduced_motion() {
+            HoldLabel::StepThree
+        } else {
+            HoldLabel::Sent
+        });
         self.state.status.set(SharedString::from(format!(
             "{} · {}",
             S::Sent.text(self.language),
-            bytes_label(self.total)
+            sent_bytes(self.language, self.total.get())
         )));
         if self.is_revision {
             self.state.send_revision();
@@ -1003,9 +1291,15 @@ impl Hold {
     }
 
     /// The drawn cooling of a released filament: the same exponential, sampled
-    /// into one keyframe track from where the release left it.
+    /// into one keyframe track from where the release left it, and one 100ms
+    /// crossfade under reduced motion.
     fn cool(&self, from: f32) {
         self.heat.stop();
+        if motion::reduced_motion() {
+            self.heat
+                .timing(0.0, motion::REDUCED_CROSSFADE_MS, Easing::EaseInOut);
+            return;
+        }
         let frames: Vec<Keyframe> = (0..16)
             .map(|index| {
                 let u = index as f32 / 15.0;
@@ -1029,6 +1323,12 @@ impl Hold {
         }
     }
 
+    fn cancel_steps(&self) {
+        for task in self.steps.borrow_mut().drain(..) {
+            task.cancel();
+        }
+    }
+
     fn end_notice(&self) {
         if let Some(task) = self.notice.borrow_mut().take() {
             task.cancel();
@@ -1043,7 +1343,14 @@ trait FilamentGlow {
 
 impl FilamentGlow for AnimatedValue {
     fn filament_glow(&self) -> AnimatedNode {
-        let ramp = tokens::palette().filament;
+        // The ramp resolves per appearance, so the filament follows the theme
+        // without the card being rebuilt.
+        let ramp: Vec<AdaptiveColor> = tokens::LIGHT
+            .filament
+            .iter()
+            .zip(tokens::DARK.filament.iter())
+            .map(|(light, dark)| AdaptiveColor::new(*light, *dark))
+            .collect();
         self.interpolate_colors(&[0.0, 0.5, 1.0], &ramp)
     }
 }
@@ -1058,6 +1365,10 @@ enum S {
     HeadlineRevision,
     To,
     Unencrypted,
+    LocalModel,
+    Remote,
+    ProxySystem,
+    ProxyDisabled,
     Scope,
     ScopeSelection,
     ScopeDocument,
@@ -1086,6 +1397,9 @@ enum S {
     AnswersReason,
     NothingWasSent,
     KeepHolding,
+    StepOne,
+    StepTwo,
+    Sending,
     Sent,
     HoldToSend,
 }
@@ -1098,6 +1412,10 @@ impl S {
                 S::HeadlineRevision => "Send the revision?",
                 S::To => "To",
                 S::Unencrypted => "HTTP (not encrypted)",
+                S::LocalModel => "Local model",
+                S::Remote => "Remote",
+                S::ProxySystem => "may use the configured system proxy",
+                S::ProxyDisabled => "proxy disabled",
                 S::Scope => "Scope",
                 S::ScopeSelection => "Selection",
                 S::ScopeDocument => "Document",
@@ -1109,7 +1427,7 @@ impl S {
                 S::FramingReason => "the framed request",
                 S::BoundaryFraming => "Protocol framing crosses this boundary.",
                 S::BoundaryContent => "The disclosed source content also crosses it.",
-                S::Total => "Total",
+                S::Total => "Content total",
                 S::DocumentName => "the document",
                 S::NamedSourceName => "named source",
                 S::PackageFileName => "package file",
@@ -1126,6 +1444,9 @@ impl S {
                 S::AnswersReason => "your answers",
                 S::NothingWasSent => "Nothing was sent.",
                 S::KeepHolding => "Keep holding…",
+                S::StepOne => "1/3",
+                S::StepTwo => "2/3",
+                S::Sending => "Sending",
                 S::Sent => "Sent",
                 S::HoldToSend => "Hold to send",
             },
@@ -1134,6 +1455,10 @@ impl S {
                 S::HeadlineRevision => "发送修订？",
                 S::To => "发送至",
                 S::Unencrypted => "HTTP（未加密）",
+                S::LocalModel => "本地模型",
+                S::Remote => "远程",
+                S::ProxySystem => "可能使用已配置的系统代理",
+                S::ProxyDisabled => "已禁用代理",
                 S::Scope => "范围",
                 S::ScopeSelection => "选区",
                 S::ScopeDocument => "文档",
@@ -1145,7 +1470,7 @@ impl S {
                 S::FramingReason => "封装后的请求",
                 S::BoundaryFraming => "协议封装会跨越此边界。",
                 S::BoundaryContent => "上述源内容也会跨越此边界发送。",
-                S::Total => "合计",
+                S::Total => "内容合计",
                 S::DocumentName => "文档",
                 S::NamedSourceName => "指定来源",
                 S::PackageFileName => "包内文件",
@@ -1162,6 +1487,9 @@ impl S {
                 S::AnswersReason => "你的回答",
                 S::NothingWasSent => "未发送任何内容。",
                 S::KeepHolding => "继续按住…",
+                S::StepOne => "1/3",
+                S::StepTwo => "2/3",
+                S::Sending => "发送中",
                 S::Sent => "已发送",
                 S::HoldToSend => "按住发送",
             },
@@ -1210,12 +1538,17 @@ mod tests {
         let rows = rows(&consent, Language::English, 20);
         let sum: u64 = rows.leaving.iter().map(|row| row.bytes).sum::<u64>()
             + rows.framing.as_ref().map_or(0, |row| row.bytes);
-        assert_eq!(rows.total, 1_000);
-        assert_eq!(sum, rows.total, "the printed total is the sum of the rows");
+        assert_eq!(rows.total, 800, "the total is the content, never the frame");
+        assert_eq!(
+            rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
+            rows.total,
+            "the printed total is the sum of the rows above it"
+        );
+        assert_eq!(sum, 1_000, "the frame is one figure beyond the total");
         assert_eq!(
             rows.framing.as_ref().map(|row| row.bytes),
             Some(200),
-            "the framing row is the framed remainder"
+            "the framing row is the framed remainder beyond the content"
         );
     }
 
@@ -1241,8 +1574,13 @@ mod tests {
         let rows = rows(&consent, Language::English, 20);
         let sum: u64 = rows.leaving.iter().map(|row| row.bytes).sum::<u64>()
             + rows.framing.as_ref().map_or(0, |row| row.bytes);
-        assert_eq!(rows.total, 4_700);
-        assert_eq!(sum, rows.total);
+        assert_eq!(rows.total, 3_528, "the package's content, not the frame");
+        assert_eq!(
+            rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
+            rows.total,
+            "the total is the rows above it"
+        );
+        assert_eq!(sum, 4_700, "the frame is listed beyond the total");
         assert_eq!(rows.metadata.len(), 1, "the binary is its own group");
         assert_eq!(rows.metadata[0].bytes, 12_004, "its disclosed size stays");
         assert!(
@@ -1292,10 +1630,71 @@ mod tests {
             stays: Vec::new(),
         };
         let rows = rows(&consent, Language::English, 4);
-        assert_eq!(rows.leaving.len(), 4, "three files and the collapse row");
-        assert_eq!(rows.leaving[3].bytes, 500, "the hidden five, summed");
+        // Four rows of budget, one of them the caption: two files and the
+        // collapse row for the other six.
+        assert_eq!(rows.leaving.len(), 3, "two files and the collapse row");
+        assert_eq!(rows.leaving[2].bytes, 600, "the hidden six, summed");
         let sum: u64 = rows.leaving.iter().map(|row| row.bytes).sum();
         assert_eq!(sum, rows.total);
+    }
+
+    #[test]
+    fn every_group_obeys_the_height_rule() {
+        // A package with more rows than the window can take in every group:
+        // the total and the buttons stay above the fold because each group
+        // collapses its tail.
+        let mut items: Vec<OutboundItem> = (0..12)
+            .map(|index| {
+                item(
+                    OutboundOrigin::PackageFile,
+                    &format!("file{index}.md"),
+                    100,
+                    true,
+                )
+            })
+            .collect();
+        items.extend((0..12).map(|index| {
+            item(
+                OutboundOrigin::PackageFile,
+                &format!("asset{index}.png"),
+                4_000,
+                false,
+            )
+        }));
+        let consent = OutboundConsent {
+            disclosure: disclosure(OutboundScope::document(1)),
+            framed_bytes: None,
+            items,
+            stays: (0..12)
+                .map(|index| {
+                    item(
+                        OutboundOrigin::ExcludedSource,
+                        &format!("stay{index}.md"),
+                        50,
+                        false,
+                    )
+                })
+                .collect(),
+        };
+        let rows = rows(&consent, Language::English, 8);
+        // Three captions, the three groups' rows and nothing more: 8 + the
+        // framing row this consent has none of.
+        let drawn = 3 + rows.leaving.len() + rows.metadata.len() + rows.stays.len();
+        assert!(drawn <= 8, "{drawn} rows drawn for a budget of 8");
+        for group in [&rows.leaving, &rows.metadata, &rows.stays] {
+            assert!(!group.is_empty(), "each group keeps a row of its own");
+            assert!(
+                group
+                    .last()
+                    .is_some_and(|row| row.label.contains("more files")),
+                "each group's tail collapses"
+            );
+        }
+        assert_eq!(
+            rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
+            rows.total,
+            "the collapse row keeps the total whole"
+        );
     }
 
     #[test]
@@ -1341,10 +1740,24 @@ mod tests {
         let line = destination(Language::English, &endpoint);
         assert!(
             line.starts_with(
-                "To 127.0.0.1:8080 · HTTP (not encrypted) · OpenAI Responses /custom/v1"
+                "To Local model · 127.0.0.1:8080 · HTTP (not encrypted) · \
+                 OpenAI Responses /custom/v1 · proxy disabled"
             ),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_remote_endpoint_discloses_the_location_and_the_proxy() {
+        let endpoint =
+            EndpointIdentity::parse(Provider::OpenAiResponses, None).expect("the default endpoint");
+        let line = destination(Language::English, &endpoint);
+        assert!(line.contains("Remote"), "{line}");
+        assert!(
+            line.contains("may use the configured system proxy"),
+            "{line}"
+        );
+        assert!(line.contains("HTTPS"), "{line}");
     }
 
     /// A manifest of the shape the state builds: one document and one named
@@ -1364,8 +1777,27 @@ mod tests {
         }
     }
 
+    /// A manifest of the shape a switch *to* the plain document leaves: the
+    /// context gone, the frame smaller.
+    fn sample_consent_without_context() -> OutboundConsent {
+        OutboundConsent {
+            disclosure: disclosure(OutboundScope::document(600)),
+            framed_bytes: None,
+            items: vec![item(OutboundOrigin::Document, "plan.md", 600, true)],
+            stays: vec![item(
+                OutboundOrigin::ExcludedSource,
+                "~/AGENTS.md",
+                200,
+                false,
+            )],
+        }
+    }
+
     /// The card over a state that already has a consent waiting: the shell's
-    /// `when(is_open)` around [`card`].
+    /// `when(is_open)` around [`card`]. One control stands in for the scope
+    /// switch, replacing the manifest the card is bound to (the card's own
+    /// switch sits on a `prims::quiet_action` wrapper, whose test id the
+    /// harness cannot press; the state call behind it is the same one).
     #[component]
     fn Harness() -> impl IntoElement {
         let state = AppState::new();
@@ -1374,10 +1806,40 @@ mod tests {
             .set(Some(SharedString::from("disclosure text")));
         state.review_manifest.set(Some(sample_consent()));
         let card_state = state.clone();
-        view().w(px(1_200.0)).h(px(800.0)).child(when(
-            move || is_open(&state),
-            move || card(card_state.clone(), Language::English),
-        ))
+        let switch_state = state.clone();
+        let reopen_state = state.clone();
+        view()
+            .w(px(1_200.0))
+            .h(px(800.0))
+            .child(
+                // A plain pressable view: its test id is the one the harness
+                // presses, and it stays out of Tab's stops.
+                view()
+                    .test_id("harness-swap")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        switch_state
+                            .review_manifest
+                            .set(Some(sample_consent_without_context()));
+                    })
+                    .child(prims::rest("swap")),
+            )
+            .child(
+                view()
+                    .test_id("harness-reopen")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        reopen_state
+                            .review_consent
+                            .set(Some(SharedString::from("disclosure text")));
+                        reopen_state.review_manifest.set(Some(sample_consent()));
+                    })
+                    .child(prims::rest("reopen")),
+            )
+            .child(when(
+                move || is_open(&state),
+                move || card(card_state.clone(), Language::English),
+            ))
     }
 
     pub(super) fn start_harness() -> (Headless, tempfile::TempDir) {
@@ -1405,9 +1867,16 @@ mod tests {
         assert!(app.shows("Leaves this device"), "the manifest caption");
         assert!(app.shows("plan.md"), "the document row");
         assert!(app.shows("~/AGENTS.md"), "the named source row");
-        assert!(app.shows("1,000 B"), "the framed total");
+        assert!(app.shows("800 B"), "the content total");
         assert!(app.shows("Protocol framing"), "the framed remainder");
-        assert!(app.shows("Hold to send 1,000 B"), "the hold's label");
+        assert!(app.shows("200 B"), "the framed remainder's own figure");
+        assert!(app.shows("Hold to send"), "the hold's label");
+        assert!(app.shows("Content total"), "the sum named for what it is");
+        assert!(
+            app.wait_for("text:/To Remote .* may use the configured system proxy/")
+                .is_ok(),
+            "the destination discloses the location and the proxy"
+        );
         // The scope row: the current scope in ink, the other one switchable.
         assert!(app.shows("Document + context"), "the scope in force");
         assert!(app.shows("Document"), "the scope it can switch back to");
@@ -1438,13 +1907,121 @@ mod tests {
     }
 
     #[test]
-    fn a_keyboard_tap_alone_sends_nothing() {
+    fn reduced_motion_steps_the_hold_and_still_sends() {
+        // Under reduced motion the charge is the same hold with the same
+        // watchdogs and the same send; only its drawing steps. The steps
+        // themselves are [`reduced_step`]'s unit test, the pointer hold here
+        // cannot be sampled mid-press.
         let (mut app, _config) = start_harness();
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("the environment");
+        app.long_press("id:consent-send").expect("hold to send");
+        // The completion is the third step under reduced motion, so the label
+        // the hold leaves is `Sending` (the ramp's would read `Sent`); only
+        // [`Hold::complete`] sets either, after the full hold.
+        assert!(
+            app.wait_for("text:Sending").is_ok(),
+            "a full hold authorized one send"
+        );
+    }
+
+    #[test]
+    fn the_reduced_motion_steps_are_thirds_of_the_charge() {
+        assert_eq!(reduced_step(0.0), 0, "nothing yet");
+        assert_eq!(reduced_step(0.32), 0, "just short of the first third");
+        assert_eq!(reduced_step(1.0 / 3.0), 1, "the first third");
+        assert_eq!(reduced_step(0.65), 1, "just short of the second");
+        assert_eq!(reduced_step(2.0 / 3.0), 2, "the second third");
+        assert_eq!(reduced_step(1.0), 2, "the third step is the send itself");
+    }
+
+    #[test]
+    fn a_keyboard_tap_alone_sends_nothing_and_cancels() {
+        let (mut app, _config) = start_harness();
+        // The focus is on nothing the card can charge (Cancel, or nothing at
+        // all on Windows): Enter and Space are the default control's.
         app.press_key("space").expect("space");
-        // The watchdog ends the charge a tap started; no key-up is reported by
-        // nsh, so this silence is the release.
-        app.wait(Duration::from_millis(900))
-            .expect("the watchdog ends the charge");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("the card closed, cancelled");
+        assert!(!app.shows("Sent"), "a tap authorizes nothing");
+    }
+
+    #[test]
+    fn two_enter_taps_send_nothing_and_cancel() {
+        // The blocker: two accidental presses within the keyboard watchdog
+        // must not carry a charge over the line — there is no charge at all
+        // while the hold control is not focused.
+        let (mut app, _config) = start_harness();
+        app.press_key("enter").expect("enter");
+        app.press_key("enter").expect("enter again");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("the first press cancelled the card");
+        assert!(!app.shows("Sent"), "nothing was sent");
+    }
+
+    #[test]
+    fn the_card_follows_a_scope_switch() {
+        // Switching scope replaces the manifest under the card: the rows, the
+        // total and the hold's bytes must follow it, never lag behind.
+        let (mut app, _config) = start_harness();
+        app.wait_for("id:consent-total").expect("the total");
+        assert!(app.shows("~/AGENTS.md"), "the context source leaves");
+        assert!(app.shows("800 B"), "the content with the context");
+        // A tap leaves the hold's notice behind: the switch must re-arm the
+        // hold, not just redraw the rows.
+        app.press("id:consent-send").expect("tap the send control");
+        app.wait_for("text:Nothing was sent.")
+            .expect("the early release says so");
+        app.press("id:harness-swap").expect("switch the scope");
+        app.wait_for("id:consent-scope")
+            .expect("the card stayed up");
+        assert!(
+            app.wait_for_gone("id:consent-row-source", Duration::from_secs(2))
+                .is_ok(),
+            "the source row went"
+        );
+        assert!(app.shows("Stays here"), "the source is shown staying");
+        assert!(
+            app.wait_for("text:600 B").is_ok(),
+            "the total followed the manifest"
+        );
+        assert!(
+            app.wait_for_gone("text:800 B", Duration::from_secs(2))
+                .is_ok(),
+            "the old total is gone"
+        );
+        assert!(
+            app.wait_for_gone("text:Nothing was sent.", Duration::from_secs(2))
+                .is_ok(),
+            "the hold was re-armed, not left spent"
+        );
+        assert!(app.shows("Hold to send"), "the invitation is back");
+        // The re-armed hold still sends, and sends the new binding.
+        app.long_press("id:consent-send").expect("hold to send");
+        assert!(app.shows("Sent"), "the re-armed hold authorized the send");
+    }
+
+    #[test]
+    fn the_keyboard_charges_only_the_focused_hold_control() {
+        // On a platform that focuses views, Tab reaches the hold control and
+        // only there does Space charge it; anywhere else Space cancels (the
+        // tests above).
+        let (mut app, _config) = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        // Tab's stops on this platform, in order: the scope switch, Cancel,
+        // then the hold control.
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab");
+        }
+        app.press_key("space").expect("space");
+        // The harness's Space is a whole press (down and up), so the charge it
+        // started cools and says so: the charge happened, nothing was sent.
+        app.wait_for("text:Nothing was sent.")
+            .expect("the focused control charged and cooled");
+        assert!(app.shows("Send for review?"), "the card stayed up");
         assert!(!app.shows("Sent"), "a tap authorizes nothing");
     }
 }
