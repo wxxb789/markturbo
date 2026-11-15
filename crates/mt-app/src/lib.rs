@@ -18,6 +18,7 @@ pub mod assets;
 pub mod i18n;
 pub mod logging;
 pub mod state;
+pub mod ui;
 pub mod web;
 
 pub use app::App;

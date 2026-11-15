@@ -1,0 +1,414 @@
+//! Owner lane: foundation.
+//!
+//! The Afterglow design tokens: the palette of both themes, the spacing and
+//! type scale, the layout numbers and the family names.
+//!
+//! Everything visual reads from here, so a surface never spells a colour or a
+//! distance out again. [`palette`] follows the effective appearance: nsh
+//! resolves `system` itself, and the settings lane applies an explicit
+//! `light` / `dark` choice with `nsh_core::element::set_color_scheme`, which
+//! this reads back as [`nsh_core::element::dark`].
+//!
+//! The colour values are the spec's, including their alphas: `ink` at .84 is
+//! one colour with that alpha, not a pre-blended grey, so it sits correctly on
+//! both the room and the column ground.
+
+use nsh_core::{Color, element::FontWeight, prelude::*};
+
+/// `0xRRGGBB`, opaque.
+const fn hex(rgb: u32) -> Color {
+    Color::rgba((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 0xff)
+}
+
+/// `0xRRGGBB` at `alpha` (0..=255).
+const fn hexa(rgb: u32, alpha: u8) -> Color {
+    Color::rgba((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, alpha)
+}
+
+// The spec's alphas, as 8-bit.
+const A_84: u8 = 214;
+const A_88: u8 = 224;
+const A_62: u8 = 158;
+const A_70: u8 = 179;
+const A_56: u8 = 143;
+const A_34: u8 = 87;
+const A_38: u8 = 97;
+const A_08: u8 = 20;
+const A_10: u8 = 26;
+const A_30: u8 = 77;
+const A_18: u8 = 46;
+const A_22: u8 = 56;
+const A_16: u8 = 41;
+const A_12: u8 = 31;
+const A_60: u8 = 153;
+const A_06: u8 = 15;
+const A_08P: u8 = 20;
+const A_04: u8 = 10;
+const A_03: u8 = 8;
+
+/// The Afterglow palette of one appearance.
+///
+/// Field names say what the colour is for; a surface that needs "the model's
+/// current words" asks for [`Palette::hot`] and never for a hex.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Palette {
+    /// The room: the window ground behind everything.
+    pub room: Color,
+    /// The column's ground, a hair off the room.
+    pub column_ground: Color,
+    /// Body ink: your text, labels at full attention.
+    pub ink: Color,
+    /// Resting ink: quiet local actions, captions (steps to [`Palette::ink`]
+    /// on hover).
+    pub ink_rest: Color,
+    /// Non-text ink: rules, dots, disabled states.
+    pub ink_faint: Color,
+    /// The 1px hairline.
+    pub hairline: Color,
+    /// The one HOT item's glyphs (model output).
+    pub hot: Color,
+    /// Its tight under-bloom plate.
+    pub hot_bloom: Color,
+    /// Its halo plate, capped at 6%, 24px.
+    pub halo: Color,
+    /// Ember: model output that has cooled.
+    pub ember: Color,
+    /// The ember's under-bloom.
+    pub ember_bloom: Color,
+    /// Inference phosphor: the haze beside words the model read into it.
+    pub haze: Color,
+    /// The 2px gutter edge of an inference.
+    pub haze_edge: Color,
+    /// Added words, while they are a hot proposal.
+    pub added: Color,
+    /// The emitter plate under added words (light theme: brighter than the
+    /// room; dark theme: the bloom carries it, same as [`Palette::room`]).
+    pub added_plate: Color,
+    /// Removed words: the cold strike.
+    pub removed: Color,
+    /// Lines that differ from disk: the dashed warm-grey underline.
+    pub conflict: Color,
+    /// Outbound data: white-hot, always with the filament.
+    pub leaving: Color,
+    /// The filament's ramp, dull to white-hot.
+    pub filament: [Color; 3],
+    /// A loopback endpoint's filament: plain grey, no heat claim.
+    pub loopback: Color,
+    /// Stale emission: colourless ink, still readable.
+    pub afterimage_ink: Color,
+    /// The ghost plate under stale emission.
+    pub afterimage_plate: Color,
+    /// Destructive intent: a failed save, an irreversible loss.
+    pub danger: Color,
+    /// The stale label's text.
+    pub stale_label: Color,
+    /// The ground the stale label sits on.
+    pub stale_ground: Color,
+    /// An emitter's plate in light theme (`#FFFDF7`); dark theme has none —
+    /// the bloom is the light — so this is the room there.
+    pub emitter_plate: Color,
+    /// Whether this is the dark appearance (for the few places that must
+    /// branch, e.g. under-bloom geometry).
+    pub is_dark: bool,
+}
+
+/// The dark appearance: warm graphite, amber model light.
+pub const DARK: Palette = Palette {
+    room: hex(0x101113),
+    column_ground: hex(0x121315),
+    ink: hexa(0xD9DCE1, A_84),
+    ink_rest: hexa(0xD9DCE1, A_56),
+    ink_faint: hexa(0xD9DCE1, A_34),
+    hairline: hexa(0xD9DCE1, A_08),
+    hot: hex(0xFFB36B),
+    hot_bloom: hexa(0xFF8A3D, A_30),
+    halo: hexa(0xFF8A3D, A_06),
+    ember: hex(0xC98A5A),
+    ember_bloom: hexa(0x7A4A2A, A_18),
+    haze: hexa(0x8FBFB6, A_16),
+    haze_edge: hexa(0x8FBFB6, A_60),
+    added: hex(0xFFD9A8),
+    added_plate: hex(0x101113),
+    removed: hex(0x8FA9C8),
+    conflict: hex(0xA39B8E),
+    leaving: hex(0xFFF1D6),
+    filament: [hex(0x5A1E10), hex(0xFF6A2A), hex(0xFFF1D6)],
+    loopback: hex(0x6B6F76),
+    afterimage_ink: hexa(0xD9DCE1, A_62),
+    afterimage_plate: hexa(0xFFFFFF, A_04),
+    danger: hex(0xFF6B5E),
+    stale_label: hex(0xD9DCE1),
+    stale_ground: hex(0x101113),
+    emitter_plate: hex(0x101113),
+    is_dark: true,
+};
+
+/// The light appearance: warm bone, an emitter is a plate brighter than the
+/// room plus saturated glyphs.
+pub const LIGHT: Palette = Palette {
+    room: hex(0xF2F0EB),
+    column_ground: hex(0xF7F5F1),
+    ink: hexa(0x23262B, A_88),
+    ink_rest: hexa(0x23262B, A_70),
+    ink_faint: hexa(0x23262B, A_38),
+    hairline: hexa(0x23262B, A_10),
+    hot: hex(0x9A4300),
+    hot_bloom: hexa(0xFFB04D, A_22),
+    halo: hexa(0xFFB04D, A_06),
+    ember: hex(0x8A5A33),
+    ember_bloom: hexa(0xB88458, A_08P),
+    haze: hexa(0x4E8C84, A_12),
+    haze_edge: hex(0x4E8C84),
+    added: hex(0x7A3A00),
+    added_plate: hex(0xFFF3E0),
+    removed: hex(0x4F6E93),
+    conflict: hex(0x8A8174),
+    leaving: hex(0xB8370C),
+    filament: [hex(0xE9D7C9), hex(0xF07A2B), hex(0xC13A0E)],
+    loopback: hex(0x6B6F76),
+    afterimage_ink: hexa(0x23262B, A_70),
+    afterimage_plate: hexa(0x000000, A_03),
+    danger: hex(0xC2372B),
+    stale_label: hex(0x23262B),
+    stale_ground: hex(0xF7F5F1),
+    emitter_plate: hex(0xFFFDF7),
+    is_dark: false,
+};
+
+/// The palette of the effective appearance (system, or what the settings
+/// lane set with `set_color_scheme`). Reading it subscribes, so a surface
+/// that calls it inside a style closure repaints on a theme change.
+pub fn palette() -> &'static Palette {
+    if dark() { &DARK } else { &LIGHT }
+}
+
+impl Palette {
+    /// The room at 70%: what dims everything under the consent card, because
+    /// the room dims to 30% while something is about to leave the device.
+    pub fn scrim(self) -> Color {
+        with_alpha(self.room, 0.70)
+    }
+
+    /// The same ink at another alpha, for the few steps the spec leaves to the
+    /// surface (a disabled label, a hairline under a plate).
+    pub fn ink_at(self, alpha: f32) -> Color {
+        with_alpha(self.ink, alpha)
+    }
+}
+
+/// `color` at `alpha` (0..=1).
+pub fn with_alpha(color: Color, alpha: f32) -> Color {
+    let (r, g, b, _) = color.to_f64();
+    Color::rgba(
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
+// ─── layout ───────────────────────────────────────────────────────────────
+
+// Distances are plain points, as `px(…)` and `Points` both take them; nothing
+// here is a `Points` until a surface asks for one.
+
+/// The 4px scale: 4, 8, 16, 24, 40, 64, 88.
+pub const SPACE_1: f32 = 4.0;
+pub const SPACE_2: f32 = 8.0;
+pub const SPACE_3: f32 = 16.0;
+pub const SPACE_4: f32 = 24.0;
+pub const SPACE_5: f32 = 40.0;
+pub const SPACE_6: f32 = 64.0;
+pub const SPACE_7: f32 = 88.0;
+
+/// The opaque title row.
+pub const TITLE_ROW_H: f32 = 32.0;
+/// The rail: a 44px strip that widens to 240px on hover.
+pub const RAIL_W: f32 = 44.0;
+pub const RAIL_HOVER_W: f32 = 240.0;
+/// The rail's one-dot-per-file mark.
+pub const RAIL_DOT: f32 = 6.0;
+/// The gap between the rail and the text column.
+pub const COLUMN_GAP: f32 = 40.0;
+/// The gap between the text column and the field.
+pub const FIELD_GAP: f32 = 40.0;
+/// The client width below which the field slides over the column.
+pub const NARROW_MAX_W: f32 = 1040.0;
+/// The client width at and above which the measure is the wide one.
+pub const WIDE_MIN_W: f32 = 1280.0;
+/// The text measure: 680 wide, 560 from 1040 to 1279.
+pub const MEASURE_WIDE: f32 = 680.0;
+pub const MEASURE_NARROW: f32 = 560.0;
+/// The field's width at the 1068 client budget (44+40+560+40+352+32).
+pub const FIELD_MIN_W: f32 = 352.0;
+/// The field's inset from the window's right edge.
+pub const FIELD_RIGHT_INSET: f32 = 32.0;
+/// The docked reading position's widest column: model text is measured, not
+/// stretched across a wide window.
+pub const FIELD_READING_MAX_W: f32 = 440.0;
+/// The consent card's width, and the range it may use.
+pub const CONSENT_CARD_MIN_W: f32 = 520.0;
+pub const CONSENT_CARD_MAX_W: f32 = 640.0;
+/// The consent card's controls.
+pub const CONSENT_BUTTON_W: f32 = 164.0;
+pub const CONSENT_BUTTON_H: f32 = 36.0;
+/// The context strip that expands the title row's path.
+pub const CONTEXT_STRIP_H: f32 = 56.0;
+/// Hairlines are 1px; the radius is 0 everywhere in this direction.
+pub const HAIRLINE: f32 = 1.0;
+/// The focus ring: a designed 1px ink ring, offset from the control.
+pub const FOCUS_RING: f32 = 1.0;
+pub const FOCUS_RING_OFFSET: f32 = 2.0;
+/// The rail's hover widening, and the 4px the consent card rises.
+pub const RAIL_WIDEN_MS: f32 = 160.0;
+pub const CARD_RISE: f32 = 4.0;
+
+/// The type scale: 12.5, 14, 16, 22 (with their line heights).
+pub const TYPE_UI: f32 = 12.5;
+pub const TYPE_UI_LINE: f32 = 18.0;
+pub const TYPE_SOURCE: f32 = 14.0;
+pub const TYPE_SOURCE_LINE: f32 = 24.0;
+pub const TYPE_PREVIEW: f32 = 16.0;
+pub const TYPE_PREVIEW_LINE: f32 = 27.0;
+pub const TYPE_MODEL: f32 = 22.0;
+pub const TYPE_MODEL_LINE: f32 = 30.0;
+/// zh-CN sets at 1.75 line height with no letter spacing.
+pub const CJK_LINE_FACTOR: f32 = 1.75;
+/// Markdown punctuation in source mode sits at 34% ink.
+pub const PUNCTUATION_INK: Color = hexa(0xD9DCE1, A_34);
+
+/// How the window is laid out at one client width: the spec's width
+/// contract, resolved once by the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Client width 1280 and above: measure 680, field in the row.
+    Wide,
+    /// 1040 to 1279: measure 560, field in the row.
+    Medium,
+    /// Below 1040: measure 560, the field slides over the column.
+    Narrow,
+}
+
+impl Layout {
+    /// The layout at `client_width`.
+    pub fn of(client_width: f32) -> Layout {
+        if client_width >= WIDE_MIN_W {
+            Layout::Wide
+        } else if client_width >= NARROW_MAX_W {
+            Layout::Medium
+        } else {
+            Layout::Narrow
+        }
+    }
+
+    /// The text column's measure.
+    pub fn measure(self) -> f32 {
+        match self {
+            Layout::Wide => MEASURE_WIDE,
+            Layout::Medium | Layout::Narrow => MEASURE_NARROW,
+        }
+    }
+
+    /// Whether the field is an overlay over the column (below 1040).
+    pub fn field_overlays(self) -> bool {
+        matches!(self, Layout::Narrow)
+    }
+
+    /// How much the field takes of the width when it overlays the column.
+    pub const OVERLAY_FRACTION: f32 = 0.46;
+
+    /// What the column's text dims to while the field overlays it.
+    pub const DIMMED: f32 = 0.4;
+
+    /// What the room dims to behind the consent card.
+    pub const SCRIM: f32 = 0.3;
+}
+
+// ─── type ─────────────────────────────────────────────────────────────────
+
+// nsh registers each embedded face under its family, so the three Grotesk
+// instances share one family name and are told apart by weight — the same
+// arrangement the prototype's CSS used.
+
+/// Martian Grotesk, the app's one family, at [`WEIGHT_MODEL`] for the model's
+/// voice, [`WEIGHT_UI`] for UI and preview body, [`WEIGHT_MEDIUM`] for the few
+/// labels that must not be quiet.
+pub const FAMILY_UI: &str = "Martian Grotesk";
+/// The same family: the model's voice.
+pub const FAMILY_MODEL: &str = FAMILY_UI;
+/// The same family, at the heavier weight.
+pub const FAMILY_MEDIUM: &str = FAMILY_UI;
+/// Martian Mono 400 (condensed): source mode.
+pub const FAMILY_SOURCE: &str = "Martian Mono";
+
+/// The model's voice: Martian Grotesk 300, the only large type in the app.
+pub const WEIGHT_MODEL: FontWeight = FontWeight(300);
+/// UI and preview body.
+pub const WEIGHT_UI: FontWeight = FontWeight(400);
+/// The few labels that must not be quiet.
+pub const WEIGHT_MEDIUM: FontWeight = FontWeight(500);
+
+/// The CJK fallbacks, in order: DengXian's geometric strokes sit well beside
+/// Martian, then Microsoft YaHei UI.
+pub const FALLBACK_CJK: &str = "DengXian, Microsoft YaHei UI";
+
+/// The UI and preview family list, CJK fallback included.
+pub const FONT_UI: &str = "Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
+/// The model voice's family list.
+pub const FONT_MODEL: &str = "Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
+/// The medium-weight family list.
+pub const FONT_MEDIUM: &str = "Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
+/// Source mode's family list. zh-CN falls back from Martian Mono to DengXian
+/// without forcing monospace widths.
+pub const FONT_SOURCE: &str = "Martian Mono, DengXian, Microsoft YaHei UI, monospace";
+
+/// What the *editor* can actually draw with today.
+///
+/// The editor is a native text input, and nsh 0.5.1's Windows text input makes
+/// its `IDWriteTextFormat` against the system font collection
+/// (`nsh-platform-windows/src/text_input.rs`: `CreateTextFormat(&family, None,
+/// ..)`), so a font the app registered is invisible to it — the family falls
+/// back to the platform's UI font, which is proportional. Every other surface
+/// draws through the core's text engine, which does see the app's fonts.
+///
+/// Until the editor can see them, source mode uses the system's monospaced
+/// face, so the two properties that matter (fixed pitch, 14/24) hold; the
+/// family is the document lane's to switch back to [`FONT_SOURCE`] the moment
+/// nsh passes the app's collection through.
+pub const FONT_SOURCE_UI: &str = "Consolas";
+
+/// The fallbacks alone, for a surface that must name them without the first
+/// family (tests, diagnostics).
+pub const FONT_UI_CJK: &str = "DengXian, Microsoft YaHei UI, sans-serif";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_breakpoints_follow_the_spec() {
+        assert_eq!(Layout::of(1440.0), Layout::Wide);
+        assert_eq!(Layout::of(1280.0), Layout::Wide);
+        assert_eq!(Layout::of(1279.0), Layout::Medium);
+        assert_eq!(Layout::of(1040.0), Layout::Medium);
+        assert_eq!(Layout::of(1039.0), Layout::Narrow);
+        assert_eq!(Layout::of(1100.0).measure(), MEASURE_NARROW);
+        assert!(!Layout::of(1100.0).field_overlays());
+        assert!(Layout::of(1000.0).field_overlays());
+    }
+
+    #[test]
+    fn the_1068_budget_adds_up() {
+        let used = RAIL_W + COLUMN_GAP + MEASURE_NARROW + FIELD_GAP + FIELD_MIN_W + 2.0 * SPACE_3;
+        assert_eq!(used, 1068.0);
+    }
+
+    #[test]
+    fn cjk_families_are_in_every_list() {
+        for list in [FONT_UI, FONT_MODEL, FONT_MEDIUM, FONT_SOURCE, FONT_UI_CJK] {
+            assert!(list.contains("DengXian"), "{list}");
+            assert!(list.contains("Microsoft YaHei UI"), "{list}");
+        }
+        assert_eq!(FALLBACK_CJK, "DengXian, Microsoft YaHei UI");
+    }
+}
