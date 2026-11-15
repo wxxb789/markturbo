@@ -1299,7 +1299,7 @@ impl AppState {
         }
         if record.source_conflicted {
             if let Some(tab) = self.active_tab() {
-                tab.conflict.set(true);
+                self.note_conflict(&tab);
             }
             self.status.set(SharedString::from(
                 "Recovered text differs from disk; reload, overwrite, or save as a new file.",
@@ -1450,6 +1450,18 @@ impl AppState {
                 disks.push((id, disk));
             }
         });
+    }
+
+    /// Note that `tab` differs from its file: its flag goes up and any disk
+    /// text from an earlier conflict is dropped, so the comparison can never
+    /// show — or mark lines against — a read that predates this conflict.
+    /// The text is read when the comparison is asked for
+    /// ([`Self::refresh_conflict_disk`]).
+    fn note_conflict(&self, tab: &Tab) {
+        tab.conflict.set(true);
+        let id = tab.id;
+        self.conflict_disks
+            .update(|disks| disks.retain(|(entry, _)| *entry != id));
     }
 
     /// Run `f` under the state's own owner: what it makes (a new tab's
@@ -1842,7 +1854,7 @@ impl AppState {
                 true
             }
             Err(SaveError::Conflict) => {
-                tab.conflict.set(true);
+                self.note_conflict(&tab);
                 self.status.set(SharedString::from(crate::i18n::t(
                     self.settings.get().language,
                     crate::i18n::Key::SaveConflictDetail,
