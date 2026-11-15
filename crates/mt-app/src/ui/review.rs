@@ -994,6 +994,73 @@ fn advance_question(session: Signal<Session>, order: &[usize], index: usize) {
 
 // ─── the footer ──────────────────────────────────────────────────────────
 
+/// The pointer's way through the findings: `J`/`K` fire only while no text
+/// input edits, and the answer field holds the focus by design, so each key is
+/// its own control — a press (or Tab and Enter) steps that way. `J` walks
+/// forward, `K` back, both clamped at the ends ([`step_finding`]).
+fn findings_stepper(
+    state: &AppState,
+    session: Signal<Session>,
+    language: Language,
+    findings: usize,
+) -> AnyElement {
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_2))
+        .child(prims::rest(step_hint(findings, language)))
+        .child(step_control(
+            "review-findings-step",
+            S::StepFindings,
+            "J",
+            1,
+            state,
+            session,
+            language,
+        ))
+        .child(prims::rest("/"))
+        .child(step_control(
+            "review-findings-back",
+            S::StepFindingsBack,
+            "K",
+            -1,
+            state,
+            session,
+            language,
+        ))
+        .child(prims::rest(s(S::StepThrough, language)))
+        .into_element()
+}
+
+/// One key of [`findings_stepper`]: the `kbd` plate is the target, so the hint
+/// reads the same whether it is typed or pressed.
+fn step_control(
+    id: &'static str,
+    label: S,
+    key: &'static str,
+    delta: i32,
+    state: &AppState,
+    session: Signal<Session>,
+    language: Language,
+) -> AnyElement {
+    let state = state.clone();
+    let step = move || step_finding(&state, session, delta);
+    view()
+        .test_id(id)
+        .on_press(step.clone())
+        .child(
+            button()
+                .accessibility_label(Some(SharedString::from(s(label, language))))
+                .p(px(0.0))
+                .bg(Color::TRANSPARENT)
+                .cursor_pointer()
+                .focus_visible(|style| style.text_color(tokens::palette().ink))
+                .on_press(step)
+                .child(prims::kbd(key)),
+        )
+        .into_element()
+}
+
 /// The legend, and the state's one next action once every question is
 /// answered or skipped.
 fn footer(
@@ -1051,43 +1118,12 @@ fn footer(
                                 .child(prims::rest(s(S::InferredLegend, language))),
                         ),
                 )
-                .child({
-                    // The pointer's way to step through findings: `J`/`K`
-                    // fire only while no text input edits, and the answer
-                    // field holds the focus by design. A press (or Tab
-                    // and Enter) steps to the next finding.
-                    let step_state = state.clone();
-                    let step = move || step_finding(&step_state, session, 1);
-                    view()
-                        .test_id("review-findings-step")
-                        .on_press(step.clone())
-                        .child(
-                            button()
-                                .accessibility_label(Some(SharedString::from(s(
-                                    S::StepFindings,
-                                    language,
-                                ))))
-                                .p(px(0.0))
-                                .bg(Color::TRANSPARENT)
-                                .cursor_pointer()
-                                .focus_visible(|style| style.text_color(tokens::palette().ink))
-                                .on_press(step)
-                                .child(
-                                    view()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(SPACE_2))
-                                        .child(prims::rest(step_hint(
-                                            review.findings_anchored.len(),
-                                            language,
-                                        )))
-                                        .child(prims::kbd("J"))
-                                        .child(prims::rest("/"))
-                                        .child(prims::kbd("K"))
-                                        .child(prims::rest(s(S::StepThrough, language))),
-                                ),
-                        )
-                }),
+                .child(findings_stepper(
+                    &state,
+                    session,
+                    language,
+                    review.findings_anchored.len(),
+                )),
         )
         .child(
             view()
@@ -1278,6 +1314,7 @@ enum S {
     TypeYourAnswer,
     StepThrough,
     StepFindings,
+    StepFindingsBack,
     CouldNotRead,
 }
 
@@ -1314,6 +1351,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::TypeYourAnswer => "Type your answer",
             S::StepThrough => "to step through",
             S::StepFindings => "Next finding",
+            S::StepFindingsBack => "Previous finding",
             S::CouldNotRead => "Couldn't read the response — Try again",
         },
         Language::Chinese => match key {
@@ -1345,6 +1383,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::TypeYourAnswer => "输入回答",
             S::StepThrough => "切换",
             S::StepFindings => "下一个发现",
+            S::StepFindingsBack => "上一个发现",
             S::CouldNotRead => "无法读取响应——请重试",
         },
     }
@@ -1656,6 +1695,7 @@ mod tests {
             S::TypeYourAnswer,
             S::StepThrough,
             S::StepFindings,
+            S::StepFindingsBack,
             S::CouldNotRead,
         ] {
             assert!(!s(key, Language::English).is_empty());
@@ -1883,6 +1923,145 @@ mod tests {
             text_of(&app, "camera-request"),
             format!("{tab}:0"),
             "the arrival must level the first finding's line"
+        );
+    }
+
+    /// The footer's own stepper, drawn with the fixture's two findings: what
+    /// each press asks the column's camera for is on screen.
+    #[component]
+    fn StepperProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.open_file(camera_fixture().to_path_buf());
+        state.review_open.set(true);
+        load_result(state.clone());
+        view()
+            .test_id("stepper-probe")
+            .flex_col()
+            .w(px(400.0))
+            .h(px(200.0))
+            .child(camera_tab(&state))
+            .child(camera_request(&state))
+            .child(findings_stepper(&state, session(), Language::English, 2))
+    }
+
+    /// The pointer walks the findings both ways and stops at either end: the
+    /// `kbd` plates are targets, so pressing `J`'s takes the next finding and
+    /// pressing `K`'s takes the previous one back.
+    #[test]
+    fn the_pointer_steps_the_findings_both_ways() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<StepperProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:review-findings-step")
+            .expect("the stepper renders");
+        app.settle();
+        app.wait(Duration::from_millis(200))
+            .expect("the fixture's tab lands");
+        app.settle();
+
+        let tab = text_of(&app, "camera-tab");
+        assert!(!tab.is_empty(), "the fixture's tab must be open");
+        app.press("id:review-findings-step")
+            .expect("step to the first");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:0"),
+            "a forward step from nothing lands on the first finding"
+        );
+        app.press("id:review-findings-step")
+            .expect("step to the second");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:1"),
+            "a forward step takes the next finding"
+        );
+        app.press("id:review-findings-step")
+            .expect("step past the last");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:1"),
+            "a forward step stops at the last finding"
+        );
+        app.press("id:review-findings-back")
+            .expect("back to the first");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:0"),
+            "the back control takes the previous finding"
+        );
+        app.press("id:review-findings-back")
+            .expect("back past the first");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:0"),
+            "the back control stops at the first finding"
+        );
+    }
+
+    /// The loading flag and the review generation, drawn for the test.
+    #[component]
+    fn BusyProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let arm_state = state.clone();
+        let start_state = state.clone();
+        view()
+            .test_id("busy-probe")
+            .flex_col()
+            .w(px(400.0))
+            .h(px(200.0))
+            .child(
+                text({
+                    let state = state.clone();
+                    move || {
+                        format!(
+                            "{}:{}",
+                            state.review_busy.get(),
+                            state.review_generation.get()
+                        )
+                    }
+                })
+                .test_id("busy-state"),
+            )
+            .child(
+                view()
+                    .test_id("busy-arm")
+                    .w_full()
+                    .h(px(24.0))
+                    .on_press(move || arm_state.review_busy.set(true)),
+            )
+            .child(
+                view()
+                    .test_id("busy-start")
+                    .w_full()
+                    .h(px(24.0))
+                    .on_press(move || start_state.start_review()),
+            )
+    }
+
+    /// Preparing a review supersedes whatever was in flight: the loading flag
+    /// its task would have cleared goes straight away, so an early return
+    /// (no request can be prepared in this probe) cannot leave the field
+    /// saying `Reviewing…` with nothing in flight.
+    #[test]
+    fn preparing_a_review_clears_the_loading_state_it_supersedes() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<BusyProbe>())).expect("start the probe");
+        app.wait_for("id:busy-state").expect("the probe renders");
+        app.settle();
+        assert_eq!(text_of(&app, "busy-state"), "false:0");
+        app.press("id:busy-arm").expect("arm the loading state");
+        app.settle();
+        assert_eq!(text_of(&app, "busy-state"), "true:0");
+        app.press("id:busy-start").expect("prepare another review");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "busy-state"),
+            "false:1",
+            "the superseded loading state must go with its request"
         );
     }
 }
