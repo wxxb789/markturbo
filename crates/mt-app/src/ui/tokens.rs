@@ -326,20 +326,29 @@ impl Layout {
 
 // ─── type ─────────────────────────────────────────────────────────────────
 
-// nsh registers each embedded face under its family, so the three Grotesk
-// instances share one family name and are told apart by weight — the same
-// arrangement the prototype's CSS used.
+// DirectWrite — the engine every surface on Windows draws through — exposes
+// each embedded face under its file's *legacy* family name (name table ID 1,
+// the name `FindFamilyName` matches), and the three Grotesk instances carry
+// one each (`Martian Grotesk Std Lt` / `Std Rg` / `Std Md`), so a family
+// names the weight it draws and `FontWeight` alone cannot pick an instance.
+// The typographic names (nameID 16: `Martian Grotesk`, `Martian Mono`) follow
+// in every list as the second family, for platforms that register the faces
+// under those; they are fallbacks, never the first entry.
 
-/// Martian Grotesk, the app's one family, at [`WEIGHT_MODEL`] for the model's
-/// voice, [`WEIGHT_UI`] for UI and preview body, [`WEIGHT_MEDIUM`] for the few
-/// labels that must not be quiet.
-pub const FAMILY_UI: &str = "Martian Grotesk";
-/// The same family: the model's voice.
-pub const FAMILY_MODEL: &str = FAMILY_UI;
-/// The same family, at the heavier weight.
-pub const FAMILY_MEDIUM: &str = FAMILY_UI;
-/// Martian Mono 400 (condensed): source mode.
-pub const FAMILY_SOURCE: &str = "Martian Mono";
+/// Martian Grotesk 400 (the `Std Rg` instance): UI and preview body.
+pub const FONT_UI: &str =
+    "Martian Grotesk Std Rg, Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
+/// Martian Grotesk 300 (the `Std Lt` instance): the model's voice, the only
+/// large type in the app. Its CJK follows the spec's light cut.
+pub const FONT_MODEL: &str = "Martian Grotesk Std Lt, Martian Grotesk, DengXian Light, DengXian, Microsoft YaHei UI, sans-serif";
+/// Martian Grotesk 500 (the `Std Md` instance): the few labels that must not
+/// be quiet. Pair it with [`WEIGHT_MEDIUM`].
+pub const FONT_MEDIUM: &str =
+    "Martian Grotesk Std Md, Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
+/// Martian Mono 400 (the condensed `Cn Rg` instance): source mode. zh-CN
+/// falls back from Martian Mono to DengXian without forcing monospace widths.
+pub const FONT_SOURCE: &str =
+    "Martian Mono Cn Rg, Martian Mono, DengXian, Microsoft YaHei UI, monospace";
 
 /// The model's voice: Martian Grotesk 300, the only large type in the app.
 pub const WEIGHT_MODEL: FontWeight = FontWeight(300);
@@ -347,39 +356,6 @@ pub const WEIGHT_MODEL: FontWeight = FontWeight(300);
 pub const WEIGHT_UI: FontWeight = FontWeight(400);
 /// The few labels that must not be quiet.
 pub const WEIGHT_MEDIUM: FontWeight = FontWeight(500);
-
-/// The CJK fallbacks, in order: DengXian's geometric strokes sit well beside
-/// Martian, then Microsoft YaHei UI.
-pub const FALLBACK_CJK: &str = "DengXian, Microsoft YaHei UI";
-
-/// The UI and preview family list, CJK fallback included.
-pub const FONT_UI: &str = "Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
-/// The model voice's family list.
-pub const FONT_MODEL: &str = "Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
-/// The medium-weight family list.
-pub const FONT_MEDIUM: &str = "Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
-/// Source mode's family list. zh-CN falls back from Martian Mono to DengXian
-/// without forcing monospace widths.
-pub const FONT_SOURCE: &str = "Martian Mono, DengXian, Microsoft YaHei UI, monospace";
-
-/// What the *editor* can actually draw with today.
-///
-/// The editor is a native text input, and nsh 0.5.1's Windows text input makes
-/// its `IDWriteTextFormat` against the system font collection
-/// (`nsh-platform-windows/src/text_input.rs`: `CreateTextFormat(&family, None,
-/// ..)`), so a font the app registered is invisible to it — the family falls
-/// back to the platform's UI font, which is proportional. Every other surface
-/// draws through the core's text engine, which does see the app's fonts.
-///
-/// Until the editor can see them, source mode uses the system's monospaced
-/// face, so the two properties that matter (fixed pitch, 14/24) hold; the
-/// family is the document lane's to switch back to [`FONT_SOURCE`] the moment
-/// nsh passes the app's collection through.
-pub const FONT_SOURCE_UI: &str = "Consolas";
-
-/// The fallbacks alone, for a surface that must name them without the first
-/// family (tests, diagnostics).
-pub const FONT_UI_CJK: &str = "DengXian, Microsoft YaHei UI, sans-serif";
 
 #[cfg(test)]
 mod tests {
@@ -404,11 +380,27 @@ mod tests {
     }
 
     #[test]
-    fn cjk_families_are_in_every_list() {
-        for list in [FONT_UI, FONT_MODEL, FONT_MEDIUM, FONT_SOURCE, FONT_UI_CJK] {
-            assert!(list.contains("DengXian"), "{list}");
-            assert!(list.contains("Microsoft YaHei UI"), "{list}");
+    fn the_family_lists_name_the_legacy_families_first() {
+        // What the text engine resolves on Windows: the file's legacy name
+        // (name table ID 1), then the typographic one, then the spec's CJK
+        // fallbacks. The resolution itself is proven through the real engine
+        // in `document::tests::the_ui_and_model_lists_resolve_to_martian`.
+        for (list, legacy, typographic) in [
+            (FONT_UI, "Martian Grotesk Std Rg", "Martian Grotesk"),
+            (FONT_MODEL, "Martian Grotesk Std Lt", "Martian Grotesk"),
+            (FONT_MEDIUM, "Martian Grotesk Std Md", "Martian Grotesk"),
+            (FONT_SOURCE, "Martian Mono Cn Rg", "Martian Mono"),
+        ] {
+            let families: Vec<&str> = list.split(',').map(str::trim).collect();
+            assert_eq!(families[0], legacy, "{list}");
+            assert_eq!(families[1], typographic, "{list}");
+            assert!(families.contains(&"DengXian"), "{list}");
+            assert!(families.contains(&"Microsoft YaHei UI"), "{list}");
         }
-        assert_eq!(FALLBACK_CJK, "DengXian, Microsoft YaHei UI");
+        // The model's 22px CJK follows the light cut before the body's.
+        assert!(
+            FONT_MODEL.contains("DengXian Light, DengXian"),
+            "{FONT_MODEL}"
+        );
     }
 }

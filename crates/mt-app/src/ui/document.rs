@@ -40,23 +40,8 @@ use nsh_core::{
 
 use crate::{
     state::{AppState, Pane, Tab},
-    ui::{glow, preview, revision, tokens},
+    ui::{glow, notices, preview, revision, tokens},
 };
-
-/// What the source editor can be set in today: Martian Mono under the name the
-/// editor's text engine can find it by.
-///
-/// `tokens::FONT_SOURCE` names the app's mono by its typographic family name
-/// (`Martian Mono`), which is what `fonts::register` reports back; the
-/// Windows text engine searches both the system collection and the registered
-/// faces with DirectWrite's `FindFamilyName`, which matches the file's
-/// *legacy* family name instead (nameID 1: `Martian Mono Cn Rg`). Measured,
-/// 60 `M`s at 14pt: DengXian 727, the registered face 504 (its 0.6em
-/// advance), Consolas 462 — see `the_editor_draws_the_registered_source_font`.
-/// The legacy name comes first, the typographic one second, so the editor
-/// follows a platform that resolves that one, and the spec's fallbacks last.
-const FONT_SOURCE_EDITOR: &str =
-    "Martian Mono Cn Rg, Martian Mono, DengXian, Microsoft YaHei UI, monospace";
 
 /// The column's content for the active document, by pane. Empty while no
 /// document is open (the shell shows [`crate::ui::welcome::welcome`] then).
@@ -180,9 +165,17 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                         // decorations carry the punctuation ink.
                         .language(None)
                         .accessibility_label(Some(SharedString::from("Markdown source")))
-                        .font_family(FONT_SOURCE_EDITOR)
+                        // `tokens::FONT_SOURCE` leads with the face's legacy family
+                        // name (`Martian Mono Cn Rg`), the name the Windows text
+                        // engine resolves the registered face by; measured with 60
+                        // `M`s at 14pt against the system faces — see
+                        // `the_editor_draws_the_registered_source_font`.
+                        .font_family(tokens::FONT_SOURCE)
                         .font_size(px(tokens::TYPE_SOURCE))
                         .line_height(px(tokens::TYPE_SOURCE_LINE))
+                        // The strip of gutter marks: the spec's 2px heat tick and
+                        // inference edge (the editor's default is 3).
+                        .gutter_decorations_width(px(2.0))
                         // The measure is the window's, not a horizontal scroll: as the
                         // prototype wraps, so does the editor.
                         .soft_wrap(true)
@@ -201,6 +194,12 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                         .decorations(move || {
                             let mut decorations = punctuation.get();
                             decorations.extend(glow::document_decorations(
+                                &decorations_state,
+                                &decorations_tab,
+                            ));
+                            // The conflict's dashed underlines, under the review's
+                            // light: the same editor, the same rows, one pass.
+                            decorations.extend(notices::conflict_decorations(
                                 &decorations_state,
                                 &decorations_tab,
                             ));
@@ -409,57 +408,224 @@ mod tests {
     #[cfg(windows)]
     const RULER: usize = 60;
 
-    /// The family names the source editor is tried in, in order: what the
-    /// column sets it in, what `tokens::FONT_SOURCE` asks for, the faces'
-    /// legacy names (nameID 1 — the name DirectWrite's `FindFamilyName`
-    /// matches), their typographic names (nameID 16), the system's own mono
-    /// and a family that does not exist (the engine's fallback face).
+    /// One family a probe tries: the label its editor carries and the width
+    /// tables print, the family list the app sets text in, and the weight the
+    /// surface pairs with it.
     #[cfg(windows)]
-    const FONT_TRIALS: [&str; 9] = [
-        FONT_SOURCE_EDITOR,
-        tokens::FONT_SOURCE,
-        "Martian Mono Cn Rg",
-        "Martian Mono",
-        "Martian Grotesk Std Rg",
-        "Martian Grotesk",
-        "Consolas",
-        "DengXian",
-        "No Such Family 12345",
+    #[derive(Clone, Copy)]
+    struct FontTrial {
+        label: &'static str,
+        family: &'static str,
+        weight: u16,
+    }
+
+    /// The Latin roles and the faces each must resolve to, with the system's
+    /// faces and a family that does not exist (the engine's own fallback) as
+    /// the contrasts.
+    ///
+    /// The app's faces are only reachable by their files' legacy family names
+    /// (name table ID 1 — `Martian Grotesk Std Lt` and friends, the name
+    /// DirectWrite's `FindFamilyName` matches), so a list that names the
+    /// typographic family first resolves to a *system* face, which the `M`
+    /// ruler sees as a different width.
+    #[cfg(windows)]
+    const LATIN_TRIALS: [FontTrial; 11] = [
+        FontTrial {
+            label: "FONT_UI",
+            family: tokens::FONT_UI,
+            weight: 400,
+        },
+        FontTrial {
+            label: "FONT_MODEL",
+            family: tokens::FONT_MODEL,
+            weight: 300,
+        },
+        FontTrial {
+            label: "FONT_MEDIUM",
+            family: tokens::FONT_MEDIUM,
+            weight: 500,
+        },
+        FontTrial {
+            label: "FONT_SOURCE",
+            family: tokens::FONT_SOURCE,
+            weight: 400,
+        },
+        FontTrial {
+            label: "Std Rg",
+            family: "Martian Grotesk Std Rg",
+            weight: 400,
+        },
+        FontTrial {
+            label: "Std Lt",
+            family: "Martian Grotesk Std Lt",
+            weight: 300,
+        },
+        FontTrial {
+            label: "Std Md",
+            family: "Martian Grotesk Std Md",
+            weight: 500,
+        },
+        FontTrial {
+            label: "Cn Rg",
+            family: "Martian Mono Cn Rg",
+            weight: 400,
+        },
+        FontTrial {
+            label: "Consolas",
+            family: "Consolas",
+            weight: 400,
+        },
+        FontTrial {
+            label: "DengXian",
+            family: "DengXian",
+            weight: 400,
+        },
+        FontTrial {
+            label: "absent",
+            family: "No Such Family 12345",
+            weight: 400,
+        },
     ];
 
-    /// One editor per family in [`FONT_TRIALS`], each with a 60-character
-    /// ruler line; the first also holds a second line of 60 `i`s, so a
-    /// monospaced face and a proportional one can be told apart by their
-    /// widths alone.
+    /// A `―` (U+2015) ruler: no Martian face has the character, and its
+    /// advance is 1.0 em in both DengXian cuts against 0.448 em in Microsoft
+    /// YaHei UI — so the width says whose glyphs the fallback took.
+    #[cfg(windows)]
+    const DASH_RULER: usize = 20;
+
+    /// An `ǔ` (U+01D4) ruler: 0.5508 em in DengXian against 0.5352 em in
+    /// DengXian Light — about 13 points apart over the ruler — and no Martian
+    /// face has it, so the width says which cut the CJK fallback took.
+    #[cfg(windows)]
+    const PINYIN_RULER: usize = 60;
+
+    /// One editor per Latin trial with a 60-character `M` ruler, and, last,
+    /// the mono's `i` ruler, so a fixed-pitch face and a proportional one can
+    /// be told apart by their widths alone.
     #[cfg(windows)]
     #[component]
     fn FontProbe() -> impl IntoElement {
         let ruler_m: SharedString = "M".repeat(RULER).into();
         let ruler_i: SharedString = "i".repeat(RULER).into();
-        let source_text: SharedString = format!("{ruler_m}\n{ruler_i}").into();
         let mut probe = view()
             .test_id("font-probe")
             .flex_col()
             .w(px(760.0))
             .h(px(700.0));
-        for (index, family) in FONT_TRIALS.iter().enumerate() {
-            let text = if index == 0 {
-                source_text.clone()
-            } else {
-                ruler_m.clone()
-            };
-            probe = probe.child(font_editor(family, text, family));
+        for trial in LATIN_TRIALS {
+            probe = probe.child(font_editor(trial, ruler_m.clone()));
+        }
+        probe.child(font_editor(
+            FontTrial {
+                label: "FONT_SOURCE-i",
+                family: tokens::FONT_SOURCE,
+                weight: 400,
+            },
+            ruler_i,
+        ))
+    }
+
+    /// The CJK trials: the three lists whose CJK must come from DengXian, the
+    /// cuts and the YaHei the widths compare against, and the engine's own
+    /// fallback for the family that does not exist.
+    #[cfg(windows)]
+    const CJK_TRIALS: [FontTrial; 7] = [
+        FontTrial {
+            label: "FONT_UI",
+            family: tokens::FONT_UI,
+            weight: 400,
+        },
+        FontTrial {
+            label: "FONT_MODEL",
+            family: tokens::FONT_MODEL,
+            weight: 300,
+        },
+        FontTrial {
+            label: "FONT_SOURCE",
+            family: tokens::FONT_SOURCE,
+            weight: 400,
+        },
+        FontTrial {
+            label: "DengXian",
+            family: "DengXian",
+            weight: 400,
+        },
+        FontTrial {
+            label: "DengXian Light",
+            family: "DengXian Light",
+            weight: 300,
+        },
+        FontTrial {
+            label: "Microsoft YaHei UI",
+            family: "Microsoft YaHei UI",
+            weight: 400,
+        },
+        FontTrial {
+            label: "absent",
+            family: "No Such Family 12345",
+            weight: 400,
+        },
+    ];
+
+    /// The DengXian-cut trials: the three lists, so each one's `ǔ` width
+    /// shows which cut its CJK follows.
+    #[cfg(windows)]
+    const PINYIN_TRIALS: [FontTrial; 5] = [
+        FontTrial {
+            label: "FONT_UI",
+            family: tokens::FONT_UI,
+            weight: 400,
+        },
+        FontTrial {
+            label: "FONT_MODEL",
+            family: tokens::FONT_MODEL,
+            weight: 300,
+        },
+        FontTrial {
+            label: "FONT_SOURCE",
+            family: tokens::FONT_SOURCE,
+            weight: 400,
+        },
+        FontTrial {
+            label: "DengXian",
+            family: "DengXian",
+            weight: 400,
+        },
+        FontTrial {
+            label: "DengXian Light",
+            family: "DengXian Light",
+            weight: 300,
+        },
+    ];
+
+    /// The CJK probe: every trial's `―` ruler first, then the `ǔ` rulers of
+    /// [`PINYIN_TRIALS`].
+    #[cfg(windows)]
+    #[component]
+    fn CjkProbe() -> impl IntoElement {
+        let dash: SharedString = "―".repeat(DASH_RULER).into();
+        let mut probe = view()
+            .test_id("cjk-probe")
+            .flex_col()
+            .w(px(760.0))
+            .h(px(700.0));
+        for trial in CJK_TRIALS {
+            probe = probe.child(font_editor(trial, dash.clone()));
+        }
+        for trial in PINYIN_TRIALS {
+            probe = probe.child(font_editor(trial, "ǔ".repeat(PINYIN_RULER).into()));
         }
         probe
     }
 
-    /// An editor of a fixed height set in `family`.
+    /// An editor of a fixed height set in the trial's family and weight.
     #[cfg(windows)]
-    fn font_editor(id: &'static str, text: SharedString, family: &'static str) -> impl IntoElement {
-        view().test_id(id).w_full().h(px(56.0)).child(
+    fn font_editor(trial: FontTrial, text: SharedString) -> impl IntoElement {
+        view().test_id(trial.label).w_full().h(px(56.0)).child(
             editor()
                 .default_value(text)
-                .font_family(family)
+                .font_family(trial.family)
+                .font_weight(nsh_core::element::FontWeight(trial.weight))
                 .font_size(px(14.0))
                 .line_height(px(24.0))
                 .soft_wrap(false)
@@ -491,80 +657,200 @@ mod tests {
         widths
     }
 
-    /// Which family name lets the source editor draw the app's registered
-    /// Martian Mono.
-    ///
-    /// The faces register as `Martian Mono` / `Martian Grotesk` (their
-    /// typographic names, nameID 16), but DirectWrite's `FindFamilyName`
-    /// matches the files' legacy family names (nameID 1): `Martian Mono Cn Rg`
-    /// and `Martian Grotesk Std Rg`. A 60-character ruler line measures the
-    /// same whichever letter it is exactly when the face that resolved is
-    /// monospaced.
-    ///
-    /// Windows-only: it lays text out with the platform's own DirectWrite
-    /// engine, the one the app draws with.
+    /// A probe app on the platform's own DirectWrite engine — the one the app
+    /// draws with — with the embedded faces travelling with the root, as
+    /// `main.rs` hands them to the app's, and the registration given its 200ms
+    /// to land.
     #[cfg(windows)]
-    #[test]
-    fn the_editor_draws_the_registered_source_font() {
+    fn font_app(root: Root, ready: &str) -> Headless {
         use nsh_platform_windows::DWriteTextEngine;
 
-        // The faces travel with the root, as `main.rs` hands them to the app's:
-        // the first frame is already measured with them.
-        let mut root = Root::of::<FontProbe>();
+        let mut root = root;
         for face in crate::ui::fonts::faces() {
             root = root.font(face);
         }
         let mut app =
             Headless::start_with_text_engine(EngineConfig::new(root), DWriteTextEngine::default)
                 .expect("start the probe");
-        app.wait_for("id:font-probe").expect("the probe renders");
+        app.wait_for(ready).expect("the probe renders");
         app.settle();
         app.wait(Duration::from_millis(200))
             .expect("the faces' registration lands");
         app.settle();
+        app
+    }
 
-        let ruler_m = "M".repeat(RULER);
-        let ruler_i = "i".repeat(RULER);
-        let m = ruler_widths(&app, &ruler_m);
+    /// Every trial's ruler width, in the probe's own order, by trial label.
+    #[cfg(windows)]
+    fn widths_by_label(
+        app: &Headless,
+        trials: &[FontTrial],
+        ruler: &str,
+    ) -> Vec<(&'static str, f32)> {
+        let widths = ruler_widths(app, ruler);
         assert_eq!(
-            m.len(),
-            FONT_TRIALS.len(),
-            "one ruler line per trial: {m:?}"
+            widths.len(),
+            trials.len(),
+            "one {ruler:?} ruler per trial: {widths:?}"
         );
-        let i = ruler_widths(&app, &ruler_i);
-        assert_eq!(i.len(), 1, "the first trial's second line: {i:?}");
-        let source_i = i[0].1;
-        let table: Vec<String> = FONT_TRIALS
+        trials
             .iter()
-            .zip(&m)
-            .map(|(family, (_, width))| format!("{family}: {width}"))
-            .collect();
-        println!("ruler widths: {}", table.join(" | "));
+            .zip(&widths)
+            .map(|(trial, (_, width))| (trial.label, *width))
+            .collect()
+    }
 
-        // The first trial is what the column sets the editor in. Whatever it
-        // resolves to must be monospaced (60 `M`s and 60 `i`s measure alike)
-        // and must not be a face the trials after it resolve to either — the
-        // proportional ones (the typographic names, DengXian, the engine's
-        // fallback) and the system's own mono.
-        let (source, source_i) = (m[0].1, source_i);
+    /// The trial `label`'s ruler width in `table`.
+    #[cfg(windows)]
+    fn width_of(table: &[(&'static str, f32)], label: &str) -> f32 {
+        table
+            .iter()
+            .find(|(trial, _)| *trial == label)
+            .map(|(_, width)| *width)
+            .unwrap_or_else(|| panic!("trial {label} in {table:?}"))
+    }
+
+    /// A width table, for a failure's message.
+    #[cfg(windows)]
+    fn table_text(table: &[(&'static str, f32)]) -> String {
+        table
+            .iter()
+            .map(|(label, width)| format!("{label}: {width}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Which family name lets the source editor draw the app's registered
+    /// Martian Mono.
+    ///
+    /// The faces register under their files' legacy family names (nameID 1:
+    /// `Martian Mono Cn Rg`), the names DirectWrite's `FindFamilyName`
+    /// matches; the typographic name (nameID 16: `Martian Mono`) is a
+    /// fallback. A 60-character ruler line measures the same whichever letter
+    /// it is exactly when the face that resolved is monospaced.
+    ///
+    /// Windows-only: it lays text out with the platform's own DirectWrite
+    /// engine, the one the app draws with.
+    #[cfg(windows)]
+    #[test]
+    fn the_editor_draws_the_registered_source_font() {
+        let app = font_app(Root::of::<FontProbe>(), "id:font-probe");
+        let m = widths_by_label(&app, &LATIN_TRIALS, &"M".repeat(RULER));
+        let i = ruler_widths(&app, &"i".repeat(RULER));
+        assert_eq!(i.len(), 1, "the mono's second ruler: {i:?}");
+        let table = table_text(&m);
+        println!("ruler widths: {table}");
+
+        // The editor is set in `tokens::FONT_SOURCE`. Whatever it resolves to
+        // must be the registered mono: the width its own legacy family name
+        // measures (not a face a list falls through to — the system's mono,
+        // DengXian, the engine's fallback), and monospaced (60 `M`s and 60
+        // `i`s measure alike).
+        let source = width_of(&m, "FONT_SOURCE");
         assert!(
-            (source - source_i).abs() <= 0.5,
-            "the source editor did not resolve to a monospaced face: {RULER} M's are \
-             {source} wide, {RULER} i's are {source_i}; all: {table:?}"
+            (source - width_of(&m, "Cn Rg")).abs() <= 0.5,
+            "the source editor does not draw the registered mono: {source} vs \
+             {}; {table}",
+            width_of(&m, "Cn Rg")
         );
-        // The same as the family's legacy name on its own (the app's face),
-        // and neither the system mono nor DengXian (what the spec's list falls
-        // through to today).
-        let legacy = m[2].1;
-        let consolas = m[6].1;
-        let dengxian = m[7].1;
         assert!(
-            (source - legacy).abs() <= 0.5
-                && (source - consolas).abs() > 0.5
-                && (source - dengxian).abs() > 0.5,
-            "the source editor resolved to a system face: {source}, legacy {legacy}, \
-             Consolas {consolas}, DengXian {dengxian}; all: {table:?}"
+            (source - i[0].1).abs() <= 0.5,
+            "the source editor is not monospaced: {RULER} M's are {source} wide, \
+             {RULER} i's are {}; {table}",
+            i[0].1
         );
+        for face in ["Consolas", "DengXian", "absent"] {
+            assert!(
+                (source - width_of(&m, face)).abs() > 0.5,
+                "the source editor fell through to {face}: {table}"
+            );
+        }
+    }
+
+    /// Every role's list resolves to its own Martian face through the engine
+    /// the app draws with: the UI and preview body to the `Std Rg` instance,
+    /// the model's voice to `Std Lt`, the medium labels to `Std Md`, source
+    /// mode to the condensed mono. The three Grotesk rulers differ by their
+    /// advance widths, so the equality proves the *instance*, not just the
+    /// family.
+    #[cfg(windows)]
+    #[test]
+    fn the_ui_and_model_lists_resolve_to_martian() {
+        let app = font_app(Root::of::<FontProbe>(), "id:font-probe");
+        let table = widths_by_label(&app, &LATIN_TRIALS, &"M".repeat(RULER));
+        println!("ruler widths: {}", table_text(&table));
+
+        let (lt, rg, md) = (
+            width_of(&table, "Std Lt"),
+            width_of(&table, "Std Rg"),
+            width_of(&table, "Std Md"),
+        );
+        assert!(
+            lt < rg && rg < md,
+            "the instances' rulers must differ: {lt} / {rg} / {md}"
+        );
+        for (list, face) in [
+            ("FONT_UI", "Std Rg"),
+            ("FONT_MODEL", "Std Lt"),
+            ("FONT_MEDIUM", "Std Md"),
+            ("FONT_SOURCE", "Cn Rg"),
+        ] {
+            let (width, expected) = (width_of(&table, list), width_of(&table, face));
+            assert!(
+                (width - expected).abs() <= 0.5,
+                "{list} resolves to {width}, not {face}'s {expected}: {}",
+                table_text(&table)
+            );
+            for fallback in ["Consolas", "DengXian", "absent"] {
+                assert!(
+                    (width - width_of(&table, fallback)).abs() > 0.5,
+                    "{list} resolves like {fallback}: {}",
+                    table_text(&table)
+                );
+            }
+        }
+    }
+
+    /// The CJK fallback: the three lists take their CJK from DengXian before
+    /// Microsoft YaHei UI, and the model's 22px text from the light cut while
+    /// the body and source stay regular.
+    #[cfg(windows)]
+    #[test]
+    fn the_cjk_fallback_prefers_dengxian() {
+        let app = font_app(Root::of::<CjkProbe>(), "id:cjk-probe");
+        let dash = widths_by_label(&app, &CJK_TRIALS, &"―".repeat(DASH_RULER));
+        let pinyin = widths_by_label(&app, &PINYIN_TRIALS, &"ǔ".repeat(PINYIN_RULER));
+        println!("dash widths: {}", table_text(&dash));
+        println!("pinyin widths: {}", table_text(&pinyin));
+
+        let dengxian = width_of(&dash, "DengXian");
+        let yahei = width_of(&dash, "Microsoft YaHei UI");
+        for list in ["FONT_UI", "FONT_MODEL", "FONT_SOURCE"] {
+            let taken = width_of(&dash, list);
+            assert!(
+                (taken - dengxian).abs() <= 0.5 && (taken - yahei).abs() > 0.5,
+                "{list}'s CJK is not DengXian's: {taken} against {dengxian} / {yahei}: {}",
+                table_text(&dash)
+            );
+        }
+
+        let regular = width_of(&pinyin, "DengXian");
+        let light = width_of(&pinyin, "DengXian Light");
+        assert!(
+            regular - light > 1.0,
+            "the cuts' rulers must differ: {regular} / {light}"
+        );
+        for (list, cut, width) in [
+            ("FONT_MODEL", "DengXian Light", light),
+            ("FONT_UI", "DengXian", regular),
+            ("FONT_SOURCE", "DengXian", regular),
+        ] {
+            assert!(
+                (width_of(&pinyin, list) - width).abs() <= 0.5,
+                "{list}'s CJK is not the {cut} cut: {}",
+                table_text(&pinyin)
+            );
+        }
     }
 
     /// The box of the row whose laid-out text is `line`, and the editor's.

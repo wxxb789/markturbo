@@ -268,10 +268,27 @@ pub fn focus_watch() -> Signal<u64> {
 /// [`focus_watch`] changes. `None` when nothing is focused, or when the
 /// finding has no anchor in this document.
 pub fn focused_range() -> Option<EditorRange> {
+    anchor_range_of(emission().get_untracked().focus?)
+}
+
+/// The 0-based line finding `finding` is anchored to in this document: what
+/// the field hands the column's camera with
+/// [`AppState::focus_document_line`](crate::state::AppState::focus_document_line)
+/// when a step lands on it, and for the first finding when a result arrives
+/// (its ignition with the first question is the link). `None` when no result
+/// is live, when the finding has no anchor in this document, or when another
+/// tab holds it.
+pub fn anchor_line(finding: usize) -> Option<u32> {
+    anchor_range_of(finding).map(|range| range.start.line)
+}
+
+/// The range finding `finding` is anchored to, against the text the live
+/// result was made from. `None` with no live result, or no such anchor.
+fn anchor_range_of(finding: usize) -> Option<EditorRange> {
     let e = emission().get_untracked();
-    let index = e.focus?;
+    e.view.as_ref()?;
     e.anchors
-        .get(index)
+        .get(finding)
         .and_then(|slot| slot.as_ref())
         .map(|anchor| anchor.range)
 }
@@ -1006,5 +1023,99 @@ mod tests {
                 PropertyValue::Color(Some(Color::TRANSPARENT))
             )
         );
+    }
+
+    /// What each decoration declares, key by key.
+    ///
+    /// The editor replays a decoration's style through `Style::decls`, so the
+    /// keys are the whole contract: a style built from a refinement has none
+    /// and is dropped, and a colour declared as the wrong key (a glyph
+    /// colour where the row's background belongs) draws nothing where the
+    /// spec wants light. This is the regression guard for both.
+    #[test]
+    fn the_decorations_carry_the_declarations_the_editor_replays() {
+        for palette in [&tokens::DARK, &tokens::LIGHT] {
+            let anchor = Anchor {
+                range: EditorRange::new(EditorPosition::new(0, 0), EditorPosition::new(0, 1)),
+                stated: true,
+                at_ms: 0.0,
+            };
+
+            // A HOT stated finding: the glyphs in the hot colour, and the
+            // under-bloom as the span's background (over the emitter plate,
+            // one flat colour).
+            let hot = stated_decoration(&anchor, 1.0, palette);
+            let style = hot.style.as_ref().expect("a span style");
+            let decls = style.decls();
+            assert_eq!(decls.len(), 2, "{decls:?}");
+            assert_eq!(
+                decls[0],
+                StyleDecl::Set(
+                    StyleKey::Color,
+                    PropertyValue::Color(Some(styled_glyph(1.0, palette)))
+                )
+            );
+            assert!(
+                matches!(
+                    &decls[1],
+                    StyleDecl::Set(StyleKey::BackgroundColor, PropertyValue::Color(Some(color)))
+                        if alpha(*color) > 0.0
+                ),
+                "the under-bloom must be a visible span background: {decls:?}"
+            );
+            assert_eq!(styled_glyph(1.0, palette), palette.hot);
+
+            // Drained: neutral ink on the ghost plate, still declared the
+            // same way (readable, colourless).
+            let drained = stated_decoration(&anchor, 0.0, palette);
+            let decls = drained.style.as_ref().expect("a style").decls();
+            assert_eq!(decls.len(), 2, "{decls:?}");
+            assert_eq!(
+                decls[0],
+                StyleDecl::Set(
+                    StyleKey::Color,
+                    PropertyValue::Color(Some(palette.afterimage_ink))
+                )
+            );
+            assert_eq!(
+                decls[1],
+                StyleDecl::Set(
+                    StyleKey::BackgroundColor,
+                    PropertyValue::Color(Some(palette.afterimage_plate))
+                )
+            );
+
+            // The gutter tick alone, beside the lines it covers.
+            let gutter = hot.gutter.as_ref().expect("a tick");
+            assert_eq!(gutter.placement, EditorGutterPlacement::Lines);
+            assert_eq!(
+                gutter.style.as_ref().expect("a mark style").decls(),
+                &[StyleDecl::Set(
+                    StyleKey::BackgroundColor,
+                    PropertyValue::Color(Some(styled_tick(1.0, palette)))
+                )][..]
+            );
+
+            // An inferred finding: the air emits (the row's background and
+            // the 2px gutter edge), the glyphs carry nothing.
+            let inferred = inferred_decoration(&anchor, 1.0, palette);
+            assert!(inferred.style.is_none(), "the glyphs stay ink");
+            assert_eq!(
+                inferred.line_style.as_ref().expect("a line style").decls(),
+                &[StyleDecl::Set(
+                    StyleKey::BackgroundColor,
+                    PropertyValue::Color(Some(styled_haze(1.0, palette)))
+                )][..]
+            );
+            let edge = inferred.gutter.as_ref().expect("an edge");
+            assert_eq!(edge.placement, EditorGutterPlacement::Lines);
+            assert_eq!(
+                edge.style.as_ref().expect("a mark style").decls(),
+                &[StyleDecl::Set(
+                    StyleKey::BackgroundColor,
+                    PropertyValue::Color(Some(styled_edge(1.0, palette)))
+                )][..]
+            );
+        }
     }
 }

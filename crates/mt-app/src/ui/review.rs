@@ -222,6 +222,10 @@ fn observe(state: &AppState, session: Signal<Session>) {
                 // Nothing is focused yet: the question is the one HOT item
                 // until `J`/`K` (or the stepper) steps to a finding.
                 glow::focus_finding(None);
+                // The first finding ignites with the first question (their
+                // simultaneous ignition is the link): the column moves so the
+                // anchored lines sit level with the docked question.
+                level_finding(&state, view.tab_id, 0);
                 focus_request().set(Some(match (view.stale, current) {
                     (true, _) => Focus::ReviewAgain,
                     (false, Some(index)) => Focus::Answer(index),
@@ -328,6 +332,9 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
         session.showing_finding = true;
     });
     glow::focus_finding(Some(to));
+    // The column re-centres so the finding's anchored lines sit level with
+    // its explanation, docked in the field (document.rs reveals the line).
+    level_finding(state, view.tab_id, to);
     let heats = emitters().get_untracked().findings;
     if let Some(from) = from
         && from != to
@@ -337,6 +344,18 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
     }
     if let Some(heat) = heats.get(to).copied() {
         ignite_hold(heat, 0.0);
+    }
+}
+
+/// Asks the column's camera for the finding the field just made HOT: the
+/// source editor levels the anchored line with the docked explanation
+/// ([`AppState::focus_document_line`]). Nothing is asked when the finding is
+/// not anchored in this document (document-wide, or another file's).
+fn level_finding(state: &AppState, tab_id: Option<u64>, finding: usize) {
+    if let Some(tab_id) = tab_id
+        && let Some(line) = glow::anchor_line(finding)
+    {
+        state.focus_document_line(tab_id, line);
     }
 }
 
@@ -812,7 +831,9 @@ fn current_question_block(
         .gap(px(SPACE_2))
         .child(
             text(priority_label(question.priority, language))
-                .font_family(tokens::FONT_UI)
+                // The medium instance's own family; the three Grotesk faces
+                // are one family each.
+                .font_family(tokens::FONT_MEDIUM)
                 .text_size(px(TYPE_UI))
                 .line_height(move || px(ui_line(language)))
                 .font_weight(tokens::WEIGHT_MEDIUM)
@@ -1565,6 +1586,10 @@ fn model_line(language: Language) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use mt_core::review::SourceLocation;
+    use nsh_engine::{EngineConfig, Root};
+    use nsh_testing::Headless;
+
     use super::*;
 
     fn question(priority: ClarificationPriority, text: &str) -> ReviewQuestionView {
@@ -1663,5 +1688,201 @@ mod tests {
         assert_eq!(step_hint(0, Language::English), "No findings ·");
         assert_eq!(step_hint(1, Language::English), "1 finding ·");
         assert_eq!(step_hint(4, Language::English), "4 findings ·");
+    }
+
+    /// The document the camera probes review: three known lines.
+    fn camera_fixture() -> &'static std::path::Path {
+        static FIXTURE: std::sync::LazyLock<(tempfile::TempDir, std::path::PathBuf)> =
+            std::sync::LazyLock::new(|| {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let path = dir.path().join("camera.md");
+                std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("write the fixture");
+                (dir, path)
+            });
+        FIXTURE.1.as_path()
+    }
+
+    /// A result whose findings are anchored to the fixture's first and second
+    /// lines (the 1-based `lines` the model writes).
+    fn camera_view(tab_id: u64) -> ReviewView {
+        ReviewView {
+            findings_anchored: vec![
+                ReviewFindingView {
+                    stated: false,
+                    text: "the first".to_owned(),
+                    location: Some(SourceLocation::lines(1, 1)),
+                },
+                ReviewFindingView {
+                    stated: false,
+                    text: "the second".to_owned(),
+                    location: Some(SourceLocation::lines(2, 2)),
+                },
+            ],
+            tab_id: Some(tab_id),
+            ..ReviewView::default()
+        }
+    }
+
+    /// The camera request the state holds, drawn as `<tab>:<line>`: a signal
+    /// is not readable from the test thread, its render is.
+    fn camera_request(state: &AppState) -> impl IntoElement {
+        let state = state.clone();
+        text(move || {
+            let focus = state.document_focus.get();
+            format!("{}:{}", focus.tab, focus.line)
+        })
+        .test_id("camera-request")
+    }
+
+    /// The reviewed tab's id, drawn so a request can be checked against it.
+    fn camera_tab(state: &AppState) -> impl IntoElement {
+        let state = state.clone();
+        text(move || {
+            state
+                .active_tab()
+                .map(|tab| tab.id.to_string())
+                .unwrap_or_default()
+        })
+        .test_id("camera-tab")
+    }
+
+    /// Hand the fixture's tab to `glow` and to the state once it lands, as
+    /// the field's own result watcher does.
+    fn load_result(state: AppState) {
+        effect(move || {
+            if state.review_view.get_untracked().is_some() {
+                return;
+            }
+            let Some(tab) = state.active_tab() else {
+                return;
+            };
+            let view = camera_view(tab.id);
+            glow::observe(Some(&view), Some(&tab));
+            state.review_view.set(Some(view));
+        });
+    }
+
+    /// A live review and one control that steps through findings exactly as
+    /// `J` does; what it asks the column's camera for is on screen.
+    #[component]
+    fn StepProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.open_file(camera_fixture().to_path_buf());
+        state.review_open.set(true);
+        load_result(state.clone());
+        let session = session();
+        let step_state = state.clone();
+        view()
+            .test_id("camera-probe")
+            .flex_col()
+            .w(px(400.0))
+            .h(px(200.0))
+            .child(camera_tab(&state))
+            .child(camera_request(&state))
+            .child(
+                view()
+                    .test_id("camera-step")
+                    .w_full()
+                    .h(px(24.0))
+                    .on_press(move || step_finding(&step_state, session, 1)),
+            )
+    }
+
+    /// A review that arrives through the field's own result watcher, so the
+    /// camera request comes from the arrival path itself.
+    #[component]
+    fn ArrivalProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.open_file(camera_fixture().to_path_buf());
+        state.review_open.set(true);
+        observe(&state, session());
+        let loaded_state = state.clone();
+        effect(move || {
+            if loaded_state.review_view.get_untracked().is_some() {
+                return;
+            }
+            let Some(tab) = loaded_state.active_tab() else {
+                return;
+            };
+            loaded_state.review_view.set(Some(camera_view(tab.id)));
+        });
+        let marker_state = state.clone();
+        view()
+            .test_id("camera-arrival-probe")
+            .flex_col()
+            .w(px(400.0))
+            .h(px(200.0))
+            .child(camera_tab(&state))
+            .child(camera_request(&state))
+            .child(when(
+                move || marker_state.active_tab().is_some(),
+                || view().test_id("camera-loaded").w(px(1.0)).h(px(1.0)),
+            ))
+    }
+
+    /// The text of the node `id`, once the probe renders it.
+    fn text_of(app: &Headless, id: &str) -> String {
+        app.screen()
+            .layout_nodes()
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some(id))
+            .and_then(|node| node.text.as_ref().map(|text| text.text.text.to_string()))
+            .unwrap_or_else(|| panic!("no `{id}` text on screen: {:?}", app.screen().texts()))
+    }
+
+    /// `J`/`K` (and the stepper) ask the column's camera for the stepped
+    /// finding's anchored start line, of the reviewed tab.
+    ///
+    /// The probe's second finding is anchored to the fixture's second line, so
+    /// a request that follows the step reads `<tab>:1` — not the first
+    /// finding's line, and not another tab's.
+    #[test]
+    fn stepping_asks_the_camera_for_the_findings_line() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<StepProbe>())).expect("start the probe");
+        app.wait_for("id:camera-step").expect("the probe renders");
+        app.settle();
+        app.wait(Duration::from_millis(200))
+            .expect("the fixture's tab lands");
+        app.settle();
+
+        let tab = text_of(&app, "camera-tab");
+        assert!(!tab.is_empty(), "the fixture's tab must be open");
+        app.press("id:camera-step").expect("step to the first");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:0"),
+            "the first step must level the first finding's line"
+        );
+        app.press("id:camera-step").expect("step to the second");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:1"),
+            "the step must level the stepped finding's own line"
+        );
+    }
+
+    /// A result's arrival asks the camera for the first finding's line: its
+    /// simultaneous ignition with the first question is the link.
+    #[test]
+    fn the_arrival_levels_the_first_finding() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ArrivalProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:camera-loaded")
+            .expect("the fixture's tab lands");
+        app.settle();
+        app.wait(Duration::from_millis(200))
+            .expect("the result watcher runs");
+        app.settle();
+
+        let tab = text_of(&app, "camera-tab");
+        assert!(!tab.is_empty(), "the fixture's tab must be open");
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:0"),
+            "the arrival must level the first finding's line"
+        );
     }
 }
