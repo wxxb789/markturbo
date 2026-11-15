@@ -17,10 +17,11 @@
 //!
 //! The guard card asks through the state's [`crate::state::GuardRequest`]
 //! instead of the platform's dialog, so a close or a quit is decided inside
-//! the room: Save, Don't save or Cancel, with Cancel the default and the
-//! keyboard's Escape and Enter both its. Windows gives keyboard focus to text
-//! fields only (nsh 0.5.1), so the other two controls are pressed with the
-//! pointer; each carries an accessibility label.
+//! the room: Save, Don't save or Cancel, with Cancel selected first. Windows
+//! gives keyboard focus to text fields only (nsh 0.5.1), so the card carries
+//! its own ring: Left/Right (or Tab/Shift+Tab) move it, Enter takes the
+//! selected control's decision, and Escape always cancels. Every control
+//! carries an accessibility label.
 
 use std::{
     ops::Range,
@@ -323,10 +324,21 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
         .child(banner_rule())
 }
 
-/// Whether `state`'s active tab has its comparison open.
+/// Whether `state`'s active tab has its comparison open: the comparison was
+/// asked for *and* its disk text is there to show. The text is read when the
+/// comparison opens and dropped when a new conflict is noticed, so an old
+/// read can never reopen, or be shown as, this conflict's disk version.
 fn compare_open(state: &AppState) -> Option<Tab> {
     let tab = state.active_tab()?;
-    (tab.conflict.get() && state.conflict_compare.get() == Some(tab.id)).then_some(tab)
+    let asked = tab.conflict.get() && state.conflict_compare.get() == Some(tab.id);
+    (asked && disk_text(state, &tab).is_some()).then_some(tab)
+}
+
+/// Whether a conflict comparison is on screen — the column's lines are being
+/// levelled against the disk version, so `ui::document` treats it as a docked
+/// reading surface (its camera, its inset, its line numbers).
+pub fn compare_is_open(state: &AppState) -> bool {
+    compare_open(state).is_some()
 }
 
 /// Fold the comparison open (at its first difference), or away.
@@ -334,13 +346,25 @@ fn toggle_compare(state: &AppState) {
     let Some(tab) = state.active_tab() else {
         return;
     };
-    if state.conflict_compare.get() == Some(tab.id) {
+    // What is *shown* decides, not the marker: after a conflict is noticed
+    // again the marker may still name this tab (from the conflict before), and
+    // pressing Compare must open the comparison, not close nothing.
+    if compare_open(state).is_some() {
         state.conflict_compare.set(None);
     } else {
-        // The disk may have changed again since the conflict was noticed.
+        // Read the file as it is now: the conflict was noticed earlier.
         state.refresh_conflict_disk(&tab);
         state.conflict_difference.set(0);
         state.conflict_compare.set(Some(tab.id));
+        focus_line(state, &tab);
+    }
+}
+
+/// Level the column on the comparison's current difference, the way a review
+/// racks a finding.
+fn focus_line(state: &AppState, tab: &Tab) {
+    if let Some(line) = conflict_focus_line(state, tab) {
+        state.focus_document_line(tab.id, line);
     }
 }
 
@@ -374,6 +398,7 @@ fn step_difference(state: &AppState, delta: isize) {
     let current = state.conflict_difference.get().min(total - 1) as isize;
     let next = (current + delta).rem_euclid(total as isize) as usize;
     state.conflict_difference.set(next);
+    focus_line(state, &tab);
 }
 
 /// The comparison: the counter, the keys, and the disk version of the current

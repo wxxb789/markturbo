@@ -260,11 +260,11 @@ pub fn has_document(state: &AppState) -> bool {
 }
 
 /// Whether a surface that levels lines with its docked reading position is in
-/// the field (the review, a revision). The column shows the editor's line
-/// numbers — a reading pass's gutter — only then; the context reads a document
-/// of its own and never moves this one.
+/// the field (the review, a revision, a conflict comparison). The column shows
+/// the editor's line numbers — a reading pass's gutter — only then; the context
+/// reads a document of its own and never moves this one.
 fn docked_surfaces(state: &AppState) -> bool {
-    state.review_open.get() || revision::is_open(state)
+    state.review_open.get() || revision::is_open(state) || notices::compare_is_open(state)
 }
 
 /// The editor's half-viewport top inset, in points: half of `visible` while a
