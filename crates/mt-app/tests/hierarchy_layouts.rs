@@ -48,8 +48,18 @@ fn compatibility_layouts_are_progressively_disclosed() {
         .expect("compatibility layout disclosed");
     app.wait_for("text:Web preview").expect("its copy");
 
-    // The disclosed layout works: Web shows the document as a page with its
-    // scripts restricted until the user trusts them.
+    // Closing the disclosure hides the layout again: the menu carries it,
+    // and nothing stays on the row.
+    app.press("id:title-settings")
+        .expect("close the glyph's menu");
+    app.wait_for_gone("id:title-menu-web", Duration::from_secs(5))
+        .expect("the compatibility layout is hidden again");
+    assert!(!app.shows("Web preview"), "the disclosed layout stayed");
+
+    // Reopened, the disclosed layout works: Web shows the document as a page
+    // with its scripts restricted until the user trusts them.
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
     app.press("id:title-menu-web")
         .expect("switch to the web pane");
     app.wait_for("id:web-pane")
