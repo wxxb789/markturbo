@@ -126,15 +126,13 @@ struct Decision {
 }
 
 /// What the field remembers between rebuilds: which proposal the decisions
-/// belong to, which hunk holds the reading position, and which outcome the
-/// user already dismissed. A proposal is its hunks' content, so a new or
-/// re-rolled one never inherits a decision.
+/// belong to and which hunk holds the reading position. A proposal is its
+/// hunks' content, so a new or re-rolled one never inherits a decision.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Session {
     proposal: u64,
     current: usize,
     decisions: Vec<Decision>,
-    dismissed: Option<u64>,
 }
 
 impl Session {
@@ -256,13 +254,6 @@ fn proposal_id(hunks: &[RevisionHunkView]) -> u64 {
     hasher.finish()
 }
 
-/// The identity of one outcome text.
-fn text_id(text: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// The decision on `change_id`, for a surface that draws the revision's other
 /// half — the column's cold strikes: `Some(true)` accepted, `Some(false)`
 /// rejected (the marks go), `None` still to be judged (the marks stand).
@@ -280,34 +271,15 @@ pub fn decision(state: &AppState, change_id: u32) -> Option<bool> {
 /// Whether the field is showing a revision.
 ///
 /// An outcome with no hunks on screen — a failure before any proposal, or the
-/// confirmation after `Done` — holds the field until it is dismissed; a run
-/// that starts after that (the status goes back to nothing while one is
-/// prepared) opens it again, with the same outcome text or another.
+/// confirmation after `Done` — holds the field until it is dismissed, and
+/// [`dismiss`] consumes it: the next outcome opens the field again, whether it
+/// reads the same as the dismissed one or not. Nothing here remembers a
+/// dismissal, so an outcome the state writes again (a second `Prepare
+/// revision` failing the same way does not pass through nothing) still shows.
 pub fn is_open(state: &AppState) -> bool {
-    if state.revision_busy.get() || state.revision_hunks.with(|hunks| !hunks.is_empty()) {
-        return true;
-    }
-    let Some(status) = state.revision_status.get() else {
-        // No outcome yet: the dismissed one is done with, so the next run's
-        // outcome shows however its text reads.
-        forget_dismissal();
-        return false;
-    };
-    session().get().dismissed != Some(text_id(&status))
-}
-
-/// Forget which outcome was dismissed. Written from [`is_open`], which the
-/// shell asks on every commit (its answer is a `when` condition), so a
-/// dismissal never outlives the outcome it named.
-fn forget_dismissal() {
-    let Some(now) = try_global::<Session>() else {
-        return;
-    };
-    now.update(|session| {
-        if session.dismissed.is_some() {
-            session.dismissed = None;
-        }
-    });
+    state.revision_busy.get()
+        || state.revision_hunks.with(|hunks| !hunks.is_empty())
+        || state.revision_status.get().is_some()
 }
 
 /// The revision field.
@@ -328,6 +300,8 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
 
     let stale_state = state.clone();
     let stale_action = state.clone();
+    let done_key_state = state.clone();
+    let done_key_gate = state.clone();
     let outcome_state = state.clone();
     let rows_state = state.clone();
     let decisions_state = state.clone();
@@ -384,6 +358,20 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
         .child(when(
             move || hunks.with(|hunks| !hunks.is_empty()),
             move || key_hints(language),
+        ))
+        // `Done`'s key, bound only while there is something it could apply: in
+        // every other state the keystroke stays the title row's `mod+enter`
+        // (`Review`), and a stale proposal has nothing to apply. The binding
+        // lives and dies with this region, which is out of the flex flow.
+        .child(when(
+            move || {
+                !done_key_gate.revision_hunks.with(|hunks| hunks.is_empty())
+                    && !done_key_gate.revision_is_stale()
+            },
+            move || {
+                bind_done_key(&done_key_state);
+                view().absolute().pointer_events(PointerEvents::None)
+            },
         ))
 }
 
@@ -913,22 +901,29 @@ fn key_hints(language: Language) -> impl IntoElement {
 // ─── keys ─────────────────────────────────────────────────────────────────
 
 /// `A` / `R` decide the current hunk, `J` / `K` move between them, and
-/// `Ctrl+Z` takes the last decision back; `Ctrl+Enter` is `Done` — all while
-/// no text input has the keyboard focus, so the document stays fully
-/// editable.
+/// `Ctrl+Z` takes the last decision back — all while no text input has the
+/// keyboard focus, so the document stays fully editable. They do nothing
+/// without a proposal, so they may stay bound; `Done`'s own key has a side
+/// effect with none, and is bound by [`bind_done_key`] only where it applies.
 fn bind_keys(state: &AppState, heat: Heat) {
     let keys = state.clone();
     on_key("a", move |_| decide(&keys, heat, true));
     let keys = state.clone();
     on_key("r", move |_| decide(&keys, heat, false));
     let keys = state.clone();
-    on_key("ctrl+enter", move |_| keys.apply_revision());
-    let keys = state.clone();
     on_key("j", move |_| move_by(&keys, 1));
     let keys = state.clone();
     on_key("k", move |_| move_by(&keys, -1));
     let keys = state.clone();
     on_key("ctrl+z", move |_| undo_decision(&keys));
+}
+
+/// `Ctrl+Enter` is `Done` (also the title row's `mod+enter`, `Review`): the
+/// field claims it only while a proposal is on screen and fresh, so the
+/// shortcut keeps starting a Review from every other state.
+fn bind_done_key(state: &AppState) {
+    let keys = state.clone();
+    on_key("ctrl+enter", move |_| keys.apply_revision());
 }
 
 // ─── actions ──────────────────────────────────────────────────────────────
@@ -1016,12 +1011,11 @@ fn undo_decision(state: &AppState) {
     }
 }
 
-/// Dismiss the outcome text on screen; a new one opens the field again.
+/// Dismiss the outcome text on screen: it is consumed, so the next outcome
+/// opens the field again however it reads — an identical failure included
+/// (the state writes it again without ever going back to nothing).
 fn dismiss(state: &AppState) {
-    let Some(status) = state.revision_status.get() else {
-        return;
-    };
-    session().update(|now| now.dismissed = Some(text_id(&status)));
+    state.revision_status.set(None);
 }
 
 /// The reading position to hunk `index` (a pressed row).
@@ -1484,14 +1478,12 @@ mod tests {
         let state = AppState::new();
         state.revision_status.set(Some(failure_text()));
         let show_state = state.clone();
-        let clear_state = state.clone();
         let fail_state = state.clone();
         view()
             .child(when(
                 move || is_open(&show_state),
                 move || field(state.clone(), Language::English),
             ))
-            .child(text("clear").on_press(move || clear_state.revision_status.set(None)))
             .child(
                 text("fail-again")
                     .on_press(move || fail_state.revision_status.set(Some(failure_text()))),
@@ -1622,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outcome_without_hunks_holds_the_field_until_dismissed() {
+    fn a_dismissed_outcome_never_hides_the_next_one() {
         let mut app =
             Headless::start(EngineConfig::new(Root::of::<OutcomeProbe>())).expect("start");
         app.wait_for("text:Revision failed: Timed out after 60 s")
@@ -1635,10 +1627,9 @@ mod tests {
             "the dismissed outcome hides the field"
         );
 
-        // A run that starts after the dismissal (the status goes back to
-        // nothing while one is prepared) opens the field again, even for the
-        // very same outcome text: a failure is never silently hidden.
-        app.press("text:clear").expect("a new run starts");
+        // A second attempt failing the very same way writes the same outcome
+        // without ever going back to nothing (what `Prepare revision` does):
+        // a failure is never silently hidden behind the dismissal.
         app.press("text:fail-again").expect("it fails the same way");
         app.wait_for("text:Revision failed: Timed out after 60 s")
             .expect("the same failure shows again");
@@ -1646,7 +1637,31 @@ mod tests {
             app.screen()
                 .matches("id:revision-dismiss")
                 .expect("the selector"),
-            "and can be dismissed again"
+            "and can be dismissed again: {:?}",
+            app.screen().texts()
+        );
+    }
+
+    #[test]
+    fn done_key_stays_unbound_where_nothing_applies() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<OutcomeProbe>())).expect("start");
+        app.wait_for("text:Revision failed: Timed out after 60 s")
+            .expect("the failure is on screen");
+        // `Ctrl+Enter` is `Done` only while a proposal could apply: with none
+        // it belongs to the title row's `mod+enter` (`Review`), and the field
+        // must not write `Done`'s own refusal over the outcome on screen.
+        app.press_key("ctrl+enter").expect("press Ctrl+Enter");
+        app.wait_for("text:probe-tail").expect("the probe's tail");
+        assert!(
+            app.shows("Revision failed: Timed out after 60 s"),
+            "the outcome is untouched: {:?}",
+            app.screen().texts()
+        );
+        assert!(
+            !app.shows("Run Review first to prepare a Revision."),
+            "and `Done` did not claim the key: {:?}",
+            app.screen().texts()
         );
     }
 
