@@ -284,11 +284,6 @@ pub struct OutboundItem {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutboundConsent {
     pub disclosure: ModelRequestDisclosure,
-    /// The framed request's bytes, when mt-core computed them at bind time:
-    /// the canonical review frame for a document or a document with Effective
-    /// Agent Context, the framed payload for an Agent Skill package. `None`
-    /// when only the items are known (a Revision).
-    pub framed_bytes: Option<u64>,
     /// What leaves and why, in display order.
     pub items: Vec<OutboundItem>,
     /// Normally in-scope items that do not leave, in display order.
@@ -2313,10 +2308,6 @@ impl AppState {
         stays.extend(excluded);
         OutboundConsent {
             disclosure,
-            framed_bytes: bound
-                .inspection()
-                .ok()
-                .map(|inspection| inspection.canonical_byte_size()),
             items,
             stays,
         }
@@ -2471,9 +2462,6 @@ impl AppState {
         }
         OutboundConsent {
             disclosure,
-            // The Revision payload's own framing is built at execute time and
-            // is not part of the disclosure, so only the items are known.
-            framed_bytes: None,
             items,
             stays: Vec::new(),
         }
