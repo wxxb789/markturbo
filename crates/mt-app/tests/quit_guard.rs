@@ -1,7 +1,12 @@
 //! The in-app Quit action must ask before discarding dirty buffers.
+//!
+//! Afterglow: Quit lives in the title menu and raises the guard card; Cancel
+//! keeps the window open with the buffer untouched.
+
+use std::time::Duration;
 
 use nsh_engine::{EngineConfig, Points, Root};
-use nsh_testing::{DialogAnswer, Headless};
+use nsh_testing::Headless;
 
 #[test]
 fn quit_cancel_keeps_the_dirty_document_open() {
@@ -25,13 +30,26 @@ fn quit_cancel_keeps_the_dirty_document_open() {
         .expect("source editor");
     app.type_text("label:Markdown source", "\nUnsaved edit.")
         .expect("edit the buffer");
+    app.wait_for("id:title-dirty").expect("dirty mark");
 
-    app.on_dialog(|_| DialogAnswer::Press("Cancel".to_owned()));
-    app.press("text:Quit").expect("request quit");
-    app.settle();
+    // Quit must raise the guard card, not close silently: the gear opens the
+    // title menu, whose Quit row carries its own test id.
+    app.press("label:\u{2699}").expect("open the title menu");
+    app.wait_for("id:title-menu").expect("the menu");
+    app.press("id:title-menu-quit").expect("request quit");
+    app.wait_for("id:guard-card").expect("quit guard");
 
+    // Cancel is the guard's safe default; take it.
+    app.press("id:guard-card >> label:Cancel")
+        .expect("cancel the quit");
+    app.wait_for_gone("id:guard-card", Duration::from_secs(5))
+        .expect("the guard card goes");
+
+    // Cancelled quit: the window (and the document) stays open, buffer intact.
     app.wait_for("label:Markdown source")
         .expect("cancelled quit keeps the window open");
+    app.wait_for("id:title-dirty")
+        .expect("the buffer is still dirty");
     let text = app
         .screen()
         .input_text("label:Markdown source")
