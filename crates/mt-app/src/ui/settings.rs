@@ -24,14 +24,14 @@ use mt_core::{
     model::{EndpointIdentity, EndpointIdentityError, Provider},
     settings::{Language, SettingsData, ThemePreference},
 };
-use nsh_base::input;
+use nsh_base::{button, input};
 use nsh_core::{Color, prelude::*};
 
 use crate::{
     i18n::{self, Key},
     state::{AppState, CredentialStatus},
     ui::{
-        notices, prims,
+        motion, notices, prims,
         tokens::{
             self, COLUMN_GAP, FONT_UI, HAIRLINE, MEASURE_WIDE, RAIL_W, SPACE_2, SPACE_3, SPACE_4,
             SPACE_5, TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MEDIUM,
@@ -408,6 +408,9 @@ fn translation_section(state: AppState, language: Language) -> impl IntoElement 
 fn credential_section(state: AppState, language: Language) -> impl IntoElement {
     let value_state = state.clone();
     let change_state = state.clone();
+    // Where the keyboard focus goes after Remove: the store control stays the
+    // same element through every status change, so it is a safe landing place.
+    let store_ref = element_ref();
     section(
         i18n::t(language, Key::Credential),
         view()
@@ -441,6 +444,7 @@ fn credential_section(state: AppState, language: Language) -> impl IntoElement {
                 state.clone(),
                 state,
                 language,
+                store_ref,
             )),
     )
 }
@@ -462,12 +466,13 @@ fn credential_status_line(state: AppState, language: Language) -> impl IntoEleme
         })
 }
 
-/// The vault's answer for the configured endpoint. The revision signal makes a
-/// store or a removal reach the views that read it: the vault has no signal of
-/// its own, and the status is never derived from the key field.
+/// The vault's answer for the configured endpoint, memoised on the endpoint and
+/// the credential revision (see [`AppState::credential_status_cached`]): the
+/// memo signal makes a store or a removal reach the views that read it, and the
+/// settings signal makes an endpoint change reach them. The status is never
+/// derived from the key field.
 fn current_credential_status(state: &AppState) -> CredentialStatus {
-    let _revision = state.settings_credential_revision.get();
-    state.credential_status()
+    state.credential_status_cached()
 }
 
 /// The status line's copy.
@@ -475,11 +480,12 @@ fn credential_status_text(state: &AppState, language: Language) -> SharedString 
     let settings = state.settings.get();
     match current_credential_status(state) {
         CredentialStatus::Unconfigured => {
-            // No wire format at all, or the base URL does not parse: say which.
-            let key = if settings.model_provider.trim().is_empty() {
-                Key::ChooseProviderForCredential
-            } else {
-                Key::CredentialEndpointInvalid
+            // No wire format, one this build does not know, or a base URL that
+            // does not parse: say which.
+            let key = match provider_choice(&settings) {
+                ProviderChoice::Best => Key::ChooseProviderForCredential,
+                ProviderChoice::Unsupported => Key::UnsupportedProvider,
+                ProviderChoice::Wire(_) => Key::CredentialEndpointInvalid,
             };
             SharedString::from(i18n::t(language, key))
         }
@@ -500,43 +506,30 @@ fn credential_actions(
     session_state: AppState,
     remove_state: AppState,
     language: Language,
+    store_ref: ElementRef,
 ) -> impl IntoElement {
-    let store_condition = store_state.clone();
-    let replace_branch = store_state.clone();
-    let store_branch = store_state.clone();
+    let label_state = store_state.clone();
     let remove_condition = remove_state.clone();
     view()
         .flex_row()
         .items_center()
         .gap(px(SPACE_3))
         .child(
-            when(
-                move || current_credential_status(&store_condition) == CredentialStatus::Stored,
-                {
-                    let state = replace_branch.clone();
-                    move || {
-                        prims::quiet_action("settings-credential-store", s(S::Replace, language), {
-                            let state = state.clone();
-                            move || store_key(&state, language, false)
-                        })
-                        .into_element()
+            reactive_action(
+                "settings-credential-store",
+                move || {
+                    if current_credential_status(&label_state) == CredentialStatus::Stored {
+                        s(S::Replace, language).into()
+                    } else {
+                        SharedString::from(i18n::t(language, Key::StoreCredentialSecurely))
                     }
                 },
+                {
+                    let state = store_state.clone();
+                    move || store_key(&state, language, false)
+                },
             )
-            .otherwise({
-                let state = store_branch.clone();
-                move || {
-                    prims::quiet_action(
-                        "settings-credential-store",
-                        i18n::t(language, Key::StoreCredentialSecurely),
-                        {
-                            let state = state.clone();
-                            move || store_key(&state, language, false)
-                        },
-                    )
-                    .into_element()
-                }
-            }),
+            .element_ref(&store_ref),
         )
         .child(prims::quiet_action(
             "settings-credential-session",
@@ -553,7 +546,7 @@ fn credential_actions(
             move || {
                 prims::quiet_action("settings-credential-remove", s(S::Remove, language), {
                     let state = remove_state.clone();
-                    move || remove_key(&state, language)
+                    move || remove_key(&state, language, store_ref)
                 })
                 .into_element()
             },
@@ -595,7 +588,7 @@ fn store_key(state: &AppState, language: Language, session: bool) {
 }
 
 /// Forget the endpoint's key, in the secure store and in this process.
-fn remove_key(state: &AppState, language: Language) {
+fn remove_key(state: &AppState, language: Language, focus_after: ElementRef) {
     match state.remove_credential() {
         Ok(()) => {
             state.settings_credential_revision.update(|n| *n += 1);
@@ -603,6 +596,9 @@ fn remove_key(state: &AppState, language: Language) {
                 language,
                 Key::CredentialDeleted,
             )));
+            // This button goes away with the key it forgot: the keyboard user
+            // lands on the store control instead of nowhere.
+            focus_after.focus();
         }
         Err(error) => state.settings_notice.set(SharedString::from(error)),
     }
@@ -634,24 +630,23 @@ fn theme_row(state: AppState, language: Language) -> impl IntoElement {
         ),
     ] {
         let read_state = state.clone();
-        let set_state = state.clone();
+        let press_state = state.clone();
         row = row.child(
             view()
                 .flex_row()
                 .items_center()
                 .gap(px(SPACE_2))
                 .child(swatch(choice))
-                .child(
-                    when(
-                        move || read_state.settings.get().theme == choice,
-                        move || prims::ink(name).into_element(),
-                    )
-                    .otherwise(move || {
-                        let state = set_state.clone();
-                        prims::quiet_action(id, name, move || state.set_theme(choice))
-                            .into_element()
-                    }),
-                ),
+                .child(choice_button(
+                    id,
+                    name,
+                    move || read_state.settings.get().theme == choice,
+                    move || {
+                        if press_state.settings.get().theme != choice {
+                            press_state.set_theme(choice);
+                        }
+                    },
+                )),
         );
     }
     row
@@ -774,10 +769,11 @@ fn usage_section(state: AppState, language: Language) -> impl IntoElement {
         ))
 }
 
-/// A row of mutually exclusive choices: the current one is plain full-ink text
-/// (it is the value, not an action), the others are quiet actions that set it.
-/// `read` reads the settings signal inside the binding, so a change repaints
-/// the row.
+/// A row of mutually exclusive choices: the current one reads as the value (full
+/// ink, selected for screen readers) and the others rest, but every choice stays
+/// the same pressable control, so choosing one with the keyboard keeps the
+/// focus. `read` reads the settings signal inside the bindings, so a change
+/// repaints the row.
 fn choice_row<T: Copy + PartialEq + 'static>(
     test_id: &'static str,
     label: &'static str,
@@ -798,20 +794,110 @@ fn choice_row<T: Copy + PartialEq + 'static>(
         let id = *id;
         let name = *name;
         let value = *value;
-        let read_state = state.clone();
-        let set_state = state.clone();
-        row = row.child(
-            when(
-                move || read(&read_state.settings.get()) == value,
-                move || prims::ink(name).into_element(),
-            )
-            .otherwise(move || {
-                let state = set_state.clone();
-                prims::quiet_action(id, name, move || set(&state, value)).into_element()
-            }),
-        );
+        let current_state = state.clone();
+        let press_state = state.clone();
+        row = row.child(choice_button(
+            id,
+            name,
+            move || read(&current_state.settings.get()) == value,
+            move || {
+                if read(&press_state.settings.get()) != value {
+                    set(&press_state, value);
+                }
+            },
+        ));
     }
     row
+}
+
+/// One choice of a mutually exclusive row: the current one carries full ink and
+/// the selected state for screen readers, the others rest, and every one of
+/// them is the same pressable control — so a choice made with the keyboard
+/// keeps the focus where it was.
+fn choice_button(
+    test_id: &'static str,
+    label: &'static str,
+    current: impl Fn() -> bool + Clone + 'static,
+    on_press: impl Fn() + 'static,
+) -> impl Interactive + ParentElement {
+    let label: SharedString = label.into();
+    let colour = {
+        let current = current.clone();
+        move || {
+            if current() {
+                tokens::palette().ink
+            } else {
+                tokens::palette().ink_rest
+            }
+        }
+    };
+    // The test id goes on the wrapper: `nsh_base`'s components are not views,
+    // so `test_id` reaches them through a plain element around them.
+    view()
+        .test_id(test_id)
+        .bg(Color::TRANSPARENT)
+        .window_drag(false)
+        .child(
+            button()
+                .accessibility_label(Some(label.clone()))
+                .selected(current)
+                .px(px(2.0))
+                .py(px(4.0))
+                .bg(Color::TRANSPARENT)
+                .cursor_pointer()
+                .rounded(px(0.0))
+                .transition_colors()
+                .duration(motion::HOVER_MS)
+                .hover(|s| s.text_color(tokens::palette().ink).underline())
+                .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                .on_press(on_press)
+                .child(
+                    text(label)
+                        .font_family(FONT_UI)
+                        .text_size(px(TYPE_UI))
+                        .line_height(px(TYPE_UI_LINE))
+                        .text_color(colour),
+                ),
+        )
+}
+
+/// A quiet local action whose label follows the state. The credential's one
+/// store control must stay the same element while its label changes from
+/// 'Store securely' to 'Replace', or the focus a keyboard user put on it is
+/// thrown away.
+fn reactive_action(
+    test_id: &'static str,
+    label: impl Fn() -> SharedString + Clone + 'static,
+    on_press: impl Fn() + 'static,
+) -> impl Interactive + ParentElement {
+    view()
+        .test_id(test_id)
+        .bg(Color::TRANSPARENT)
+        .window_drag(false)
+        .child(
+            button()
+                .accessibility_label({
+                    let label = label.clone();
+                    move || Some(label())
+                })
+                .px(px(2.0))
+                .py(px(4.0))
+                .bg(Color::TRANSPARENT)
+                .cursor_pointer()
+                .rounded(px(0.0))
+                .transition_colors()
+                .duration(motion::HOVER_MS)
+                .hover(|s| s.text_color(tokens::palette().ink).underline())
+                .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                .on_press(on_press)
+                .child(
+                    text(label)
+                        .font_family(FONT_UI)
+                        .text_size(px(TYPE_UI))
+                        .line_height(px(TYPE_UI_LINE))
+                        .text_color(move || tokens::palette().ink_rest),
+                ),
+        )
 }
 
 /// The settings page's own copy. New strings live here rather than in
@@ -874,6 +960,80 @@ fn s(key: S, language: Language) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, LazyLock, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use mt_core::credentials::{CredentialError, Secret, SecureCredentialStore};
+
+    /// The vault a test drives: credentials live in this map and never in the
+    /// platform's secure store, and every read is counted, so a test can prove
+    /// the page does not read the store per keystroke.
+    #[derive(Default)]
+    struct CountingStore {
+        values: Mutex<HashMap<String, Secret>>,
+        reads: AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+
+        fn forget_reads(&self) {
+            self.reads.store(0, Ordering::Relaxed);
+        }
+
+        /// The secret stored for `target`, for the test's own assertions.
+        fn stored(&self, target: &str) -> Option<String> {
+            self.values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(target)
+                .map(|secret| secret.expose().to_owned())
+        }
+    }
+
+    impl SecureCredentialStore for CountingStore {
+        fn is_supported(&self) -> bool {
+            true
+        }
+
+        fn read(&self, target: &str) -> Result<Option<Secret>, CredentialError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(target)
+                .cloned())
+        }
+
+        fn write(&self, target: &str, secret: &Secret) -> Result<(), CredentialError> {
+            self.values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(target.to_owned(), secret.clone());
+            Ok(())
+        }
+
+        fn delete(&self, target: &str) -> Result<(), CredentialError> {
+            self.values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(target);
+            Ok(())
+        }
+    }
+
+    /// The probe's vault: one per test binary, read by the test that drives the
+    /// page so it can count the store reads.
+    static PROBE_STORE: LazyLock<Arc<CountingStore>> =
+        LazyLock::new(|| Arc::new(CountingStore::default()));
 
     #[test]
     fn an_empty_base_url_uses_the_provider_default() {
@@ -950,11 +1110,14 @@ mod tests {
 
     /// The page on its own, without the shell: the probe test's root. The shell
     /// is not the subject here — while the overlay layer takes pointer input
-    /// nothing above it is pressable in the harness either.
+    /// nothing above it is pressable in the harness either. Its vault is the
+    /// probe's own in-memory store, never the platform's.
     #[component]
     fn SettingsProbe() -> impl IntoElement {
         crate::ui::fonts::register();
-        let state = AppState::new();
+        let state = AppState::with_vault(mt_core::credentials::CredentialVault::with_store(
+            PROBE_STORE.clone(),
+        ));
         // A custom endpoint, so the environment is never consulted: the status
         // this probe reads is the one the vault holds.
         state.settings.update(|settings| {
@@ -975,12 +1138,13 @@ mod tests {
     }
 
     /// Drives the page in the headless harness: the credential status follows
-    /// the wire format, the line under the base URL follows what is typed, and
-    /// the session key stores and is forgotten again. Kept because the real
-    /// window cannot be driven on this host (a disconnected session takes no
-    /// synthetic input).
+    /// the wire format, the line under the base URL follows what is typed, the
+    /// secure store is read for an endpoint change and not for anything else,
+    /// and the stored and session keys are forgotten again. Kept because the
+    /// real window cannot be driven on this host (a disconnected session takes
+    /// no synthetic input).
     #[test]
-    fn the_page_follows_the_endpoint_and_manages_a_session_key() {
+    fn the_page_follows_the_endpoint_and_manages_the_keys() {
         let config = tempfile::tempdir().expect("config dir");
         // SAFETY: no other test in this binary starts the app or reads these
         // variables.
@@ -1034,8 +1198,108 @@ mod tests {
         app.wait_for("text:No key saved")
             .expect("configured status");
 
-        // The session fallback stores nothing persistent, clears the field, and
-        // Remove takes it away again.
+        // A choice that is now the current one stays the same control: pressing
+        // it again is still a press (a keyboard user keeps the focus) and does
+        // nothing — not even re-saving the settings.
+        app.press("text:OpenAI Chat Completions")
+            .expect("the current wire format is still a control");
+        app.press("text:English")
+            .expect("the current language is still a control");
+        app.wait_for("text:No key saved").expect("unchanged status");
+        assert!(
+            !app.screen().shows("Settings saved."),
+            "pressing the current choice saved the settings again"
+        );
+
+        // The status is read from the vault for an endpoint change, and for
+        // nothing else: typing in a field the status does not depend on, or
+        // toggling the local counters, must not touch the secure store.
+        PROBE_STORE.forget_reads();
+        app.type_text("id:settings-model", "probe-model")
+            .expect("type a model");
+        app.wait_for("text:probe-model").expect("the model landed");
+        assert_eq!(
+            PROBE_STORE.reads(),
+            0,
+            "the status read the vault for a model edit"
+        );
+        app.clear("id:settings-target-language")
+            .expect("clear the target language");
+        app.type_text("id:settings-target-language", "ja")
+            .expect("type a target language");
+        app.wait_for("text:ja").expect("the target language landed");
+        app.press("text:On").expect("enable the local counters");
+        app.wait_for("text:Usage-counter preference saved.")
+            .expect("the counters were saved");
+        assert_eq!(
+            PROBE_STORE.reads(),
+            0,
+            "the status read the vault for a preference change"
+        );
+
+        // The key stores in the vault the page was built with, the control
+        // keeps its identity while its label changes to Replace, and Remove
+        // forgets it again.
+        let target =
+            EndpointIdentity::parse(Provider::OpenAiChat, Some("http://127.0.0.1:8000/v1"))
+                .expect("the probe's endpoint")
+                .credential_target()
+                .as_str()
+                .to_owned();
+        app.type_text("id:api-key", "synthetic-probe-key")
+            .expect("type a key");
+        app.press("text:Store securely").expect("store securely");
+        app.wait_for("text:Key saved in Windows Credential Manager")
+            .expect("stored status");
+        app.wait_for("text:Key stored securely.")
+            .expect("store notice");
+        assert!(
+            PROBE_STORE.reads() > 0,
+            "the stored status never read the vault"
+        );
+        assert_eq!(
+            PROBE_STORE.stored(&target).as_deref(),
+            Some("synthetic-probe-key"),
+            "the key did not reach the vault"
+        );
+        assert_eq!(
+            app.screen()
+                .input_text("id:api-key")
+                .expect("read the key field")
+                .unwrap_or_default(),
+            "",
+            "the field keeps the key after storing it"
+        );
+        app.type_text("id:api-key", "synthetic-replacement-key")
+            .expect("type a replacement");
+        app.press("text:Replace")
+            .expect("the same control, replaced");
+        app.wait_for("text:Key saved in Windows Credential Manager")
+            .expect("still stored");
+        assert_eq!(
+            PROBE_STORE.stored(&target).as_deref(),
+            Some("synthetic-replacement-key"),
+            "Replace did not write the new key"
+        );
+        assert_eq!(
+            app.screen()
+                .input_text("id:api-key")
+                .expect("read the key field")
+                .unwrap_or_default(),
+            "",
+            "the field keeps the key after replacing it"
+        );
+        app.press("text:Remove").expect("forget the stored key");
+        app.wait_for("text:No key saved")
+            .expect("status after removal");
+        assert_eq!(
+            PROBE_STORE.stored(&target),
+            None,
+            "Remove left the key in the vault"
+        );
+
+        // The session fallback stores nothing persistent and is forgotten the
+        // same way.
         app.type_text("id:api-key", "synthetic-probe-key")
             .expect("type a key");
         app.press("text:Use for session")
@@ -1045,12 +1309,9 @@ mod tests {
         app.wait_for("text:Key stored for this session.")
             .expect("store notice");
         assert_eq!(
-            app.screen()
-                .input_text("id:api-key")
-                .expect("read the key field")
-                .unwrap_or_default(),
-            "",
-            "the field keeps the key after storing it"
+            PROBE_STORE.stored(&target),
+            None,
+            "the session key was written to the secure store"
         );
         app.press("text:Remove").expect("forget the key");
         app.wait_for("text:No key saved")

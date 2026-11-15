@@ -114,6 +114,10 @@ pub struct AppState {
     /// Bumped after a credential is stored or removed, so the settings page
     /// re-reads the credential status: the vault has no signal of its own.
     pub settings_credential_revision: Signal<u64>,
+    /// The last credential status and what it was computed for, so a render
+    /// that changes nothing about the endpoint does not read the secure store
+    /// again; the settings page is the only reader.
+    pub(crate) settings_credential_status: Signal<Option<(CredentialStatusKey, CredentialStatus)>>,
     pub usage_counts: Signal<UsageAggregate>,
     pub usage_inspection_open: Signal<bool>,
     pub recovery_records: Signal<Vec<RecoveredRecord>>,
@@ -216,6 +220,20 @@ pub struct SearchHit {
 
 impl AppState {
     pub fn new() -> Self {
+        Self::build(CredentialVault::production())
+    }
+
+    /// The state with the credential vault given: a test passes its own
+    /// in-memory vault, so nothing it does can read, write or delete a
+    /// credential in the platform's secure store.
+    #[cfg(test)]
+    pub(crate) fn with_vault(vault: CredentialVault) -> Self {
+        Self::build(vault)
+    }
+
+    /// The constructor's body, with the one choice a test overrides made a
+    /// parameter.
+    fn build(vault: CredentialVault) -> Self {
         let settings = SettingsData::load();
         set_color_scheme(match settings.theme {
             ThemePreference::System => nsh_core::platform::Appearance::System,
@@ -269,6 +287,7 @@ impl AppState {
             settings_credential: signal(String::new()),
             settings_notice: signal(SharedString::from("")),
             settings_credential_revision: signal(0_u64),
+            settings_credential_status: signal(None),
             usage_counts: signal(UsageAggregate::default()),
             usage_inspection_open: signal(false),
             recovery_records: signal(records),
@@ -289,7 +308,7 @@ impl AppState {
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
-            vault: CredentialVault::production(),
+            vault,
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
@@ -2091,6 +2110,10 @@ impl AppState {
     /// operation does: this process's session key first, then the secure store,
     /// then the provider's environment variable for an endpoint allowed to use
     /// it.
+    ///
+    /// The vault's only source-aware query is `resolve`, and resolving reads
+    /// the platform's secure store behind a global mutex; callers that draw a
+    /// status line should use [`Self::credential_status_cached`] instead.
     pub fn credential_status(&self) -> CredentialStatus {
         let settings = self.settings.get();
         let Some(provider) = mt_core::model::Provider::from_key(settings.model_provider.trim())
@@ -2124,6 +2147,28 @@ impl AppState {
         }
     }
 
+    /// [`credential_status`](Self::credential_status), computed again only when
+    /// the endpoint or the credential state changes: a status line must not
+    /// read the secure store once per binding, nor on every keystroke of a
+    /// field the status does not depend on.
+    pub(crate) fn credential_status_cached(&self) -> CredentialStatus {
+        let settings = self.settings.get();
+        let key = CredentialStatusKey {
+            provider: settings.model_provider.clone(),
+            base_url: settings.model_base_url.clone(),
+            environment_identity: settings.model_environment_key_identity.clone(),
+            revision: self.settings_credential_revision.get(),
+        };
+        if let Some((cached, status)) = self.settings_credential_status.get()
+            && cached == key
+        {
+            return status;
+        }
+        let status = self.credential_status();
+        self.settings_credential_status.set(Some((key, status)));
+        status
+    }
+
     /// Forget the configured endpoint's key: the secure-store entry and this
     /// process's copy, if either exists.
     pub fn remove_credential(&self) -> Result<(), String> {
@@ -2144,6 +2189,17 @@ impl AppState {
             .map_err(|error| error.to_string())?;
         Ok(endpoint.credential_target().as_str().to_owned())
     }
+}
+
+/// The settings [`AppState::credential_status_cached`] depends on: the wire
+/// format, the base URL, the endpoint's environment authorization, and the
+/// credential revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CredentialStatusKey {
+    provider: String,
+    base_url: String,
+    environment_identity: String,
+    revision: u64,
 }
 
 /// How the configured endpoint's model credential resolves right now, as the
