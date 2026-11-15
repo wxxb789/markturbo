@@ -3,12 +3,11 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::{DialogAnswer, Headless};
-
-mod support;
 
 #[test]
 fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialog() {
@@ -65,14 +64,16 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         nsh_engine::Points(1280.0),
         nsh_engine::Points(800.0),
     ))
-    .expect("wide viewport for the toolbar");
+    .expect("wide viewport");
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
+    // Translation's consent is the state's one-shot dialog; it discloses the
+    // outbound request and authorizes nothing until it is answered.
     app.on_dialog(|_| DialogAnswer::Press("Send".to_owned()));
-    app.press("text:More layouts")
-        .expect("open the secondary actions");
-    app.press("text:Translate").expect("start translation");
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-translate")
+        .expect("start translation");
     app.wait_for_within(
         "text:Translated 1 segment(s) into zh.",
         Duration::from_secs(20),
@@ -84,8 +85,9 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         app.screen().texts()
     );
 
-    app.press("text:Save").expect("save translation");
-    support::wait_for_file(
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-save").expect("save translation");
+    wait_for_file(
         &mut app,
         &document,
         |text| text.contains("你好"),
@@ -93,51 +95,87 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         Duration::from_secs(20),
     );
 
-    if app.shows("More layouts") {
-        app.press("text:More layouts")
-            .expect("open the secondary actions");
-    }
-    app.press("text:Translate")
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-translate")
         .expect("start another translation");
     app.wait_for("text:Waiting for model request approval…")
         .expect("second translation is pending");
-    app.press("text:other.md").expect("open another tab");
+    // Open another document and dirty it: the pending translation must land on
+    // the revision it was prepared from, not on whatever is active.
+    app.press_key("mod+p").expect("open the file palette");
+    app.wait_for("id:palette-input").expect("the palette input");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open another tab");
     app.wait_for("text:Other").expect("other document");
     app.type_text("label:Markdown source", "\nUnsaved edit.")
         .expect("dirty the other tab");
-    app.press("text:plan.md >> nth=0")
+    app.press("id:rail-file-row >> nth=0")
         .expect("return to the translation target");
     app.wait_for("label:Markdown source")
         .expect("translation target editor");
-    app.answer_dialogs_myself();
-    app.press("text:Quit").expect("request quit");
-    support::wait_for_pending_dialog(
-        &mut app,
-        "Quit must await a decision",
-        Duration::from_secs(20),
-    );
+    // Quit: the in-app guard takes the decision, and it must await it.
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-quit").expect("request quit");
+    app.wait_for("text:Close without saving?")
+        .expect("Quit must await a decision");
 
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:你好，再见", Duration::from_secs(20))
         .expect("second translation applies while Quit is pending");
-    assert!(app.pending_dialog().is_some(), "Quit must still be pending");
-    app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
+    assert!(
+        app.screen()
+            .matches("id:guard-card")
+            .expect("guard selector"),
+        "Quit must still be pending"
+    );
+    app.press("id:guard-save >> role:button")
         .expect("save all and quit");
 
-    support::wait_for_file(
+    wait_for_file(
         &mut app,
         &document,
         |text| text.contains("你好，再见"),
         "Quit saves the translation it received",
         Duration::from_secs(20),
     );
-    support::wait_for_file(
+    wait_for_file(
         &mut app,
         &other,
         |text| text.contains("Unsaved edit."),
         "Quit saves the other dirty tab",
         Duration::from_secs(20),
     );
+}
+
+/// How long one pumped frame waits for the app before the loop looks again.
+const STEP: Duration = Duration::from_millis(25);
+
+fn pump(app: &mut Headless) {
+    app.next_change(STEP).expect("settle while waiting");
+}
+
+/// Waits until the text at `path` satisfies `holds`.
+fn wait_for_file(
+    app: &mut Headless,
+    path: &Path,
+    holds: impl Fn(&str) -> bool,
+    what: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if holds(&text) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {path:?} holds {text:?} with {:?} on screen",
+            app.screen().texts()
+        );
+        pump(app);
+    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
