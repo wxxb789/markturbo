@@ -24,8 +24,9 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Pane},
     ui::{
+        consent,
         motion::HOVER_MS,
-        prims, shell,
+        notices, prims, shell,
         tokens::{
             self, COLUMN_GAP, FONT_SOURCE, HAIRLINE, Layout, RAIL_W, SPACE_1, SPACE_2, SPACE_3,
             TITLE_ROW_H, TYPE_UI, TYPE_UI_LINE,
@@ -48,8 +49,16 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         },
         move |_: &str| {
             // A revision on screen is a decision waiting: reviewing over it
-            // would drop the proposal being decided.
-            if review_state.active.get().is_some() && review_state.revision_hunks.get().is_empty() {
+            // would drop the proposal being decided. While a consent card is
+            // up, Ctrl+Enter is its hold-to-send key; re-preparing the review
+            // there would rebuild the card under the user's hold. A review in
+            // flight or a guard decision is not restarted either.
+            if review_state.active.get().is_some()
+                && review_state.revision_hunks.get().is_empty()
+                && !consent::is_open(&review_state)
+                && !notices::guard_is_open(&review_state)
+                && !review_state.review_busy.get()
+            {
                 review_state.start_review();
             }
         },
