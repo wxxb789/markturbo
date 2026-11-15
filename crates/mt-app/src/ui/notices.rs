@@ -457,7 +457,9 @@ fn compare_line(spans: &[Marked]) -> impl IntoElement {
         SharedString::default()
     };
     let mut line = text(content)
-        .font_family(tokens::FONT_SOURCE_UI)
+        // The app's mono: a text view draws through the engine, which sees
+        // the registered faces under their legacy family names.
+        .font_family(tokens::FONT_SOURCE)
         .text_size(px(tokens::TYPE_SOURCE))
         .line_height(px(tokens::TYPE_SOURCE_LINE))
         .text_color(move || tokens::palette().ink);
