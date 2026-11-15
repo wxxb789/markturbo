@@ -19,6 +19,6 @@ fn clean_launch_shows_welcome() {
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
 
     app.wait_for("id:welcome").expect("welcome surface");
-    app.wait_for("text:Create a new document or open one from your computer.")
+    app.wait_for("text:Opening, editing and search stay on this device.")
         .expect("welcome guidance");
 }
