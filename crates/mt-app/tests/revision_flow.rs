@@ -4,13 +4,14 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
+
+mod support;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -132,11 +133,37 @@ fn partial_accept_records_the_final_split_once() {
         .expect("revision ready");
     app.wait_for("text:Use the reviewed title.")
         .expect("the first hunk is the one docked");
+    // Both hunks start undecided, and an undecided hunk is rejected: `Done`
+    // applies accepted changes only. The docked one waits for its decision,
+    // the other waits in the list with no decision on its own row, and
+    // neither counts as decided or as an applied change.
+    app.wait_for("id:revision-reject")
+        .expect("the docked hunk waits for a decision");
+    app.wait_for("text:0 of 2 decided")
+        .expect("both hunks start undecided");
+    app.wait_for("text:2 not applied")
+        .expect("both hunks start rejected");
+    assert_eq!(
+        app.screen()
+            .count("text:/ · (Accepted|Rejected)$/")
+            .expect("decision-suffix selector"),
+        0,
+        "no hunk starts decided"
+    );
+    app.wait_for("text:Change the second line.")
+        .expect("the second hunk waits in the list");
     // Approve the docked hunk only: the second hunk stays rejected.
     app.press("label:Accept")
         .expect("approve the first hunk only");
     app.wait_for("text:1 of 2 decided")
         .expect("exactly one hunk is decided");
+    // The decision is per hunk and reads on the accepted hunk's own row: the
+    // dock extinguishes, the next undecided hunk takes it, and the accepted
+    // one keeps its `Accepted` word.
+    app.wait_for("text:Use the reviewed title. · Accepted")
+        .expect("the accepted hunk shows its decision");
+    app.wait_for("text:1 not applied")
+        .expect("the second hunk stays rejected");
     app.press("label:Done")
         .expect("apply the approved revision");
     app.wait_for("text:Approved changes applied to the buffer.")
@@ -145,7 +172,7 @@ fn partial_accept_records_the_final_split_once() {
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-save")
         .expect("save applied revision");
-    wait_for_file(
+    support::wait_for_file(
         &mut app,
         &document,
         |text| text == "Revised\nUnchanged\n",
@@ -370,36 +397,6 @@ fn revision_usage_totals() -> (u64, u64, u64, u64) {
                         .unwrap_or_default(),
             )
         })
-}
-
-/// How long one pumped frame waits for the app before the loop looks again.
-const STEP: Duration = Duration::from_millis(25);
-
-fn pump(app: &mut Headless) {
-    app.next_change(STEP).expect("settle while waiting");
-}
-
-/// Waits until the text at `path` satisfies `holds`.
-fn wait_for_file(
-    app: &mut Headless,
-    path: &Path,
-    holds: impl Fn(&str) -> bool,
-    what: &str,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        if holds(&text) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: {path:?} holds {text:?} with {:?} on screen",
-            app.screen().texts()
-        );
-        pump(app);
-    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

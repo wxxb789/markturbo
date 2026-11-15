@@ -3,11 +3,12 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::{DialogAnswer, Headless};
+
+mod support;
 
 #[test]
 fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialog() {
@@ -87,7 +88,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
 
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-save").expect("save translation");
-    wait_for_file(
+    support::wait_for_file(
         &mut app,
         &document,
         |text| text.contains("你好"),
@@ -110,10 +111,18 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.wait_for("text:Other").expect("other document");
     app.type_text("label:Markdown source", "\nUnsaved edit.")
         .expect("dirty the other tab");
-    app.press("id:rail-file-row >> nth=0")
+    // Return by the row's own label, and prove the target is the active tab:
+    // the title row reads its file name and the editor holds its text, so a
+    // later landing can only be the revision the translation was prepared
+    // from.
+    app.press("label:plan.md")
         .expect("return to the translation target");
     app.wait_for("label:Markdown source")
         .expect("translation target editor");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("the translation target is the active tab");
+    app.wait_for("id:source-editor >> text:/你好/")
+        .expect("the active editor holds the translation target's text");
     // Quit: the in-app guard takes the decision, and it must await it.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-quit").expect("request quit");
@@ -132,50 +141,20 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.press("id:guard-save >> role:button")
         .expect("save all and quit");
 
-    wait_for_file(
+    support::wait_for_file(
         &mut app,
         &document,
         |text| text.contains("你好，再见"),
         "Quit saves the translation it received",
         Duration::from_secs(20),
     );
-    wait_for_file(
+    support::wait_for_file(
         &mut app,
         &other,
         |text| text.contains("Unsaved edit."),
         "Quit saves the other dirty tab",
         Duration::from_secs(20),
     );
-}
-
-/// How long one pumped frame waits for the app before the loop looks again.
-const STEP: Duration = Duration::from_millis(25);
-
-fn pump(app: &mut Headless) {
-    app.next_change(STEP).expect("settle while waiting");
-}
-
-/// Waits until the text at `path` satisfies `holds`.
-fn wait_for_file(
-    app: &mut Headless,
-    path: &Path,
-    holds: impl Fn(&str) -> bool,
-    what: &str,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        if holds(&text) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: {path:?} holds {text:?} with {:?} on screen",
-            app.screen().texts()
-        );
-        pump(app);
-    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

@@ -75,19 +75,33 @@ fn opens_a_markdown_file() {
         }
     }
 
-    // The context field: the resolved chain for this file, the project's own
-    // instructions included, each with its Include in review decision.
+    // The context field: the resolved chain for this file. The fixture's
+    // project holds exactly one instruction file, AGENTS.md at its root; the
+    // row names it inside the row itself (the title row also reads
+    // AGENTS.md, so an unscoped text check would prove nothing), and a row
+    // that applies carries its Include in review decision and is not in the
+    // profile's not-applied inventory.
     app.press("id:title-context").expect("open the context");
     app.wait_for("id:context-field").expect("context field");
     app.wait_for("id:context-source-0")
         .expect("a resolved context source");
+    app.wait_for("id:context-source-0 >> text:AGENTS.md")
+        .expect("the project's own AGENTS.md is the resolved source");
+    assert_eq!(
+        app.screen().count("id:context-source-1").expect("selector"),
+        0,
+        "the fixture's project resolves exactly one source"
+    );
     let shown = app.screen().texts().join("\n");
-    assert!(shown.contains("AGENTS.md"), "{shown}");
     assert!(
         shown.contains("Applies from the repository root"),
         "{shown}"
     );
     assert!(shown.contains("Include in review"), "{shown}");
+    assert!(
+        !shown.contains("Not applied by Codex"),
+        "a project-root AGENTS.md applies; it is not inventory: {shown}"
+    );
 
     // The checkpoint must not modify the source file. Reopen the store as a
     // fresh process would and verify the recovered text is the edited buffer.

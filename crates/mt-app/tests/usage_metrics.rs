@@ -1,30 +1,11 @@
 //! Usage recording is explicit, inspectable, export-only and reversible.
 
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
-/// How long one pumped frame waits for the app before the loop looks again.
-const STEP: Duration = Duration::from_millis(25);
-
-fn pump(app: &mut Headless) {
-    app.next_change(STEP).expect("settle while waiting");
-}
-
-/// Waits until `path` exists.
-fn wait_for_path(app: &mut Headless, path: &Path, what: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "{what}: {:?} on screen",
-            app.screen().texts()
-        );
-        pump(app);
-    }
-}
+mod support;
 
 fn start() -> Headless {
     let mut app =
@@ -82,7 +63,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     // Paste is the welcome state's control: no document is open yet.
     app.press("id:welcome-paste >> role:button")
         .expect("paste an artifact");
-    wait_for_path(&mut app, &store, "count the paste", Duration::from_secs(5));
+    support::wait_for_path(&mut app, &store, "count the paste", Duration::from_secs(5));
     drop(app);
 
     let mut app = start();
@@ -99,7 +80,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         .expect("choose export destination");
     app.press("id:usage-export >> role:button")
         .expect("deliberate export");
-    wait_for_path(
+    support::wait_for_path(
         &mut app,
         &export,
         "export aggregate",
