@@ -75,8 +75,10 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
     let close_state = state.clone();
     // Which source's text is open, if any: the surface's own furniture, so it
     // does not belong to `AppState` (a rebuild re-keys it, which is fine for a
-    // disclosure).
-    let expanded = signal(None::<usize>);
+    // disclosure). It holds the source's own path, not its chain position: a
+    // re-resolution may put a different file at the same index, and that file
+    // must not open unasked.
+    let expanded = signal(None::<PathBuf>);
     view()
         .test_id("context-field")
         .w_full()
@@ -348,7 +350,7 @@ fn preview_text(text: &str) -> String {
 fn source_block(
     state: AppState,
     language: Language,
-    expanded: Signal<Option<usize>>,
+    expanded: Signal<Option<PathBuf>>,
     row: ReadSignal<SourceRow>,
 ) -> impl IntoElement {
     let light_selection = state.context_selected;
@@ -406,7 +408,7 @@ fn source_block(
                 .child(prims::faint(move || detail_row.get().detail.clone())),
         )
         .child(when(
-            move || expanded.get() == Some(index),
+            move || expanded.get().as_deref() == Some(row.get_untracked().path.as_path()),
             move || source_text(text_state.clone(), language, row),
         ))
 }
@@ -499,11 +501,12 @@ fn ordinal(row: ReadSignal<SourceRow>, light: Outbound) -> impl IntoElement {
 /// as a document would), and the path carries the outbound light.
 fn path_expand(
     language: Language,
-    expanded: Signal<Option<usize>>,
+    expanded: Signal<Option<PathBuf>>,
     row: ReadSignal<SourceRow>,
     light: Outbound,
 ) -> impl IntoElement {
     let index = row.get_untracked().index;
+    let path = row.get_untracked().path.clone();
     let ink = light.glyph(adaptive(tokens::LIGHT.ink_rest, tokens::DARK.ink_rest));
     view()
         .test_id(&format!("context-source-{index}"))
@@ -514,7 +517,8 @@ fn path_expand(
             button()
                 .accessibility_label(move || {
                     let label = row.get_untracked().path_label.clone();
-                    let open = expanded.get() == Some(index);
+                    let open =
+                        expanded.get().as_deref() == Some(row.get_untracked().path.as_path());
                     Some(SharedString::from(if open {
                         hide_text_label(language, &label)
                     } else {
@@ -532,8 +536,9 @@ fn path_expand(
                 .hover(|style| style.text_color(tokens::palette().ink).underline())
                 .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
                 .on_press(move || {
-                    expanded.update(|open| {
-                        *open = (*open != Some(index)).then_some(index);
+                    let path = path.clone();
+                    expanded.update(move |open| {
+                        *open = (open.as_deref() != Some(path.as_path())).then_some(path);
                     });
                 })
                 .child(
@@ -1493,30 +1498,45 @@ mod tests {
             app.shows("selected:1"),
             "reading the text keeps the selection"
         );
-        app.press("text:docs/AGENTS.md")
-            .expect("close the text again");
-        app.wait_for_gone("text:Docs rules.", Duration::from_secs(5))
-            .expect("the text closed");
 
-        // Excluding a source records nothing for the next send.
+        // Excluding a source records nothing for the next send (and leaves
+        // the open text alone: it is a disclosure, not a selection).
         app.press("text:Include in review >> nth=2")
             .expect("exclude the nested source");
         app.wait_for("text:selected:0")
             .expect("the selection cleared");
+        assert!(app.shows("Docs rules."), "the text stays open");
 
         // Refresh resolves again: an override file that did not exist before
-        // joins the chain in place of the docs instructions.
+        // joins the chain in place of the docs instructions. The disclosure
+        // is keyed by path, so the file that took the index opens nothing.
         std::fs::write(fixture.root.join("docs/AGENTS.override.md"), "Override.\n")
             .expect("override instructions");
         app.press("label:Refresh").expect("refresh the chain");
         app.wait_for("text:docs/AGENTS.override.md")
             .expect("the refreshed chain");
+        assert!(
+            !app.shows("Override."),
+            "a re-resolved chain opens no text unasked"
+        );
+        assert!(
+            !app.shows("Docs rules."),
+            "the file that left the chain takes its text with it"
+        );
 
         // `Open` opens the file itself, as a document. (Last: the document
         // becomes the active tab, and the chain then follows it.)
         app.press("text:docs/AGENTS.override.md")
-            .expect("open the override's text");
+            .expect("open the override's text"); // opens it…
         app.wait_for("text:Override.").expect("the override's text");
+        app.press("text:docs/AGENTS.override.md")
+            .expect("close the override's text");
+        app.wait_for_gone("text:Override.", Duration::from_secs(5))
+            .expect("the override's text closed");
+        app.press("text:docs/AGENTS.override.md")
+            .expect("open the override's text again");
+        app.wait_for("text:Override.")
+            .expect("the override's text again");
         app.press("label:Open docs/AGENTS.override.md")
             .expect("open the override as a document");
         app.wait_for("text:tabs:2").expect("the source opened");
