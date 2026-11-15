@@ -55,23 +55,54 @@ pub fn column(state: AppState, language: Language) -> impl IntoElement {
         // prototype's `.doc` does; the banners the shell puts above stay
         // outside it.
         .pt(px(tokens::SPACE_5))
+        // Keyed by tab AND by which column the pane draws: a retained row
+        // keeps its nodes, so a pane change that swaps the column (editor,
+        // preview, web) must be a new key, or the old column stays up.
         .child(each(
-            move || state_for_tabs.active_tab().into_iter().collect::<Vec<_>>(),
-            |tab: &Tab| tab.id,
+            move || {
+                state_for_tabs
+                    .active_tab()
+                    .into_iter()
+                    .map(|tab| {
+                        let kind = ColumnKind::of(tab.pane.get());
+                        (tab, kind)
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |(tab, kind): &(Tab, ColumnKind)| (tab.id, *kind),
             {
                 let state = state.clone();
-                move |tab: ReadSignal<Tab>, _| {
-                    let tab = tab.get();
-                    match tab.pane.get() {
-                        Pane::Source | Pane::Split | Pane::SplitWeb => {
-                            source(state.clone(), tab).into_element()
+                move |row: ReadSignal<(Tab, ColumnKind)>, _| {
+                    let (tab, kind) = row.get();
+                    match kind {
+                        ColumnKind::Source => source(state.clone(), tab).into_element(),
+                        ColumnKind::Preview => {
+                            preview::column(state.clone(), language).into_element()
                         }
-                        Pane::Preview => preview::column(state.clone(), language).into_element(),
-                        Pane::Web => preview::web(state.clone(), language).into_element(),
+                        ColumnKind::Web => preview::web(state.clone(), language).into_element(),
                     }
                 }
             },
         ))
+}
+
+/// Which surface the column draws for a pane: Split and Split · Web keep the
+/// editor in the column and put their preview in the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ColumnKind {
+    Source,
+    Preview,
+    Web,
+}
+
+impl ColumnKind {
+    fn of(pane: Pane) -> Self {
+        match pane {
+            Pane::Source | Pane::Split | Pane::SplitWeb => Self::Source,
+            Pane::Preview => Self::Preview,
+            Pane::Web => Self::Web,
+        }
+    }
 }
 
 /// The source editor: plain-file Markdown, bytes preserved, findings drawn as
