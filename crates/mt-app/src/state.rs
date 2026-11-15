@@ -28,7 +28,7 @@ use mt_core::{
     recovery::{RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RecoveryStore},
     review::{
         ArtifactLens, ClarificationPriority, FindingKind, ReviewModelOutput, ReviewRequest,
-        ReviewResult, ReviewStatus, SourceSnapshot,
+        ReviewResult, ReviewStatus, SourceAnchor, SourceLocation, SourceSnapshot,
         provider::{
             PreparedDocumentReviewRequest, PreparedReview, PreparedRevisionRequest, ReviewError,
             ReviewLanguage, RevisionAnswer, RevisionAnswers, RevisionError,
@@ -125,6 +125,9 @@ pub struct AppState {
     pub review_consent: Signal<Option<SharedString>>,
     pub review_view: Signal<Option<ReviewView>>,
     pub review_busy: Signal<bool>,
+    /// Why the last Review attempt could not be prepared, when it could not:
+    /// the field explains it and offers Settings. `None` normally.
+    pub review_unavailable: Signal<Option<ReviewUnavailable>>,
     pub translation_busy: Signal<bool>,
     pub revision_questions: Signal<Vec<RevisionQuestionView>>,
     pub revision_consent: Signal<Option<SharedString>>,
@@ -196,12 +199,70 @@ pub struct ReviewView {
     pub sections: Vec<ReviewSection>,
     pub findings: Vec<String>,
     pub questions: Vec<String>,
+    /// Whether the source moved on after this result: the field says so, and
+    /// the column keeps only the afterimage.
+    pub stale: bool,
+    /// The findings with their anchors intact: the field writes their line
+    /// ranges and the column lights the anchored words.
+    pub findings_anchored: Vec<ReviewFindingView>,
+    /// The questions with priority and impact kept apart: the field orders
+    /// them and shows one at a time.
+    pub questions_detail: Vec<ReviewQuestionView>,
+    /// The tab this result belongs to; the column lights findings only in
+    /// that tab's text.
+    pub tab_id: Option<u64>,
+    /// Why the review failed, when it did: the field writes the plain
+    /// diagnostic line the spec asks for.
+    pub failure: Option<ReviewFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReviewSection {
     pub title: String,
     pub items: Vec<String>,
+}
+
+/// One grounded finding as the review field and the document's light need it.
+///
+/// `stated` decides where the light is: a stated finding makes the anchored
+/// glyphs themselves emit, an inferred one makes the air beside them. The
+/// location is the model's anchor as the core resolved it, so neither surface
+/// can invent a source position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewFindingView {
+    pub stated: bool,
+    pub text: String,
+    pub location: Option<SourceLocation>,
+}
+
+/// One clarification question with its priority and impact kept apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewQuestionView {
+    pub priority: ClarificationPriority,
+    pub question: String,
+    pub impact: Option<String>,
+}
+
+/// Why Review could not be prepared, so nothing left the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewUnavailable {
+    /// No model provider or credential is configured.
+    NotSetUp,
+    /// The document or its context cannot form a review request.
+    Unpreparable,
+}
+
+/// Why a sent Review produced no result, as the field's copy names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFailure {
+    /// The provider did not answer in time.
+    Timeout,
+    /// The answer could not be read as a review.
+    Malformed,
+    /// The wait was cancelled; nothing changed.
+    Cancelled,
+    /// Anything else, shown with the localized status and the detail.
+    Other,
 }
 
 /// One content-search row.
@@ -279,6 +340,7 @@ impl AppState {
             review_consent: signal(None),
             review_view: signal(None),
             review_busy: signal(false),
+            review_unavailable: signal(None),
             translation_busy: signal(false),
             revision_questions: signal(Vec::new()),
             revision_consent: signal(None),
@@ -800,6 +862,7 @@ impl AppState {
             view.status =
                 crate::i18n::t(self.settings.get().language, crate::i18n::Key::ReviewStale)
                     .to_owned();
+            view.stale = true;
             self.review_view.set(Some(view));
         }
     }
@@ -1580,6 +1643,7 @@ impl AppState {
         };
         self.context_open.set(false);
         self.review_view.set(None);
+        self.review_unavailable.set(None);
         self.review_consent.set(None);
         *self.review_origin.borrow_mut() = None;
         *self.review_binding.borrow_mut() = None;
@@ -1594,6 +1658,14 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
+                self.review_unavailable.set(Some(match error {
+                    ReviewError::UnsupportedConfiguredProvider
+                    | ReviewError::InvalidEndpoint { .. }
+                    | ReviewError::CredentialAccess { .. }
+                    | ReviewError::MissingCredential { .. }
+                    | ReviewError::NoAvailableCredential => ReviewUnavailable::NotSetUp,
+                    _ => ReviewUnavailable::Unpreparable,
+                }));
                 self.status
                     .set(SharedString::from(format!("Review unavailable: {error}")));
                 return;
@@ -1615,6 +1687,8 @@ impl AppState {
         let mut request = match built {
             Ok(built) => built.into_parts().0,
             Err(error) => {
+                self.review_unavailable
+                    .set(Some(ReviewUnavailable::Unpreparable));
                 self.status.set(SharedString::from(format!(
                     "Review request rejected: {error}"
                 )));
@@ -1716,7 +1790,13 @@ impl AppState {
                         );
                     }
                     *state.review_binding.borrow_mut() = Some(binding);
-                    ReviewView::from_result(&transport.result, stale, state.settings.get().language)
+                    let mut view = ReviewView::from_result(
+                        &transport.result,
+                        stale,
+                        state.settings.get().language,
+                    );
+                    view.tab_id = Some(origin.tab_id);
+                    view
                 }
                 Ok(Err(error)) => {
                     state.record_review_failure(&error);
@@ -2017,6 +2097,7 @@ impl AppState {
         self.cancel_review();
         self.reset_revision();
         self.review_view.set(None);
+        self.review_unavailable.set(None);
         self.review_open.set(false);
     }
 
@@ -2095,6 +2176,15 @@ impl AppState {
 }
 
 impl ReviewView {
+    /// Whether `self` and `other` are the same result: the same understood
+    /// sections, findings and questions. The status text and the stale flag
+    /// change under one result without it becoming a new arrival.
+    pub fn same_result(&self, other: &Self) -> bool {
+        self.sections == other.sections
+            && self.findings_anchored == other.findings_anchored
+            && self.questions_detail == other.questions_detail
+    }
+
     fn from_result(result: &ReviewResult, stale: bool, language: Language) -> Self {
         let mut view = Self {
             status: if stale {
@@ -2116,6 +2206,7 @@ impl ReviewView {
                 .diagnostic
                 .as_ref()
                 .map(|diagnostic| diagnostic.message.as_str().to_owned()),
+            stale: stale || matches!(result.status, ReviewStatus::Stale),
             ..Self::default()
         };
         let Some(output) = &result.output else {
@@ -2135,6 +2226,21 @@ impl ReviewView {
                     }
                 };
                 format!("{kind}: {}", finding.text.as_str())
+            })
+            .collect();
+        view.findings_anchored = output
+            .findings
+            .iter()
+            .map(|finding| ReviewFindingView {
+                stated: matches!(
+                    finding.kind,
+                    FindingKind::Source | FindingKind::SourceStatement
+                ),
+                text: finding.text.as_str().to_owned(),
+                location: match &finding.anchor {
+                    SourceAnchor::Document { location } => Some(*location),
+                    _ => None,
+                },
             })
             .collect();
         view.questions = output
@@ -2165,6 +2271,18 @@ impl ReviewView {
                 }
             })
             .collect();
+        view.questions_detail = output
+            .clarification_questions
+            .iter()
+            .map(|question| ReviewQuestionView {
+                priority: question.priority,
+                question: question.question.as_str().to_owned(),
+                impact: question
+                    .impact
+                    .as_ref()
+                    .map(|impact| impact.as_str().to_owned()),
+            })
+            .collect();
         view
     }
 
@@ -2172,6 +2290,14 @@ impl ReviewView {
         Self {
             status: crate::i18n::t(language, crate::i18n::Key::ReviewFailed).to_owned(),
             diagnostic: Some(error.to_string()),
+            failure: Some(match error {
+                ReviewError::Timeout { .. } => ReviewFailure::Timeout,
+                ReviewError::MalformedResponse { .. }
+                | ReviewError::MissingResponseText { .. }
+                | ReviewError::ResponseTooLarge { .. } => ReviewFailure::Malformed,
+                ReviewError::Cancelled { .. } => ReviewFailure::Cancelled,
+                _ => ReviewFailure::Other,
+            }),
             ..Self::default()
         }
     }
