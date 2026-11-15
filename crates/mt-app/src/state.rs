@@ -2983,6 +2983,11 @@ impl AppState {
     /// the endpoint or the credential state changes: a status line must not
     /// read the secure store once per binding, nor on every keystroke of a
     /// field the status does not depend on.
+    ///
+    /// A store that could not be read is never remembered (the caller may be
+    /// looking at a moment of contention), and
+    /// [`forget_credential_status`](Self::forget_credential_status) drops the
+    /// memo for a caller that knows the store may have changed under it.
     pub(crate) fn credential_status_cached(&self) -> CredentialStatus {
         let settings = self.settings.get();
         let key = CredentialStatusKey {
@@ -2997,8 +3002,20 @@ impl AppState {
             return status;
         }
         let status = self.credential_status();
-        self.settings_credential_status.set(Some((key, status)));
+        // A failure is a moment, not a state: retry it on the next read rather
+        // than pin it for the life of the process.
+        if status != CredentialStatus::Unavailable {
+            self.settings_credential_status.set(Some((key, status)));
+        }
         status
+    }
+
+    /// Drop the memoised credential status, so the next read resolves the vault
+    /// again. The settings page calls this whenever it is built: the secure
+    /// store can change under it (another instance storing or removing a key),
+    /// and nothing in this process reports that.
+    pub(crate) fn forget_credential_status(&self) {
+        self.settings_credential_status.set(None);
     }
 
     /// Forget the configured endpoint's key: the secure-store entry and this
