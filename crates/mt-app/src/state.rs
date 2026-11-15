@@ -125,6 +125,10 @@ pub struct AppState {
     pub review_consent: Signal<Option<SharedString>>,
     pub review_view: Signal<Option<ReviewView>>,
     pub review_busy: Signal<bool>,
+    /// The source column's camera ([`DocumentFocus`]): the line a docked
+    /// surface wants levelled with it. Set it with
+    /// [`AppState::focus_document_line`].
+    pub document_focus: Signal<DocumentFocus>,
     pub translation_busy: Signal<bool>,
     pub revision_questions: Signal<Vec<RevisionQuestionView>>,
     pub revision_consent: Signal<Option<SharedString>>,
@@ -196,6 +200,21 @@ pub struct ReviewView {
     pub sections: Vec<ReviewSection>,
     pub findings: Vec<String>,
     pub questions: Vec<String>,
+}
+
+/// The column's camera: the document line a surface asked the source editor to
+/// level with its docked reading position (a review's racked finding, a
+/// revision's current hunk). The document lane's `ui::document` scrolls to it;
+/// nothing here changes the document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocumentFocus {
+    /// The tab the line belongs to; another tab's request is ignored.
+    pub tab: u64,
+    /// The line, from 0.
+    pub line: u32,
+    /// Bumped by every request, so asking again for the same line levels it
+    /// again.
+    pub request: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -279,6 +298,7 @@ impl AppState {
             review_consent: signal(None),
             review_view: signal(None),
             review_busy: signal(false),
+            document_focus: signal(DocumentFocus::default()),
             translation_busy: signal(false),
             revision_questions: signal(Vec::new()),
             revision_consent: signal(None),
@@ -773,6 +793,20 @@ impl AppState {
                 .status
                 .set(SharedString::from(format!("Sample unavailable: {error}"))),
         }
+    }
+
+    /// Ask the source column to level `line` (from 0) of tab `tab_id` with
+    /// its docked reading position — the review's racked finding, a
+    /// revision's current hunk. The document lane's `ui::document` does the
+    /// scrolling, so the anchored lines and the field's docked explanation
+    /// sit level; the document itself is never touched.
+    pub fn focus_document_line(&self, tab_id: u64, line: u32) {
+        let request = self.document_focus.get().request.wrapping_add(1);
+        self.document_focus.set(DocumentFocus {
+            tab: tab_id,
+            line,
+            request,
+        });
     }
 
     /// Remember that a tab was edited, so its next checkpoint waits for a
