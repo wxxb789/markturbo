@@ -11,27 +11,31 @@
 //! Trust rules this file keeps:
 //!
 //! * the card is built from the manifest the state froze when it bound the
-//!   request — the endpoint, the items that leave with their own bytes and the
-//!   framed remainder — and when no manifest exists it shows the state's own
-//!   disclosure text verbatim, never summarized;
+//!   request — the endpoint and the items that leave with their own bytes —
+//!   and when no manifest exists it shows the state's own disclosure text
+//!   verbatim, never summarized;
 //! * the body follows that manifest: a scope switch replaces it, and the rows,
 //!   the total and the hold are re-made for the binding that is now waiting;
 //! * the rows add up: the content total prints exactly the sum of the rows
-//!   above it, and the framed remainder mt-core produced is listed below it,
-//!   never folded in (the wire request is larger still: nothing here claims
-//!   to know it);
+//!   above it, and the request's own framing is disclosed below it as *not
+//!   counted*: nothing here measures the wire request, so nothing here prints
+//!   a figure for it;
 //! * Cancel has the default focus and equals the send's weight; Esc always
 //!   cancels; `Enter` and `Space` charge the hold only while the hold control
 //!   itself has the focus — anywhere else they activate the default (Cancel) —
-//!   and a tap alone authorizes nothing;
+//!   and a held `Ctrl+Enter` charges the same hold wherever the focus is, so
+//!   the keyboard route exists on every platform; a tap alone authorizes
+//!   nothing;
 //! * a send needs a deliberate hold: a press-and-release, a keyboard tap, an
 //!   auto-repeat or a handler's second hand never authorize anything, and each
 //!   consent is single-use;
+//! * a rebuilt body drops what went with the old controls: the focus flag and
+//!   any press or key charge in flight, whose release can never arrive;
 //! * a loopback HTTP endpoint keeps its filament and row underlines plain grey
 //!   and reads `HTTP (not encrypted)`.
 //!
-//! nsh 0.5.1 reports no key-up, so a held `Space` or `Enter` is read through
-//! its auto-repeats: the first press starts the charge and every repeat (or
+//! nsh 0.5.1 reports no key-up, so a held key is read through its
+//! auto-repeats: the first press starts the charge and every repeat (or
 //! [`KEY_ALIVE_MS`] of silence) says whether the key is still down. A tap
 //! therefore charges for one watchdog and cools back, while two presses in
 //! quick succession carry the charge on.
@@ -40,13 +44,14 @@
 //! strings: the shell's `when` re-makes its branch when *that* flips, never
 //! when a manifest inside it is replaced.
 //!
-//! The keyboard holds where the platform focuses views: Cancel takes the focus
-//! as the card opens, and Tab reaches the hold control, which then charges on
-//! `Space` or `Enter`. nsh 0.5.1 on Windows focuses text inputs only, and
-//! focuses nothing from code, so there the hold is out of the keyboard's
-//! reach and the two keys stay on the safe path; a text input that keeps the
-//! focus loses those two keys to the card (the keys that edit it still reach
-//! it: only the shell can block them).
+//! Where the platform focuses views (macOS, Linux, the web), Cancel takes the
+//! focus as the card opens and Tab reaches the hold control, which then
+//! charges on `Space` or `Enter`. nsh 0.5.1 on Windows focuses text inputs
+//! only, and focuses no other view from code, so there `Enter` and `Space`
+//! stay on the safe path (`Enter` activates the card's default, Cancel) and
+//! the hold is `Ctrl+Enter`, which needs no focus at all. A text input that
+//! keeps the focus loses these keys to the card (the keys that edit it still
+//! reach it: only the shell can block them).
 
 use std::{
     cell::{Cell, RefCell},
@@ -60,7 +65,6 @@ use mt_core::{
     },
     settings::Language,
 };
-use nsh_base::button;
 use nsh_core::keymap::When;
 use nsh_core::{Color, TransformKind, prelude::*};
 
@@ -135,7 +139,7 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
         }
     });
     // One hold for as long as the card lives, shared with the keyboard
-    // bindings below: the body re-arms it whenever the manifest changes.
+    // bindings below: the body resets it whenever it is built again.
     let hold = Hold::new(state.clone(), is_revision, language);
     // The keyboard: Esc cancels; Enter and Space charge the hold while it has
     // the focus and cancel anywhere else. The bindings live under the card's
@@ -186,7 +190,7 @@ fn card_body(state: &AppState, language: Language, hold: &Hold, is_revision: boo
         )
     });
     let total = rows.as_ref().map_or(0, |rows| rows.total);
-    hold.rearm(waiting.consent.as_ref(), total);
+    hold.rebuild(waiting.consent.as_ref(), total);
     match waiting.consent.as_ref() {
         Some(consent) => view()
             .flex_col()
@@ -264,7 +268,7 @@ fn disclosure_body(
                                 .text_color(move || tokens::palette().ink),
                         ),
                 )
-                .child(framing_section(rows, loopback)),
+                .child(framing_section(language, loopback)),
         )
         .child(
             view()
@@ -403,18 +407,23 @@ fn rows_section(language: Language, rows: &Rows, loopback: bool) -> impl IntoEle
     section
 }
 
-/// The framed remainder, below the sum the card prints and labelled for what
-/// it is, so the two figures are not read as one sum.
-fn framing_section(rows: &Rows, loopback: bool) -> AnyElement {
-    let Some(row) = rows.framing.as_ref() else {
-        return view().into_element();
+/// What travels beyond the disclosed content: the request's own framing. It
+/// carries no byte figure, because nothing here measures the request that
+/// leaves — only mt-core's canonical frame, which is not the wire body.
+fn framing_section(language: Language, loopback: bool) -> AnyElement {
+    let row = Row {
+        origin: OutboundOrigin::Document,
+        label: S::RequestFraming.text(language).to_owned(),
+        reason: S::FramingReason.text(language).to_owned(),
+        bytes: 0,
+        has_bytes: false,
     };
     view()
         .test_id("consent-framing")
         .flex_col()
         .w_full()
         .gap(px(tokens::SPACE_1))
-        .child(row_view(row, tone_of(loopback)))
+        .child(row_view(&row, tone_of(loopback)))
         .into_element()
 }
 
@@ -517,6 +526,9 @@ fn buttons(
         .gap(px(tokens::SPACE_3))
         .child(cancel_button(state, is_revision, language))
         .child(send_button(hold, language, total))
+        // The keyboard route that needs no focus anywhere: Cancel is where the
+        // card asks for it, and this hold works without it.
+        .child(prims::rest(S::HoldCtrlEnter.text(language)))
 }
 
 /// Cancel: default focus, the send's weight, and it authorizes nothing.
@@ -540,13 +552,17 @@ fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl
 
 /// `prims::primary_action`'s chrome, as the Cancel control itself: the same
 /// hairline, ink and hover step as every other local action, filling the
-/// 164x36 box the send control fills, with the element ref on this button.
+/// 164x36 box the send control fills. The control is one focusable view with
+/// the ref *on it*: a component's element is a boundary the platforms cannot
+/// focus, so `Enter` would otherwise land nowhere (`nsh_base`'s button keeps
+/// its own pressable view inside it, out of the ref's reach).
 fn cancel_action(
     label: &'static str,
     on_press: impl Fn() + 'static,
     reference: ElementRef,
 ) -> AnyElement {
-    button()
+    view()
+        .test_id("consent-cancel-button")
         .w_full()
         .h_full()
         .flex_row()
@@ -560,8 +576,10 @@ fn cancel_action(
         .duration(motion::HOVER_MS)
         .hover(|s| s.border_color(tokens::palette().ink))
         .focus_visible(|s| s.border_color(tokens::palette().ink))
-        .accessibility_label(Some(SharedString::from(label)))
-        .on_press(on_press)
+        .focusable(true)
+        .role(AccessibilityRole::Button)
+        .label(SharedString::from(label))
+        .on_press(move |_: &PressEvent| on_press())
         .element_ref(&reference)
         .child(
             text(label)
@@ -659,16 +677,38 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
 /// the hold while the hold control itself has the focus, and activates the
 /// card's default (Cancel) anywhere else. The two keys are consumed wherever
 /// the focus is, so a stray press can never edit the document behind the card
-/// or charge a control the user never reached.
+/// or charge a control the user never reached. `Ctrl+Enter` is the
+/// focus-independent hold: it charges the same filament wherever the keyboard
+/// is, which is the only keyboard route on a platform that focuses no views.
 fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
     let escape_state = state.clone();
     let enter_state = state.clone();
     let space_state = state.clone();
+    let ctrl_enter_state = state.clone();
+    let ctrl_enter_hold = hold.clone();
     effect(move || {
         on_key_with("escape", KeyOptions::default(), {
             let state = escape_state.clone();
             move |_| cancel(&state, is_revision)
         });
+        on_key_with(
+            "ctrl+enter",
+            KeyOptions {
+                repeat: true,
+                when: When::Always,
+                ..KeyOptions::default()
+            },
+            {
+                let state = ctrl_enter_state.clone();
+                let hold = ctrl_enter_hold.clone();
+                move |_| {
+                    if !is_open(&state) {
+                        return;
+                    }
+                    hold.key_press();
+                }
+            },
+        );
         for key in ["enter", "space"] {
             let state = if key == "enter" {
                 enter_state.clone()
@@ -726,17 +766,15 @@ struct Rows {
     /// The items whose content leaves, in display order, with any collapse row
     /// last.
     leaving: Vec<Row>,
-    /// The framed bytes beyond the listed content, when mt-core framed the
-    /// request.
-    framing: Option<Row>,
     /// Package entries that leave as path, size and hash only: listed with
-    /// their file size, but not part of the total — what they contribute at the
-    /// boundary sits in the framing row. A collapse row closes the group.
+    /// their file size, but not part of the total — what they contribute at
+    /// the boundary is request framing, which the card discloses without a
+    /// figure. A collapse row closes the group.
     metadata: Vec<Row>,
     /// The items that stay. A collapse row closes the group.
     stays: Vec<Row>,
-    /// The content bytes the rows above the total line sum to: the framed
-    /// remainder is listed below it, never folded in.
+    /// The content bytes the rows above the total line sum to. Request framing
+    /// is not part of it and is not counted anywhere.
     total: u64,
 }
 
@@ -760,32 +798,18 @@ fn rows(consent: &OutboundConsent, language: Language, cap: usize) -> Rows {
         .filter(|item| !item.content_leaves)
         .collect();
     let stays_items: Vec<&OutboundItem> = consent.stays.iter().collect();
-    let framing = consent
-        .framed_bytes
-        .filter(|framed| *framed > content_bytes)
-        .map(|framed| Row {
-            origin: OutboundOrigin::Document,
-            label: S::ProtocolFraming.text(language).to_owned(),
-            reason: S::FramingReason.text(language).to_owned(),
-            bytes: framed - content_bytes,
-            has_bytes: true,
-        });
     let mut left = cap.max(2);
     let mut leaving = Vec::new();
-    let caption = usize::from(!content_items.is_empty() || framing.is_some());
+    let caption = usize::from(!content_items.is_empty());
     // What the groups below need whatever this one does: a caption and one
     // row each.
     let reserve =
         2 * usize::from(!metadata_items.is_empty()) + 2 * usize::from(!stays_items.is_empty());
     if !content_items.is_empty() {
-        let share = left
-            .saturating_sub(caption)
-            .saturating_sub(reserve)
-            .saturating_sub(usize::from(framing.is_some()))
-            .max(1);
+        let share = left.saturating_sub(caption).saturating_sub(reserve).max(1);
         leaving = fit(&content_items, share, language, OutboundOrigin::PackageFile);
     }
-    left = left.saturating_sub(caption + leaving.len() + usize::from(framing.is_some()));
+    left = left.saturating_sub(caption + leaving.len());
     let mut metadata = Vec::new();
     if !metadata_items.is_empty() {
         let share = left
@@ -812,7 +836,6 @@ fn rows(consent: &OutboundConsent, language: Language, cap: usize) -> Rows {
     }
     Rows {
         leaving,
-        framing,
         metadata,
         stays,
         total: content_bytes,
@@ -1044,7 +1067,7 @@ struct Hold {
     /// reports it (`Sent · N content bytes`).
     total: Rc<Cell<u64>>,
     /// The manifest the charge belongs to: a scope switch replaces it, and
-    /// [`Hold::rearm`] starts the hold over for the new bytes.
+    /// [`Hold::rebuild`] starts the hold over for the new bytes.
     manifest: Rc<RefCell<Option<OutboundConsent>>>,
     /// Whether the hold control has the keyboard focus: only there do `Enter`
     /// and `Space` charge it.
@@ -1090,28 +1113,39 @@ impl Hold {
         }
     }
 
-    /// Follow the manifest under the card: the label's bytes come from it, and
-    /// a *different* manifest (a scope switch) re-arms the hold, because the
-    /// charge it may have started belongs to the binding that just went away.
-    fn rearm(&self, manifest: Option<&OutboundConsent>, total: u64) {
+    /// Follow the body under the card. Every rebuild makes new controls, so
+    /// the old ones' state goes with them: the focus flag (a view that is
+    /// removed hears no blur) and any press or key charge in flight (its
+    /// release can never arrive). A *different* manifest (a scope switch) also
+    /// re-arms the hold, because the charge belongs to the binding that just
+    /// went away.
+    fn rebuild(&self, manifest: Option<&OutboundConsent>, total: u64) {
         let changed = {
             let stored = self.manifest.borrow();
             let stored: &Option<OutboundConsent> = &stored;
             stored.as_ref() != manifest
         };
         self.total.set(total);
-        if !changed {
-            return;
-        }
-        *self.manifest.borrow_mut() = manifest.cloned();
         self.cancel_completion();
         self.cancel_key_alive();
         self.cancel_steps();
-        self.end_notice();
         self.charging.set(None);
         self.released.set(None);
         self.heat.stop();
         self.heat.set(0.0);
+        self.focused.set(false);
+        if self.spent.get() {
+            // The send already left: its label stays put.
+            return;
+        }
+        self.end_notice();
+        if !changed {
+            // The same binding, a new body: the charge it may have started is
+            // gone with the old controls, and the card says so again.
+            self.label.set(HoldLabel::Idle);
+            return;
+        }
+        *self.manifest.borrow_mut() = manifest.cloned();
         self.spent.set(false);
         self.label.set(HoldLabel::Idle);
     }
@@ -1376,7 +1410,7 @@ enum S {
     LeavesThisDevice,
     StaysHere,
     MetadataOnly,
-    ProtocolFraming,
+    RequestFraming,
     FramingReason,
     BoundaryFraming,
     BoundaryContent,
@@ -1402,6 +1436,7 @@ enum S {
     Sending,
     Sent,
     HoldToSend,
+    HoldCtrlEnter,
 }
 
 impl S {
@@ -1423,9 +1458,9 @@ impl S {
                 S::LeavesThisDevice => "Leaves this device",
                 S::StaysHere => "Stays here",
                 S::MetadataOnly => "Path, size and hash only",
-                S::ProtocolFraming => "Protocol framing",
-                S::FramingReason => "the framed request",
-                S::BoundaryFraming => "Protocol framing crosses this boundary.",
+                S::RequestFraming => "Request framing (not counted)",
+                S::FramingReason => "headers and JSON beyond the content above",
+                S::BoundaryFraming => "Request framing crosses this boundary.",
                 S::BoundaryContent => "The disclosed source content also crosses it.",
                 S::Total => "Content total",
                 S::DocumentName => "the document",
@@ -1449,6 +1484,7 @@ impl S {
                 S::Sending => "Sending",
                 S::Sent => "Sent",
                 S::HoldToSend => "Hold to send",
+                S::HoldCtrlEnter => "Hold Ctrl+Enter to send",
             },
             Language::Chinese => match self {
                 S::HeadlineReview => "发送以进行审查？",
@@ -1466,9 +1502,9 @@ impl S {
                 S::LeavesThisDevice => "离开此设备",
                 S::StaysHere => "留在本机",
                 S::MetadataOnly => "仅路径、大小与哈希",
-                S::ProtocolFraming => "协议封装",
-                S::FramingReason => "封装后的请求",
-                S::BoundaryFraming => "协议封装会跨越此边界。",
+                S::RequestFraming => "请求封装（未计入合计）",
+                S::FramingReason => "上述内容之外的标头与 JSON",
+                S::BoundaryFraming => "请求封装会跨越此边界。",
                 S::BoundaryContent => "上述源内容也会跨越此边界发送。",
                 S::Total => "内容合计",
                 S::DocumentName => "文档",
@@ -1492,6 +1528,7 @@ impl S {
                 S::Sending => "发送中",
                 S::Sent => "已发送",
                 S::HoldToSend => "按住发送",
+                S::HoldCtrlEnter => "按住 Ctrl+Enter 发送",
             },
         }
     }
@@ -1524,11 +1561,10 @@ mod tests {
 
     #[test]
     fn the_total_is_the_sum_of_the_rows_on_screen() {
-        // A document with one named source: the frame carries its tag, the
-        // length prefixes and the context JSON beyond the content.
+        // A document with one named source: the total is their content, and
+        // the request's own framing is disclosed without a figure.
         let consent = OutboundConsent {
             disclosure: disclosure(OutboundScope::document(600)),
-            framed_bytes: Some(1_000),
             items: vec![
                 item(OutboundOrigin::Document, "plan.md", 600, true),
                 item(OutboundOrigin::NamedSource, "~/AGENTS.md", 200, true),
@@ -1536,29 +1572,20 @@ mod tests {
             stays: Vec::new(),
         };
         let rows = rows(&consent, Language::English, 20);
-        let sum: u64 = rows.leaving.iter().map(|row| row.bytes).sum::<u64>()
-            + rows.framing.as_ref().map_or(0, |row| row.bytes);
-        assert_eq!(rows.total, 800, "the total is the content, never the frame");
+        assert_eq!(rows.total, 800);
         assert_eq!(
             rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
             rows.total,
             "the printed total is the sum of the rows above it"
-        );
-        assert_eq!(sum, 1_000, "the frame is one figure beyond the total");
-        assert_eq!(
-            rows.framing.as_ref().map(|row| row.bytes),
-            Some(200),
-            "the framing row is the framed remainder beyond the content"
         );
     }
 
     #[test]
     fn a_metadata_only_entry_is_listed_but_never_counted() {
         // A skill package with a binary asset: its raw bytes stay here; its
-        // path, size and hash leave inside the frame.
+        // path, size and hash leave as metadata, beyond the total.
         let consent = OutboundConsent {
             disclosure: disclosure(OutboundScope::document(2_140)),
-            framed_bytes: Some(4_700),
             items: vec![
                 item(OutboundOrigin::PackageFile, "SKILL.md", 2_140, true),
                 item(OutboundOrigin::PackageFile, "scripts/run.py", 1_388, true),
@@ -1572,15 +1599,12 @@ mod tests {
             stays: vec![item(OutboundOrigin::Omission, "notes/old.md", 0, false)],
         };
         let rows = rows(&consent, Language::English, 20);
-        let sum: u64 = rows.leaving.iter().map(|row| row.bytes).sum::<u64>()
-            + rows.framing.as_ref().map_or(0, |row| row.bytes);
-        assert_eq!(rows.total, 3_528, "the package's content, not the frame");
+        assert_eq!(rows.total, 3_528, "the package's content");
         assert_eq!(
             rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
             rows.total,
             "the total is the rows above it"
         );
-        assert_eq!(sum, 4_700, "the frame is listed beyond the total");
         assert_eq!(rows.metadata.len(), 1, "the binary is its own group");
         assert_eq!(rows.metadata[0].bytes, 12_004, "its disclosed size stays");
         assert!(
@@ -1591,14 +1615,13 @@ mod tests {
     }
 
     #[test]
-    fn a_revision_without_a_framed_total_lists_only_its_items() {
+    fn a_revision_lists_only_its_items() {
         let consent = OutboundConsent {
             disclosure: ModelRequestDisclosure::new(
                 ModelOperation::Revision,
                 EndpointIdentity::parse(Provider::OpenAiResponses, None).expect("endpoint"),
                 OutboundScope::document(400),
             ),
-            framed_bytes: None,
             items: vec![
                 item(OutboundOrigin::Document, "plan.md", 400, true),
                 item(OutboundOrigin::ReviewContext, "Review context", 900, true),
@@ -1608,7 +1631,6 @@ mod tests {
         };
         let rows = rows(&consent, Language::English, 20);
         assert_eq!(rows.total, 1_420);
-        assert_eq!(rows.framing, None, "nothing framed is claimed");
     }
 
     #[test]
@@ -1625,7 +1647,6 @@ mod tests {
             .collect();
         let consent = OutboundConsent {
             disclosure: disclosure(OutboundScope::document(1)),
-            framed_bytes: None,
             items,
             stays: Vec::new(),
         };
@@ -1663,7 +1684,6 @@ mod tests {
         }));
         let consent = OutboundConsent {
             disclosure: disclosure(OutboundScope::document(1)),
-            framed_bytes: None,
             items,
             stays: (0..12)
                 .map(|index| {
@@ -1677,8 +1697,7 @@ mod tests {
                 .collect(),
         };
         let rows = rows(&consent, Language::English, 8);
-        // Three captions, the three groups' rows and nothing more: 8 + the
-        // framing row this consent has none of.
+        // Three captions and the three groups' rows, nothing more.
         let drawn = 3 + rows.leaving.len() + rows.metadata.len() + rows.stays.len();
         assert!(drawn <= 8, "{drawn} rows drawn for a budget of 8");
         for group in [&rows.leaving, &rows.metadata, &rows.stays] {
@@ -1761,14 +1780,13 @@ mod tests {
     }
 
     /// A manifest of the shape the state builds: one document and one named
-    /// source, framed at 1,000 bytes.
+    /// source.
     fn sample_consent() -> OutboundConsent {
         OutboundConsent {
             disclosure: disclosure(
                 OutboundScope::document_with_effective_agent_context(600, ["~/AGENTS.md"])
                     .expect("a named source"),
             ),
-            framed_bytes: Some(1_000),
             items: vec![
                 item(OutboundOrigin::Document, "plan.md", 600, true),
                 item(OutboundOrigin::NamedSource, "~/AGENTS.md", 200, true),
@@ -1778,11 +1796,10 @@ mod tests {
     }
 
     /// A manifest of the shape a switch *to* the plain document leaves: the
-    /// context gone, the frame smaller.
+    /// context gone, its source staying.
     fn sample_consent_without_context() -> OutboundConsent {
         OutboundConsent {
             disclosure: disclosure(OutboundScope::document(600)),
-            framed_bytes: None,
             items: vec![item(OutboundOrigin::Document, "plan.md", 600, true)],
             stays: vec![item(
                 OutboundOrigin::ExcludedSource,
@@ -1868,10 +1885,20 @@ mod tests {
         assert!(app.shows("plan.md"), "the document row");
         assert!(app.shows("~/AGENTS.md"), "the named source row");
         assert!(app.shows("800 B"), "the content total");
-        assert!(app.shows("Protocol framing"), "the framed remainder");
-        assert!(app.shows("200 B"), "the framed remainder's own figure");
         assert!(app.shows("Hold to send"), "the hold's label");
         assert!(app.shows("Content total"), "the sum named for what it is");
+        assert!(
+            app.shows("Request framing (not counted)"),
+            "the framing disclosure, without a figure"
+        );
+        assert!(
+            !app.shows("Protocol framing"),
+            "no figure is claimed for the wire request"
+        );
+        assert!(
+            app.shows("Hold Ctrl+Enter to send"),
+            "the focus-independent hold is on the card"
+        );
         assert!(
             app.wait_for("text:/To Remote .* may use the configured system proxy/")
                 .is_ok(),
@@ -1895,6 +1922,16 @@ mod tests {
     fn escape_cancels_and_closes_the_card() {
         let (mut app, _config) = start_harness();
         app.press_key("escape").expect("escape");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("the card closed");
+    }
+
+    #[test]
+    fn the_cancel_control_cancels() {
+        // The cancel control is one focusable view of its own (not a
+        // component's boundary): its press still authorizes nothing.
+        let (mut app, _config) = start_harness();
+        app.press("id:consent-cancel-button").expect("press Cancel");
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("the card closed");
     }
@@ -2023,5 +2060,48 @@ mod tests {
             .expect("the focused control charged and cooled");
         assert!(app.shows("Send for review?"), "the card stayed up");
         assert!(!app.shows("Sent"), "a tap authorizes nothing");
+    }
+
+    #[test]
+    fn ctrl_enter_charges_without_any_focus_and_an_early_release_sends_nothing() {
+        // The focus-independent route: nothing is focused (the host platform
+        // focuses no views), and an early release — the harness reports no
+        // key-up, so the watchdog is the release — charges and then says so,
+        // with nothing authorized. The completion this charge reaches on a
+        // platform that repeats the key is `a_held_press_sends_once`'s path.
+        let (mut app, _config) = start_harness();
+        app.press_key("ctrl+enter").expect("ctrl+enter");
+        assert!(
+            app.shows("Nothing was sent."),
+            "the charge started and the early release says so"
+        );
+        assert!(app.shows("Send for review?"), "the card stayed up");
+        app.wait(Duration::from_millis(1_200))
+            .expect("past the charge");
+        assert!(!app.shows("Sent"), "an early release authorizes nothing");
+    }
+
+    #[test]
+    fn a_rebuilt_body_drops_the_focus_that_went_with_it() {
+        // A rebuild makes new controls, and the old ones' state goes with
+        // them: a still-charging `focused` flag would let `Enter` charge a
+        // control the user can no longer see.
+        let (mut app, _config) = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        // Tab's stops, in order: the scope switch, Cancel, then the hold
+        // control, which then holds the focus.
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab");
+        }
+        app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(900.0)))
+            .expect("resize, which rebuilds the body");
+        // The rebuilt card's `Enter` is the default control's, not a charge.
+        app.press_key("enter").expect("enter");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("Enter cancelled: the stale focus was dropped");
+        assert!(!app.shows("Sent"), "nothing was sent");
     }
 }
