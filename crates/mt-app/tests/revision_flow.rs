@@ -4,14 +4,13 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
-
-mod support;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -107,29 +106,46 @@ fn partial_accept_records_the_final_split_once() {
 
     let mut app =
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
-    app.press("text:Review").expect("start review");
-    app.wait_for("text:Send").expect("review disclosure");
-    app.press("text:Send").expect("send review");
-    app.wait_for_within("text:Review ready", Duration::from_secs(20))
+    app.press("id:title-review").expect("start review");
+    app.wait_for("id:consent-card").expect("review disclosure");
+    app.long_press("id:consent-send").expect("send review");
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("review ready");
 
-    app.press("text:Prepare revision")
+    // Prepare revision is the result's one next action.
+    app.press("label:Prepare revision")
         .expect("prepare revision");
-    app.wait_for("text:Send revision")
-        .expect("revision disclosure");
-    app.press("text:Send revision").expect("send revision");
-    app.wait_for("text:☐ Rejected").expect("revision hunk");
-    app.press("text:Use the reviewed title.")
+    app.wait_for("text:Send the revision?")
+        .expect("revision disclosure names the revision");
+    app.long_press("id:consent-send").expect("send revision");
+    // The hunks arrive with the reading position on the first group.
+    app.wait_for("id:revision-accept").expect("revision hunk");
+    app.wait_for("text:Revision ready. Approve individual changes, then apply.")
+        .expect("revision ready");
+    app.wait_for("text:Use the reviewed title.")
+        .expect("the first hunk is the one docked");
+    // Approve the docked hunk only: the second hunk stays rejected.
+    app.press("label:Accept")
         .expect("approve the first hunk only");
-    app.wait_for("text:☑ Approved").expect("hunk approved");
-    app.press("text:Apply approved").expect("apply revision");
+    app.wait_for("text:1 of 2 decided")
+        .expect("exactly one hunk is decided");
+    app.press("label:Done")
+        .expect("apply the approved revision");
     app.wait_for("text:Approved changes applied to the buffer.")
         .expect("apply status");
-    app.press("text:Save").expect("save applied revision");
-    support::wait_for_file(
+    // Save through the title row's menu: the applied revision lands on disk.
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-save")
+        .expect("save applied revision");
+    wait_for_file(
         &mut app,
         &document,
         |text| text == "Revised\nUnchanged\n",
@@ -354,6 +370,36 @@ fn revision_usage_totals() -> (u64, u64, u64, u64) {
                         .unwrap_or_default(),
             )
         })
+}
+
+/// How long one pumped frame waits for the app before the loop looks again.
+const STEP: Duration = Duration::from_millis(25);
+
+fn pump(app: &mut Headless) {
+    app.next_change(STEP).expect("settle while waiting");
+}
+
+/// Waits until the text at `path` satisfies `holds`.
+fn wait_for_file(
+    app: &mut Headless,
+    path: &Path,
+    holds: impl Fn(&str) -> bool,
+    what: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if holds(&text) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {path:?} holds {text:?} with {:?} on screen",
+            app.screen().texts()
+        );
+        pump(app);
+    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

@@ -18,13 +18,16 @@ fn language_switch_keeps_the_unsubmitted_credential() {
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
     app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
         .expect("wide viewport");
-    app.wait_for("text:Settings").expect("shell");
-    app.press("text:Settings").expect("open settings");
+    app.wait_for("id:shell").expect("shell");
+    // The settings page lives behind the title row's gear.
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-settings").expect("open settings");
     app.wait_for("id:api-key").expect("credential field");
     app.type_text("id:api-key", "synthetic-key")
         .expect("type credential");
 
-    app.press("text:简体中文").expect("switch language");
+    app.press("id:settings-language-chinese >> role:button")
+        .expect("switch language");
     app.wait_for("text:界面语言").expect("Chinese settings");
     let value = app
         .screen()
