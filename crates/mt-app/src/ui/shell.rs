@@ -264,6 +264,9 @@ fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
         .test_id("overlay")
         .absolute()
         .inset_0()
+        // The layer itself never takes a press: empty, it would cover every
+        // control in the window. Its scrims and cards still do.
+        .pointer_events(PointerEvents::BoxNone)
         .child(when(
             {
                 let condition_state = consent_state.clone();
