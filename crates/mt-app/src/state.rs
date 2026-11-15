@@ -111,6 +111,13 @@ pub struct AppState {
     pub settings_open: Signal<bool>,
     pub settings_credential: Signal<String>,
     pub settings_notice: Signal<SharedString>,
+    /// Bumped after a credential is stored or removed, so the settings page
+    /// re-reads the credential status: the vault has no signal of its own.
+    pub settings_credential_revision: Signal<u64>,
+    /// The last credential status and what it was computed for, so a render
+    /// that changes nothing about the endpoint does not read the secure store
+    /// again; the settings page is the only reader.
+    pub(crate) settings_credential_status: Signal<Option<(CredentialStatusKey, CredentialStatus)>>,
     pub usage_counts: Signal<UsageAggregate>,
     pub usage_inspection_open: Signal<bool>,
     pub recovery_records: Signal<Vec<RecoveredRecord>>,
@@ -232,6 +239,20 @@ pub struct SearchHit {
 
 impl AppState {
     pub fn new() -> Self {
+        Self::build(CredentialVault::production())
+    }
+
+    /// The state with the credential vault given: a test passes its own
+    /// in-memory vault, so nothing it does can read, write or delete a
+    /// credential in the platform's secure store.
+    #[cfg(test)]
+    pub(crate) fn with_vault(vault: CredentialVault) -> Self {
+        Self::build(vault)
+    }
+
+    /// The constructor's body, with the one choice a test overrides made a
+    /// parameter.
+    fn build(vault: CredentialVault) -> Self {
         let settings = SettingsData::load();
         set_color_scheme(match settings.theme {
             ThemePreference::System => nsh_core::platform::Appearance::System,
@@ -284,6 +305,8 @@ impl AppState {
             settings_open: signal(false),
             settings_credential: signal(String::new()),
             settings_notice: signal(SharedString::from("")),
+            settings_credential_revision: signal(0_u64),
+            settings_credential_status: signal(None),
             usage_counts: signal(UsageAggregate::default()),
             usage_inspection_open: signal(false),
             recovery_records: signal(records),
@@ -305,7 +328,7 @@ impl AppState {
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
-            vault: CredentialVault::production(),
+            vault,
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
@@ -2137,6 +2160,80 @@ impl AppState {
             })
     }
 
+    /// How the configured endpoint's credential would resolve right now,
+    /// without reading or returning the secret. Mirrors the resolution a model
+    /// operation does: this process's session key first, then the secure store,
+    /// then the provider's environment variable for an endpoint allowed to use
+    /// it.
+    ///
+    /// The vault's only source-aware query is `resolve`, and resolving reads
+    /// the platform's secure store behind a global mutex; callers that draw a
+    /// status line should use [`Self::credential_status_cached`] instead.
+    pub fn credential_status(&self) -> CredentialStatus {
+        let settings = self.settings.get();
+        let Some(provider) = mt_core::model::Provider::from_key(settings.model_provider.trim())
+        else {
+            return CredentialStatus::Unconfigured;
+        };
+        let base = (!settings.model_base_url.trim().is_empty())
+            .then_some(settings.model_base_url.as_str());
+        let Ok(endpoint) = mt_core::model::EndpointIdentity::parse(provider, base) else {
+            return CredentialStatus::Unconfigured;
+        };
+        let target = endpoint.credential_target();
+        let environment_allowed = endpoint.is_vendor_default()
+            || settings.model_environment_key_identity == target.as_str();
+        let environment_value = environment_allowed
+            .then(|| std::env::var(provider.credential_environment_variable()).ok())
+            .flatten();
+        match self
+            .vault
+            .resolve(target.as_str(), environment_value, environment_allowed)
+        {
+            Ok(Some(resolved)) => match resolved.source() {
+                mt_core::credentials::CredentialSource::Session => CredentialStatus::Session,
+                mt_core::credentials::CredentialSource::Persistent => CredentialStatus::Stored,
+                mt_core::credentials::CredentialSource::Environment => {
+                    CredentialStatus::Environment
+                }
+            },
+            Ok(None) => CredentialStatus::Missing,
+            Err(_) => CredentialStatus::Unavailable,
+        }
+    }
+
+    /// [`credential_status`](Self::credential_status), computed again only when
+    /// the endpoint or the credential state changes: a status line must not
+    /// read the secure store once per binding, nor on every keystroke of a
+    /// field the status does not depend on.
+    pub(crate) fn credential_status_cached(&self) -> CredentialStatus {
+        let settings = self.settings.get();
+        let key = CredentialStatusKey {
+            provider: settings.model_provider.clone(),
+            base_url: settings.model_base_url.clone(),
+            environment_identity: settings.model_environment_key_identity.clone(),
+            revision: self.settings_credential_revision.get(),
+        };
+        if let Some((cached, status)) = self.settings_credential_status.get()
+            && cached == key
+        {
+            return status;
+        }
+        let status = self.credential_status();
+        self.settings_credential_status.set(Some((key, status)));
+        status
+    }
+
+    /// Forget the configured endpoint's key: the secure-store entry and this
+    /// process's copy, if either exists.
+    pub fn remove_credential(&self) -> Result<(), String> {
+        let target = self.credential_target()?;
+        self.vault.delete(&target).map_err(|error| {
+            self.record_usage(UsageEvent::CredentialFailure);
+            error.to_string()
+        })
+    }
+
     fn credential_target(&self) -> Result<String, String> {
         let settings = self.settings.get();
         let provider = mt_core::model::Provider::from_key(settings.model_provider.trim())
@@ -2147,6 +2244,35 @@ impl AppState {
             .map_err(|error| error.to_string())?;
         Ok(endpoint.credential_target().as_str().to_owned())
     }
+}
+
+/// The settings [`AppState::credential_status_cached`] depends on: the wire
+/// format, the base URL, the endpoint's environment authorization, and the
+/// credential revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CredentialStatusKey {
+    provider: String,
+    base_url: String,
+    environment_identity: String,
+    revision: u64,
+}
+
+/// How the configured endpoint's model credential resolves right now, as the
+/// settings page's status line says it. Never carries the key itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStatus {
+    /// No usable endpoint: no wire format chosen, or the base URL is invalid.
+    Unconfigured,
+    /// A wire format and endpoint are set, but no key is available.
+    Missing,
+    /// A key held for this process only.
+    Session,
+    /// A key in the platform's secure store (Windows Credential Manager).
+    Stored,
+    /// A key from the provider's environment variable.
+    Environment,
+    /// The secure store could not be read.
+    Unavailable,
 }
 
 impl ReviewView {
