@@ -131,6 +131,16 @@ pub struct AppState {
     pub revision_hunks: Signal<Vec<RevisionHunkView>>,
     pub revision_status: Signal<Option<SharedString>>,
     pub revision_busy: Signal<bool>,
+    /// The destructive close or quit guard (`ui::notices`): up while a
+    /// decision over dirty buffers is waiting.
+    pub guard: Signal<Option<GuardRequest>>,
+    /// The tab whose disk comparison (`ui::notices`) is open, if any.
+    pub conflict_compare: Signal<Option<u64>>,
+    /// Which difference the open comparison shows (`ui::notices`).
+    pub conflict_difference: Signal<usize>,
+    /// The file-on-disk text the conflict comparison reads (`ui::notices`),
+    /// refreshed whenever a document is marked as differing from disk.
+    pub conflict_disk: Signal<Option<String>>,
     owner: Owner,
     vault: CredentialVault,
     usage: Rc<RefCell<UsageStore>>,
@@ -170,6 +180,19 @@ pub struct RevisionHunkView {
     pub before: String,
     pub after: String,
     pub accepted: Signal<bool>,
+}
+
+/// One destructive decision the guard is asking about (`ui::notices`).
+#[derive(Clone, PartialEq)]
+pub struct GuardRequest {
+    /// The tab being closed; `None` quits the window.
+    pub tab: Option<u64>,
+    /// The dirty documents the decision covers, as they were when it opened.
+    pub dirty: Vec<u64>,
+    /// A save is going on: the guard's controls wait for it.
+    pub busy: Signal<bool>,
+    /// Why the guard is still up (a save that could not finish).
+    pub notice: Signal<Option<SharedString>>,
 }
 
 /// Immutable inputs retained after a successful Review for a later Revision.
@@ -285,6 +308,10 @@ impl AppState {
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
+            guard: signal(None),
+            conflict_compare: signal(None),
+            conflict_difference: signal(0),
+            conflict_disk: signal(None),
             vault: CredentialVault::production(),
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
@@ -602,7 +629,20 @@ impl AppState {
             .and_then(|name| name.to_str())
             .unwrap_or("Untitled")
             .to_owned();
-        let text = signal(SharedString::from(loaded.text.clone()));
+        // A tab's signals belong to the app, not to whatever element asked for
+        // the tab: a Restore pressed in a transient row (a recovered record
+        // that the press itself removes) would otherwise take the new
+        // document's text, dirty and conflict signals down with its owner.
+        let (text, dirty_signal, revision, pane, web_trusted, conflict) = self.owner.run(|| {
+            (
+                signal(SharedString::from(loaded.text.clone())),
+                signal(dirty),
+                signal(0),
+                signal(Pane::Split),
+                signal(false),
+                signal(false),
+            )
+        });
         let path = loaded.path.clone();
         let recovery_key = RecoveryKey::for_path(&path);
         self.record_recent(&path, RecentTargetKind::File);
@@ -615,11 +655,11 @@ impl AppState {
                 path,
                 title: SharedString::from(title),
                 text,
-                dirty: signal(dirty),
-                revision: signal(0),
-                pane: signal(Pane::Split),
-                web_trusted: signal(false),
-                conflict: signal(false),
+                dirty: dirty_signal,
+                revision,
+                pane,
+                web_trusted,
+                conflict,
                 untitled: false,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
@@ -953,7 +993,7 @@ impl AppState {
         }
         if record.source_conflicted {
             if let Some(tab) = self.active_tab() {
-                tab.conflict.set(true);
+                self.note_conflict(&tab);
             }
             self.status.set(SharedString::from(
                 "Recovered text differs from disk; reload, overwrite, or save as a new file.",
@@ -1070,39 +1110,150 @@ impl AppState {
             self.close_tab_now(id);
             return;
         }
-        let state = self.clone();
-        self.spawn_task(async move {
-            let answer = alert_dialog()
-                .title("Unsaved changes")
-                .description("Save this document before closing it?")
-                .action("save", "Save")
-                .destructive("discard", "Discard")
-                .cancel("cancel", "Cancel")
-                .show()
-                .await;
-            match answer {
-                Ok(answer) if answer.action.as_deref() == Some("save") => {
-                    state.set_active(id);
-                    state.save_active();
-                    if !state
+        // The in-app guard takes the decision (`ui::notices`): Save, Don't
+        // save or Cancel, with Cancel the default.
+        self.open_guard(Some(id), vec![id]);
+    }
+
+    /// Show the destructive close or quit guard for `tab` (or the whole
+    /// window when it is `None`), covering `dirty`.
+    fn open_guard(&self, tab: Option<u64>, dirty: Vec<u64>) {
+        if dirty.is_empty() {
+            return;
+        }
+        // The guard outlives the control that asked for it (the card replaces
+        // the tab's own row), so its signals are the app's.
+        let (busy, notice) = self.owner.run(|| (signal(false), signal(None)));
+        self.guard.set(Some(GuardRequest {
+            tab,
+            dirty,
+            busy,
+            notice,
+        }));
+    }
+
+    /// Mark `tab` as differing from its file and read the file's text, so
+    /// the conflict banner can show the comparison (`ui::notices`). The
+    /// read is best-effort: a file that cannot be read leaves the
+    /// comparison empty and the other decisions in place.
+    fn note_conflict(&self, tab: &Tab) {
+        tab.conflict.set(true);
+        let disk = io::load(&tab.path).ok().map(|loaded| loaded.text);
+        self.conflict_disk.set(disk);
+    }
+
+    /// The guard's Save: save every document it covers, then finish the
+    /// close. A save that cannot finish leaves the guard up with its notice.
+    pub fn guard_save(&self) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        if request.busy.get() {
+            return;
+        }
+        match request.tab {
+            Some(id) => {
+                self.set_active(id);
+                let untitled = self
+                    .tabs
+                    .get()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .is_some_and(|tab| tab.untitled);
+                if untitled {
+                    // The picker is the next decision; nothing is discarded
+                    // when it is cancelled.
+                    self.guard.set(None);
+                    self.save_active();
+                    return;
+                }
+                let saved = self.save_tab(id);
+                if saved {
+                    self.guard.set(None);
+                    self.close_tab_now(id);
+                } else {
+                    request.notice.set(Some(SharedString::from(
+                        "Still open: the document could not be saved.",
+                    )));
+                }
+            }
+            None => {
+                let state = self.clone();
+                request.busy.set(true);
+                request.notice.set(None);
+                self.spawn_task(async move {
+                    // Translation can dirty another tab while a save waits,
+                    // and Cancel takes the guard away mid-flight.
+                    let dirty: Vec<u64> = state
                         .tabs
                         .get()
                         .iter()
-                        .find(|tab| tab.id == id)
-                        .is_some_and(|tab| tab.dirty.get())
-                    {
-                        state.close_tab_now(id);
+                        .filter(|tab| tab.dirty.get())
+                        .map(|tab| tab.id)
+                        .collect();
+                    for id in dirty {
+                        if state.guard.get().is_none() {
+                            return;
+                        }
+                        let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id).cloned()
+                        else {
+                            continue;
+                        };
+                        let saved = if tab.untitled {
+                            state.save_as_tab(tab).await
+                        } else {
+                            state.save_tab(id)
+                        };
+                        if !saved {
+                            if let Some(request) = state.guard.get() {
+                                request.busy.set(false);
+                                request.notice.set(Some(SharedString::from(
+                                    "Still open: a document could not be saved.",
+                                )));
+                            }
+                            state.status.set(SharedString::from(
+                                "Quit cancelled: a document could not be saved.",
+                            ));
+                            return;
+                        }
+                    }
+                    if state.guard.get().is_some() {
+                        state.guard.set(None);
+                        nsh_core::element::desktop::current_window().close();
+                    }
+                });
+            }
+        }
+    }
+
+    /// The guard's Don't save: close the covered documents, retiring their
+    /// recovery records.
+    pub fn guard_discard(&self) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        self.guard.set(None);
+        match request.tab {
+            Some(id) => self.close_tab_now(id),
+            None => {
+                self.quit_discarded.set(true);
+                for id in request.dirty {
+                    if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
+                        self.retire_tab_recovery(tab);
                     }
                 }
-                Ok(answer) if answer.action.as_deref() == Some("discard") => {
-                    state.close_tab_now(id);
-                }
-                Ok(_) => {}
-                Err(error) => state
-                    .status
-                    .set(SharedString::from(format!("Close dialog failed: {error}"))),
+                nsh_core::element::desktop::current_window().close();
             }
-        });
+        }
+    }
+
+    /// The guard's Cancel: nothing changes and the guard goes.
+    pub fn guard_cancel(&self) {
+        if let Some(request) = self.guard.get() {
+            request.busy.set(false);
+            request.notice.set(None);
+            self.guard.set(None);
+        }
     }
 
     fn close_tab_now(&self, id: u64) {
@@ -1341,7 +1492,7 @@ impl AppState {
                 true
             }
             Err(SaveError::Conflict) => {
-                tab.conflict.set(true);
+                self.note_conflict(&tab);
                 self.status.set(SharedString::from(crate::i18n::t(
                     self.settings.get().language,
                     crate::i18n::Key::SaveConflictDetail,
@@ -1357,11 +1508,14 @@ impl AppState {
     }
 
     /// Ask before discarding every dirty buffer, then close the window. This
-    /// is the guarded close path available inside the app; the platform title
-    /// bar and Alt+F4 still have no cancellable close event in nsh 0.4, so the
-    /// periodic checkpoint remains the only recovery protection on that path.
-    /// A dirty buffer is checkpointed before the dialog as a best-effort extra
-    /// guard against a failed save or dialog.
+    /// is the guarded close path available inside the app: the in-app guard
+    /// (`ui::notices`) takes the decision. The platform title bar and Alt+F4
+    /// reach the window without it — nsh 0.5.1 can intercept them with
+    /// `WindowAttributes::close_on_press = false` and
+    /// `WindowRef::on_close_press`, which `app.rs` does not wire yet — so the
+    /// periodic checkpoint remains the recovery protection on that path. A
+    /// dirty buffer is checkpointed before the guard as a best-effort extra
+    /// guard against a failed save.
     pub fn request_quit(&self) {
         let dirty: Vec<u64> = self
             .tabs
@@ -1375,61 +1529,8 @@ impl AppState {
             return;
         }
         self.checkpoint_dirty_now();
-
-        let state = self.clone();
-        self.spawn_task(async move {
-            let answer = alert_dialog()
-                .title("Quit MarkTurbo?")
-                .description("Some documents have unsaved changes.")
-                .action("save", "Save all")
-                .destructive("discard", "Discard all")
-                .cancel("cancel", "Cancel")
-                .show()
-                .await;
-            // Translation can dirty another tab while the dialog is open.
-            let dirty: Vec<u64> = state
-                .tabs
-                .get()
-                .iter()
-                .filter(|tab| tab.dirty.get())
-                .map(|tab| tab.id)
-                .collect();
-            match answer {
-                Ok(answer) if answer.action.as_deref() == Some("save") => {
-                    for &id in &dirty {
-                        let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id).cloned()
-                        else {
-                            continue;
-                        };
-                        let saved = if tab.untitled {
-                            state.save_as_tab(tab).await
-                        } else {
-                            state.save_tab(id)
-                        };
-                        if !saved {
-                            state.status.set(SharedString::from(
-                                "Quit cancelled: a document could not be saved.",
-                            ));
-                            return;
-                        }
-                    }
-                    nsh_core::element::desktop::current_window().close();
-                }
-                Ok(answer) if answer.action.as_deref() == Some("discard") => {
-                    state.quit_discarded.set(true);
-                    for &id in &dirty {
-                        if let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id) {
-                            state.retire_tab_recovery(tab);
-                        }
-                    }
-                    nsh_core::element::desktop::current_window().close();
-                }
-                Ok(_) => {}
-                Err(error) => state
-                    .status
-                    .set(SharedString::from(format!("Quit dialog failed: {error}"))),
-            }
-        });
+        // The in-app guard takes the decision (`ui::notices`).
+        self.open_guard(None, dirty);
     }
 
     /// Translate the active document through the consent-bound provider path.
