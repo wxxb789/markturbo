@@ -179,6 +179,11 @@ pub struct AppState {
     usage: Rc<RefCell<UsageStore>>,
     pending_review: Rc<RefCell<Option<PreparedDocumentReviewRequest>>>,
     review_origin: Rc<RefCell<Option<ReviewOrigin>>>,
+    /// The tab a sent Review request belongs to, until its answer lands or
+    /// the request stops mattering (replaced or withdrawn). It outlives the
+    /// tab being on screen: switching tabs must not drop an answer nobody
+    /// has read yet.
+    review_in_flight: Rc<RefCell<Option<ReviewOrigin>>>,
     review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
     pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
@@ -506,6 +511,7 @@ impl AppState {
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
+            review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
             pending_revision: Rc::new(RefCell::new(None)),
@@ -736,16 +742,10 @@ impl AppState {
             return;
         }
         if let Some(slot) = self.preview_slot.get() {
-            // A request in flight for the slot's tab keeps it: its answer
-            // would land on a closed tab. The tab holding the model's live
-            // output keeps it too — replacing that tab would drop a reading
-            // nobody has seen.
-            let waiting = self.active.get() == Some(slot)
-                && (self.review_busy.get() || self.revision_busy.get());
-            // Only an untouched slot tab may be replaced: its text is what
-            // the file on disk holds, so nothing is lost.
-            let replaceable = !waiting
-                && !self.holds_live_model_output(slot)
+            // A tab that still owns model work keeps its slot — a request out
+            // for it, the answer bound to it, the Revision it prepared — and
+            // so does one the user has changed. Both would be lost with it.
+            let replaceable = !self.holds_live_model_output(slot)
                 && self
                     .tabs
                     .get()
@@ -798,30 +798,46 @@ impl AppState {
         });
     }
 
-    /// Whether `id` is the tab the model's live output belongs to
-    /// (additive, chrome lane): a review that has come back and whose text
-    /// has not moved since, or a revision the model proposed. A request in
-    /// flight has produced nothing yet, so it does not count.
+    /// Whether this tab holds live Review or Revision work: a request out for
+    /// it, the answer bound to it, or the Revision a Review prepared. The
+    /// work travels with the tab, not with what is on screen — switching tabs
+    /// does not move it, and replacing the tab would drop it.
     pub fn holds_live_model_output(&self, id: u64) -> bool {
-        if self.active.get() != Some(id) {
-            return false;
-        }
-        if !self.revision_hunks.get().is_empty() || !self.revision_questions.get().is_empty() {
-            return true;
-        }
-        let Some(binding) = *self.review_binding.borrow() else {
-            return false;
-        };
-        if binding.tab_id != id {
-            return false;
-        }
-        // The same test `note_edit` uses to call a review stale: the text has
-        // not moved on since the model read it.
-        self.tabs
+        let owns = |origin: &Option<ReviewOrigin>| origin.is_some_and(|origin| origin.tab_id == id);
+        // The answer is the tab's while its result is the one on screen: a
+        // closed Review keeps its binding but holds nothing.
+        let shown = self
+            .review_view
             .get()
-            .iter()
-            .find(|tab| tab.id == id)
-            .is_some_and(|tab| tab.revision.get() == binding.snapshot.revision)
+            .is_some_and(|view| view.tab_id == Some(id));
+        let binding = *self.review_binding.borrow();
+        let answer = shown
+            && binding.is_some_and(|binding| {
+                binding.tab_id == id
+                    // The same test `note_edit` uses to call a review stale:
+                    // the text has not moved on since the model read it.
+                    && self
+                        .tabs
+                        .get()
+                        .iter()
+                        .find(|tab| tab.id == id)
+                        .is_some_and(|tab| tab.revision.get() == binding.snapshot.revision)
+            });
+        let revision = self.revision_context.borrow();
+        let revision_work = match revision.as_ref() {
+            Some(context) => context.tab_id == id,
+            // Hunks and questions clear with the context; without one they
+            // are the tab on screen's (a Revision still coming back).
+            None => {
+                self.active.get() == Some(id)
+                    && (!self.revision_hunks.get().is_empty()
+                        || !self.revision_questions.get().is_empty())
+            }
+        };
+        owns(&self.review_origin.borrow())
+            || owns(&self.review_in_flight.borrow())
+            || answer
+            || revision_work
     }
 
     /// Start an empty document that does not have a source file yet.
@@ -2012,6 +2028,7 @@ impl AppState {
         // leave the field saying `Reviewing…`.
         self.review_generation.update(|generation| *generation += 1);
         self.review_busy.set(false);
+        self.review_in_flight.borrow_mut().take();
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -2494,6 +2511,7 @@ impl AppState {
         self.review_consent.set(None);
         self.review_manifest.set(None);
         self.review_busy.set(true);
+        *self.review_in_flight.borrow_mut() = Some(origin);
         self.record_usage(UsageEvent::review_started(&revision_request));
         let started = Instant::now();
         let state = self.clone();
@@ -2514,6 +2532,7 @@ impl AppState {
                 return;
             }
             state.review_busy.set(false);
+            *state.review_in_flight.borrow_mut() = None;
             let view = match result {
                 Ok(Ok(transport)) => {
                     state.record_usage(UsageEvent::ReviewCompleted(
@@ -2867,6 +2886,7 @@ impl AppState {
     /// stays cancelled.
     pub fn cancel_review_in_flight(&self) {
         self.review_generation.update(|generation| *generation += 1);
+        self.review_in_flight.borrow_mut().take();
         self.cancel_review();
     }
 

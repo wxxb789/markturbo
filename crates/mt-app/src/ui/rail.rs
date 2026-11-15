@@ -174,7 +174,7 @@ fn strip(
         )
         // Painted over the invisible names, so a press in the 44px strip is
         // always a press on a dot.
-        .child(names(state.clone(), language, slide, palette))
+        .child(names(state.clone(), language, hovered, slide, palette))
         .child(dots(state, palette))
 }
 
@@ -261,6 +261,7 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
 fn names(
     state: AppState,
     language: Language,
+    hovered: Signal<bool>,
     slide: AnimatedValue,
     palette: Palette,
 ) -> impl IntoElement {
@@ -288,11 +289,6 @@ fn names(
                 let close_state = state.clone();
                 view()
                     .test_id("rail-name-row")
-                    .role(AccessibilityRole::Button)
-                    .optional_label(Some(title.clone()))
-                    // The dot row is this tab's keyboard stop: the name row
-                    // is the pointer's way into the widened strip.
-                    .focusable(false)
                     .h(px(24.0))
                     .w_full()
                     .pl(px(44.0))
@@ -302,6 +298,12 @@ fn names(
                     .child(
                         view()
                             .test_id("rail-name")
+                            // The dot row is this tab's keyboard stop: the
+                            // name is the pointer's way into the strip, and
+                            // a stop here would be clipped while it rests.
+                            .focusable(false)
+                            .role(AccessibilityRole::Button)
+                            .optional_label(Some(title.clone()))
                             .flex_1()
                             .min_w(px(0.0))
                             .py(px(SPACE_1))
@@ -346,6 +348,9 @@ fn names(
                                 s(S::Close, language),
                                 title
                             ))))
+                            // A stop only while the strip is open: a clipped
+                            // button is no place for the focus to land.
+                            .focusable(move || hovered.get())
                             .border(px(HAIRLINE))
                             .border_color(Color::TRANSPARENT)
                             .focus_visible(|s| s.border_color(tokens::palette().ink))

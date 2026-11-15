@@ -65,6 +65,8 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     on_key("mod+o", move |_: &str| {
         welcome::choose_folder(open_state.clone())
     });
+    let new_state = state.clone();
+    on_key("mod+n", move |_: &str| new_state.new_document());
     let save_as_state = state.clone();
     on_key("shift+mod+s", move |_: &str| {
         if save_as_state.active.get().is_some() {
@@ -387,6 +389,22 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
             )
             .element_ref(&first)
         })
+        // The welcome's two ways to start a document, wherever the menu is
+        // opened from: the new document becomes the active tab.
+        .child({
+            let new_state = state.clone();
+            menu_row("title-menu-new-file", s(S::NewFile, language), move || {
+                menu.set(false);
+                new_state.new_document();
+            })
+        })
+        .child({
+            let paste_state = state.clone();
+            menu_row("title-menu-paste", s(S::PasteAsNew, language), move || {
+                menu.set(false);
+                paste_state.new_from_clipboard();
+            })
+        })
         .child(
             view()
                 .px(px(SPACE_3))
@@ -667,6 +685,8 @@ fn shortcut(keys: &str) -> String {
 #[derive(Clone, Copy)]
 enum S {
     OpenFolder,
+    NewFile,
+    PasteAsNew,
     SaveAs,
     Split,
     WebPreview,
@@ -678,6 +698,8 @@ fn s(key: S, language: Language) -> &'static str {
     match language {
         Language::English => match key {
             S::OpenFolder => "Open folder\u{2026}",
+            S::NewFile => "New file",
+            S::PasteAsNew => "Paste as new document",
             S::SaveAs => "Save As\u{2026}",
             S::Split => "Split",
             S::WebPreview => "Web preview",
@@ -686,6 +708,8 @@ fn s(key: S, language: Language) -> &'static str {
         },
         Language::Chinese => match key {
             S::OpenFolder => "打开文件夹\u{2026}",
+            S::NewFile => "新建文件",
+            S::PasteAsNew => "粘贴为新文档",
             S::SaveAs => "另存为\u{2026}",
             S::Split => "分栏",
             S::WebPreview => "Web 预览",
