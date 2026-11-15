@@ -2005,6 +2005,27 @@ impl AppState {
         )));
     }
 
+    /// Whether the live Revision proposal's base moved since the Review it was
+    /// computed from — an edit to the document, or another document active —
+    /// which is exactly what [`apply_revision`](Self::apply_revision) refuses:
+    /// the field says so and offers no Accept then. A proposal from no Review
+    /// (a synthetic one) is never stale.
+    pub fn revision_is_stale(&self) -> bool {
+        let context = self.revision_context.borrow();
+        let Some(context) = context.as_ref() else {
+            return false;
+        };
+        match self.active_tab() {
+            Some(tab) => {
+                tab.id != context.tab_id
+                    || !context
+                        .snapshot
+                        .matches(SourceSnapshot::new(tab.revision.get(), 0))
+            }
+            None => true,
+        }
+    }
+
     /// Withdraw the prepared request before it is sent.
     pub fn cancel_review(&self) {
         self.pending_review.borrow_mut().take();
