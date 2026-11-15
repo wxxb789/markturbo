@@ -2007,8 +2007,11 @@ impl AppState {
     /// Nothing leaves the machine until [`send_review`](Self::send_review).
     pub fn start_review(&self) {
         // A review that is prepared replaces any review still in flight: its
-        // task writes nothing when it comes back.
+        // task writes nothing when it comes back, and the loading state it
+        // left is not this run's to show — the early returns below must not
+        // leave the field saying `Reviewing…`.
         self.review_generation.update(|generation| *generation += 1);
+        self.review_busy.set(false);
         let Some(tab) = self.active_tab() else {
             return;
         };
