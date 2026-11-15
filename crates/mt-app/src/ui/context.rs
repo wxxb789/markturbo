@@ -3,12 +3,16 @@
 //! Effective Agent Context in the field: the ordered sources that apply to
 //! this file (global → repository root → nested), their precedence, the
 //! sources a profile verified versus the inventory that never claims to
-//! apply, and the `Include in review` choices.
+//! apply, the `Include in review` choices, and the text an included source
+//! would carry.
 //!
 //! Contract: [`is_open`] says the field is the context's; [`field`] draws it.
-//! Only outbound data emits, and only in consent — a source marked
-//! `Include in review` is white-hot there, never here; everything in this
-//! file is ambient ink. The order along the list is the order Codex applies
+//! Outbound data is the one thing here that emits: a source marked
+//! `Include in review` ignites white-hot along the underline under its order
+//! number and path, and decays to plain ambient ink when it is switched off
+//! (the spec's `agent_context_visual` and its 'Choosing what leaves' moment).
+//! Everything else is ambient ink: your own text, the rows and the toggles
+//! never glow. The order along the list is the order Codex applies
 //! instructions, and the numbers are that order, not a heat ramp.
 //!
 //! The copy is the spec's (`agent_context_visual`): 'Context', 'Applies to
@@ -17,6 +21,7 @@
 //! until a source is chosen for the next send.
 
 use std::{
+    cell::Cell,
     collections::HashSet,
     path::{Path, PathBuf},
 };
@@ -31,13 +36,17 @@ use mt_core::{
     settings::Language,
 };
 use nsh_base::{button, checkbox};
-use nsh_core::{Color, prelude::*};
+use nsh_core::{
+    Color,
+    element::{AdaptiveColor, AnimatedNode, AnimatedValue, Easing, animated_value},
+    prelude::*,
+};
 
 use crate::{
     i18n::{self, Key},
     state::AppState,
     ui::{
-        motion::HOVER_MS,
+        motion::{HOVER_MS, IGNITE_MS, REDUCED_CROSSFADE_MS, reduced_motion},
         prims,
         tokens::{
             self, FONT_SOURCE, FONT_UI, HAIRLINE, SPACE_1, SPACE_2, SPACE_4, SPACE_5, TYPE_SOURCE,
@@ -50,6 +59,10 @@ use crate::{
 /// lines hang under the paths.
 const ORDINAL_W: f32 = 20.0;
 
+/// How long an included source's light takes to decay back to plain ink (the
+/// spec's 'Switching it off: 0-250ms').
+const OUTBOUND_DECAY_MS: f32 = 250.0;
+
 /// Whether the field is showing the agent context.
 pub fn is_open(state: &AppState) -> bool {
     state.context_open.get()
@@ -60,6 +73,10 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
     let rows_state = state.clone();
     let refresh_state = state.clone();
     let close_state = state.clone();
+    // Which source's text is open, if any: the surface's own furniture, so it
+    // does not belong to `AppState` (a rebuild re-keys it, which is fine for a
+    // disclosure).
+    let expanded = signal(None::<usize>);
     view()
         .test_id("context-field")
         .w_full()
@@ -77,6 +94,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                 .pt(px(SPACE_4))
                 .child(busy_line(state.clone(), language))
                 .child(error_line(state.clone()))
+                .child(status_line(state.clone(), language))
                 .child(diagnostics(state.clone()))
                 .child(no_sources_line(state.clone(), language))
                 .child(each(
@@ -84,11 +102,12 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                     |row: &SourceRow| row.key.clone(),
                     {
                         let state = state.clone();
-                        move |row, _| source_block(state.clone(), language, row)
+                        move |row, _| source_block(state.clone(), language, expanded, row)
                     },
                 ))
                 .child(instructions_section(state.clone(), language))
                 .child(skills_section(state.clone(), language))
+                .child(assumptions_section(state.clone(), language))
                 .child(project_root_line(state.clone(), language)),
         )
         .child(
@@ -168,10 +187,42 @@ fn error_line(state: AppState) -> impl IntoElement {
     )
 }
 
+/// The resolution's own state, whenever it is not a clean one: a partial
+/// chain (project content unavailable), invalid input, or an inventory-only
+/// resolution. Without it the empty list would read as a verdict.
+fn status_line(state: AppState, language: Language) -> impl IntoElement {
+    let condition_state = state.clone();
+    when(
+        move || {
+            condition_state
+                .context_resolved
+                .get()
+                .is_some_and(|resolved| resolved.status != ResolutionStatus::Resolved)
+        },
+        move || {
+            let text_state = state.clone();
+            prims::faint(
+                move || match text_state.context_resolved.get().map(|r| r.status) {
+                    Some(ResolutionStatus::Partial) => s(S::StatusPartial, language).to_owned(),
+                    Some(ResolutionStatus::InvalidInput) => {
+                        s(S::StatusInvalid, language).to_owned()
+                    }
+                    Some(ResolutionStatus::InventoryOnly) => {
+                        s(S::StatusInventory, language).to_owned()
+                    }
+                    _ => String::new(),
+                },
+            )
+        },
+    )
+}
+
 /// Resolution diagnostics: what could not be read or is not followed. Their
 /// messages are the resolver's, shown as they are; errors in the danger ink,
-/// warnings at resting ink. Informational notices are not shown here — the
-/// rows carry size and truncation already.
+/// warnings at resting ink. Two informative notices are kept because they
+/// change what the rows mean — a duplicated source and a duplicated line are
+/// deduplicated in the request while every row still shows its own bytes; the
+/// rest (truncation, no instructions) the rows already carry.
 ///
 /// Every conditional block of this surface is a `when` region and not an
 /// empty view: a region's content goes, an empty view would still take a gap.
@@ -186,17 +237,15 @@ fn diagnostics(state: AppState) -> impl IntoElement {
                 move || diagnostic_rows(&rows_state),
                 |row: &DiagnosticRow| row.key.clone(),
                 move |row, _| {
-                    let danger = row.get().danger;
+                    let severity = row.get().severity;
                     text(move || row.get().message.clone())
                         .font_family(FONT_UI)
                         .text_size(px(TYPE_UI))
                         .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || {
-                            if danger {
-                                tokens::palette().danger
-                            } else {
-                                tokens::palette().ink_rest
-                            }
+                        .text_color(move || match severity {
+                            Severity::Error => tokens::palette().danger,
+                            Severity::Warning => tokens::palette().ink_rest,
+                            Severity::Info => tokens::palette().ink_faint,
                         })
                 },
             ))
@@ -204,17 +253,20 @@ fn diagnostics(state: AppState) -> impl IntoElement {
     )
 }
 
-/// 'No AGENTS.md applies' once a resolution settled on an empty chain: the
-/// calm room must not read as a failure.
+/// 'No AGENTS.md applies' once a resolution settled — and only then, on a
+/// resolved chain — on an empty one: the calm room must not read as a failure,
+/// and a failed resolution must not read as a verdict.
 fn no_sources_line(state: AppState, language: Language) -> impl IntoElement {
     when(
         move || {
             !state.context_busy.get()
                 && state.context_error.get().is_none()
-                && state
-                    .context_resolved
-                    .get()
-                    .is_some_and(|resolved| resolved.sources.is_empty())
+                && state.context_resolved.get().is_some_and(|resolved| {
+                    matches!(
+                        resolved.status,
+                        ResolutionStatus::Resolved | ResolutionStatus::Partial
+                    ) && resolved.sources.is_empty()
+                })
         },
         move || prims::faint(s(S::NoSources, language)),
     )
@@ -244,6 +296,10 @@ struct SourceRow {
     path_label: SharedString,
     detail: SharedString,
     includable: bool,
+    /// The effective text that would leave with this source, cut to the
+    /// preview the old panel showed (400 characters and an ellipsis); `None`
+    /// when there is nothing to include.
+    preview: Option<SharedString>,
 }
 
 impl SourceRow {
@@ -253,10 +309,11 @@ impl SourceRow {
         source: &SourceOccurrence,
         language: Language,
     ) -> Self {
-        let includable = source
+        let content = source
             .content_index
             .and_then(|content| resolved.contents.get(content))
-            .is_some_and(|content| !content.text.trim().is_empty());
+            .filter(|content| !content.text.trim().is_empty());
+        let includable = content.is_some();
         Self {
             key: SharedString::from(format!("{index}:{}", source.path.display())),
             index,
@@ -269,18 +326,53 @@ impl SourceRow {
                 bytes_line(resolved, source, includable, language),
             )),
             includable,
+            preview: content.map(|content| SharedString::from(preview_text(&content.text))),
         }
     }
 }
 
-/// One source: its order number, its provenance path (a press opens the
-/// file), the scope and bytes it contributes, and the one toggle.
+/// The 400-character preview the old panel showed, with an ellipsis when the
+/// text is longer.
+fn preview_text(text: &str) -> String {
+    let mut preview: String = text.chars().take(400).collect();
+    if text.chars().count() > 400 {
+        preview.push('\u{2026}');
+    }
+    preview
+}
+
+/// One source: its order number and provenance path (which carry the
+/// outbound light and share its underline), the scope and bytes it
+/// contributes, the `Include in review` toggle, and — while the row is open
+/// — the text that would leave.
 fn source_block(
     state: AppState,
     language: Language,
+    expanded: Signal<Option<usize>>,
     row: ReadSignal<SourceRow>,
 ) -> impl IntoElement {
+    let light_selection = state.context_selected;
+    let index = row.get_untracked().index;
+    // One light per row, at the level the selection already holds (a row is
+    // made with the surface): white-hot while the source is marked to leave,
+    // plain ambient ink while it is not. The effect animates only changes.
+    let lit_now = light_selection.read_only().get_untracked().contains(&index);
+    let light = Outbound::at(if lit_now { 1.0 } else { 0.0 });
+    let lit_before = Cell::new(lit_now);
+    effect(move || {
+        let lit = light_selection.get().contains(&index);
+        if lit != lit_before.get() {
+            lit_before.set(lit);
+            if lit {
+                light.ignite();
+            } else {
+                light.decay();
+            }
+        }
+    });
     let detail_row = row;
+    let text_state = state.clone();
+    let toggle_state = state.clone();
     view()
         .flex_col()
         .gap(px(SPACE_1))
@@ -289,34 +381,130 @@ fn source_block(
                 .flex_row()
                 .items_center()
                 .gap(px(SPACE_2))
-                .child(ordinal(row))
-                .child(path_press(state.clone(), language, row))
-                .child(include_toggle(state, language, row)),
+                .child(
+                    // The number and the path are the emitting group: they
+                    // light together, along one underline.
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex_col()
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(SPACE_2))
+                                .child(ordinal(row, light))
+                                .child(path_expand(language, expanded, row, light)),
+                        )
+                        .child(underline(light)),
+                )
+                .child(include_toggle(toggle_state, language, row)),
         )
         .child(
             view()
                 .pl(px(ORDINAL_W + SPACE_2))
                 .child(prims::faint(move || detail_row.get().detail.clone())),
         )
+        .child(when(
+            move || expanded.get() == Some(index),
+            move || source_text(text_state.clone(), language, row),
+        ))
+}
+
+/// One source's outbound light: white-hot while the source is marked to leave
+/// with the next send, plain ambient ink while it is not.
+///
+/// This is the one emitter in this file, and it burns in the outbound colour
+/// (`Palette::leaving`), never in the model's amber: what is about to leave
+/// the device is a different kind of light from what the model sent back. The
+/// nodes are adaptive, so a theme change follows without a rebuild.
+#[derive(Clone, Copy)]
+struct Outbound(AnimatedValue);
+
+impl Outbound {
+    /// The light settled at `level` (0 plain ink, 1 white-hot), not animating.
+    fn at(level: f32) -> Self {
+        Self(animated_value(level))
+    }
+
+    /// Ignite to white-hot: [`IGNITE_MS`] linear, one crossfade under reduced
+    /// motion.
+    fn ignite(&self) {
+        self.0.stop();
+        if reduced_motion() {
+            self.0.timing(1.0, REDUCED_CROSSFADE_MS, Easing::EaseInOut);
+            return;
+        }
+        self.0.timing(1.0, IGNITE_MS, Easing::Linear);
+    }
+
+    /// Decay to plain ink: [`OUTBOUND_DECAY_MS`], eased out, one crossfade
+    /// under reduced motion.
+    fn decay(&self) {
+        self.0.stop();
+        if reduced_motion() {
+            self.0.timing(0.0, REDUCED_CROSSFADE_MS, Easing::EaseInOut);
+            return;
+        }
+        self.0.timing(0.0, OUTBOUND_DECAY_MS, Easing::EaseOut);
+    }
+
+    /// A glyph colour that follows the light: `ink` at rest, white-hot lit.
+    fn glyph(&self, ink: AdaptiveColor) -> AnimatedNode {
+        self.0.interpolate_colors(&[0.0, 1.0], &[ink, white_hot()])
+    }
+
+    /// The underline's colour: transparent at rest (the line is always laid
+    /// out, its light follows the temperature), white-hot lit.
+    fn filament(&self) -> AnimatedNode {
+        self.0
+            .interpolate_colors(&[0.0, 1.0], &[AdaptiveColor::TRANSPARENT, white_hot()])
+    }
+}
+
+/// The same colour in both appearances, as an animated node's stop.
+fn adaptive(light: Color, dark: Color) -> AdaptiveColor {
+    AdaptiveColor::new(light, dark)
+}
+
+/// Outbound data's colour: white-hot, the same in both apps' appearances
+/// (`Palette::leaving`).
+fn white_hot() -> AdaptiveColor {
+    adaptive(tokens::LIGHT.leaving, tokens::DARK.leaving)
+}
+
+/// The 1px underline under a source's number and path: the line the outbound
+/// light ignites along.
+fn underline(light: Outbound) -> impl IntoElement {
+    let filament = light.filament();
+    view().w_full().h(px(HAIRLINE)).bind_background(&filament)
 }
 
 /// The order number: full ink, tabular figures, in the same mono face as the
-/// path so the chain reads as one column.
-fn ordinal(row: ReadSignal<SourceRow>) -> impl IntoElement {
+/// path so the chain reads as one column. It lights with the source.
+fn ordinal(row: ReadSignal<SourceRow>, light: Outbound) -> impl IntoElement {
+    let ink = light.glyph(adaptive(tokens::LIGHT.ink, tokens::DARK.ink));
     view().w(px(ORDINAL_W)).flex_shrink_0().child(
         text(move || row.get().number.to_string())
             .font_family(FONT_SOURCE)
             .text_size(px(TYPE_SOURCE))
             .line_height(px(TYPE_SOURCE_LINE))
             .tabular_nums()
-            .text_color(move || tokens::palette().ink),
+            .bind_color(&ink),
     )
 }
 
-/// The provenance path: resting ink, a press opens the file as a document.
-fn path_press(state: AppState, language: Language, row: ReadSignal<SourceRow>) -> impl IntoElement {
+/// The provenance path: a press opens the source's own text below the row
+/// (reading what would leave must not cost the selection — opening the file
+/// as a document would), and the path carries the outbound light.
+fn path_expand(
+    language: Language,
+    expanded: Signal<Option<usize>>,
+    row: ReadSignal<SourceRow>,
+    light: Outbound,
+) -> impl IntoElement {
     let index = row.get_untracked().index;
-    let path = row.get_untracked().path.clone();
+    let ink = light.glyph(adaptive(tokens::LIGHT.ink_rest, tokens::DARK.ink_rest));
     view()
         .test_id(&format!("context-source-{index}"))
         .flex_1()
@@ -325,10 +513,13 @@ fn path_press(state: AppState, language: Language, row: ReadSignal<SourceRow>) -
         .child(
             button()
                 .accessibility_label(move || {
-                    Some(SharedString::from(open_label(
-                        language,
-                        &row.get_untracked().path_label,
-                    )))
+                    let label = row.get_untracked().path_label.clone();
+                    let open = expanded.get() == Some(index);
+                    Some(SharedString::from(if open {
+                        hide_text_label(language, &label)
+                    } else {
+                        show_text_label(language, &label)
+                    }))
                 })
                 .w_full()
                 .px(px(0.0))
@@ -340,23 +531,101 @@ fn path_press(state: AppState, language: Language, row: ReadSignal<SourceRow>) -
                 .duration(HOVER_MS)
                 .hover(|style| style.text_color(tokens::palette().ink).underline())
                 .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
-                .on_press(move || state.open_file(path.clone()))
+                .on_press(move || {
+                    expanded.update(|open| {
+                        *open = (*open != Some(index)).then_some(index);
+                    });
+                })
                 .child(
                     text(move || row.get().path_label.clone())
                         .font_family(FONT_SOURCE)
                         .text_size(px(TYPE_SOURCE))
                         .line_height(px(TYPE_SOURCE_LINE))
-                        .text_color(move || tokens::palette().ink_rest)
+                        .bind_color(&ink)
                         .w_full()
                         .truncate(),
                 ),
         )
 }
 
-/// The `Include in review` toggle: ambient ink only — a checked square and
-/// full-ink label. What it marks is left to leave the device in consent;
-/// here nothing glows. Only a source with effective text can be included,
-/// so a content-free occurrence has no toggle.
+/// The text a source would carry, while its row is open: the effective text
+/// the next send would include (the preview the old panel showed, 400
+/// characters at most), and the way to the file itself. Read-only, ambient
+/// ink — only the row's number and path carry light.
+fn source_text(
+    state: AppState,
+    language: Language,
+    row: ReadSignal<SourceRow>,
+) -> impl IntoElement {
+    let index = row.get_untracked().index;
+    let path = row.get_untracked().path.clone();
+    let name = {
+        let path = row.get_untracked().path_label.clone();
+        SharedString::from(open_label(language, &path))
+    };
+    view()
+        .flex_col()
+        .gap(px(SPACE_2))
+        .pl(px(ORDINAL_W + SPACE_2))
+        .child(when(
+            move || row.get().preview.is_some(),
+            move || {
+                prims::source_ink(
+                    move || row.get().preview.clone().unwrap_or_default(),
+                    move || tokens::palette().ink_rest,
+                )
+            },
+        ))
+        .child(quiet_action_named(
+            &format!("context-open-{index}"),
+            i18n::t(language, Key::Open),
+            name,
+            move || state.open_file(path.clone()),
+        ))
+}
+
+/// `prims::quiet_action` with an accessible name of its own: the primitive
+/// takes the name from the visible label, which is the same 'Open' in every
+/// row. (A primitive taking both apart belongs in `prims`.)
+fn quiet_action_named(
+    test_id: &str,
+    label: impl Into<SharedString>,
+    name: SharedString,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let label: SharedString = label.into();
+    view()
+        .test_id(test_id)
+        .bg(Color::TRANSPARENT)
+        .window_drag(false)
+        .child(
+            button()
+                .accessibility_label(Some(name))
+                .px(px(2.0))
+                .py(px(4.0))
+                .bg(Color::TRANSPARENT)
+                .cursor_pointer()
+                .rounded(px(0.0))
+                .transition_colors()
+                .duration(HOVER_MS)
+                .hover(|style| style.text_color(tokens::palette().ink).underline())
+                .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+                .on_press(on_press)
+                .child(
+                    text(label)
+                        .font_family(FONT_UI)
+                        .text_size(px(TYPE_UI))
+                        .line_height(px(TYPE_UI_LINE))
+                        .text_color(move || tokens::palette().ink_rest),
+                ),
+        )
+}
+
+/// The `Include in review` toggle: a checked square and a full-ink label,
+/// ambient ink of its own — the light it switches on is the row's number and
+/// path, which ignite white-hot as outbound data. Only a source with
+/// effective text can be included, so a content-free occurrence has no
+/// toggle.
 fn include_toggle(
     state: AppState,
     language: Language,
@@ -504,6 +773,44 @@ fn skills_section(state: AppState, language: Language) -> impl IntoElement {
 /// Afterimage ink: what discovery found but this profile does not apply.
 fn instruction_ink() -> Color {
     tokens::palette().afterimage_ink
+}
+
+/// The profile's assumptions: what the frozen `codex-agents-md` profile takes
+/// for granted, including what it does not claim. They travel with every
+/// context-backed request, so they are shown as they are, at faint ink.
+fn assumptions_section(state: AppState, language: Language) -> impl IntoElement {
+    let condition_state = state.clone();
+    let rows_state = state.clone();
+    when(
+        move || {
+            condition_state
+                .context_resolved
+                .get()
+                .is_some_and(|resolved| !resolved.assumptions.is_empty())
+        },
+        move || {
+            let rows_state = rows_state.clone();
+            view().flex_col().gap(px(SPACE_2)).child(each(
+                move || {
+                    rows_state
+                        .context_resolved
+                        .get()
+                        .map(|resolved| resolved.assumptions)
+                        .unwrap_or_default()
+                },
+                |assumption: &String| assumption.clone(),
+                move |assumption: ReadSignal<String>, _| {
+                    prims::faint(move || {
+                        format!(
+                            "{}: {}",
+                            i18n::t(language, Key::Assumption),
+                            assumption.get()
+                        )
+                    })
+                },
+            ))
+        },
+    )
 }
 
 /// Resting ink: the skills inventory.
@@ -832,11 +1139,27 @@ fn grouped(number: usize) -> String {
     grouped
 }
 
-/// The accessible name of a source's path: what pressing it does.
+/// The accessible name of the `Open` action: what pressing it does.
 fn open_label(language: Language, path: &str) -> String {
     match language {
         Language::English => format!("Open {path}"),
         Language::Chinese => format!("打开 {path}"),
+    }
+}
+
+/// The accessible name of a path whose press opens the source's text.
+fn show_text_label(language: Language, path: &str) -> String {
+    match language {
+        Language::English => format!("Show the text of {path}"),
+        Language::Chinese => format!("显示 {path} 的文本"),
+    }
+}
+
+/// The same, while the text is open.
+fn hide_text_label(language: Language, path: &str) -> String {
+    match language {
+        Language::English => format!("Hide the text of {path}"),
+        Language::Chinese => format!("隐藏 {path} 的文本"),
     }
 }
 
@@ -845,7 +1168,7 @@ fn open_label(language: Language, path: &str) -> String {
 struct DiagnosticRow {
     key: SharedString,
     message: SharedString,
-    danger: bool,
+    severity: Severity,
 }
 
 fn diagnostic_rows(state: &AppState) -> Vec<DiagnosticRow> {
@@ -855,11 +1178,17 @@ fn diagnostic_rows(state: &AppState) -> Vec<DiagnosticRow> {
     resolved
         .diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.severity != Severity::Info)
+        .filter(|diagnostic| {
+            diagnostic.severity != Severity::Info
+                || matches!(
+                    diagnostic.source.as_str(),
+                    "context.duplicate-source" | "context.duplicate-directive"
+                )
+        })
         .map(|diagnostic| DiagnosticRow {
             key: SharedString::from(diagnostic.to_string()),
             message: SharedString::from(diagnostic.message.clone()),
-            danger: diagnostic.severity == Severity::Error,
+            severity: diagnostic.severity,
         })
         .collect()
 }
@@ -884,6 +1213,9 @@ enum S {
     IncludeInReview,
     NotAppliedByCodex,
     NoSources,
+    StatusPartial,
+    StatusInvalid,
+    StatusInventory,
     AppliesEverywhere,
     AppliesFromRoot,
     Empty,
@@ -905,6 +1237,16 @@ fn s(key: S, language: Language) -> &'static str {
         (S::NotAppliedByCodex, Language::Chinese) => "Codex 未应用",
         (S::NoSources, Language::English) => "No AGENTS.md file applies to this file",
         (S::NoSources, Language::Chinese) => "没有 AGENTS.md 文件适用于此文件",
+        (S::StatusPartial, Language::English) => {
+            "Partially resolved \u{2014} project instructions are unavailable"
+        }
+        (S::StatusPartial, Language::Chinese) => "部分解析——项目指令不可用",
+        (S::StatusInvalid, Language::English) => "Not resolved for this file",
+        (S::StatusInvalid, Language::Chinese) => "未能为此文件解析",
+        (S::StatusInventory, Language::English) => {
+            "Inventory only \u{2014} no verified profile applies"
+        }
+        (S::StatusInventory, Language::Chinese) => "仅清单——没有已验证的 profile 适用",
         (S::AppliesEverywhere, Language::English) => "Applies to every project",
         (S::AppliesEverywhere, Language::Chinese) => "适用于所有项目",
         (S::AppliesFromRoot, Language::English) => "Applies from the repository root",
@@ -1072,6 +1414,16 @@ mod tests {
         assert!(at("Applies under docs/") < at("Not applied by Codex"));
         assert!(at("Not applied by Codex") < at("fix-bug"));
         assert_eq!(app.screen().count("id:context-include-2").unwrap(), 1);
+        // The profile's assumptions travel with every context-backed request,
+        // so they are on screen (at faint ink); a source's own text is not —
+        // it waits behind its row's press.
+        assert!(
+            shown.contains("Assumption: This profile freezes inspected source semantics"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Project rules."), "{shown}");
+        // A clean resolution has no status line of its own.
+        assert!(!shown.contains("Not resolved for this file"), "{shown}");
 
         // The surface fills the field under the title row, the rows sit in
         // it and the actions below them: a percentage height would collapse
@@ -1106,9 +1458,10 @@ mod tests {
         );
     }
 
-    /// The surface's controls: a press on a path opens the file, a press on
-    /// the toggle records the source for the next send, Refresh re-resolves
-    /// the chain, and Close leaves the field.
+    /// The surface's controls: the toggle records the source for the next
+    /// send and lights its number and path white-hot, a press on a path opens
+    /// the text that would leave, `Open` reaches the file itself, Refresh
+    /// re-resolves the chain, and Close leaves the field.
     #[test]
     fn toggles_refreshes_opens_and_closes() {
         let fixture = Fixture::new();
@@ -1119,14 +1472,35 @@ mod tests {
         app.wait_for("id:context-include-2")
             .expect("the three applied sources");
 
-        // Include, then exclude, the global source. The id sits on the view
-        // around the checkbox, so the press names the checkbox's own label.
-        app.press("text:Include in review >> nth=0")
-            .expect("include the global source");
+        // Include the nested source (its path names one row only). The id
+        // sits on the view around the checkbox, so a press names the
+        // checkbox's own label. What it lights (the row's number, path and
+        // underline) is a native animation: the harness moves those values
+        // but draws nothing, so the light itself is checked in the app's own
+        // captures, not here.
+        app.press("text:Include in review >> nth=2")
+            .expect("include the nested source");
         app.wait_for("text:selected:1")
             .expect("the selection recorded");
-        app.press("text:Include in review >> nth=0")
-            .expect("include it again");
+
+        // The path opens the text that would leave — and reading it keeps the
+        // selection (opening the file as a document would clear it).
+        app.press("text:docs/AGENTS.md")
+            .expect("open the nested source's text");
+        app.wait_for("text:Docs rules.")
+            .expect("the source's own text");
+        assert!(
+            app.shows("selected:1"),
+            "reading the text keeps the selection"
+        );
+        app.press("text:docs/AGENTS.md")
+            .expect("close the text again");
+        app.wait_for_gone("text:Docs rules.", Duration::from_secs(5))
+            .expect("the text closed");
+
+        // Excluding a source records nothing for the next send.
+        app.press("text:Include in review >> nth=2")
+            .expect("exclude the nested source");
         app.wait_for("text:selected:0")
             .expect("the selection cleared");
 
@@ -1138,9 +1512,13 @@ mod tests {
         app.wait_for("text:docs/AGENTS.override.md")
             .expect("the refreshed chain");
 
-        // A path press opens the source as a document.
-        app.press("label:Open AGENTS.md")
-            .expect("open the repository's AGENTS.md");
+        // `Open` opens the file itself, as a document. (Last: the document
+        // becomes the active tab, and the chain then follows it.)
+        app.press("text:docs/AGENTS.override.md")
+            .expect("open the override's text");
+        app.wait_for("text:Override.").expect("the override's text");
+        app.press("label:Open docs/AGENTS.override.md")
+            .expect("open the override as a document");
         app.wait_for("text:tabs:2").expect("the source opened");
 
         // Close leaves the field.
