@@ -12,11 +12,13 @@
 //! one 100ms crossfade instead of a 90ms flash plus a 1260ms decay, and
 //! [`stagger`] returns no delay.
 
+use std::sync::OnceLock;
+
 use nsh_core::{
     Color,
     element::{
         AnimatedNode, AnimatedValue, Easing, Keyframe, KeyframeTiming, Timing, animated_value,
-        reduce_motion,
+        reduce_motion, sample_easing,
     },
 };
 
@@ -60,6 +62,22 @@ pub const COOL_STOPS: [f32; 16] = [
 /// The camera's curve: 360ms of `cubic-bezier(0.22, 1, 0.36, 1)`.
 pub fn camera_easing() -> Easing {
     Easing::Bezier(0.22, 1.0, 0.36, 1.0)
+}
+
+/// How far the camera has travelled `elapsed_ms` into its glide: 0 at the
+/// start, 1 from [`CAMERA_MS`] on, along [`camera_easing`].
+///
+/// The column's scroll offset is not a style an [`AnimatedValue`] can drive,
+/// so the camera steps it itself; the curve is nsh's own, sampled once a
+/// millisecond and read between samples.
+pub fn camera_progress(elapsed_ms: f32) -> f32 {
+    static CURVE: OnceLock<Vec<f32>> = OnceLock::new();
+    let curve = CURVE.get_or_init(|| sample_easing(camera_easing(), CAMERA_MS as usize + 1));
+    let at = elapsed_ms.clamp(0.0, CAMERA_MS);
+    let index = at.floor() as usize;
+    let next = (index + 1).min(curve.len() - 1);
+    let fraction = at - index as f32;
+    curve[index] + (curve[next] - curve[index]) * fraction
 }
 
 /// The rail's widening: 160ms of `cubic-bezier(0.2, 0, 0, 1)`.
@@ -290,6 +308,22 @@ mod tests {
                 "heat never rises again after the ignition"
             );
             assert!(pair[1].offset >= pair[0].offset);
+        }
+    }
+
+    #[test]
+    fn the_camera_glides_out_fast_and_settles_on_its_target() {
+        assert_eq!(camera_progress(0.0), 0.0);
+        assert_eq!(camera_progress(CAMERA_MS), 1.0);
+        assert_eq!(camera_progress(CAMERA_MS * 2.0), 1.0, "it stays put after");
+        // `cubic-bezier(0.22, 1, 0.36, 1)` is an ease-out: most of the way is
+        // covered in the first half.
+        assert!(camera_progress(CAMERA_MS / 2.0) > 0.8);
+        let mut last = 0.0;
+        for ms in 1..=CAMERA_MS as usize {
+            let progress = camera_progress(ms as f32 - 0.5);
+            assert!(progress >= last, "the camera never backs up at {ms}ms");
+            last = progress;
         }
     }
 
