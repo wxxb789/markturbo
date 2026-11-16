@@ -1740,8 +1740,10 @@ impl AppState {
         });
     }
 
-    /// Save the active buffer to a new path. An existing destination is never
-    /// replaced here; the user must choose a path that does not exist yet.
+    /// Save the active buffer to a new path. The native save dialog asks
+    /// before an existing file is chosen, so a picked existing destination is
+    /// replaced (atomically, as Save does) — unless another tab has it open,
+    /// which is refused so two tabs never edit one file.
     pub fn save_as_active(&self) {
         let Some(tab) = self.active_tab() else {
             return;
@@ -1764,23 +1766,43 @@ impl AppState {
         );
         match picked.await {
             Ok(Some(path)) => {
+                if !tab.untitled && path == tab.path {
+                    // Its own file: a plain Save, with its conflict check.
+                    return self.save_tab(tab.id);
+                }
+                if self
+                    .tabs
+                    .get()
+                    .iter()
+                    .any(|other| other.id != tab.id && other.path == path)
+                {
+                    self.status.set(SharedString::from(
+                        crate::i18n::save_as_path_already_open_message(
+                            self.settings.get().language,
+                            &path,
+                        ),
+                    ));
+                    return false;
+                }
                 let text = tab.text.get().to_string();
                 let (newline, had_bom) = {
                     let loaded = tab.loaded.borrow();
                     (loaded.newline, loaded.had_bom)
                 };
-                match io::save_as(&path, &text, newline, had_bom) {
+                let saved = match io::save_as(&path, &text, newline, had_bom) {
+                    // The native dialog already asked before this existing
+                    // file was chosen: replace the entry it showed.
+                    Err(SaveError::DestinationExists) => {
+                        io::overwrite_as(&path, &text, newline, had_bom)
+                    }
+                    saved => saved,
+                };
+                match saved {
                     Ok(loaded) => {
                         self.close_tab_now(tab.id);
                         self.add_tab(loaded);
                         self.record_usage(UsageEvent::ArtifactSaved);
                         true
-                    }
-                    Err(SaveError::DestinationExists) => {
-                        self.status.set(SharedString::from(
-                            "Save As refused: that file exists. Choose a new name.",
-                        ));
-                        false
                     }
                     Err(error) => {
                         self.status
