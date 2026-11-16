@@ -7,6 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use mt_core::settings::Language;
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
@@ -129,8 +130,10 @@ fn partial_accept_records_the_final_split_once() {
     app.long_press("id:consent-send").expect("send revision");
     // The hunks arrive with the reading position on the first group.
     app.wait_for("id:revision-accept").expect("revision hunk");
-    app.wait_for("text:Revision ready. Approve individual changes, then apply.")
-        .expect("revision ready");
+    app.wait_for(
+        "text:Revision ready. Each accepted change enters the buffer at once; nothing is saved.",
+    )
+    .expect("revision ready");
     app.wait_for("text:Use the reviewed title.")
         .expect("the first hunk is the one docked");
     // Both hunks start undecided, and an undecided hunk is rejected: `Done`
@@ -370,6 +373,324 @@ fn all_rejected_apply_records_one_decision_and_finalizes() {
     app.wait_for("text:Run Review first to prepare a Revision.")
         .expect("fresh proposal finalized");
     assert_eq!(std::fs::read(&store).unwrap(), finalized);
+}
+
+/// The revision field over a document the loopback provider reviews, with
+/// the buffer on screen: the field's own keys decide, and the text node shows
+/// what each decision wrote.
+#[component]
+fn RevisionFieldOverBuffer() -> impl IntoElement {
+    let state = mt_app::state::AppState::new();
+    state.open_file(
+        std::env::var_os("MARKTURBO_OPEN")
+            .expect("document path")
+            .into(),
+    );
+    let review = state.clone();
+    let send_review = state.clone();
+    let revision = state.clone();
+    let send_revision = state.clone();
+    let edit = state.clone();
+    let review_view = state.review_view;
+    let tabs = state.tabs;
+    let open_state = state.clone();
+    let field_state = state.clone();
+    // The controls beside the field, which takes the window's height.
+    let controls = view()
+        .flex_col()
+        .w(px(320.0))
+        .child(text("Review").on_press(move || review.start_review()))
+        .child(text("Send Review").on_press(move || send_review.send_review()))
+        .child(text("Prepare Revision").on_press(move || revision.start_revision()))
+        .child(text("Send Revision").on_press(move || send_revision.send_revision()))
+        // An edit inside the accepted first word, made as the source editor
+        // makes one.
+        .child(text("Edit the first line").on_press(move || {
+            if let Some(tab) = edit.active_tab() {
+                let edited = tab.text.get().replacen("Revised", "Re-vised", 1);
+                tab.text.set(SharedString::from(edited));
+                tab.dirty.set(true);
+                tab.revision.update(|revision| *revision += 1);
+                edit.note_edit(tab.id);
+            }
+        }))
+        .child(text(move || {
+            review_view
+                .get()
+                .map(|view| view.status)
+                .unwrap_or_default()
+        }))
+        .child(text(move || {
+            format!(
+                "Buffer: {}",
+                tabs.get()
+                    .first()
+                    .map(|tab| tab.text.get())
+                    .unwrap_or_default()
+            )
+        }));
+    view()
+        .flex_row()
+        .child(controls)
+        .child(view().flex_1().child(when(
+            move || mt_app::ui::revision::is_open(&open_state),
+            move || mt_app::ui::revision::field(field_state.clone(), Language::English),
+        )))
+}
+
+/// A Review with no findings and a Revision of two changes that both change
+/// length: `Original` (8 bytes) becomes `Revised` (7), `Unchanged` (9)
+/// becomes `Changed` (7).
+fn two_change_outputs() -> (String, String) {
+    let review = serde_json::json!({
+        "schema_version": "review-v1",
+        "scope": {"kind": "document"},
+        "understood_intent": {
+            "stated_goal": "keep the document intent",
+            "relevant_context": [],
+            "constraints": [],
+            "non_goals": [],
+            "expected_deliverable": "a reviewed document",
+            "success_evidence": [],
+            "inferred_assumptions": [],
+            "unresolved_decisions": []
+        },
+        "findings": [],
+        "clarification_questions": []
+    });
+    let revision = serde_json::json!({
+        "schema_version": "revision-v1",
+        "groups": [{
+            "rationale": "Use the reviewed title.",
+            "edits": [{
+                "range": {"start": 0, "end": 8},
+                "expected_source": "Original",
+                "replacement": "Revised"
+            }]
+        }, {
+            "rationale": "Change the second line.",
+            "edits": [{
+                "range": {"start": 9, "end": 18},
+                "expected_source": "Unchanged",
+                "replacement": "Changed"
+            }]
+        }],
+        "question_coverage": []
+    });
+    (review.to_string(), revision.to_string())
+}
+
+/// Serve `review` and `revision` on a loopback provider, write `source` and
+/// the settings that point at it, and start `RevisionFieldOverBuffer` up to
+/// the moment the hunks arrive. The temporary directories live as long as
+/// the returned guards.
+fn start_field_over_buffer(
+    source: &str,
+) -> (
+    Headless,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let (review_output, revision_output) = two_change_outputs();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let body = read_http_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            if request["stream"].as_bool().unwrap_or(false) {
+                write_sse(&mut stream, &revision_output);
+            } else {
+                write_review_json(&mut stream, &review_output);
+            }
+        }
+    });
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    std::fs::write(&document, source).expect("write document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionFieldOverBuffer>()))
+        .expect("start the field over the buffer");
+    app.wait_for(&format!("text:Buffer: {source}"))
+        .expect("document loaded");
+    app.press("text:Review").expect("prepare Review");
+    app.press("text:Send Review").expect("send Review");
+    app.wait_for_within("text:Review ready", Duration::from_secs(20))
+        .expect("Review ready");
+    app.press("text:Prepare Revision")
+        .expect("prepare Revision");
+    app.press("text:Send Revision").expect("send Revision");
+    app.wait_for_within("id:revision-accept", Duration::from_secs(20))
+        .expect("the hunks arrive");
+    app.wait_for("text:0 of 2 decided")
+        .expect("nothing is decided yet");
+    (app, document, directory, config)
+}
+
+/// Accept writes its hunk into the buffer at once, and only that hunk; a
+/// later hunk lands on its own bytes after an earlier one changed length;
+/// Reject writes nothing; `Ctrl+Z` takes each decision back with exactly
+/// its text; `Done` keeps what was accepted, discards the undecided hunk
+/// unwritten, and nothing reaches the disk.
+#[test]
+fn decisions_write_at_once_and_undo_restores_the_exact_text() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let source = "Original\nUnchanged\n";
+    let (mut app, document, _directory, _config) = start_field_over_buffer(source);
+
+    // Accept the docked first hunk: its replacement is in the buffer now,
+    // before any `Done`, and the second line is untouched.
+    app.press_key("a").expect("press A");
+    app.wait_for("text:Buffer: Revised\nUnchanged\n")
+        .expect("the accepted hunk is written at once, and only it");
+    app.wait_for("text:1 of 2 decided").expect("one decided");
+    // The reading position moves on once the dock extinguishes.
+    app.wait_for("text:Use the reviewed title. · Accepted")
+        .expect("the second hunk is docked");
+
+    // The second hunk sits one byte earlier now; it still replaces exactly
+    // its own word.
+    app.press_key("a").expect("press A on the second hunk");
+    app.wait_for("text:Buffer: Revised\nChanged\n")
+        .expect("the later hunk follows the earlier length change");
+    app.wait_for("text:2 of 2 decided").expect("both decided");
+
+    // Ctrl+Z takes the last decision back together with its text.
+    app.press_key("ctrl+z").expect("undo the second accept");
+    app.wait_for("text:1 of 2 decided")
+        .expect("the decision is back");
+    app.wait_for("text:Buffer: Revised\nUnchanged\n")
+        .expect("exactly the second hunk's reviewed bytes are back");
+
+    // Reject writes nothing.
+    app.press_key("r").expect("reject the second hunk");
+    app.wait_for("text:2 of 2 decided").expect("rejected");
+    assert!(
+        buffer_shows(&app, "Revised\nUnchanged\n"),
+        "a rejection leaves the text: {:?}",
+        app.screen().texts()
+    );
+    app.press_key("ctrl+z").expect("undo the rejection");
+    app.wait_for("text:1 of 2 decided")
+        .expect("the rejection is taken back");
+    assert!(
+        buffer_shows(&app, "Revised\nUnchanged\n"),
+        "undoing a rejection writes nothing: {:?}",
+        app.screen().texts()
+    );
+
+    // Repeated Ctrl+Z walks further back, to the reviewed bytes exactly.
+    app.press_key("ctrl+z").expect("undo the first accept");
+    app.wait_for("text:0 of 2 decided")
+        .expect("no decision is left");
+    app.wait_for(&format!("text:Buffer: {source}"))
+        .expect("the reviewed text, byte for byte");
+    assert_eq!(
+        std::fs::read_to_string(&document).unwrap(),
+        source,
+        "deciding saves nothing"
+    );
+
+    // Accept the first hunk again and finish with the second undecided.
+    app.press_key("a").expect("accept the first hunk again");
+    app.wait_for("text:Buffer: Revised\nUnchanged\n")
+        .expect("written again");
+    app.wait_for("text:1 of 2 decided").expect("one decided");
+    app.press_key("ctrl+enter").expect("Done");
+    app.wait_for("text:Approved changes applied to the buffer.")
+        .expect("Done keeps the accepted change");
+    app.wait_for("text:1 not applied")
+        .expect("Done reports the undecided hunk as not applied");
+    assert!(
+        buffer_shows(&app, "Revised\nUnchanged\n"),
+        "Done writes nothing for the undecided hunk: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&document).unwrap(),
+        source,
+        "Done saves nothing"
+    );
+    assert_eq!(
+        revision_usage_totals(),
+        (1, 1, 1, 1),
+        "one decision record: one accepted, one not, one applied"
+    );
+}
+
+/// The user edits between decisions: an edit inside an accepted change
+/// refuses its undo with a message (the decision and the edit both stand),
+/// while the untouched hunk still lands on its own, moved bytes.
+#[test]
+fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let source = "Original\nUnchanged\n";
+    let (mut app, document, _directory, _config) = start_field_over_buffer(source);
+
+    app.press_key("a").expect("accept the first hunk");
+    app.wait_for("text:Buffer: Revised\nUnchanged\n")
+        .expect("written at once");
+    app.wait_for("text:Use the reviewed title. · Accepted")
+        .expect("the second hunk is docked");
+
+    // The user types inside the accepted replacement.
+    app.press("text:Edit the first line")
+        .expect("edit the accepted text");
+    app.wait_for("text:Buffer: Re-vised\nUnchanged\n")
+        .expect("the edit is in the buffer");
+
+    // The second hunk was not touched: it still accepts, one byte later.
+    app.press_key("a").expect("accept the second hunk");
+    app.wait_for("text:Buffer: Re-vised\nChanged\n")
+        .expect("the untouched hunk follows the user's edit");
+    app.wait_for("text:2 of 2 decided").expect("both decided");
+
+    // Undo the second accept: its part is intact, so its bytes come back.
+    app.press_key("ctrl+z").expect("undo the second accept");
+    app.wait_for("text:Buffer: Re-vised\nUnchanged\n")
+        .expect("the second hunk's reviewed bytes are back");
+    app.wait_for("text:1 of 2 decided").expect("one decided");
+
+    // Undo the first: the user edited it since, so the undo is refused with
+    // a message and nothing is written over the edit.
+    app.press_key("ctrl+z").expect("undo the edited accept");
+    app.wait_for("text:Can't undo — this part was edited after it was accepted.")
+        .expect("the refusal says why");
+    assert!(
+        buffer_shows(&app, "Re-vised\nUnchanged\n") && app.shows("1 of 2 decided"),
+        "the text and the decision both stand: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
+}
+
+/// Whether the buffer line reads `text` exactly (`shows` trims the final
+/// newline the buffer keeps).
+fn buffer_shows(app: &Headless, text: &str) -> bool {
+    app.screen()
+        .matches(&format!("text:Buffer: {text}"))
+        .expect("the buffer selector")
 }
 
 fn revision_usage_totals() -> (u64, u64, u64, u64) {
