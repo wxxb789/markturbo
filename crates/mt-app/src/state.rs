@@ -219,6 +219,10 @@ pub struct AppState {
     /// answer sent under an older generation belongs to no live proposal and
     /// is dropped unread.
     revision_generation: Rc<Cell<u64>>,
+    /// Bumped by every context resolution and reset: only the latest
+    /// resolution lands, so a slower one for the document that was active
+    /// before cannot replace the chain of the one active now.
+    context_generation: Rc<Cell<u64>>,
     pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
     /// Where the live proposal's hunks sit in its tab's text: the one
     /// authority that writes an accepted change, or takes one back.
@@ -529,6 +533,8 @@ impl AppState {
     /// The constructor's body, with the one choice a test overrides made a
     /// parameter.
     fn build(vault: CredentialVault) -> Self {
+        #[cfg(test)]
+        crate::test_env::hermetic();
         let settings = SettingsData::load();
         set_color_scheme(match settings.theme {
             ThemePreference::System => nsh_core::platform::Appearance::System,
@@ -621,6 +627,7 @@ impl AppState {
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
             revision_generation: Rc::new(Cell::new(0)),
+            context_generation: Rc::new(Cell::new(0)),
             pending_revision: Rc::new(RefCell::new(None)),
             revision_ledger: Rc::new(RefCell::new(None)),
             recovery,
@@ -1095,6 +1102,9 @@ impl AppState {
     }
 
     fn reset_context(&self) {
+        self.context_generation
+            .set(self.context_generation.get().wrapping_add(1));
+        self.context_busy.set(false);
         self.context_resolved.set(None);
         self.context_selected.set(Vec::new());
         self.context_error.set(None);
@@ -1150,6 +1160,8 @@ impl AppState {
             project_root_markers: vec![".git".to_owned()],
             project_trust: ProjectTrust::Unspecified,
         };
+        let generation = self.context_generation.get().wrapping_add(1);
+        self.context_generation.set(generation);
         self.context_busy.set(true);
         self.context_error.set(None);
         let state = self.clone();
@@ -1160,6 +1172,9 @@ impl AppState {
                 (resolve(&input, &skills), skills, instructions)
             })
             .await;
+            if state.context_generation.get() != generation {
+                return;
+            }
             state.context_busy.set(false);
             match scanned {
                 Ok((resolved, skills, instructions)) => {
@@ -1777,19 +1792,39 @@ impl AppState {
                     return;
                 }
             };
-            let text = loaded.text.clone();
-            *tab.loaded.borrow_mut() = loaded;
-            tab.text.set(SharedString::from(text));
-            tab.dirty.set(false);
-            tab.conflict.set(false);
-            tab.revision.update(|revision| *revision += 1);
-            state.retire_tab_recovery(&tab);
-            state.recovery_tracks.borrow_mut().remove(&tab.id);
+            state.adopt_disk_version(&tab, loaded);
             state.status.set(SharedString::from(format!(
                 "Reloaded {}",
                 tab.path.display()
             )));
         });
+    }
+
+    /// Replace the tab's buffer with the file as it is on disk, which the
+    /// tab now tracks. Trust was granted to the buffer it replaces: it is
+    /// revoked first, so the disk's text never runs scripts under it.
+    fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
+        let text = loaded.text.clone();
+        *tab.loaded.borrow_mut() = loaded;
+        tab.web_trusted.set(false);
+        tab.text.set(SharedString::from(text));
+        tab.dirty.set(false);
+        tab.conflict.set(false);
+        tab.revision.update(|revision| *revision += 1);
+        self.retire_tab_recovery(tab);
+        self.recovery_tracks.borrow_mut().remove(&tab.id);
+    }
+
+    /// Write model-produced text (a translation, a Revision decision) into
+    /// the tab as one unsaved edit. Trust was granted to the text before this
+    /// write: it is revoked first, so the new text never runs scripts under
+    /// it.
+    fn write_model_text(&self, tab: &Tab, text: String) {
+        tab.web_trusted.set(false);
+        tab.text.set(SharedString::from(text));
+        tab.dirty.set(true);
+        tab.revision.update(|revision| *revision += 1);
+        self.note_edit(tab.id);
     }
 
     /// Overwrite a changed file only after an explicit destructive decision.
@@ -2132,10 +2167,7 @@ impl AppState {
                         ));
                         return;
                     }
-                    tab.text.set(SharedString::from(translated));
-                    tab.dirty.set(true);
-                    tab.revision.update(|revision| *revision += 1);
-                    state.note_edit(tab.id);
+                    state.write_model_text(&tab, translated);
                     state.status.set(SharedString::from(format!(
                         "Translated {segments} segment(s) into {target}."
                     )));
@@ -3111,13 +3143,7 @@ impl AppState {
             hunk.accepted.set(applied);
         }
         if let Some(text) = written {
-            // Trust was granted to the text before this write: revoke it
-            // first, so revised text never runs scripts under it.
-            tab.web_trusted.set(false);
-            tab.text.set(SharedString::from(text));
-            tab.dirty.set(true);
-            tab.revision.update(|revision| *revision += 1);
-            self.note_edit(tab.id);
+            self.write_model_text(&tab, text);
         }
         self.revision_status
             .set(Some(SharedString::from(REVISION_READY)));
@@ -3746,6 +3772,24 @@ mod tests {
 
     static OUTCOME: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
 
+    /// Every (text, trust) a watcher of the tab's text observes, as the Web
+    /// pane does: the trust is read when the text changes, not watched.
+    fn watch_text_and_trust(tab: &Tab) -> Rc<RefCell<Vec<(String, bool)>>> {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let watch = seen.clone();
+        let (text, trusted) = (tab.text, tab.web_trusted);
+        effect(move || {
+            let text = text.get().to_string();
+            let trusted = untracked(|| trusted.get());
+            watch.borrow_mut().push((text, trusted));
+        });
+        seen
+    }
+
+    fn read(tab: &Tab) -> (String, bool) {
+        (tab.text.get().to_string(), tab.web_trusted.get())
+    }
+
     /// Accepts, then undoes, one Revision change in a trusted document, as
     /// the hunk card does.
     #[component]
@@ -3773,15 +3817,7 @@ mod tests {
 
         // Whatever watches the text (the Web pane) must never see revised
         // text under the trust granted to the text before it.
-        let seen = Rc::new(RefCell::new(Vec::<(String, bool)>::new()));
-        let watch = seen.clone();
-        let (text, trusted) = (tab.text, tab.web_trusted);
-        effect(move || {
-            let text = text.get().to_string();
-            let trusted = untracked(|| trusted.get());
-            watch.borrow_mut().push((text, trusted));
-        });
-        let read = |tab: &Tab| (tab.text.get().to_string(), tab.web_trusted.get());
+        let seen = watch_text_and_trust(&tab);
 
         tab.web_trusted.set(true);
         assert!(state.set_revision_change_applied(0, true), "accept");
@@ -3819,6 +3855,78 @@ mod tests {
         assert!(
             seen.iter().skip(1).all(|(_, trusted)| !trusted),
             "a watcher saw revised text under old trust: {seen:?}"
+        );
+    }
+
+    static REPLACED: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
+
+    /// Lands a translation, then takes the disk version (the conflict's
+    /// `Use disk version`), each over a document whose scripts are trusted.
+    #[component]
+    fn ReplaceProbe() -> impl IntoElement {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("plan.md");
+        std::fs::write(
+            &path, "on disk
+",
+        )
+        .expect("the file on disk");
+        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the new document");
+        tab.text.set(SharedString::from(SOURCE));
+        let seen = watch_text_and_trust(&tab);
+
+        tab.web_trusted.set(true);
+        state.write_model_text(
+            &tab,
+            "translated
+"
+            .to_owned(),
+        );
+        let translated = read(&tab);
+        tab.web_trusted.set(true);
+        state.adopt_disk_version(&tab, io::load(&path).expect("load the file"));
+        let reloaded = read(&tab);
+        *REPLACED.lock().expect("the outcome") =
+            Some((translated, reloaded, seen.borrow().clone()));
+        view()
+    }
+
+    #[test]
+    fn a_translation_and_the_disk_version_revoke_web_script_trust_first() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ReplaceProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (translated, reloaded, seen) = REPLACED
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert_eq!(
+            translated,
+            (
+                "translated
+"
+                .to_owned(),
+                false
+            )
+        );
+        assert_eq!(
+            reloaded,
+            (
+                "on disk
+"
+                .to_owned(),
+                false
+            )
+        );
+        assert!(
+            seen.iter().skip(1).all(|(_, trusted)| !trusted),
+            "a watcher saw replaced text under old trust: {seen:?}"
         );
     }
 }

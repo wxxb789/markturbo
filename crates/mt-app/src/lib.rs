@@ -18,6 +18,8 @@ pub mod assets;
 pub mod i18n;
 pub mod logging;
 pub mod state;
+#[cfg(test)]
+mod test_env;
 pub mod ui;
 pub mod web;
 

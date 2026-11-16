@@ -835,33 +835,33 @@ fn choice_button(
             }
         }
     };
-    // The test id goes on the wrapper: `nsh_base`'s components are not views,
-    // so `test_id` reaches them through a plain element around them.
+    // One plain view is the button: its test id, UI Automation's
+    // AutomationId, names the control a press reaches, as `prims`' do.
     view()
         .test_id(test_id)
-        .bg(Color::TRANSPARENT)
+        .role(AccessibilityRole::Button)
+        .optional_label(Some(label.clone()))
+        .accessibility_state(move || AccessibilityState {
+            selected: current(),
+            ..AccessibilityState::default()
+        })
         .window_drag(false)
+        .px(px(2.0))
+        .py(px(4.0))
+        .bg(Color::TRANSPARENT)
+        .cursor_pointer()
+        .rounded(px(0.0))
+        .transition_colors()
+        .duration(motion::HOVER_MS)
+        .hover(|s| s.text_color(tokens::palette().ink).underline())
+        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+        .on_press(move |_: &PressEvent| on_press())
         .child(
-            button()
-                .accessibility_label(Some(label.clone()))
-                .selected(current)
-                .px(px(2.0))
-                .py(px(4.0))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .rounded(px(0.0))
-                .transition_colors()
-                .duration(motion::HOVER_MS)
-                .hover(|s| s.text_color(tokens::palette().ink).underline())
-                .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-                .on_press(on_press)
-                .child(
-                    text(label)
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(colour),
-                ),
+            text(label)
+                .font_family(FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(colour),
         )
 }
 
@@ -973,6 +973,52 @@ mod tests {
     };
 
     use mt_core::credentials::{CredentialError, Secret, SecureCredentialStore};
+
+    /// One choice, current, and a line that counts the presses it hears.
+    #[component]
+    fn ChoiceHarness() -> impl IntoElement {
+        let presses = signal(0u32);
+        view()
+            .flex_col()
+            .child(choice_button(
+                "harness-choice",
+                "Light",
+                || true,
+                move || presses.update(|n| *n += 1),
+            ))
+            .child(view().test_id("harness-presses").child(prims::ink(move || {
+                SharedString::from(format!("{} presses", presses.get()))
+            })))
+    }
+
+    /// A choice's test id names the pressable button itself — the element UI
+    /// Automation exposes with that AutomationId — and the button says it is
+    /// the current choice.
+    #[test]
+    fn a_choices_test_id_is_on_the_button_itself() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ChoiceHarness,
+            >()))
+            .expect("start the harness");
+        app.wait_for("id:harness-presses").expect("the harness");
+        let node = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("harness-choice"))
+            .expect("the choice")
+            .id;
+        for selector in ["id:harness-choice", "role:button[Light]"] {
+            assert_eq!(
+                app.screen().press_target(selector).expect("selector"),
+                Some(node),
+                "`{selector}` is the control carrying the id"
+            );
+        }
+        app.press("id:harness-choice").expect("press the choice");
+        app.wait_for("text:1 presses").expect("the press heard");
+    }
 
     /// The vault a test drives: credentials live in this map and never in the
     /// platform's secure store, and every read is counted, so a test can prove

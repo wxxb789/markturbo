@@ -577,8 +577,9 @@ mod tests {
     /// the preview, not just its label.
     #[test]
     fn the_shell_shows_the_preview_in_the_field() {
-        // SAFETY: this binary's tests are the only readers of the variable, and
-        // this is the only test that sets it (the probes build their own root).
+        let _env = crate::test_env::lock();
+        // SAFETY: every test that sets a process-global variable holds
+        // `test_env::lock` while its probe reads it.
         unsafe { std::env::set_var("MARKTURBO_OPEN", probe_path()) };
         let mut app =
             Headless::start(EngineConfig::new(Root::of::<crate::App>())).expect("start the app");

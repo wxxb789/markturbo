@@ -599,30 +599,29 @@ fn quiet_action_named(
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     let label: SharedString = label.into();
+    // One plain view is the button, its test id the control's AutomationId,
+    // as `prims::quiet_action`'s is.
     view()
         .test_id(test_id)
-        .bg(Color::TRANSPARENT)
+        .role(AccessibilityRole::Button)
+        .optional_label(Some(name))
         .window_drag(false)
+        .px(px(2.0))
+        .py(px(4.0))
+        .bg(Color::TRANSPARENT)
+        .cursor_pointer()
+        .rounded(px(0.0))
+        .transition_colors()
+        .duration(HOVER_MS)
+        .hover(|style| style.text_color(tokens::palette().ink).underline())
+        .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+        .on_press(move |_: &PressEvent| on_press())
         .child(
-            button()
-                .accessibility_label(Some(name))
-                .px(px(2.0))
-                .py(px(4.0))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .rounded(px(0.0))
-                .transition_colors()
-                .duration(HOVER_MS)
-                .hover(|style| style.text_color(tokens::palette().ink).underline())
-                .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
-                .on_press(on_press)
-                .child(
-                    text(label)
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || tokens::palette().ink_rest),
-                ),
+            text(label)
+                .font_family(FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink_rest),
         )
 }
 
@@ -1274,9 +1273,45 @@ mod tests {
 
     use super::*;
 
-    /// The two tests share one process: each holds this while its fixture
-    /// and its environment are the ones its probe reads.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// One named action, and a line that counts the presses it hears.
+    #[component]
+    fn NamedActionHarness() -> impl IntoElement {
+        let presses = signal(0u32);
+        view()
+            .flex_col()
+            .child(quiet_action_named(
+                "harness-open",
+                "Open",
+                SharedString::from("Open plan.md"),
+                move || presses.update(|n| *n += 1),
+            ))
+            .child(text(move || format!("{} presses", presses.get())))
+    }
+
+    /// A named action's test id names the pressable button itself — UI
+    /// Automation's AutomationId — which carries its own accessible name.
+    #[test]
+    fn a_named_actions_test_id_is_on_the_button_itself() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<NamedActionHarness>()))
+            .expect("start the harness");
+        app.wait_for("text:0 presses").expect("the harness");
+        let node = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("harness-open"))
+            .expect("the action")
+            .id;
+        for selector in ["id:harness-open", "role:button[Open plan.md]"] {
+            assert_eq!(
+                app.screen().press_target(selector).expect("selector"),
+                Some(node),
+                "`{selector}` is the control carrying the id"
+            );
+        }
+        app.press("id:harness-open").expect("press the action");
+        app.wait_for("text:1 presses").expect("the press heard");
+    }
 
     /// A fixture with one source of every kind — global, repository root and
     /// nested in the applied chain; CLAUDE.md, a Cursor rule file and a
@@ -1285,15 +1320,14 @@ mod tests {
         root: PathBuf,
         _root: tempfile::TempDir,
         _codex_home: tempfile::TempDir,
-        _config: tempfile::TempDir,
         _serial: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let serial = SERIAL
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Both tests hold this while their fixture and its environment
+            // are the ones their probe reads.
+            let serial = crate::test_env::lock();
             let root = tempfile::tempdir().expect("fixture");
             let root_path = root.path().to_path_buf();
             std::fs::create_dir_all(root_path.join("docs")).expect("docs");
@@ -1317,20 +1351,16 @@ mod tests {
             let codex_home = tempfile::tempdir().expect("codex home");
             std::fs::write(codex_home.path().join("AGENTS.md"), "Global rules.\n")
                 .expect("global instructions");
-            let config = tempfile::tempdir().expect("config");
-            // SAFETY: both tests hold `SERIAL` from here on, and this module
-            // is the only place in the binary that touches these variables.
+            // SAFETY: every test that sets a process-global variable holds
+            // `test_env::lock` while its probe reads it.
             unsafe {
                 std::env::set_var("MT_CONTEXT_FIXTURE", &root_path);
                 std::env::set_var("CODEX_HOME", codex_home.path());
-                std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
-                std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
             }
             Self {
                 root: root_path,
                 _root: root,
                 _codex_home: codex_home,
-                _config: config,
                 _serial: serial,
             }
         }
