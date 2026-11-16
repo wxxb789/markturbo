@@ -1,7 +1,7 @@
 # Architecture
 
-> **Migration status (2026-11-11):** `crates/mt-app` is now a Native Shell
-> (nsh 0.4) Rust app on the native Win32/Direct2D, AppKit and GTK 4 backends.
+> **Migration status (2026-11-16):** `crates/mt-app` is now a Native Shell
+> (nsh 0.5.1) Rust app on the native Win32/Direct2D, AppKit and GTK 4 backends.
 > `mt-core` remains UI-framework-free. The GPUI-specific mechanisms below
 > describe the v0.1 shell and are retained as history; current UI boundaries are
 > the nsh modules under `crates/mt-app/src`.
@@ -12,10 +12,12 @@
 
 |Module|Responsibility|
 |---|---|
-|`app.rs`|Window regions, toolbar/sidebar, tabs, document panes, Context/Review/Revision panels, recovery banner and conflict choices.|
+|`app.rs`|Application root: startup, the checkpoint ticker, the main window's close request (routed to the unsaved-changes guard), and the shell, re-keyed on language or layout-breakpoint changes.|
+|`ui/`|The Afterglow UI: `shell` (title row, rail, text column, field, overlay layer), `titlebar` (file name, Review, settings menu), `rail`, `welcome`, `document`/`preview`, `context`, `review`/`glow`, `revision`, `consent`, `notices`, `settings`, and the `tokens`/`fonts`/`prims`/`motion` foundation.|
 |`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore, Web trust.|
+|`state/revision_ledger.rs`|`RevisionLedger`: where each hunk of a live Approved Revision sits in its tab's text.|
 |`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
-|`web.rs`, `theme.rs`, `i18n.rs`|HTML/CSP construction, theme tokens and localized disclosure strings.|
+|`web.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, localized strings and disclosures, log setup.|
 
 ### Optional local usage counters
 
@@ -40,8 +42,9 @@ The live nsh transitions count the first opted-in launch present in the retained
 aggregate, file opens, clipboard pastes, Review starts/completions, submitted
 clarification answers, final revision hunk decisions, applied revisions,
 successful saves, provider/credential failures, blocked stale applications and
-recovery restores. The shell has no artifact-copy or explicit clarification
-defer/reject action, so those vocabulary entries are not emitted. Blank answers
+recovery restores. Revision's Copy does not record an artifact copy, and the
+shell has no explicit clarification defer/reject action, so those vocabulary
+entries are not emitted. Blank answers
 are not inferred to be deliberate deferrals. The counters contain no source,
 answers, proposed/model text, filenames, paths, endpoint identities, credentials,
 user/install identity or precise timestamps; they cannot establish activation
@@ -125,16 +128,30 @@ views decide when to invoke them and render their results. In particular,
 `Tabs<T>` and `History` keep their state invariants in core, while tab elements
 and navigation buttons stay in app.
 
-The app's `workspace::review::ReviewFlow` is the one owner of the Review to
-Approved Revision interaction state: captured result and source identity,
-pending cancellation/generation, answer bindings, user decisions, and the
-identity of an explicit Apply. Workspace supplies document observations,
-window prompts and asynchronous transport; it cannot turn a response into
-editor text. Core `review::provider` binds frozen requests to disclosure and
-one-use consent, while its private Revision implementation validates provider
-coverage and proposed edits. `DocumentView` performs the final source check
-and one undoable approved edit. Its `DocumentPreview` owns only derived
-rendering and Web failure/cache transitions, never editor or source identity.
+In the nsh app, `AppState` owns the Review to Approved Revision interaction
+state: the captured result and source identity, the pending consent, answer
+bindings and the live proposal. Core `review::provider` binds frozen requests
+to disclosure and one-use consent, while its private Revision implementation
+validates provider coverage and proposed edits. Each Revision request carries
+the `revision_generation` current when it was sent; resetting or replacing
+the Review (another Review, Close) advances it, and an answer that returns
+under an older generation is dropped without touching the field or the busy
+flag. A validated proposal is placed over the reviewed tab by a
+`RevisionLedger` (`state/revision_ledger.rs`); nothing is written until the
+user decides. Each Accept writes that change's replacement into the tab's text
+at once, and a Reject after an Accept writes the reviewed bytes back exactly;
+`Ctrl+Z` returns the last-decided change, with its text, to the state it had
+before that decision. The ledger follows user edits between
+decisions: hunks wholly before or after the edited span move, while a hunk the
+edit touched loses its place and can be neither accepted ("Can't apply — this
+part changed") nor, once accepted, taken back. Every write also checks that the
+bytes at the hunk's place are the ones it expects, so a refusal leaves the
+text untouched. Before a decision's text replaces the buffer, the tab's Web
+script trust is revoked, so revised text never runs scripts under trust
+granted to the text before it. `Done` discards the ledger, keeps the
+decisions as written, and reports undecided hunks as not applied; `Copy` reads
+the tab's current text without changing it. Nothing is saved. The paragraphs
+below describe the retired GPUI flow and remain as history.
 
 The app's `workspace::recovery::RecoveryFlow` is the single owner of the
 optional store handle, startup identity and scan readiness, the per-document

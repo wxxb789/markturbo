@@ -1,19 +1,24 @@
 # Agent instructions
 
-This file exists so you can see how markturbo treats agent artifacts. Open it
-and look at the toolbar: it is labelled **Agent Instructions**, not "Markdown".
+This file exists so you can see how markturbo treats agent artifacts. Choose
+**Review** on it: the result's **Lens** reads **Agent Instructions**, not
+"Prompt", because markturbo knows the file by its name.
 
-That labelling is deliberate. `AGENTS.md`, `CLAUDE.md`, `SKILL.md`, and
+That recognition is deliberate. `AGENTS.md`, `CLAUDE.md`, `SKILL.md`, and
 `.cursor/rules/*` are the source code of human–agent collaboration, and a
 workspace for them should know what they are.
 
-## Why this matters later
+## Which instructions apply
 
-Recognition is the foundation for a feature markturbo does not have yet:
+Click the file name at the top of the window to open **Context**. It resolves
+the chain of instruction files that apply to the open file, the way Codex
+reads them:
 
 ```text
 Effective Agent Context
 
+global AGENTS.md
+        ↓
 repo/AGENTS.md
         ↓
 src/AGENTS.md
@@ -21,9 +26,9 @@ src/AGENTS.md
 current file
 ```
 
-Resolving which instructions actually apply to a given file requires knowing
-which files are instructions in the first place. v0.1 stops at recognition —
-the architecture just doesn't prevent the rest.
+Later files override earlier ones. Instruction files Codex does not apply are
+listed separately as **Not applied by Codex**. Tick **Include in review** on a
+source to send it with the next Review; nothing is included until you do.
 
 ## Example content
 

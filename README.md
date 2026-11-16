@@ -75,23 +75,29 @@ an upgrade path.
 1. On the welcome screen, choose **Open folder** to open a workspace, **New
    file** or **Paste** to start a document, or **Open sample** (shown when a
    sample is available: the embedded copy in release builds, or the
-   repository's `sample/` folder in debug builds). In a folder, press
-   `Ctrl+P` (**Find a file**) to open a file; there is no file tree.
+   repository's `sample/` folder in debug builds). Recent folders and files are
+   listed below; one that no longer exists is marked **Missing**. Once a folder
+   is open, the welcome gives way to the workspace's home, which lists its
+   first files; press `Ctrl+P` to find any file. There is no file tree.
 2. Open **⚙ → Settings**. Under **Endpoint**, choose a **Provider**, and
    optionally a **Base URL** and **Model**. Under **Credential**, enter the
    **API key** and choose **Store securely** or **Use for session**. Do not
    paste the key into a document, the settings file, or a screenshot. **Close**
    also saves.
-3. Choose **Context** in the title row to see the instruction files that apply
-   to this file, in order. Tick **Include in review** only for the sources you
+3. Click the file name at the left of the title row (or choose **⚙ →
+   Context**) to see the instruction files that apply to this file, in order. Tick **Include in review** only for the sources you
    want sent. The verified profile is `codex-agents-md-2026-08-29`; other
    discovered instructions are inventory only.
-4. Choose **Review** (or `Ctrl+Enter`). Review always covers the whole
-   document; the lens (Prompt, Specification, Plan, Agent Instructions, Agent
-   Skill) is inferred from the file path. The **Send for review?** card shows
-   **To** (endpoint, local or remote), **Scope** (**Document** or **Document +
-   context**), what **Leaves this device**, what **Stays here**, and the
-   **Content total**. Check the endpoint and every listed row; cancel if the
+4. Choose **Review** in the title row (or `Ctrl+Enter`) to review the whole
+   document, or select text in the source editor and choose **⚙ → Review
+   selection** to review only that. The lens (Prompt, Specification, Plan,
+   Agent Instructions, Agent Skill) is inferred from the file path. An Agent
+   Skill is always reviewed as its whole package. The **Send for review?**
+   card shows **To** (endpoint, local or remote), **Scope** (**Selection**,
+   **Document**, or **Document + context**; a Review started while text is
+   selected can switch between them), what **Leaves this device**, what
+   **Stays here**, and the **Content total**. A selection is sent without
+   Effective Agent Context. Check the endpoint and every listed row; cancel if the
    scope is not what you intend. **Cancel** is the card's default: `Enter` (or
    `Esc`) cancels. On macOS and Linux, Cancel also takes the keyboard focus; on
    Windows no view takes focus, so the keyboard route to send is holding
@@ -102,10 +108,18 @@ an upgrade path.
    and questions in priority order with **Why it matters:**. Type an answer and
    choose **Answer**, or **Skip**. Then choose **Prepare revision**, check the
    **Send the revision?** card, and hold to send.
-6. Each proposed change shows old and new text. **Accept** or **Reject** it
-   (`A` / `R`), then choose **Done** (`Ctrl+Enter`). Only accepted changes go
-   into the buffer, and nothing is saved; save with **Save** in the title row
-   (wide windows) or **⚙ → Save**.
+6. Each proposed change shows the old text struck through and the
+   **Proposed text**. **Accept** writes the change into the buffer at once;
+   **Reject** leaves (or puts back) the original text (`A` / `R`). `Ctrl+Z`
+   takes the last decision back together with its text; a change whose part
+   of the document you edited since can no longer be accepted (**Can't apply —
+   this part changed**). In the document, each undecided change's old words stay
+   struck through until you decide it.
+   **Copy** puts the approved text on the clipboard. **Done** (`Ctrl+Enter`)
+   keeps the decisions as written and reports undecided changes as **not
+   applied**. Nothing is saved; save with **⚙ → Save**. Every write of an
+   accepted or undone change first returns the tab to **Restricted** Web
+   scripts.
 
 If you edit the document after sending, the result is marked **Stale — edited
 after review** and offers **Review again**.
@@ -129,10 +143,11 @@ card while the total and controls stay visible. Translation asks through a nativ
 Consent covers exactly one operation, endpoint, and the content shown; any
 change (for example, switching the scope) rebuilds the card and needs a new
 hold, and each consent is used once. Files that are not listed never leave the
-device. If a normally in-scope supporting file is missing from a Skill package,
+device. If a normally in-scope supporting file is missing from a Skill package
+(for example, a file `SKILL.md` links to that the package does not hold),
 the card lists it under **Stays here** as **not sent with the package** before
-you send. The review result itself carries no **Partial review** label today,
-a pending gap against the original contract that labeled the result partial.
+you send, and the result is labeled **Partial review**: it does not cover that
+file.
 
 Only an IP loopback address (`127.0.0.1`, `[::1]`) counts as local. `localhost`
 is treated as a remote host: it requires `https` and may go through a proxy.
@@ -173,11 +188,13 @@ There are no screenshots of the current UI in the repository.
   creating a file first. Open files appear as dots in the left rail; find files
   with `Ctrl+P` and search contents with `Ctrl+Shift+F`.
 - Read and edit in **Edit**, **Preview**, or **Split** (the default for each
-  tab); **Web preview** and **Split · Web** are in the ⚙ menu.
+  tab), or render through the WebView with **Web preview** and **Split · Web**;
+  the ⚙ menu switches between all five.
 - Render Mermaid, D2, PlantUML, and LaTeX math from document source.
 - Show the Effective Agent Context chain for the active file and the
   workspace's Skills, and include selected sources in Review.
-- Review a document and apply only the revision changes you accept.
+- Review a document or a selection, and apply only the revision changes you
+  accept; each decision can be undone.
 - Translate a document's prose into a target language.
 - On Windows, recover unsaved changes after a crash: a banner offers
   **Restore** or **Discard** on the next start. Recovery checkpoints exist only
@@ -186,6 +203,11 @@ There are no screenshots of the current UI in the repository.
   **Changed on disk** with **Compare**, **Keep mine**, **Use disk version**, and
   **Save As…**. There is no file watcher; the check happens on save and on
   recovery.
+- **Save As…** replaces an existing file once the native save dialog has
+  confirmed the overwrite, and refuses a destination that is open in another
+  tab. Save writes back in the file's own encoding, byte-order mark, and line
+  endings; Save As writes UTF-8 and keeps the line endings and byte-order
+  mark.
 - Ask **Close without saving?** (**Save**, **Don't save**, **Cancel**) when
   closing a dirty tab, choosing **⚙ → Quit**, or closing the window (its close
   button or `Alt+F4`).
@@ -283,8 +305,8 @@ mt-app (nsh desktop shell)
 `mt-app` depends on `mt-core`, not the reverse. Core's model transport is an
 optional feature (`model-transport`) that the desktop app enables by default.
 Colors, sizes, and fonts come from `crates/mt-app/theme.json` and
-`ui/tokens.rs`. [docs/architecture.md](docs/architecture.md) still describes the
-nsh 0.4 module layout and has not been updated for `ui/`.
+`ui/tokens.rs`. See [docs/architecture.md](docs/architecture.md) for module
+boundaries and the reasons behind them.
 
 ## Renderers
 
@@ -386,7 +408,8 @@ platform WebView as an HTML string with no base URL.
 Every tab starts **Restricted**. The web pane shows **Restricted: scripts
 disabled** and a **Trust scripts** button; trusting asks **Run scripts in this
 document?** and, after **Run scripts**, shows **Trusted: scripts may run**.
-Trust applies to that open tab.
+Trust applies to that open tab. Accepting or undoing a Revision change
+revokes it before the text changes.
 
 | | Restricted (default) | Trusted |
 |---|---|---|
@@ -415,12 +438,12 @@ navigation.
 | Review result | `J` / `K` | Next / previous finding |
 | Review | `Esc` | Cancel a running review, or close |
 | Send card | hold `Ctrl+Enter` / `Esc` | Send / cancel |
-| Revision | `A` / `R` / `J` / `K` | Accept / reject / move |
-| Revision | `Ctrl+Z` / `Ctrl+Enter` | Undo a decision / Done |
+| Revision, keyboard outside the editor | `A` / `R` / `J` / `K` | Accept / reject / move |
+| Revision, keyboard outside the editor | `Ctrl+Z` / `Ctrl+Enter` | Undo the last decision / Done |
 | Close guard | `Left` / `Right` / `Tab`, `Enter`, `Esc` | Move, choose, cancel |
 | Compare | `J` / `K`, `Esc` | Next / previous difference, close |
 
-There is no `Ctrl+S`; save from the title row or the ⚙ menu. The source editor
+There is no `Ctrl+S`; save from the ⚙ menu. The source editor
 provides native undo/redo, clipboard, and IME.
 
 The table describes the bindings in the code, not accepted behavior: native
@@ -444,10 +467,11 @@ UI tests in `crates/mt-app/tests` drive the app headlessly with
 `nsh_testing::Headless`. See [development validation](docs/development.md) for
 focused commands.
 
-`check native` runs the native harness's Python unit tests and currently
-passes; it is not acceptance. All four `mt.py accept` harnesses (goal-02,
-goal-03, goal-06, goal-07) still target the retired GPUI UI's automation IDs
-and source contracts, and none can give acceptance against the nsh UI. The
+`check native` runs the native harness's Python unit tests; it is not
+acceptance. The four `mt.py accept` harnesses (goal-02, goal-03, goal-06,
+goal-07) have been ported to the nsh UI's automation IDs but have not yet run
+live against an nsh build, so no acceptance evidence exists for the current UI;
+see [docs/verification.md](docs/verification.md#native-harness-status). The
 measurement probes in
 `scripts/` were also written for the GPUI window structure and have not been
 revalidated on nsh.
