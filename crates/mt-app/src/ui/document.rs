@@ -560,7 +560,7 @@ mod tests {
     /// cuts and the YaHei the widths compare against, and the engine's own
     /// fallback for the family that does not exist.
     #[cfg(windows)]
-    const CJK_TRIALS: [FontTrial; 7] = [
+    const CJK_TRIALS: [FontTrial; 8] = [
         FontTrial {
             label: "FONT_UI",
             family: tokens::FONT_UI,
@@ -590,6 +590,11 @@ mod tests {
             label: "Microsoft YaHei UI",
             family: "Microsoft YaHei UI",
             weight: 400,
+        },
+        FontTrial {
+            label: "Microsoft YaHei UI 300",
+            family: "Microsoft YaHei UI",
+            weight: 300,
         },
         FontTrial {
             label: "absent",
@@ -856,7 +861,18 @@ mod tests {
         println!("pinyin widths: {}", table_text(&pinyin));
 
         let dengxian = width_of(&dash, "DengXian");
-        let yahei = width_of(&dash, "Microsoft YaHei UI");
+        // Each list's YaHei at the list's own weight: the model's 300 draws
+        // YaHei's light face, whose ruler differs from the regular one.
+        let yahei = |list: &str| {
+            width_of(
+                &dash,
+                if list == "FONT_MODEL" {
+                    "Microsoft YaHei UI 300"
+                } else {
+                    "Microsoft YaHei UI"
+                },
+            )
+        };
         // DengXian is optional on Windows Server images (the CI runner has
         // none); there the lists must fall through to Microsoft YaHei UI.
         let fonts =
@@ -866,7 +882,7 @@ mod tests {
             .all(|file| fonts.join(file).is_file())
         {
             for list in ["FONT_UI", "FONT_MODEL", "FONT_SOURCE"] {
-                let taken = width_of(&dash, list);
+                let (taken, yahei) = (width_of(&dash, list), yahei(list));
                 assert!(
                     (taken - yahei).abs() <= 0.5,
                     "without DengXian, {list}'s CJK is not YaHei's: {taken} against {yahei}: {}",
@@ -876,7 +892,7 @@ mod tests {
             return;
         }
         for list in ["FONT_UI", "FONT_MODEL", "FONT_SOURCE"] {
-            let taken = width_of(&dash, list);
+            let (taken, yahei) = (width_of(&dash, list), yahei(list));
             assert!(
                 (taken - dengxian).abs() <= 0.5 && (taken - yahei).abs() > 0.5,
                 "{list}'s CJK is not DengXian's: {taken} against {dengxian} / {yahei}: {}",
