@@ -12,6 +12,77 @@ class EvidenceSchemaTests(unittest.TestCase):
         self.assertEqual(evidence["schema_version"], 1)
         self.assertEqual([case["id"] for case in evidence["cases"]], list(REQUIRED_CASE_IDS))
 
+    def test_window_case_requires_an_alt_f4_cancel_that_changed_nothing(self) -> None:
+        for key, value in (
+            ("editor_after_alt_f4_cancel", {"byte_count": 1, "sha256": "c" * 64}),
+            ("source_after_alt_f4_cancel", {"byte_count": 1, "sha256": "c" * 64}),
+        ):
+            with self.subTest(key=key):
+                evidence = valid_evidence()
+                evidence["cases"][2]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, "Alt\\+F4 Cancel changed"):
+                    VALIDATE_EVIDENCE(evidence)
+
+        evidence = valid_evidence()
+        evidence["cases"][2]["observations"]["alt_f4_cancel_kept_window"] = False
+        with self.assertRaisesRegex(ValueError, "requires true alt_f4_cancel_kept_window"):
+            VALIDATE_EVIDENCE(evidence)
+
+    def test_window_scenario_cancels_alt_f4_before_saving_through_wm_close(self) -> None:
+        harness = object.__new__(HARNESS.Goal02Harness)
+        harness.ui_timeout = 1.0
+        order = mock.Mock()
+        app = order.app
+        app.hwnd = 73
+        app.process.poll.return_value = None
+        app.security_context.evidence.return_value = {}
+        edited = HARNESS.fingerprint_bytes(b"edit")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness.case_roots = mock.Mock(
+                return_value=(root / "data", root / "config", root, root / "stderr.log")
+            )
+            harness.launch = mock.Mock(return_value=app)
+            harness.replace_editor = mock.Mock(return_value=edited)
+            harness.editor_fingerprint = mock.Mock(return_value=edited)
+            harness.win32 = order.win32
+            harness.click_lifecycle_decision = order.click_lifecycle_decision
+
+            def exit_after_save(_app, _timeout):
+                (root / "window.md").write_bytes(b"edit")
+
+            harness.wait_process_exit = mock.Mock(side_effect=exit_after_save)
+            harness.reap = mock.Mock()
+            with mock.patch.object(HARNESS, "scan_runtime_artifacts", return_value={}):
+                observations = harness.scenario_window_save()
+
+        calls = [call for call in order.mock_calls if not call[0].startswith("app.")]
+        sent = calls[1].args[0]
+        self.assertEqual(
+            [(item.ki.wVk, item.ki.dwFlags) for item in sent],
+            [
+                (HARNESS.VK_MENU, 0),
+                (HARNESS.VK_F4, 0),
+                (HARNESS.VK_F4, runtime.KEYEVENTF_KEYUP),
+                (HARNESS.VK_MENU, runtime.KEYEVENTF_KEYUP),
+            ],
+        )
+        self.assertEqual(
+            calls,
+            [
+                mock.call.win32.require_foreground(73, 1.0),
+                mock.call.win32.send_inputs(sent),
+                mock.call.click_lifecycle_decision(app, "Cancel"),
+                mock.call.win32.post_close(73),
+                mock.call.click_lifecycle_decision(app, "Save"),
+            ],
+        )
+        self.assertTrue(observations["alt_f4_cancel_kept_window"])
+        self.assertEqual(
+            observations["source_after_alt_f4_cancel"],
+            HARNESS.fingerprint_bytes(HARNESS.ORIGINAL_BYTES).evidence(),
+        )
+
     def test_rejects_missing_required_case(self) -> None:
         evidence = valid_evidence()
         evidence["cases"].pop()

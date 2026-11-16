@@ -133,6 +133,9 @@ def valid_evidence() -> dict:
         },
         REQUIRED_CASE_IDS[2]: {
             "editor": edited,
+            "alt_f4_cancel_kept_window": True,
+            "editor_after_alt_f4_cancel": edited,
+            "source_after_alt_f4_cancel": fp(HARNESS.ORIGINAL_BYTES),
             "saved_source": edited,
             "flow": HARNESS.CASE_FLOWS[REQUIRED_CASE_IDS[2]],
             "window_exited": True,

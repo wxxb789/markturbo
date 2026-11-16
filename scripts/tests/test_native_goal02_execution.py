@@ -116,7 +116,7 @@ class PrivacyAndCliTests(unittest.TestCase):
         for module in (HARNESS, goal03, goal06, goal07):
             with self.subTest(goal=module.SCHEMA), tempfile.TemporaryDirectory() as temporary:
                 args = module.parse_args(["--expect-exe-sha256", HASH])
-                relative = Path("target") / "native-acceptance" / f"{module.SCHEMA.removeprefix('markturbo.')}-v1.json"
+                relative = Path("target") / "native-acceptance" / f"{module.SCHEMA.removeprefix('markturbo.')}-v{module.SCHEMA_VERSION}.json"
                 self.assertEqual(args.evidence, module.REPO / relative)
                 root = Path(temporary)
                 retained = root / "docs" / "evidence" / relative.name

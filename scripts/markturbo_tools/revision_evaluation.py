@@ -34,6 +34,10 @@ EVIDENCE_SCHEMA = "markturbo-goal-07-revision-evaluation-v2"
 MACHINE_RECEIPT_SCHEMA = "markturbo-goal-07-machine-receipt-v2"
 LOCAL_DIFF_RUNNER_SCHEMA = "markturbo-local-diff-receipt-v2"
 NATIVE_ACCEPTANCE_SCHEMA = "markturbo.goal-07-native-acceptance"
+# The nsh harness writes version 2 (`native/goal07.py` `SCHEMA_VERSION`). The
+# retained version 1 files describe the retired GPUI UI and never bind here.
+NATIVE_ACCEPTANCE_SCHEMA_VERSION = 2
+NATIVE_ACCEPTANCE_HISTORICAL_SCHEMA_VERSION = 1
 NATIVE_REQUIRED_CASE_IDS = frozenset(
     {
         "reject_all_byte_identity",
@@ -1417,7 +1421,13 @@ def load_native_acceptance(
     payload = _mapping(value, field="native acceptance evidence")
     if not isinstance(payload.get("schema"), str) or payload.get("schema") != NATIVE_ACCEPTANCE_SCHEMA:
         raise RevisionEvaluationError("native acceptance evidence schema is invalid")
-    if type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1:
+    version = payload.get("schema_version")
+    if type(version) is int and version == NATIVE_ACCEPTANCE_HISTORICAL_SCHEMA_VERSION:
+        raise RevisionEvaluationError(
+            "native acceptance evidence is a historical GPUI-era record (schema_version 1), "
+            "not acceptance for the current UI"
+        )
+    if type(version) is not int or version != NATIVE_ACCEPTANCE_SCHEMA_VERSION:
         raise RevisionEvaluationError("native acceptance evidence schema is invalid")
     if not isinstance(payload.get("status"), str) or payload.get("status") != "PASS":
         raise RevisionEvaluationError("native acceptance evidence must have PASS status")

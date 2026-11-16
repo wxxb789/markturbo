@@ -145,26 +145,30 @@ Retained acceptance, ablation, and measurement evidence is indexed in
 
 ## Native harness status
 
-The goal-02/03/06/07 harnesses (`scripts/markturbo_tools/native/`) drive the
-nsh UI. They have not yet run live against an nsh build; no nsh acceptance
-evidence exists, and that absence stays pending, not a pass. Their unit tests
-run in `check native`, not the fast gate. Pass the packaged app with
+The goal-02/03/06/07 harnesses (`scripts/markturbo_tools/native/`) are ported
+to the nsh UI and synchronized with the merged Afterglow behavior below. They
+have not yet run live against an nsh build: no nsh acceptance evidence exists,
+and that absence stays pending, not a pass. Their unit tests run in
+`check native`, not the fast gate. Pass the packaged app with
 `--exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe`.
 
 How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
 
 - A view's `test_id` is the UIA AutomationId, but only when the view is itself
   an element: a Button (pressable), Edit (input), Text, or a labelled Group.
-  Unlabelled wrappers are flattened, so the `quiet_action`/`primary_action`
-  ids sit on no element; those buttons are found by their visible label (the
-  Name) with no AutomationId.
+  Unlabelled wrappers are flattened. The `prims` quiet/primary actions and
+  the guard card's buttons are the pressable view itself, so each is found by
+  its own AutomationId (`guard-save`, `welcome-new-file`, `revision-accept`,
+  ...). Rows that share an id (`welcome-recent`, `workspace-home-file`) are
+  enumerated by it and told apart by their Name.
 - Title-menu rows (`title-menu-*`) are reached by invoking `title-settings`
   first, so a command can move between the title row and that menu without a
-  selector change. Save, Save As, Quit and the Edit/Web modes go through it.
+  selector change. Save, Save As, Quit, Review selection and the Edit/Web
+  modes go through it.
 - The editor's accessible element is the `Markdown source` IME input; its UIA
   Value is not the document. The harness reads the document with Ctrl+A, Ctrl+C
-  and restores the user's clipboard. Selection, Undo and Review use the
-  editor's own keys (Ctrl+A, Ctrl+Z, Ctrl+Enter).
+  and restores the user's clipboard. Selection and Review use the editor's own
+  keys (Ctrl+A, Ctrl+Enter).
 - UIA Invoke is one tap. The consent card's `consent-send` sends only after a
   held press, so the harnesses hold the real pointer past the control's 1.2 s
   threshold; an Invoke is never consent.
@@ -186,22 +190,51 @@ How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
 Each harness checks that the selectors it uses still exist in production Rust
 source (test modules and comments do not count) before launching.
 
-Goal 07 evidence keeps `schema_version` 1 although the port renamed
-observation keys (`revision_evaluation.py` accepts only version 1). Three
-retained GPUI-era files, `docs/evidence/goal-07-final-ablation-f1ec266c.json`,
-`goal-07-final-ablation-f1ec266c-r2.json` and
-`goal-07-post-ablation-trust-f1ec266c.json`, no longer validate. Bumping the
-version needs a matching change in `revision_evaluation.py`.
+What the ported cases expect, matching the merged UI:
 
-Known product gaps the ported cases will report as FAIL until the UI provides
-them: no selection Review command (goal 06/07 selection scope expects a
-`title-menu-review-selection` row); no Copy of an approved Revision result
-(`revision-copy`) and no labelled Group around the docked hunk's proposed lines
-(`revision-proposal-after`); WM_CLOSE/Alt+F4 does not raise the unsaved-changes
-guard; Done does not revoke Web script trust before replacing the buffer; Save
-As refuses an existing destination after the native overwrite prompt; a stale
-recent row is not marked; and opening a folder or the sample does not leave the
-welcome.
+- Goal 02: Alt+F4 (SendInput) and WM_CLOSE on a dirty window raise the
+  'Close without saving?' guard; Cancel keeps the window, the editor bytes and
+  the file, and Save writes the exact editor bytes before the window exits.
+- Goal 03: the welcome's four entry points are found by their own ids; a
+  recent target that no longer exists is a disabled row named
+  `File <name> — Missing`, and a real pointer press on it opens nothing; Open
+  sample and a directory argument replace the welcome with the workspace home
+  (`workspace-home-file` rows); Save As onto an existing file replaces it after
+  the native dialog's own Yes and keeps it after No.
+- Goal 06: the selection Review selects the source and runs the title menu's
+  `Review selection` row (`title-menu-review-selection`); with a provider the
+  consent card shows the `Selection` scope.
+- Goal 07: each decision writes at once; one `Undo` (`revision-undo`) restores
+  the exact pre-accept text; Done writes nothing more; `Copy`
+  (`revision-copy`) puts exactly the approved text on the clipboard without
+  changing the editor, dirty mark or file; the docked hunk's proposed lines are
+  read from the `revision-proposal-after` group named `Proposed text`; an edit
+  over a hunk's part shows `Can't apply — this part changed`, withholds Accept
+  (button and A key) and Done writes nothing; trust is revoked before every
+  Revision write (source check on `set_revision_change_applied`), and the Web
+  pane shows Restricted after an accepted executable change.
+
+Goal 07 evidence is `schema_version` 2, the nsh flow above; the harness
+writes `target/native-acceptance/goal-07-native-acceptance-v2.json` by
+default, and `revision_evaluation.py` binds only version 2. The four retained
+version 1 files under `docs/evidence/` (`goal-07-final-ablation-f1ec266c.json`,
+`goal-07-final-ablation-f1ec266c-r2.json`,
+`goal-07-post-ablation-trust-f1ec266c.json` and
+`goal-07-native-acceptance-v1.json`) are historical GPUI-era records:
+`goal07.validate_historical_evidence` checks their envelope (schema, case set,
+statuses, summary, no private content), the current validator rejects them,
+and the revision evaluation refuses them as acceptance. Goals 02, 03 and 06
+keep `schema_version` 1; their retained GPUI-era files are not re-validated
+against the ported harnesses (the goal 02 and goal 06 PASS files no longer
+validate).
+
+The former known gaps are fixed in the merged UI and are now expected by the
+cases above: the selection Review command, the Revision Copy and the labelled
+proposal group, the WM_CLOSE/Alt+F4 guard, trust revocation before every
+Revision write, Save As replacing a confirmed existing destination, the marked
+stale recent row, and the workspace home replacing the welcome. Whether the
+packaged app passes them is unknown until the first live run on an active,
+unlocked Windows 11 desktop.
 
 Goal 09's release-build screenshot matrix is produced by:
 

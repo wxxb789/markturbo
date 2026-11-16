@@ -124,7 +124,9 @@ The canonical `evaluation verify-manifest` command also verifies Goal 07's
 immutable corpus. `revision-evaluation scaffold` writes a fail-closed v2 record
 without inventing owner values. `revision-evaluation record` consumes an external
 eligibility registry, a v2 machine receipt, a separately hash-bound native
-Goal 07 `PASS` receipt, and one metadata-only owner JSON per artifact. The
+Goal 07 `PASS` receipt (`schema_version` 2; the retained version 1 files are
+historical GPUI-era records and are refused), and one metadata-only owner JSON
+per artifact. The
 machine receipt schema is `markturbo-goal-07-machine-receipt-v2`. Per case,
 `editable_source_sha256` and `editable_source_byte_count` are the SHA-256 and
 UTF-8 byte count of `proposal.source()`; `source_binding_sha256` is
@@ -182,7 +184,7 @@ $decisionDir = "docs/evidence/goal-07\composition-decisions"
 $machineReceipt = "docs/evidence/goal-07\machine-receipt.json"
 $registry = "docs/evidence/goal-07\eligibility.json"
 $ownerDir = "docs/evidence/goal-07\owner-input"
-$nativeEvidence = "docs/evidence/goal-07\goal-07-native-acceptance-v1.json"
+$nativeEvidence = "docs/evidence/goal-07\goal-07-native-acceptance-v2.json"
 $evidence = "docs/evidence/goal-07\revision-evaluation.json"
 
 cargo build --release --locked -p mt-core --bin markturbo-goal07-evaluate
@@ -321,7 +323,7 @@ uv run --project scripts scripts/mt.py accept goal-06 -- \
 uv run --project scripts scripts/mt.py accept goal-07 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence docs/evidence/goal-07-native-acceptance-v1.json
+  --evidence docs/evidence/goal-07-native-acceptance-v2.json
 ```
 
 Delegated commands run from the repository root. Therefore paths supplied to

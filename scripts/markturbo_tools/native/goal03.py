@@ -5,12 +5,18 @@ x64 executable SHA-256 and uses isolated MARKTURBO_DATA_DIR and
 MARKTURBO_CONFIG_DIR roots. Evidence contains fingerprints and booleans, never
 document text or filesystem paths.
 
-It drives the nsh welcome (`ui/welcome.rs`): Open folder, New file, Paste and
-Open sample are Buttons with their own AutomationIds; the recent rows share
-the `welcome-recent` id. Save As runs from
-the title menu or Ctrl+Shift+S through the native IFileSaveDialog, whose own
-overwrite confirmation is the only overwrite decision. Editor text is read with
-the editor's Select All + Copy (see `runtime.EDITOR_NAME`).
+It drives the nsh welcome (`ui/welcome.rs`): Open folder
+(`welcome-open-folder`), New file (`welcome-new-file`), Paste (`welcome-paste`)
+and Open sample (`welcome-open-sample`) are Buttons with their own
+AutomationIds. The recent rows are Buttons sharing the `welcome-recent` id,
+named `<kind> <name>`; a target that no longer exists stays listed, disabled,
+named `<kind> <name> — Missing`, and a press opens nothing. An open workspace
+(Open sample, a directory argument, a folder) replaces the welcome with the
+workspace home, whose file rows are Buttons sharing `workspace-home-file`.
+Save As runs from the title menu or Ctrl+Shift+S through the native
+IFileSaveDialog, whose own overwrite confirmation is the only overwrite
+decision: Yes replaces the existing file. Editor text is read with the
+editor's Select All + Copy (see `runtime.EDITOR_NAME`).
 """
 
 from __future__ import annotations
@@ -80,8 +86,10 @@ WELCOME_NEW_AUTOMATION_ID = "welcome-new-file"
 WELCOME_PASTE_AUTOMATION_ID = "welcome-paste"
 WELCOME_SAMPLE_AUTOMATION_ID = "welcome-open-sample"
 WELCOME_RECENT_AUTOMATION_ID = "welcome-recent"
-# What a stale recent row must say when it is not simply disabled.
-STALE_RECENT_MARKER = "Missing"
+# A file recent row is named `File <name>`; once its target is gone it is
+# disabled and named `File <name> — Missing` (`ui/welcome.rs` `recents`).
+STALE_RECENT_NAME = "File {name} \u2014 Missing"
+WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
 UI_SOURCE_REQUIREMENTS = {
     "crates/mt-app/src/ui/welcome.rs": (
         '"welcome-open-folder"',
@@ -92,6 +100,10 @@ UI_SOURCE_REQUIREMENTS = {
         '"Paste"',
         '"Open sample"',
         '"welcome-recent"',
+        '"{kind} {} \\u{2014} {}"',
+        '"Missing"',
+        ".disabled(missing)",
+        '"workspace-home-file"',
     ),
     "crates/mt-app/src/ui/titlebar.rs": (
         '"title-menu-save-as"',
@@ -100,6 +112,7 @@ UI_SOURCE_REQUIREMENTS = {
     "crates/mt-app/src/ui/rail.rs": ('on_key("mod+w"',),
     "crates/mt-app/src/ui/notices.rs": ('"Close without saving?"', '"Don\'t save"'),
     "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
+    "crates/mt-app/src/i18n.rs": ('Key::File => "File"',),
     "crates/mt-app/src/state.rs": ("pick_save_path(",),
 }
 
@@ -176,6 +189,7 @@ ALLOWED_OBSERVATION_KEYS = {
     "reopened_editor",
     "runtime_scan",
     "sample_workspace_opened",
+    "workspace_home_visible",
     "sample_content",
     "sample_file_count",
     "sample_manifest",
@@ -194,12 +208,17 @@ ALLOWED_OBSERVATION_KEYS = {
     "source_after_cancel",
     "source_before",
     "stale_recent_disabled",
+    "stale_recent_press_ignored",
     "overwrite_cancel_focus_preserved",
     "utf16le_sentinel_absent",
     "utf8_sentinel_absent",
     "welcome_restart_visible",
     "welcome_visible",
 }
+
+
+# A press, not a hold: long enough for the pointer down and up to register.
+STALE_RECENT_PRESS_SECONDS = 0.05
 
 
 def recent_settings_document(documents: list[Path]) -> bytes:
@@ -330,6 +349,7 @@ def required_observations(case_id: str) -> set[str]:
         },
         CASE_SAMPLE: {
             "sample_workspace_opened",
+            "workspace_home_visible",
             "sample_file_count",
             "sample_manifest",
             "sample_content",
@@ -340,6 +360,7 @@ def required_observations(case_id: str) -> set[str]:
             "recent_count",
             "recent_visible_count",
             "stale_recent_disabled",
+            "stale_recent_press_ignored",
         },
         CASE_CLI: {"direct_file_bypassed_welcome", "direct_directory_bypassed_welcome"},
     }
@@ -403,7 +424,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         if saved != editor_before or saved == before:
             raise ValueError("confirmed overwrite did not replace the destination")
     elif case_id == CASE_SAMPLE:
-        require_true(observations, "sample_workspace_opened")
+        require_true(observations, "sample_workspace_opened", "workspace_home_visible")
         file_count = observations.get("sample_file_count")
         if not isinstance(file_count, int) or isinstance(file_count, bool) or file_count <= 0:
             raise ValueError("sample file inventory must be nonempty")
@@ -417,7 +438,12 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         if content["sha256"][:24] != version:
             raise ValueError("sample version does not match the materialized content")
     elif case_id == CASE_RECENTS:
-        require_true(observations, "recent_restart_visible", "stale_recent_disabled")
+        require_true(
+            observations,
+            "recent_restart_visible",
+            "stale_recent_disabled",
+            "stale_recent_press_ignored",
+        )
         if observations.get("recent_count") != 10:
             raise ValueError("recent target bound was not exactly ten")
         visible = observations.get("recent_visible_count")
@@ -864,10 +890,26 @@ class Goal03Harness(BaseNativeHarness):
         )
 
     def recent_controls(self, app: Any) -> list[Any]:
+        return self.buttons_sharing_id(app, WELCOME_RECENT_AUTOMATION_ID, "RECENT")
+
+    def workspace_home_files(self, app: Any) -> list[Any]:
+        return self.buttons_sharing_id(app, WORKSPACE_HOME_FILE_AUTOMATION_ID, "WORKSPACE_HOME")
+
+    def wait_workspace_home(self, app: Any) -> None:
+        """The welcome gave way to the workspace home, which lists files."""
+        self.wait_welcome_absent(app)
+        wait_until(
+            lambda: self.workspace_home_files(app),
+            self.ui_timeout,
+            "WORKSPACE_HOME_UIA_TIMEOUT",
+        )
+
+    def buttons_sharing_id(self, app: Any, automation_id: str, code: str) -> list[Any]:
+        """Every visible Button whose AutomationId is `automation_id`."""
         try:
             uia = self.iuia_class()
             condition = uia.iuia.CreatePropertyCondition(
-                uia.UIA_dll.UIA_AutomationIdPropertyId, WELCOME_RECENT_AUTOMATION_ID
+                uia.UIA_dll.UIA_AutomationIdPropertyId, automation_id
             )
             elements = self.fresh_uia_root(app.hwnd).element.FindAll(
                 uia.tree_scope["descendants"], condition
@@ -877,24 +919,24 @@ class Goal03Harness(BaseNativeHarness):
             for index in range(elements.Length):
                 element = elements.GetElement(index)
                 if (
-                    element.CurrentAutomationId != WELCOME_RECENT_AUTOMATION_ID
+                    element.CurrentAutomationId != automation_id
                     or element.CurrentControlType != expected_control_type
                 ):
-                    raise HarnessFailure("RECENT_UIA_CONTRACT_MISMATCH")
+                    raise HarnessFailure(f"{code}_UIA_CONTRACT_MISMATCH")
                 control = self.uia_wrapper_class(self.uia_element_info_class(element))
                 info = control.element_info
                 if (
-                    info.automation_id != WELCOME_RECENT_AUTOMATION_ID
+                    info.automation_id != automation_id
                     or info.control_type != "Button"
                     or not control.is_visible()
                 ):
-                    raise HarnessFailure("RECENT_UIA_CONTRACT_MISMATCH")
+                    raise HarnessFailure(f"{code}_UIA_CONTRACT_MISMATCH")
                 controls.append(control)
             return controls
         except HarnessFailure:
             raise
         except Exception as error:
-            raise HarnessFailure("RECENT_UIA_QUERY_FAILED", safe_exception_name(error)) from None
+            raise HarnessFailure(f"{code}_UIA_QUERY_FAILED", safe_exception_name(error)) from None
 
     def scenario_welcome(self) -> dict[str, Any]:
         case_root, data, config, workspace, stderr = self.profile(CASE_WELCOME)
@@ -1062,11 +1104,12 @@ class Goal03Harness(BaseNativeHarness):
         try:
             sample = self.welcome_action(app, WELCOME_SAMPLE_AUTOMATION_ID)
             self.click_control(sample, "WELCOME_SAMPLE_CLICK_FAILED")
-            self.wait_welcome_absent(app)
+            self.wait_workspace_home(app)
             materialized = materialized_sample_inventory(data)
             self.close_app(app)
             observations = {
                 "sample_workspace_opened": True,
+                "workspace_home_visible": True,
                 **materialized,
                 "flow": CASE_FLOWS[CASE_SAMPLE],
                 "process_context": app.security_context.evidence(),
@@ -1125,8 +1168,14 @@ class Goal03Harness(BaseNativeHarness):
             if len(stale_matches) != 1:
                 raise HarnessFailure("STALE_RECENT_UIA_CONTRACT_MISMATCH")
             stale = stale_matches[0]
-            if stale.is_enabled() and STALE_RECENT_MARKER not in (stale.element_info.name or ""):
+            if stale.is_enabled() or stale.element_info.name != STALE_RECENT_NAME.format(
+                name=stale_name
+            ):
                 raise HarnessFailure("STALE_RECENT_NOT_DEGRADED")
+            # A real pointer press on the disabled row opens nothing.
+            self.hold_control(
+                restarted, stale, STALE_RECENT_PRESS_SECONDS, "STALE_RECENT_PRESS_FAILED"
+            )
             self.welcome_open_folder(restarted)
             if not self.editor_absent_while_running(restarted):
                 raise HarnessFailure("STALE_RECENT_OPENED_DOCUMENT")
@@ -1136,6 +1185,7 @@ class Goal03Harness(BaseNativeHarness):
                 "recent_count": recent_count,
                 "recent_visible_count": len(controls),
                 "stale_recent_disabled": True,
+                "stale_recent_press_ignored": True,
                 "flow": CASE_FLOWS[CASE_RECENTS],
                 "process_context": first_context.evidence(),
                 "foreground_verified": True,
@@ -1161,7 +1211,7 @@ class Goal03Harness(BaseNativeHarness):
             write_durable(directory / "readme.md", b"folder\n")
             directory_app = self.launch_app(directory, data, config, workspace, stderr)
             try:
-                self.wait_welcome_absent(directory_app)
+                self.wait_workspace_home(directory_app)
                 self.close_app(directory_app)
             finally:
                 self.reap(directory_app)

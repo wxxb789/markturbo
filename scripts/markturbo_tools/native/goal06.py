@@ -9,8 +9,11 @@ editor and source file stayed byte-identical.
 
 On the nsh UI the document Review is Ctrl+Enter from the editor; the consent
 card authorizes only a real pointer hold on `consent-send` (a UIA Invoke is a
-tap and sends nothing). The selection Review needs a selection command the
-UI must expose as the title-menu row `title-menu-review-selection`.
+tap and sends nothing). The selection Review selects the source with the
+editor's Select All, then runs the title menu's `Review selection` row
+(`title-menu-review-selection`), which reviews the mounted source editor's
+live selection; a configured provider's consent card then shows the
+`Selection` scope.
 """
 
 from __future__ import annotations
@@ -71,10 +74,16 @@ CONSENT_SEND_AUTOMATION_ID = "consent-send"
 CONSENT_SELECTION_SCOPE = "Selection"
 # Longer than the control's 1.2s hold (`HOLD_MS`), so a send completes.
 CONSENT_HOLD_SECONDS = 1.8
-# Not in the nsh UI yet: the selection Review command this harness requires.
+# `ui/titlebar.rs`: the settings-glyph menu's selection Review row.
 REVIEW_SELECTION_MENU_AUTOMATION_ID = "title-menu-review-selection"
 UI_SOURCE_REQUIREMENTS = {
-    "crates/mt-app/src/ui/titlebar.rs": ('"mod+enter"', '"title-settings"'),
+    "crates/mt-app/src/ui/titlebar.rs": (
+        '"mod+enter"',
+        '"title-settings"',
+        '"title-menu-review-selection"',
+        '"Review selection"',
+        "state.start_review_selection()",
+    ),
     "crates/mt-app/src/ui/review.rs": ('"No model set up"', '"Understood:"'),
     "crates/mt-app/src/ui/consent.rs": (
         '"consent-send"',

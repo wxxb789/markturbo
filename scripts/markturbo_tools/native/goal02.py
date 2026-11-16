@@ -5,8 +5,9 @@ required case runs against the expected x64 release executable in an active,
 unlocked Windows 11 session. Document text is never written to stdout or JSON;
 observations contain only UTF-8 byte counts, SHA-256 digests, and timings.
 
-It drives the nsh UI: the rail's close control, Ctrl+W and the native window
-close each must raise the in-window guard card (Save / Don't save / Cancel);
+It drives the nsh UI: the rail's close control, Ctrl+W, Alt+F4 and the native
+window close (WM_CLOSE) each must raise the in-window guard card (Save /
+Don't save / Cancel) for a dirty document, never close it unasked;
 Save runs from the title menu; a same-length external rewrite must be refused
 by Save until Keep mine is confirmed; an interrupted dirty buffer must leave a
 canonical recovery record the next launch offers to Restore.
@@ -31,6 +32,7 @@ from .runtime import (
     REASON_CODE_RE,
     SAFE_FAILURE_TYPES,
     SHA256_RE,
+    VK_MENU,
     VK_W,
     CONFLICT_HEADING,
     HarnessFailure,
@@ -40,6 +42,7 @@ from .runtime import (
     complete_evidence as complete_evidence_envelope,
     finite_nonnegative,
     fingerprint_bytes,
+    key_input,
     load_pywinauto,
     main_native_acceptance,
     normalize_expected_hash,
@@ -69,7 +72,7 @@ CASE_RECOVERY = "cjk-emoji-interruption-recovery-retirement"
 CASE_FLOWS = {
     CASE_POINTER_CANCEL: "pointer rail close -> guard Cancel -> menu Save",
     CASE_KEYBOARD_DISCARD: "SendInput Ctrl+W -> guard Don't save",
-    CASE_WINDOW_SAVE: "WM_CLOSE -> guard Save",
+    CASE_WINDOW_SAVE: "SendInput Alt+F4 -> guard Cancel -> WM_CLOSE -> guard Save",
     CASE_EXTERNAL_CONFLICT: (
         "same-length rewrite -> menu Save refused with conflict -> Keep mine -> "
         "explicit Overwrite"
@@ -87,6 +90,7 @@ SAFE_OBSERVATION_STRINGS = (
     | INTEGRITY_NAMES
 )
 ALLOWED_OBSERVATION_KEYS = {
+    "alt_f4_cancel_kept_window",
     "app_logs_scanned",
     "byte_count",
     "checkpoint_record_seen",
@@ -103,6 +107,7 @@ ALLOWED_OBSERVATION_KEYS = {
     "edit_to_signal_ms",
     "edited_text",
     "editor",
+    "editor_after_alt_f4_cancel",
     "editor_after_conflict",
     "external_source",
     "explicit_overwrite_used",
@@ -140,6 +145,7 @@ ALLOWED_OBSERVATION_KEYS = {
     "set_foreground_return",
     "foreground_attempts",
     "sha256",
+    "source_after_alt_f4_cancel",
     "source_after_cancel_save",
     "source_after_discard",
     "source_after_recovery_discard",
@@ -183,6 +189,9 @@ REQUIRED_OBSERVATION_KEYS = {
     },
     CASE_WINDOW_SAVE: {
         "editor",
+        "alt_f4_cancel_kept_window",
+        "editor_after_alt_f4_cancel",
+        "source_after_alt_f4_cancel",
         "saved_source",
         "flow",
         "window_exited",
@@ -273,6 +282,7 @@ UI_SOURCE_REQUIREMENTS = {
     "crates/mt-app/src/state.rs": ('.destructive("overwrite", "Overwrite")',),
 }
 
+VK_F4 = 0x73
 DOCUMENT_SENTINEL = "MTG02-NATIVE-SENTINEL-\u4fdd\u5b58-\U0001f680"
 CANONICAL_RECOVERY_RECORD_RE = re.compile(r"^[0-9a-f]{64}\.mtrecovery$")
 
@@ -543,8 +553,12 @@ def validate_passed_case(
             raise ValueError("Discard changed source bytes")
     elif case_id == CASE_WINDOW_SAVE:
         editor = validate_fingerprint(observations.get("editor"))
+        kept = validate_fingerprint(observations.get("editor_after_alt_f4_cancel"))
+        untouched = validate_fingerprint(observations.get("source_after_alt_f4_cancel"))
         saved = validate_fingerprint(observations.get("saved_source"))
-        require_true(observations, "window_exited")
+        require_true(observations, "alt_f4_cancel_kept_window", "window_exited")
+        if kept != editor or untouched != fingerprint_bytes(ORIGINAL_BYTES).evidence():
+            raise ValueError("Alt+F4 Cancel changed the editor or the source")
         if editor != saved:
             raise ValueError("window Save did not preserve exact editor bytes")
     elif case_id == CASE_EXTERNAL_CONFLICT:
@@ -772,6 +786,18 @@ class Goal02Harness(BaseNativeHarness):
         )
         self.click_control(close, "TAB_CLOSE_POINTER_CLICK_FAILED")
 
+    def send_alt_f4(self, app: RunningApp) -> None:
+        """Alt+F4 through SendInput to the foreground main window."""
+        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+        self.win32.send_inputs(
+            [
+                key_input(VK_MENU, False),
+                key_input(VK_F4, False),
+                key_input(VK_F4, True),
+                key_input(VK_MENU, True),
+            ]
+        )
+
     def require_editor_closed(self, app: RunningApp, code: str, timeout: float) -> None:
         wait_until(lambda: self.editor_absent_while_running(app), timeout, code)
 
@@ -844,6 +870,17 @@ class Goal02Harness(BaseNativeHarness):
         app = self.launch(document, data, config, workspace, stderr)
         try:
             editor = self.replace_editor(app, WINDOW_EDIT)
+            # Alt+F4 must raise the guard, not close the window; Cancel keeps it.
+            self.send_alt_f4(app)
+            self.click_lifecycle_decision(app, "Cancel")
+            if app.process.poll() is not None:
+                raise HarnessFailure("ALT_F4_CANCEL_CLOSED_PROCESS")
+            kept = self.editor_fingerprint(app)
+            if kept != editor:
+                raise HarnessFailure("ALT_F4_CANCEL_CHANGED_EDITOR_BYTES")
+            untouched = sha256_file(document)
+            if untouched != fingerprint_bytes(ORIGINAL_BYTES):
+                raise HarnessFailure("ALT_F4_CANCEL_CHANGED_SOURCE")
             # The platform close must raise the guard, not close the window.
             self.win32.post_close(app.hwnd)
             self.click_lifecycle_decision(app, "Save")
@@ -853,6 +890,9 @@ class Goal02Harness(BaseNativeHarness):
                 raise HarnessFailure("WINDOW_SAVE_BYTES_MISMATCH")
             observations = {
                 "editor": editor.evidence(),
+                "alt_f4_cancel_kept_window": True,
+                "editor_after_alt_f4_cancel": kept.evidence(),
+                "source_after_alt_f4_cancel": untouched.evidence(),
                 "saved_source": saved.evidence(),
                 "flow": CASE_FLOWS[CASE_WINDOW_SAVE],
                 "window_exited": True,

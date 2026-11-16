@@ -136,6 +136,7 @@ def valid_evidence() -> dict:
         },
         CASE_SAMPLE: {
             "sample_workspace_opened": True,
+            "workspace_home_visible": True,
             **sample_observation(),
         },
         CASE_RECENTS: {
@@ -143,6 +144,7 @@ def valid_evidence() -> dict:
             "recent_count": 10,
             "recent_visible_count": 5,
             "stale_recent_disabled": True,
+            "stale_recent_press_ignored": True,
         },
         CASE_CLI: {
             "direct_file_bypassed_welcome": True,
@@ -686,6 +688,16 @@ class RecentControlBehaviorTests(unittest.TestCase):
                 self.harness([element]).recent_controls(type("App", (), {"hwnd": 42})())
             self.assertEqual(raised.exception.code, "RECENT_UIA_CONTRACT_MISMATCH")
 
+    def test_workspace_home_rows_share_their_own_id_and_failure_codes(self) -> None:
+        harness = self.harness([self.element(HARNESS.WORKSPACE_HOME_FILE_AUTOMATION_ID, 1)])
+        controls = harness.workspace_home_files(type("App", (), {"hwnd": 42})())
+        self.assertEqual(len(controls), 1)
+
+        harness = self.harness([self.element(HARNESS.WORKSPACE_HOME_FILE_AUTOMATION_ID, 2)])
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.workspace_home_files(type("App", (), {"hwnd": 42})())
+        self.assertEqual(raised.exception.code, "WORKSPACE_HOME_UIA_CONTRACT_MISMATCH")
+
     def test_recent_query_preserves_uia_contract_failures(self) -> None:
         failure = HARNESS_FAILURE("RECENT_UIA_CONTRACT_MISMATCH")
         harness = self.harness([], failure)
@@ -694,6 +706,67 @@ class RecentControlBehaviorTests(unittest.TestCase):
             harness.recent_controls(type("App", (), {"hwnd": 42})())
 
         self.assertIs(raised.exception, failure)
+
+
+class StaleRecentScenarioTests(unittest.TestCase):
+    """The restart half of the recents case: the stale row is disabled, named
+    `File <name> — Missing`, and a real press on it opens nothing."""
+
+    @staticmethod
+    def row(name: str, *, enabled: bool = True) -> mock.Mock:
+        control = mock.Mock()
+        control.element_info.name = name
+        control.is_enabled.return_value = enabled
+        return control
+
+    def run_scenario(self, stale: mock.Mock) -> tuple[mock.Mock, dict]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            roots = tuple(root / name for name in ("case", "data", "config", "workspace"))
+            for path in roots:
+                path.mkdir()
+            harness = object.__new__(HARNESS.Goal03Harness)
+            harness.ui_timeout = 1.0
+            harness.profile = mock.Mock(return_value=(*roots, root / "stderr.log"))
+            first, restarted = mock.Mock(), mock.Mock()
+            harness.launch_app = mock.Mock(side_effect=[first, restarted])
+            fresh = self.row("File recent-00.md")
+            harness.recent_controls = mock.Mock(
+                side_effect=[[fresh], [fresh, self.row("Workspace workspace"), stale]]
+            )
+            harness.welcome_open_folder = mock.Mock()
+            harness.click_control = mock.Mock()
+            harness.source_editor_ready = mock.Mock()
+            harness.close_app = mock.Mock()
+            harness.reap = mock.Mock()
+            harness.hold_control = mock.Mock()
+            harness.editor_absent_while_running = mock.Mock(return_value=True)
+            with (
+                mock.patch.object(HARNESS, "persisted_recent_count", return_value=10),
+                mock.patch.object(HARNESS, "scan_case_artifacts", return_value={}),
+            ):
+                observations = harness.scenario_recents()
+            return harness, observations
+
+    def test_a_disabled_missing_row_is_pressed_and_opens_nothing(self) -> None:
+        stale = self.row("File recent-01.md \u2014 Missing", enabled=False)
+        harness, observations = self.run_scenario(stale)
+        harness.hold_control.assert_called_once_with(
+            mock.ANY, stale, HARNESS.STALE_RECENT_PRESS_SECONDS, "STALE_RECENT_PRESS_FAILED"
+        )
+        self.assertTrue(observations["stale_recent_press_ignored"])
+        self.assertEqual(observations["recent_visible_count"], 3)
+
+    def test_an_enabled_or_unmarked_stale_row_fails(self) -> None:
+        for stale in (
+            self.row("File recent-01.md \u2014 Missing", enabled=True),
+            self.row("File recent-01.md", enabled=False),
+        ):
+            with self.subTest(name=stale.element_info.name), self.assertRaises(
+                HARNESS_FAILURE
+            ) as raised:
+                self.run_scenario(stale)
+            self.assertEqual(raised.exception.code, "STALE_RECENT_NOT_DEGRADED")
 
 
 class RuntimeArtifactPrivacyTests(unittest.TestCase):

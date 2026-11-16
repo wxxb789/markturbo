@@ -262,6 +262,7 @@ class Goal07Fixtures:
                         "selective_expected": changed_fingerprint,
                         "editor_after_apply": changed_fingerprint,
                         "editor_after_undo": fingerprint,
+                        "editor_after_done": changed_fingerprint,
                         "source_before": fingerprint,
                         "source_after": fingerprint,
                         "selective_matches_expected": True,
@@ -273,17 +274,17 @@ class Goal07Fixtures:
                 item.update(
                     {
                         "editor_before_apply": fingerprint,
-                        "editor_after_preview": fingerprint,
+                        "editor_after_accept_all": changed_fingerprint,
                         "accept_all_expected": changed_fingerprint,
                         "editor_after_done": changed_fingerprint,
                         "accept_all_matches_expected": True,
                         "copy_preview_fingerprint": changed_fingerprint,
                         "copy_preview_exact": True,
-                        "copy_editor_before": fingerprint,
-                        "copy_editor_after": fingerprint,
+                        "copy_editor_before": changed_fingerprint,
+                        "copy_editor_after": changed_fingerprint,
                         "copy_editor_unchanged": True,
-                        "copy_dirty_before": False,
-                        "copy_dirty_after": False,
+                        "copy_dirty_before": True,
+                        "copy_dirty_after": True,
                         "copy_dirty_unchanged": True,
                         "copy_source_before": fingerprint,
                         "copy_source_after": fingerprint,
@@ -296,15 +297,15 @@ class Goal07Fixtures:
                         "editor_before": fingerprint,
                         "editor_after_edit": changed_fingerprint,
                         "editor_after_activation_attempt": changed_fingerprint,
+                        "editor_after_done": changed_fingerprint,
                         "source_before": fingerprint,
                         "source_after": fingerprint,
                         "stale_proposal_received": True,
-                        "stale_visible": True,
+                        "part_changed_visible": True,
+                        "accept_withheld": True,
                         "apply_activation_attempted": True,
                         "apply_disabled_source_contract": True,
                         "stale_no_mutation": True,
-                        "apply_control_observed": True,
-                        "apply_accessibility_reported_enabled": True,
                     }
                 )
             elif case_id == native_goal07.CASE_SAVE_CONFLICT:
@@ -340,7 +341,7 @@ class Goal07Fixtures:
             observations[case_id] = item
         return {
             "schema": revision.NATIVE_ACCEPTANCE_SCHEMA,
-            "schema_version": 1,
+            "schema_version": native_goal07.SCHEMA_VERSION,
             "status": "PASS",
             "started_at_utc": "2026-09-18T00:00:00Z",
             "completed_at_utc": "2026-09-18T00:00:01Z",
@@ -1066,6 +1067,25 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
             approved_native_executable_sha256=self.fixtures.native_executable_anchor,
         )
         self.assertFalse(evidence["evaluation"]["all_cases_satisfied"])
+
+    def test_native_schema_version_follows_the_harness_and_refuses_historical_files(self) -> None:
+        self.assertEqual(revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION, native_goal07.SCHEMA_VERSION)
+        self.assertEqual(
+            revision.NATIVE_ACCEPTANCE_HISTORICAL_SCHEMA_VERSION,
+            native_goal07.HISTORICAL_SCHEMA_VERSION,
+        )
+        # The retained PASS of the retired GPUI harness is historical, never acceptance.
+        retained = revision.REPO / "docs" / "evidence" / "goal-07-final-ablation-f1ec266c-r2.json"
+        value = json.loads(retained.read_text(encoding="utf-8"))
+        self.assertEqual((value["schema_version"], value["status"]), (1, "PASS"))
+        path = Path(self.temp.name) / "native-historical.json"
+        shutil.copyfile(retained, path)
+        with self.assertRaisesRegex(revision.RevisionEvaluationError, "historical GPUI-era record"):
+            revision.load_native_acceptance(
+                path,
+                approved_native_evidence_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                approved_native_executable_sha256=value["executable"]["expected_sha256"],
+            )
 
     def test_native_schema_version_and_unhashable_case_id_fail_closed(self) -> None:
         wrong_type = {**self.fixtures.native_value, "schema_version": True}
