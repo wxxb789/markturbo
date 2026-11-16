@@ -511,7 +511,10 @@ const MISSING_REFERENCE_REASON: &str = "referenced file not found";
 /// does not hold, so a package missing a normally in-scope supporting file is
 /// partial rather than presented as complete. Links with a scheme, absolute
 /// or escaping paths, fragments and percent-encoded targets are not package
-/// files and are left alone.
+/// files and are left alone. A link resolves as the platform's file system
+/// resolves it: without regard to case on Windows and macOS. The disclosures
+/// never take the inventory to its entry bound; a package that reaches it is
+/// already partial.
 fn disclose_missing_references(
     files: &[SkillPackageFile],
     omissions: &mut Vec<SkillPackageOmission>,
@@ -522,13 +525,26 @@ fn disclose_missing_references(
     let SkillFilePayload::Utf8 { content } = &entrypoint.payload else {
         return;
     };
+    let fold = |path: &str| {
+        if cfg!(any(windows, target_os = "macos")) {
+            path.to_lowercase()
+        } else {
+            path.to_owned()
+        }
+    };
     let covers = |path: &str, target: &str| {
+        let (path, target) = (fold(path), fold(target));
         path == target
             || path
-                .strip_prefix(target)
+                .strip_prefix(&target)
                 .is_some_and(|rest| rest.starts_with('/'))
     };
     for target in relative_link_targets(content) {
+        if files.len().saturating_add(omissions.len())
+            >= source::MAX_AGENT_SKILL_INVENTORY_ENTRIES - 1
+        {
+            break;
+        }
         let Ok(omission) = SkillPackageOmission::new(&target, MISSING_REFERENCE_REASON, false)
         else {
             continue;
@@ -854,6 +870,47 @@ Read [the guide](references/guide.md),
         fs::write(directory.path().join("scripts").join("run.py"), "print()").unwrap();
         let complete = frozen_skill_package(directory.path(), "", false).unwrap();
         assert!(!complete.package().is_partial());
+    }
+
+    #[test]
+    fn a_reference_resolves_as_the_platform_file_system_does() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("SKILL.md"),
+            "Read [the guide](References/Guide.md).\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("references")).unwrap();
+        fs::write(
+            directory.path().join("references").join("guide.md"),
+            "guide",
+        )
+        .unwrap();
+
+        let package = frozen_skill_package(directory.path(), "", false).unwrap();
+        // Windows and macOS open `References/Guide.md` as the packaged
+        // `references/guide.md`; elsewhere that link names a missing file.
+        assert_eq!(
+            package.package().is_partial(),
+            !cfg!(any(windows, target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn missing_reference_disclosures_stay_inside_the_inventory_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let links = (0..MAX_AGENT_SKILL_INVENTORY_ENTRIES + 8)
+            .map(|index| format!("[{index}](missing/{index}.md)\n"))
+            .collect::<String>();
+        fs::write(directory.path().join("SKILL.md"), links).unwrap();
+
+        let package = frozen_skill_package(directory.path(), "", false).unwrap();
+        let package = package.package();
+        assert!(package.is_partial());
+        assert_eq!(
+            package.files().len() + package.omissions().len(),
+            MAX_AGENT_SKILL_INVENTORY_ENTRIES - 1
+        );
     }
 
     #[test]

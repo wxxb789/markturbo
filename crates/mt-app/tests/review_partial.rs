@@ -83,6 +83,22 @@ fn a_package_missing_a_referenced_file_is_reviewed_as_partial() {
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
+    // An Agent Skill is reviewed as one package: Review selection says so
+    // and prepares nothing.
+    app.type_text("label:Markdown source", "")
+        .expect("focus the editor");
+    app.press_key("ctrl+a").expect("select all");
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-review-selection")
+        .expect("Review selection");
+    app.wait_for("text:An Agent Skill is reviewed as one package: use Review.")
+        .expect("the package is reviewed whole");
+    assert!(!app.shows("id:consent-card"), "nothing was prepared");
+    assert!(
+        !app.shows("id:review-unavailable"),
+        "not a failure to prepare"
+    );
+
     // The consent names the omission among what stays.
     app.press("id:title-review").expect("open Review");
     app.wait_for("id:consent-card").expect("package disclosure");

@@ -52,7 +52,10 @@ use mt_core::{
         tree::{self, FileNode},
     },
 };
-use nsh_base::alert_dialog;
+use nsh_base::{
+    alert_dialog,
+    editor::{Editor, EditorApi},
+};
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
 
 mod revision_ledger;
@@ -110,6 +113,9 @@ impl PartialEq for Tab {
     }
 }
 
+/// A mounted source editor's handle and the tab it edits.
+type SourceEditor = (u64, ComponentRef<Editor>);
+
 /// The shell's state.
 #[derive(Clone)]
 pub struct AppState {
@@ -145,9 +151,6 @@ pub struct AppState {
     pub harness_skills: Signal<Vec<Skill>>,
     pub harness_instructions: Signal<Vec<Instruction>>,
     pub review_open: Signal<bool>,
-    /// The source editor's primary selection, as the editor last reported it
-    /// (`ui::document`): what `Review selection` reviews.
-    pub source_selection: Signal<Option<SourceSelection>>,
     pub review_consent: Signal<Option<SharedString>>,
     /// The waiting Review consent's structured disclosure and manifest.
     pub review_manifest: Signal<Option<OutboundConsent>>,
@@ -200,6 +203,11 @@ pub struct AppState {
     /// frozen text, when the waiting Review consent was prepared: the
     /// `Selection` scope the card may switch to. `None` offers no selection.
     review_selection: Rc<Cell<Option<(usize, usize)>>>,
+    /// The source editor `ui::document` mounted last, with the tab it edits.
+    /// Its selection is read live when a Review is prepared; once that
+    /// editor is unmounted (another pane or tab) its handle reaches nothing,
+    /// so a selection nobody sees is never reviewed.
+    source_editor: Rc<Cell<Option<SourceEditor>>>,
     /// The tab a sent Review request belongs to, until its answer lands or
     /// the request stops mattering (replaced or withdrawn). It outlives the
     /// tab being on screen: switching tabs must not drop an answer nobody
@@ -335,17 +343,15 @@ pub enum ReviewScopeChoice {
 /// a line from 0 and a column in UTF-16 code units, from where it started
 /// (`anchor`) to where the caret is (`head`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SourceSelection {
-    /// The tab whose editor reported it.
-    pub tab: u64,
-    pub anchor: (u32, u32),
-    pub head: (u32, u32),
+struct SourceSelection {
+    anchor: (u32, u32),
+    head: (u32, u32),
 }
 
 impl SourceSelection {
     /// The selection as a byte range of `text`, ordered and clamped to the
     /// text; `None` when it selects nothing.
-    pub fn byte_range(&self, text: &str) -> Option<(usize, usize)> {
+    fn byte_range(&self, text: &str) -> Option<(usize, usize)> {
         let anchor = byte_offset(text, self.anchor);
         let head = byte_offset(text, self.head);
         let (start, end) = (anchor.min(head), anchor.max(head));
@@ -354,18 +360,17 @@ impl SourceSelection {
 }
 
 /// The byte offset of an editor position (line from 0, UTF-16 column) in
-/// `text`, clamped to the end of its line (before the `\r` of a `\r\n`) and
-/// to the end of the text.
+/// `text`, clamped to the end of its line (before its line break) and to the
+/// end of the text.
 fn byte_offset(text: &str, (line, column): (u32, u32)) -> usize {
     let mut start = 0;
     for _ in 0..line {
-        match text[start..].find('\n') {
-            Some(newline) => start += newline + 1,
+        match line_bounds(text, start).1 {
+            Some(next) => start = next,
             None => return text.len(),
         }
     }
-    let line_text = text[start..].split('\n').next().unwrap_or_default();
-    let line_text = line_text.strip_suffix('\r').unwrap_or(line_text);
+    let line_text = &text[start..line_bounds(text, start).0];
     let mut units = 0;
     for (offset, character) in line_text.char_indices() {
         if units >= column as usize {
@@ -374,6 +379,24 @@ fn byte_offset(text: &str, (line, column): (u32, u32)) -> usize {
         units += character.len_utf16();
     }
     start + line_text.len()
+}
+
+/// Where the line starting at byte `start` of `text` ends (before its break)
+/// and where the next line starts, if one does. Lines break as the source
+/// editor breaks them: at `\r\n`, `\n` or a lone `\r`.
+fn line_bounds(text: &str, start: usize) -> (usize, Option<usize>) {
+    match text[start..].find(['\r', '\n']) {
+        None => (text.len(), None),
+        Some(at) => {
+            let end = start + at;
+            let next = if text[end..].starts_with("\r\n") {
+                end + 2
+            } else {
+                end + 1
+            };
+            (end, Some(next))
+        }
+    }
 }
 
 /// Immutable inputs retained after a successful Review for a later Revision.
@@ -568,7 +591,6 @@ impl AppState {
             harness_skills: signal(Vec::new()),
             harness_instructions: signal(Vec::new()),
             review_open: signal(false),
-            source_selection: signal(None),
             review_consent: signal(None),
             review_manifest: signal(None),
             review_view: signal(None),
@@ -594,6 +616,7 @@ impl AppState {
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
             review_selection: Rc::new(Cell::new(None)),
+            source_editor: Rc::new(Cell::new(None)),
             review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
@@ -2129,13 +2152,29 @@ impl AppState {
         self.prepare_review(true);
     }
 
-    /// The non-empty selection of `tab`'s source editor, as byte offsets
-    /// into `text`.
+    /// Record the source editor `ui::document` mounted for `tab`: the one
+    /// whose live selection `Review selection` reviews.
+    pub fn attach_source_editor(&self, tab: u64, editor: ComponentRef<Editor>) {
+        self.source_editor.set(Some((tab, editor)));
+    }
+
+    /// The non-empty primary selection the mounted source editor of `tab`
+    /// shows now, as byte offsets into `text`. No editor on screen for the
+    /// tab (another pane, another tab), or an editor that does not hold
+    /// `text`, selects nothing.
     fn selection_in(&self, tab: &Tab, text: &str) -> Option<(usize, usize)> {
-        self.source_selection
-            .get_untracked()
-            .filter(|selection| selection.tab == tab.id)
-            .and_then(|selection| selection.byte_range(text))
+        let (owner, editor) = self.source_editor.get()?;
+        let api = editor.api::<EditorApi>().filter(|_| owner == tab.id)?;
+        // The editor holds the text with its line breaks as `\n`.
+        if api.value() != text.replace("\r\n", "\n").replace('\r', "\n") {
+            return None;
+        }
+        let primary = api.selections().pop()?;
+        SourceSelection {
+            anchor: (primary.anchor.line, primary.anchor.column),
+            head: (primary.head.line, primary.head.column),
+        }
+        .byte_range(text)
     }
 
     /// [`start_review`](Self::start_review) for the whole document, or for
@@ -2187,6 +2226,13 @@ impl AppState {
                 return;
             }
         };
+        let lens = ArtifactLens::infer_from_path(&tab.path);
+        if selection && lens == ArtifactLens::AgentSkill {
+            self.status.set(SharedString::from(
+                "An Agent Skill is reviewed as one package: use Review.",
+            ));
+            return;
+        }
         let text = tab.text.get().to_string();
         let captured = self.selection_in(&tab, &text);
         if selection && captured.is_none() {
@@ -2203,7 +2249,7 @@ impl AppState {
                 } else {
                     ReviewTarget::Document
                 },
-                ArtifactLens::infer_from_path(&tab.path),
+                lens,
                 Some(&tab.path),
                 &text,
                 range.as_ref(),
@@ -3613,12 +3659,7 @@ mod selection_tests {
     use super::SourceSelection;
 
     fn range(text: &str, anchor: (u32, u32), head: (u32, u32)) -> Option<(usize, usize)> {
-        SourceSelection {
-            tab: 1,
-            anchor,
-            head,
-        }
-        .byte_range(text)
+        SourceSelection { anchor, head }.byte_range(text)
     }
 
     #[test]
@@ -3635,6 +3676,9 @@ mod selection_tests {
         assert_eq!(range(text, (1, 0), (1, 99)), Some((line, x + 1)));
         // Across lines, and a line past the text clamps to its end.
         assert_eq!(range(text, (0, 1), (9, 0)), Some((1, text.len())));
+        // A lone `\r` breaks a line, as it does in the editor.
+        assert_eq!(range("a\rbc\r\nd", (1, 0), (1, 2)), Some((2, 4)));
+        assert_eq!(range("a\rbc\r\nd", (2, 0), (2, 1)), Some((6, 7)));
         // A caret selects nothing.
         assert_eq!(range(text, (2, 1), (2, 1)), None);
         assert_eq!(range("", (0, 0), (3, 3)), None);
