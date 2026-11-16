@@ -70,7 +70,7 @@ use nsh_core::{Color, TransformKind, prelude::*};
 
 use crate::{
     i18n::{self, Key},
-    state::{AppState, OutboundConsent, OutboundItem, OutboundOrigin},
+    state::{AppState, OutboundConsent, OutboundItem, OutboundOrigin, ReviewScopeChoice},
     ui::{motion, prims, tokens},
 };
 
@@ -282,8 +282,11 @@ fn disclosure_body(
         )
 }
 
-/// The scope: the words the state can bind, the current one in full ink, the
-/// other one a quiet switch (choosing a scope is your action, never warm).
+/// The scope: the words the state can bind (`Selection`, `Document`,
+/// `Document + context`), the current one in full ink, each other bindable one
+/// a quiet switch (choosing a scope is your action, never warm), and one that
+/// cannot be bound not drawn. A switch rebinds the consent; it authorizes
+/// nothing.
 fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl IntoElement {
     let kind = waiting
         .consent
@@ -298,33 +301,47 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
             .effective_context_sources()
             .is_empty()
     });
-    let selection = kind == Some(OutboundScopeKind::Selection);
-    let offered = !waiting.is_revision && state.review_consent_offers_context();
-    let to_context = state.clone();
-    let to_document = state;
+    let current = if kind == Some(OutboundScopeKind::Selection) {
+        ReviewScopeChoice::Selection
+    } else if with_context {
+        ReviewScopeChoice::DocumentWithContext
+    } else {
+        ReviewScopeChoice::Document
+    };
+    let review = !waiting.is_revision;
+    let offers_selection = review && state.review_consent_offers_selection();
+    let offers_context = review && state.review_consent_offers_context();
+    let option = |choice: ReviewScopeChoice, test_id: &'static str, label: S, offered: bool| {
+        let state = state.clone();
+        scope_choice(
+            test_id,
+            label.text(language),
+            current == choice,
+            offered
+                .then(|| Box::new(move || state.set_review_consent_scope(choice)) as Box<dyn Fn()>),
+        )
+    };
     let mut options: Vec<AnyElement> = Vec::new();
-    if selection {
-        options.push(scope_word(
+    if current == ReviewScopeChoice::Selection || offers_selection {
+        options.push(option(
+            ReviewScopeChoice::Selection,
             "consent-scope-selection",
-            S::ScopeSelection.text(language),
+            S::ScopeSelection,
+            offers_selection,
         ));
     }
-    options.push(scope_choice(
+    options.push(option(
+        ReviewScopeChoice::Document,
         "consent-scope-document",
-        S::ScopeDocument.text(language),
-        !with_context,
-        (with_context).then(|| {
-            Box::new(move || to_document.set_review_consent_scope(false)) as Box<dyn Fn()>
-        }),
+        S::ScopeDocument,
+        review,
     ));
-    if with_context || offered {
-        options.push(scope_choice(
+    if current == ReviewScopeChoice::DocumentWithContext || offers_context {
+        options.push(option(
+            ReviewScopeChoice::DocumentWithContext,
             "consent-scope-context",
-            S::ScopeContext.text(language),
-            with_context,
-            (!with_context).then(|| {
-                Box::new(move || to_context.set_review_consent_scope(true)) as Box<dyn Fn()>
-            }),
+            S::ScopeContext,
+            offers_context,
         ));
     }
     view()
@@ -843,6 +860,7 @@ fn rows_max_h(height: f32) -> f32 {
 fn name(language: Language, origin: OutboundOrigin) -> &'static str {
     match origin {
         OutboundOrigin::Document => S::DocumentName.text(language),
+        OutboundOrigin::Selection => S::SelectionName.text(language),
         OutboundOrigin::NamedSource => S::NamedSourceName.text(language),
         OutboundOrigin::PackageFile => S::PackageFileName.text(language),
         OutboundOrigin::Omission => S::OmissionName.text(language),
@@ -860,6 +878,7 @@ fn reason_of(language: Language, item: &OutboundItem) -> String {
     }
     match item.origin {
         OutboundOrigin::Document => S::DocumentReason.text(language).to_owned(),
+        OutboundOrigin::Selection => S::SelectionReason.text(language).to_owned(),
         OutboundOrigin::NamedSource => S::NamedSourceReason.text(language).to_owned(),
         OutboundOrigin::PackageFile => S::PackageFileReason.text(language).to_owned(),
         OutboundOrigin::Omission => S::OmissionReason.text(language).to_owned(),
@@ -1353,6 +1372,7 @@ enum S {
     BoundaryContent,
     Total,
     DocumentName,
+    SelectionName,
     NamedSourceName,
     PackageFileName,
     OmissionName,
@@ -1360,6 +1380,7 @@ enum S {
     ReviewContextName,
     AnswersName,
     DocumentReason,
+    SelectionReason,
     NamedSourceReason,
     PackageFileReason,
     OmissionReason,
@@ -1401,6 +1422,7 @@ impl S {
                 S::BoundaryContent => "The disclosed source content also crosses it.",
                 S::Total => "Content total",
                 S::DocumentName => "the document",
+                S::SelectionName => "the selection",
                 S::NamedSourceName => "named source",
                 S::PackageFileName => "package file",
                 S::OmissionName => "not sent",
@@ -1408,6 +1430,7 @@ impl S {
                 S::ReviewContextName => "Review context",
                 S::AnswersName => "Answers",
                 S::DocumentReason => "the document",
+                S::SelectionReason => "selected text only",
                 S::NamedSourceReason => "named source",
                 S::PackageFileReason => "in the package",
                 S::OmissionReason => "not sent with the package",
@@ -1445,6 +1468,7 @@ impl S {
                 S::BoundaryContent => "上述源内容也会跨越此边界发送。",
                 S::Total => "内容合计",
                 S::DocumentName => "文档",
+                S::SelectionName => "选区",
                 S::NamedSourceName => "指定来源",
                 S::PackageFileName => "包内文件",
                 S::OmissionName => "未发送",
@@ -1452,6 +1476,7 @@ impl S {
                 S::ReviewContextName => "审查上下文",
                 S::AnswersName => "回答",
                 S::DocumentReason => "文档本身",
+                S::SelectionReason => "仅选中的文本",
                 S::NamedSourceReason => "指定来源",
                 S::PackageFileReason => "包内文件",
                 S::OmissionReason => "未随包发送",

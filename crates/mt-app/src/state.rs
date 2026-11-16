@@ -32,8 +32,9 @@ use mt_core::{
     },
     recovery::{RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RecoveryStore},
     review::{
-        ArtifactLens, ClarificationPriority, FindingKind, ReviewModelOutput, ReviewRequest,
-        ReviewResult, ReviewStatus, SkillFilePayload, SourceAnchor, SourceLocation, SourceSnapshot,
+        ArtifactLens, ByteRange, ClarificationPriority, FindingKind, ReviewModelOutput,
+        ReviewRequest, ReviewResult, ReviewScope, ReviewSource, ReviewStatus, SkillFilePayload,
+        SourceAnchor, SourceLocation, SourceSnapshot,
         provider::{
             PreparedDocumentReviewRequest, PreparedReview, PreparedRevisionRequest, ReviewError,
             ReviewLanguage, RevisionAnswer, RevisionAnswers, RevisionError,
@@ -51,7 +52,10 @@ use mt_core::{
         tree::{self, FileNode},
     },
 };
-use nsh_base::alert_dialog;
+use nsh_base::{
+    alert_dialog,
+    editor::{Editor, EditorApi},
+};
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
 
 mod revision_ledger;
@@ -108,6 +112,9 @@ impl PartialEq for Tab {
         self.id == other.id
     }
 }
+
+/// A mounted source editor's handle and the tab it edits.
+type SourceEditor = (u64, ComponentRef<Editor>);
 
 /// The shell's state.
 #[derive(Clone)]
@@ -192,6 +199,15 @@ pub struct AppState {
     usage: Rc<RefCell<UsageStore>>,
     pending_review: Rc<RefCell<Option<PreparedDocumentReviewRequest>>>,
     review_origin: Rc<RefCell<Option<ReviewOrigin>>>,
+    /// The non-empty source selection captured, as byte offsets into the
+    /// frozen text, when the waiting Review consent was prepared: the
+    /// `Selection` scope the card may switch to. `None` offers no selection.
+    review_selection: Rc<Cell<Option<(usize, usize)>>>,
+    /// The source editor `ui::document` mounted last, with the tab it edits.
+    /// Its selection is read live when a Review is prepared; once that
+    /// editor is unmounted (another pane or tab) its handle reaches nothing,
+    /// so a selection nobody sees is never reviewed.
+    source_editor: Rc<Cell<Option<SourceEditor>>>,
     /// The tab a sent Review request belongs to, until its answer lands or
     /// the request stops mattering (replaced or withdrawn). It outlives the
     /// tab being on screen: switching tabs must not drop an answer nobody
@@ -264,6 +280,8 @@ pub const GUARD_CHOICES: usize = 3;
 pub enum OutboundOrigin {
     /// The reviewed document itself.
     Document,
+    /// The selected part of the reviewed document, alone.
+    Selection,
     /// One named Effective Agent Context source.
     NamedSource,
     /// One Agent Skill package file, whose own reason travels with it.
@@ -309,6 +327,78 @@ pub struct OutboundConsent {
     pub stays: Vec<OutboundItem>,
 }
 
+/// The outbound scope a waiting Review consent can be rebound to: the spec's
+/// `Selection · Document · Document + context`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewScopeChoice {
+    /// Only the source selection captured when the Review was prepared.
+    Selection,
+    /// The whole document (or Agent Skill package).
+    Document,
+    /// The whole document with its selected Effective Agent Context sources.
+    DocumentWithContext,
+}
+
+/// The source editor's primary selection in the editor's own coordinates:
+/// a line from 0 and a column in UTF-16 code units, from where it started
+/// (`anchor`) to where the caret is (`head`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceSelection {
+    anchor: (u32, u32),
+    head: (u32, u32),
+}
+
+impl SourceSelection {
+    /// The selection as a byte range of `text`, ordered and clamped to the
+    /// text; `None` when it selects nothing.
+    fn byte_range(&self, text: &str) -> Option<(usize, usize)> {
+        let anchor = byte_offset(text, self.anchor);
+        let head = byte_offset(text, self.head);
+        let (start, end) = (anchor.min(head), anchor.max(head));
+        (start < end).then_some((start, end))
+    }
+}
+
+/// The byte offset of an editor position (line from 0, UTF-16 column) in
+/// `text`, clamped to the end of its line (before its line break) and to the
+/// end of the text.
+fn byte_offset(text: &str, (line, column): (u32, u32)) -> usize {
+    let mut start = 0;
+    for _ in 0..line {
+        match line_bounds(text, start).1 {
+            Some(next) => start = next,
+            None => return text.len(),
+        }
+    }
+    let line_text = &text[start..line_bounds(text, start).0];
+    let mut units = 0;
+    for (offset, character) in line_text.char_indices() {
+        if units >= column as usize {
+            return start + offset;
+        }
+        units += character.len_utf16();
+    }
+    start + line_text.len()
+}
+
+/// Where the line starting at byte `start` of `text` ends (before its break)
+/// and where the next line starts, if one does. Lines break as the source
+/// editor breaks them: at `\r\n`, `\n` or a lone `\r`.
+fn line_bounds(text: &str, start: usize) -> (usize, Option<usize>) {
+    match text[start..].find(['\r', '\n']) {
+        None => (text.len(), None),
+        Some(at) => {
+            let end = start + at;
+            let next = if text[end..].starts_with("\r\n") {
+                end + 2
+            } else {
+                end + 1
+            };
+            (end, Some(next))
+        }
+    }
+}
+
 /// Immutable inputs retained after a successful Review for a later Revision.
 struct RevisionContext {
     tab_id: u64,
@@ -347,6 +437,9 @@ pub struct ReviewView {
     /// Why the review failed, when it did: the field writes the plain
     /// diagnostic line the spec asks for.
     pub failure: Option<ReviewFailure>,
+    /// Whether the reviewed Agent Skill package omitted a normally in-scope
+    /// supporting file: the result is labelled partial, never complete.
+    pub partial: bool,
 }
 
 /// The column's camera: the document line a surface asked the source editor to
@@ -522,6 +615,8 @@ impl AppState {
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
+            review_selection: Rc::new(Cell::new(None)),
+            source_editor: Rc::new(Cell::new(None)),
             review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
@@ -2066,6 +2161,44 @@ impl AppState {
     /// configured endpoint and credential, and show the exact disclosure.
     /// Nothing leaves the machine until [`send_review`](Self::send_review).
     pub fn start_review(&self) {
+        self.prepare_review(false);
+    }
+
+    /// Prepare one Review of exactly the active source editor's selection:
+    /// the request, the disclosure and the bytes are the selected text's
+    /// alone. Without a non-empty selection nothing is prepared.
+    pub fn start_review_selection(&self) {
+        self.prepare_review(true);
+    }
+
+    /// Record the source editor `ui::document` mounted for `tab`: the one
+    /// whose live selection `Review selection` reviews.
+    pub fn attach_source_editor(&self, tab: u64, editor: ComponentRef<Editor>) {
+        self.source_editor.set(Some((tab, editor)));
+    }
+
+    /// The non-empty primary selection the mounted source editor of `tab`
+    /// shows now, as byte offsets into `text`. No editor on screen for the
+    /// tab (another pane, another tab), or an editor that does not hold
+    /// `text`, selects nothing.
+    fn selection_in(&self, tab: &Tab, text: &str) -> Option<(usize, usize)> {
+        let (owner, editor) = self.source_editor.get()?;
+        let api = editor.api::<EditorApi>().filter(|_| owner == tab.id)?;
+        // The editor holds the text with its line breaks as `\n`.
+        if api.value() != text.replace("\r\n", "\n").replace('\r', "\n") {
+            return None;
+        }
+        let primary = api.selections().pop()?;
+        SourceSelection {
+            anchor: (primary.anchor.line, primary.anchor.column),
+            head: (primary.head.line, primary.head.column),
+        }
+        .byte_range(text)
+    }
+
+    /// [`start_review`](Self::start_review) for the whole document, or for
+    /// the selection with `selection`.
+    fn prepare_review(&self, selection: bool) {
         // A review that is prepared replaces any review still in flight: its
         // task writes nothing when it comes back, and the loading state it
         // left is not this run's to show — the early returns below must not
@@ -2087,6 +2220,7 @@ impl AppState {
         self.review_manifest.set(None);
         *self.review_origin.borrow_mut() = None;
         *self.review_binding.borrow_mut() = None;
+        self.review_selection.set(None);
         self.reset_revision();
 
         let settings = self.settings.get();
@@ -2111,14 +2245,33 @@ impl AppState {
                 return;
             }
         };
+        let lens = ArtifactLens::infer_from_path(&tab.path);
+        if selection && lens == ArtifactLens::AgentSkill {
+            self.status.set(SharedString::from(
+                "An Agent Skill is reviewed as one package: use Review.",
+            ));
+            return;
+        }
         let text = tab.text.get().to_string();
+        let captured = self.selection_in(&tab, &text);
+        if selection && captured.is_none() {
+            self.status.set(SharedString::from(
+                "Select text in the source to review a selection.",
+            ));
+            return;
+        }
+        let range = captured.map(|(start, end)| start..end);
         let built = build_review_request(
             ReviewRequestBuildRequest::new(
-                ReviewTarget::Document,
-                ArtifactLens::infer_from_path(&tab.path),
+                if selection {
+                    ReviewTarget::Selection
+                } else {
+                    ReviewTarget::Document
+                },
+                lens,
                 Some(&tab.path),
                 &text,
-                None,
+                range.as_ref(),
                 SourceSnapshot::new(tab.revision.get(), 0),
                 tab.dirty.get(),
             )
@@ -2135,7 +2288,9 @@ impl AppState {
                 return;
             }
         };
-        if let Some(context) = self.context_resolved.get() {
+        // A selection leaves alone: Effective Agent Context belongs to the
+        // whole artifact.
+        if let Some(context) = self.context_resolved.get().filter(|_| !selection) {
             let selected = self.context_selected.get();
             if !selected.is_empty() && context.input.target == tab.path {
                 let selected = match context.select_sources(&selected) {
@@ -2175,12 +2330,22 @@ impl AppState {
             &tab.path,
             self.excluded_sources(&tab.path, context_included),
         );
+        // The selection is offered only where a selection can be bound: an
+        // Agent Skill package is reviewed whole.
+        let selectable = matches!(bound.request().source, ReviewSource::Document { .. });
         *self.pending_review.borrow_mut() = Some(bound);
         *self.review_origin.borrow_mut() = Some(origin);
+        self.review_selection.set(captured.filter(|_| selectable));
         self.review_consent
             .set(Some(SharedString::from(disclosure)));
         self.review_manifest.set(Some(manifest));
         self.review_open.set(true);
+    }
+
+    /// Whether the waiting Review consent may be bound to the source
+    /// selection captured when it was prepared (the `Selection` scope).
+    pub fn review_consent_offers_selection(&self) -> bool {
+        self.review_selection.get().is_some() && self.review_consent_target().is_some()
     }
 
     /// Whether the waiting Review consent may also be bound with its selected
@@ -2241,15 +2406,46 @@ impl AppState {
     }
 
     /// Re-arm the waiting Review consent for another outbound scope: rebuild
-    /// the same frozen request with or without the selected Effective Agent
-    /// Context and disclose the new scope. Nothing is authorized; the next
-    /// send needs a fresh hold.
-    pub fn set_review_consent_scope(&self, with_context: bool) {
+    /// the same frozen request over the captured selection, the whole
+    /// document, or the document with the selected Effective Agent Context,
+    /// and disclose the new scope. Nothing is authorized; the next send needs
+    /// a fresh hold.
+    pub fn set_review_consent_scope(&self, choice: ReviewScopeChoice) {
         let Some((target, base, language)) = self.review_base() else {
             return;
         };
-        let mut request = base;
-        if with_context {
+        let scope = match choice {
+            ReviewScopeChoice::Selection => {
+                let Some((start, end)) = self.review_selection.get() else {
+                    return;
+                };
+                match ByteRange::new(start as u64, end as u64) {
+                    Ok(range) => ReviewScope::selection(range),
+                    Err(error) => {
+                        self.status.set(SharedString::from(format!(
+                            "Review request rejected: {error}"
+                        )));
+                        return;
+                    }
+                }
+            }
+            ReviewScopeChoice::Document | ReviewScopeChoice::DocumentWithContext => {
+                match base.scope {
+                    ReviewScope::Selection { .. } => ReviewScope::Document,
+                    whole => whole,
+                }
+            }
+        };
+        let mut request = match ReviewRequest::new(base.lens, scope, base.source, base.snapshot) {
+            Ok(request) => request,
+            Err(error) => {
+                self.status.set(SharedString::from(format!(
+                    "Review request rejected: {error}"
+                )));
+                return;
+            }
+        };
+        if choice == ReviewScopeChoice::DocumentWithContext {
             let context = match self.context_selection(&target) {
                 Ok(Some(context)) => context,
                 Ok(None) => return,
@@ -2404,7 +2600,11 @@ impl AppState {
         } else {
             if let Some(path) = path {
                 items.push(OutboundItem {
-                    origin: OutboundOrigin::Document,
+                    origin: if scope.kind() == OutboundScopeKind::Selection {
+                        OutboundOrigin::Selection
+                    } else {
+                        OutboundOrigin::Document
+                    },
                     path: Some(self.display_path(path)),
                     reason: None,
                     bytes: scope.primary_content_byte_size(),
@@ -2532,6 +2732,10 @@ impl AppState {
         };
         let binding = origin;
         let revision_request = bound.request().clone();
+        let partial = revision_request
+            .source
+            .package()
+            .is_some_and(|package| package.is_partial());
         let revision_language = bound.language();
         let disclosure = bound.disclosure().clone();
         let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
@@ -2591,6 +2795,7 @@ impl AppState {
                         state.settings.get().language,
                     );
                     view.tab_id = Some(origin.tab_id);
+                    view.partial = partial;
                     view
                 }
                 Ok(Err(error)) => {
@@ -3615,5 +3820,36 @@ mod tests {
             seen.iter().skip(1).all(|(_, trusted)| !trusted),
             "a watcher saw revised text under old trust: {seen:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::SourceSelection;
+
+    fn range(text: &str, anchor: (u32, u32), head: (u32, u32)) -> Option<(usize, usize)> {
+        SourceSelection { anchor, head }.byte_range(text)
+    }
+
+    #[test]
+    fn editor_positions_map_to_the_text_bytes_they_select() {
+        let text = "ab\n\u{4e2d}\u{6587}\u{1f600}x\r\nz";
+        let line = text.find('\u{4e2d}').unwrap();
+        // UTF-16 columns: two CJK units and one surrogate pair before `x`.
+        let x = text.find('x').unwrap();
+        assert_eq!(range(text, (1, 0), (1, 4)), Some((line, x)));
+        assert_eq!(&text[line..x], "\u{4e2d}\u{6587}\u{1f600}");
+        // Selected backwards, the range is the same.
+        assert_eq!(range(text, (1, 4), (1, 0)), Some((line, x)));
+        // A column past the line stops before its `\r\n`.
+        assert_eq!(range(text, (1, 0), (1, 99)), Some((line, x + 1)));
+        // Across lines, and a line past the text clamps to its end.
+        assert_eq!(range(text, (0, 1), (9, 0)), Some((1, text.len())));
+        // A lone `\r` breaks a line, as it does in the editor.
+        assert_eq!(range("a\rbc\r\nd", (1, 0), (1, 2)), Some((2, 4)));
+        assert_eq!(range("a\rbc\r\nd", (2, 0), (2, 1)), Some((6, 7)));
+        // A caret selects nothing.
+        assert_eq!(range(text, (2, 1), (2, 1)), None);
+        assert_eq!(range("", (0, 0), (3, 3)), None);
     }
 }

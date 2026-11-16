@@ -129,6 +129,9 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     let styles_state = state.clone();
     let numbers_state = state.clone();
     let editor_ref = component_ref::<Editor>();
+    // Review selection reads this editor's selection live: once the editor
+    // is unmounted, the handle reaches nothing.
+    state.attach_source_editor(tab.id, editor_ref);
     let camera = editor_ref;
 
     // The column's camera: a docked surface asked to level a line, and the
