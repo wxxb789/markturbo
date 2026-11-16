@@ -86,8 +86,8 @@ class EvidenceSchemaTests(unittest.TestCase):
 
     def test_pass_requires_true_case_facts_and_runtime_scan(self) -> None:
         evidence = valid_evidence()
-        evidence["cases"][3]["observations"]["watcher_conflict_before_save"] = False
-        with self.assertRaisesRegex(ValueError, "requires true watcher_conflict_before_save"):
+        evidence["cases"][3]["observations"]["save_refused_with_conflict"] = False
+        with self.assertRaisesRegex(ValueError, "requires true save_refused_with_conflict"):
             VALIDATE_EVIDENCE(evidence)
 
         evidence = valid_evidence()
@@ -147,7 +147,7 @@ class EvidenceSchemaTests(unittest.TestCase):
 
     def test_pass_rejects_contradictory_flow_mechanics(self) -> None:
         evidence = valid_evidence()
-        evidence["cases"][1]["observations"]["flow"] = "WM_CLOSE -> Save"
+        evidence["cases"][1]["observations"]["flow"] = HARNESS.CASE_FLOWS[REQUIRED_CASE_IDS[2]]
         with self.assertRaisesRegex(ValueError, "flow mechanics"):
             VALIDATE_EVIDENCE(evidence)
 

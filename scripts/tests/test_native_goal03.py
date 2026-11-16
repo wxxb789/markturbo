@@ -29,7 +29,7 @@ CASE_WELCOME = HARNESS.CASE_WELCOME
 COMPLETE_EVIDENCE = HARNESS.complete_evidence
 DOCUMENT_SENTINEL = HARNESS.DOCUMENT_SENTINEL
 HARNESS_FAILURE = runtime.HarnessFailure
-HAS_UNICODE_CLIPBOARD_TEXT = HARNESS.has_unicode_clipboard_text
+HAS_UNICODE_CLIPBOARD_TEXT = runtime.has_unicode_clipboard_text
 NEW_EVIDENCE = HARNESS.new_evidence
 NORMALIZE_EXPECTED_HASH = runtime.normalize_expected_hash
 PARSE_ARGS = HARNESS.parse_args
@@ -105,8 +105,8 @@ def valid_evidence() -> dict:
     observations = {
         CASE_WELCOME: {
             "welcome_visible": True,
-            "dont_show_visible": True,
-            "dont_show_memory_buffer": True,
+            "entry_points_visible": True,
+            "welcome_restart_visible": True,
         },
         CASE_NEW_PASTE: {
             "new_buffer_created": True,
@@ -141,6 +141,7 @@ def valid_evidence() -> dict:
         CASE_RECENTS: {
             "recent_restart_visible": True,
             "recent_count": 10,
+            "recent_visible_count": 5,
             "stale_recent_disabled": True,
         },
         CASE_CLI: {
@@ -260,6 +261,18 @@ class EvidenceSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly ten"):
             VALIDATE_EVIDENCE(evidence)
 
+        for visible in (0, 11, True):
+            with self.subTest(recent_visible_count=visible):
+                evidence = valid_evidence()
+                evidence["cases"][5]["observations"]["recent_visible_count"] = visible
+                with self.assertRaisesRegex(ValueError, "between one and ten"):
+                    VALIDATE_EVIDENCE(evidence)
+
+        evidence = valid_evidence()
+        evidence["cases"][0]["observations"]["welcome_restart_visible"] = False
+        with self.assertRaisesRegex(ValueError, "requires true welcome_restart_visible"):
+            VALIDATE_EVIDENCE(evidence)
+
     def test_pass_requires_the_complete_materialized_sample_inventory(self) -> None:
         evidence = valid_evidence()
         evidence["cases"][4]["observations"].pop("sample_content")
@@ -370,8 +383,8 @@ class ParserAndIsolationTests(unittest.TestCase):
             def focus_editor(self, app):
                 events.append(("focus", app.hwnd))
 
-            def wait_editor_fingerprint(self, app, expected, timeout, *, already_focused):
-                events.append(("wait", timeout, already_focused))
+            def wait_editor_fingerprint(self, app, expected, timeout):
+                events.append(("wait", timeout))
                 return expected, 0.0
 
         app = type("App", (), {"hwnd": 42})()
@@ -382,7 +395,10 @@ class ParserAndIsolationTests(unittest.TestCase):
         self.assertEqual(events[1], ("write", "emoji \U0001f680"))
         self.assertIn(("shortcut", 42, runtime.VK_A), events)
         self.assertIn(("shortcut", 42, HARNESS.VK_V), events)
-        self.assertEqual(events[-1], ("write", "previous text"))
+        self.assertLess(events.index(("focus", 42)), events.index(("shortcut", 42, runtime.VK_A)))
+        self.assertLess(
+            events.index(("write", "previous text")), events.index(("wait", 1.0))
+        )
 
     def test_source_editor_focus_check_reads_uia_without_refocusing(self) -> None:
         events = []
@@ -393,14 +409,18 @@ class ParserAndIsolationTests(unittest.TestCase):
                 return True
 
         class FakeHarness:
-            def control_by_id(self, hwnd, automation_id, control_type, mismatch_code):
-                events.append(("lookup", hwnd, automation_id, control_type, mismatch_code))
+            def control_by_name(self, hwnd, name, control_type, mismatch_code):
+                events.append(("lookup", hwnd, name, control_type, mismatch_code))
                 return FakeControl()
 
         app = type("App", (), {"hwnd": 42})()
         focused = GOAL_03_HARNESS.source_editor_has_focus(FakeHarness(), app)
 
         self.assertTrue(focused)
+        self.assertEqual(
+            events[0],
+            ("lookup", 42, runtime.EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"),
+        )
         self.assertEqual(events[-1], ("read_focus",))
         self.assertNotIn("click", [event[0] for event in events])
 
@@ -497,276 +517,60 @@ class ParserAndIsolationTests(unittest.TestCase):
 
 
 class SourceContractFixtureTests(unittest.TestCase):
-    WORKSPACE_SOURCE = '''#[cfg(test)]
-use crate::test_support::WorkspaceFixture;
+    """The welcome, Save As and guard selectors the harness drives must live in
+    production nsh source; tests and comments cannot supply them."""
 
-fn on_paste_into_new() { cx.read_from_clipboard(); }
-fn prompt_save_as_overwrite() {
-    PromptButton::ok(i18n::t(i18n::Key::Replace, cx));
-}
+    REPO = Path(__file__).resolve().parents[2]
 
-#[cfg(test)]
-mod tests {
-    const SOURCE_MARKER_DECOYS: &[&str] = &[
-        "fn on_paste_into_new",
-        "cx.read_from_clipboard()",
-        "fn prompt_save_as_overwrite",
-        "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
-    ];
-}
-'''
-    WELCOME_SOURCE = '''#[cfg(test)]
-use crate::test_support::WelcomeFixture;
+    def copy_repository(self, root: Path) -> None:
+        for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.REPO / relative, target)
 
-const WELCOME_AUTOMATION_IDS: &[&str] = &[
-    "markturbo-welcome-new",
-    "markturbo-welcome-paste",
-    "markturbo-welcome-open-file",
-    "markturbo-welcome-open-folder",
-    "markturbo-welcome-open-sample",
-    "markturbo-welcome-dont-show-again",
-];
-
-fn show_welcome(initial: Option<()>, show_welcome_on_startup: bool) {
-    if initial.is_none() && show_welcome_on_startup {}
-}
-
-fn dont_show_welcome_again() {}
-fn open_bundled_sample() {}
-fn record_recent_target() {}
-
-#[cfg(test)]
-mod tests {
-    const SOURCE_MARKER_DECOYS: &[&str] = &[
-        "markturbo-welcome-new",
-        "markturbo-welcome-paste",
-        "markturbo-welcome-open-file",
-        "markturbo-welcome-open-folder",
-        "markturbo-welcome-open-sample",
-        "markturbo-welcome-dont-show-again",
-        "initial.is_none() && show_welcome_on_startup",
-        "fn dont_show_welcome_again",
-        "fn open_bundled_sample",
-        "fn record_recent_target",
-    ];
-}
-'''
-    DOCUMENT_SOURCE = '''#[cfg(test)]
-use crate::test_support::DocumentFixture;
-
-const SAVE_AS_AUTOMATION_ID: &str = "markturbo-document-save-as";
-fn dispatch_save_as() { DocumentEvent::SaveAsRequested; }
-
-#[cfg(test)]
-mod tests {
-    const SOURCE_MARKER_DECOYS: &[&str] = &[
-        "markturbo-document-save-as",
-        "DocumentEvent::SaveAsRequested",
-    ];
-}
-'''
-
-    @staticmethod
-    def write_repository(
-        root: Path, workspace: str, welcome: str | None, document: str
-    ) -> None:
-        workspace_path = root / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
-        welcome_path = workspace_path.parent / "workspace" / "welcome.rs"
-        document_path = root / "crates" / "mt-app" / "src" / "views" / "document.rs"
-        workspace_path.parent.mkdir(parents=True, exist_ok=True)
-        welcome_path.parent.mkdir(parents=True, exist_ok=True)
-        document_path.parent.mkdir(parents=True, exist_ok=True)
-        workspace_path.write_text(workspace, encoding="utf-8")
-        if welcome is not None:
-            welcome_path.write_text(welcome, encoding="utf-8")
-        document_path.write_text(document, encoding="utf-8")
-
-    @classmethod
-    def source_failure(
-        cls, root: Path, workspace: str, document: str, *, welcome: str | None = None
-    ) -> str | None:
-        cls.write_repository(
-            root,
-            workspace,
-            cls.WELCOME_SOURCE if welcome is None else welcome,
-            document,
-        )
-        with mock.patch.object(HARNESS, "REPO", root):
-            return HARNESS.source_contract_failure()
-
-    def test_complete_temporary_repository_satisfies_source_contract(self) -> None:
+    def failure_after(self, relative: str, edit) -> str | None:
         with tempfile.TemporaryDirectory() as temporary:
-            self.assertIsNone(
-                self.source_failure(
-                    Path(temporary), self.WORKSPACE_SOURCE, self.DOCUMENT_SOURCE
-                )
-            )
+            root = Path(temporary)
+            self.copy_repository(root)
+            target = root / relative
+            target.write_text(edit(target.read_text(encoding="utf-8")), encoding="utf-8")
+            with mock.patch.object(HARNESS, "REPO", root):
+                return HARNESS.source_contract_failure()
 
-    @unittest.skipUnless(
-        (Path(__file__).resolve().parents[2] / "crates/mt-app/src/views/workspace.rs").exists(),
-        "legacy GPUI source contract removed during the nsh migration; nsh native acceptance is pending",
-    )
     def test_real_repository_satisfies_source_contract(self) -> None:
         self.assertIsNone(HARNESS.source_contract_failure())
 
-    def test_alternate_test_modules_cannot_supply_production_contracts(self) -> None:
-        cases = (
-            ("workspace", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            ("welcome", "WELCOME_UIA_CONTRACT_MISSING"),
-            ("document", "SAVE_AS_UIA_CONTRACT_MISSING"),
+    def test_each_missing_production_marker_fails_closed(self) -> None:
+        for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
+            for marker in markers:
+                with self.subTest(file=relative, marker=marker):
+                    self.assertEqual(
+                        self.failure_after(relative, lambda text: text.replace(marker, "")),
+                        "FIRST_USE_SOURCE_CONTRACT_MISSING",
+                    )
+
+    def test_comment_or_test_module_cannot_replace_a_production_marker(self) -> None:
+        relative = "crates/mt-app/src/ui/welcome.rs"
+        marker = '"welcome-open-folder"'
+        commented = self.failure_after(
+            relative, lambda text: text.replace(marker, '"x"') + f"\n// {marker}\n"
         )
-        for source_name, expected in cases:
-            with self.subTest(source=source_name), tempfile.TemporaryDirectory() as temporary:
-                sources = {
-                    "workspace": self.WORKSPACE_SOURCE,
-                    "welcome": self.WELCOME_SOURCE,
-                    "document": self.DOCUMENT_SOURCE,
-                }
-                sources[source_name] = (
-                    "#[cfg(test)] mod checks {\n"
-                    + sources[source_name]
-                    + "\n}\nfn production_after_tests() {}\n"
-                )
-                self.assertEqual(
-                    self.source_failure(
-                        Path(temporary), sources["workspace"], sources["document"],
-                        welcome=sources["welcome"],
-                    ),
-                    expected,
-                )
-
-    def test_unsafe_projection_returns_existing_source_contract_codes(self) -> None:
-        for source_name, expected in (
-            ("workspace", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            ("welcome", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            ("document", "SAVE_AS_SOURCE_CONTRACT_MISSING"),
-        ):
-            with self.subTest(source=source_name), tempfile.TemporaryDirectory() as temporary:
-                sources = {
-                    "workspace": self.WORKSPACE_SOURCE,
-                    "welcome": self.WELCOME_SOURCE,
-                    "document": self.DOCUMENT_SOURCE,
-                }
-                sources[source_name] += "\n#[cfg(test)] mod checks {\n"
-                self.assertEqual(
-                    self.source_failure(
-                        Path(temporary), sources["workspace"], sources["document"],
-                        welcome=sources["welcome"],
-                    ),
-                    expected,
-                )
-
-    def test_missing_production_markers_fail_with_their_contract_codes(self) -> None:
-        welcome_markers = (
-            ("markturbo-welcome-new", "WELCOME_UIA_CONTRACT_MISSING"),
-            ("markturbo-welcome-paste", "WELCOME_UIA_CONTRACT_MISSING"),
-            ("markturbo-welcome-open-file", "WELCOME_UIA_CONTRACT_MISSING"),
-            ("markturbo-welcome-open-folder", "WELCOME_UIA_CONTRACT_MISSING"),
-            ("markturbo-welcome-open-sample", "WELCOME_UIA_CONTRACT_MISSING"),
-            ("markturbo-welcome-dont-show-again", "WELCOME_UIA_CONTRACT_MISSING"),
-            (
-                "initial.is_none() && show_welcome_on_startup",
-                "NO_ARGUMENT_WELCOME_CONTRACT_MISSING",
-            ),
-            ("fn dont_show_welcome_again", "DONT_SHOW_WELCOME_CONTRACT_MISSING"),
-            ("fn open_bundled_sample", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            ("fn record_recent_target", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
+        test_only = self.failure_after(
+            relative,
+            lambda text: text.replace(marker, '"x"')
+            + f"\n#[cfg(test)]\nmod decoy {{ const ID: &str = {marker}; }}\n",
         )
-        for marker, expected_code in welcome_markers:
-            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
-                welcome = self.WELCOME_SOURCE.replace(marker, "", 1)
-                self.assertEqual(
-                    self.source_failure(
-                        Path(temporary), self.WORKSPACE_SOURCE, self.DOCUMENT_SOURCE,
-                        welcome=welcome,
-                    ),
-                    expected_code,
-                )
+        self.assertEqual(commented, "FIRST_USE_SOURCE_CONTRACT_MISSING")
+        self.assertEqual(test_only, "FIRST_USE_SOURCE_CONTRACT_MISSING")
 
-        workspace_markers = (
-            ("fn on_paste_into_new", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            ("cx.read_from_clipboard()", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            ("fn prompt_save_as_overwrite", "FIRST_USE_SOURCE_CONTRACT_MISSING"),
-            (
-                "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
-                "FIRST_USE_SOURCE_CONTRACT_MISSING",
-            ),
-        )
-        for marker, expected_code in workspace_markers:
-            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
-                workspace = self.WORKSPACE_SOURCE.replace(marker, "", 1)
-                self.assertEqual(
-                    self.source_failure(
-                        Path(temporary), workspace, self.DOCUMENT_SOURCE
-                    ),
-                    expected_code,
-                )
-
-        document_markers = (
-            ("markturbo-document-save-as", "SAVE_AS_UIA_CONTRACT_MISSING"),
-            ("DocumentEvent::SaveAsRequested", "SAVE_AS_SOURCE_CONTRACT_MISSING"),
-        )
-        for marker, expected_code in document_markers:
-            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temporary:
-                document = self.DOCUMENT_SOURCE.replace(marker, "", 1)
-                self.assertEqual(
-                    self.source_failure(
-                        Path(temporary), self.WORKSPACE_SOURCE, document
-                    ),
-                    expected_code,
-                )
-
-    def test_production_comment_cannot_replace_removed_first_use_action(self) -> None:
-        workspace = self.WORKSPACE_SOURCE.replace(
-            "cx.read_from_clipboard();",
-            "// Removed action marker: cx.read_from_clipboard().",
-            1,
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            self.assertEqual(
-                self.source_failure(
-                    Path(temporary), workspace, self.DOCUMENT_SOURCE
-                ),
-                "FIRST_USE_SOURCE_CONTRACT_MISSING",
-            )
-
-    def test_welcome_comment_cannot_replace_a_production_action(self) -> None:
-        welcome = self.WELCOME_SOURCE.replace(
-            "fn open_bundled_sample() {}",
-            "// Removed action marker: fn open_bundled_sample() {}",
-            1,
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            self.assertEqual(
-                self.source_failure(
-                    Path(temporary), self.WORKSPACE_SOURCE, self.DOCUMENT_SOURCE,
-                    welcome=welcome,
-                ),
-                "FIRST_USE_SOURCE_CONTRACT_MISSING",
-            )
-
-    def test_workspace_literal_cannot_replace_missing_welcome_control(self) -> None:
-        workspace = (
-            'const WRONG_OWNER: &str = "markturbo-welcome-new";\n'
-            + self.WORKSPACE_SOURCE
-        )
-        welcome = self.WELCOME_SOURCE.replace('"markturbo-welcome-new"', "", 1)
-        with tempfile.TemporaryDirectory() as temporary:
-            self.assertEqual(
-                self.source_failure(
-                    Path(temporary), workspace, self.DOCUMENT_SOURCE, welcome=welcome
-                ),
-                "WELCOME_UIA_CONTRACT_MISSING",
-            )
-
-    def test_missing_welcome_module_fails_closed(self) -> None:
+    def test_missing_source_file_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            self.write_repository(root, self.WORKSPACE_SOURCE, None, self.DOCUMENT_SOURCE)
+            self.copy_repository(root)
+            (root / "crates/mt-app/src/ui/welcome.rs").unlink()
             with mock.patch.object(HARNESS, "REPO", root):
                 self.assertEqual(
-                    HARNESS.source_contract_failure(),
-                    "FIRST_USE_SOURCE_CONTRACT_MISSING",
+                    HARNESS.source_contract_failure(), "FIRST_USE_SOURCE_CONTRACT_MISSING"
                 )
 
 
@@ -789,10 +593,11 @@ class RecentControlBehaviorTests(unittest.TestCase):
 
         class FakeIUIA:
             @staticmethod
-            def CreateTrueCondition() -> object:
-                return object()
+            def CreatePropertyCondition(property_id: object, value: object) -> object:
+                return (property_id, value)
 
         class FakeUIA:
+            UIA_dll = type("UIADll", (), {"UIA_AutomationIdPropertyId": "automation-id"})()
             iuia = FakeIUIA()
             tree_scope = {"descendants": object()}
             known_control_types = {"Button": 1}
@@ -800,18 +605,22 @@ class RecentControlBehaviorTests(unittest.TestCase):
         class ElementInfo:
             def __init__(self, element: object) -> None:
                 self.automation_id = element.CurrentAutomationId
-                self.control_type = "Button"
-
-        elements_by_id = {element.CurrentAutomationId: element for element in elements}
+                self.control_type = "Button" if element.CurrentControlType == 1 else "Text"
 
         class Control:
             def __init__(self, element_info: ElementInfo) -> None:
                 self.element_info = element_info
-                self.element = elements_by_id[element_info.automation_id]
 
             def is_visible(self) -> bool:
-                return self.element.visible
+                return self.element_info.visible
 
+        original_info = ElementInfo.__init__
+
+        def remember_visibility(info: ElementInfo, element: object) -> None:
+            original_info(info, element)
+            info.visible = element.visible
+
+        ElementInfo.__init__ = remember_visibility
         harness = object.__new__(HARNESS.Goal03Harness)
         harness.iuia_class = FakeUIA
         harness.fresh_uia_root = lambda _hwnd: type(
@@ -833,12 +642,10 @@ class RecentControlBehaviorTests(unittest.TestCase):
             },
         )()
 
-    def test_recent_query_returns_only_recent_entry_buttons(self) -> None:
+    def test_recent_query_returns_every_recent_row_button(self) -> None:
         elements = [
-            self.element("markturbo-welcome-recent-alpha", 1),
-            self.element("markturbo-welcome-recent-remove-alpha", 1),
-            self.element("markturbo-welcome-recent-status-alpha", 2),
-            self.element("unrelated-control", 1),
+            self.element(HARNESS.WELCOME_RECENT_AUTOMATION_ID, 1),
+            self.element(HARNESS.WELCOME_RECENT_AUTOMATION_ID, 1),
         ]
         harness = self.harness(elements)
 
@@ -846,8 +653,17 @@ class RecentControlBehaviorTests(unittest.TestCase):
 
         self.assertEqual(
             [control.element_info.automation_id for control in controls],
-            ["markturbo-welcome-recent-alpha"],
+            [HARNESS.WELCOME_RECENT_AUTOMATION_ID] * 2,
         )
+
+    def test_recent_query_rejects_a_hidden_or_mistyped_row(self) -> None:
+        for element in (
+            self.element(HARNESS.WELCOME_RECENT_AUTOMATION_ID, 2),
+            self.element(HARNESS.WELCOME_RECENT_AUTOMATION_ID, 1, visible=False),
+        ):
+            with self.subTest(element=element), self.assertRaises(HARNESS_FAILURE) as raised:
+                self.harness([element]).recent_controls(type("App", (), {"hwnd": 42})())
+            self.assertEqual(raised.exception.code, "RECENT_UIA_CONTRACT_MISMATCH")
 
     def test_recent_query_preserves_uia_contract_failures(self) -> None:
         failure = HARNESS_FAILURE("RECENT_UIA_CONTRACT_MISMATCH")

@@ -4,6 +4,12 @@ The harness is intentionally fail-closed. It emits PASS only after every
 required case runs against the expected x64 release executable in an active,
 unlocked Windows 11 session. Document text is never written to stdout or JSON;
 observations contain only UTF-8 byte counts, SHA-256 digests, and timings.
+
+It drives the nsh UI: the rail's close control, Ctrl+W and the native window
+close each must raise the in-window guard card (Save / Don't save / Cancel);
+Save runs from the title menu; a same-length external rewrite must be refused
+by Save until Keep mine is confirmed; an interrupted dirty buffer must leave a
+canonical recovery record the next launch offers to Restore.
 """
 
 from __future__ import annotations
@@ -15,8 +21,9 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from .source_contract import production_markers_present
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -24,11 +31,12 @@ from .runtime import (
     REASON_CODE_RE,
     SAFE_FAILURE_TYPES,
     SHA256_RE,
-    VK_S,
     VK_W,
+    CONFLICT_HEADING,
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
+    RunningApp,
     complete_evidence as complete_evidence_envelope,
     finite_nonnegative,
     fingerprint_bytes,
@@ -53,20 +61,35 @@ DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-02-native-accep
 
 SCHEMA = "markturbo.goal-02-native-acceptance"
 SCHEMA_VERSION = 1
-SAFE_OBSERVATION_STRINGS = {
-    "pointer tab-close -> Cancel -> SendInput Ctrl+S",
-    "SendInput Ctrl+W -> Discard",
-    "WM_CLOSE -> Save",
-    "watcher conflict -> explicit Overwrite",
-    "edit -> checkpoint log -> TerminateProcess -> restart -> Discard -> restart after startup log",
-    "TerminateProcess",
-    "content-free checkpoint success log",
-    "content-free recovery startup finished log",
-} | INTEGRITY_NAMES
+CASE_POINTER_CANCEL = "pointer-dirty-tab-close-cancel"
+CASE_KEYBOARD_DISCARD = "sendinput-ctrl-w-discard"
+CASE_WINDOW_SAVE = "wm-close-save-exact-bytes"
+CASE_EXTERNAL_CONFLICT = "same-length-mtime-external-conflict"
+CASE_RECOVERY = "cjk-emoji-interruption-recovery-retirement"
+CASE_FLOWS = {
+    CASE_POINTER_CANCEL: "pointer rail close -> guard Cancel -> menu Save",
+    CASE_KEYBOARD_DISCARD: "SendInput Ctrl+W -> guard Don't save",
+    CASE_WINDOW_SAVE: "WM_CLOSE -> guard Save",
+    CASE_EXTERNAL_CONFLICT: (
+        "same-length rewrite -> menu Save refused with conflict -> Keep mine -> "
+        "explicit Overwrite"
+    ),
+    CASE_RECOVERY: (
+        "edit -> recovery record -> TerminateProcess -> restart -> Restore -> "
+        "Ctrl+W -> guard Don't save -> restart without recovery offer"
+    ),
+}
+CHECKPOINT_SIGNAL = "content-free canonical recovery record"
+STARTUP_SIGNAL = "document ready without recovery offer"
+SAFE_OBSERVATION_STRINGS = (
+    set(CASE_FLOWS.values())
+    | {"TerminateProcess", CHECKPOINT_SIGNAL, STARTUP_SIGNAL}
+    | INTEGRITY_NAMES
+)
 ALLOWED_OBSERVATION_KEYS = {
     "app_logs_scanned",
     "byte_count",
-    "checkpoint_log_seen",
+    "checkpoint_record_seen",
     "checkpoint_signal",
     "canonical_record_count",
     "canonical_records",
@@ -80,6 +103,7 @@ ALLOWED_OBSERVATION_KEYS = {
     "edit_to_signal_ms",
     "edited_text",
     "editor",
+    "editor_after_conflict",
     "external_source",
     "explicit_overwrite_used",
     "files_scanned",
@@ -94,6 +118,7 @@ ALLOWED_OBSERVATION_KEYS = {
     "live_runtime_scan",
     "process_context",
     "process_contexts",
+    "recovery_offer_seen",
     "recovery_restored_exact",
     "recovery_artifacts_scanned",
     "recovery_leases_scanned",
@@ -105,6 +130,7 @@ ALLOWED_OBSERVATION_KEYS = {
     "runtime_scan",
     "same_length",
     "same_mtime_ns",
+    "save_refused_with_conflict",
     "saved_after_explicit_overwrite",
     "saved_source",
     "session_id",
@@ -117,22 +143,16 @@ ALLOWED_OBSERVATION_KEYS = {
     "source_after_cancel_save",
     "source_after_discard",
     "source_after_recovery_discard",
+    "source_after_refused_save",
     "source_before",
     "termination",
     "panic_absent",
     "utf16le_sentinel_absent",
     "utf8_sentinel_absent",
-    "startup_finished_log_seen",
     "startup_signal",
     "startup_observed_before_restart_editor",
-    "watcher_conflict_before_save",
     "window_exited",
 }
-CASE_POINTER_CANCEL = "pointer-dirty-tab-close-cancel"
-CASE_KEYBOARD_DISCARD = "sendinput-ctrl-w-discard"
-CASE_WINDOW_SAVE = "wm-close-save-exact-bytes"
-CASE_EXTERNAL_CONFLICT = "same-length-mtime-external-conflict"
-CASE_RECOVERY = "cjk-emoji-interruption-recovery-retirement"
 REQUIRED_CASE_IDS = (
     CASE_POINTER_CANCEL,
     CASE_KEYBOARD_DISCARD,
@@ -174,10 +194,12 @@ REQUIRED_OBSERVATION_KEYS = {
         "loaded_source",
         "external_source",
         "dirty_editor",
+        "source_after_refused_save",
+        "editor_after_conflict",
         "saved_after_explicit_overwrite",
         "same_length",
         "same_mtime_ns",
-        "watcher_conflict_before_save",
+        "save_refused_with_conflict",
         "explicit_overwrite_used",
         "flow",
         "process_context",
@@ -186,11 +208,12 @@ REQUIRED_OBSERVATION_KEYS = {
     },
     CASE_RECOVERY: {
         "edited_text",
-        "checkpoint_log_seen",
+        "checkpoint_record_seen",
         "checkpoint_signal",
         "live_recovery_scan",
         "live_runtime_scan",
         "edit_to_signal_ms",
+        "recovery_offer_seen",
         "restored_editor",
         "recovery_restored_exact",
         "restore_ms",
@@ -200,7 +223,6 @@ REQUIRED_OBSERVATION_KEYS = {
         "discarded_recovery_absent",
         "termination",
         "restart_count",
-        "startup_finished_log_seen",
         "startup_signal",
         "startup_observed_before_restart_editor",
         "flow",
@@ -210,27 +232,42 @@ REQUIRED_OBSERVATION_KEYS = {
     },
 }
 
-TAB_CLOSE_AUTOMATION_ID = "markturbo-document-tab-close"
-CONFLICT_OVERWRITE_AUTOMATION_ID = "markturbo-conflict-overwrite"
-
-CASE_FLOWS = {
-    CASE_POINTER_CANCEL: "pointer tab-close -> Cancel -> SendInput Ctrl+S",
-    CASE_KEYBOARD_DISCARD: "SendInput Ctrl+W -> Discard",
-    CASE_WINDOW_SAVE: "WM_CLOSE -> Save",
-    CASE_EXTERNAL_CONFLICT: "watcher conflict -> explicit Overwrite",
-    CASE_RECOVERY: (
-        "edit -> checkpoint log -> TerminateProcess -> restart -> Discard -> "
-        "restart after startup log"
+# The rail's per-tab close control (`ui/rail.rs`): a Button with its own test
+# id, clipped until the pointer widens the rail over a file row.
+RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
+TAB_CLOSE_AUTOMATION_ID = "rail-close"
+# Anonymous Buttons named by their accessibility labels (`ui/notices.rs`,
+# `state.rs` `overwrite_active`'s confirmation).
+KEEP_MINE_NAME = "Keep mine"
+OVERWRITE_CONFIRM_NAME = "Overwrite"
+RESTORE_NAME = "Restore"
+UI_SOURCE_REQUIREMENTS = {
+    "crates/mt-app/src/ui/rail.rs": (
+        '"rail-file-row"',
+        '"rail-close"',
+        'on_key("mod+w"',
     ),
+    "crates/mt-app/src/ui/notices.rs": (
+        '"Close without saving?"',
+        '"Save"',
+        '"Don\'t save"',
+        '"Cancel"',
+        '"Changed on disk"',
+        '"Keep mine"',
+        '"Restore"',
+        "accessibility_label(Some(SharedString::from(label)))",
+    ),
+    "crates/mt-app/src/ui/titlebar.rs": (
+        '"title-settings"',
+        '"title-menu-save"',
+        '"title-menu-edit"',
+        '"title-dirty"',
+    ),
+    "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
+    "crates/mt-app/src/state.rs": ('.destructive("overwrite", "Overwrite")',),
 }
 
 DOCUMENT_SENTINEL = "MTG02-NATIVE-SENTINEL-\u4fdd\u5b58-\U0001f680"
-RECOVERY_CHECKPOINT_LOG_RE = re.compile(
-    rb"(?mi)^.*\brecovery checkpoint written\s*$"
-)
-RECOVERY_STARTUP_FINISHED_LOG_RE = re.compile(
-    rb"(?mi)^.*\brecovery startup finished\s*$"
-)
 CANONICAL_RECOVERY_RECORD_RE = re.compile(r"^[0-9a-f]{64}\.mtrecovery$")
 
 ORIGINAL_BYTES = b"native acceptance original"
@@ -508,16 +545,22 @@ def validate_passed_case(
         loaded = validate_fingerprint(observations.get("loaded_source"))
         external = validate_fingerprint(observations.get("external_source"))
         dirty = validate_fingerprint(observations.get("dirty_editor"))
+        refused = validate_fingerprint(observations.get("source_after_refused_save"))
+        after_conflict = validate_fingerprint(observations.get("editor_after_conflict"))
         saved = validate_fingerprint(observations.get("saved_after_explicit_overwrite"))
         require_true(
             observations,
             "same_length",
             "same_mtime_ns",
-            "watcher_conflict_before_save",
+            "save_refused_with_conflict",
             "explicit_overwrite_used",
         )
         if loaded["byte_count"] != external["byte_count"] or loaded["sha256"] == external["sha256"]:
             raise ValueError("external rewrite evidence is not same-length and different")
+        if refused != external:
+            raise ValueError("refused Save changed the externally rewritten source")
+        if after_conflict != dirty:
+            raise ValueError("the conflict replaced the dirty editor")
         if dirty != saved or external == saved:
             raise ValueError("explicit overwrite did not preserve exact dirty editor bytes")
     elif case_id == CASE_RECOVERY:
@@ -527,16 +570,16 @@ def validate_passed_case(
         restarted = validate_fingerprint(observations.get("restart_editor"))
         require_true(
             observations,
-            "checkpoint_log_seen",
+            "checkpoint_record_seen",
+            "recovery_offer_seen",
             "recovery_restored_exact",
             "discarded_recovery_absent",
-            "startup_finished_log_seen",
             "startup_observed_before_restart_editor",
         )
-        if observations.get("checkpoint_signal") != "content-free checkpoint success log":
-            raise ValueError("recovery checkpoint signal is not the required log")
-        if observations.get("startup_signal") != "content-free recovery startup finished log":
-            raise ValueError("recovery startup signal is not the required log")
+        if observations.get("checkpoint_signal") != CHECKPOINT_SIGNAL:
+            raise ValueError("recovery checkpoint signal is not the canonical record")
+        if observations.get("startup_signal") != STARTUP_SIGNAL:
+            raise ValueError("recovery startup signal is not the absent offer")
         if observations.get("termination") != "TerminateProcess":
             raise ValueError("recovery interruption did not use TerminateProcess")
         if observations.get("restart_count") != 2 or len(contexts) != 3:
@@ -576,51 +619,27 @@ def build_cli_command(exe: Path, expected_hash: str, evidence: Path) -> list[str
     ]
 
 
-def checkpoint_success_present(value: bytes, offset: int = 0) -> bool:
-    return RECOVERY_CHECKPOINT_LOG_RE.search(value[max(0, offset) :]) is not None
+def source_contract_failure() -> str | None:
+    """The nsh selectors this harness drives must exist in production source."""
+    if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
+        return "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
+    return None
 
 
-def recovery_startup_finished_present(value: bytes, offset: int = 0) -> bool:
-    return RECOVERY_STARTUP_FINISHED_LOG_RE.search(value[max(0, offset) :]) is not None
-
-
-def wait_for_log_marker(
-    path: Path,
-    offset: int,
-    predicate: Callable[[bytes], bool],
-    timeout: float,
-    code: str,
-) -> None:
-    cursor = max(0, offset)
-    trailing_line = b""
-
-    def present() -> bool:
-        nonlocal cursor, trailing_line
-        try:
-            with path.open("rb") as handle:
-                handle.seek(cursor)
-                appended = handle.read()
-        except OSError:
-            return False
-        if not appended:
-            return False
-        cursor += len(appended)
-        observed = trailing_line + appended
-        if predicate(observed):
-            return True
-        trailing_line = observed.rsplit(b"\n", 1)[-1][-512:]
-        return False
-
-    wait_until(present, timeout, code, interval=0.025)
+def canonical_recovery_records(data_root: Path) -> list[Path]:
+    recovery_root = data_root / "recovery"
+    try:
+        return sorted(
+            path
+            for path in recovery_root.glob("*.mtrecovery")
+            if path.is_file() and CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)
+        )
+    except OSError:
+        return []
 
 
 def scan_live_recovery_records(data_root: Path) -> dict[str, Any]:
-    recovery_root = data_root / "recovery"
-    records = sorted(
-        path
-        for path in recovery_root.glob("*.mtrecovery")
-        if path.is_file() and CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)
-    )
+    records = canonical_recovery_records(data_root)
     if not records:
         raise HarnessFailure("CANONICAL_RECOVERY_RECORD_MISSING")
     utf8 = DOCUMENT_SENTINEL.encode("utf-8")
@@ -702,31 +721,49 @@ def scan_runtime_artifacts(data_root: Path, stderr_path: Path) -> dict[str, Any]
 
 
 class Goal02Harness(BaseNativeHarness):
-    def wait_checkpoint_log(self, app: RunningApp, offset: int, started: float) -> float:
+    def wait_checkpoint_record(self, data_root: Path, started: float) -> float:
+        """Wait for the dirty buffer's canonical record within the loss window."""
         remaining = 10.0 - (time.perf_counter() - started)
         if remaining <= 0:
-            raise HarnessFailure("RECOVERY_SUCCESS_LOG_EXCEEDED_10_SECONDS")
-
-        wait_for_log_marker(
-            app.app_log_path,
-            offset,
-            checkpoint_success_present,
+            raise HarnessFailure("RECOVERY_RECORD_EXCEEDED_10_SECONDS")
+        wait_until(
+            lambda: canonical_recovery_records(data_root),
             remaining,
-            "RECOVERY_SUCCESS_LOG_EXCEEDED_10_SECONDS",
+            "RECOVERY_RECORD_EXCEEDED_10_SECONDS",
+            interval=0.025,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
         if elapsed_ms > 10_000:
-            raise HarnessFailure("RECOVERY_SUCCESS_LOG_EXCEEDED_10_SECONDS")
+            raise HarnessFailure("RECOVERY_RECORD_EXCEEDED_10_SECONDS")
         return elapsed_ms
 
-    def wait_recovery_startup_finished(self, app: RunningApp, timeout: float) -> None:
-        wait_for_log_marker(
-            app.app_log_path,
-            0,
-            recovery_startup_finished_present,
-            timeout,
-            "RECOVERY_STARTUP_FINISHED_TIMEOUT",
+    def close_tab_by_pointer(self, app: RunningApp) -> None:
+        """Widen the rail under the pointer, then click the tab's close control."""
+        row = self.find_control(
+            app,
+            RAIL_FILE_ROW_AUTOMATION_ID,
+            "Button",
+            "RAIL_FILE_ROW_UIA_TIMEOUT",
+            "RAIL_FILE_ROW_UIA_CONTRACT_MISMATCH",
         )
+        try:
+            rectangle = row.rectangle()
+        except Exception as error:
+            raise HarnessFailure("RAIL_FILE_ROW_UIA_QUERY_FAILED", safe_exception_name(error)) from None
+        self.win32.move_cursor(
+            (rectangle.left + rectangle.right) // 2, (rectangle.top + rectangle.bottom) // 2
+        )
+        close = self.find_control(
+            app,
+            TAB_CLOSE_AUTOMATION_ID,
+            "Button",
+            "TAB_CLOSE_UIA_TIMEOUT",
+            "TAB_CLOSE_UIA_CONTRACT_MISMATCH",
+        )
+        self.click_control(close, "TAB_CLOSE_POINTER_CLICK_FAILED")
+
+    def require_editor_closed(self, app: RunningApp, code: str, timeout: float) -> None:
+        wait_until(lambda: self.editor_absent_while_running(app), timeout, code)
 
     def scenario_pointer_cancel(self) -> dict[str, Any]:
         data, config, workspace, stderr = self.case_roots(CASE_POINTER_CANCEL)
@@ -736,14 +773,7 @@ class Goal02Harness(BaseNativeHarness):
         app = self.launch(document, data, config, workspace, stderr)
         try:
             editor = self.replace_editor(app, POINTER_EDIT)
-            close = self.find_control(
-                app,
-                TAB_CLOSE_AUTOMATION_ID,
-                "Button",
-                "TAB_CLOSE_UIA_TIMEOUT",
-                "TAB_CLOSE_UIA_CONTRACT_MISMATCH",
-            )
-            self.click_control(close, "TAB_CLOSE_POINTER_CLICK_FAILED")
+            self.close_tab_by_pointer(app)
             self.click_lifecycle_decision(app, "Cancel")
             if app.process.poll() is not None:
                 raise HarnessFailure("CANCEL_CLOSED_PROCESS")
@@ -751,7 +781,7 @@ class Goal02Harness(BaseNativeHarness):
                 raise HarnessFailure("CANCEL_CHANGED_EDITOR_BYTES")
             if sha256_file(document) != source_before:
                 raise HarnessFailure("CANCEL_CHANGED_SOURCE")
-            self.win32.send_shortcut(app.hwnd, VK_S)
+            self.save_via_menu(app)
             saved = self.wait_file(document, editor, "CANCEL_FOLLOWUP_SAVE_TIMEOUT")
             observations = {
                 "editor": editor.evidence(),
@@ -775,18 +805,14 @@ class Goal02Harness(BaseNativeHarness):
         app = self.launch(document, data, config, workspace, stderr)
         try:
             discarded = self.replace_editor(app, KEYBOARD_EDIT)
+            self.focus_editor(app)
             self.win32.send_shortcut(app.hwnd, VK_W)
             self.click_lifecycle_decision(app, "Discard")
-            wait_until(
-                lambda: self.editor_absent_while_running(app),
-                self.ui_timeout,
-                "DISCARD_TAB_CLOSE_TIMEOUT",
-            )
+            self.require_editor_closed(app, "DISCARD_TAB_CLOSE_TIMEOUT", self.ui_timeout)
             source_after = sha256_file(document)
             if source_after != source_before:
                 raise HarnessFailure("DISCARD_CHANGED_SOURCE")
-            self.win32.post_close(app.hwnd)
-            self.wait_process_exit(app)
+            self.close_app(app)
             observations = {
                 "discarded_editor": discarded.evidence(),
                 "source_before": source_before.evidence(),
@@ -808,6 +834,7 @@ class Goal02Harness(BaseNativeHarness):
         app = self.launch(document, data, config, workspace, stderr)
         try:
             editor = self.replace_editor(app, WINDOW_EDIT)
+            # The platform close must raise the guard, not close the window.
             self.win32.post_close(app.hwnd)
             self.click_lifecycle_decision(app, "Save")
             self.wait_process_exit(app, max(self.ui_timeout, 20.0))
@@ -843,33 +870,49 @@ class Goal02Harness(BaseNativeHarness):
             after = document.stat()
             if after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
                 raise HarnessFailure("EXACT_MTIME_RESTORE_UNAVAILABLE")
+            external = sha256_file(document)
+            if external != fingerprint_bytes(EXTERNAL_BYTES):
+                raise HarnessFailure("EXTERNAL_REWRITE_NOT_OBSERVED")
 
-            # The watcher must expose the conflict before any Save input.
-            overwrite = self.find_control(
+            # Save must detect the same-length rewrite and refuse to write.
+            self.save_via_menu(app)
+            self.wait_name(app, CONFLICT_HEADING, "Text", "SAVE_CONFLICT_UIA_TIMEOUT")
+            refused = sha256_file(document)
+            if refused != external:
+                raise HarnessFailure("SAVE_OVERWROTE_EXTERNAL_REWRITE")
+            after_conflict = self.editor_fingerprint(app)
+            if after_conflict != dirty:
+                raise HarnessFailure("CONFLICT_CHANGED_EDITOR")
+            keep_mine = self.find_named(
                 app,
-                CONFLICT_OVERWRITE_AUTOMATION_ID,
+                KEEP_MINE_NAME,
+                "Button",
+                "CONFLICT_KEEP_MINE_UIA_TIMEOUT",
+                "CONFLICT_KEEP_MINE_UIA_CONTRACT_MISMATCH",
+            )
+            self.click_control(keep_mine, "CONFLICT_KEEP_MINE_CLICK_FAILED")
+            if sha256_file(document) != external:
+                raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+            confirm = self.find_named(
+                app,
+                OVERWRITE_CONFIRM_NAME,
                 "Button",
                 "CONFLICT_OVERWRITE_UIA_TIMEOUT",
                 "CONFLICT_OVERWRITE_UIA_CONTRACT_MISMATCH",
-                self.ui_timeout,
             )
-            external = sha256_file(document)
-            if external != fingerprint_bytes(EXTERNAL_BYTES):
-                raise HarnessFailure("WATCHER_CONFLICT_CHANGED_EXTERNAL_SOURCE")
-            if self.editor_fingerprint(app) != dirty:
-                raise HarnessFailure("WATCHER_CONFLICT_CHANGED_EDITOR")
-            self.click_control(overwrite, "CONFLICT_OVERWRITE_CLICK_FAILED")
+            self.click_control(confirm, "CONFLICT_OVERWRITE_CLICK_FAILED")
             saved = self.wait_file(document, dirty, "EXPLICIT_OVERWRITE_SAVE_TIMEOUT")
-            self.win32.post_close(app.hwnd)
-            self.wait_process_exit(app)
+            self.close_app(app)
             observations = {
                 "loaded_source": loaded.evidence(),
                 "external_source": external.evidence(),
                 "dirty_editor": dirty.evidence(),
+                "source_after_refused_save": refused.evidence(),
+                "editor_after_conflict": after_conflict.evidence(),
                 "saved_after_explicit_overwrite": saved.evidence(),
                 "same_length": True,
                 "same_mtime_ns": True,
-                "watcher_conflict_before_save": True,
+                "save_refused_with_conflict": True,
                 "explicit_overwrite_used": True,
                 "flow": CASE_FLOWS[CASE_EXTERNAL_CONFLICT],
                 "process_context": app.security_context.evidence(),
@@ -885,14 +928,15 @@ class Goal02Harness(BaseNativeHarness):
         document = (workspace / "recovery.md").resolve()
         write_durable(document, ORIGINAL_BYTES)
         source = sha256_file(document)
+        long_timeout = max(self.ui_timeout, 20.0)
 
         first = self.launch(document, data, config, workspace, stderr)
         try:
-            wait_until(first.app_log_path.exists, self.ui_timeout, "APP_LOG_STARTUP_TIMEOUT")
-            log_offset = first.app_log_path.stat().st_size
+            if canonical_recovery_records(data):
+                raise HarnessFailure("RECOVERY_RECORD_BEFORE_EDIT")
             input_started = time.perf_counter()
             edited = self.replace_editor(first, RECOVERY_EDIT)
-            signal_ms = self.wait_checkpoint_log(first, log_offset, input_started)
+            signal_ms = self.wait_checkpoint_record(data, input_started)
             live_recovery_scan = scan_live_recovery_records(data)
             self.terminate(first)
         finally:
@@ -902,38 +946,47 @@ class Goal02Harness(BaseNativeHarness):
 
         second = self.launch(document, data, config, workspace, stderr)
         try:
-            restored, restore_ms = self.wait_editor_fingerprint(
-                second, edited, max(self.ui_timeout, 20.0)
+            restore_started = time.perf_counter()
+            restore = self.find_named(
+                second,
+                RESTORE_NAME,
+                "Button",
+                "RECOVERY_RESTORE_UIA_TIMEOUT",
+                "RECOVERY_RESTORE_UIA_CONTRACT_MISMATCH",
+                long_timeout,
             )
+            self.click_control(restore, "RECOVERY_RESTORE_CLICK_FAILED")
+            restored, _ = self.wait_editor_fingerprint(second, edited, long_timeout)
+            restore_ms = (time.perf_counter() - restore_started) * 1000
+            self.focus_editor(second)
             self.win32.send_shortcut(second.hwnd, VK_W)
             self.click_lifecycle_decision(second, "Discard")
-            wait_until(
-                lambda: self.editor_absent_while_running(second),
-                max(self.ui_timeout, 20.0),
-                "RECOVERY_DISCARD_CLOSE_TIMEOUT",
-            )
+            self.require_editor_closed(second, "RECOVERY_DISCARD_CLOSE_TIMEOUT", long_timeout)
             if sha256_file(document) != source:
                 raise HarnessFailure("RECOVERY_DISCARD_CHANGED_SOURCE")
-            self.win32.post_close(second.hwnd)
-            self.wait_process_exit(second, max(self.ui_timeout, 20.0))
+            self.close_app(second)
         finally:
             self.reap(second)
 
         third = self.launch(document, data, config, workspace, stderr)
         try:
             restart_started = time.perf_counter()
-            self.wait_recovery_startup_finished(third, max(self.ui_timeout, 20.0))
-            restarted, _ = self.wait_editor_fingerprint(
-                third, source, max(self.ui_timeout, 20.0)
-            )
+            # The store is read before the first frame: once the document is
+            # on screen, a remaining record would already be offered.
+            if self.name_present(third, RESTORE_NAME, "Button"):
+                raise HarnessFailure("DISCARDED_RECOVERY_OFFERED_AGAIN")
+            if canonical_recovery_records(data):
+                raise HarnessFailure("DISCARDED_RECOVERY_RECORD_RETAINED")
+            restarted, _ = self.wait_editor_fingerprint(third, source, long_timeout)
             absent_ms = (time.perf_counter() - restart_started) * 1000
             observations = {
                 "edited_text": edited.evidence(),
-                "checkpoint_log_seen": True,
-                "checkpoint_signal": "content-free checkpoint success log",
+                "checkpoint_record_seen": True,
+                "checkpoint_signal": CHECKPOINT_SIGNAL,
                 "live_runtime_scan": live_runtime_scan,
                 "live_recovery_scan": live_recovery_scan,
                 "edit_to_signal_ms": round(signal_ms, 3),
+                "recovery_offer_seen": True,
                 "restored_editor": restored.evidence(),
                 "recovery_restored_exact": restored == edited,
                 "restore_ms": round(restore_ms, 3),
@@ -943,8 +996,7 @@ class Goal02Harness(BaseNativeHarness):
                 "discard_restart_absent_ms": round(absent_ms, 3),
                 "termination": "TerminateProcess",
                 "restart_count": 2,
-                "startup_finished_log_seen": True,
-                "startup_signal": "content-free recovery startup finished log",
+                "startup_signal": STARTUP_SIGNAL,
                 "startup_observed_before_restart_editor": True,
                 "flow": CASE_FLOWS[CASE_RECOVERY],
                 "process_contexts": [
@@ -959,12 +1011,14 @@ class Goal02Harness(BaseNativeHarness):
         observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
         return observations
 
+
 def native_run_plan() -> NativeRunPlan:
     return NativeRunPlan(
         required_case_ids=REQUIRED_CASE_IDS,
         workdir_prefix="markturbo-goal-02-native-",
         new_evidence=new_evidence,
         validate_evidence=validate_evidence,
+        source_contract=source_contract_failure,
         preflight=preflight,
         ui_types_loader=load_pywinauto,
         harness_factory=Goal02Harness,

@@ -5,6 +5,13 @@ loopback server. Each case has isolated data/config/workspace roots. The
 server and evidence boundary never persist document text, request bodies, or
 credentials; evidence contains only hashes, byte counts, booleans, and safe
 reason codes.
+
+On the nsh UI a Review starts with Ctrl+Enter from the editor, the question is
+answered in `review-answer-input`, `Prepare revision` asks for the Revision,
+and both sends need a real pointer hold on `consent-send`. The Revision field
+decides one docked hunk at a time (`Accept` / `Reject`, counted by `n of m
+decided`) and `Done` performs the one write. Editor text is read with the
+editor's Select All + Copy; Save runs from the title menu.
 """
 
 from __future__ import annotations
@@ -13,7 +20,6 @@ import argparse
 import hashlib
 import json
 import math
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,7 +27,7 @@ from urllib.parse import urlsplit
 
 from . import goal07_provider as provider_fixtures
 from .goal03 import Goal03Harness as ClipboardNativeHarness
-from .source_contract import production_source, rust_source_views
+from .source_contract import production_markers_present, production_source, rust_source_views
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -29,11 +35,11 @@ from .runtime import (
     REASON_CODE_RE,
     SAFE_FAILURE_TYPES,
     SHA256_RE,
-    SOURCE_EDITOR_AUTOMATION_ID,
-    TASK_DIALOG_BUTTON_CLASS,
-    VK_A,
-    VK_CONTROL,
-    VK_S,
+    CONFLICT_HEADING,
+    MENU_EDIT_AUTOMATION_ID,
+    MENU_WEB_AUTOMATION_ID,
+    VK_RETURN,
+    VK_Z,
     Fingerprint,
     HarnessBlocked,
     HarnessFailure,
@@ -42,7 +48,6 @@ from .runtime import (
     finite_nonnegative,
     fingerprint_bytes,
     fingerprint_text,
-    key_input,
     load_pywinauto,
     main_native_acceptance,
     normalize_expected_hash,
@@ -142,30 +147,66 @@ RUNTIME_SCAN_KEYS = frozenset(
     }
 )
 
-REVIEW_RUN_ACCESSIBILITY_ID = "markturbo-review-run"
-REVIEW_RESULT_ACCESSIBILITY_ID = "markturbo-review-result"
-REVISION_RUN_ACCESSIBILITY_ID = "markturbo-revision-run"
-REVISION_CONTROL_BOTTOM_INSET = 32
-REVISION_RESULT_ACCESSIBILITY_ID = "markturbo-revision-result"
-REVISION_PREVIEW_ACCESSIBILITY_ID = "markturbo-revision-preview"
-REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID = "markturbo-revision-preview-source"
-REVISION_PREVIEW_SOURCE_LABELS = frozenset(
-    {"Final approved Revision source", "最终批准的修订源文本"}
-)
-REVISION_RESULT_DISMISS_ACCESSIBILITY_ID = "markturbo-revision-result-dismiss"
-REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID = "markturbo-revision-discard-answers"
-REVISION_STALE_ACCESSIBILITY_ID = "markturbo-revision-stale"
-REVISION_ACCEPT_ALL_ACCESSIBILITY_ID = "markturbo-revision-accept-all"
-REVISION_REJECT_ALL_ACCESSIBILITY_ID = "markturbo-revision-reject-all"
-REVISION_APPLY_ACCESSIBILITY_ID = "markturbo-revision-apply"
-REVISION_COPY_ACCESSIBILITY_ID = "markturbo-revision-copy"
-REVISION_QUESTION_PREFIX = "markturbo-revision-question-"
-REVISION_CHANGE_PREFIX = "markturbo-revision-change-"
-CONFLICT_OVERWRITE_ACCESSIBILITY_ID = "markturbo-conflict-overwrite"
-TRUST_AUTOMATION_ID = "markturbo-document-trust"
-REVISION_CONSENT_AUTOMATION_ID = "CommandButton_1"
-VK_SHIFT = 0x10
-VK_R = 0x52
+# `ui/review.rs`: the structured result's first line, the answer input, and
+# the anonymous Buttons named by their labels.
+REVIEW_RESULT_MARKER = "Understood:"
+REVIEW_ANSWER_INPUT_AUTOMATION_ID = "review-answer-input"
+REVIEW_ANSWER_NAME = "Answer"
+PREPARE_REVISION_NAME = "Prepare revision"
+# `ui/consent.rs` `send_button`: only a pointer hold past `HOLD_MS` sends.
+CONSENT_SEND_AUTOMATION_ID = "consent-send"
+CONSENT_HOLD_SECONDS = 1.8
+# `ui/revision.rs`: the docked hunk's decisions, the count and Done.
+REVISION_ACCEPT_NAME = "Accept"
+REVISION_REJECT_NAME = "Reject"
+REVISION_DONE_NAME = "Done"
+REVISION_STALE_TEXT = "Stale \u2014 edited after review"
+# Not in the nsh UI yet: the Copy of the approved result, and an exposed group
+# around the docked hunk's proposed lines.
+REVISION_COPY_AUTOMATION_ID = "revision-copy"
+REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
+# `ui/preview.rs` and `state.rs` `request_web_trust`.
+TRUST_SCRIPTS_NAME = "Trust scripts"
+TRUST_CONFIRM_NAME = "Run scripts"
+TRUSTED_BANNER = "Trusted: scripts may run"
+RESTRICTED_BANNER = "Restricted: scripts disabled"
+UI_SOURCE_REQUIREMENTS = {
+    "crates/mt-app/src/ui/titlebar.rs": (
+        '"mod+enter"',
+        '"title-settings"',
+        '"title-menu-save"',
+        '"title-menu-edit"',
+        '"title-menu-web"',
+        '"title-menu-quit"',
+        '"title-dirty"',
+    ),
+    "crates/mt-app/src/ui/review.rs": (
+        '"review-answer-input"',
+        '"Answer"',
+        '"Prepare revision"',
+        '"Understood:"',
+    ),
+    "crates/mt-app/src/ui/consent.rs": ('"consent-send"', ".long_press_delay(HOLD_MS)"),
+    "crates/mt-app/src/ui/revision.rs": (
+        '"Accept"',
+        '"Reject"',
+        '"Done"',
+        '"Stale \u2014 edited after review"',
+        '"{n} of {m} decided"',
+    ),
+    "crates/mt-app/src/ui/notices.rs": (
+        '"Changed on disk"',
+        '"Close without saving?"',
+        '"Don\'t save"',
+    ),
+    "crates/mt-app/src/i18n.rs": (
+        '"Trust scripts"',
+        '"Trusted: scripts may run"',
+        '"Restricted: scripts disabled"',
+    ),
+    "crates/mt-app/src/state.rs": ('.destructive("trust", "Run scripts")',),
+    "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
+}
 
 CASE_REJECT_ALL = "reject_all_byte_identity"
 CASE_SELECTIVE_UNDO = "selective_apply_one_undo"
@@ -182,12 +223,14 @@ REQUIRED_CASE_IDS = (
     CASE_TRUST_REVOKE,
 )
 CASE_FLOWS = {
-    CASE_REJECT_ALL: "Review -> Revision -> reject all -> exact editor and source identity",
-    CASE_SELECTIVE_UNDO: "Review -> Revision -> one hunk -> Apply -> one undo",
-    CASE_ACCEPT_ALL_PREVIEW: "Review -> Revision -> accept all -> exact final preview before Apply",
-    CASE_STALE: "Revision -> edit source -> stale visible -> Apply disabled",
-    CASE_SAVE_CONFLICT: "Revision -> Apply -> external write -> safe Save conflict",
-    CASE_TRUST_REVOKE: "trusted HTML -> executable Apply -> Restricted trust",
+    CASE_REJECT_ALL: "Review -> Revision -> Reject every hunk -> Done -> exact editor and source identity",
+    CASE_SELECTIVE_UNDO: "Review -> Revision -> Accept one hunk, Reject one -> Done -> one undo",
+    CASE_ACCEPT_ALL_PREVIEW: (
+        "Review -> Revision -> Accept every hunk -> Copy approved result -> Done exact"
+    ),
+    CASE_STALE: "Revision -> edit source -> stale visible -> Accept withheld and Done refused",
+    CASE_SAVE_CONFLICT: "Revision -> Done -> external write -> menu Save conflict",
+    CASE_TRUST_REVOKE: "trusted HTML -> executable Done -> Restricted trust",
 }
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
@@ -228,6 +271,7 @@ SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES | {
     "Restricted",
 }
 ALLOWED_OBSERVATION_KEYS = {
+    "accept_all_expected",
     "accept_all_matches_expected",
     "copy_dirty_after",
     "copy_dirty_before",
@@ -247,18 +291,19 @@ ALLOWED_OBSERVATION_KEYS = {
     "apply_disabled_source_contract",
     "editor_after",
     "editor_after_apply",
+    "editor_after_done",
     "editor_after_edit",
     "editor_after_preview",
     "editor_before",
     "editor_before_apply",
     "external_source_after",
     "external_source_before",
-    "final_preview",
     "flow",
     "foreground_verified",
     "loopback_provider",
     "one_undo_transaction",
     "preview_fingerprint",
+    "proposal_expected",
     "proposal_received",
     "reviewed_source_match",
     "provider_request_count",
@@ -276,10 +321,9 @@ ALLOWED_OBSERVATION_KEYS = {
     "runtime_scan",
     "safe_save_conflict_visible",
     "safe_save_no_overwrite",
-    "save_shortcut_sent",
+    "save_command_sent",
     "conflict_visible_before_save",
-    "selective_preview",
-    "selective_matches_editor",
+    "selective_expected",
     "selective_matches_expected",
     "server_deterministic",
     "server_loopback",
@@ -326,26 +370,6 @@ ALLOWED_OBSERVATION_KEYS = {
     "set_foreground_return",
     "foreground_attempts",
 }
-
-
-def revision_question_accessibility_id(index: int) -> str:
-    try:
-        question_id = provider_fixtures.QUESTION_IDS[index]
-    except IndexError as error:
-        raise ValueError("native fixture question index is out of range") from error
-    return f"{REVISION_QUESTION_PREFIX}{question_id}"
-
-
-def revision_answer_accessibility_id(index: int, state: str) -> str:
-    if state not in {"unanswered", "unspecified", "answered", "input"}:
-        raise ValueError("native fixture answer state is invalid")
-    return f"{revision_question_accessibility_id(index)}-{state}"
-
-
-def revision_change_accessibility_id(change_id: int, decision: str) -> str:
-    if decision not in {"accept", "reject"}:
-        raise ValueError("native fixture change decision is invalid")
-    return f"{REVISION_CHANGE_PREFIX}{change_id}-{decision}"
 
 
 def endpoint_environment_key_identity(endpoint: str) -> str:
@@ -561,9 +585,11 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
         "executable_expected",
         "external_source_after",
         "external_source_before",
-        "final_preview",
+        "accept_all_expected",
+        "editor_after_done",
         "preview_fingerprint",
-        "selective_preview",
+        "proposal_expected",
+        "selective_expected",
         "source_after",
         "source_before",
         "copy_editor_after",
@@ -718,12 +744,11 @@ def required_observations(case_id: str) -> set[str]:
         },
         CASE_SELECTIVE_UNDO: {
             "editor_before",
-            "selective_preview",
+            "selective_expected",
             "editor_after_apply",
             "editor_after_undo",
             "source_before",
             "source_after",
-            "selective_matches_editor",
             "selective_matches_expected",
             "one_undo_transaction",
             "undo_count",
@@ -731,8 +756,8 @@ def required_observations(case_id: str) -> set[str]:
         CASE_ACCEPT_ALL_PREVIEW: {
             "editor_before_apply",
             "editor_after_preview",
-            "preview_fingerprint",
-            "final_preview",
+            "accept_all_expected",
+            "editor_after_done",
             "accept_all_matches_expected",
             "copy_preview_fingerprint",
             "copy_preview_exact",
@@ -764,13 +789,14 @@ def required_observations(case_id: str) -> set[str]:
             "editor_after_apply",
             "external_source_before",
             "external_source_after",
-            "save_shortcut_sent",
+            "save_command_sent",
             "conflict_visible_before_save",
             "safe_save_conflict_visible",
             "safe_save_no_overwrite",
         },
         CASE_TRUST_REVOKE: {
             "trust_before",
+            "editor_before_apply",
             "editor_after_apply",
             "restricted_after_apply",
             "executable_change",
@@ -779,6 +805,7 @@ def required_observations(case_id: str) -> set[str]:
             "trust_revocation_order_source_contract",
             "preview_inert_source_contract",
             "preview_fingerprint",
+            "proposal_expected",
             "preview_matches_expected",
             "preview_contains_executable_text",
         },
@@ -835,14 +862,13 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
             raise ValueError("reject-all changed editor or source bytes")
     elif case_id == CASE_SELECTIVE_UNDO:
         before = validate_fingerprint(observations["editor_before"])
-        selected = validate_fingerprint(observations["selective_preview"])
+        selected = validate_fingerprint(observations["selective_expected"])
         applied = validate_fingerprint(observations["editor_after_apply"])
         undone = validate_fingerprint(observations["editor_after_undo"])
         source_before = validate_fingerprint(observations["source_before"])
         source_after = validate_fingerprint(observations["source_after"])
         require_true(
             observations,
-            "selective_matches_editor",
             "selective_matches_expected",
             "one_undo_transaction",
         )
@@ -853,8 +879,8 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
     elif case_id == CASE_ACCEPT_ALL_PREVIEW:
         before = validate_fingerprint(observations["editor_before_apply"])
         after = validate_fingerprint(observations["editor_after_preview"])
-        preview = validate_fingerprint(observations["preview_fingerprint"])
-        final = validate_fingerprint(observations["final_preview"])
+        final = validate_fingerprint(observations["accept_all_expected"])
+        done = validate_fingerprint(observations["editor_after_done"])
         copied = validate_fingerprint(observations["copy_preview_fingerprint"])
         copy_before = validate_fingerprint(observations["copy_editor_before"])
         copy_after = validate_fingerprint(observations["copy_editor_after"])
@@ -870,14 +896,14 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         )
         if (
             before != after
-            or preview != final
+            or done != final
             or copied != final
             or copy_before != copy_after
             or copy_source_before != copy_source_after
             or observations.get("copy_dirty_before")
             is not observations.get("copy_dirty_after")
         ):
-            raise ValueError("accept-all preview was not stable before Apply")
+            raise ValueError("accept-all was not stable before Done or not exact after it")
     elif case_id == CASE_STALE:
         before = validate_fingerprint(observations["editor_before"])
         edited = validate_fingerprint(observations["editor_after_edit"])
@@ -904,7 +930,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         after = validate_fingerprint(observations["external_source_after"])
         require_true(
             observations,
-            "save_shortcut_sent",
+            "save_command_sent",
             "safe_save_conflict_visible",
             "safe_save_no_overwrite",
         )
@@ -916,6 +942,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         actual = validate_fingerprint(observations["editor_after_apply"])
         expected = validate_fingerprint(observations["executable_expected"])
         preview = validate_fingerprint(observations["preview_fingerprint"])
+        proposal = validate_fingerprint(observations["proposal_expected"])
         require_true(
             observations,
             "trust_before",
@@ -927,7 +954,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
             "preview_matches_expected",
             "preview_contains_executable_text",
         )
-        if preview != expected or actual != expected or before == actual:
+        if preview != proposal or actual != expected or before == actual:
             raise ValueError("trusted executable Apply did not produce the expected restricted change")
 
 
@@ -1093,204 +1120,49 @@ def _rust_function_body(source: str | None, signature: str) -> str | None:
 
 
 def trust_apply_source_contract_ok() -> bool:
-    """Check the production trust revocation boundary before source replacement."""
-    document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
-    body = _rust_function_body(document, "pub fn apply_approved_revision(")
+    """Applying a revision revokes the tab's script trust (`state.rs`) before
+    the approved text replaces the buffer, so no trusted page renders it."""
+    state = production_source(REPO / "crates" / "mt-app" / "src" / "state.rs")
+    body = _rust_function_body(state, "pub fn apply_revision(")
     if body is None:
         return False
-    markers = (
-        "self.trust == Trust::Trusted",
-        "matches!(self.document.doc_type(),",
-        "DocType::Html | DocType::Mdx",
-        "current_text != final_text",
-        "self.trust = Trust::Restricted;",
-        "self.preview",
-        ".trust_changed(",
-        "self.replace_text(final_text, window, cx);",
-    )
-    if any(marker not in body for marker in markers):
-        return False
-    revoke = body.find("let revoke_trust =")
-    branch = body.find("if revoke_trust {")
-    trust = body.find("self.trust = Trust::Restricted;")
-    preview_state = body.find("self.preview", trust)
-    preview = body.find(".trust_changed(", preview_state)
-    preview_trust = body.find("Trust::Restricted", preview)
-    replace = body.find("self.replace_text(final_text, window, cx);", preview_trust)
-    ordered = (
-        revoke >= 0
-        and branch > revoke
-        and trust > branch
-        and preview_state > trust
-        and preview > trust
-        and preview_trust > preview
-        and replace > preview_trust
-    )
-    if not ordered:
-        return False
-
-    preview_source = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "document" / "preview.rs"
-    )
-    trust_changed = _rust_function_body(preview_source, "pub(super) fn trust_changed(")
-    rebuild_web = _rust_function_body(preview_source, "fn rebuild_web(")
-    return (
-        trust_changed is not None
-        and "self.rebuild_web(document, source_path, trust, cx);" in trust_changed
-        and rebuild_web is not None
-        and "self.web_revision = self.web_revision.wrapping_add(1);" in rebuild_web
-        and "self.web_html = Some(" in rebuild_web
-        and "Trust::Restricted => web::build_html_raw(document, trust)" in rebuild_web
-        and "web::build_html_themed(" in rebuild_web
-    )
+    revoke = body.find("web_trusted.set(false)")
+    replace = body.find("tab.text.set(")
+    return 0 <= revoke < replace
 
 
 def preview_inert_source_contract_ok() -> bool:
-    """Guard the Revision preview's stable, inert GPUI text surface."""
-    review = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
-    )
-    if review is None:
+    """The Revision field shows proposals as text, never through a WebView."""
+    revision = production_source(REPO / "crates" / "mt-app" / "src" / "ui" / "revision.rs")
+    if revision is None:
         return False
-    views = rust_source_views(review)
+    views = rust_source_views(revision)
     if views is None:
         return False
     _, comment_free = views
-
-    start = comment_free.find('.id("revision-preview")')
-    if start < 0:
-        return False
-    end = comment_free.find(".into_any_element()", start)
-    if end < 0:
-        return False
-    body = comment_free[start:end]
-    required = (
-        ".role(gpui::Role::Group)",
-        f'.accessibility_id("{REVISION_PREVIEW_ACCESSIBILITY_ID}")',
-        '.id("revision-preview-source")',
-        ".role(gpui::Role::Label)",
-        ".aria_value(preview.clone())",
-        f'.accessibility_id("{REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}")',
-        ".child(preview)",
-    )
-    forbidden = ("WebSurface", "WebView", "render_html", "set_html", "web_payload")
-    return all(marker in body for marker in required) and not any(
-        marker in body for marker in forbidden
-    )
-
-
-def stale_accessibility_source_contract_ok() -> bool:
-    """Guard the stale warning's stable, inert UIA text node."""
-    review = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
-    )
-    if review is None:
-        return False
-    start = review.find('.id("revision-stale")')
-    if start < 0:
-        return False
-    end = review.find(".into_any_element()", start)
-    if end < 0:
-        return False
-    body = review[start:end]
-    return all(
-        marker in body
-        for marker in (
-            "accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)",
-            ".role(gpui::Role::Label)",
-            ".aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))",
-        )
+    forbidden = ("web_view", "WebView", "web_view_html", "java_script_enabled")
+    return f'"{REVISION_PROPOSAL_AFTER_AUTOMATION_ID}"' in comment_free and not any(
+        marker in comment_free for marker in forbidden
     )
 
 
 def stale_apply_source_contract_ok() -> bool:
-    """Guard that stale state disables the rendered Revision Apply command."""
-    review = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
-    )
-    if review is None:
+    """A stale proposal withholds Accept and leaves Done's key unbound."""
+    revision = production_source(REPO / "crates" / "mt-app" / "src" / "ui" / "revision.rs")
+    state = production_source(REPO / "crates" / "mt-app" / "src" / "state.rs")
+    apply = _rust_function_body(state, "pub fn apply_revision(")
+    if revision is None or apply is None:
         return False
-    start = review.find('Button::new("revision-apply")')
-    if start < 0:
-        return False
-    end = review.find('Button::new("revision-save")', start)
-    if end < 0:
-        return False
-    body = review[start:end]
-    return all(
-        marker in body
-        for marker in (
-            "accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)",
-            ".disabled(revision_stale)",
-            "this.apply_revision(window, cx)",
-        )
+    return (
+        "state.revision_is_stale()" in revision
+        and "!done_key_gate.revision_is_stale()" in revision
+        and "!snapshot.matches(current_snapshot)" in apply
     )
 
 
 def source_contract_failure() -> str | None:
-    workspace = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs")
-    review = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
-    )
-    document = production_source(REPO / "crates" / "mt-app" / "src" / "views" / "document.rs")
-    if workspace is None or review is None:
-        return "REVISION_UIA_CONTRACT_MISSING"
-    if document is None:
-        return "REVISION_BOUNDARY_CONTRACT_MISSING"
-    review_views = rust_source_views(review)
-    if review_views is None:
-        return "REVISION_UIA_CONTRACT_MISSING"
-    _, review_comment_free = review_views
-    for symbol, value in (
-        ("REVIEW_RUN_ACCESSIBILITY_ID", REVIEW_RUN_ACCESSIBILITY_ID),
-        ("REVIEW_RESULT_ACCESSIBILITY_ID", REVIEW_RESULT_ACCESSIBILITY_ID),
-        ("REVISION_RUN_ACCESSIBILITY_ID", REVISION_RUN_ACCESSIBILITY_ID),
-        ("REVISION_STALE_ACCESSIBILITY_ID", REVISION_STALE_ACCESSIBILITY_ID),
-        ("REVISION_ACCEPT_ALL_ACCESSIBILITY_ID", REVISION_ACCEPT_ALL_ACCESSIBILITY_ID),
-        ("REVISION_REJECT_ALL_ACCESSIBILITY_ID", REVISION_REJECT_ALL_ACCESSIBILITY_ID),
-        ("REVISION_APPLY_ACCESSIBILITY_ID", REVISION_APPLY_ACCESSIBILITY_ID),
-        ("REVISION_COPY_ACCESSIBILITY_ID", REVISION_COPY_ACCESSIBILITY_ID),
-        (
-            "REVISION_RESULT_DISMISS_ACCESSIBILITY_ID",
-            REVISION_RESULT_DISMISS_ACCESSIBILITY_ID,
-        ),
-        (
-            "REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID",
-            REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID,
-        ),
-    ):
-        if f'const {symbol}: &str = "{value}";' not in workspace:
-            return "REVISION_UIA_CONTRACT_MISSING"
-        if f"accessibility_id({symbol})" not in review_comment_free:
-            return "REVISION_SOURCE_CONTRACT_MISSING"
-
-    for value in (
-        REVISION_RESULT_ACCESSIBILITY_ID,
-        REVISION_PREVIEW_ACCESSIBILITY_ID,
-        REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
-        REVISION_QUESTION_PREFIX,
-        REVISION_CHANGE_PREFIX,
-    ):
-        if value not in review_comment_free:
-            return "REVISION_UIA_CONTRACT_MISSING"
-
-    if (
-        "DocumentEvent::Conflict" not in workspace
-        or 'Button::new("trust")' not in document
-        or "accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID)" not in document
-        or TRUST_AUTOMATION_ID not in document
-        or "accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID)" not in document
-        or CONFLICT_OVERWRITE_ACCESSIBILITY_ID not in document
-    ):
-        return "REVISION_BOUNDARY_CONTRACT_MISSING"
-    if not trust_apply_source_contract_ok():
-        return "REVISION_TRUST_SOURCE_CONTRACT_MISSING"
-    if not preview_inert_source_contract_ok():
-        return "REVISION_PREVIEW_INERT_CONTRACT_MISSING"
-    if not stale_accessibility_source_contract_ok():
-        return "REVISION_STALE_ACCESSIBILITY_CONTRACT_MISSING"
-    if not stale_apply_source_contract_ok():
-        return "REVISION_STALE_APPLY_CONTRACT_MISSING"
+    if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
+        return "REVISION_SOURCE_CONTRACT_MISSING"
     return None
 
 
@@ -1393,316 +1265,34 @@ class Goal07Harness(ClipboardNativeHarness):
         write_durable(config_root / "settings.toml", review_settings_document(endpoint))
         return case_root, data_root, config_root, workspace_root, stderr_path, source
 
-    def _text_control(self, app: Any, automation_id: str, control_type: str = "Text") -> str:
-        control = self.find_control(
-            app,
-            automation_id,
-            control_type,
-            f"{automation_id.upper().replace('-', '_')}_UIA_TIMEOUT",
-            f"{automation_id.upper().replace('-', '_')}_UIA_CONTRACT_MISMATCH",
-        )
-        try:
-            if control_type == "Edit":
-                return str(control.iface_value.CurrentValue)
-            value = control.element_info.name
-            if isinstance(value, str) and value:
-                return value
-            pattern = control.iface_value
-            return str(pattern.CurrentValue)
-        except Exception as error:
-            raise HarnessFailure("REVISION_TEXT_UIA_QUERY_FAILED", safe_exception_name(error)) from None
-
-    def _fingerprint_control(self, app: Any, automation_id: str) -> Fingerprint:
-        return fingerprint_text(self._text_control(app, automation_id))
-
-    def _preview_source_text(self, app: Any) -> str:
-        """Read the labelled preview's child text rather than its aria label."""
-        control = self.find_control(
-            app,
-            REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
-            "Text",
-            "REVISION_PREVIEW_SOURCE_UIA_TIMEOUT",
-            "REVISION_PREVIEW_SOURCE_UIA_CONTRACT_MISMATCH",
-        )
-        name = self._control_name(control)
-        try:
-            pattern = control.iface_value
-            value = pattern.CurrentValue
-        except self.no_pattern_error_class:
-            value = ""
-        except Exception as error:
-            raise HarnessFailure(
-                "REVISION_PREVIEW_SOURCE_UIA_QUERY_FAILED", safe_exception_name(error)
-            ) from None
-        if isinstance(value, str) and value and value != name:
-            return value
-        try:
-            children = control.children()
-            child_names = [
-                child.element_info.name
-                for child in children
-                if isinstance(child.element_info.name, str)
-                and child.element_info.name
-                and child.element_info.name != name
-            ]
-        except Exception as error:
-            raise HarnessFailure(
-                "REVISION_PREVIEW_SOURCE_UIA_QUERY_FAILED", safe_exception_name(error)
-            ) from None
-        if child_names:
-            return "\n".join(child_names)
-        if isinstance(value, str) and value:
-            return value
-        if name and name not in REVISION_PREVIEW_SOURCE_LABELS:
-            return name
-        if name:
-            raise HarnessFailure("REVISION_PREVIEW_SOURCE_TEXT_CONTRACT_MISMATCH")
-        raise HarnessFailure("REVISION_PREVIEW_SOURCE_TEXT_UNAVAILABLE")
-
-    @staticmethod
-    def _control_name(control: Any) -> str:
-        try:
-            name = control.element_info.name
-        except Exception as error:
-            raise HarnessFailure("UIA_CONTROL_NAME_QUERY_FAILED", safe_exception_name(error)) from None
-        return name if isinstance(name, str) else ""
-
-    def _document_dirty(self, app: Any, filename: str) -> bool:
-        """Read the active tab's real UIA aria label, including its dirty marker."""
-        expected = filename.casefold()
-
-        def locate() -> dict[str, bool] | None:
-            try:
-                uia = self.iuia_class()
-                elements = self.fresh_uia_root(app.hwnd).element.FindAll(
-                    uia.tree_scope["descendants"], uia.iuia.CreateTrueCondition()
-                )
-                tab_item_type = uia.known_control_types["TabItem"]
-                for index in range(elements.Length):
-                    element = elements.GetElement(index)
-                    if element.CurrentControlType != tab_item_type:
-                        continue
-                    name = str(element.CurrentName or "")
-                    if expected not in name.casefold():
-                        continue
-                    lowered = name.casefold()
-                    return {
-                        "dirty": "unsaved changes" in lowered or "未保存" in name,
-                    }
-                return None
-            except HarnessFailure:
-                raise
-            except Exception as error:
-                raise HarnessFailure("DIRTY_STATE_UIA_QUERY_FAILED", safe_exception_name(error)) from None
-
-        result = wait_until(locate, self.ui_timeout, "DIRTY_STATE_UIA_TIMEOUT", interval=0.05)
-        return bool(result["dirty"])
-
-    def _trust_label(self, app: Any) -> str:
-        control = self.find_control(
-            app,
-            TRUST_AUTOMATION_ID,
-            "Button",
-            "TRUST_BUTTON_UIA_TIMEOUT",
-            "TRUST_BUTTON_UIA_CONTRACT_MISMATCH",
-        )
-        return self._control_name(control)
-
-    @staticmethod
-    def _is_trusted_label(label: str) -> bool:
-        lowered = label.casefold()
-        return "trusted" in lowered or "已信任" in label
-
-    @staticmethod
-    def _is_restricted_label(label: str) -> bool:
-        lowered = label.casefold()
-        return (
-            "trust this document" in lowered
-            or "restricted" in lowered
-            or "受限" in label
-        )
-
     def _require_foreground(self, app: Any) -> bool:
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
         return True
 
-    def _click_id(self, app: Any, automation_id: str, control_type: str = "Button") -> None:
+    def _press_named(self, app: Any, name: str, code: str) -> None:
         self._require_foreground(app)
-        control = self.find_control(
-            app,
-            automation_id,
-            control_type,
-            f"{automation_id.upper().replace('-', '_')}_UIA_TIMEOUT",
-            f"{automation_id.upper().replace('-', '_')}_UIA_CONTRACT_MISMATCH",
+        control = self.find_named(
+            app, name, "Button", f"{code}_UIA_TIMEOUT", f"{code}_UIA_CONTRACT_MISMATCH"
         )
-        if automation_id.startswith("markturbo-revision-"):
-            control = self._scroll_revision_control_into_view(
-                app, automation_id, control_type, control
-            )
-        if automation_id == REVISION_RUN_ACCESSIBILITY_ID:
-            def enabled_revision_run() -> Any | None:
-                candidate = self.control_by_id(
-                    app.hwnd,
-                    automation_id,
-                    control_type,
-                    "REVISION_RUN_UIA_CONTRACT_MISMATCH",
-                )
-                if candidate is None:
-                    return None
-                try:
-                    return candidate if candidate.is_enabled() else None
-                except Exception as error:
-                    raise HarnessFailure(
-                        "REVISION_RUN_UIA_QUERY_FAILED", safe_exception_name(error)
-                    ) from None
+        self.click_control(control, f"{code}_CLICK_FAILED")
 
-            control = wait_until(
-                enabled_revision_run,
-                self.ui_timeout,
-                "REVISION_RUN_ENABLED_TIMEOUT",
-                interval=0.025,
-            )
-            control = self._scroll_revision_control_into_view(
-                app, automation_id, control_type, control
-            )
-            self._require_foreground(app)
-        self.click_control(control, f"{automation_id.upper().replace('-', '_')}_CLICK_FAILED")
-
-    def _scroll_revision_control_into_view(
-        self, app: Any, automation_id: str, control_type: str, control: Any
-    ) -> Any:
-        window_rect = app.window.rectangle()
-        anchors = [(REVIEW_RESULT_ACCESSIBILITY_ID, "Text")]
-        anchors.extend(
-            (revision_answer_accessibility_id(index, "input"), "Edit")
-            for index in range(len(provider_fixtures.QUESTION_IDS))
+    def _named_texts(self, app: Any, automation_id: str, code: str) -> str:
+        """The line texts inside one exposed group, joined by newlines."""
+        group = self.find_control(
+            app, automation_id, "Group", f"{code}_UIA_TIMEOUT", f"{code}_UIA_CONTRACT_MISMATCH"
         )
-        anchors.append((REVISION_PREVIEW_ACCESSIBILITY_ID, "Group"))
-        for _ in range(8):
-            control_rect = control.rectangle()
-            window_rect = app.window.rectangle()
-            safe_bottom = window_rect.bottom - REVISION_CONTROL_BOTTOM_INSET
-            if (
-                control_rect.top >= window_rect.top
-                and control_rect.bottom <= safe_bottom
-            ):
-                return control
-            anchor = next(
-                (
-                    candidate
-                    for candidate_id, candidate_type in anchors
-                    if (candidate := self.control_by_id(
-                        app.hwnd,
-                        candidate_id,
-                        candidate_type,
-                        "REVISION_SCROLL_ANCHOR_UIA_CONTRACT_MISMATCH",
-                    ))
-                    is not None
-                    and (candidate_rect := candidate.rectangle()).top >= window_rect.top
-                    and candidate_rect.bottom <= window_rect.bottom
-                ),
-                None,
-            )
-            if anchor is None:
-                break
-            anchor.wheel_mouse_input(
-                wheel_dist=-3 if control_rect.bottom > safe_bottom else 3
-            )
-            time.sleep(0.05)
-            next_control = self.control_by_id(
-                app.hwnd,
-                automation_id,
-                control_type,
-                f"{automation_id.upper().replace('-', '_')}_UIA_CONTRACT_MISMATCH",
-            )
-            if next_control is None:
-                break
-            control = next_control
-        raise HarnessFailure(
-            f"{automation_id.upper().replace('-', '_')}_SCROLL_TIMEOUT"
-        )
-
-    def _find_stale_control(self, app: Any) -> Any:
-        def locate() -> Any | None:
-            control = self.control_by_id(
-                app.hwnd,
-                REVISION_STALE_ACCESSIBILITY_ID,
-                "Text",
-                "REVISION_STALE_UIA_CONTRACT_MISMATCH",
-            )
-            if control is not None:
-                return control
-            window_rect = app.window.rectangle()
-            for automation_id, control_type in (
-                (REVISION_PREVIEW_ACCESSIBILITY_ID, "Group"),
-                (REVISION_RESULT_ACCESSIBILITY_ID, "Group"),
-                *(
-                    (revision_answer_accessibility_id(index, "input"), "Edit")
-                    for index in range(len(provider_fixtures.QUESTION_IDS))
-                ),
-            ):
-                anchor = self.control_by_id(
-                    app.hwnd,
-                    automation_id,
-                    control_type,
-                    "REVISION_SCROLL_ANCHOR_UIA_CONTRACT_MISMATCH",
-                )
-                if anchor is None:
-                    continue
-                anchor_rect = anchor.rectangle()
-                if anchor_rect.top >= window_rect.top and anchor_rect.bottom <= window_rect.bottom:
-                    anchor.wheel_mouse_input(wheel_dist=3)
-                    break
-            return None
-
-        control = wait_until(
-            locate,
-            self.ui_timeout,
-            "REVISION_STALE_UIA_TIMEOUT",
-            interval=0.05,
-        )
-        return self._scroll_revision_control_into_view(
-            app, REVISION_STALE_ACCESSIBILITY_ID, "Text", control
-        )
-
-    def _set_answer(self, app: Any, index: int, value: str) -> None:
-        # The input is disabled until the explicit Answered state is selected.
-        # Type through the focused editor so the native harness exercises the
-        # same input path as a user instead of relying on unsupported UIA SetValue.
-        self._click_id(app, revision_answer_accessibility_id(index, "answered"))
-        automation_id = revision_answer_accessibility_id(index, "input")
-        def enabled_input() -> Any | None:
-            control = self.control_by_id(
-                app.hwnd,
-                automation_id,
-                "Edit",
-                "REVISION_ANSWER_UIA_CONTRACT_MISMATCH",
-            )
-            if control is None:
-                return None
-            try:
-                return control if control.is_enabled() else None
-            except Exception as error:
-                raise HarnessFailure(
-                    "REVISION_ANSWER_UIA_QUERY_FAILED", safe_exception_name(error)
-                ) from None
-
-        wait_until(
-            enabled_input,
-            self.ui_timeout,
-            "REVISION_ANSWER_UIA_TIMEOUT",
-            interval=0.025,
-        )
-        self.win32.send_unicode(app.hwnd, value)
-        wait_until(
-            lambda: value if self._text_control(app, automation_id, "Edit") == value else None,
-            self.ui_timeout,
-            "REVISION_ANSWER_INPUT_TIMEOUT",
-            interval=0.025,
-        )
-
-    def _mark_intentionally_unspecified(self, app: Any, index: int) -> None:
-        self._click_id(app, revision_answer_accessibility_id(index, "unspecified"))
+        try:
+            names = [
+                child.element_info.name
+                for child in group.children()
+                if child.element_info.control_type == "Text"
+                and isinstance(child.element_info.name, str)
+            ]
+        except Exception as error:
+            raise HarnessFailure(f"{code}_UIA_QUERY_FAILED", safe_exception_name(error)) from None
+        if not names:
+            raise HarnessFailure(f"{code}_TEXT_UNAVAILABLE")
+        return "\n".join(names)
 
     def _open_consent_gate(
         self,
@@ -1729,26 +1319,18 @@ class Goal07Harness(ClipboardNativeHarness):
         expected_request_count: int | None = None,
         open_gate: Any = None,
     ) -> None:
-        def locate() -> Any | None:
-            dialogs = self.win32.owned_task_dialogs(app.process.pid, app.hwnd)
-            if len(dialogs) > 1:
-                raise HarnessFailure("MULTIPLE_REVISION_CONSENT_DIALOGS")
-            if not dialogs:
-                return None
-            return self.control_by_id(
-                dialogs[0],
-                REVISION_CONSENT_AUTOMATION_ID,
-                "Button",
-                "REVISION_CONSENT_UIA_CONTRACT_MISMATCH",
-                expected_class_name=TASK_DIALOG_BUTTON_CLASS,
-            )
-
-        button = wait_until(locate, self.ui_timeout, "REVISION_CONSENT_UIA_TIMEOUT", interval=0.025)
+        send = self.find_control(
+            app,
+            CONSENT_SEND_AUTOMATION_ID,
+            "Button",
+            "CONSENT_SEND_UIA_TIMEOUT",
+            "CONSENT_SEND_UIA_CONTRACT_MISMATCH",
+        )
         if expected_request_count is None or open_gate is None:
             raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
         self._open_consent_gate(provider, expected_request_count, open_gate)
-        click = lambda: self.click_control(button, failure_code)
-        provider.dispatch_consent_click(expected_request_count, click)
+        hold = lambda: self.hold_control(app, send, CONSENT_HOLD_SECONDS, failure_code)
+        provider.dispatch_consent_click(expected_request_count, hold)
 
     def run_review(
         self, app: Any, provider: provider_fixtures.LoopbackRevisionServer,
@@ -1760,92 +1342,81 @@ class Goal07Harness(ClipboardNativeHarness):
         else:
             self.focus_editor(app)
             self._require_foreground(app)
-        self.win32.send_inputs(
-            [
-                key_input(VK_CONTROL, False),
-                key_input(VK_SHIFT, False),
-                key_input(VK_R, False),
-                key_input(VK_R, True),
-                key_input(VK_SHIFT, True),
-                key_input(VK_CONTROL, True),
-            ]
-        )
-        self._click_id(app, REVIEW_RUN_ACCESSIBILITY_ID)
+        self.win32.send_shortcut(app.hwnd, VK_RETURN)
         self._approve_consent(
             app,
-            "REVIEW_CONSENT_CLICK_FAILED",
+            "REVIEW_CONSENT_HOLD_FAILED",
             provider=provider,
             expected_request_count=0,
             open_gate=provider.grant_review_consent,
         )
-        self.find_control(
-            app,
-            REVIEW_RESULT_ACCESSIBILITY_ID,
-            "Text",
-            "REVIEW_RESULT_UIA_TIMEOUT",
-            "REVIEW_RESULT_UIA_CONTRACT_MISMATCH",
+        self.wait_name(
+            app, REVIEW_RESULT_MARKER, "Text", "REVIEW_RESULT_UIA_TIMEOUT", max(self.ui_timeout, 60.0)
         )
+
+    def _set_answer(self, app: Any, value: str) -> None:
+        # Type through the focused input, the same path a user takes.
+        answer = self.find_control(
+            app,
+            REVIEW_ANSWER_INPUT_AUTOMATION_ID,
+            "Edit",
+            "REVIEW_ANSWER_UIA_TIMEOUT",
+            "REVIEW_ANSWER_UIA_CONTRACT_MISMATCH",
+        )
+        try:
+            answer.set_focus()
+        except Exception as error:
+            raise HarnessFailure("REVIEW_ANSWER_FOCUS_FAILED", safe_exception_name(error)) from None
+        self.win32.send_unicode(app.hwnd, value)
+
+        def typed() -> bool:
+            control = self.control_by_id(
+                app.hwnd,
+                REVIEW_ANSWER_INPUT_AUTOMATION_ID,
+                "Edit",
+                "REVIEW_ANSWER_UIA_CONTRACT_MISMATCH",
+            )
+            return control is not None and control.iface_value.CurrentValue == value
+
+        wait_until(typed, self.ui_timeout, "REVIEW_ANSWER_INPUT_TIMEOUT", interval=0.025)
+        self._press_named(app, REVIEW_ANSWER_NAME, "REVIEW_ANSWER_SUBMIT")
 
     def request_revision(
         self,
         app: Any,
         *,
         provider: provider_fixtures.LoopbackRevisionServer,
+        hunks: int,
     ) -> None:
-        self._set_answer(app, 0, provider_fixtures.ANSWER_TEXT)
-        self._mark_intentionally_unspecified(app, 1)
-        self._click_id(app, REVISION_RUN_ACCESSIBILITY_ID)
+        self._set_answer(app, provider_fixtures.ANSWER_TEXT)
+        self._press_named(app, PREPARE_REVISION_NAME, "REVISION_PREPARE")
         self._approve_consent(
             app,
-            "REVISION_CONSENT_CLICK_FAILED",
+            "REVISION_CONSENT_HOLD_FAILED",
             provider=provider,
             expected_request_count=1,
             open_gate=provider.grant_revision_consent,
         )
-        self.find_control(
+        self.wait_name(
             app,
-            REVISION_PREVIEW_ACCESSIBILITY_ID,
-            "Group",
-            "REVISION_PREVIEW_UIA_TIMEOUT",
-            "REVISION_PREVIEW_UIA_CONTRACT_MISMATCH",
+            f"0 of {hunks} decided",
+            "Text",
+            "REVISION_PROPOSAL_UIA_TIMEOUT",
+            max(self.ui_timeout, 60.0),
         )
 
-    def _apply_button_state(self, app: Any) -> tuple[Any, bool]:
-        button = self.control_by_id(
-            app.hwnd,
-            REVISION_APPLY_ACCESSIBILITY_ID,
-            "Button",
-            "REVISION_APPLY_UIA_CONTRACT_MISMATCH",
-        )
-        if button is None:
-            raise HarnessFailure("REVISION_APPLY_UIA_TIMEOUT")
-        button = self._scroll_revision_control_into_view(
-            app, REVISION_APPLY_ACCESSIBILITY_ID, "Button", button
-        )
-        try:
-            return button, bool(button.is_enabled())
-        except Exception as error:
-            raise HarnessFailure("REVISION_APPLY_UIA_QUERY_FAILED", safe_exception_name(error)) from None
+    def decide_hunks(self, app: Any, decisions: list[bool]) -> None:
+        """Decide the docked hunk, in order, waiting for each to be counted."""
+        total = len(decisions)
+        for index, accepted in enumerate(decisions):
+            name = REVISION_ACCEPT_NAME if accepted else REVISION_REJECT_NAME
+            self._press_named(app, name, "REVISION_ACCEPT" if accepted else "REVISION_REJECT")
+            self.wait_name(
+                app, f"{index + 1} of {total} decided", "Text", "REVISION_DECISION_TIMEOUT"
+            )
 
-    def _apply_button_enabled(self, app: Any) -> bool:
-        return self._apply_button_state(app)[1]
-
-    def _status_contains_conflict(self, app: Any) -> bool:
-        def locate() -> bool | None:
-            try:
-                control = self.control_by_id(
-                    app.hwnd,
-                    CONFLICT_OVERWRITE_ACCESSIBILITY_ID,
-                    "Button",
-                    "CONFLICT_OVERWRITE_UIA_CONTRACT_MISMATCH",
-                )
-                return control is not None
-            except Exception as error:
-                raise HarnessFailure(
-                    "CONFLICT_OVERWRITE_UIA_QUERY_FAILED", safe_exception_name(error)
-                ) from None
-
-        return bool(wait_until(locate, self.ui_timeout, "SAVE_CONFLICT_UIA_TIMEOUT", interval=0.05))
+    def done(self, app: Any) -> None:
+        self._press_named(app, REVISION_DONE_NAME, "REVISION_DONE")
 
     def _common_observations(
         self, provider: provider_fixtures.LoopbackRevisionServer
@@ -1871,6 +1442,9 @@ class Goal07Harness(ClipboardNativeHarness):
         observations["runtime_scan"] = scan_case_artifacts(case_root, self._credential)
         return observations
 
+    def _expected(self, source: bytes, edits: list[dict[str, Any]]) -> Fingerprint:
+        return fingerprint_bytes(apply_edits(source, edits))
+
     def scenario_reject_all(self) -> dict[str, Any]:
         provider = provider_fixtures.LoopbackRevisionServer(EDITOR_SOURCE_TEXT).start()
         app = None
@@ -1878,23 +1452,24 @@ class Goal07Harness(ClipboardNativeHarness):
             case_root, data, config, workspace, stderr, source = self.profile(
                 CASE_REJECT_ALL, provider.base_url
             )
+            hunks = len(provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT))
             app = self.launch_app(source, data, config, workspace, stderr)
             self.activate_source_layout(app)
             editor_before = self.editor_fingerprint(app)
             source_before = sha256_file(source)
-            dirty_before = self._document_dirty(app, source.name)
+            dirty_before = self.document_dirty(app)
             self.run_review(app, provider)
-            self.request_revision(app, provider=provider)
-            preview_text = self._preview_source_text(app)
-            self._click_id(app, REVISION_REJECT_ALL_ACCESSIBILITY_ID)
+            self.request_revision(app, provider=provider, hunks=hunks)
+            self.decide_hunks(app, [False] * hunks)
+            self.done(app)
             editor_after = self.editor_fingerprint(app)
             source_after = sha256_file(source)
-            dirty_after = self._document_dirty(app, source.name)
+            dirty_after = self.document_dirty(app)
             observations = {
                 "flow": CASE_FLOWS[CASE_REJECT_ALL],
                 "process_context": app.security_context.evidence(),
                 "foreground_verified": self._require_foreground(app),
-                "proposal_received": bool(preview_text),
+                "proposal_received": hunks > 0,
                 "reviewed_source_match": editor_before
                 == fingerprint_bytes(EDITOR_SOURCE_BYTES),
                 "editor_before": editor_before.evidence(),
@@ -1923,24 +1498,19 @@ class Goal07Harness(ClipboardNativeHarness):
             case_root, data, config, workspace, stderr, source = self.profile(
                 CASE_SELECTIVE_UNDO, provider.base_url
             )
+            edits = provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT)
             app = self.launch_app(source, data, config, workspace, stderr)
             self.activate_source_layout(app)
             editor_before = self.editor_fingerprint(app)
             source_before = sha256_file(source)
             self.run_review(app, provider)
-            self.request_revision(app, provider=provider)
-            expected_preview = fingerprint_bytes(
-                apply_edits(
-                    EDITOR_SOURCE_BYTES,
-                    provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT)[:1],
-                )
-            )
-            self._click_id(app, revision_change_accessibility_id(0, "accept"))
-            self._click_id(app, revision_change_accessibility_id(1, "reject"))
-            selected_preview = fingerprint_text(self._preview_source_text(app))
-            self._click_id(app, REVISION_APPLY_ACCESSIBILITY_ID)
+            self.request_revision(app, provider=provider, hunks=len(edits))
+            expected = self._expected(EDITOR_SOURCE_BYTES, edits[:1])
+            self.decide_hunks(app, [True] + [False] * (len(edits) - 1))
+            self.done(app)
             editor_after_apply = self.editor_fingerprint(app)
-            self.win32.send_shortcut(app.hwnd, 0x5A)
+            self.focus_editor(app)
+            self.win32.send_shortcut(app.hwnd, VK_Z)
             editor_after_undo = self.editor_fingerprint(app)
             source_after = sha256_file(source)
             observations = {
@@ -1948,13 +1518,12 @@ class Goal07Harness(ClipboardNativeHarness):
                 "process_context": app.security_context.evidence(),
                 "foreground_verified": self._require_foreground(app),
                 "editor_before": editor_before.evidence(),
-                "selective_preview": selected_preview.evidence(),
+                "selective_expected": expected.evidence(),
                 "editor_after_apply": editor_after_apply.evidence(),
                 "editor_after_undo": editor_after_undo.evidence(),
                 "source_before": source_before.evidence(),
                 "source_after": source_after.evidence(),
-                "selective_matches_editor": editor_after_apply == selected_preview,
-                "selective_matches_expected": selected_preview == expected_preview,
+                "selective_matches_expected": editor_after_apply == expected,
                 "one_undo_transaction": editor_after_undo == editor_before,
                 "undo_count": 1,
             }
@@ -1973,52 +1542,51 @@ class Goal07Harness(ClipboardNativeHarness):
             case_root, data, config, workspace, stderr, source = self.profile(
                 CASE_ACCEPT_ALL_PREVIEW, provider.base_url
             )
+            edits = provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT)
             app = self.launch_app(source, data, config, workspace, stderr)
             self.activate_source_layout(app)
             self.run_review(app, provider)
-            self.request_revision(app, provider=provider)
+            self.request_revision(app, provider=provider, hunks=len(edits))
             editor_before = self.editor_fingerprint(app)
-            self._click_id(app, REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)
-            preview_text = self._preview_source_text(app)
-            final_preview = fingerprint_text(preview_text)
-            expected = fingerprint_bytes(
-                apply_edits(
-                    EDITOR_SOURCE_BYTES,
-                    provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT),
-                )
-            )
+            expected_bytes = apply_edits(EDITOR_SOURCE_BYTES, edits)
+            expected = fingerprint_bytes(expected_bytes)
+            self.decide_hunks(app, [True] * len(edits))
             editor_after_preview = self.editor_fingerprint(app)
             copy_editor_before = editor_after_preview
-            copy_dirty_before = self._document_dirty(app, source.name)
+            copy_dirty_before = self.document_dirty(app)
             copy_source_before = sha256_file(source)
             clipboard_before = self.read_text_clipboard()
             try:
                 # Clear the clipboard first so an unchanged old value cannot
                 # accidentally satisfy the copy assertion.
                 self.write_text_clipboard(None)
-                self._click_id(app, REVISION_COPY_ACCESSIBILITY_ID)
-                copied = wait_until(
-                    lambda: self.read_text_clipboard(),
-                    self.ui_timeout,
-                    "REVISION_COPY_CLIPBOARD_TIMEOUT",
-                    interval=0.05,
+                copy = self.find_control(
+                    app,
+                    REVISION_COPY_AUTOMATION_ID,
+                    "Button",
+                    "REVISION_COPY_UIA_TIMEOUT",
+                    "REVISION_COPY_UIA_CONTRACT_MISMATCH",
                 )
-                copy_editor_after = self.editor_fingerprint(app)
-                copy_dirty_after = self._document_dirty(app, source.name)
-                copy_source_after = sha256_file(source)
+                self.click_control(copy, "REVISION_COPY_CLICK_FAILED")
+                copied = self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
             finally:
                 self.write_text_clipboard(clipboard_before)
+            copy_editor_after = self.editor_fingerprint(app)
+            copy_dirty_after = self.document_dirty(app)
+            copy_source_after = sha256_file(source)
+            self.done(app)
+            editor_after_done = self.editor_fingerprint(app)
             observations = {
                 "flow": CASE_FLOWS[CASE_ACCEPT_ALL_PREVIEW],
                 "process_context": app.security_context.evidence(),
                 "foreground_verified": self._require_foreground(app),
                 "editor_before_apply": editor_before.evidence(),
                 "editor_after_preview": editor_after_preview.evidence(),
-                "preview_fingerprint": final_preview.evidence(),
-                "final_preview": final_preview.evidence(),
-                "accept_all_matches_expected": final_preview == expected,
-                "copy_preview_fingerprint": fingerprint_text(str(copied)).evidence(),
-                "copy_preview_exact": str(copied) == preview_text,
+                "accept_all_expected": expected.evidence(),
+                "editor_after_done": editor_after_done.evidence(),
+                "accept_all_matches_expected": editor_after_done == expected,
+                "copy_preview_fingerprint": fingerprint_text(copied).evidence(),
+                "copy_preview_exact": copied.encode("utf-8") == expected_bytes,
                 "copy_editor_before": copy_editor_before.evidence(),
                 "copy_editor_after": copy_editor_after.evidence(),
                 "copy_editor_unchanged": copy_editor_before == copy_editor_after,
@@ -2044,17 +1612,26 @@ class Goal07Harness(ClipboardNativeHarness):
             case_root, data, config, workspace, stderr, source = self.profile(
                 CASE_STALE, provider.base_url
             )
+            hunks = len(provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT))
             app = self.launch_app(source, data, config, workspace, stderr)
             self.activate_source_layout(app)
             self.run_review(app, provider)
-            self.request_revision(app, provider=provider)
+            self.request_revision(app, provider=provider, hunks=hunks)
             editor_before = self.editor_fingerprint(app)
             self.replace_editor(app, STALE_EDIT_TEXT)
             editor_after_edit = self.editor_fingerprint(app)
-            self._find_stale_control(app)
-            apply_button, apply_accessibility_reported_enabled = self._apply_button_state(app)
+            self.wait_name(app, REVISION_STALE_TEXT, "Text", "REVISION_STALE_UIA_TIMEOUT")
+            if self.name_present(app, REVISION_ACCEPT_NAME, "Button"):
+                raise HarnessFailure("STALE_REVISION_OFFERS_ACCEPT")
+            done = self.control_by_name(
+                app.hwnd, REVISION_DONE_NAME, "Button", "REVISION_DONE_UIA_CONTRACT_MISMATCH"
+            )
+            done_enabled = bool(done is not None and done.is_enabled())
             source_before = sha256_file(source)
-            self.click_control(apply_button, "REVISION_APPLY_CLICK_FAILED")
+            if done is not None:
+                self.click_control(done, "REVISION_DONE_CLICK_FAILED")
+            self.focus_editor(app)
+            self.win32.send_shortcut(app.hwnd, VK_RETURN)
             editor_after_activation_attempt = self.editor_fingerprint(app)
             source_after = sha256_file(source)
             observations = {
@@ -2069,8 +1646,8 @@ class Goal07Harness(ClipboardNativeHarness):
                 "stale_visible": True,
                 "apply_activation_attempted": True,
                 "apply_disabled_source_contract": stale_apply_source_contract_ok(),
-                "apply_control_observed": apply_button is not None,
-                "apply_accessibility_reported_enabled": apply_accessibility_reported_enabled,
+                "apply_control_observed": done is not None,
+                "apply_accessibility_reported_enabled": done_enabled,
                 "editor_after_activation_attempt": editor_after_activation_attempt.evidence(),
                 "stale_no_mutation": (
                     source_before == source_after
@@ -2092,19 +1669,19 @@ class Goal07Harness(ClipboardNativeHarness):
             case_root, data, config, workspace, stderr, source = self.profile(
                 CASE_SAVE_CONFLICT, provider.base_url
             )
+            hunks = len(provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT))
             app = self.launch_app(source, data, config, workspace, stderr)
             self.activate_source_layout(app)
             self.run_review(app, provider)
-            self.request_revision(app, provider=provider)
-            self._click_id(app, REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)
-            self._click_id(app, REVISION_APPLY_ACCESSIBILITY_ID)
+            self.request_revision(app, provider=provider, hunks=hunks)
+            self.decide_hunks(app, [True] * hunks)
+            self.done(app)
             editor_after_apply = self.editor_fingerprint(app)
             write_durable(source, EXTERNAL_SOURCE_BYTES)
             external_source_before = sha256_file(source)
-            conflict_visible_before_save = self._status_contains_conflict(app)
-            self.focus_editor(app)
-            self.win32.send_shortcut(app.hwnd, VK_S)
-            conflict = self._status_contains_conflict(app)
+            conflict_visible_before_save = self.name_present(app, CONFLICT_HEADING, "Text")
+            self.save_via_menu(app)
+            self.wait_name(app, CONFLICT_HEADING, "Text", "SAVE_CONFLICT_UIA_TIMEOUT")
             external_source_after = sha256_file(source)
             observations = {
                 "flow": CASE_FLOWS[CASE_SAVE_CONFLICT],
@@ -2113,9 +1690,9 @@ class Goal07Harness(ClipboardNativeHarness):
                 "editor_after_apply": editor_after_apply.evidence(),
                 "external_source_before": external_source_before.evidence(),
                 "external_source_after": external_source_after.evidence(),
-                "save_shortcut_sent": True,
+                "save_command_sent": True,
                 "conflict_visible_before_save": conflict_visible_before_save,
-                "safe_save_conflict_visible": conflict,
+                "safe_save_conflict_visible": True,
                 "safe_save_no_overwrite": external_source_before == external_source_after,
             }
             return self._finalize_observations(provider, case_root, app, observations)
@@ -2133,57 +1710,43 @@ class Goal07Harness(ClipboardNativeHarness):
             case_root, data, config, workspace, stderr, source = self.profile(
                 CASE_TRUST_REVOKE, provider.base_url, html=True
             )
+            edits = provider_fixtures.fixture_edits(HTML_EDITOR_SOURCE_TEXT)
             app = self.launch_app(source, data, config, workspace, stderr)
-            trust = self.find_control(
-                app,
-                TRUST_AUTOMATION_ID,
-                "Button",
-                "TRUST_BUTTON_UIA_TIMEOUT",
-                "TRUST_BUTTON_UIA_CONTRACT_MISMATCH",
-            )
-            self.click_control(trust, "TRUST_BUTTON_CLICK_FAILED")
-
-            def trusted_label() -> str | None:
-                label = self._trust_label(app)
-                return label if self._is_trusted_label(label) else None
-
-            trusted_label = wait_until(
-                trusted_label,
+            self.menu_command(app, MENU_WEB_AUTOMATION_ID)
+            self._press_named(app, TRUST_SCRIPTS_NAME, "TRUST_BUTTON")
+            self._press_named(app, TRUST_CONFIRM_NAME, "TRUST_CONFIRM")
+            self.wait_name(app, TRUSTED_BANNER, "Text", "TRUST_ENABLE_STATE_TIMEOUT")
+            trust_before = True
+            # Leaving the Web pane must hand keyboard ownership back to the
+            # main window before the Review shortcut is sent.
+            self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
+            self.editor_control(app)
+            wait_until(
+                lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
                 self.ui_timeout,
-                "TRUST_ENABLE_STATE_TIMEOUT",
-                interval=0.05,
+                "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
             )
-            trust_before = self._is_trusted_label(str(trusted_label))
-            # HTML opens in Web. Observe a visible, natively focused WebHost
-            # handing input to the main HWND before any helper can refocus it.
-            self.activate_source_from_focused_web(app)
             self.run_review(app, provider, preserve_focus=True)
-            self.request_revision(app, provider=provider)
-            self._click_id(app, REVISION_ACCEPT_ALL_ACCESSIBILITY_ID)
-            editor_before_apply = self.editor_fingerprint(app)
-            expected = fingerprint_bytes(
-                apply_edits(
-                    HTML_EDITOR_SOURCE_BYTES,
-                    provider_fixtures.fixture_edits(HTML_EDITOR_SOURCE_TEXT),
+            self.request_revision(app, provider=provider, hunks=len(edits))
+            preview_text = self._named_texts(
+                app, REVISION_PROPOSAL_AFTER_AUTOMATION_ID, "REVISION_PROPOSAL_AFTER"
+            )
+            preview = fingerprint_text(preview_text)
+            expected_bytes = apply_edits(HTML_EDITOR_SOURCE_BYTES, edits)
+            expected = fingerprint_bytes(expected_bytes)
+            proposal = fingerprint_text(
+                next(
+                    line
+                    for line in expected_bytes.decode("utf-8").split("\n")
+                    if edits[0]["replacement"] in line
                 )
             )
-            preview_text = self._preview_source_text(app)
-            preview = fingerprint_text(preview_text)
-            self._click_id(app, REVISION_APPLY_ACCESSIBILITY_ID)
+            editor_before_apply = self.editor_fingerprint(app)
+            self.decide_hunks(app, [True] * len(edits))
+            self.done(app)
             editor_after_apply = self.editor_fingerprint(app)
-
-            def restricted_label() -> str | None:
-                label = self._trust_label(app)
-                return label if self._is_restricted_label(label) else None
-
-            restricted_label = wait_until(
-                restricted_label,
-                self.ui_timeout,
-                "TRUST_RESTRICTED_STATE_TIMEOUT",
-                interval=0.05,
-            )
-            trust_order_contract = trust_apply_source_contract_ok()
-            preview_inert_contract = preview_inert_source_contract_ok()
+            self.menu_command(app, MENU_WEB_AUTOMATION_ID)
+            self.wait_name(app, RESTRICTED_BANNER, "Text", "TRUST_RESTRICTED_STATE_TIMEOUT")
             observations = {
                 "flow": CASE_FLOWS[CASE_TRUST_REVOKE],
                 "process_context": app.security_context.evidence(),
@@ -2193,19 +1756,19 @@ class Goal07Harness(ClipboardNativeHarness):
                 "editor_after_apply": editor_after_apply.evidence(),
                 "executable_expected": expected.evidence(),
                 "executable_matches_expected": editor_after_apply == expected,
-                "restricted_after_apply": self._is_restricted_label(str(restricted_label)),
+                "restricted_after_apply": True,
                 "executable_change": editor_before_apply != editor_after_apply,
-                "trust_revocation_order_source_contract": trust_order_contract,
-                "preview_inert_source_contract": preview_inert_contract,
+                "trust_revocation_order_source_contract": trust_apply_source_contract_ok(),
+                "preview_inert_source_contract": preview_inert_source_contract_ok(),
                 "preview_fingerprint": preview.evidence(),
-                "preview_matches_expected": preview == expected,
+                "proposal_expected": proposal.evidence(),
+                "preview_matches_expected": preview == proposal,
                 "preview_contains_executable_text": (
                     "<script>" in preview_text and 'goal07 = "new"' in preview_text
                 ),
             }
-            self._click_id(app, REVISION_RESULT_DISMISS_ACCESSIBILITY_ID)
-            self._click_id(app, REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID)
-            self.win32.post_close(app.hwnd)
+            # The applied buffer is dirty: quit through the guard, unsaved.
+            self.quit_via_menu(app)
             self.click_lifecycle_decision(app, "Discard")
             self.wait_process_exit(app)
             return self._finalize_observations(provider, case_root, app, observations)

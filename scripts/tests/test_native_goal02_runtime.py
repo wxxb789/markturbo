@@ -3,6 +3,7 @@
 from ._native_goal02_support import *
 
 import sys
+import time
 from types import SimpleNamespace
 
 
@@ -160,43 +161,38 @@ class ArtifactContainsTests(unittest.TestCase):
 
 
 class RuntimeEvidenceTests(unittest.TestCase):
-    def test_log_marker_wait_reads_only_bytes_appended_after_the_offset(self) -> None:
-        marker = b"DEBUG recovery checkpoint written\n"
+    def test_checkpoint_signal_is_only_a_canonical_recovery_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "markturbo.log"
-            path.write_bytes(marker)
+            data = Path(temporary) / "data"
+            self.assertEqual(HARNESS.canonical_recovery_records(data), [])
+            recovery = data / "recovery"
+            recovery.mkdir(parents=True)
+            (recovery / "junk.mtrecovery").write_bytes(b"ignored")
+            (recovery / (("b" * 64) + ".tmp")).write_bytes(b"partial")
+            (recovery / (("c" * 64) + ".mtrecovery")).mkdir()
+            self.assertEqual(HARNESS.canonical_recovery_records(data), [])
 
-            def append_then_match(predicate, timeout, code, interval):
-                self.assertEqual((timeout, code, interval), (1.0, "TIMEOUT", 0.025))
-                self.assertFalse(predicate())
-                with path.open("ab") as handle:
-                    handle.write(b"DEBUG recovery checkpoint ")
-                self.assertFalse(predicate())
-                with path.open("ab") as handle:
-                    handle.write(b"written\n")
-                self.assertTrue(predicate())
+            canonical = recovery / (("a" * 64) + ".mtrecovery")
+            canonical.write_bytes(b"sealed")
+            self.assertEqual(HARNESS.canonical_recovery_records(data), [canonical])
 
-            with mock.patch.object(HARNESS, "wait_until", side_effect=append_then_match):
-                HARNESS.wait_for_log_marker(
-                    path,
-                    len(marker),
-                    CHECKPOINT_SUCCESS_PRESENT,
-                    1.0,
-                    "TIMEOUT",
-                )
+    def test_checkpoint_wait_is_bounded_by_the_ten_second_loss_window(self) -> None:
+        harness = object.__new__(HARNESS.Goal02Harness)
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            (data / "recovery").mkdir(parents=True)
+            (data / "recovery" / (("a" * 64) + ".mtrecovery")).write_bytes(b"sealed")
+            started = time.perf_counter()
+            self.assertLessEqual(harness.wait_checkpoint_record(data, started), 10_000)
 
-    def test_checkpoint_log_parser_requires_written_marker_after_offset(self) -> None:
-        marker = b"DEBUG recovery checkpoint written\n"
-        self.assertTrue(CHECKPOINT_SUCCESS_PRESENT(marker))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(b"recovery checkpoint failed; durable=false\n"))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(b"recovery checkpoint written but failed\n"))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(marker + b"other\n", len(marker)))
+            with self.assertRaises(HARNESS_FAILURE) as late:
+                harness.wait_checkpoint_record(data, started - 10.5)
+            self.assertEqual(late.exception.code, "RECOVERY_RECORD_EXCEEDED_10_SECONDS")
 
-    def test_startup_log_parser_requires_finished_marker_after_offset(self) -> None:
-        marker = b"DEBUG recovery startup finished\n"
-        self.assertTrue(RECOVERY_STARTUP_FINISHED_PRESENT(marker))
-        self.assertFalse(RECOVERY_STARTUP_FINISHED_PRESENT(b"recovery startup began\n"))
-        self.assertFalse(RECOVERY_STARTUP_FINISHED_PRESENT(marker + b"other\n", len(marker)))
+            empty = Path(temporary) / "empty"
+            with self.assertRaises(HARNESS_FAILURE) as missing:
+                harness.wait_checkpoint_record(empty, time.perf_counter() - 9.95)
+            self.assertEqual(missing.exception.code, "RECOVERY_RECORD_EXCEEDED_10_SECONDS")
 
     def test_live_recovery_scan_requires_canonical_encrypted_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

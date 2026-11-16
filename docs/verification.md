@@ -145,12 +145,42 @@ Retained acceptance, ablation, and measurement evidence is indexed in
 
 ## Native harness status
 
-The nsh app has stable headless test IDs but not yet a complete native
-automation ID contract. The historical goal-03/06/07 harnesses target retired
-GPUI IDs and source files; their unit tests are in `check native`, not the fast
-gate. Rewriting the selectors and cases is a bounded follow-up before native
-acceptance can pass on nsh; the absence of that evidence is recorded as pending,
-not converted into a passing result.
+The goal-02/03/06/07 harnesses (`scripts/markturbo_tools/native/`) drive the
+nsh UI. They have not yet run live against an nsh build; no nsh acceptance
+evidence exists, and that absence stays pending, not a pass. Their unit tests
+run in `check native`, not the fast gate. Pass the packaged app with
+`--exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe`.
+
+How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
+
+- A view's `test_id` is the UIA AutomationId, but only when the view is itself
+  an element: a Button (pressable), Edit (input), Text, or a labelled Group.
+  Unlabelled wrappers are flattened, so the `quiet_action`/`primary_action`
+  ids sit on no element; those buttons are found by their visible label (the
+  Name) with no AutomationId.
+- Title-menu rows (`title-menu-*`) are reached by invoking `title-settings`
+  first, so a command can move between the title row and that menu without a
+  selector change. Save, Save As, Quit and the Edit/Web modes go through it.
+- The editor's accessible element is the `Markdown source` IME input; its UIA
+  Value is not the document. The harness reads the document with Ctrl+A, Ctrl+C
+  and restores the user's clipboard. Selection, Undo and Review use the
+  editor's own keys (Ctrl+A, Ctrl+Z, Ctrl+Enter).
+- UIA Invoke is one tap. The consent card's `consent-send` sends only after a
+  held press, so the harnesses hold the real pointer past the control's 1.2 s
+  threshold; an Invoke is never consent.
+
+Each harness checks that the selectors it uses still exist in production Rust
+source (test modules and comments do not count) before launching.
+
+Known product gaps the ported cases will report as FAIL until the UI provides
+them: no selection Review command (goal 06/07 selection scope expects a
+`title-menu-review-selection` row); no Copy of an approved Revision result
+(`revision-copy`) and no labelled Group around the docked hunk's proposed lines
+(`revision-proposal-after`); WM_CLOSE/Alt+F4 does not raise the unsaved-changes
+guard; Done does not revoke Web script trust before replacing the buffer; Save
+As refuses an existing destination after the native overwrite prompt; a stale
+recent row is not marked; and opening a folder or the sample does not leave the
+welcome.
 
 Goal 09's release-build screenshot matrix is produced by:
 

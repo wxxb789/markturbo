@@ -506,3 +506,24 @@ def rust_source_views(source: str) -> tuple[str, str] | None:
         index += 1
 
     return "".join(code_only), "".join(comment_free)
+
+
+def production_markers_present(root: Path, requirements: dict[str, tuple[str, ...]]) -> bool:
+    """Whether each file's comment-free production source holds its markers.
+
+    `requirements` maps a repository-relative Rust file to the literals (test
+    ids, labels) a native harness selects by. Test-only items and comments
+    cannot supply a marker; an unreadable or unparsable file fails closed.
+    """
+    for relative, markers in requirements.items():
+        try:
+            source = production_source(root / relative)
+        except OSError:
+            return False
+        views = None if source is None else rust_source_views(source)
+        if views is None:
+            return False
+        _, comment_free = views
+        if any(marker not in comment_free for marker in markers):
+            return False
+    return True

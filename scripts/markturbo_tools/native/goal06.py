@@ -6,6 +6,11 @@ diagnostic. The explicit configured-provider mode sends only the fixed test
 document to an already-running loopback provider using a fresh process-only
 credential. Both modes bind PASS evidence to an executable hash and prove the
 editor and source file stayed byte-identical.
+
+On the nsh UI the document Review is Ctrl+Enter from the editor; the consent
+card authorizes only a real pointer hold on `consent-send` (a UIA Invoke is a
+tap and sends nothing). The selection Review needs a selection command the
+UI must expose as the title-menu row `title-menu-review-selection`.
 """
 
 from __future__ import annotations
@@ -14,12 +19,11 @@ import argparse
 import hashlib
 import json
 import math
-import re
 import uuid
 from pathlib import Path
 from typing import Any
 
-from .source_contract import production_source, rust_source_views
+from .source_contract import production_markers_present
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -27,11 +31,8 @@ from .runtime import (
     REASON_CODE_RE,
     SAFE_FAILURE_TYPES,
     SHA256_RE,
-    SOURCE_EDITOR_AUTOMATION_ID,
-    TASK_DIALOG_BUTTON_CLASS,
     VK_A,
-    VK_CONTROL,
-    Fingerprint,
+    VK_RETURN,
     HarnessBlocked,
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
@@ -39,7 +40,6 @@ from .runtime import (
     artifact_contains,
     complete_evidence as complete_evidence_envelope,
     finite_nonnegative,
-    key_input,
     load_pywinauto,
     main_native_acceptance,
     normalize_expected_hash,
@@ -51,7 +51,6 @@ from .runtime import (
     validate_environment as validate_runtime_environment,
     validate_fingerprint,
     validate_process_context,
-    wait_until,
     write_durable,
 )
 
@@ -62,19 +61,29 @@ DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-06-native-accep
 
 SCHEMA = "markturbo.goal-06-native-acceptance"
 SCHEMA_VERSION = 1
-VK_SHIFT = 0x10
-VK_MENU = 0x12
-VK_R = 0x52
-
-REVIEW_RUN_ACCESSIBILITY_ID = "markturbo-review-run"
-REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID = "markturbo-review-diagnostic"
-REVIEW_RESULT_ACCESSIBILITY_ID = "markturbo-review-result"
-MISSING_CREDENTIAL_MESSAGE = (
-    "Review is unavailable because the configured model provider has no credential."
-)
-REVIEW_READY_MESSAGE = "Review ready"
-REVIEW_CONSENT_ACCESSIBILITY_ID = "CommandButton_1"
-REVIEW_CONSENT_MESSAGE = "Send"
+# `ui/review.rs` `unavailable`: the explicit local diagnostic, an anonymous Text.
+MISSING_CREDENTIAL_MESSAGE = "No model set up"
+# `ui/review.rs` `intent`: the first line of a structured result.
+REVIEW_RESULT_MARKER = "Understood:"
+# `ui/consent.rs` `send_button`: the hold control carries its own test id.
+CONSENT_SEND_AUTOMATION_ID = "consent-send"
+# `ui/consent.rs` `scope_row`: the scope word a selection binding shows.
+CONSENT_SELECTION_SCOPE = "Selection"
+# Longer than the control's 1.2s hold (`HOLD_MS`), so a send completes.
+CONSENT_HOLD_SECONDS = 1.8
+# Not in the nsh UI yet: the selection Review command this harness requires.
+REVIEW_SELECTION_MENU_AUTOMATION_ID = "title-menu-review-selection"
+UI_SOURCE_REQUIREMENTS = {
+    "crates/mt-app/src/ui/titlebar.rs": ('"mod+enter"', '"title-settings"'),
+    "crates/mt-app/src/ui/review.rs": ('"No model set up"', '"Understood:"'),
+    "crates/mt-app/src/ui/consent.rs": (
+        '"consent-send"',
+        '"Selection"',
+        ".long_press_delay(HOLD_MS)",
+        ".on_press_down(",
+    ),
+    "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
+}
 
 MISSING_CREDENTIAL_MODE = "missing_credential_diagnostic"
 CONFIGURED_PROVIDER_MODE = "configured_provider_success"
@@ -84,12 +93,24 @@ CASE_DOCUMENT = "configured_provider_missing_credential_document"
 CASE_SELECTION = "configured_provider_missing_credential_selection"
 REQUIRED_CASE_IDS = (CASE_DOCUMENT, CASE_SELECTION)
 CASE_FLOWS = {
-    CASE_DOCUMENT: "configured provider without credential -> document review -> explicit diagnostic",
-    CASE_SELECTION: "configured provider without credential -> selection review -> explicit diagnostic",
+    CASE_DOCUMENT: (
+        "configured provider without credential -> Ctrl+Enter document review -> "
+        "explicit diagnostic"
+    ),
+    CASE_SELECTION: (
+        "configured provider without credential -> menu selection review -> "
+        "explicit diagnostic"
+    ),
 }
 CONFIGURED_PROVIDER_CASE_FLOWS = {
-    CASE_DOCUMENT: "configured provider with ephemeral credential -> document review -> explicit consent -> structured success",
-    CASE_SELECTION: "configured provider with ephemeral credential -> selection review -> explicit consent -> structured success",
+    CASE_DOCUMENT: (
+        "configured provider with ephemeral credential -> Ctrl+Enter document review -> "
+        "hold-to-send consent -> structured success"
+    ),
+    CASE_SELECTION: (
+        "configured provider with ephemeral credential -> menu selection review -> "
+        "selection-scope hold-to-send consent -> structured success"
+    ),
 }
 
 DOCUMENT_SENTINEL = "MTG06-NATIVE-READ-ONLY-SENTINEL"
@@ -410,47 +431,9 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
 
 
 def source_contract_failure() -> str | None:
-    workspace = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
-    )
-    review = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
-    )
-    if workspace is None or review is None:
+    """The nsh selectors this harness drives must exist in production source."""
+    if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
         return "REVIEW_SOURCE_CONTRACT_MISSING"
-    workspace_views = rust_source_views(workspace)
-    review_views = rust_source_views(review)
-    if workspace_views is None or review_views is None:
-        return "REVIEW_SOURCE_CONTRACT_MISSING"
-    _, workspace_comment_free = workspace_views
-    review_code, _ = review_views
-
-    for value in (
-        REVIEW_RUN_ACCESSIBILITY_ID,
-        REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID,
-        REVIEW_RESULT_ACCESSIBILITY_ID,
-    ):
-        if value not in workspace_comment_free:
-            return "REVIEW_UIA_CONTRACT_MISSING"
-    for contract in (
-        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None)',
-        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None)',
-    ):
-        if contract not in workspace_comment_free:
-            return "REVIEW_SOURCE_CONTRACT_MISSING"
-    for contract in (
-        "accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID)",
-        "accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID)",
-        "accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID)",
-        "gpui_kit::Role::Label",
-        ".aria_value(diagnostic.diagnostic.message.as_str())",
-        "ReviewError::MissingCredential",
-        "i18n::Key::ReviewMissingCredential",
-        "PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx))",
-        "i18n::Key::ReviewReady",
-    ):
-        if contract not in review_code:
-            return "REVIEW_SOURCE_CONTRACT_MISSING"
     return None
 
 
@@ -555,89 +538,37 @@ class Goal06Harness(BaseNativeHarness):
         )
         return case_root, data_root, config_root, workspace_root, stderr_path, source
 
-    def request_review_shortcut(self, app: Any, target: str) -> None:
+    def request_review(self, app: Any, target: str) -> None:
+        """Document: Ctrl+Enter from the editor. Selection: select all, then
+        the title menu's selection Review row."""
         self.focus_editor(app)
-        self.win32.require_foreground(app.hwnd, self.ui_timeout)
         if target == CASE_SELECTION:
             self.win32.send_shortcut(app.hwnd, VK_A)
-        inputs = [key_input(VK_CONTROL, False), key_input(VK_SHIFT, False)]
-        if target == CASE_SELECTION:
-            inputs.append(key_input(VK_MENU, False))
-        inputs.extend([key_input(VK_R, False), key_input(VK_R, True)])
-        if target == CASE_SELECTION:
-            inputs.append(key_input(VK_MENU, True))
-        inputs.extend([key_input(VK_SHIFT, True), key_input(VK_CONTROL, True)])
-        self.win32.send_inputs(inputs)
+            self.menu_command(app, REVIEW_SELECTION_MENU_AUTOMATION_ID)
+            return
+        self.win32.send_shortcut(app.hwnd, VK_RETURN)
 
-    def run_review(self, app: Any) -> None:
-        button = self.find_control(
+    def approve_review_consent(self, app: Any, target: str) -> None:
+        send = self.find_control(
             app,
-            REVIEW_RUN_ACCESSIBILITY_ID,
+            CONSENT_SEND_AUTOMATION_ID,
             "Button",
-            "REVIEW_RUN_UIA_TIMEOUT",
-            "REVIEW_RUN_UIA_CONTRACT_MISMATCH",
-        )
-        self.click_control(button, "REVIEW_RUN_CLICK_FAILED")
-
-    def approve_review_consent(self, app: Any) -> None:
-        def locate() -> Any | None:
-            dialogs = self.win32.owned_task_dialogs(app.process.pid, app.hwnd)
-            if len(dialogs) > 1:
-                raise HarnessFailure("MULTIPLE_REVIEW_CONSENT_DIALOGS")
-            if not dialogs:
-                return None
-            return self.control_by_id(
-                dialogs[0],
-                REVIEW_CONSENT_ACCESSIBILITY_ID,
-                "Button",
-                "REVIEW_CONSENT_UIA_CONTRACT_MISMATCH",
-                REVIEW_CONSENT_MESSAGE,
-                TASK_DIALOG_BUTTON_CLASS,
-            )
-
-        button = wait_until(
-            locate,
-            self.ui_timeout,
             "REVIEW_CONSENT_UIA_TIMEOUT",
-            interval=0.025,
+            "REVIEW_CONSENT_UIA_CONTRACT_MISMATCH",
         )
-        self.click_control(button, "REVIEW_CONSENT_CLICK_FAILED")
+        if target == CASE_SELECTION and not self.name_present(
+            app, CONSENT_SELECTION_SCOPE, "Text"
+        ):
+            raise HarnessFailure("REVIEW_CONSENT_SELECTION_SCOPE_MISSING")
+        self.hold_control(app, send, CONSENT_HOLD_SECONDS, "REVIEW_CONSENT_HOLD_FAILED")
 
     def require_missing_credential_diagnostic(self, app: Any) -> None:
-        diagnostic = self.find_control(
-            app,
-            REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID,
-            "Text",
-            "REVIEW_DIAGNOSTIC_UIA_TIMEOUT",
-            "REVIEW_DIAGNOSTIC_UIA_CONTRACT_MISMATCH",
-        )
-        try:
-            if diagnostic.element_info.name != MISSING_CREDENTIAL_MESSAGE:
-                raise HarnessFailure("REVIEW_DIAGNOSTIC_TEXT_MISMATCH")
-        except HarnessFailure:
-            raise
-        except Exception as error:
-            raise HarnessFailure(
-                "REVIEW_DIAGNOSTIC_UIA_QUERY_FAILED", safe_exception_name(error)
-            ) from None
+        self.wait_name(app, MISSING_CREDENTIAL_MESSAGE, "Text", "REVIEW_DIAGNOSTIC_UIA_TIMEOUT")
 
     def require_structured_success_result(self, app: Any) -> None:
-        result = self.find_control(
-            app,
-            REVIEW_RESULT_ACCESSIBILITY_ID,
-            "Text",
-            "REVIEW_RESULT_UIA_TIMEOUT",
-            "REVIEW_RESULT_UIA_CONTRACT_MISMATCH",
+        self.wait_name(
+            app, REVIEW_RESULT_MARKER, "Text", "REVIEW_RESULT_UIA_TIMEOUT", max(self.ui_timeout, 60.0)
         )
-        try:
-            if result.element_info.name != REVIEW_READY_MESSAGE:
-                raise HarnessFailure("REVIEW_RESULT_TEXT_MISMATCH")
-        except HarnessFailure:
-            raise
-        except Exception as error:
-            raise HarnessFailure(
-                "REVIEW_RESULT_UIA_QUERY_FAILED", safe_exception_name(error)
-            ) from None
 
     def scenario(self, case_id: str) -> dict[str, Any]:
         case_root, data, config, workspace, stderr, source = self.profile(case_id)
@@ -648,10 +579,9 @@ class Goal06Harness(BaseNativeHarness):
             source_before = sha256_file(source)
             if editor_before != source_before:
                 raise HarnessFailure("INITIAL_EDITOR_SOURCE_MISMATCH")
-            self.request_review_shortcut(app, case_id)
-            self.run_review(app)
+            self.request_review(app, case_id)
             if self.configured_provider:
-                self.approve_review_consent(app)
+                self.approve_review_consent(app, case_id)
                 self.require_structured_success_result(app)
             else:
                 self.require_missing_credential_diagnostic(app)
@@ -661,6 +591,8 @@ class Goal06Harness(BaseNativeHarness):
                 raise HarnessFailure("REVIEW_CHANGED_EDITOR")
             if source_after != source_before:
                 raise HarnessFailure("REVIEW_CHANGED_SOURCE")
+            if self.document_dirty(app):
+                raise HarnessFailure("REVIEW_MARKED_DOCUMENT_DIRTY")
             self.close_app(app)
             observations = {
                 "editor_before": editor_before.evidence(),

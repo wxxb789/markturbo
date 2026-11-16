@@ -13,6 +13,7 @@ from unittest import mock
 
 from scripts.markturbo_tools.native import goal06 as HARNESS
 from scripts.markturbo_tools.native import runtime
+from scripts.markturbo_tools.native import source_contract
 
 
 CASE_DOCUMENT = HARNESS.CASE_DOCUMENT
@@ -389,31 +390,96 @@ class PersistentCredentialPreflightTests(unittest.TestCase):
 
 
 class HarnessContractTests(unittest.TestCase):
-    def test_configured_mode_approves_the_send_task_dialog(self) -> None:
-        events: list[tuple[str, object]] = []
+    @staticmethod
+    def consent_harness(events: list[tuple[str, object]], *, scope_shown: bool = True):
         button = object()
-        app = type("App", (), {"process": type("Process", (), {"pid": 7})(), "hwnd": 42})()
-
-        class FakeWin32:
-            def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
-                events.append(("dialogs", (process_id, owner_hwnd)))
-                return [99]
 
         class FakeHarness:
-            win32 = FakeWin32()
             ui_timeout = 1.0
 
-            def control_by_id(self, *args: object) -> object:
-                events.append(("control", args))
+            def find_control(self, app, automation_id, control_type, timeout_code, mismatch_code):
+                events.append(("control", (automation_id, control_type, timeout_code)))
                 return button
 
-            def click_control(self, value: object, failure_code: str) -> None:
-                events.append(("click", (value, failure_code)))
+            def name_present(self, app, name, control_type):
+                events.append(("scope", (name, control_type)))
+                return scope_shown
 
-        HARNESS.Goal06Harness.approve_review_consent(FakeHarness(), app)
+            def hold_control(self, app, control, seconds, failure_code):
+                events.append(("hold", (control, seconds, failure_code)))
 
-        self.assertEqual(events[0], ("dialogs", (7, 42)))
-        self.assertEqual(events[-1], ("click", (button, "REVIEW_CONSENT_CLICK_FAILED")))
+            def click_control(self, *_args):
+                events.append(("click", None))
+
+            def invoke_control(self, *_args):
+                events.append(("invoke", None))
+
+        return FakeHarness(), button
+
+    def test_configured_mode_approves_consent_only_by_a_full_pointer_hold(self) -> None:
+        events: list[tuple[str, object]] = []
+        harness, button = self.consent_harness(events)
+        app = type("App", (), {"hwnd": 42})()
+
+        HARNESS.Goal06Harness.approve_review_consent(harness, app, CASE_DOCUMENT)
+
+        self.assertEqual(
+            events[0],
+            ("control", (HARNESS.CONSENT_SEND_AUTOMATION_ID, "Button", "REVIEW_CONSENT_UIA_TIMEOUT")),
+        )
+        self.assertEqual(
+            events[-1],
+            ("hold", (button, HARNESS.CONSENT_HOLD_SECONDS, "REVIEW_CONSENT_HOLD_FAILED")),
+        )
+        self.assertNotIn("click", [event[0] for event in events])
+        self.assertNotIn("invoke", [event[0] for event in events])
+        # The control's own hold threshold is 1.2s; the harness must exceed it.
+        self.assertGreater(HARNESS.CONSENT_HOLD_SECONDS, 1.2)
+
+    def test_selection_consent_requires_the_selection_scope_before_holding(self) -> None:
+        events: list[tuple[str, object]] = []
+        harness, _button = self.consent_harness(events, scope_shown=False)
+        app = type("App", (), {"hwnd": 42})()
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            HARNESS.Goal06Harness.approve_review_consent(harness, app, CASE_SELECTION)
+
+        self.assertEqual(raised.exception.code, "REVIEW_CONSENT_SELECTION_SCOPE_MISSING")
+        self.assertIn(("scope", (HARNESS.CONSENT_SELECTION_SCOPE, "Text")), events)
+        self.assertNotIn("hold", [event[0] for event in events])
+
+    def test_review_requests_use_the_editor_shortcut_or_the_selection_menu_row(self) -> None:
+        for case_id, expected in (
+            (CASE_DOCUMENT, [("focus", 42), ("shortcut", runtime.VK_RETURN)]),
+            (
+                CASE_SELECTION,
+                [
+                    ("focus", 42),
+                    ("shortcut", runtime.VK_A),
+                    ("menu", HARNESS.REVIEW_SELECTION_MENU_AUTOMATION_ID),
+                ],
+            ),
+        ):
+            with self.subTest(case=case_id):
+                events: list[tuple[str, object]] = []
+
+                class FakeWin32:
+                    def send_shortcut(self, hwnd, key):
+                        events.append(("shortcut", key))
+
+                class FakeHarness:
+                    win32 = FakeWin32()
+
+                    def focus_editor(self, app):
+                        events.append(("focus", app.hwnd))
+
+                    def menu_command(self, app, automation_id):
+                        events.append(("menu", automation_id))
+
+                HARNESS.Goal06Harness.request_review(
+                    FakeHarness(), type("App", (), {"hwnd": 42})(), case_id
+                )
+                self.assertEqual(events, expected)
 
     def test_cli_arguments_require_a_hash_and_accept_each_case(self) -> None:
         for case_id in REQUIRED_CASE_IDS:
@@ -466,7 +532,7 @@ class HarnessContractTests(unittest.TestCase):
             source = Path(directory) / "workspace.rs"
             source.write_text(source_text, encoding="utf-8")
 
-            production = HARNESS.production_source(source)
+            production = source_contract.production_source(source)
 
         self.assertIsNotNone(production)
         self.assertNotIn("use crate::test_support::TestDependency;", production)
@@ -476,220 +542,77 @@ class HarnessContractTests(unittest.TestCase):
 
 
 class SourceContractTests(unittest.TestCase):
-    WORKSPACE_SOURCE = (
-        'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n'
-        'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n'
-        'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n'
-        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n'
-        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n'
-    )
-    REVIEW_SOURCE = (
-        "fn review_controls(diagnostic: Diagnostic, cx: &Context) {\n"
-        "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n"
-        "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n"
-        "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n"
-        "    diagnostic_control.role(gpui_kit::Role::Label);\n"
-        "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n"
-        "    let _ = ReviewError::MissingCredential;\n"
-        "    let _ = i18n::Key::ReviewMissingCredential;\n"
-        "    let _ = PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx));\n"
-        "    let _ = i18n::Key::ReviewReady;\n"
-        "}\n"
-    )
-    TEST_MODULE = "\n#[cfg(test)]\nmod tests {\n    // test-only contract decoy\n}\n"
+    """The review shortcut, diagnostic, result and consent selectors must live
+    in production nsh source; tests and comments cannot supply them."""
 
-    @staticmethod
-    def source_contract_failure(workspace: str, review: str) -> str | None:
+    REPO = Path(__file__).resolve().parents[2]
+    TEST_SCOPES = (
+        "\n#[cfg(test)]\nmod tests {\n    // test-only contract decoy\n}\n",
+        "\n#[cfg(test)] mod checks {\nfn decoy() {\n// test-only contract decoy\n}\n}\n",
+        "\n# [ cfg (\n test \n) ]\npub(crate) mod checks\n{\n"
+        "fn decoy() {\n// test-only contract decoy\n}\n}\n",
+        "\n#[cfg(test)] fn decoy() {\n// test-only contract decoy\n}\n",
+        "\n#[cfg(all(test, windows))] fn decoy() {\n// test-only contract decoy\n}\n",
+        "\nmod helpers {\n#[cfg(test)] mod checks {\n"
+        "fn decoy() {\n// test-only contract decoy\n}\n}\n}\n",
+    )
+
+    def failure_after(self, relative: str, edit) -> str | None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            views = repo / "crates" / "mt-app" / "src" / "views"
-            review_dir = views / "workspace"
-            review_dir.mkdir(parents=True)
-            (views / "workspace.rs").write_text(workspace, encoding="utf-8")
-            (review_dir / "review.rs").write_text(review, encoding="utf-8")
-
-            with mock.patch.object(HARNESS, "REPO", repo):
+            root = Path(directory)
+            for name in HARNESS.UI_SOURCE_REQUIREMENTS:
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((self.REPO / name).read_bytes())
+            target = root / relative
+            target.write_text(edit(target.read_text(encoding="utf-8")), encoding="utf-8")
+            with mock.patch.object(HARNESS, "REPO", root):
                 return HARNESS.source_contract_failure()
 
-    def test_complete_temporary_workspace_and_review_sources_satisfy_contract(self) -> None:
-        self.assertIsNone(
-            self.source_contract_failure(self.WORKSPACE_SOURCE, self.REVIEW_SOURCE)
-        )
-
-    @unittest.skipUnless(
-        (Path(__file__).resolve().parents[2] / "crates/mt-app/src/views/workspace.rs").exists(),
-        "legacy GPUI source contract removed during the nsh migration; nsh native acceptance is pending",
-    )
     def test_real_repository_satisfies_source_contract(self) -> None:
         self.assertIsNone(HARNESS.source_contract_failure())
 
-    def test_unsafe_projection_returns_existing_source_contract_failure(self) -> None:
-        malformed = "\n#[cfg(test)] mod checks {\n"
-        for workspace, review in (
-            (self.WORKSPACE_SOURCE + malformed, self.REVIEW_SOURCE),
-            (self.WORKSPACE_SOURCE, self.REVIEW_SOURCE + malformed),
-        ):
-            with self.subTest(workspace=workspace, review=review):
+    def test_unsafe_projection_returns_source_contract_failure(self) -> None:
+        for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
+            with self.subTest(file=relative):
                 self.assertEqual(
-                    self.source_contract_failure(workspace, review),
+                    self.failure_after(relative, lambda text: text + "\n#[cfg(test)] mod checks {\n"),
                     "REVIEW_SOURCE_CONTRACT_MISSING",
                 )
 
-    def test_each_missing_workspace_accessibility_id_returns_uia_contract_failure(
-        self,
-    ) -> None:
-        for contract in (
-            'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n',
-            'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n',
-            'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n',
-        ):
-            with self.subTest(contract=contract):
-                workspace = self.WORKSPACE_SOURCE.replace(contract, "", 1)
-                self.assertEqual(
-                    self.source_contract_failure(workspace, self.REVIEW_SOURCE),
-                    "REVIEW_UIA_CONTRACT_MISSING",
-                )
-
-    def test_each_missing_review_control_returns_source_contract_failure(self) -> None:
-        for contract in (
-            "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n",
-            "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n",
-            "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n",
-        ):
-            with self.subTest(contract=contract):
-                review = self.REVIEW_SOURCE.replace(contract, "", 1)
-                self.assertEqual(
-                    self.source_contract_failure(self.WORKSPACE_SOURCE, review),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )
-
-    def test_each_missing_review_shortcut_returns_source_contract_failure(self) -> None:
-        for contract in (
-            'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n',
-            'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n',
-        ):
-            with self.subTest(contract=contract):
-                workspace = self.WORKSPACE_SOURCE.replace(contract, "", 1)
-                self.assertEqual(
-                    self.source_contract_failure(workspace, self.REVIEW_SOURCE),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )
-
-    def test_missing_diagnostic_aria_value_returns_source_contract_failure(self) -> None:
-        review = self.REVIEW_SOURCE.replace(
-            "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
-            "",
-            1,
-        )
-
-        self.assertEqual(
-            self.source_contract_failure(self.WORKSPACE_SOURCE, review),
-            "REVIEW_SOURCE_CONTRACT_MISSING",
-        )
-
-    def test_cfg_test_decoys_do_not_supply_missing_production_contracts(self) -> None:
-        cases = (
-            (
-                "workspace run ID",
-                "workspace",
-                'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n',
-                "REVIEW_UIA_CONTRACT_MISSING",
-            ),
-            (
-                "workspace diagnostic ID",
-                "workspace",
-                'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n',
-                "REVIEW_UIA_CONTRACT_MISSING",
-            ),
-            (
-                "workspace result ID",
-                "workspace",
-                'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n',
-                "REVIEW_UIA_CONTRACT_MISSING",
-            ),
-            (
-                "document shortcut",
-                "workspace",
-                'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n',
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "selection shortcut",
-                "workspace",
-                'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n',
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "run control",
-                "review",
-                "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "diagnostic control",
-                "review",
-                "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "result control",
-                "review",
-                "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "diagnostic aria value",
-                "review",
-                "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-        )
-
-        test_scopes = (
-            self.TEST_MODULE,
-            "\n#[cfg(test)] mod checks {\n"
-            "fn decoy() {\n// test-only contract decoy\n}\n}\n",
-            "\n# [ cfg (\n test \n) ]\npub(crate) mod checks\n{\n"
-            "fn decoy() {\n// test-only contract decoy\n}\n}\n",
-            "\n#[cfg(test)] fn decoy() {\n// test-only contract decoy\n}\n",
-            "\n#[cfg(all(test, windows))] fn decoy() {\n"
-            "// test-only contract decoy\n}\n",
-            "\nmod helpers {\n#[cfg(test)] mod checks {\n"
-            "fn decoy() {\n// test-only contract decoy\n}\n}\n}\n",
-        )
-        for name, source_file, contract, failure in cases:
-            for test_scope in test_scopes:
-                workspace, review = self.WORKSPACE_SOURCE, self.REVIEW_SOURCE
-                source = workspace if source_file == "workspace" else review
-                source = test_scope.replace(
-                    "// test-only contract decoy", contract.strip()
-                ) + source.replace(contract, "", 1)
-                if source_file == "workspace":
-                    workspace = source
-                else:
-                    review = source
-                with self.subTest(contract=name, test_scope=test_scope):
+    def test_each_missing_production_marker_returns_source_contract_failure(self) -> None:
+        for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
+            for marker in markers:
+                with self.subTest(file=relative, marker=marker):
                     self.assertEqual(
-                        self.source_contract_failure(workspace, review), failure
+                        self.failure_after(relative, lambda text: text.replace(marker, "")),
+                        "REVIEW_SOURCE_CONTRACT_MISSING",
                     )
 
-    def test_comment_or_string_decoys_do_not_preserve_removed_diagnostic_exposure(
-        self,
-    ) -> None:
-        decoys = (
-            "// .aria_value(diagnostic.diagnostic.message.as_str())\n",
-            'const REMOVED_DIAGNOSTIC_EXPOSURE: &str = '
-            '".aria_value(diagnostic.diagnostic.message.as_str())";\n',
-        )
+    def test_cfg_test_decoys_do_not_supply_missing_production_contracts(self) -> None:
+        # Each file's parse is exercised once per test scope; the marker
+        # check itself is shared by every marker.
+        for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
+            for marker in markers[:1]:
+                for scope in self.TEST_SCOPES:
+                    decoy = scope.replace(
+                        "// test-only contract decoy", f"let _ = {marker};"
+                    )
+                    with self.subTest(file=relative, marker=marker, scope=scope):
+                        self.assertEqual(
+                            self.failure_after(
+                                relative,
+                                lambda text: decoy + text.replace(marker, ""),
+                            ),
+                            "REVIEW_SOURCE_CONTRACT_MISSING",
+                        )
 
-        for decoy in decoys:
+    def test_comment_decoys_do_not_preserve_a_removed_selector(self) -> None:
+        relative = "crates/mt-app/src/ui/review.rs"
+        marker = '"No model set up"'
+        for decoy in (f"// {marker}\n", f"/* {marker} */\n", f"/// {marker}\nfn f() {{}}\n"):
             with self.subTest(decoy=decoy):
-                review = self.REVIEW_SOURCE.replace(
-                    "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
-                    "",
-                    1,
-                ) + decoy
                 self.assertEqual(
-                    self.source_contract_failure(self.WORKSPACE_SOURCE, review),
+                    self.failure_after(relative, lambda text: text.replace(marker, '""') + decoy),
                     "REVIEW_SOURCE_CONTRACT_MISSING",
                 )
