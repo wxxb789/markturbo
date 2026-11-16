@@ -81,7 +81,10 @@ fn opens_a_markdown_file() {
     // AGENTS.md, so an unscoped text check would prove nothing), and a row
     // that applies carries its Include in review decision and is not in the
     // profile's not-applied inventory.
-    app.press("id:title-context").expect("open the context");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-context")
+        .expect("open the context");
     app.wait_for("id:context-field").expect("context field");
     app.wait_for("id:context-source-0")
         .expect("a resolved context source");

@@ -33,8 +33,12 @@ fn new_document_saves_with_save_as() {
 
     app.on_pick_save_path(Some(destination.clone()))
         .expect("register the save path");
-    app.wait_for("id:title-save").expect("save action");
-    app.press("id:title-save").expect("Save As for untitled");
+    app.wait_for("id:title-settings")
+        .expect("the settings glyph");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save")
+        .expect("Save As for untitled");
     app.wait_for("text:notes.md").expect("saved tab title");
     assert_eq!(
         std::fs::read_to_string(&destination).expect("read saved file"),

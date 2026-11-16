@@ -39,8 +39,11 @@ fn external_change_shows_conflict_resolution() {
         .expect("edit the buffer");
 
     std::fs::write(&path, "# External change\n").expect("replace the file");
-    app.wait_for("id:title-save").expect("save action");
-    app.press("id:title-save").expect("attempt save");
+    app.wait_for("id:title-settings")
+        .expect("the settings glyph");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save").expect("attempt save");
 
     // The refusal is visible with its decisions, and nothing was written.
     app.wait_for("id:conflict-banner").expect("conflict banner");

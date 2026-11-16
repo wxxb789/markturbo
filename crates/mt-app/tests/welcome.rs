@@ -21,4 +21,36 @@ fn clean_launch_shows_welcome() {
     app.wait_for("id:welcome").expect("welcome surface");
     app.wait_for("text:Opening, editing and search stay on this device.")
         .expect("welcome guidance");
+
+    // The welcome states its one status line once: the four choices already
+    // say how to begin, so no second line repeats them under it.
+    let texts = app.screen().texts();
+    assert_eq!(
+        app.screen()
+            .count("text:Opening, editing and search stay on this device.")
+            .expect("selector"),
+        1,
+        "the local-only line, once: {texts:?}"
+    );
+    assert!(
+        !app.shows("Open a folder to begin."),
+        "a second status line under the welcome: {texts:?}"
+    );
+
+    // With no document there is no name and nothing to review: the title row
+    // holds the settings glyph alone.
+    assert_eq!(
+        app.screen()
+            .count("id:title-row >> role:button")
+            .expect("selector"),
+        1,
+        "the welcome's title row: {texts:?}"
+    );
+    assert_eq!(
+        app.screen()
+            .count("id:title-row >> role:button[Settings]")
+            .expect("selector"),
+        1,
+        "the settings glyph"
+    );
 }

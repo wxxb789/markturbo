@@ -43,7 +43,9 @@ fn a_second_conflict_reads_the_disk_again() {
     app.type_text("label:Markdown source", "\nLocal edit.")
         .expect("edit the buffer");
     std::fs::write(&path, "# Alpha disk\n").expect("replace the file");
-    app.press("id:title-save").expect("attempt the save");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save").expect("attempt the save");
     app.wait_for("id:conflict-banner")
         .expect("the conflict banner");
 
@@ -73,7 +75,10 @@ fn a_second_conflict_reads_the_disk_again() {
     std::fs::write(&path, "# Beta disk\n").expect("replace the file again");
     app.type_text("label:Markdown source", "\nSecond local edit.")
         .expect("edit the buffer again");
-    app.press("id:title-save").expect("attempt the save again");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save")
+        .expect("attempt the save again");
     app.wait_for("id:conflict-banner")
         .expect("the conflict banner again");
 

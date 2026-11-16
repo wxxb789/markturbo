@@ -34,7 +34,7 @@ fn quit_save_all_saves_an_untitled_draft() {
 
     app.on_pick_save_path(Some(destination.clone()))
         .expect("register save path");
-    app.press("label:\u{2699}").expect("open the title menu");
+    app.press("label:Settings").expect("open the title menu");
     app.wait_for("id:title-menu").expect("the menu");
     app.press("id:title-menu-quit").expect("quit");
     app.wait_for("id:guard-card").expect("quit guard");
