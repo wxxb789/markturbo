@@ -139,15 +139,22 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     // which turns on with the same request) gives the editor its room to
     // scroll into, and the editor computes its scroll target from the rows as
     // laid out, so the inset must be a frame old by then.
+    //
+    // The effect's first run is this editor's mount (a tab switch or the mode
+    // toggle back to Source). A request it sees then is one the column already
+    // holds, not a new one, so the camera cuts: file switching and the mode
+    // toggle are instant.
     let glide = Glide::default();
     let camera_glide = glide.clone();
+    let mounting = Cell::new(true);
     effect(move || {
+        let cut = mounting.replace(false);
         let focus = camera_state.document_focus.get();
         if focus.tab != camera_tab.id || !docked_surfaces(&camera_state) {
             return;
         }
         let glide = camera_glide.clone();
-        request_animation_frame(move |_| level_line(camera, &glide, focus.line));
+        request_animation_frame(move |_| level_line(camera, &glide, focus.line, cut));
     });
 
     // The half-viewport inset, in points: the visible height of the column's
@@ -307,19 +314,20 @@ impl Glide {
 /// Levels line `line` with the field's docked reading position (the
 /// editor's own centre, as `reveal_position(.., center)` places it) by a
 /// [`motion::CAMERA_MS`] glide on the camera's curve from where the column is
-/// now; at once under reduced motion.
+/// now; at once under reduced motion or when `cut` (the editor was just
+/// mounted).
 ///
 /// The target is the editor's own: the reveal is asked for, its scroll offset
 /// read, and the offset put back before anything is drawn. A glide already in
 /// flight is replaced from the column's current position, so a new target
 /// mid-glide turns the column without a jump.
-fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32) {
+fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, cut: bool) {
     let Some(api) = editor.api::<EditorApi>() else {
         return;
     };
     glide.stop();
     let position = EditorPosition::new(line, 0);
-    if motion::reduced_motion() {
+    if cut || motion::reduced_motion() {
         api.reveal_position(position, true);
         return;
     }
@@ -513,6 +521,8 @@ mod tests {
         state.review_open.set(true);
         let first_state = state.clone();
         let last_state = state.clone();
+        let preview_state = state.clone();
+        let source_state = state.clone();
         view()
             .test_id("probe")
             .flex_col()
@@ -542,6 +552,28 @@ mod tests {
                     .on_press(move || {
                         if let Some(tab) = last_state.active_tab() {
                             last_state.focus_document_line(tab.id, 58);
+                        }
+                    }),
+            )
+            .child(
+                view()
+                    .test_id("probe-pane-preview")
+                    .w_full()
+                    .h(px(8.0))
+                    .on_press(move || {
+                        if let Some(tab) = preview_state.active_tab() {
+                            preview_state.set_pane(tab.id, Pane::Preview);
+                        }
+                    }),
+            )
+            .child(
+                view()
+                    .test_id("probe-pane-source")
+                    .w_full()
+                    .h(px(8.0))
+                    .on_press(move || {
+                        if let Some(tab) = source_state.active_tab() {
+                            source_state.set_pane(tab.id, Pane::Source);
                         }
                     }),
             )
@@ -1203,6 +1235,54 @@ mod tests {
         assert!(
             end.abs() <= tokens::TYPE_SOURCE_LINE,
             "after the retarget the last line sits {end} points off the centre"
+        );
+    }
+
+    /// A camera request the column already holds is not a new one: when the
+    /// source editor is mounted again (the mode toggle back to Source, or a
+    /// tab switch and back) the line is level at once, because file switching
+    /// and the mode toggle are instant.
+    #[test]
+    fn a_remounted_editor_cuts_to_the_held_line() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64 + 60))
+            .expect("the glide ends");
+
+        app.press("id:probe-pane-preview").expect("to Preview");
+        assert!(
+            app.screen().matches("label:Markdown source") == Ok(false),
+            "Preview takes the column"
+        );
+        app.press("id:probe-pane-source").expect("back to Source");
+        let offset = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            offset.abs() <= tokens::TYPE_SOURCE_LINE,
+            "back in Source line 3 sits {offset} points off the centre with no time passing"
+        );
+    }
+
+    /// The user's typing ends the glide: the column stays where it was when
+    /// the text changed, not carried on to the camera's target.
+    #[test]
+    fn the_users_typing_ends_the_glide() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        app.run_for(Duration::from_millis(20))
+            .expect("early in the glide");
+        app.type_text("id:source-editor", "x")
+            .expect("the user types");
+        let typed = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64))
+            .expect("the glide's time passes");
+        let after = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            (after - typed).abs() < 1.0,
+            "the camera kept moving after the user typed: {typed} -> {after}"
+        );
+        assert!(
+            after < -tokens::TYPE_SOURCE_LINE,
+            "the camera finished its glide over the user's typing: {after} from the centre"
         );
     }
 
