@@ -5,9 +5,9 @@ model: opus
 
 # Broken Example
 
-This skill is deliberately non-conformant, so you can see what validation
-reports. Open the **Harness** tab: it is flagged, and the inspector lists every
-problem.
+This skill is deliberately non-conformant. Open **Context** (click the file
+name at the top of the window): it is still listed under **Skills**, under the
+name its frontmatter gives it.
 
 Three things are wrong:
 

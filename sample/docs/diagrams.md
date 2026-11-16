@@ -13,7 +13,7 @@ failing — which is the point.
 graph TD;
   A[Open folder] --> B{Markdown file?};
   B -->|yes| C[Parse to blocks];
-  B -->|no| D[Show in tree only];
+  B -->|no| D[Edit as source];
   C --> E[Native render];
   C --> F[Web render];
 ```
