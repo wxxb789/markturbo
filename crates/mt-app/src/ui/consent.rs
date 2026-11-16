@@ -753,10 +753,15 @@ fn open_hold() -> Rc<RefCell<Option<Hold>>> {
 
 /// One `Ctrl+Enter` press, or one of its auto-repeats, on the open card's
 /// hold ([`titlebar::bind_mod_enter`]); nothing without a card.
+///
+/// It runs under the card's owner: the binding that fired belongs to
+/// whichever effect run bound it last (a focus-in rebinds it, a tab switch
+/// unmounts it), and the hold's timers must not go with that run, or a press
+/// would never be released and the next tap would find the charge full.
 pub fn key_hold() {
     let hold = open_hold().borrow().clone();
     if let Some(hold) = hold {
-        hold.key_press();
+        hold.owner.run(|| hold.key_press());
     }
 }
 
@@ -1057,6 +1062,8 @@ struct Hold {
     notice: Rc<RefCell<Option<Spawned<()>>>>,
     /// The send fired: this consent is spent.
     spent: Rc<Cell<bool>>,
+    /// The card's owner: the hold's timers live under it, whoever presses.
+    owner: Owner,
 }
 
 impl Hold {
@@ -1077,6 +1084,7 @@ impl Hold {
             steps: Rc::new(RefCell::new(Vec::new())),
             notice: Rc::new(RefCell::new(None)),
             spent: Rc::new(Cell::new(false)),
+            owner: Owner::current(),
         }
     }
 

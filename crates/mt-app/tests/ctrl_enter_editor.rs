@@ -329,6 +329,48 @@ fn a_held_ctrl_enter_from_the_refocused_editor_charges_the_consent_hold() {
     assert!(!is_dirty(&app), "and the document is still clean");
 }
 
+#[test]
+fn a_refocus_in_the_middle_of_a_ctrl_enter_hold_keeps_one_tap_from_sending() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The same manual clock and reduced motion as the held-key test above.
+    let (mut app, _directory, _config) = start(true);
+    app.press("id:title-review").expect("start review");
+    app.wait_for("id:consent-card").expect("review disclosure");
+    focus_editor(&mut app);
+
+    // A press from the editor, then the focus leaves the editor and comes
+    // back while the key would still count as held: the binding that took
+    // the press is bound again.
+    app.press_key("ctrl+enter").expect("press ctrl+enter");
+    app.run_for(Duration::from_millis(100))
+        .expect("inside the release watchdog");
+    blur_and_refocus_editor(&mut app);
+
+    // The press was let go: the hold says so and cools, and the card stays.
+    app.run_for(Duration::from_millis(1_200))
+        .expect("past the release watchdog");
+    assert!(
+        app.shows("Nothing was sent."),
+        "the interrupted press is released as a tap: {:?}",
+        app.screen().texts()
+    );
+    app.run_for(Duration::from_millis(2_000))
+        .expect("the notice ends");
+
+    // One tap after that authorizes nothing.
+    app.press_key("ctrl+enter").expect("tap ctrl+enter");
+    app.run_for(Duration::from_millis(50)).expect("the tap");
+    assert!(
+        !app.screen()
+            .matches("text:/^Sent · /")
+            .expect("the selector"),
+        "one tap sends nothing: {:?}",
+        app.screen().texts()
+    );
+    assert!(app.shows("Send for review?"), "the card stayed up");
+    assert_eq!(editor_lines(&app), lines(SOURCE), "nothing edited the text");
+}
+
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
