@@ -34,7 +34,7 @@ fn quit_cancel_keeps_the_dirty_document_open() {
 
     // Quit must raise the guard card, not close silently: the gear opens the
     // title menu, whose Quit row carries its own test id.
-    app.press("label:\u{2699}").expect("open the title menu");
+    app.press("label:Settings").expect("open the title menu");
     app.wait_for("id:title-menu").expect("the menu");
     app.press("id:title-menu-quit").expect("request quit");
     app.wait_for("id:guard-card").expect("quit guard");
@@ -60,7 +60,7 @@ fn quit_cancel_keeps_the_dirty_document_open() {
     // The guard is keyboard-complete: the card carries its own ring (Enter
     // with the initial selection is Cancel, which must change nothing), and
     // Right moves the ring to Save, whose Enter saves the buffer and quits.
-    app.press("label:\u{2699}")
+    app.press("label:Settings")
         .expect("open the title menu again");
     app.wait_for("id:title-menu").expect("the menu again");
     app.press("id:title-menu-quit").expect("request quit again");
@@ -82,7 +82,7 @@ fn quit_cancel_keeps_the_dirty_document_open() {
         .unwrap_or_default();
     assert!(text.contains("Unsaved edit."), "nothing was discarded");
 
-    app.press("label:\u{2699}")
+    app.press("label:Settings")
         .expect("open the title menu once more");
     app.wait_for("id:title-menu").expect("the menu once more");
     app.press("id:title-menu-quit")

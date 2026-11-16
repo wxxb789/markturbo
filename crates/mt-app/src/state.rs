@@ -447,12 +447,9 @@ impl AppState {
                 Some(SharedString::from(format!("Recovery unavailable: {error}"))),
             ),
         };
-        let status = notice.clone().unwrap_or_else(|| {
-            SharedString::from(crate::i18n::t(
-                settings.language,
-                crate::i18n::Key::OpenFolderToBegin,
-            ))
-        });
+        // With nothing to report the status line starts empty: the welcome's
+        // own choices and its local-only line say how to begin, once.
+        let status = notice.clone().unwrap_or_default();
         let usage = UsageStore::open(settings.usage_metrics_enabled);
         let state = Self {
             owner: Owner::current(),

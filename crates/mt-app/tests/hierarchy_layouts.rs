@@ -26,11 +26,29 @@ fn compatibility_layouts_are_progressively_disclosed() {
 
     app.wait_for("label:Markdown source")
         .expect("source editor");
-    // The three modes a roomy window holds are primary row actions.
+    // The row holds no mode, even in a roomy window: the three modes are the
+    // glyph's menu's first pane commands.
     for mode in ["id:title-edit", "id:title-preview", "id:title-split"] {
-        app.wait_for(mode).expect("primary mode on the row");
+        assert_eq!(
+            app.screen().count(mode).expect("selector"),
+            0,
+            "`{mode}` on the title row"
+        );
     }
-    // The web compatibility pane is not: it waits behind the glyph's menu.
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    for mode in [
+        "id:title-menu-edit",
+        "id:title-menu-preview",
+        "id:title-menu-split",
+    ] {
+        app.wait_for(mode).expect("primary mode in the menu");
+    }
+    app.press("id:title-settings")
+        .expect("close the glyph's menu");
+    app.wait_for_gone("id:title-menu", Duration::from_secs(5))
+        .expect("the menu closes");
+    // The web compatibility pane waits behind the glyph's menu too.
     assert!(
         !app.shows("Web preview"),
         "advanced layout shown before disclosure"
@@ -78,11 +96,11 @@ fn compatibility_layouts_are_progressively_disclosed() {
     app.wait_for_gone("id:web-pane", Duration::from_secs(5))
         .expect("the web pane left");
 
-    // A narrow window folds the modes into the menu: never a lost action.
+    // A narrow window keeps the modes in the menu: never a lost action.
     app.set_viewport(nsh_core::Size::new(Points(900.0), Points(700.0)))
         .expect("narrow viewport");
     app.wait_for_gone("id:title-edit", Duration::from_secs(5))
-        .expect("the modes leave the row");
+        .expect("no mode on the row");
     app.press("id:title-settings")
         .expect("open the glyph's menu");
     app.wait_for("id:title-menu-edit")

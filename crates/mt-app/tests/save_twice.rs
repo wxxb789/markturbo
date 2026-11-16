@@ -27,13 +27,18 @@ fn saving_twice_does_not_report_its_own_first_save_as_a_conflict() {
 
     app.wait_for("label:Markdown source")
         .expect("source editor");
-    app.wait_for("id:title-save").expect("save action");
+    app.wait_for("id:title-settings")
+        .expect("the settings glyph");
     app.type_text("label:Markdown source", "\nFirst edit.")
         .expect("first edit");
-    app.press("id:title-save").expect("first save");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save").expect("first save");
     app.type_text("label:Markdown source", "\nSecond edit.")
         .expect("second edit");
-    app.press("id:title-save").expect("second save");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save").expect("second save");
 
     // Pump the app's frames while the second save lands instead of sleeping in
     // this thread, which never advances the app.

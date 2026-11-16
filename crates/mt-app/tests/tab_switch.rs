@@ -49,9 +49,13 @@ fn switching_tabs_swaps_the_document_surface() {
         "both open files hold a rail dot"
     );
 
-    // The title row is mounted once, so its pane controls must resolve the
-    // active tab when pressed rather than capture the startup `None`.
-    app.press("id:title-preview").expect("switch to Preview");
+    // The title row is mounted once, so the pane commands in its menu must
+    // resolve the active tab when pressed rather than capture the startup
+    // `None`.
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-preview")
+        .expect("switch to Preview");
     app.wait_for("id:preview-column")
         .expect("the preview takes the column");
     app.wait_for_gone("label:Markdown source", Duration::from_secs(5))
