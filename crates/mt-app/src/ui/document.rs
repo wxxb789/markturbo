@@ -844,7 +844,8 @@ mod tests {
 
     /// The CJK fallback: the three lists take their CJK from DengXian before
     /// Microsoft YaHei UI, and the model's 22px text from the light cut while
-    /// the body and source stay regular.
+    /// the body and source stay regular. Without DengXian installed, all three
+    /// fall back to Microsoft YaHei UI.
     #[cfg(windows)]
     #[test]
     fn the_cjk_fallback_prefers_dengxian() {
@@ -856,6 +857,24 @@ mod tests {
 
         let dengxian = width_of(&dash, "DengXian");
         let yahei = width_of(&dash, "Microsoft YaHei UI");
+        // DengXian is optional on Windows Server images (the CI runner has
+        // none); there the lists must fall through to Microsoft YaHei UI.
+        let fonts =
+            std::path::Path::new(&std::env::var("WINDIR").unwrap_or_default()).join("Fonts");
+        if !["Deng.ttf", "Dengl.ttf"]
+            .iter()
+            .all(|file| fonts.join(file).is_file())
+        {
+            for list in ["FONT_UI", "FONT_MODEL", "FONT_SOURCE"] {
+                let taken = width_of(&dash, list);
+                assert!(
+                    (taken - yahei).abs() <= 0.5,
+                    "without DengXian, {list}'s CJK is not YaHei's: {taken} against {yahei}: {}",
+                    table_text(&dash)
+                );
+            }
+            return;
+        }
         for list in ["FONT_UI", "FONT_MODEL", "FONT_SOURCE"] {
             let taken = width_of(&dash, list);
             assert!(
