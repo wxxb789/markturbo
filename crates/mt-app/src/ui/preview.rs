@@ -27,7 +27,7 @@ use mt_core::{
     rendering::{RenderOutcome, RendererRegistry},
     settings::Language,
 };
-use nsh_base::{TextViewMath, text_view};
+use nsh_base::{TextViewMath, TextViewPart, TextViewParts, text_view};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{
@@ -196,6 +196,12 @@ fn rendered(state: AppState, language: Language) -> impl IntoElement {
         move |tab: ReadSignal<Tab>, _| {
             let tab = tab.get();
             let preview = preview_of(&tab);
+            // Inline code at the source's size: text_view's own is 13pt, a
+            // step below the source column. Its face is the theme's
+            // `font-mono` (theme.json), the source's Martian Mono.
+            provide_context(TextViewParts::new().part(TextViewPart::Code, |style| {
+                style.text_size(px(tokens::TYPE_SOURCE))
+            }));
             view()
                 .test_id("preview")
                 .flex_1()
@@ -492,8 +498,10 @@ mod tests {
     /// code and its body — in the column, and keeps the source out of it.
     #[test]
     fn the_preview_renders_the_document() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<ColumnProbe>())).expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<ColumnProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the probe");
         app.wait_for("id:preview").expect("the preview renders");
         let shown = texts(&app);
         assert!(shown.contains("Release plan"), "{}", dump(&app));
@@ -516,6 +524,23 @@ mod tests {
         assert!(
             family.contains("Martian Grotesk"),
             "the preview body is set in {family:?}"
+        );
+
+        // Inline code reads at the source's own size and face, not
+        // text_view's 13pt system monospace.
+        let code = app
+            .screen()
+            .span_style("text:agent")
+            .expect("the inline code's style");
+        assert_eq!(code.font_size.0, tokens::TYPE_SOURCE);
+        let family = code
+            .font_family
+            .as_ref()
+            .map(|family| family.name().to_string())
+            .unwrap_or_default();
+        assert!(
+            family.contains("Martian Mono"),
+            "inline code is set in {family:?}"
         );
     }
 

@@ -17,8 +17,7 @@ fn main() -> impl std::process::Termination {
         // environment concurrently.
         unsafe { std::env::set_var("MARKTURBO_OPEN", path) };
     }
-    let tokens = nsh_base::tokens_of(Some(include_str!("../theme.json")))
-        .expect("theme.json is a valid nsh theme");
+    let tokens = mt_app::ui::tokens::theme();
     // The faces travel with the root, so the first frame is already measured
     // with them (the app registers them again at startup for hosts that build
     // the root themselves; nsh ignores a font it has seen).

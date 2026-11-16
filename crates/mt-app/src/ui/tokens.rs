@@ -357,9 +357,34 @@ pub const WEIGHT_UI: FontWeight = FontWeight(400);
 /// The few labels that must not be quiet.
 pub const WEIGHT_MEDIUM: FontWeight = FontWeight(500);
 
+/// The app's nsh theme (`theme.json`): the root carries it in the app and in
+/// any probe that must draw with the app's own fonts and colours.
+pub fn theme() -> nsh_core::element::Tokens {
+    nsh_base::tokens_of(Some(include_str!("../../theme.json")))
+        .expect("theme.json is a valid nsh theme")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nsh's own controls (inputs, inline code) draw with the theme's
+    /// `font-sans` / `font-mono`; they must lead with the app's Martian faces.
+    #[test]
+    fn the_theme_fonts_are_the_app_lists() {
+        use nsh_core::element::{FONT_MONO, FONT_SANS};
+        let theme = theme();
+        // nsh keeps a font token's first family only.
+        let first = |list: &'static str| list.split(',').next().map(str::trim);
+        assert_eq!(
+            theme.font(FONT_SANS).map(|font| font.as_ref()),
+            first(FONT_UI)
+        );
+        assert_eq!(
+            theme.font(FONT_MONO).map(|font| font.as_ref()),
+            first(FONT_SOURCE)
+        );
+    }
 
     #[test]
     fn layout_breakpoints_follow_the_spec() {
