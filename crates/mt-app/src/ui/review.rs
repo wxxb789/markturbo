@@ -1882,14 +1882,28 @@ mod tests {
             ))
     }
 
-    /// The text of the node `id`, once the probe renders it.
-    fn text_of(app: &Headless, id: &str) -> String {
-        app.screen()
+    /// The text of the node `id` on `screen`, if it is drawn.
+    fn text_on(screen: &nsh_testing::Screen, id: &str) -> Option<String> {
+        screen
             .layout_nodes()
             .iter()
             .find(|node| node.test_id.as_deref() == Some(id))
             .and_then(|node| node.text.as_ref().map(|text| text.text.text.to_string()))
+    }
+
+    /// The text of the node `id`, once the probe renders it.
+    fn text_of(app: &Headless, id: &str) -> String {
+        text_on(app.screen(), id)
             .unwrap_or_else(|| panic!("no `{id}` text on screen: {:?}", app.screen().texts()))
+    }
+
+    /// Waits until the node `id` reads a text that `holds`: the fixture's
+    /// file loads on a blocking thread, in its own time.
+    fn wait_for_text(app: &mut Headless, id: &str, what: &str, holds: impl Fn(&str) -> bool) {
+        app.wait_until(what, Duration::from_secs(5), |screen| {
+            text_on(screen, id).is_some_and(|text| holds(&text))
+        })
+        .expect(what);
     }
 
     /// `J`/`K` (and the stepper) ask the column's camera for the stepped
@@ -1903,10 +1917,9 @@ mod tests {
         let mut app =
             Headless::start(EngineConfig::new(Root::of::<StepProbe>())).expect("start the probe");
         app.wait_for("id:camera-step").expect("the probe renders");
-        app.settle();
-        app.wait(Duration::from_millis(200))
-            .expect("the fixture's tab lands");
-        app.settle();
+        wait_for_text(&mut app, "camera-tab", "the fixture's tab lands", |tab| {
+            !tab.is_empty()
+        });
 
         let tab = text_of(&app, "camera-tab");
         assert!(!tab.is_empty(), "the fixture's tab must be open");
@@ -1934,10 +1947,13 @@ mod tests {
             .expect("start the probe");
         app.wait_for("id:camera-loaded")
             .expect("the fixture's tab lands");
-        app.settle();
-        app.wait(Duration::from_millis(200))
-            .expect("the result watcher runs");
-        app.settle();
+        // Tab ids start at 1: a request for tab 0 is the default, none yet.
+        wait_for_text(
+            &mut app,
+            "camera-request",
+            "the result watcher runs",
+            |request| !request.starts_with("0:"),
+        );
 
         let tab = text_of(&app, "camera-tab");
         assert!(!tab.is_empty(), "the fixture's tab must be open");
@@ -1975,10 +1991,9 @@ mod tests {
             .expect("start the probe");
         app.wait_for("id:review-findings-step")
             .expect("the stepper renders");
-        app.settle();
-        app.wait(Duration::from_millis(200))
-            .expect("the fixture's tab lands");
-        app.settle();
+        wait_for_text(&mut app, "camera-tab", "the fixture's tab lands", |tab| {
+            !tab.is_empty()
+        });
 
         let tab = text_of(&app, "camera-tab");
         assert!(!tab.is_empty(), "the fixture's tab must be open");

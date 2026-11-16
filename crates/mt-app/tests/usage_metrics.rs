@@ -52,7 +52,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         !store.exists(),
         "default-off startup and inspection wrote counts"
     );
-    app.press("id:usage-on >> role:button")
+    app.press("id:usage-on")
         .expect("explicitly enable recording");
     app.wait_for("text:Usage-counter preference saved.")
         .expect("consent persisted");
@@ -96,8 +96,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         assert!(!text.contains("chosen-summary"));
         assert!(!text.contains(&config.path().to_string_lossy().to_string()));
     }
-    app.press("id:usage-off >> role:button")
-        .expect("disable recording");
+    app.press("id:usage-off").expect("disable recording");
     app.wait_for("text:Usage-counter preference saved.")
         .expect("disable saved");
     assert!(!mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
@@ -126,7 +125,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         "text:0 retained UTC days · 0 Reviews completed · 0 revision decisions · 0 events",
     )
     .expect("summary reflects Clear");
-    app.press("id:settings-language-chinese >> role:button")
+    app.press("id:settings-language-chinese")
         .expect("switch settings language");
     app.wait_for("text:本地使用计数")
         .expect("localized section");

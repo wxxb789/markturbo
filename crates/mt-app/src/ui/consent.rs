@@ -311,39 +311,45 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
     let review = !waiting.is_revision;
     let offers_selection = review && state.review_consent_offers_selection();
     let offers_context = review && state.review_consent_offers_context();
+    // The current scope in ink; another one a quiet switch when it can be
+    // bound, and not drawn at all when it cannot.
     let option = |choice: ReviewScopeChoice, test_id: &'static str, label: S, offered: bool| {
+        let label = label.text(language);
+        if current == choice {
+            return Some(scope_word(test_id, label));
+        }
         let state = state.clone();
-        scope_choice(
-            test_id,
-            label.text(language),
-            current == choice,
-            offered
-                .then(|| Box::new(move || state.set_review_consent_scope(choice)) as Box<dyn Fn()>),
-        )
+        offered.then(|| {
+            view()
+                .child(prims::quiet_action(test_id, label, move || {
+                    state.set_review_consent_scope(choice)
+                }))
+                .into_element()
+        })
     };
-    let mut options: Vec<AnyElement> = Vec::new();
-    if current == ReviewScopeChoice::Selection || offers_selection {
-        options.push(option(
+    let options: Vec<AnyElement> = [
+        option(
             ReviewScopeChoice::Selection,
             "consent-scope-selection",
             S::ScopeSelection,
             offers_selection,
-        ));
-    }
-    options.push(option(
-        ReviewScopeChoice::Document,
-        "consent-scope-document",
-        S::ScopeDocument,
-        review,
-    ));
-    if current == ReviewScopeChoice::DocumentWithContext || offers_context {
-        options.push(option(
+        ),
+        option(
+            ReviewScopeChoice::Document,
+            "consent-scope-document",
+            S::ScopeDocument,
+            review,
+        ),
+        option(
             ReviewScopeChoice::DocumentWithContext,
             "consent-scope-context",
             S::ScopeContext,
             offers_context,
-        ));
-    }
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     view()
         .test_id("consent-scope")
         .flex_row()
@@ -359,25 +365,6 @@ fn scope_word(test_id: &'static str, label: &'static str) -> AnyElement {
         .test_id(test_id)
         .child(prims::ink(label))
         .into_element()
-}
-
-/// One scope option: the current one is ink; an available other one is a quiet
-/// local action; one that cannot be bound is not drawn.
-fn scope_choice(
-    test_id: &'static str,
-    label: &'static str,
-    selected: bool,
-    on_press: Option<Box<dyn Fn()>>,
-) -> AnyElement {
-    if selected {
-        return scope_word(test_id, label);
-    }
-    match on_press {
-        Some(on_press) => view()
-            .child(prims::quiet_action(test_id, label, on_press))
-            .into_element(),
-        None => view().test_id(test_id).into_element(),
-    }
 }
 
 /// How a row is lit: outbound data is white-hot, a loopback endpoint is plain
@@ -557,7 +544,7 @@ fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl
     // Cancel takes the keyboard focus as soon as the card is up, so Enter and
     // Escape both land somewhere that authorizes nothing. The ref goes on the
     // button itself: nsh focuses an input or a view that takes presses, and
-    // `prims::primary_action`'s wrapper takes none.
+    // `prims::primary_action` takes no ref, so Cancel draws its own control.
     effect(move || reference.focus());
     view()
         .test_id("consent-cancel")
@@ -999,6 +986,15 @@ fn cooled(charge: f32, ms: f32) -> f32 {
     charge * (-ms / motion::FILAMENT_RELEASE_TAU_MS).exp()
 }
 
+/// Milliseconds since `at` on the engine's clock, which the hold's timers
+/// also run on.
+fn elapsed_ms(at: Instant) -> f32 {
+    nsh_core::time::now()
+        .saturating_duration_since(at)
+        .as_secs_f32()
+        * 1000.0
+}
+
 /// The hold time a charge still needs.
 fn remaining_ms(charge: f32) -> f32 {
     (1.0 - charge).max(0.0) * motion::FILAMENT_CHARGE_MS
@@ -1110,10 +1106,10 @@ impl Hold {
     /// released, what was left, decayed.
     fn charge_now(&self) -> f32 {
         if let Some((value, at)) = self.charging.get() {
-            return charged(value, at.elapsed().as_secs_f32() * 1000.0);
+            return charged(value, elapsed_ms(at));
         }
         if let Some((value, at)) = self.released.get() {
-            return cooled(value, at.elapsed().as_secs_f32() * 1000.0);
+            return cooled(value, elapsed_ms(at));
         }
         0.0
     }
@@ -1127,7 +1123,7 @@ impl Hold {
         self.end_notice();
         self.cancel_completion();
         let value = self.charge_now();
-        self.charging.set(Some((value, Instant::now())));
+        self.charging.set(Some((value, nsh_core::time::now())));
         self.released.set(None);
         self.heat.stop();
         let remaining = remaining_ms(value);
@@ -1211,8 +1207,8 @@ impl Hold {
         let Some((value, at)) = self.charging.take() else {
             return;
         };
-        let value = charged(value, at.elapsed().as_secs_f32() * 1000.0);
-        self.released.set(Some((value, Instant::now())));
+        let value = charged(value, elapsed_ms(at));
+        self.released.set(Some((value, nsh_core::time::now())));
         self.cancel_completion();
         self.cancel_key_alive();
         self.cancel_steps();
@@ -1606,7 +1602,7 @@ mod tests {
             consent.items.len() + consent.stays.len() > budget,
             "the manifest overflows the {budget}-row region"
         );
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.press("id:harness-large")
             .expect("open the large manifest");
         app.wait_for("text:skills/file39.md")
@@ -1744,8 +1740,7 @@ mod tests {
     /// The card over a state that already has a consent waiting: the shell's
     /// `when(is_open)` around [`card`]. One control stands in for the scope
     /// switch, replacing the manifest the card is bound to (the card's own
-    /// switch sits on a `prims::quiet_action` wrapper, whose test id the
-    /// harness cannot press; the state call behind it is the same one).
+    /// switch rebinds a prepared Review, which this harness does not have).
     #[component]
     fn Harness() -> impl IntoElement {
         let state = AppState::new();
@@ -1800,26 +1795,22 @@ mod tests {
             ))
     }
 
-    pub(super) fn start_harness() -> (Headless, tempfile::TempDir) {
-        let config = tempfile::tempdir().expect("config dir");
-        // SAFETY: this test binary owns these variables; every test sets them.
-        unsafe {
-            std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
-            std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
-        }
-        // The system clock: the hold's charge, its watchdogs and the notice
-        // are all real time, as they are in the app.
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+    pub(super) fn start_harness() -> Headless {
+        // A manual clock: the hold's charge, its watchdogs and the notice move
+        // only as the harness steps time, so a loaded machine cannot reorder
+        // them (a late frame once ran the completion before the watchdog).
+        let mut config = EngineConfig::new(Root::of::<Harness>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the harness");
         app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
             .expect("viewport");
         app.wait_for("id:consent-card").expect("the card");
-        (app, config)
+        app
     }
 
     #[test]
     fn the_card_shows_the_manifest_and_a_tap_authorizes_nothing() {
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.wait_for("id:consent-total").expect("the total");
         assert!(app.shows("Send for review?"), "the headline");
         assert!(app.shows("Leaves this device"), "the manifest caption");
@@ -1859,9 +1850,54 @@ mod tests {
         assert!(!app.shows("Sent"), "nothing left the device");
     }
 
+    /// A Revision of a reviewed selection, waiting on the card.
+    #[component]
+    fn RevisionSelectionHarness() -> impl IntoElement {
+        let state = AppState::new();
+        state
+            .revision_consent
+            .set(Some(SharedString::from("disclosure text")));
+        state.revision_manifest.set(Some(OutboundConsent {
+            disclosure: ModelRequestDisclosure::new(
+                ModelOperation::Revision,
+                EndpointIdentity::parse(Provider::OpenAiResponses, None).expect("endpoint"),
+                OutboundScope::selection(120),
+            ),
+            items: vec![item(OutboundOrigin::Selection, "plan.md", 120, true)],
+            stays: Vec::new(),
+        }));
+        view()
+            .w(px(1_200.0))
+            .h(px(800.0))
+            .child(card(state, Language::English))
+    }
+
+    #[test]
+    fn a_revision_of_a_selection_names_its_scope_and_offers_no_other() {
+        let mut config = EngineConfig::new(Root::of::<RevisionSelectionHarness>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the harness");
+        app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
+            .expect("viewport");
+        app.wait_for("id:consent-scope-selection >> text:Selection")
+            .expect("the scope in force, in words");
+        let scope_ids: Vec<String> = app
+            .screen()
+            .layout_nodes()
+            .iter()
+            .filter_map(|node| node.test_id.as_deref().map(str::to_owned))
+            .filter(|id| id.starts_with("consent-scope-"))
+            .collect();
+        assert_eq!(
+            scope_ids,
+            ["consent-scope-selection"],
+            "a Revision's scope cannot switch, so no other scope is drawn"
+        );
+    }
+
     #[test]
     fn escape_cancels_and_closes_the_card() {
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.press_key("escape").expect("escape");
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("the card closed");
@@ -1871,7 +1907,7 @@ mod tests {
     fn the_cancel_control_cancels() {
         // The cancel control is one focusable view of its own (not a
         // component's boundary): its press still authorizes nothing.
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.press("id:consent-cancel-button").expect("press Cancel");
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("the card closed");
@@ -1879,7 +1915,7 @@ mod tests {
 
     #[test]
     fn a_held_press_sends_once() {
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.long_press("id:consent-send").expect("hold to send");
         assert!(app.shows("Sent"), "a full hold authorized one send");
     }
@@ -1890,7 +1926,7 @@ mod tests {
         // watchdogs and the same send; only its drawing steps. The steps
         // themselves are [`reduced_step`]'s unit test, the pointer hold here
         // cannot be sampled mid-press.
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.set_environment("reduced motion", |env| env.reduce_motion = true)
             .expect("the environment");
         app.long_press("id:consent-send").expect("hold to send");
@@ -1915,7 +1951,7 @@ mod tests {
 
     #[test]
     fn a_keyboard_tap_alone_sends_nothing_and_cancels() {
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         // The focus is on nothing the card can charge (Cancel, or nothing at
         // all on Windows): Enter and Space are the default control's.
         app.press_key("space").expect("space");
@@ -1929,7 +1965,7 @@ mod tests {
         // The blocker: two accidental presses within the keyboard watchdog
         // must not carry a charge over the line — there is no charge at all
         // while the hold control is not focused.
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.press_key("enter").expect("enter");
         app.press_key("enter").expect("enter again");
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
@@ -1941,7 +1977,7 @@ mod tests {
     fn the_card_follows_a_scope_switch() {
         // Switching scope replaces the manifest under the card: the rows, the
         // total and the hold's bytes must follow it, never lag behind.
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.wait_for("id:consent-total").expect("the total");
         assert!(app.shows("~/AGENTS.md"), "the context source leaves");
         assert!(app.shows("800 B"), "the content with the context");
@@ -1984,7 +2020,7 @@ mod tests {
         // On a platform that focuses views, Tab reaches the hold control and
         // only there does Space charge it; anywhere else Space cancels (the
         // tests above).
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.set_environment("a platform that focuses views", |env| {
             env.os = nsh_core::element::Os::Linux;
         })
@@ -2010,7 +2046,7 @@ mod tests {
         // key-up, so the watchdog is the release — charges and then says so,
         // with nothing authorized. The completion this charge reaches on a
         // platform that repeats the key is `a_held_press_sends_once`'s path.
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.press_key("ctrl+enter").expect("ctrl+enter");
         assert!(
             app.shows("Nothing was sent."),
@@ -2027,7 +2063,7 @@ mod tests {
         // A rebuild makes new controls, and the old ones' state goes with
         // them: a still-charging `focused` flag would let `Enter` charge a
         // control the user can no longer see.
-        let (mut app, _config) = start_harness();
+        let mut app = start_harness();
         app.set_environment("a platform that focuses views", |env| {
             env.os = nsh_core::element::Os::Linux;
         })

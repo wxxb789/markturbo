@@ -1123,11 +1123,10 @@ mod tests {
     /// (`scroll_beyond_last_line`).
     #[test]
     fn the_camera_levels_an_anchored_line() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<CameraProbe>())).expect("start the probe");
-        app.wait_for("label:Markdown source")
-            .expect("source editor");
-        app.settle();
+        // On the manual clock, each glide is stepped through to its end: on
+        // the system's, a loaded machine could end a settle mid-glide.
+        let mut app = glide_probe(false);
+        let glide = Duration::from_millis(motion::CAMERA_MS as u64 + 60);
 
         // A docked surface with no camera request moves nothing: the document
         // still starts at the top of the column, so its fourth line sits high
@@ -1140,7 +1139,7 @@ mod tests {
         );
 
         app.press("id:probe-focus-first").expect("focus line 3");
-        app.settle();
+        app.run_for(glide).expect("the glide");
         let offset = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
         assert!(
             offset.abs() <= tokens::TYPE_SOURCE_LINE,
@@ -1149,7 +1148,7 @@ mod tests {
 
         app.press("id:probe-focus-last")
             .expect("focus the last line");
-        app.settle();
+        app.run_for(glide).expect("the glide");
         let offset = level_offset(&app, "END-OF-THE-DOCUMENT");
         assert!(
             offset.abs() <= tokens::TYPE_SOURCE_LINE,

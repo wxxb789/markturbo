@@ -26,7 +26,7 @@ fn language_switch_keeps_the_unsubmitted_credential() {
     app.type_text("id:api-key", "synthetic-key")
         .expect("type credential");
 
-    app.press("id:settings-language-chinese >> role:button")
+    app.press("id:settings-language-chinese")
         .expect("switch language");
     app.wait_for("text:界面语言").expect("Chinese settings");
     let value = app
