@@ -492,6 +492,10 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             runtime.GUARD_BUTTON_NAMES,
             {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"},
         )
+        self.assertEqual(
+            runtime.GUARD_BUTTON_AUTOMATION_IDS,
+            {"Save": "guard-save", "Discard": "guard-dont-save", "Cancel": "guard-cancel"},
+        )
         self.assertIsNone(HARNESS.source_contract_failure())
 
     def test_source_contract_rejects_a_comment_only_selector(self) -> None:
@@ -552,14 +556,16 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
     def guard_root(self) -> tuple[FakeRoot, dict[str, FakeControl], FakeControl]:
         buttons = {
-            decision: FakeControl("", "Button", name=name)
+            decision: FakeControl(
+                runtime.GUARD_BUTTON_AUTOMATION_IDS[decision], "Button", name=name
+            )
             for decision, name in runtime.GUARD_BUTTON_NAMES.items()
         }
         title_save = FakeControl("title-save", "Button", name="Save")
         heading = FakeControl("", "Text", name=runtime.GUARD_HEADING)
         return FakeRoot([title_save, heading, *buttons.values()]), buttons, title_save
 
-    def test_guard_card_uses_its_anonymous_labelled_buttons(self) -> None:
+    def test_guard_card_finds_its_buttons_by_their_own_ids(self) -> None:
         root, buttons, title_save = self.guard_root()
         harness = native_harness(FreshRootFactory([root]))
 
@@ -570,7 +576,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(buttons["Discard"].click_count, 1)
         self.assertEqual(buttons["Save"].click_count, 0)
         self.assertEqual(title_save.click_count, 0)
-        self.assertIn(("descendants", ("name", "Don't save")), root.find_calls)
+        self.assertIn(("descendants", ("automation-id", "guard-dont-save")), root.find_calls)
 
     def test_guard_card_requires_its_heading_and_a_running_process(self) -> None:
         root, _buttons, _title_save = self.guard_root()
@@ -587,7 +593,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
     def test_guard_card_rejects_two_buttons_with_one_decision(self) -> None:
         root, _buttons, _title_save = self.guard_root()
-        root.controls.append(FakeControl("", "Button", name="Cancel"))
+        root.controls.append(FakeControl("guard-cancel", "Button", name="Cancel"))
         harness = native_harness(FreshRootFactory([root]))
         with self.assertRaises(HARNESS_FAILURE) as raised:
             harness.lifecycle_dialog(running_app())
@@ -1196,7 +1202,7 @@ class SystemAlertTests(unittest.TestCase):
         harness.save_via_menu = mock.Mock()
         harness.wait_name = mock.Mock()
         harness.editor_fingerprint = mock.Mock(return_value=dirty)
-        harness.find_named = mock.Mock(return_value=keep_mine)
+        harness.find_control = mock.Mock(return_value=keep_mine)
         harness.close_app = mock.Mock()
         harness.reap = mock.Mock()
 
@@ -1224,8 +1230,10 @@ class SystemAlertTests(unittest.TestCase):
             observations["saved_after_explicit_overwrite"], observations["dirty_editor"]
         )
         self.assertIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
-        harness.find_named.assert_called_once()
-        self.assertEqual(harness.find_named.call_args.args[1:3], (HARNESS.KEEP_MINE_NAME, "Button"))
+        harness.find_control.assert_called_once()
+        self.assertEqual(
+            harness.find_control.call_args.args[1:3], (HARNESS.KEEP_MINE_AUTOMATION_ID, "Button")
+        )
 
     def test_external_conflict_fails_when_keep_mine_writes_without_the_alert(self) -> None:
         harness, app = self.conflict_scenario(

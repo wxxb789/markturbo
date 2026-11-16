@@ -127,7 +127,8 @@ fn start(state: AppState, language: Language) -> impl IntoElement {
 fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
     let name_state = state.clone();
     let files_state = state.clone();
-    let empty_state = state.clone();
+    // One read of the tree feeds both the rows and the empty line.
+    let files = computed(move || workspace_files(&files_state));
     view()
         .test_id("workspace-home")
         .w_full()
@@ -148,7 +149,7 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
                 })),
         )
         .child(each(
-            move || workspace_files(&files_state),
+            move || files.get(),
             |entry: &Entry| entry.path.clone(),
             move |entry: ReadSignal<Entry>, _| {
                 let entry = entry.get();
@@ -181,7 +182,7 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
             },
         ))
         .child(when(
-            move || workspace_files(&empty_state).is_empty(),
+            move || files.with(Vec::is_empty),
             move || {
                 view()
                     .test_id("workspace-home-empty")

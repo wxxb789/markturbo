@@ -424,6 +424,27 @@ class ParserAndIsolationTests(unittest.TestCase):
         self.assertEqual(events[-1], ("read_focus",))
         self.assertNotIn("click", [event[0] for event in events])
 
+    def test_welcome_actions_are_found_by_their_own_automation_ids(self) -> None:
+        # The nsh welcome's actions are Buttons that carry their test ids, so
+        # an anonymous by-name lookup would never see them.
+        harness = mock.Mock()
+        app = object()
+        GOAL_03_HARNESS.welcome_entry_points(harness, app)
+
+        self.assertEqual(
+            [call.args[1] for call in harness.welcome_action.call_args_list],
+            ["welcome-new-file", "welcome-paste", "welcome-open-sample"],
+        )
+        GOAL_03_HARNESS.welcome_action(harness, app, HARNESS.WELCOME_SAMPLE_AUTOMATION_ID)
+        harness.find_control.assert_called_once_with(
+            app,
+            "welcome-open-sample",
+            "Button",
+            "WELCOME_UIA_TIMEOUT",
+            "WELCOME_UIA_CONTRACT_MISMATCH",
+        )
+        harness.find_named.assert_not_called()
+
     def test_save_as_shortcut_requires_editor_focus_and_sends_six_key_events(self) -> None:
         events = []
 

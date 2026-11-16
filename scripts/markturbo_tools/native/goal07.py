@@ -160,18 +160,20 @@ RUNTIME_SCAN_KEYS = frozenset(
 )
 
 # `ui/review.rs`: the structured result's first line, the answer input, and
-# the anonymous Buttons named by their labels.
+# the Buttons, each carrying its own AutomationId (`prims` actions).
 REVIEW_RESULT_MARKER = "Understood:"
 REVIEW_ANSWER_INPUT_AUTOMATION_ID = "review-answer-input"
-REVIEW_ANSWER_NAME = "Answer"
-PREPARE_REVISION_NAME = "Prepare revision"
+REVIEW_ANSWER_AUTOMATION_ID = "review-answer-submit"
+PREPARE_REVISION_AUTOMATION_ID = "review-prepare"
 # `ui/consent.rs` `send_button`: only a pointer hold past `HOLD_MS` sends.
 CONSENT_SEND_AUTOMATION_ID = "consent-send"
 CONSENT_HOLD_SECONDS = 1.8
 # `ui/revision.rs`: the docked hunk's decisions, the count and Done.
+# Accept's Name is checked for absence across the whole window.
 REVISION_ACCEPT_NAME = "Accept"
-REVISION_REJECT_NAME = "Reject"
-REVISION_DONE_NAME = "Done"
+REVISION_ACCEPT_AUTOMATION_ID = "revision-accept"
+REVISION_REJECT_AUTOMATION_ID = "revision-reject"
+REVISION_DONE_AUTOMATION_ID = "revision-done"
 REVISION_STALE_TEXT = "Stale \u2014 edited after review"
 # Not in the nsh UI yet: the Copy of the approved result, and an exposed group
 # around the docked hunk's proposed lines.
@@ -179,7 +181,7 @@ REVISION_COPY_AUTOMATION_ID = "revision-copy"
 REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
 # `ui/preview.rs`. `state.rs` `request_web_trust` confirms with an nsh system
 # alert outside the UIA tree, answered with Enter (`confirm_system_alert`).
-TRUST_SCRIPTS_NAME = "Trust scripts"
+TRUST_SCRIPTS_AUTOMATION_ID = "web-trust"
 TRUSTED_BANNER = "Trusted: scripts may run"
 RESTRICTED_BANNER = "Restricted: scripts disabled"
 UI_SOURCE_REQUIREMENTS = {
@@ -194,12 +196,17 @@ UI_SOURCE_REQUIREMENTS = {
     ),
     "crates/mt-app/src/ui/review.rs": (
         '"review-answer-input"',
+        '"review-answer-submit"',
+        '"review-prepare"',
         '"Answer"',
         '"Prepare revision"',
         '"Understood:"',
     ),
     "crates/mt-app/src/ui/consent.rs": ('"consent-send"', ".long_press_delay(HOLD_MS)"),
     "crates/mt-app/src/ui/revision.rs": (
+        '"revision-accept"',
+        '"revision-reject"',
+        '"revision-done"',
         '"Accept"',
         '"Reject"',
         '"Done"',
@@ -216,6 +223,7 @@ UI_SOURCE_REQUIREMENTS = {
         '"Trusted: scripts may run"',
         '"Restricted: scripts disabled"',
     ),
+    "crates/mt-app/src/ui/preview.rs": ('"web-trust"',),
     "crates/mt-app/src/state.rs": ('.destructive("trust", "Run scripts")',),
     "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
 }
@@ -1285,10 +1293,10 @@ class Goal07Harness(ClipboardNativeHarness):
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
         return True
 
-    def _press_named(self, app: Any, name: str, code: str) -> None:
+    def _press(self, app: Any, automation_id: str, code: str) -> None:
         self._require_foreground(app)
-        control = self.find_named(
-            app, name, "Button", f"{code}_UIA_TIMEOUT", f"{code}_UIA_CONTRACT_MISMATCH"
+        control = self.find_control(
+            app, automation_id, "Button", f"{code}_UIA_TIMEOUT", f"{code}_UIA_CONTRACT_MISMATCH"
         )
         self.click_control(control, f"{code}_CLICK_FAILED")
 
@@ -1395,7 +1403,7 @@ class Goal07Harness(ClipboardNativeHarness):
             return control is not None and control.iface_value.CurrentValue == value
 
         wait_until(typed, self.ui_timeout, "REVIEW_ANSWER_INPUT_TIMEOUT", interval=0.025)
-        self._press_named(app, REVIEW_ANSWER_NAME, "REVIEW_ANSWER_SUBMIT")
+        self._press(app, REVIEW_ANSWER_AUTOMATION_ID, "REVIEW_ANSWER_SUBMIT")
 
     def request_revision(
         self,
@@ -1405,7 +1413,7 @@ class Goal07Harness(ClipboardNativeHarness):
         hunks: int,
     ) -> None:
         self._set_answer(app, provider_fixtures.ANSWER_TEXT)
-        self._press_named(app, PREPARE_REVISION_NAME, "REVISION_PREPARE")
+        self._press(app, PREPARE_REVISION_AUTOMATION_ID, "REVISION_PREPARE")
         self._approve_consent(
             app,
             "REVISION_CONSENT_HOLD_FAILED",
@@ -1425,14 +1433,16 @@ class Goal07Harness(ClipboardNativeHarness):
         """Decide the docked hunk, in order, waiting for each to be counted."""
         total = len(decisions)
         for index, accepted in enumerate(decisions):
-            name = REVISION_ACCEPT_NAME if accepted else REVISION_REJECT_NAME
-            self._press_named(app, name, "REVISION_ACCEPT" if accepted else "REVISION_REJECT")
+            automation_id = (
+                REVISION_ACCEPT_AUTOMATION_ID if accepted else REVISION_REJECT_AUTOMATION_ID
+            )
+            self._press(app, automation_id, "REVISION_ACCEPT" if accepted else "REVISION_REJECT")
             self.wait_name(
                 app, f"{index + 1} of {total} decided", "Text", "REVISION_DECISION_TIMEOUT"
             )
 
     def done(self, app: Any) -> None:
-        self._press_named(app, REVISION_DONE_NAME, "REVISION_DONE")
+        self._press(app, REVISION_DONE_AUTOMATION_ID, "REVISION_DONE")
 
     def _common_observations(
         self, provider: provider_fixtures.LoopbackRevisionServer
@@ -1639,8 +1649,8 @@ class Goal07Harness(ClipboardNativeHarness):
             self.wait_name(app, REVISION_STALE_TEXT, "Text", "REVISION_STALE_UIA_TIMEOUT")
             if self.name_present(app, REVISION_ACCEPT_NAME, "Button"):
                 raise HarnessFailure("STALE_REVISION_OFFERS_ACCEPT")
-            done = self.control_by_name(
-                app.hwnd, REVISION_DONE_NAME, "Button", "REVISION_DONE_UIA_CONTRACT_MISMATCH"
+            done = self.control_by_id(
+                app.hwnd, REVISION_DONE_AUTOMATION_ID, "Button", "REVISION_DONE_UIA_CONTRACT_MISMATCH"
             )
             done_enabled = bool(done is not None and done.is_enabled())
             source_before = sha256_file(source)
@@ -1729,7 +1739,7 @@ class Goal07Harness(ClipboardNativeHarness):
             edits = provider_fixtures.fixture_edits(HTML_EDITOR_SOURCE_TEXT)
             app = self.launch_app(source, data, config, workspace, stderr)
             self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-            self._press_named(app, TRUST_SCRIPTS_NAME, "TRUST_BUTTON")
+            self._press(app, TRUST_SCRIPTS_AUTOMATION_ID, "TRUST_BUTTON")
             # The Run scripts alert is outside the UIA tree; Enter answers it
             # with Run scripts (`alert_enter_confirms`).
             self.confirm_system_alert(

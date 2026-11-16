@@ -75,4 +75,28 @@ fn opening_a_workspace_replaces_the_welcome() {
         "no welcome under a directory argument: {:?}",
         app.screen().texts()
     );
+    app.wait_for("id:workspace-home-file")
+        .expect("the directory's document listed");
+    assert_eq!(
+        app.screen()
+            .count("id:workspace-home-empty")
+            .expect("selector"),
+        0,
+        "a folder with a document is not called empty"
+    );
+    drop(app);
+
+    // An empty folder says so, and lists nothing.
+    let empty = tempfile::tempdir().expect("empty workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let mut app = start(config.path(), Some(empty.path()));
+    app.wait_for("id:workspace-home-empty")
+        .expect("the empty folder's line");
+    assert_eq!(
+        app.screen()
+            .count("id:workspace-home-file")
+            .expect("selector"),
+        0,
+        "no file rows in an empty folder"
+    );
 }

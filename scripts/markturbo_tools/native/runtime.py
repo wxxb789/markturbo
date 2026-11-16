@@ -66,9 +66,10 @@ INTEGRITY_NAMES = {
 # * AutomationId is the view's `.test_id(..)` (src/access/uia.rs:821), but only
 #   on a view that is itself a UIA element. A plain view with no role, label or
 #   press handler is flat and is looked through (src/access.rs:284-297,
-#   373-384), so `prims::quiet_action`/`primary_action` and the guard card put
-#   their id on such a wrapper and expose an anonymous Button named by its
-#   accessibility label instead.
+#   373-384). `prims::quiet_action`/`primary_action` and the guard card's
+#   actions are the pressable Button view itself, so each carries its own
+#   AutomationId (for example `guard-save`, `welcome-new-file`) and is found by
+#   it; anonymous name lookups do not see them.
 # * Name is the accessibility label, else a text view's visible text, else the
 #   folded content of a grouping control such as a Button (src/access.rs:453).
 # * ControlType follows the role, else Text for text views, Edit for inputs,
@@ -103,6 +104,11 @@ MENU_QUIT_AUTOMATION_ID = "title-menu-quit"
 DIRTY_MARK_AUTOMATION_ID = "title-dirty"
 GUARD_HEADING = "Close without saving?"
 GUARD_BUTTON_NAMES = {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"}
+GUARD_BUTTON_AUTOMATION_IDS = {
+    "Save": "guard-save",
+    "Discard": "guard-dont-save",
+    "Cancel": "guard-cancel",
+}
 CONFLICT_HEADING = "Changed on disk"
 LIFECYCLE_CLICK_FAILURE_CODES = {
     "Save": "LIFECYCLE_SAVE_CLICK_FAILED",
@@ -1568,9 +1574,9 @@ class NativeHarness:
     ) -> Any | None:
         """The one control of `control_type` named `name`.
 
-        `anonymous` keeps only elements without an AutomationId: the nsh
-        controls that carry their test id on a flat wrapper, so a title-row
-        or menu control that happens to share the label never matches.
+        `anonymous` keeps only elements without an AutomationId, such as the
+        source editor and card headings, so a control with its own id that
+        happens to share the label never matches.
         """
         matches = self.controls_by_name(hwnd, name, control_type, anonymous=anonymous)
         if not matches:
@@ -1987,9 +1993,13 @@ class NativeHarness:
                 ) is None:
                     return None
                 buttons = {}
-                for decision, name in GUARD_BUTTON_NAMES.items():
-                    button = self.control_by_name(
-                        app.hwnd, name, "Button", "GUARD_BUTTON_UIA_CONTRACT_MISMATCH"
+                for decision, automation_id in GUARD_BUTTON_AUTOMATION_IDS.items():
+                    button = self.control_by_id(
+                        app.hwnd,
+                        automation_id,
+                        "Button",
+                        "GUARD_BUTTON_UIA_CONTRACT_MISMATCH",
+                        expected_name=GUARD_BUTTON_NAMES[decision],
                     )
                     if button is None:
                         return None
