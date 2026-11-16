@@ -2906,6 +2906,9 @@ impl AppState {
             hunk.accepted.set(applied);
         }
         if let Some(text) = written {
+            // Trust was granted to the text before this write: revoke it
+            // first, so revised text never runs scripts under it.
+            tab.web_trusted.set(false);
             tab.text.set(SharedString::from(text));
             tab.dirty.set(true);
             tab.revision.update(|revision| *revision += 1);
@@ -3465,5 +3468,123 @@ fn recovered_loaded(record: &RecoveredRecord) -> LoadedFile {
             .unwrap_or(encoding_rs::UTF_8),
         decode_had_errors: metadata.decode_had_errors,
         source_identity: metadata.source_identity.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mt_core::{
+        credentials::{CredentialError, Secret, SecureCredentialStore},
+        review::{
+            ByteRange,
+            revision::{RevisionChange, RevisionEdit, RevisionLimits},
+        },
+    };
+
+    use super::*;
+
+    /// A credential store with nothing in it: the test never reaches the
+    /// platform's secure store.
+    struct NoStore;
+
+    impl SecureCredentialStore for NoStore {
+        fn is_supported(&self) -> bool {
+            false
+        }
+        fn read(&self, _: &str) -> Result<Option<Secret>, CredentialError> {
+            Ok(None)
+        }
+        fn write(&self, _: &str, _: &Secret) -> Result<(), CredentialError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
+
+    const SOURCE: &str = "compiles but no check\n";
+
+    /// What the probe saw: the text and trust after the accept and after
+    /// the undo, then every (text, trust) a text watcher observed.
+    type Outcome = ((String, bool), (String, bool), Vec<(String, bool)>);
+
+    static OUTCOME: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
+
+    /// Accepts, then undoes, one Revision change in a trusted document, as
+    /// the hunk card does.
+    #[component]
+    fn TrustProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the new document");
+        tab.text.set(SharedString::from(SOURCE));
+        let changes = [("Tighten.", "compiles but", "compiles, but")]
+            .iter()
+            .map(|&(reason, before, after)| {
+                let start = SOURCE.find(before).expect("in the source") as u64;
+                let range = ByteRange::new(start, start + before.len() as u64).expect("a range");
+                RevisionChange::new(reason, vec![RevisionEdit::new(range, before, after)])
+            })
+            .collect();
+        let proposal = RevisionProposal::validate(
+            SOURCE,
+            SourceSnapshot::new(0, 0),
+            changes,
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision(proposal);
+
+        // Whatever watches the text (the Web pane) must never see revised
+        // text under the trust granted to the text before it.
+        let seen = Rc::new(RefCell::new(Vec::<(String, bool)>::new()));
+        let watch = seen.clone();
+        let (text, trusted) = (tab.text, tab.web_trusted);
+        effect(move || {
+            let text = text.get().to_string();
+            let trusted = untracked(|| trusted.get());
+            watch.borrow_mut().push((text, trusted));
+        });
+        let read = |tab: &Tab| (tab.text.get().to_string(), tab.web_trusted.get());
+
+        tab.web_trusted.set(true);
+        assert!(state.set_revision_change_applied(0, true), "accept");
+        let accepted = read(&tab);
+        tab.web_trusted.set(true);
+        assert!(state.set_revision_change_applied(0, false), "undo");
+        let undone = read(&tab);
+        *OUTCOME.lock().expect("the outcome") = Some((accepted, undone, seen.borrow().clone()));
+        view()
+    }
+
+    #[test]
+    fn every_revision_write_revokes_web_script_trust_first() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                TrustProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (accepted, undone, seen) = OUTCOME
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert_eq!(
+            accepted,
+            (
+                "compiles, but no check
+"
+                .to_owned(),
+                false
+            )
+        );
+        assert_eq!(undone, (SOURCE.to_owned(), false));
+        assert!(
+            seen.iter().skip(1).all(|(_, trusted)| !trusted),
+            "a watcher saw revised text under old trust: {seen:?}"
+        );
     }
 }
