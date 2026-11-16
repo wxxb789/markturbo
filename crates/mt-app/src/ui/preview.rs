@@ -590,6 +590,51 @@ mod tests {
         let shown = texts(&app);
         assert!(shown.contains("Preview"), "{}", dump(&app));
         assert!(shown.contains("Release plan"), "{}", dump(&app));
-        println!("field nodes:\n{}", dump(&app));
+        // The preview is on screen, not just in the tree: its scroll has room
+        // and the rendered heading lies inside it, in the narrow window's
+        // overlay and at the wide breakpoint alike.
+        assert_preview_is_visible(&app);
+        app.set_viewport(nsh_core::Size::new(
+            nsh_core::Points(1440.0),
+            nsh_core::Points(900.0),
+        ))
+        .expect("a 1440x900 window");
+        app.settle();
+        assert_preview_is_visible(&app);
+    }
+
+    /// The field's preview scroll has a visible height, and the document's
+    /// rendered heading starts inside it: a scroll laid out at zero height
+    /// clips the whole document away.
+    fn assert_preview_is_visible(app: &Headless) {
+        let nodes = app.screen().layout_nodes();
+        let scroll = nodes
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some("preview-text"))
+            .unwrap_or_else(|| panic!("the preview scroll: {}", dump(app)))
+            .bounds;
+        assert!(
+            scroll.size.height.0 > 100.0,
+            "the preview scroll is {}pt tall: {}",
+            scroll.size.height.0,
+            dump(app)
+        );
+        let heading = nodes
+            .iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text.as_str() == "Release plan")
+            })
+            .unwrap_or_else(|| panic!("the rendered heading: {}", dump(app)))
+            .bounds;
+        let top = scroll.origin.y.0;
+        let bottom = top + scroll.size.height.0;
+        assert!(
+            heading.origin.y.0 >= top && heading.origin.y.0 < bottom,
+            "the heading at y{} is outside the preview scroll y{top}..{bottom}: {}",
+            heading.origin.y.0,
+            dump(app)
+        );
     }
 }

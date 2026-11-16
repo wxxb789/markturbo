@@ -219,13 +219,16 @@ fn field(state: AppState, language: Language, layout: Layout) -> impl IntoElemen
         view()
             .w_full()
             .max_w(px(tokens::FIELD_READING_MAX_W))
+            // The field's full height reaches its surface: a surface that
+            // scrolls (the preview) fills it rather than collapsing to 0.
+            .h(relative(1.0))
             .child(field_surface(state, language)),
     )
 }
 
 /// The one surface the field shows, in [`surface`]'s order of precedence.
 fn field_surface(state: AppState, language: Language) -> impl IntoElement {
-    let mut field = view().test_id("field").w_full().flex_col();
+    let mut field = view().test_id("field").w_full().h(relative(1.0)).flex_col();
     for want in [
         FieldSurface::Revision,
         FieldSurface::Review,
