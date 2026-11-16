@@ -1198,6 +1198,32 @@ class Win32:
             self.kernel32.CloseHandle(process)
 
 
+CLIPBOARD_OPEN_TIMEOUT_SECONDS = 1.0
+CLIPBOARD_OPEN_RETRY_SECONDS = 0.02
+
+
+def open_clipboard_with_retry(
+    open_clipboard: Callable[[], bool],
+    timeout: float = CLIPBOARD_OPEN_TIMEOUT_SECONDS,
+    *,
+    clock: Callable[[], float] = time.perf_counter,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Open the clipboard, retrying while another process holds it.
+
+    Windows lets one process open the clipboard at a time, and clipboard
+    listeners (the RDP clipboard redirector, clipboard managers) open it
+    briefly after every change: a single failed attempt is contention, not
+    an unavailable clipboard."""
+    deadline = clock() + timeout
+    while True:
+        if open_clipboard():
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(CLIPBOARD_OPEN_RETRY_SECONDS)
+
+
 def key_input(key: int, key_up: bool) -> INPUT:
     flags = KEYEVENTF_KEYUP if key_up else 0
     return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(key, 0, flags, 0, 0))
@@ -1862,7 +1888,7 @@ class NativeHarness:
         kernel32.GlobalLock.restype = wt.LPVOID
         kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
         kernel32.GlobalUnlock.restype = wt.BOOL
-        if not user32.OpenClipboard(None):
+        if not open_clipboard_with_retry(lambda: bool(user32.OpenClipboard(None))):
             raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
         try:
             formats: set[int] = set()
@@ -1903,7 +1929,7 @@ class NativeHarness:
         kernel32.GlobalLock.restype = wt.LPVOID
         kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
         kernel32.GlobalUnlock.restype = wt.BOOL
-        if not user32.OpenClipboard(None):
+        if not open_clipboard_with_retry(lambda: bool(user32.OpenClipboard(None))):
             raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
         try:
             if not user32.EmptyClipboard():

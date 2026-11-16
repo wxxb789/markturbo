@@ -534,3 +534,31 @@ class OwnedProcessTests(unittest.TestCase):
                     win32.create_suspended_process(spec)
                 expected = [mock.call(81)] if duplicate_failure else [mock.call(81), mock.call(82)]
                 self.assertEqual(api.CloseHandle.call_args_list, expected)
+
+
+class ClipboardOpenRetryTests(unittest.TestCase):
+    """Another process holding the clipboard for a moment is contention, not an
+    unavailable clipboard: the open is retried until a deadline."""
+
+    def fake_clock(self) -> tuple[list[float], Any, Any]:
+        now = [0.0]
+        return now, (lambda: now[0]), (lambda seconds: now.__setitem__(0, now[0] + seconds))
+
+    def test_a_briefly_held_clipboard_opens_on_a_retry(self) -> None:
+        attempts = iter([False, False, True])
+        _, clock, sleep = self.fake_clock()
+        self.assertTrue(
+            runtime.open_clipboard_with_retry(lambda: next(attempts), clock=clock, sleep=sleep)
+        )
+
+    def test_a_clipboard_held_past_the_deadline_is_unavailable(self) -> None:
+        now, clock, sleep = self.fake_clock()
+        calls = []
+
+        def held() -> bool:
+            calls.append(now[0])
+            return False
+
+        self.assertFalse(runtime.open_clipboard_with_retry(held, 0.1, clock=clock, sleep=sleep))
+        self.assertGreater(len(calls), 1)
+        self.assertGreaterEqual(now[0], 0.1)
