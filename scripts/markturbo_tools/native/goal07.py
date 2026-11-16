@@ -1239,18 +1239,25 @@ def _rust_function_body(source: str | None, signature: str) -> str | None:
 
 
 def trust_apply_source_contract_ok() -> bool:
-    """Every Revision write revokes the tab's script trust (`state.rs`
-    `set_revision_change_applied`, which Accept and Undo both call) before the
-    text replaces the buffer, and Done (`finish_revision`) writes no text, so
-    no trusted page renders revised text."""
+    """Every Revision write revokes the tab's script trust before the text
+    replaces the buffer: `set_revision_change_applied` (which Accept and Undo
+    both call) writes only through `write_model_text`, which revokes trust
+    first; Done (`finish_revision`) writes no text, so no trusted page
+    renders revised text."""
     state = production_source(REPO / "crates" / "mt-app" / "src" / "state.rs")
-    write = _rust_function_body(state, "pub fn set_revision_change_applied(")
+    decide = _rust_function_body(state, "pub fn set_revision_change_applied(")
+    write = _rust_function_body(state, "fn write_model_text(")
     done = _rust_function_body(state, "pub fn finish_revision(")
-    if write is None or done is None:
+    if decide is None or write is None or done is None:
         return False
     revoke = write.find("web_trusted.set(false)")
     replace = write.find("text.set(")
-    return 0 <= revoke < replace and "text.set(" not in done
+    return (
+        0 <= revoke < replace
+        and "write_model_text(" in decide
+        and "text.set(" not in decide
+        and "text.set(" not in done
+    )
 
 
 def preview_inert_source_contract_ok() -> bool:

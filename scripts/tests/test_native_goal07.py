@@ -233,9 +233,12 @@ SAFE_STATE = """\
             Ok(written) => written,
             Err(LedgerRefusal::PartChanged) => return false,
         };
+        self.write_model_text(&tab, text);
+        true
+    }
+    fn write_model_text(&self, tab: &Tab, text: String) {
         tab.web_trusted.set(false);
         tab.text.set(SharedString::from(text));
-        true
     }
     pub fn finish_revision(&self, undecided: usize) {
         self.revision_status.set(Some(SharedString::from("No changes approved.")));
@@ -917,6 +920,14 @@ class SourceContractFixtureTests(unittest.TestCase):
         )
         self.assertNotEqual(writing_done, SAFE_STATE)
         self.assertFalse(self.checks(state=writing_done)[1])
+
+    def test_source_contract_rejects_a_decision_that_bypasses_the_revoking_write(self) -> None:
+        bypass = SAFE_STATE.replace(
+            "        self.write_model_text(&tab, text);\n",
+            "        tab.text.set(SharedString::from(text));\n",
+        )
+        self.assertNotEqual(bypass, SAFE_STATE)
+        self.assertFalse(self.checks(state=bypass)[1])
 
     def test_source_contract_rejects_comment_only_trust_markers(self) -> None:
         for decoy in (

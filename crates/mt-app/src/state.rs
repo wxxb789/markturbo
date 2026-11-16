@@ -533,8 +533,11 @@ impl AppState {
     /// The constructor's body, with the one choice a test overrides made a
     /// parameter.
     fn build(vault: CredentialVault) -> Self {
+        // A block, so the native harnesses' source filter can mask it.
         #[cfg(test)]
-        crate::test_env::hermetic();
+        {
+            crate::test_env::hermetic();
+        }
         let settings = SettingsData::load();
         set_color_scheme(match settings.theme {
             ThemePreference::System => nsh_core::platform::Appearance::System,
