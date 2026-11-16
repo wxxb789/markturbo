@@ -28,11 +28,15 @@
 //!
 //! Contract: [`is_open`] says the field belongs to the revision (it outranks
 //! the review field, because a revision runs inside a review); [`field`] draws
-//! it. The other half — the removed words struck cold in the column, the
-//! accepted words settling in as ambient ink — belongs to whatever draws the
-//! column's decorations; [`decision`] is the seam it reads, because the
-//! state's per-change signal alone cannot tell a rejected change from one
-//! still to be judged.
+//! it. The other half — the removed words struck cold in the column — is
+//! [`column_decorations`], which `ui::document` merges into the editor's
+//! decorations; it reads [`decision`], because the state's per-change signal
+//! alone cannot tell a rejected change from one still to be judged. Accepted
+//! words need no mark: once written they are plain ink.
+//!
+//! `Copy` puts the approved result — the document as it stands, every
+//! accepted change in it and nothing else of the proposal — on the clipboard,
+//! without touching the editor, the dirty flag or the file.
 //!
 //! Old and new are always on screen together — no modifier key, no hover — so
 //! the hunk is judged without leaving the field. The current proposal is this
@@ -63,12 +67,14 @@ use std::{
 };
 
 use mt_core::settings::Language;
-use nsh_core::prelude::*;
+use nsh_base::editor::EditorDecoration;
+use nsh_core::{Color, PropertyValue, StyleKey, TextDecoration, element::Style, prelude::*};
 
 use crate::{
     i18n::{self, Key},
-    state::{AppState, RevisionHunkView},
+    state::{AppState, RevisionHunkView, Tab},
     ui::{
+        glow,
         motion::{self, Heat},
         prims,
         tokens::{self, SPACE_1, SPACE_2, SPACE_3},
@@ -100,6 +106,8 @@ enum S {
     OtherDocument,
     ReviewAgain,
     Move,
+    Copy,
+    Proposed,
 }
 
 impl S {
@@ -118,6 +126,8 @@ impl S {
                 S::OtherDocument => "This Revision belongs to another document".to_owned(),
                 S::ReviewAgain => "Review again".to_owned(),
                 S::Move => "Move".to_owned(),
+                S::Copy => "Copy".to_owned(),
+                S::Proposed => "Proposed text".to_owned(),
             },
             Language::Chinese => match self {
                 S::Accept => "接受".to_owned(),
@@ -132,6 +142,8 @@ impl S {
                 S::OtherDocument => "此修订属于另一个文档".to_owned(),
                 S::ReviewAgain => "重新审阅".to_owned(),
                 S::Move => "切换".to_owned(),
+                S::Copy => "复制".to_owned(),
+                S::Proposed => "建议的文本".to_owned(),
             },
         }
     }
@@ -287,6 +299,60 @@ fn proposal_id(hunks: &[RevisionHunkView]) -> u64 {
 pub fn decision(state: &AppState, change_id: u32) -> Option<bool> {
     let hunks = state.revision_hunks.get();
     session().with(|now| now.synced(&hunks).decision(change_id))
+}
+
+/// The column's marks for `tab`: every hunk still to be judged has its
+/// removed words struck cold — a 1px strike and underline in the palette's
+/// removed colour, the glyphs keeping their ink. An accepted hunk is plain
+/// text already and a rejected one loses its marks; a hunk an edit touched
+/// has no place to mark. The places are the state's ledger's, never a
+/// search for the old text. Reads signals only, so the editor's binding
+/// follows every decision and edit.
+pub fn column_decorations(state: &AppState, tab: &Tab) -> Vec<EditorDecoration> {
+    let hunks = state.revision_hunks.get();
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+    // Reading the session subscribes, as [`decision`] does.
+    let decided = session().with(|now| now.synced(&hunks));
+    let removed = removed_style();
+    tab.text.with(|text| {
+        hunks
+            .iter()
+            .filter(|hunk| !hunk.accepted.get() && decided.decision(hunk.change_id).is_none())
+            .filter_map(|hunk| state.revision_hunk_range(tab.id, hunk.ordinal))
+            .filter_map(|range| glow::positions(text, range.start, range.end))
+            .map(|range| {
+                // `EditorDecoration` is `#[non_exhaustive]`: a default and
+                // its fields, not a literal.
+                let mut decoration = EditorDecoration::default();
+                decoration.range = range;
+                decoration.style = Some(removed.clone());
+                decoration
+            })
+            .collect()
+    })
+}
+
+/// The cold strike on removed words, as declarations the editor replays.
+fn removed_style() -> Style {
+    let lines = TextDecoration {
+        underline: true,
+        line_through: true,
+    };
+    Style::default()
+        .with(
+            StyleKey::TextDecorationLine,
+            PropertyValue::TextDecoration(Some(lines)),
+        )
+        .with(
+            StyleKey::TextDecorationColor,
+            PropertyValue::Color(Some(tokens::palette().removed)),
+        )
+        .with(
+            StyleKey::TextDecorationThickness,
+            PropertyValue::OptPoints(Some(px(tokens::HAIRLINE))),
+        )
 }
 
 // ─── the surface ──────────────────────────────────────────────────────────
@@ -625,8 +691,12 @@ fn docked_proposal(
                                 ))
                         }))
                         .child(when(has_after, move || {
+                            // A labelled group whose lines are its text
+                            // children: what a screen reader reads as the
+                            // proposal.
                             view()
                                 .test_id("revision-proposal-after")
+                                .label(S::Proposed.text(language))
                                 .w_full()
                                 .flex_col()
                                 .child(
@@ -778,6 +848,7 @@ fn decisions(
     now: Signal<Session>,
 ) -> impl IntoElement {
     let undo_state = state.clone();
+    let copy_state = state.clone();
     let close_state = state.clone();
     let done_state = state;
     view()
@@ -848,6 +919,7 @@ fn decisions(
                 .justify_end()
                 .w_full()
                 .gap(px(SPACE_3))
+                .child(copy_action(copy_state, language))
                 .child(prims::quiet_action(
                     "revision-close",
                     i18n::t(language, Key::Close),
@@ -856,6 +928,33 @@ fn decisions(
                 // `Done` is the one next action only once nothing is left to
                 // judge; while hunks wait it stays the quiet one.
                 .child(done_action(done_state, language, hunks, now)),
+        )
+}
+
+/// `Copy`, a quiet action whose pressable view carries the test id itself,
+/// so a screen reader (and UI Automation) finds one button by it.
+fn copy_action(state: AppState, language: Language) -> impl IntoElement {
+    let label = SharedString::from(S::Copy.text(language));
+    view()
+        .test_id("revision-copy")
+        .role(AccessibilityRole::Button)
+        .label(label.clone())
+        .focusable(true)
+        .cursor_pointer()
+        .bg(Color::TRANSPARENT)
+        .px(px(2.0))
+        .py(px(4.0))
+        .transition_colors()
+        .duration(motion::HOVER_MS)
+        .hover(|s| s.text_color(tokens::palette().ink).underline())
+        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+        .on_press(move || copy_approved(&state))
+        .child(
+            text(label)
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink_rest),
         )
 }
 
@@ -1052,6 +1151,14 @@ fn done(state: &AppState) {
     let hunks = state.revision_hunks.get();
     let (decided, all) = session().with(|now| now.synced(&hunks).counts(&hunks));
     state.finish_revision(all - decided);
+}
+
+/// `Copy`: the approved result on the clipboard. Nothing else changes — not
+/// the editor, not the dirty flag, not the file.
+fn copy_approved(state: &AppState) {
+    if let Some(text) = state.revision_approved_text() {
+        set_clipboard(text.to_string());
+    }
 }
 
 /// Dismiss the outcome text on screen: it is consumed, so the next outcome
@@ -1903,6 +2010,163 @@ mod tests {
                 && docked.origin.y.0 + docked.size.height.0 <= rows.origin.y.0 + rows.size.height.0,
             "the docked hunk is kept in view: {docked:?} in {rows:?}"
         );
+    }
+
+    /// The two-change proposal with the column's marks for the tab on screen
+    /// written out, and the controls that change them from outside the
+    /// field: an edit inside the first hunk's old text, and another document.
+    #[component]
+    fn ColumnMarksProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let marks_state = state.clone();
+        let edit_state = state.clone();
+        let other_state = state.clone();
+        view()
+            .child(text(move || {
+                marks_state.active_tab().map_or_else(
+                    || "marks: no tab".to_owned(),
+                    |tab| describe_marks(&column_decorations(&marks_state, &tab)),
+                )
+            }))
+            .child(text("edit-first").on_press(move || {
+                if let Some(tab) = edit_state.active_tab() {
+                    let edited = tab.text.get().replacen("compiles but", "compiles, yet", 1);
+                    tab.text.set(SharedString::from(edited));
+                    tab.revision.update(|revision| *revision += 1);
+                    edit_state.note_edit(tab.id);
+                }
+            }))
+            .child(text("other-document").on_press(move || other_state.new_document()))
+            .child(field(state, Language::English))
+    }
+
+    /// The marks as `line:column-line:column` ranges, each flagged when its
+    /// style is anything but the cold strike: a 1px strike and underline in
+    /// the palette's removed colour, the glyphs left alone, nothing on the
+    /// line or in the gutter.
+    fn describe_marks(decorations: &[EditorDecoration]) -> String {
+        use nsh_core::StyleDecl;
+        let cold = [
+            StyleDecl::Set(
+                StyleKey::TextDecorationLine,
+                PropertyValue::TextDecoration(Some(TextDecoration {
+                    underline: true,
+                    line_through: true,
+                })),
+            ),
+            StyleDecl::Set(
+                StyleKey::TextDecorationColor,
+                PropertyValue::Color(Some(tokens::palette().removed)),
+            ),
+            StyleDecl::Set(
+                StyleKey::TextDecorationThickness,
+                PropertyValue::OptPoints(Some(px(1.0))),
+            ),
+        ];
+        let marks: Vec<String> = decorations
+            .iter()
+            .map(|decoration| {
+                let struck_cold = decoration
+                    .style
+                    .as_ref()
+                    .is_some_and(|style| style.decls() == &cold[..])
+                    && decoration.line_style.is_none()
+                    && decoration.gutter.is_none()
+                    && decoration.class.is_none();
+                let range = decoration.range;
+                format!(
+                    "{}:{}-{}:{}{}",
+                    range.start.line,
+                    range.start.column,
+                    range.end.line,
+                    range.end.column,
+                    if struck_cold { "" } else { " (not cold)" }
+                )
+            })
+            .collect();
+        if marks.is_empty() {
+            "marks: none".to_owned()
+        } else {
+            format!("marks: {}", marks.join(" "))
+        }
+    }
+
+    #[test]
+    fn the_column_strikes_the_undecided_hunks_old_words_cold() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ColumnMarksProbe>()))
+            .expect("start the probe");
+        // `compiles but no check`: both hunks wait, both old texts struck.
+        app.wait_for("text:marks: 0:0-0:12 0:13-0:21")
+            .expect("each undecided hunk's old words are struck cold");
+
+        // Accept: the replacement is plain text, its strike gone in the same
+        // step; the other hunk's mark follows its bytes one column on.
+        app.press_key("a").expect("accept the first hunk");
+        app.wait_for("text:marks: 0:14-0:22")
+            .expect("the accepted hunk loses its mark, the other one moves");
+        app.wait_for("text:Tighten the promise. · Accepted")
+            .expect("the second hunk is docked");
+
+        // Reject: the cold marks go.
+        app.press_key("r").expect("reject the second hunk");
+        app.wait_for("text:marks: none")
+            .expect("a rejected hunk loses its marks");
+
+        // Undo walks back: undecided again, struck again.
+        app.press_key("ctrl+z").expect("undo the rejection");
+        app.wait_for("text:marks: 0:14-0:22")
+            .expect("the undecided hunk is struck again");
+        app.press_key("ctrl+z").expect("undo the accept");
+        app.wait_for("text:marks: 0:0-0:12 0:13-0:21")
+            .expect("the reviewed words are back, and struck");
+
+        // An edit inside the first hunk's old words: it has no place left to
+        // mark (and no Accept); the untouched hunk keeps its own bytes.
+        app.press("text:edit-first")
+            .expect("edit inside the first hunk");
+        app.wait_for("text:marks: 0:14-0:22")
+            .expect("only the untouched hunk is marked, where it moved");
+
+        // Another document on screen: the proposal's marks stay in its own.
+        app.press("text:other-document")
+            .expect("open another document");
+        app.wait_for("text:marks: none")
+            .expect("another document carries no marks");
+    }
+
+    #[test]
+    fn the_docked_proposal_reads_as_a_labelled_group_of_lines() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<TallHunkProbe>()))
+            .expect("start the field");
+        app.wait_for("id:revision-proposal-after")
+            .expect("the proposal's lines");
+        let screen = app.screen();
+        assert_eq!(
+            screen.count("label:Proposed text").expect("the selector"),
+            1,
+            "one labelled proposal: {:?}",
+            screen.texts()
+        );
+        // Every proposed line is a text inside the labelled group, in the
+        // group the harness reads by its id.
+        for group in ["label:Proposed text", "id:revision-proposal-after"] {
+            assert_eq!(
+                screen
+                    .count(&format!("{group} >> text:/^new line [0-9]+$/"))
+                    .expect("the selector"),
+                20,
+                "every proposed line is a text of {group}: {:?}",
+                screen.texts()
+            );
+            assert!(
+                !screen
+                    .matches(&format!("{group} >> text:old line 1"))
+                    .expect("the selector"),
+                "the old text is not part of the proposal"
+            );
+        }
     }
 
     /// One untitled document holding `text`, the source a probe's proposal

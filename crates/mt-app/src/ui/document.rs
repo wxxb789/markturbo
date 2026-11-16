@@ -264,6 +264,12 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                                 &decorations_state,
                                 &decorations_tab,
                             ));
+                            // The revision's cold strikes on the words its
+                            // undecided hunks would remove.
+                            decorations.extend(revision::column_decorations(
+                                &decorations_state,
+                                &decorations_tab,
+                            ));
                             decorations
                         })
                         .w_full()
