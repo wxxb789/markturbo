@@ -481,6 +481,8 @@ fn build_frozen_agent_skill_package(
         files.push(file);
     }
 
+    disclose_missing_references(&files, &mut omissions);
+
     let entrypoint_source = match requested_entrypoint {
         RequestedEntrypoint::Disk => EntrypointSource::Disk,
         RequestedEntrypoint::EditorText(_) => EntrypointSource::EditorText,
@@ -499,6 +501,78 @@ fn build_frozen_agent_skill_package(
             supporting_files,
         }),
     })
+}
+
+/// The reason a supporting file that `SKILL.md` links to, but that is not in
+/// the inventory, is disclosed as an omission.
+const MISSING_REFERENCE_REASON: &str = "referenced file not found";
+
+/// Disclose every relative file the entrypoint links to that the inventory
+/// does not hold, so a package missing a normally in-scope supporting file is
+/// partial rather than presented as complete. Links with a scheme, absolute
+/// or escaping paths, fragments and percent-encoded targets are not package
+/// files and are left alone.
+fn disclose_missing_references(
+    files: &[SkillPackageFile],
+    omissions: &mut Vec<SkillPackageOmission>,
+) {
+    let Some(entrypoint) = files.iter().find(|file| file.path == "SKILL.md") else {
+        return;
+    };
+    let SkillFilePayload::Utf8 { content } = &entrypoint.payload else {
+        return;
+    };
+    let covers = |path: &str, target: &str| {
+        path == target
+            || path
+                .strip_prefix(target)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    for target in relative_link_targets(content) {
+        let Ok(omission) = SkillPackageOmission::new(&target, MISSING_REFERENCE_REASON, false)
+        else {
+            continue;
+        };
+        if files.iter().any(|file| covers(&file.path, &omission.path))
+            || omissions
+                .iter()
+                .any(|existing| covers(&existing.path, &omission.path))
+        {
+            continue;
+        }
+        omissions.push(omission);
+    }
+    omissions.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+}
+
+/// The link and image destinations of a Markdown entrypoint that can name a
+/// file inside the package, without fragment or query.
+fn relative_link_targets(markdown_source: &str) -> Vec<String> {
+    fn walk(node: &markdown::mdast::Node, targets: &mut Vec<String>) {
+        use markdown::mdast::Node;
+        let url = match node {
+            Node::Link(link) => Some(link.url.as_str()),
+            Node::Image(image) => Some(image.url.as_str()),
+            Node::Definition(definition) => Some(definition.url.as_str()),
+            _ => None,
+        };
+        if let Some(url) = url {
+            let path = url.split(['#', '?']).next().unwrap_or_default();
+            if !path.is_empty() && !path.contains([':', '%']) && !path.starts_with(['/', '\\']) {
+                targets.push(path.to_owned());
+            }
+        }
+        for child in node.children().into_iter().flatten() {
+            walk(child, targets);
+        }
+    }
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.frontmatter = true;
+    let mut targets = Vec::new();
+    if let Ok(tree) = markdown::to_mdast(markdown_source, &options) {
+        walk(&tree, &mut targets);
+    }
+    targets
 }
 
 fn skill_package_file_from_disk_bytes(
@@ -727,6 +801,59 @@ mod tests {
             SkillFilePayload::Utf8 { content } if content == "disk entrypoint"
         ));
         assert!(package.files()[1].is_binary_metadata_only());
+    }
+
+    #[test]
+    fn a_missing_referenced_supporting_file_is_disclosed_as_an_omission() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("SKILL.md"),
+            "---
+name: tool
+description: d
+---
+Read [the guide](references/guide.md),
+             [the api](./references/api.md#usage), [run](scripts/run.py) and              [the web](https://example.invalid/x.md); see [above](#top) and [assets](assets/).
+",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("references")).unwrap();
+        fs::write(
+            directory.path().join("references").join("guide.md"),
+            "guide",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("assets")).unwrap();
+        fs::write(directory.path().join("assets").join("logo.txt"), "logo").unwrap();
+
+        let package = frozen_skill_package(directory.path(), "", false).unwrap();
+        let package = package.package();
+        assert_eq!(
+            package
+                .omissions()
+                .iter()
+                .map(|omission| (omission.path.as_str(), omission.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("references/api.md", "referenced file not found"),
+                ("scripts/run.py", "referenced file not found"),
+            ]
+        );
+        assert!(package.is_partial());
+        assert!(
+            package
+                .files()
+                .iter()
+                .all(|file| !file.path.starts_with("scripts")),
+            "nothing is invented for a missing file"
+        );
+
+        // A package whose references all resolve is complete.
+        fs::write(directory.path().join("references").join("api.md"), "api").unwrap();
+        fs::create_dir(directory.path().join("scripts")).unwrap();
+        fs::write(directory.path().join("scripts").join("run.py"), "print()").unwrap();
+        let complete = frozen_skill_package(directory.path(), "", false).unwrap();
+        assert!(!complete.package().is_partial());
     }
 
     #[test]

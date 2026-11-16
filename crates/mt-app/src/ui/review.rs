@@ -436,6 +436,9 @@ fn result(
     if stale {
         column = column.child(stale_banner(state.clone(), language));
     }
+    if review.partial {
+        column = column.child(partial_banner(language));
+    }
     column
         .child(intent(language, session, &review, &emitters, stale))
         .child(spacer())
@@ -535,6 +538,19 @@ fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
                     .element_ref(&reference),
                 ),
         )
+}
+
+/// 'Partial review': the reviewed package omitted a normally in-scope
+/// supporting file, so the result never presents itself as covering it all.
+fn partial_banner(language: Language) -> impl IntoElement {
+    view()
+        .test_id("review-partial")
+        .w_full()
+        .flex_col()
+        .gap(px(SPACE_1))
+        .pt(px(SPACE_3))
+        .child(prims::ink(i18n::t(language, Key::ReviewPartial)))
+        .child(prims::faint(s(S::PartialHint, language)))
 }
 
 /// `Lens: <kind>`.
@@ -1316,6 +1332,7 @@ enum S {
     StepFindings,
     StepFindingsBack,
     CouldNotRead,
+    PartialHint,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -1353,6 +1370,9 @@ fn s(key: S, language: Language) -> &'static str {
             S::StepFindings => "Next finding",
             S::StepFindingsBack => "Previous finding",
             S::CouldNotRead => "Couldn't read the response — Try again",
+            S::PartialHint => {
+                "A supporting file of the package was not sent; this result does not cover it."
+            }
         },
         Language::Chinese => match key {
             S::Lens => "视角",
@@ -1385,6 +1405,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::StepFindings => "下一个发现",
             S::StepFindingsBack => "上一个发现",
             S::CouldNotRead => "无法读取响应——请重试",
+            S::PartialHint => "包中有支持文件未发送；此结果未涵盖该文件。",
         },
     }
 }
@@ -1697,6 +1718,7 @@ mod tests {
             S::StepFindings,
             S::StepFindingsBack,
             S::CouldNotRead,
+            S::PartialHint,
         ] {
             assert!(!s(key, Language::English).is_empty());
             assert!(!s(key, Language::Chinese).is_empty());

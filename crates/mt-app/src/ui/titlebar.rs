@@ -376,6 +376,14 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
                         )
                         .into_element(),
                     )
+                    .child(
+                        row(
+                            "title-menu-review-selection",
+                            s(S::ReviewSelection, language),
+                            |state| state.start_review_selection(),
+                        )
+                        .into_element(),
+                    )
                     .into_element()
             }
         }))
@@ -530,6 +538,7 @@ enum S {
     WebPreview,
     SplitWeb,
     Context,
+    ReviewSelection,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -543,6 +552,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::WebPreview => "Web preview",
             S::SplitWeb => "Split \u{00B7} Web",
             S::Context => "Context",
+            S::ReviewSelection => "Review selection",
         },
         Language::Chinese => match key {
             S::OpenFolder => "打开文件夹\u{2026}",
@@ -553,6 +563,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::WebPreview => "Web 预览",
             S::SplitWeb => "分栏 \u{00B7} Web",
             S::Context => "上下文",
+            S::ReviewSelection => "审查选区",
         },
     }
 }

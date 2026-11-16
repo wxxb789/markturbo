@@ -35,7 +35,7 @@ use mt_core::settings::Language;
 use nsh_base::{
     editor::{
         Editor, EditorApi, EditorDecoration, EditorPosition, EditorRange, EditorScrollBeyond,
-        EditorStyles, editor,
+        EditorSelection, EditorStyles, editor,
     },
     text_view::PartStyle,
 };
@@ -46,7 +46,7 @@ use nsh_core::{
 };
 
 use crate::{
-    state::{AppState, Pane, Tab},
+    state::{AppState, Pane, SourceSelection, Tab},
     ui::{glow, motion, notices, preview, revision, tokens},
 };
 
@@ -128,6 +128,8 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     let camera_tab = tab.clone();
     let styles_state = state.clone();
     let numbers_state = state.clone();
+    let selection_state = state.clone();
+    let selection_tab = tab.id;
     let editor_ref = component_ref::<Editor>();
     let camera = editor_ref;
 
@@ -268,6 +270,18 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                         })
                         .w_full()
                         .flex_1()
+                        // The primary selection, for Review selection: kept
+                        // in the editor's coordinates and read against the
+                        // text only when a Review is prepared.
+                        .on_selection_change(move |selections: &Vec<EditorSelection>| {
+                            selection_state.source_selection.set(selections.last().map(
+                                |selection| SourceSelection {
+                                    tab: selection_tab,
+                                    anchor: (selection.anchor.line, selection.anchor.column),
+                                    head: (selection.head.line, selection.head.column),
+                                },
+                            ));
+                        })
                         .on_change(move |value: &SharedString| {
                             // nsh reports the bound value once on mount. A document is
                             // dirty only after the buffer differs from what the editor
