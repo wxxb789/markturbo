@@ -199,6 +199,10 @@ pub struct AppState {
     review_in_flight: Rc<RefCell<Option<ReviewOrigin>>>,
     review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
+    /// Bumped whenever the revision context is replaced or reset: a Revision
+    /// answer sent under an older generation belongs to no live proposal and
+    /// is dropped unread.
+    revision_generation: Rc<Cell<u64>>,
     pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
     /// Where the live proposal's hunks sit in its tab's text: the one
     /// authority that writes an accepted change, or takes one back.
@@ -524,6 +528,7 @@ impl AppState {
             review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
+            revision_generation: Rc::new(Cell::new(0)),
             pending_revision: Rc::new(RefCell::new(None)),
             revision_ledger: Rc::new(RefCell::new(None)),
             recovery,
@@ -2614,7 +2619,11 @@ impl AppState {
             output,
             language,
         });
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
+        *self.pending_revision.borrow_mut() = None;
         *self.revision_ledger.borrow_mut() = None;
+        self.revision_busy.set(false);
         self.revision_not_applied.set(0);
         self.revision_questions.set(questions);
         self.revision_consent.set(None);
@@ -2625,6 +2634,8 @@ impl AppState {
 
     fn reset_revision(&self) {
         *self.revision_context.borrow_mut() = None;
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
         *self.pending_revision.borrow_mut() = None;
         *self.revision_ledger.borrow_mut() = None;
         self.revision_not_applied.set(0);
@@ -2717,6 +2728,19 @@ impl AppState {
         let Some(bound) = self.pending_revision.borrow_mut().take() else {
             return;
         };
+        // The answer belongs to the document this Review read, and only for
+        // as long as this context lives.
+        let Some(tab_id) = self
+            .revision_context
+            .borrow()
+            .as_ref()
+            .map(|context| context.tab_id)
+        else {
+            self.revision_status
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            return;
+        };
+        let generation = self.revision_generation.get();
         let disclosure = bound.disclosure().clone();
         let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
         let authorization = match bound.authorize(&mut consent) {
@@ -2739,9 +2763,15 @@ impl AppState {
         let state = self.clone();
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
+            if state.revision_generation.get() != generation {
+                // Its Review was reset or replaced while the request was out
+                // (another tab's Review, Close): the answer is no live
+                // proposal's, and must not touch the field or the busy flag.
+                return;
+            }
             state.revision_busy.set(false);
             match result {
-                Ok(Ok(transport)) => state.present_revision(transport.into_proposal()),
+                Ok(Ok(transport)) => state.present_revision_for(tab_id, transport.into_proposal()),
                 Ok(Err(error)) => {
                     if matches!(
                         error,
@@ -2765,22 +2795,19 @@ impl AppState {
         });
     }
 
+    /// Present `proposal` over the tab on screen, as if a Review of it had
+    /// prepared the proposal: the unit tests' way in, with no provider.
+    #[cfg(test)]
+    pub(crate) fn present_revision(&self, proposal: RevisionProposal) {
+        if let Some(tab_id) = self.active.get() {
+            self.present_revision_for(tab_id, proposal);
+        }
+    }
+
     /// Show a validated proposal for per-change decisions: its hunks in the
-    /// field, and a ledger placing them in the text of the tab the Review
-    /// read (the tab on screen when no Review prepared it). Nothing is
-    /// written until the user accepts a change.
-    pub fn present_revision(&self, proposal: RevisionProposal) {
-        let tab_id = self
-            .revision_context
-            .borrow()
-            .as_ref()
-            .map(|context| context.tab_id)
-            .or_else(|| self.active.get());
-        let Some(tab_id) = tab_id else {
-            self.revision_status
-                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
-            return;
-        };
+    /// field, and a ledger placing them in the text of `tab_id`, the tab the
+    /// Review read. Nothing is written until the user accepts a change.
+    fn present_revision_for(&self, tab_id: u64, proposal: RevisionProposal) {
         let mut accepted = HashMap::new();
         let hunks = proposal
             .hunks()

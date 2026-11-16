@@ -685,6 +685,164 @@ fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
     assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
 }
 
+/// Two documents and the Revision controls: the Revision is prepared for
+/// the first, then a Review of the second resets it while the Revision is
+/// still out.
+#[component]
+fn RevisionAcrossDocuments() -> impl IntoElement {
+    let state = mt_app::state::AppState::new();
+    state.open_file(
+        std::env::var_os("MARKTURBO_OPEN")
+            .expect("document path")
+            .into(),
+    );
+    let review = state.clone();
+    let send_review = state.clone();
+    let revision = state.clone();
+    let send_revision = state.clone();
+    let other = state.clone();
+    let approve = state.clone();
+    let review_view = state.review_view;
+    let hunks = state.revision_hunks;
+    let busy = state.revision_busy;
+    let tabs = state.tabs;
+    view()
+        .flex_col()
+        .child(text("Review").on_press(move || review.start_review()))
+        .child(text("Send Review").on_press(move || send_review.send_review()))
+        .child(text("Prepare Revision").on_press(move || revision.start_revision()))
+        .child(text("Send Revision").on_press(move || send_revision.send_revision()))
+        .child(text("Open other").on_press(move || {
+            other.open_file(
+                std::env::var_os("MARKTURBO_OTHER")
+                    .expect("other document path")
+                    .into(),
+            )
+        }))
+        .child(text("Approve first hunk").on_press(move || approve.toggle_revision_hunk(0)))
+        .child(text(move || {
+            review_view
+                .get()
+                .map(|view| view.status)
+                .unwrap_or_default()
+        }))
+        .child(text(move || format!("Hunks: {}", hunks.get().len())))
+        .child(text(move || format!("Busy: {}", busy.get())))
+        .child(text(move || format!("Tabs: {}", tabs.get().len())))
+        .child(text(move || {
+            tabs.get()
+                .iter()
+                .map(|tab| format!("[{}]", tab.text.get()))
+                .collect::<String>()
+        }))
+}
+
+/// A Revision answer that arrives after its Review was reset (here by a
+/// Review of another document) belongs to no live proposal: it shows no
+/// hunks, and nothing of it can be accepted into either document.
+#[test]
+fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let (review_output, revision_output) = two_change_outputs();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (answered, answer_sent) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let body = read_http_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            if request["stream"].as_bool().unwrap_or(false) {
+                // Held back until the test has reset the Review.
+                let _ = released.recv();
+                write_sse(&mut stream, &revision_output);
+                let _ = answered.send(());
+            } else {
+                write_review_json(&mut stream, &review_output);
+            }
+        }
+    });
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    let other = directory.path().join("other.md");
+    let source = "Original\nUnchanged\n";
+    // The other document starts with the reviewed one's text: a placement
+    // that diffs the reviewed text against it would find the first hunk's
+    // bytes there.
+    let other_source = "Original\nUnchanged\nMore\n";
+    std::fs::write(&document, source).expect("write document");
+    std::fs::write(&other, other_source).expect("write other document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_OTHER", &other);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionAcrossDocuments>()))
+        .expect("start the two-document controls");
+    app.wait_for("text:Tabs: 1").expect("document loaded");
+    app.press("text:Review").expect("prepare Review");
+    app.press("text:Send Review").expect("send Review");
+    app.wait_for_within("text:Review ready", Duration::from_secs(20))
+        .expect("Review ready");
+    app.press("text:Prepare Revision")
+        .expect("prepare Revision");
+    app.press("text:Send Revision").expect("send Revision");
+    app.wait_for("text:Busy: true")
+        .expect("the Revision is out");
+
+    // Switch to the other document and review it: the first Review and its
+    // Revision are reset while the answer is still held back.
+    app.press("text:Open other")
+        .expect("open the other document");
+    app.wait_for("text:Tabs: 2")
+        .expect("the other document is open");
+    app.press("text:Review").expect("review the other document");
+    app.wait_for("text:Busy: false")
+        .expect("the reset clears the loading state");
+
+    release.send(()).expect("release the Revision answer");
+    answer_sent
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the answer is sent");
+    app.wait(Duration::from_millis(1500))
+        .expect("the late answer lands");
+    assert!(
+        app.shows("Hunks: 0") && app.shows("Busy: false"),
+        "a late answer to a reset Review presents nothing: {:?}",
+        app.screen().texts()
+    );
+    app.press("text:Approve first hunk")
+        .expect("try to accept a late hunk");
+    app.wait(Duration::from_millis(300)).expect("settle");
+    let both = format!("[{source}][{other_source}]");
+    assert!(
+        app.screen()
+            .matches(&format!("text:{both}"))
+            .expect("the documents selector"),
+        "neither document changes: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), other_source);
+}
+
 /// Whether the buffer line reads `text` exactly (`shows` trims the final
 /// newline the buffer keeps).
 fn buffer_shows(app: &Headless, text: &str) -> bool {

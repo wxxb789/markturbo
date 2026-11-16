@@ -42,9 +42,10 @@
 //! Both sides of the docked hunk are complete: a tall one scrolls in place,
 //! so `Accept` never approves text that was hidden. A hunk whose part of the
 //! document was edited says `Can't apply — this part changed`; a proposal
-//! whose document is no longer the one on screen says `Stale — edited after
-//! review` with `Review again`. Neither offers an `Accept`, and the field
-//! always offers a way out (`Close`, and `Review again` once stale).
+//! whose document is no longer the one on screen says `This Revision belongs
+//! to another document` with `Review again`. Neither offers an `Accept`, and
+//! the field always offers a way out (`Close`, and `Review again` on another
+//! document).
 //!
 //! The decision log and the reading position live here, in a module-local
 //! session keyed by the proposal ([`Session`]); a decision is recorded only
@@ -96,7 +97,7 @@ enum S {
     Decided(usize, usize),
     NotApplied(usize),
     CannotApply,
-    Stale,
+    OtherDocument,
     ReviewAgain,
     Move,
 }
@@ -114,7 +115,7 @@ impl S {
                 S::Decided(n, m) => format!("{n} of {m} decided"),
                 S::NotApplied(n) => format!("{n} not applied"),
                 S::CannotApply => "Can't apply — this part changed".to_owned(),
-                S::Stale => "Stale — edited after review".to_owned(),
+                S::OtherDocument => "This Revision belongs to another document".to_owned(),
                 S::ReviewAgain => "Review again".to_owned(),
                 S::Move => "Move".to_owned(),
             },
@@ -128,7 +129,7 @@ impl S {
                 S::Decided(n, m) => format!("已决定 {n} / {m}"),
                 S::NotApplied(n) => format!("{n} 项未应用"),
                 S::CannotApply => "无法应用——这部分已改动".to_owned(),
-                S::Stale => "已过期——审阅后文档有改动".to_owned(),
+                S::OtherDocument => "此修订属于另一个文档".to_owned(),
                 S::ReviewAgain => "重新审阅".to_owned(),
                 S::Move => "切换".to_owned(),
             },
@@ -334,7 +335,8 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
         .h(move || px(field_height()))
         .flex_col()
         .gap(px(SPACE_3))
-        // The proposal's base moved: nothing here can apply any more.
+        // The proposal belongs to a tab not on screen: nothing here can be
+        // decided into this one.
         .child(when(
             move || {
                 !stale_state.revision_hunks.with(|hunks| hunks.is_empty())
@@ -347,7 +349,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_3))
-                    .child(prims::ink(S::Stale.text(language)))
+                    .child(prims::ink(S::OtherDocument.text(language)))
                     .child(prims::primary_action(
                         "revision-review-again",
                         S::ReviewAgain.text(language),
@@ -1381,6 +1383,36 @@ mod tests {
         app.wait_for("id:revision-accept")
             .expect("the untouched hunk can be accepted");
         assert!(!app.shows("Can't apply — this part changed"));
+    }
+
+    /// The two-change proposal, then another document comes on screen.
+    #[component]
+    fn OtherDocumentProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        open_probe_document(&state, PROBE_TEXT);
+        field(state, Language::English)
+    }
+
+    #[test]
+    fn a_proposal_for_another_document_says_so_and_offers_no_accept() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<OtherDocumentProbe>()))
+            .expect("start the field");
+        app.wait_for("id:revision-stale")
+            .expect("the field says the proposal is not this document's");
+        assert!(app.shows("This Revision belongs to another document"));
+        assert!(
+            !app.shows("Stale — edited after review"),
+            "nothing was edited after the review"
+        );
+        assert!(
+            !app.screen()
+                .matches("id:revision-accept")
+                .expect("the selector"),
+            "no Accept into a document the proposal was not made for: {:?}",
+            app.screen().texts()
+        );
     }
 
     #[test]
