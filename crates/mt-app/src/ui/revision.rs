@@ -6,6 +6,26 @@
 //! row — `Accept` / `Reject` on the current hunk (`A` / `R`), one pip per hunk
 //! reading `n of m decided`, `Undo` (`Ctrl+Z`) and `Done`.
 //!
+//! A decision writes its text at once. `Accept` puts the replacement in the
+//! column in the same frame the proposal extinguishes (the struck words are
+//! gone with it); `Reject` writes nothing. `Undo` takes the last decision back
+//! together with its text — the reviewed bytes of that hunk, exactly — and
+//! repeated `Undo` walks further back. The state's ledger
+//! ([`AppState::set_revision_change_applied`]) does every write, keeps later
+//! hunks on their own bytes after an earlier one changed length, and follows
+//! the user's own edits between decisions: a hunk whose part the user edited
+//! says `Can't apply — this part changed` and offers no `Accept`, and an
+//! `Undo` whose accepted text was edited since is refused with a message on
+//! the status line (the decision stays), never written over the edit.
+//! Nothing here saves; the tab only turns dirty.
+//!
+//! `Ctrl+Z` belongs to whoever has the keyboard: while the source editor (or
+//! any text input) has the focus, the editor's own undo wins and takes back
+//! its last edit — an accepted replacement included, which the ledger then
+//! reads as the user's edit of that part. Everywhere else — the field, its
+//! buttons, nothing focused — `Ctrl+Z` is this field's `Undo`. The `Undo`
+//! button is always this field's.
+//!
 //! Contract: [`is_open`] says the field belongs to the revision (it outranks
 //! the review field, because a revision runs inside a review); [`field`] draws
 //! it. The other half — the removed words struck cold in the column, the
@@ -20,18 +40,21 @@
 //! extinguished when it is decided, which leaves it docked and plain until
 //! the next undecided hunk takes its place); the other hunks are ember lines.
 //! Both sides of the docked hunk are complete: a tall one scrolls in place,
-//! so `Accept` never approves text that was hidden. A hunk whose expected
-//! text no longer appears in the document says `Can't apply — this part
-//! changed`; a proposal whose reviewed snapshot moved says `Stale — edited
-//! after review` with `Review again`. Neither offers an `Accept`, and the
-//! field always offers a way out (`Close`, and `Review again` once stale).
+//! so `Accept` never approves text that was hidden. A hunk whose part of the
+//! document was edited says `Can't apply — this part changed`; a proposal
+//! whose document is no longer the one on screen says `This Revision belongs
+//! to another document` with `Review again`. Neither offers an `Accept`, and
+//! the field always offers a way out (`Close`, and `Review again` on another
+//! document).
 //!
-//! Decisions live here, in a module-local session keyed by the proposal
-//! ([`Session`]), and are mirrored into the state's per-change signals through
-//! [`AppState::toggle_revision_hunk`]: a change the user accepted is exactly a
-//! change `apply_revision` composes. `Done` performs the state's one validated
-//! write for every accepted change and discards the rest — undecided hunks are
-//! never written. Nothing in this file mutates the document.
+//! The decision log and the reading position live here, in a module-local
+//! session keyed by the proposal ([`Session`]); a decision is recorded only
+//! once the state has written (or refused) its text, so a change's state
+//! signal is `true` exactly when the session's last decision on it is an
+//! accept. `Done` ([`AppState::finish_revision`]) writes nothing more: the
+//! accepted changes are already in, and the undecided ones are discarded —
+//! never written — with `n not applied`. Nothing in this file mutates the
+//! document except through the state.
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -74,7 +97,7 @@ enum S {
     Decided(usize, usize),
     NotApplied(usize),
     CannotApply,
-    Stale,
+    OtherDocument,
     ReviewAgain,
     Move,
 }
@@ -92,7 +115,7 @@ impl S {
                 S::Decided(n, m) => format!("{n} of {m} decided"),
                 S::NotApplied(n) => format!("{n} not applied"),
                 S::CannotApply => "Can't apply — this part changed".to_owned(),
-                S::Stale => "Stale — edited after review".to_owned(),
+                S::OtherDocument => "This Revision belongs to another document".to_owned(),
                 S::ReviewAgain => "Review again".to_owned(),
                 S::Move => "Move".to_owned(),
             },
@@ -106,7 +129,7 @@ impl S {
                 S::Decided(n, m) => format!("已决定 {n} / {m}"),
                 S::NotApplied(n) => format!("{n} 项未应用"),
                 S::CannotApply => "无法应用——这部分已改动".to_owned(),
-                S::Stale => "已过期——审阅后文档有改动".to_owned(),
+                S::OtherDocument => "此修订属于另一个文档".to_owned(),
                 S::ReviewAgain => "重新审阅".to_owned(),
                 S::Move => "切换".to_owned(),
             },
@@ -312,7 +335,8 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
         .h(move || px(field_height()))
         .flex_col()
         .gap(px(SPACE_3))
-        // The proposal's base moved: nothing here can apply any more.
+        // The proposal belongs to a tab not on screen: nothing here can be
+        // decided into this one.
         .child(when(
             move || {
                 !stale_state.revision_hunks.with(|hunks| hunks.is_empty())
@@ -325,7 +349,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_3))
-                    .child(prims::ink(S::Stale.text(language)))
+                    .child(prims::ink(S::OtherDocument.text(language)))
                     .child(prims::primary_action(
                         "revision-review-again",
                         S::ReviewAgain.text(language),
@@ -387,13 +411,22 @@ fn outcome(state: AppState, language: Language) -> impl IntoElement {
     let status_state = state.clone();
     let condition_state = state.clone();
     let close_state = state.clone();
+    let discarded = state.revision_not_applied;
     view()
         .flex_row()
         .items_center()
+        // The outcome, what `Done` discarded and the way out wrap in a
+        // narrow field rather than run past its edge.
+        .flex_wrap()
         .gap(px(SPACE_3))
         .child(prims::rest(move || {
             status_state.revision_status.get().unwrap_or_default()
         }))
+        // What `Done` discarded undecided: never written.
+        .child(when(
+            move || discarded.get() > 0,
+            move || prims::faint(move || S::NotApplied(discarded.get()).text(language)),
+        ))
         .child(when(
             move || {
                 condition_state
@@ -506,11 +539,11 @@ fn docked_proposal(
     let reason = move || hunk.with(|hunk| hunk.rationale.clone());
     let message_condition = {
         let state = state.clone();
-        move || hunk.with(|hunk| base_changed(&state, &hunk.before))
+        move || hunk.with(|hunk| cannot_apply(&state, hunk))
     };
     let accept_condition = {
         let state = state.clone();
-        move || hunk.with(|hunk| state.revision_is_stale() || base_changed(&state, &hunk.before))
+        move || hunk.with(|hunk| state.revision_is_stale() || cannot_apply(&state, hunk))
     };
     let decided_condition =
         move || hunk.with(|hunk| now.with(|now| now.decision(hunk.change_id).is_some()));
@@ -858,13 +891,13 @@ fn done_action(
                 when(all_decided, move || {
                     let state = primary_state.clone();
                     prims::primary_action("revision-done", S::Done.text(language), move || {
-                        state.apply_revision()
+                        done(&state)
                     })
                 })
                 .otherwise(move || {
                     let state = quiet_state.clone();
                     prims::quiet_action("revision-done", S::Done.text(language), move || {
-                        state.apply_revision()
+                        done(&state)
                     })
                 }),
             )
@@ -923,7 +956,7 @@ fn bind_keys(state: &AppState, heat: Heat) {
 /// shortcut keeps starting a Review from every other state.
 fn bind_done_key(state: &AppState) {
     let keys = state.clone();
-    on_key("ctrl+enter", move |_| keys.apply_revision());
+    on_key("ctrl+enter", move |_| done(&keys));
 }
 
 // ─── actions ──────────────────────────────────────────────────────────────
@@ -938,9 +971,9 @@ fn decide(state: &AppState, heat: Heat, accepted: bool) {
     let Some(index) = next.current(&hunks) else {
         return;
     };
-    // A hunk whose base changed offers no Accept; the state's snapshot check
-    // at `Done` is the second gate.
-    if accepted && (state.revision_is_stale() || base_changed(state, &hunks[index].before)) {
+    // A hunk whose part changed offers no Accept; the ledger's own byte check
+    // is the second gate.
+    if accepted && (state.revision_is_stale() || cannot_apply(state, &hunks[index])) {
         return;
     }
     let change_id = hunks[index].change_id;
@@ -950,10 +983,14 @@ fn decide(state: &AppState, heat: Heat, accepted: bool) {
         signal.set(next);
         return;
     }
+    // The text first: a decision whose text the state refuses is not made
+    // (the refusal is on the status line).
+    if !state.set_revision_change_applied(change_id, accepted) {
+        return;
+    }
     next.record(&hunks, index, accepted);
     let proposal = next.proposal;
     signal.set(next);
-    set_change_accepted(state, change_id, accepted);
     heat.extinguish();
     let state = state.clone();
     set_timeout(
@@ -993,22 +1030,28 @@ fn move_by(state: &AppState, step: isize) {
     });
 }
 
-/// Take the last decision back, and its change's signal with it.
+/// Take the last decision back together with its text: the change returns
+/// to what it was decided as before it (its reviewed bytes, unless an earlier
+/// decision accepted it). When the state refuses — the accepted text was
+/// edited since — the decision stays and the status line says why.
 fn undo_decision(state: &AppState) {
     let hunks = state.revision_hunks.get();
     let signal = session();
-    let mut restored = None;
-    signal.update(|now| {
-        let mut synced = now.synced(&hunks);
-        let Some(change_id) = synced.undo() else {
-            return;
-        };
-        restored = Some((change_id, synced.decision(change_id).unwrap_or(false)));
-        *now = synced;
-    });
-    if let Some((change_id, accepted)) = restored {
-        set_change_accepted(state, change_id, accepted);
+    let mut taken_back = signal.with(|now| now.synced(&hunks));
+    let Some(change_id) = taken_back.undo() else {
+        return;
+    };
+    let applied = taken_back.decision(change_id) == Some(true);
+    if state.set_revision_change_applied(change_id, applied) {
+        signal.set(taken_back);
     }
+}
+
+/// `Done`, with the hunks still undecided counted as discarded.
+fn done(state: &AppState) {
+    let hunks = state.revision_hunks.get();
+    let (decided, all) = session().with(|now| now.synced(&hunks).counts(&hunks));
+    state.finish_revision(all - decided);
 }
 
 /// Dismiss the outcome text on screen: it is consumed, so the next outcome
@@ -1016,6 +1059,7 @@ fn undo_decision(state: &AppState) {
 /// (the state writes it again without ever going back to nothing).
 fn dismiss(state: &AppState) {
     state.revision_status.set(None);
+    state.revision_not_applied.set(0);
 }
 
 /// The reading position to hunk `index` (a pressed row).
@@ -1054,18 +1098,6 @@ fn watch_proposal(hunks: Signal<Vec<RevisionHunkView>>, now: Signal<Session>) {
         let current = hunks.get();
         sync_session(&current, now);
     });
-}
-
-/// Make the state's signal for `change_id` say `accepted`: every hunk of one
-/// change carries the same signal, so one toggle sets them all.
-fn set_change_accepted(state: &AppState, change_id: u32, accepted: bool) {
-    let hunks = state.revision_hunks.get();
-    if let Some(index) = hunks
-        .iter()
-        .position(|hunk| hunk.change_id == change_id && hunk.accepted.get() != accepted)
-    {
-        state.toggle_revision_hunk(index);
-    }
 }
 
 // ─── heat ─────────────────────────────────────────────────────────────────
@@ -1113,21 +1145,11 @@ fn watch_heat(hunks: Signal<Vec<RevisionHunkView>>, now: Signal<Session>, heat: 
 
 // ─── the document ─────────────────────────────────────────────────────────
 
-/// Whether the part of the document the hunk expects to replace is no longer
-/// there: the proposal was validated against the reviewed bytes, and a hunk
-/// whose base moved cannot apply. (The whole proposal is one snapshot; the
-/// state refuses a stale one at `Done` and says why.)
-fn base_changed(state: &AppState, before: &str) -> bool {
-    match state.active_tab() {
-        Some(tab) => tab.text.with(|text| base_moved(text, before)),
-        None => true,
-    }
-}
-
-/// [`base_changed`] against a text: an insertion (nothing to replace) can
-/// always apply.
-fn base_moved(text: &str, before: &str) -> bool {
-    !before.is_empty() && !text.contains(before)
+/// Whether the hunk cannot be accepted because the user edited the part of
+/// the document it covers (the state's ledger says so). An accepted hunk is
+/// not refused here: its text is already in.
+fn cannot_apply(state: &AppState, hunk: &RevisionHunkView) -> bool {
+    !hunk.accepted.get() && state.revision_hunk_part_changed(hunk.ordinal)
 }
 
 // ─── text helpers ─────────────────────────────────────────────────────────
@@ -1188,41 +1210,76 @@ mod tests {
         ]
     }
 
-    /// A second proposal over the same document: same ordinals and change
-    /// ids (the core numbers them per proposal from zero), other content.
-    fn replacement_hunks() -> Vec<RevisionHunkView> {
-        vec![
-            hunk(0, 0, "Another take.", "compiles but", "compiles cleanly"),
-            hunk(1, 1, "Second take.", "no check", "two checks"),
-        ]
+    /// The probe document every two-change proposal reads.
+    const PROBE_TEXT: &str = "compiles but no check\n";
+
+    /// `two_hunks` as a proposal over `PROBE_TEXT`: (reason, old, new).
+    const TWO_CHANGES: &[(&str, &str, &str)] = &[
+        ("Tighten the promise.", "compiles but", "compiles, but"),
+        ("Name the check.", "no check", "one check"),
+    ];
+
+    /// A second proposal over the document after the first one's accept:
+    /// same ordinals and change ids (the core numbers them per proposal from
+    /// zero), other content.
+    const REPLACEMENT_CHANGES: &[(&str, &str, &str)] = &[
+        ("Another take.", "compiles, but", "compiles cleanly"),
+        ("Second take.", "no check", "two checks"),
+    ];
+
+    /// Both sides of one hunk with more lines than the docked position shows
+    /// at once.
+    fn tall_sides() -> (String, String) {
+        let side = |word: &str| {
+            (1..=20)
+                .map(|line| format!("{word} line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        (side("old"), side("new"))
     }
 
-    /// One hunk with more lines than the docked position shows at once.
-    fn tall_hunk() -> RevisionHunkView {
-        let before = (1..=20)
-            .map(|line| format!("old line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let after = (1..=20)
-            .map(|line| format!("new line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        hunk(0, 0, "Rewrite the block.", &before, &after)
-    }
-
-    /// A proposal as large as the core allows a list of rows to be.
-    fn many_hunks() -> Vec<RevisionHunkView> {
-        (0..40)
+    /// A proposal as large as the core allows a list of rows to be: the
+    /// document and its changes.
+    fn many_changes() -> (String, Vec<(String, String, String)>) {
+        let source = (0..40).map(|index| format!("old {index}\n")).collect();
+        let changes = (0..40)
             .map(|index| {
-                hunk(
-                    index,
-                    index as u32,
-                    &format!("Reason {index}."),
-                    &format!("old {index}"),
-                    &format!("new {index}"),
+                (
+                    format!("Reason {index}."),
+                    format!("old {index}\n"),
+                    format!("new {index}\n"),
                 )
             })
-            .collect()
+            .collect();
+        (source, changes)
+    }
+
+    /// Present a validated proposal over `source` — one change per
+    /// `(reason, old, new)`, at the old text's first place — as a real
+    /// Revision arrives: through the state, which places it in the tab on
+    /// screen.
+    fn present(state: &AppState, source: &str, changes: &[(&str, &str, &str)]) {
+        use mt_core::review::{
+            ByteRange, SourceSnapshot,
+            revision::{RevisionChange, RevisionEdit, RevisionLimits, RevisionProposal},
+        };
+        let changes = changes
+            .iter()
+            .map(|&(reason, before, after)| {
+                let start = source.find(before).expect("the old text is in the source") as u64;
+                let range = ByteRange::new(start, start + before.len() as u64).expect("a range");
+                RevisionChange::new(reason, vec![RevisionEdit::new(range, before, after)])
+            })
+            .collect();
+        let proposal = RevisionProposal::validate(
+            source,
+            SourceSnapshot::new(0, 0),
+            changes,
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision(proposal);
     }
 
     #[test]
@@ -1285,13 +1342,76 @@ mod tests {
         assert_ne!(fresh.proposal, session.proposal);
     }
 
+    /// The two-change proposal, then an edit inside the first change's old
+    /// text, made as the editor makes one.
+    #[component]
+    fn ChangedBaseProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        if let Some(tab) = state.active_tab() {
+            tab.text.set(SharedString::from(
+                "compiles, yet no check
+",
+            ));
+            tab.revision.update(|revision| *revision += 1);
+            state.note_edit(tab.id);
+        }
+        field(state, Language::English)
+    }
+
     #[test]
     fn a_changed_base_refuses_the_hunk() {
-        assert!(base_moved("the new text", "compiles but"));
-        assert!(!base_moved("compiles but it does", "compiles but"));
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ChangedBaseProbe>()))
+            .expect("start the field");
+        app.wait_for("id:revision-proposal-blocked")
+            .expect("the edited hunk says it cannot apply");
+        assert!(app.shows("Can't apply — this part changed"));
         assert!(
-            !base_moved("anything", ""),
-            "an insertion has no base to match"
+            !app.screen()
+                .matches("id:revision-accept")
+                .expect("the selector"),
+            "no Accept on a hunk whose base changed: {:?}",
+            app.screen().texts()
+        );
+        app.press_key("a").expect("press A");
+        app.wait(Duration::from_millis(50)).expect("a frame");
+        assert!(app.shows("0 of 2 decided"), "A decided nothing");
+
+        // The untouched hunk is still where the edit left it, and accepts.
+        app.press_key("j").expect("press J");
+        app.wait_for("id:revision-accept")
+            .expect("the untouched hunk can be accepted");
+        assert!(!app.shows("Can't apply — this part changed"));
+    }
+
+    /// The two-change proposal, then another document comes on screen.
+    #[component]
+    fn OtherDocumentProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        open_probe_document(&state, PROBE_TEXT);
+        field(state, Language::English)
+    }
+
+    #[test]
+    fn a_proposal_for_another_document_says_so_and_offers_no_accept() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<OtherDocumentProbe>()))
+            .expect("start the field");
+        app.wait_for("id:revision-stale")
+            .expect("the field says the proposal is not this document's");
+        assert!(app.shows("This Revision belongs to another document"));
+        assert!(
+            !app.shows("Stale — edited after review"),
+            "nothing was edited after the review"
+        );
+        assert!(
+            !app.screen()
+                .matches("id:revision-accept")
+                .expect("the selector"),
+            "no Accept into a document the proposal was not made for: {:?}",
+            app.screen().texts()
         );
     }
 
@@ -1324,11 +1444,8 @@ mod tests {
     #[component]
     fn ProposalProbe() -> impl IntoElement {
         let state = AppState::new();
-        open_probe_document(&state);
-        state.revision_hunks.set(two_hunks());
-        state.revision_status.set(Some(SharedString::from(
-            "Revision ready. Approve individual changes, then apply.",
-        )));
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
         field(state, Language::English)
     }
 
@@ -1464,12 +1581,13 @@ mod tests {
         app.wait_for("text:compiles but")
             .expect("the first hunk docks on the mouse press");
 
-        // `Done` is reachable without the mouse: the key runs it. (The
-        // proposal here is synthetic — no Review prepared one — so the state
-        // refuses to apply, which is what proves the key reached `Done`.)
+        // `Done` is reachable without the mouse: the key runs it, keeping
+        // the accepted change and discarding the one still undecided.
         app.press_key("ctrl+enter").expect("press Ctrl+Enter");
-        app.wait_for("text:Run Review first to prepare a Revision.")
+        app.wait_for("text:Approved changes applied to the buffer.")
             .expect("Done ran from the keyboard");
+        app.wait_for("text:1 not applied")
+            .expect("the undecided hunk was discarded, not written");
     }
 
     /// A surface that routes on `is_open`, as the shell does.
@@ -1500,16 +1618,21 @@ mod tests {
     #[component]
     fn SwapProbe() -> impl IntoElement {
         let state = AppState::new();
-        open_probe_document(&state);
-        state.revision_hunks.set(two_hunks());
-        state.revision_status.set(Some(SharedString::from(
-            "Revision ready. Approve individual changes, then apply.",
-        )));
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
         let swap_state = state.clone();
         view()
-            .child(
-                text("swap").on_press(move || swap_state.revision_hunks.set(replacement_hunks())),
-            )
+            .child(text("swap").on_press(move || {
+                // A second proposal, read from the text as it is now (the
+                // first proposal's accepted change included).
+                let current = swap_state
+                    .active_tab()
+                    .expect("the probe document")
+                    .text
+                    .get()
+                    .to_string();
+                present(&swap_state, &current, REPLACEMENT_CHANGES);
+            }))
             .child(field(state, Language::English))
     }
 
@@ -1518,11 +1641,10 @@ mod tests {
     #[component]
     fn TallHunkProbe() -> impl IntoElement {
         let state = AppState::new();
-        open_probe_document(&state);
-        state.revision_hunks.set(vec![tall_hunk()]);
-        state.revision_status.set(Some(SharedString::from(
-            "Revision ready. Approve individual changes, then apply.",
-        )));
+        let (before, after) = tall_sides();
+        let source = format!("{before}\n");
+        open_probe_document(&state, &source);
+        present(&state, &source, &[("Rewrite the block.", &before, &after)]);
         field(state, Language::English)
     }
 
@@ -1530,11 +1652,13 @@ mod tests {
     #[component]
     fn ManyHunksProbe() -> impl IntoElement {
         let state = AppState::new();
-        open_probe_document(&state);
-        state.revision_hunks.set(many_hunks());
-        state.revision_status.set(Some(SharedString::from(
-            "Revision ready. Approve individual changes, then apply.",
-        )));
+        let (source, changes) = many_changes();
+        open_probe_document(&state, &source);
+        let changes: Vec<(&str, &str, &str)> = changes
+            .iter()
+            .map(|(reason, before, after)| (reason.as_str(), before.as_str(), after.as_str()))
+            .collect();
+        present(&state, &source, &changes);
         field(state, Language::English)
     }
 
@@ -1543,11 +1667,8 @@ mod tests {
     #[component]
     fn ShellProbe() -> impl IntoElement {
         let state = AppState::new();
-        open_probe_document(&state);
-        state.revision_hunks.set(two_hunks());
-        state.revision_status.set(Some(SharedString::from(
-            "Revision ready. Approve individual changes, then apply.",
-        )));
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
         crate::ui::shell(state, Language::English, crate::ui::tokens::Layout::Wide)
     }
 
@@ -1672,7 +1793,10 @@ mod tests {
         app.wait_for("id:revision-field").expect("the field");
         app.press_key("a").expect("press A");
         app.wait_for("text:1 of 2 decided").expect("one decided");
-        assert!(app.shows("Tighten the promise. · Accepted"));
+        // The decided row appears once the dock has extinguished (a timer),
+        // so it is waited for rather than read in the same frame.
+        app.wait_for("text:Tighten the promise. · Accepted")
+            .expect("the accepted hunk's row");
 
         // The proposal is replaced in place: same ordinals, same change ids,
         // other content. Nothing of the first proposal's decisions may stick.
@@ -1781,12 +1905,12 @@ mod tests {
         );
     }
 
-    /// One untitled document holding the hunks' expected text, so the base
-    /// checks answer as they would for a real proposal.
-    fn open_probe_document(state: &AppState) {
+    /// One untitled document holding `text`, the source a probe's proposal
+    /// is read from.
+    fn open_probe_document(state: &AppState, text: &str) {
         state.new_document();
         if let Some(tab) = state.active_tab() {
-            tab.text.set(SharedString::from("compiles but no check\n"));
+            tab.text.set(SharedString::from(text.to_owned()));
         }
     }
 }

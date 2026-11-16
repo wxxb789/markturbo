@@ -54,7 +54,17 @@ use mt_core::{
 use nsh_base::alert_dialog;
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
 
+mod revision_ledger;
+
+use revision_ledger::{LedgerRefusal, RevisionLedger};
+
 static FIRST_LAUNCH_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// The status line while a proposal waits for decisions.
+const REVISION_READY: &str =
+    "Revision ready. Each accepted change enters the buffer at once; nothing is saved.";
+/// The status line when there is no proposal to decide or finish.
+const REVISION_UNAVAILABLE: &str = "Run Review first to prepare a Revision.";
 
 /// Which panes a document shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -159,6 +169,9 @@ pub struct AppState {
     pub revision_hunks: Signal<Vec<RevisionHunkView>>,
     pub revision_status: Signal<Option<SharedString>>,
     pub revision_busy: Signal<bool>,
+    /// How many hunks the last `Done` discarded undecided (never written);
+    /// zero when there is nothing to report.
+    pub revision_not_applied: Signal<usize>,
     /// The rail's preview slot (chrome lane): the tab a single press in the
     /// rail's file list opened, which the next single press replaces, until a
     /// double press pins it. `None` when nothing is slotted.
@@ -186,8 +199,14 @@ pub struct AppState {
     review_in_flight: Rc<RefCell<Option<ReviewOrigin>>>,
     review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
+    /// Bumped whenever the revision context is replaced or reset: a Revision
+    /// answer sent under an older generation belongs to no live proposal and
+    /// is dropped unread.
+    revision_generation: Rc<Cell<u64>>,
     pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
-    revision_proposal: Rc<RefCell<Option<RevisionProposal>>>,
+    /// Where the live proposal's hunks sit in its tab's text: the one
+    /// authority that writes an accepted change, or takes one back.
+    revision_ledger: Rc<RefCell<Option<RevisionLedger>>>,
     recovery: Option<Rc<RecoveryStore>>,
     recovery_tracks: Rc<RefCell<HashMap<u64, RecoveryTrack>>>,
     quit_discarded: Rc<Cell<bool>>,
@@ -293,7 +312,6 @@ pub struct OutboundConsent {
 /// Immutable inputs retained after a successful Review for a later Revision.
 struct RevisionContext {
     tab_id: u64,
-    snapshot: SourceSnapshot,
     request: ReviewRequest,
     output: ReviewModelOutput,
     language: ReviewLanguage,
@@ -493,6 +511,7 @@ impl AppState {
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
+            revision_not_applied: signal(0),
             preview_slot: signal(None),
             vault,
             review_generation: signal(0),
@@ -506,8 +525,9 @@ impl AppState {
             review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
+            revision_generation: Rc::new(Cell::new(0)),
             pending_revision: Rc::new(RefCell::new(None)),
-            revision_proposal: Rc::new(RefCell::new(None)),
+            revision_ledger: Rc::new(RefCell::new(None)),
             recovery,
             recovery_tracks: Rc::new(RefCell::new(HashMap::new())),
             quit_discarded: Rc::new(Cell::new(false)),
@@ -1115,6 +1135,7 @@ impl AppState {
     /// Remember that a tab was edited, so its next checkpoint waits for a
     /// short idle window instead of copying on every keystroke.
     pub fn note_edit(&self, id: u64) {
+        self.observe_revision_edit(id);
         let now = Instant::now();
         self.recovery_tracks
             .borrow_mut()
@@ -2591,12 +2612,16 @@ impl AppState {
             .collect();
         *self.revision_context.borrow_mut() = Some(RevisionContext {
             tab_id: origin.tab_id,
-            snapshot: origin.snapshot,
             request,
             output,
             language,
         });
-        *self.revision_proposal.borrow_mut() = None;
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
+        *self.pending_revision.borrow_mut() = None;
+        *self.revision_ledger.borrow_mut() = None;
+        self.revision_busy.set(false);
+        self.revision_not_applied.set(0);
         self.revision_questions.set(questions);
         self.revision_consent.set(None);
         self.revision_manifest.set(None);
@@ -2606,8 +2631,11 @@ impl AppState {
 
     fn reset_revision(&self) {
         *self.revision_context.borrow_mut() = None;
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
         *self.pending_revision.borrow_mut() = None;
-        *self.revision_proposal.borrow_mut() = None;
+        *self.revision_ledger.borrow_mut() = None;
+        self.revision_not_applied.set(0);
         self.revision_questions.set(Vec::new());
         self.revision_consent.set(None);
         self.revision_manifest.set(None);
@@ -2628,11 +2656,11 @@ impl AppState {
             )
         });
         let Some((tab_id, request, output, language)) = context else {
-            self.revision_status.set(Some(SharedString::from(
-                "Run Review first to prepare a Revision.",
-            )));
+            self.revision_status
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
             return;
         };
+        self.revision_not_applied.set(0);
         let answers: Vec<RevisionAnswer> = self
             .revision_questions
             .get()
@@ -2697,6 +2725,19 @@ impl AppState {
         let Some(bound) = self.pending_revision.borrow_mut().take() else {
             return;
         };
+        // The answer belongs to the document this Review read, and only for
+        // as long as this context lives.
+        let Some(tab_id) = self
+            .revision_context
+            .borrow()
+            .as_ref()
+            .map(|context| context.tab_id)
+        else {
+            self.revision_status
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            return;
+        };
+        let generation = self.revision_generation.get();
         let disclosure = bound.disclosure().clone();
         let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
         let authorization = match bound.authorize(&mut consent) {
@@ -2719,32 +2760,15 @@ impl AppState {
         let state = self.clone();
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
+            if state.revision_generation.get() != generation {
+                // Its Review was reset or replaced while the request was out
+                // (another tab's Review, Close): the answer is no live
+                // proposal's, and must not touch the field or the busy flag.
+                return;
+            }
             state.revision_busy.set(false);
             match result {
-                Ok(Ok(transport)) => {
-                    let proposal = transport.into_proposal();
-                    let mut accepted = HashMap::new();
-                    let hunks = proposal
-                        .hunks()
-                        .iter()
-                        .enumerate()
-                        .map(|(ordinal, hunk)| RevisionHunkView {
-                            ordinal,
-                            change_id: hunk.change_id().0,
-                            rationale: hunk.rationale().to_owned(),
-                            before: hunk.expected_source().to_owned(),
-                            after: hunk.replacement().to_owned(),
-                            accepted: *accepted
-                                .entry(hunk.change_id().0)
-                                .or_insert_with(|| signal(false)),
-                        })
-                        .collect();
-                    state.revision_hunks.set(hunks);
-                    *state.revision_proposal.borrow_mut() = Some(proposal);
-                    state.revision_status.set(Some(SharedString::from(
-                        "Revision ready. Approve individual changes, then apply.",
-                    )));
-                }
+                Ok(Ok(transport)) => state.present_revision_for(tab_id, transport.into_proposal()),
                 Ok(Err(error)) => {
                     if matches!(
                         error,
@@ -2768,104 +2792,198 @@ impl AppState {
         });
     }
 
-    pub fn toggle_revision_hunk(&self, index: usize) {
-        if let Some(hunk) = self.revision_hunks.get().get(index) {
-            hunk.accepted.update(|accepted| *accepted = !*accepted);
+    /// Present `proposal` over the tab on screen, as if a Review of it had
+    /// prepared the proposal: the unit tests' way in, with no provider.
+    #[cfg(test)]
+    pub(crate) fn present_revision(&self, proposal: RevisionProposal) {
+        if let Some(tab_id) = self.active.get() {
+            self.present_revision_for(tab_id, proposal);
         }
     }
 
-    /// Compose only explicitly approved changes and apply them to the buffer.
-    pub fn apply_revision(&self) {
-        let Some(proposal) = self.revision_proposal.borrow().clone() else {
-            self.revision_status.set(Some(SharedString::from(
-                "Run Review first to prepare a Revision.",
-            )));
-            return;
+    /// Show a validated proposal for per-change decisions: its hunks in the
+    /// field, and a ledger placing them in the text of `tab_id`, the tab the
+    /// Review read. Nothing is written until the user accepts a change.
+    fn present_revision_for(&self, tab_id: u64, proposal: RevisionProposal) {
+        let mut accepted = HashMap::new();
+        let hunks = proposal
+            .hunks()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, hunk)| RevisionHunkView {
+                ordinal,
+                change_id: hunk.change_id().0,
+                rationale: hunk.rationale().to_owned(),
+                before: hunk.expected_source().to_owned(),
+                after: hunk.replacement().to_owned(),
+                accepted: *accepted
+                    .entry(hunk.change_id().0)
+                    .or_insert_with(|| signal(false)),
+            })
+            .collect();
+        *self.revision_ledger.borrow_mut() = Some(RevisionLedger::new(tab_id, &proposal));
+        self.revision_not_applied.set(0);
+        self.revision_hunks.set(hunks);
+        self.revision_status
+            .set(Some(SharedString::from(REVISION_READY)));
+    }
+
+    /// Write one change into the buffer now, as one edit: `applied` puts its
+    /// replacement in place of the reviewed bytes, otherwise the reviewed
+    /// bytes go back exactly. Returns whether the buffer now reads as asked;
+    /// a refusal says why on the status line and changes nothing. Nothing is
+    /// saved — the tab is only dirty.
+    pub fn set_revision_change_applied(&self, change_id: u32, applied: bool) -> bool {
+        let change = ChangeId(change_id);
+        let mut slot = self.revision_ledger.borrow_mut();
+        let Some(ledger) = slot.as_mut() else {
+            drop(slot);
+            self.revision_status
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            return false;
         };
-        let Some((tab_id, snapshot)) = self
-            .revision_context
-            .borrow()
-            .as_ref()
-            .map(|context| (context.tab_id, context.snapshot))
-        else {
-            self.revision_status.set(Some(SharedString::from(
-                "Run Review first to prepare a Revision.",
-            )));
-            return;
-        };
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        let current_snapshot = SourceSnapshot::new(tab.revision.get(), 0);
-        if tab.id != tab_id || !snapshot.matches(current_snapshot) {
+        if ledger.applied(change) == applied {
+            return true;
+        }
+        let Some(tab) = self.active_tab().filter(|tab| tab.id == ledger.tab_id()) else {
+            drop(slot);
             self.record_usage(UsageEvent::StaleResultBlocked);
             self.revision_status.set(Some(SharedString::from(
-                "This Revision belongs to another document or source state. Run Review again before applying.",
+                "This Revision belongs to another document. Return to it to decide.",
             )));
-            return;
-        }
-        let mut decisions = HashMap::new();
-        for hunk in self.revision_hunks.get() {
-            decisions.insert(ChangeId(hunk.change_id), hunk.accepted.get());
-        }
-        let decisions: Vec<_> = decisions.into_iter().collect();
-        let text = match proposal.compose_against(&tab.text.get(), current_snapshot, &decisions) {
-            Ok(text) => text,
-            Err(error) => {
-                self.revision_status.set(Some(SharedString::from(format!(
-                    "Revision apply rejected: {error}"
-                ))));
-                return;
+            return false;
+        };
+        let written = match tab
+            .text
+            .with(|text| ledger.set_applied(change, applied, text))
+        {
+            Ok(written) => written,
+            Err(refusal) => {
+                drop(slot);
+                let message = match (refusal, applied) {
+                    (LedgerRefusal::UnknownChange, _) => "This change is not part of the Revision.",
+                    (LedgerRefusal::PartChanged, true) => {
+                        self.record_usage(UsageEvent::StaleResultBlocked);
+                        "Can't apply — this part changed."
+                    }
+                    (LedgerRefusal::PartChanged, false) => {
+                        "Can't undo — this part was edited after it was accepted."
+                    }
+                };
+                self.revision_status.set(Some(SharedString::from(message)));
+                return false;
             }
         };
-        let hunks = self.revision_hunks.get();
-        if text == tab.text.get().as_str() {
-            self.record_usage(UsageEvent::RevisionDecision {
-                accepted_hunks: 0,
-                rejected_hunks: hunks.len() as u64,
-            });
-            *self.revision_proposal.borrow_mut() = None;
-            self.revision_hunks.set(Vec::new());
+        // The ledger already follows the new text: `note_edit` below finds
+        // nothing left to observe.
+        drop(slot);
+        if let Some(hunk) = self
+            .revision_hunks
+            .get()
+            .iter()
+            .find(|hunk| hunk.change_id == change_id)
+        {
+            // Every hunk of one change shares this signal.
+            hunk.accepted.set(applied);
+        }
+        if let Some(text) = written {
+            tab.text.set(SharedString::from(text));
+            tab.dirty.set(true);
+            tab.revision.update(|revision| *revision += 1);
+            self.note_edit(tab.id);
+        }
+        self.revision_status
+            .set(Some(SharedString::from(REVISION_READY)));
+        true
+    }
+
+    /// Flip the hunk's change between accepted (written) and not.
+    pub fn toggle_revision_hunk(&self, index: usize) {
+        if let Some(hunk) = self.revision_hunks.get().get(index) {
+            self.set_revision_change_applied(hunk.change_id, !hunk.accepted.get());
+        }
+    }
+
+    /// Whether the hunk at `index` no longer finds its own text where it
+    /// left it — an edit touched the part it covers — so it can neither be
+    /// accepted nor, once accepted, taken back. Reads the tab's text, so a
+    /// binding follows every edit.
+    pub fn revision_hunk_part_changed(&self, index: usize) -> bool {
+        let ledger = self.revision_ledger.borrow();
+        let Some(ledger) = ledger.as_ref() else {
+            return true;
+        };
+        let tab = self
+            .tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == ledger.tab_id())
+            .cloned();
+        tab.is_none_or(|tab| tab.text.with(|text| ledger.part_changed(index, text)))
+    }
+
+    /// Follow an edit of tab `id` with the live proposal's ledger, so each
+    /// hunk the edit did not touch keeps its place.
+    fn observe_revision_edit(&self, id: u64) {
+        let mut slot = self.revision_ledger.borrow_mut();
+        let Some(ledger) = slot.as_mut().filter(|ledger| ledger.tab_id() == id) else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
+            tab.text.with(|text| ledger.observe(text));
+        }
+    }
+
+    /// `Done`: the decisions stand as written — every accepted change is
+    /// already in the buffer — and the `undecided` hunks are discarded,
+    /// never written; the outcome line counts them. Nothing is saved.
+    pub fn finish_revision(&self, undecided: usize) {
+        if self.revision_ledger.borrow_mut().take().is_none() {
             self.revision_status
-                .set(Some(SharedString::from("No changes approved.")));
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
             return;
         }
+        let hunks = self.revision_hunks.get();
         let accepted_hunks = hunks.iter().filter(|hunk| hunk.accepted.get()).count() as u64;
         self.record_usage(UsageEvent::RevisionDecision {
             accepted_hunks,
             rejected_hunks: hunks.len() as u64 - accepted_hunks,
         });
-        tab.text.set(SharedString::from(text));
-        tab.dirty.set(true);
-        tab.revision.update(|revision| *revision += 1);
-        self.note_edit(tab.id);
-        self.record_usage(UsageEvent::RevisionApplied);
-        *self.revision_proposal.borrow_mut() = None;
+        if accepted_hunks > 0 {
+            self.record_usage(UsageEvent::RevisionApplied);
+        }
         self.revision_hunks.set(Vec::new());
-        self.revision_status.set(Some(SharedString::from(
-            "Approved changes applied to the buffer.",
-        )));
+        self.revision_not_applied.set(undecided);
+        self.revision_status
+            .set(Some(SharedString::from(if accepted_hunks > 0 {
+                "Approved changes applied to the buffer."
+            } else {
+                "No changes approved."
+            })));
     }
 
-    /// Whether the live Revision proposal's base moved since the Review it was
-    /// computed from — an edit to the document, or another document active —
-    /// which is exactly what [`apply_revision`](Self::apply_revision) refuses:
-    /// the field says so and offers no Accept then. A proposal from no Review
-    /// (a synthetic one) is never stale.
+    /// `Done` for a caller that keeps no decisions of its own: every hunk
+    /// not accepted counts as not applied.
+    pub fn apply_revision(&self) {
+        let not_applied = self
+            .revision_hunks
+            .get()
+            .iter()
+            .filter(|hunk| !hunk.accepted.get())
+            .count();
+        self.finish_revision(not_applied);
+    }
+
+    /// Whether the live proposal belongs to a tab other than the one on
+    /// screen: its hunks are placed in that tab's text, so nothing can be
+    /// decided into this one. An edit to the proposal's own tab does not
+    /// make the whole proposal stale — each hunk the edit touched says so on
+    /// its own ([`revision_hunk_part_changed`](Self::revision_hunk_part_changed)).
     pub fn revision_is_stale(&self) -> bool {
-        let context = self.revision_context.borrow();
-        let Some(context) = context.as_ref() else {
-            return false;
-        };
-        match self.active_tab() {
-            Some(tab) => {
-                tab.id != context.tab_id
-                    || !context
-                        .snapshot
-                        .matches(SourceSnapshot::new(tab.revision.get(), 0))
-            }
-            None => true,
-        }
+        let ledger = self.revision_ledger.borrow();
+        ledger
+            .as_ref()
+            .is_some_and(|ledger| self.active.get() != Some(ledger.tab_id()))
     }
 
     /// Withdraw the prepared request before it is sent.
