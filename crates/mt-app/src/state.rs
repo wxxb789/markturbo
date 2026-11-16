@@ -2212,6 +2212,20 @@ impl AppState {
         self.source_editor.set(Some((tab, editor)));
     }
 
+    /// Take the keyboard focus from the mounted source editor, if it has it:
+    /// a card that floats over the room (consent, the close guard) owns
+    /// Enter, Escape and Tab, which the focused editor would otherwise take
+    /// first (its keys are the newest bindings while it is focused).
+    pub fn blur_source_editor(&self) {
+        if let Some(api) = self
+            .source_editor
+            .get()
+            .and_then(|(_, editor)| editor.api::<EditorApi>())
+        {
+            api.blur();
+        }
+    }
+
     /// The non-empty primary selection the mounted source editor of `tab`
     /// shows now, as byte offsets into `text`. No editor on screen for the
     /// tab (another pane, another tab), or an editor that does not hold

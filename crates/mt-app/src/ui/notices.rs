@@ -915,6 +915,8 @@ pub fn guard(state: AppState, language: Language) -> impl IntoElement {
 
 /// The card itself, for the request the state is holding.
 fn guard_card(state: AppState, request: GuardRequest, language: Language) -> AnyElement {
+    // The card owns its keys: the source editor gives up the focus.
+    state.blur_source_editor();
     bind_guard_keys(&state);
     let names_state = state.clone();
     let save_state = state.clone();

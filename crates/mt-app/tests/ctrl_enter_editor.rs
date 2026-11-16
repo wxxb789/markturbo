@@ -189,6 +189,16 @@ fn cancel_card(app: &mut Headless) {
         .expect("the card closed");
 }
 
+fn close_card_with_key(app: &mut Headless, key: &str) {
+    app.press_key(key).expect("a key");
+    assert!(
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .is_ok(),
+        "{key} cancels the card opened from the editor: {:?}",
+        app.screen().texts()
+    );
+}
+
 fn is_dirty(app: &Headless) -> bool {
     app.screen()
         .matches("id:title-dirty")
@@ -222,13 +232,19 @@ fn ctrl_enter_from_the_focused_editor_starts_review_after_every_refocus() {
     assert_eq!(editor_lines(&app), lines(SOURCE));
     assert!(!is_dirty(&app));
 
-    // Cancel the card; the editor's keys are bound again on every focus,
-    // and the shortcut must stay the app's after each.
-    cancel_card(&mut app);
-    for cycle in 0..2 {
+    // The card opened from the editor answers its own keys: Escape and
+    // Enter cancel it (the editor's Enter would insert a line), as Cancel
+    // does. The editor's keys are bound again on every focus, and the
+    // shortcut must stay the app's after each.
+    close_card_with_key(&mut app, "escape");
+    for (cycle, key) in ["enter", ""].into_iter().enumerate() {
         blur_and_refocus_editor(&mut app);
         ctrl_enter_reviews(&mut app, &format!("refocus {cycle}"));
-        cancel_card(&mut app);
+        if key.is_empty() {
+            cancel_card(&mut app);
+        } else {
+            close_card_with_key(&mut app, key);
+        }
     }
     assert_eq!(
         editor_lines(&app),

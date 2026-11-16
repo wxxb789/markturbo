@@ -124,6 +124,9 @@ fn waiting(state: &AppState) -> Waiting {
 
 /// The consent card.
 pub fn card(state: AppState, language: Language) -> impl IntoElement {
+    // The card owns Enter, Escape and the hold: the source editor gives up
+    // the focus it may still hold from the Ctrl+Enter that opened the card.
+    state.blur_source_editor();
     let is_revision = state.revision_consent.get().is_some();
     // The app's only shadow: sending is the one thing that breaks the room.
     // It takes its colour adaptively, so the theme stays current without a
