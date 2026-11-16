@@ -506,3 +506,70 @@ def rust_source_views(source: str) -> tuple[str, str] | None:
         index += 1
 
     return "".join(code_only), "".join(comment_free)
+
+
+def production_markers_present(root: Path, requirements: dict[str, tuple[str, ...]]) -> bool:
+    """Whether each file's comment-free production source holds its markers.
+
+    `requirements` maps a repository-relative Rust file to the literals (test
+    ids, labels) a native harness selects by. Test-only items and comments
+    cannot supply a marker; an unreadable or unparsable file fails closed.
+    """
+    for relative, markers in requirements.items():
+        try:
+            source = production_source(root / relative)
+        except OSError:
+            return False
+        views = None if source is None else rust_source_views(source)
+        if views is None:
+            return False
+        _, comment_free = views
+        if any(marker not in comment_free for marker in markers):
+            return False
+    return True
+
+
+_ALERT_BUTTON_RE = re.compile(r'\.(action|cancel|destructive)\(\s*"([^"]*)"')
+
+
+def alert_enter_confirms(path: Path, signature: str, action_id: str) -> bool:
+    """Whether Enter answers the `alert_dialog()` built in `signature` with `action_id`.
+
+    nsh 0.5.1 draws an alert inside the surface, outside the UIA tree, so a
+    native harness answers it with Enter. On Windows Enter presses the focused
+    button, which starts on the last `.action` (Default style) and otherwise on
+    the first button (nsh-platform-windows `system.rs` `default_button`). The
+    function's one alert must therefore list `.destructive("<action_id>", ..)`
+    first and hold no `.action`. Comments and test-only items cannot satisfy
+    this; an unreadable or unparsable file fails closed.
+    """
+    try:
+        source = production_source(path)
+    except OSError:
+        return False
+    views = None if source is None else rust_source_views(source)
+    if views is None:
+        return False
+    code_only, comment_free = views
+    start = code_only.find(signature)
+    opening = -1 if start < 0 else code_only.find("{", start + len(signature))
+    if opening < 0:
+        return False
+    depth = 0
+    for index in range(opening, len(code_only)):
+        if code_only[index] == "{":
+            depth += 1
+        elif code_only[index] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+    else:
+        return False
+    body = comment_free[opening : index + 1]
+    buttons = _ALERT_BUTTON_RE.findall(body)
+    return (
+        code_only[opening : index + 1].count("alert_dialog()") == 1
+        and bool(buttons)
+        and buttons[0] == ("destructive", action_id)
+        and all(kind != "action" for kind, _ in buttons)
+    )

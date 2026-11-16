@@ -19,7 +19,6 @@ from scripts.markturbo_tools.native import runtime
 
 BUILD_CLI_COMMAND = HARNESS.build_cli_command
 BUILD_LAUNCH_SPEC = runtime.build_launch_spec
-CHECKPOINT_SUCCESS_PRESENT = HARNESS.checkpoint_success_present
 COMPLETE_EVIDENCE = HARNESS.complete_evidence
 DOCUMENT_SENTINEL = HARNESS.DOCUMENT_SENTINEL
 EXECUTABLE_HASH_FAILURE = runtime.executable_hash_failure
@@ -28,7 +27,6 @@ HARNESS_BLOCKED = runtime.HarnessBlocked
 HARNESS_FAILURE = runtime.HarnessFailure
 INSPECT_PE_BYTES = runtime.inspect_pe_bytes
 INSPECT_PE_SECTIONS = runtime.inspect_pe_sections
-LAYOUT_SOURCE_AUTOMATION_ID = runtime.LAYOUT_SOURCE_AUTOMATION_ID
 NATIVE_HARNESS = HARNESS.Goal02Harness
 NEW_EVIDENCE = HARNESS.new_evidence
 NORMALIZE_EXPECTED_HASH = runtime.normalize_expected_hash
@@ -39,18 +37,17 @@ REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
 RUNTIME_ARTIFACT_SCAN = HARNESS.scan_runtime_artifacts
 LIVE_RECOVERY_SCAN = HARNESS.scan_live_recovery_records
 LAUNCH_FAILURE_CODE = runtime.launch_failure_code
-RECOVERY_STARTUP_FINISHED_PRESENT = HARNESS.recovery_startup_finished_present
 SECURITY_CONTEXT = runtime.SecurityContext
 SECURITY_CONTEXT_FAILURE = runtime.security_context_failure
 SAFE_EXCEPTION_NAME = runtime.safe_exception_name
 SAFE_FAILURE_TYPE = runtime.safe_failure_type
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
 WAIT_UNTIL = runtime.wait_until
-SOURCE_EDITOR_AUTOMATION_ID = runtime.SOURCE_EDITOR_AUTOMATION_ID
+EDITOR_NAME = runtime.EDITOR_NAME
 TAB_CLOSE_AUTOMATION_ID = HARNESS.TAB_CLOSE_AUTOMATION_ID
-CONFLICT_OVERWRITE_AUTOMATION_ID = HARNESS.CONFLICT_OVERWRITE_AUTOMATION_ID
 VK_A = runtime.VK_A
 VK_BACK = runtime.VK_BACK
+VK_C = runtime.VK_C
 
 HASH = "a" * 64
 SAME_AS_RAW = object()
@@ -119,7 +116,7 @@ def valid_evidence() -> dict:
             "source_before": original,
             "source_after_cancel_save": edited,
             "cancel_kept_tab": True,
-            "flow": "pointer tab-close -> Cancel -> SendInput Ctrl+S",
+            "flow": HARNESS.CASE_FLOWS[REQUIRED_CASE_IDS[0]],
             "process_context": process_context,
             "foreground_verified": True,
             "runtime_scan": runtime_scan,
@@ -129,7 +126,7 @@ def valid_evidence() -> dict:
             "source_before": original,
             "source_after_discard": original,
             "discard_closed_tab": True,
-            "flow": "SendInput Ctrl+W -> Discard",
+            "flow": HARNESS.CASE_FLOWS[REQUIRED_CASE_IDS[1]],
             "process_context": process_context,
             "foreground_verified": True,
             "runtime_scan": runtime_scan,
@@ -137,7 +134,7 @@ def valid_evidence() -> dict:
         REQUIRED_CASE_IDS[2]: {
             "editor": edited,
             "saved_source": edited,
-            "flow": "WM_CLOSE -> Save",
+            "flow": HARNESS.CASE_FLOWS[REQUIRED_CASE_IDS[2]],
             "window_exited": True,
             "process_context": process_context,
             "foreground_verified": True,
@@ -147,23 +144,26 @@ def valid_evidence() -> dict:
             "loaded_source": original,
             "external_source": external,
             "dirty_editor": edited,
+            "source_after_refused_save": external,
+            "editor_after_conflict": edited,
             "saved_after_explicit_overwrite": edited,
             "same_length": True,
             "same_mtime_ns": True,
-            "watcher_conflict_before_save": True,
+            "save_refused_with_conflict": True,
             "explicit_overwrite_used": True,
-            "flow": "watcher conflict -> explicit Overwrite",
+            "flow": HARNESS.CASE_FLOWS[REQUIRED_CASE_IDS[3]],
             "process_context": process_context,
             "foreground_verified": True,
             "runtime_scan": runtime_scan,
         },
         REQUIRED_CASE_IDS[4]: {
             "edited_text": edited,
-            "checkpoint_log_seen": True,
-            "checkpoint_signal": "content-free checkpoint success log",
+            "checkpoint_record_seen": True,
+            "checkpoint_signal": HARNESS.CHECKPOINT_SIGNAL,
             "live_runtime_scan": runtime_scan,
             "live_recovery_scan": live_recovery_scan,
             "edit_to_signal_ms": 9999.0,
+            "recovery_offer_seen": True,
             "restored_editor": edited,
             "recovery_restored_exact": True,
             "restore_ms": 3.0,
@@ -173,13 +173,9 @@ def valid_evidence() -> dict:
             "discard_restart_absent_ms": 4.0,
             "termination": "TerminateProcess",
             "restart_count": 2,
-            "startup_finished_log_seen": True,
-            "startup_signal": "content-free recovery startup finished log",
+            "startup_signal": HARNESS.STARTUP_SIGNAL,
             "startup_observed_before_restart_editor": True,
-            "flow": (
-                "edit -> checkpoint log -> TerminateProcess -> restart -> Discard -> "
-                "restart after startup log"
-            ),
+            "flow": HARNESS.CASE_FLOWS[REQUIRED_CASE_IDS[4]],
             "process_contexts": [process_context, process_context, process_context],
             "foreground_verified": True,
             "runtime_scan": runtime_scan,

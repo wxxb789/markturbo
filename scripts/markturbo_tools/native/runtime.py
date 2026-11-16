@@ -60,13 +60,50 @@ INTEGRITY_NAMES = {
     "protected",
 }
 
-LAYOUT_SOURCE_AUTOMATION_ID = "markturbo-layout-source"
-SOURCE_EDITOR_AUTOMATION_ID = "markturbo-document-source-editor"
-LIFECYCLE_BUTTON_CONTRACTS = {
-    "Save": ("CommandButton_1", "Save"),
-    "Discard": ("CommandButton_-2", "Discard"),
-    "Cancel": ("CommandButton_2", "Cancel"),
-}
+# How the nsh 0.5.1 UI appears in Windows UI Automation. Verified against the
+# nsh-platform-windows 0.5.1 crate source:
+#
+# * AutomationId is the view's `.test_id(..)` (src/access/uia.rs:821), but only
+#   on a view that is itself a UIA element. A plain view with no role, label or
+#   press handler is flat and is looked through (src/access.rs:284-297,
+#   373-384), so `prims::quiet_action`/`primary_action` and the guard card put
+#   their id on such a wrapper and expose an anonymous Button named by its
+#   accessibility label instead.
+# * Name is the accessibility label, else a text view's visible text, else the
+#   folded content of a grouping control such as a Button (src/access.rs:453).
+# * ControlType follows the role, else Text for text views, Edit for inputs,
+#   Button for pressable views and Group for labelled ones (src/access.rs:284;
+#   src/access/uia.rs:1256).
+# * Invoke is offered by pressable views and `activate` actions, never by
+#   toggles (src/access/uia.rs:771); it delivers one whole press, so it cannot
+#   charge the consent card's hold (`ui/consent.rs` `send_button`). Value is
+#   offered by inputs only (src/access/uia.rs:789); the source editor's input
+#   is its IME sink, not the document (nsh-base 0.5.1 src/editor/view.rs:1526,
+#   src/editor/controller.rs:749-813), so the document is read through the
+#   editor's own Select All + Copy, which writes the exact text
+#   (nsh-platform-windows src/system.rs:2046). SetFocus is supported
+#   (src/access/uia.rs:974).
+# * System alerts (`nsh::alert_dialog()`: the Overwrite and Run scripts
+#   confirmations in `state.rs`) are not in the UIA tree. They are drawn inside
+#   the surface as items the root hosts (src/system.rs:5-13, 1906), the
+#   `Hosted` trait has no accessibility hook, and the UIA tree walks views only
+#   (src/access.rs:373-384). While one shows, every key goes to it
+#   (src/system.rs:2022-2040); Enter presses its focused button, which starts on
+#   the last Default-styled button, else the first (src/system.rs:1461-1476,
+#   1674). `confirm_system_alert` answers with Enter, and
+#   `source_contract.alert_enter_confirms` pins the button order it relies on.
+SYSTEM_ALERT_SETTLE_SECONDS = 0.5
+EDITOR_NAME = "Markdown source"
+MENU_BUTTON_AUTOMATION_ID = "title-settings"
+MENU_SAVE_AUTOMATION_ID = "title-menu-save"
+MENU_SAVE_AS_AUTOMATION_ID = "title-menu-save-as"
+MENU_EDIT_AUTOMATION_ID = "title-menu-edit"
+MENU_WEB_AUTOMATION_ID = "title-menu-web"
+MENU_QUIT_AUTOMATION_ID = "title-menu-quit"
+DIRTY_MARK_AUTOMATION_ID = "title-dirty"
+GUARD_HEADING = "Close without saving?"
+GUARD_BUTTON_NAMES = {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"}
+CONFLICT_HEADING = "Changed on disk"
 LIFECYCLE_CLICK_FAILURE_CODES = {
     "Save": "LIFECYCLE_SAVE_CLICK_FAILED",
     "Discard": "LIFECYCLE_DISCARD_CLICK_FAILED",
@@ -74,6 +111,8 @@ LIFECYCLE_CLICK_FAILURE_CODES = {
 }
 TASK_DIALOG_CLASS = "#32770"
 TASK_DIALOG_BUTTON_CLASS = "CCPushButton"
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
 ERROR_NOT_FOUND = 1168
 
 WM_CLOSE = 0x0010
@@ -83,11 +122,18 @@ VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_A = 0x41
 VK_BACK = 0x08
+VK_C = 0x43
+VK_RETURN = 0x0D
+VK_V = 0x56
+VK_Z = 0x5A
 VK_S = 0x53
 VK_W = 0x57
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
+INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_TERMINATE = 0x0001
 TOKEN_QUERY = 0x0008
@@ -114,9 +160,6 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO = 4
 JOB_OBJECT_COMPLETION_KEY = 1
 WAIT_TIMEOUT = 258
-EVENT_OBJECT_SHOW = 0x8002
-EVENT_OBJECT_HIDE = 0x8003
-EVENT_OBJECT_FOCUS = 0x8005
 
 
 class GUITHREADINFO(ctypes.Structure):
@@ -530,6 +573,10 @@ def build_launch_spec(
     )
 
 
+def has_unicode_clipboard_text(formats: set[int]) -> bool:
+    return CF_UNICODETEXT in formats
+
+
 def load_pywinauto() -> Any:
     try:
         from pywinauto import Application
@@ -801,27 +848,8 @@ class Win32:
         self.user32.IsChild.restype = wt.BOOL
         self.user32.IsWindow.argtypes = [wt.HWND]
         self.user32.IsWindow.restype = wt.BOOL
-        self.user32.FindWindowExW.argtypes = [wt.HWND, wt.HWND, wt.LPCWSTR, wt.LPCWSTR]
-        self.user32.FindWindowExW.restype = wt.HWND
-        self._win_event_proc = ctypes.WINFUNCTYPE(
-            None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG, wt.LONG, wt.DWORD, wt.DWORD
-        )
-        self.user32.SetWinEventHook.argtypes = [
-            wt.DWORD, wt.DWORD, wt.HMODULE, self._win_event_proc,
-            wt.DWORD, wt.DWORD, wt.DWORD,
-        ]
-        self.user32.SetWinEventHook.restype = wt.HANDLE
-        self.user32.UnhookWinEvent.argtypes = [wt.HANDLE]
-        self.user32.UnhookWinEvent.restype = wt.BOOL
-        self.user32.MsgWaitForMultipleObjectsEx.argtypes = [
-            wt.DWORD, ctypes.POINTER(wt.HANDLE), wt.DWORD, wt.DWORD, wt.DWORD,
-        ]
-        self.user32.MsgWaitForMultipleObjectsEx.restype = wt.DWORD
-        self.user32.PeekMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT]
-        self.user32.PeekMessageW.restype = wt.BOOL
-        self.user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
-        self.user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
-        self.user32.DispatchMessageW.restype = ctypes.c_ssize_t
+        self.user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        self.user32.SetCursorPos.restype = wt.BOOL
         self._enum_windows_proc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
         self.user32.EnumWindows.argtypes = [self._enum_windows_proc, wt.LPARAM]
         self.user32.EnumWindows.restype = wt.BOOL
@@ -1042,69 +1070,13 @@ class Win32:
         )
 
     def foreground_focus(self, hwnd: int) -> int:
-        """Observe OS keyboard ownership, not GPUI/UIA's logical control focus."""
+        """Observe OS keyboard ownership, not UIA's logical control focus."""
         if self.user32.GetForegroundWindow() != hwnd:
             return 0
         info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
         if not self.user32.GetGUIThreadInfo(0, ctypes.byref(info)):
             raise HarnessFailure("NATIVE_FOCUS_QUERY_FAILED")
         return int(info.hwndFocus or 0)
-
-    def visible_web_host(self, hwnd: int) -> int:
-        host = self.user32.FindWindowExW(hwnd, None, "MarkTurboWebHost", None)
-        return int(host) if host and self.user32.IsWindowVisible(host) else 0
-
-    def after_window_events(
-        self, hwnd: int, events: tuple[int, ...], action: Callable[[], Any],
-        observed: Callable[[], Any], timeout: float, failure_code: str,
-    ) -> Any:
-        """Subscribe before acting, then pump native notifications without polling."""
-        changed = True
-
-        @self._win_event_proc
-        def notify(_hook, _event, target, _object, _child, _thread, _time):
-            nonlocal changed
-            if target == hwnd or self.user32.IsChild(hwnd, target):
-                changed = True
-
-        hooks = []
-        try:
-            for event in events:
-                # Out-of-context hooks run on this thread while it pumps messages.
-                # Do not filter by PID: WebView descendants can belong to Edge.
-                hook = self.user32.SetWinEventHook(event, event, None, notify, 0, 0, 0)
-                if not hook:
-                    raise HarnessFailure("NATIVE_WINDOW_EVENT_HOOK_FAILED")
-                hooks.append(hook)
-            deadline = time.monotonic() + timeout
-            action()
-            while True:
-                if changed:
-                    changed = False
-                    if result := observed():
-                        return result
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise HarnessFailure(failure_code)
-                # QS_ALLINPUT | MWMO_INPUTAVAILABLE: wait for actual queued input,
-                # including out-of-context WinEvents, never a periodic timer.
-                status = self.user32.MsgWaitForMultipleObjectsEx(
-                    0, None, math.ceil(remaining * 1000), 0x04FF, 0x0004
-                )
-                if status == WAIT_TIMEOUT:
-                    raise HarnessFailure(failure_code)
-                if status != 0:
-                    raise HarnessFailure("NATIVE_WINDOW_EVENT_WAIT_FAILED")
-                message = wt.MSG()
-                while self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):
-                    if time.monotonic() >= deadline:
-                        raise HarnessFailure(failure_code)
-                    self.user32.TranslateMessage(ctypes.byref(message))
-                    self.user32.DispatchMessageW(ctypes.byref(message))
-        finally:
-            unhooked = [self.user32.UnhookWinEvent(hook) for hook in hooks]
-            if not all(unhooked):
-                raise HarnessFailure("NATIVE_WINDOW_EVENT_UNHOOK_FAILED")
 
     def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
         dialogs: list[int] = []
@@ -1187,6 +1159,20 @@ class Win32:
         self.require_foreground(hwnd)
         self.send_inputs([key_input(key, False), key_input(key, True)])
 
+    def move_cursor(self, x: int, y: int) -> None:
+        if not self.user32.SetCursorPos(x, y):
+            raise HarnessFailure("SET_CURSOR_POS_FAILED")
+
+    def press_and_hold(self, hwnd: int, x: int, y: int, seconds: float) -> None:
+        """Hold the primary button at a screen point: a real pointer hold."""
+        self.require_foreground(hwnd)
+        self.move_cursor(x, y)
+        self.send_inputs([mouse_input(MOUSEEVENTF_LEFTDOWN)])
+        try:
+            time.sleep(seconds)
+        finally:
+            self.send_inputs([mouse_input(MOUSEEVENTF_LEFTUP)])
+
     def send_unicode(self, hwnd: int, text: str) -> None:
         self.require_foreground(hwnd)
         units = struct.unpack(f"<{len(text.encode('utf-16-le')) // 2}H", text.encode("utf-16-le"))
@@ -1209,6 +1195,10 @@ class Win32:
 def key_input(key: int, key_up: bool) -> INPUT:
     flags = KEYEVENTF_KEYUP if key_up else 0
     return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(key, 0, flags, 0, 0))
+
+
+def mouse_input(flags: int) -> INPUT:
+    return INPUT(type=INPUT_MOUSE, mi=MOUSEINPUT(0, 0, 0, flags, 0, 0))
 
 
 def unicode_input(unit: int, key_up: bool) -> INPUT:
@@ -1567,23 +1557,62 @@ class NativeHarness:
             raise HarnessFailure(mismatch_code)
         return control
 
-    def find_control(
+    def control_by_name(
         self,
-        app: RunningApp,
-        automation_id: str,
+        hwnd: int,
+        name: str,
         control_type: str,
-        timeout_code: str,
         mismatch_code: str,
-        timeout: float | None = None,
+        *,
+        anonymous: bool = True,
+    ) -> Any | None:
+        """The one control of `control_type` named `name`.
+
+        `anonymous` keeps only elements without an AutomationId: the nsh
+        controls that carry their test id on a flat wrapper, so a title-row
+        or menu control that happens to share the label never matches.
+        """
+        matches = self.controls_by_name(hwnd, name, control_type, anonymous=anonymous)
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise HarnessFailure(mismatch_code)
+        return matches[0]
+
+    def controls_by_name(
+        self, hwnd: int, name: str, control_type: str, *, anonymous: bool = True
+    ) -> list[Any]:
+        uia = self.iuia_class()
+        condition = uia.iuia.CreatePropertyCondition(uia.UIA_dll.UIA_NamePropertyId, name)
+        elements = self.fresh_uia_root(hwnd).element.FindAll(
+            uia.tree_scope["descendants"], condition
+        )
+        expected_control_type = uia.known_control_types[control_type]
+        controls = []
+        for index in range(elements.Length):
+            element = elements.GetElement(index)
+            if element.CurrentName != name or element.CurrentControlType != expected_control_type:
+                continue
+            if anonymous and element.CurrentAutomationId:
+                continue
+            control = self.uia_wrapper_class(self.uia_element_info_class(element))
+            if control.element_info.control_type is None:
+                raise RuntimeError("UIA_CONTROL_PROPERTIES_UNAVAILABLE")
+            controls.append(control)
+        return controls
+
+    def _wait_ready(
+        self,
+        lookup: Callable[[], Any | None],
+        timeout_code: str,
+        timeout: float | None,
     ) -> Any:
         last_failure_type: str | None = None
 
         def locate() -> Any | None:
             nonlocal last_failure_type
             try:
-                control = self.control_by_id(
-                    app.hwnd, automation_id, control_type, mismatch_code
-                )
+                control = lookup()
                 if control is None:
                     return None
                 if not control.is_visible() or not control.is_enabled():
@@ -1607,71 +1636,155 @@ class NativeHarness:
                 raise HarnessFailure(timeout_code, last_failure_type) from None
             raise
 
+    def find_control(
+        self,
+        app: RunningApp,
+        automation_id: str,
+        control_type: str,
+        timeout_code: str,
+        mismatch_code: str,
+        timeout: float | None = None,
+    ) -> Any:
+        return self._wait_ready(
+            lambda: self.control_by_id(app.hwnd, automation_id, control_type, mismatch_code),
+            timeout_code,
+            timeout,
+        )
+
+    def find_named(
+        self,
+        app: RunningApp,
+        name: str,
+        control_type: str,
+        timeout_code: str,
+        mismatch_code: str,
+        timeout: float | None = None,
+        *,
+        anonymous: bool = True,
+    ) -> Any:
+        return self._wait_ready(
+            lambda: self.control_by_name(
+                app.hwnd, name, control_type, mismatch_code, anonymous=anonymous
+            ),
+            timeout_code,
+            timeout,
+        )
+
+    def name_present(self, app: RunningApp, name: str, control_type: str) -> bool:
+        """Whether any control of `control_type` carries `name` (ids allowed)."""
+        try:
+            return bool(self.controls_by_name(app.hwnd, name, control_type, anonymous=False))
+        except HarnessFailure:
+            raise
+        except Exception as error:
+            raise HarnessFailure("UIA_NAME_QUERY_FAILED", safe_exception_name(error)) from None
+
+    def wait_name(
+        self, app: RunningApp, name: str, control_type: str, timeout_code: str,
+        timeout: float | None = None,
+    ) -> None:
+        wait_until(
+            lambda: self.name_present(app, name, control_type),
+            self.ui_timeout if timeout is None else timeout,
+            timeout_code,
+            interval=0.05,
+        )
+
     def click_control(self, control: Any, failure_code: str) -> None:
         try:
             control.click_input()
         except Exception as error:
             raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
-    def activate_source_layout(self, app: RunningApp) -> None:
-        source_layout = self.find_control(
-            app,
-            LAYOUT_SOURCE_AUTOMATION_ID,
-            "TabItem",
-            "SOURCE_LAYOUT_UIA_TIMEOUT",
-            "SOURCE_LAYOUT_UIA_CONTRACT_MISMATCH",
-        )
+    def invoke_control(self, control: Any, failure_code: str) -> None:
+        """One whole press through the UIA Invoke pattern (no pointer)."""
         try:
-            source_layout.select()
+            control.invoke()
         except Exception as error:
-            raise HarnessFailure(
-                "SOURCE_LAYOUT_SELECT_FAILED", safe_exception_name(error)
-            ) from None
-        self.find_control(
+            raise HarnessFailure(failure_code, safe_exception_name(error)) from None
+
+    def confirm_system_alert(
+        self, app: RunningApp, still_undecided: Callable[[], bool], early_code: str
+    ) -> None:
+        """Answer the nsh system alert that the last press opened with Enter.
+
+        The alert is invisible to UIA (see the mapping above), so it is proven
+        by effect: `still_undecided` must hold after the press alone (else
+        `early_code`: the action ran without its confirmation), and the caller
+        must then wait for the confirmed effect. The alert opens from an async
+        task after the press; the settle delay keeps Enter from reaching the
+        app's own views first, where it could at most open the alert again.
+        Keys reach the alert only through the main window's own keyboard focus,
+        not a WebView's.
+        """
+        time.sleep(SYSTEM_ALERT_SETTLE_SECONDS)
+        if not still_undecided():
+            raise HarnessFailure(early_code)
+        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+        wait_until(
+            lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
+            self.ui_timeout,
+            "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT",
+        )
+        self.win32.send_key(app.hwnd, VK_RETURN)
+
+    def hold_control(
+        self, app: RunningApp, control: Any, seconds: float, failure_code: str
+    ) -> None:
+        """Press and hold the pointer at the control's centre, then release."""
+        try:
+            rectangle = control.rectangle()
+            x = (rectangle.left + rectangle.right) // 2
+            y = (rectangle.top + rectangle.bottom) // 2
+        except Exception as error:
+            raise HarnessFailure(failure_code, safe_exception_name(error)) from None
+        self.win32.press_and_hold(app.hwnd, x, y, seconds)
+
+    def menu_command(self, app: RunningApp, automation_id: str) -> None:
+        """Run one title-menu row: open the settings glyph's menu, invoke the row."""
+        code = automation_id.upper().replace("-", "_")
+        if self.control_by_id(
+            app.hwnd, automation_id, "Button", f"{code}_UIA_CONTRACT_MISMATCH"
+        ) is None:
+            anchor = self.find_control(
+                app,
+                MENU_BUTTON_AUTOMATION_ID,
+                "Button",
+                "MENU_BUTTON_UIA_TIMEOUT",
+                "MENU_BUTTON_UIA_CONTRACT_MISMATCH",
+            )
+            self.invoke_control(anchor, "MENU_BUTTON_INVOKE_FAILED")
+        item = self.find_control(
+            app, automation_id, "Button", f"{code}_UIA_TIMEOUT", f"{code}_UIA_CONTRACT_MISMATCH"
+        )
+        self.invoke_control(item, f"{code}_INVOKE_FAILED")
+
+    def save_via_menu(self, app: RunningApp) -> None:
+        self.menu_command(app, MENU_SAVE_AUTOMATION_ID)
+
+    def quit_via_menu(self, app: RunningApp) -> None:
+        self.menu_command(app, MENU_QUIT_AUTOMATION_ID)
+
+    def editor_control(self, app: RunningApp, timeout: float | None = None) -> Any:
+        return self.find_named(
             app,
-            SOURCE_EDITOR_AUTOMATION_ID,
+            EDITOR_NAME,
             "Edit",
             "SOURCE_EDITOR_UIA_TIMEOUT",
             "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
+            timeout,
         )
 
-    def activate_source_from_focused_web(self, app: RunningApp) -> None:
-        """Require the WebHost -> main-HWND handoff before any editor click."""
-        host = self.win32.after_window_events(
-            app.hwnd, (EVENT_OBJECT_SHOW,), lambda: None,
-            lambda: self.win32.visible_web_host(app.hwnd),
-            self.ui_timeout, "WEB_PREVIEW_VISIBLE_TIMEOUT",
-        )
-        web = self.uia_wrapper_class(self.uia_element_info_class(host))
-
-        def web_focused() -> bool:
-            focused = self.win32.foreground_focus(app.hwnd)
-            return bool(
-                self.win32.user32.IsWindowVisible(host)
-                and focused
-                and (focused == host or self.win32.user32.IsChild(host, focused))
-            )
-
-        self.win32.after_window_events(
-            app.hwnd, (EVENT_OBJECT_FOCUS,),
-            lambda: self.click_control(web, "WEB_PREVIEW_CLICK_FAILED"),
-            web_focused, self.ui_timeout, "WEB_PREVIEW_NATIVE_FOCUS_TIMEOUT",
-        )
-
-        def source_focused() -> bool:
-            # Source selection preserves GPUI's logical control focus. The
-            # contract is native keyboard ownership, NOT editor autofocus.
-            return bool(
-                self.win32.user32.IsWindow(host)
-                and not self.win32.user32.IsWindowVisible(host)
-                and self.win32.foreground_focus(app.hwnd) == app.hwnd
-            )
-
-        self.win32.after_window_events(
-            app.hwnd, (EVENT_OBJECT_HIDE, EVENT_OBJECT_FOCUS),
-            lambda: self.activate_source_layout(app), source_focused,
-            self.ui_timeout, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
-        )
+    def activate_source_layout(self, app: RunningApp) -> None:
+        """Wait for the document's source editor; the Edit mode shows it."""
+        try:
+            self.editor_control(app, min(self.ui_timeout, 5.0))
+            return
+        except HarnessFailure as error:
+            if error.code != "SOURCE_EDITOR_UIA_TIMEOUT":
+                raise
+        self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
+        self.editor_control(app)
 
     def control_absent(
         self,
@@ -1694,49 +1807,154 @@ class NativeHarness:
     def editor_absent_while_running(self, app: RunningApp) -> bool:
         if app.process.poll() is not None:
             raise HarnessFailure("PROCESS_EXITED_DURING_TAB_CLOSE")
-        return self.control_absent(
-            app,
-            SOURCE_EDITOR_AUTOMATION_ID,
-            "Edit",
-            "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED",
-            "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH",
-        )
+        try:
+            return self.control_by_name(
+                app.hwnd,
+                EDITOR_NAME,
+                "Edit",
+                "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH",
+            ) is None
+        except HarnessFailure:
+            raise
+        except Exception as error:
+            raise HarnessFailure(
+                "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED", safe_exception_name(error)
+            ) from None
+
+    def document_dirty(self, app: RunningApp) -> bool:
+        """The title row's unsaved mark (`title-dirty`) for the active document."""
+        try:
+            return self.control_by_id(
+                app.hwnd, DIRTY_MARK_AUTOMATION_ID, "Text", "DIRTY_MARK_UIA_CONTRACT_MISMATCH"
+            ) is not None
+        except HarnessFailure:
+            raise
+        except Exception as error:
+            raise HarnessFailure("DIRTY_STATE_UIA_QUERY_FAILED", safe_exception_name(error)) from None
 
     def focus_editor(self, app: RunningApp) -> None:
-        editor = self.find_control(
-            app,
-            SOURCE_EDITOR_AUTOMATION_ID,
-            "Edit",
-            "SOURCE_EDITOR_UIA_TIMEOUT",
-            "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
-        )
-        self.click_control(editor, "EDITOR_POINTER_FOCUS_FAILED")
+        editor = self.editor_control(app)
+        try:
+            editor.set_focus()
+        except Exception as error:
+            raise HarnessFailure("EDITOR_FOCUS_FAILED", safe_exception_name(error)) from None
+        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+
+    def read_text_clipboard(self) -> str | None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.OpenClipboard.argtypes = [wt.HWND]
+        user32.OpenClipboard.restype = wt.BOOL
+        user32.CloseClipboard.restype = wt.BOOL
+        user32.EnumClipboardFormats.argtypes = [wt.UINT]
+        user32.EnumClipboardFormats.restype = wt.UINT
+        user32.IsClipboardFormatAvailable.argtypes = [wt.UINT]
+        user32.IsClipboardFormatAvailable.restype = wt.BOOL
+        user32.GetClipboardData.argtypes = [wt.UINT]
+        user32.GetClipboardData.restype = wt.HANDLE
+        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalLock.restype = wt.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wt.BOOL
+        if not user32.OpenClipboard(None):
+            raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
+        try:
+            formats: set[int] = set()
+            format_id = 0
+            while format_id := int(user32.EnumClipboardFormats(format_id)):
+                formats.add(format_id)
+            if formats and not has_unicode_clipboard_text(formats):
+                raise HarnessBlocked("CLIPBOARD_CONTAINS_NON_TEXT")
+            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                return None
+            handle = user32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
+            try:
+                return ctypes.wstring_at(pointer)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+
+    def write_text_clipboard(self, value: str | None) -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.OpenClipboard.argtypes = [wt.HWND]
+        user32.OpenClipboard.restype = wt.BOOL
+        user32.CloseClipboard.restype = wt.BOOL
+        user32.EmptyClipboard.restype = wt.BOOL
+        user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+        user32.SetClipboardData.restype = wt.HANDLE
+        kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wt.HGLOBAL
+        kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalFree.restype = wt.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalLock.restype = wt.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wt.BOOL
+        if not user32.OpenClipboard(None):
+            raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
+        try:
+            if not user32.EmptyClipboard():
+                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+            if value is None:
+                return
+            payload = value.encode("utf-16-le") + b"\0\0"
+            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
+            if not handle:
+                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                kernel32.GlobalFree(handle)
+                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+            ctypes.memmove(pointer, payload, len(payload))
+            kernel32.GlobalUnlock(handle)
+            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+                kernel32.GlobalFree(handle)
+                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+        finally:
+            user32.CloseClipboard()
+
+    def wait_clipboard_text(self, timeout_code: str) -> str:
+        """The clipboard's text once something (even an empty text) arrives."""
+
+        def copied() -> tuple[str] | None:
+            value = self.read_text_clipboard()
+            return None if value is None else (value,)
+
+        (value,) = wait_until(copied, self.ui_timeout, timeout_code, interval=0.025)
+        return value
+
+    def read_editor_text(self, app: RunningApp) -> str:
+        """The editor's exact document through its own Select All + Copy.
+
+        The user's text clipboard is restored afterwards; nothing read here is
+        written to evidence except its fingerprint.
+        """
+        before = self.read_text_clipboard()
+        try:
+            self.write_text_clipboard(None)
+            self.focus_editor(app)
+            self.win32.send_shortcut(app.hwnd, VK_A)
+            self.win32.send_shortcut(app.hwnd, VK_C)
+            return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
+        finally:
+            self.write_text_clipboard(before)
 
     def read_editor_fingerprint(self, app: RunningApp) -> Fingerprint | None:
-        editor = self.control_by_id(
-            app.hwnd,
-            SOURCE_EDITOR_AUTOMATION_ID,
-            "Edit",
-            "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
-        )
-        if editor is None:
+        if self.control_by_name(
+            app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
+        ) is None:
             return None
-        try:
-            pattern = editor.iface_value
-        except self.no_pattern_error_class:
-            raise HarnessFailure("EDITOR_UIA_VALUE_CONTRACT_MISMATCH") from None
-        if pattern is None:
-            raise HarnessFailure("EDITOR_UIA_VALUE_CONTRACT_MISMATCH")
-        value = pattern.CurrentValue
-        if not isinstance(value, str):
-            raise HarnessFailure("EDITOR_UIA_VALUE_CONTRACT_MISMATCH")
-        return fingerprint_text(value)
+        return fingerprint_text(self.read_editor_text(app))
 
     def editor_fingerprint(self, app: RunningApp) -> Fingerprint:
-        self.focus_editor(app)
-        fingerprint, _ = self.wait_editor_fingerprint(
-            app, None, self.ui_timeout, already_focused=True
-        )
+        fingerprint, _ = self.wait_editor_fingerprint(app, None, self.ui_timeout)
         return fingerprint
 
     def replace_editor(self, app: RunningApp, value: str) -> Fingerprint:
@@ -1744,39 +1962,38 @@ class NativeHarness:
         self.win32.send_shortcut(app.hwnd, VK_A)
         if value:
             self.win32.send_unicode(app.hwnd, value)
-        else:
-            self.win32.send_key(app.hwnd, VK_BACK)
-        expected = fingerprint_text(value)
-        actual, _ = self.wait_editor_fingerprint(
-            app, expected, self.ui_timeout, already_focused=True
-        )
-        return actual
+            actual, _ = self.wait_editor_fingerprint(
+                app, fingerprint_text(value), self.ui_timeout
+            )
+            return actual
+        self.win32.send_key(app.hwnd, VK_BACK)
+        # An empty document copies line-wise as its one empty line, "\n"
+        # (nsh-base 0.5.1 `editor/commands.rs` `copy`). Backspace over Select
+        # All leaves no line break behind, so here "\n" can only mean empty.
+        self.wait_editor_fingerprint(app, fingerprint_text("\n"), self.ui_timeout)
+        return fingerprint_text("")
 
     def lifecycle_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
+        """The in-window guard card (`ui/notices.rs` `guard_card`) and its decisions."""
         last_failure_type: str | None = None
 
         def locate() -> dict[str, Any] | None:
             nonlocal last_failure_type
+            if app.process.poll() is not None:
+                raise HarnessFailure("PROCESS_EXITED_BEFORE_GUARD")
             try:
-                dialogs = self.win32.owned_task_dialogs(app.process.pid, app.hwnd)
-                if not dialogs:
+                if self.control_by_name(
+                    app.hwnd, GUARD_HEADING, "Text", "GUARD_CARD_UIA_CONTRACT_MISMATCH"
+                ) is None:
                     return None
-                if len(dialogs) != 1:
-                    raise HarnessFailure("MULTIPLE_LIFECYCLE_TASK_DIALOGS")
-                dialog_hwnd = dialogs[0]
                 buttons = {}
-                for name, (automation_id, expected_name) in LIFECYCLE_BUTTON_CONTRACTS.items():
-                    button = self.control_by_id(
-                        dialog_hwnd,
-                        automation_id,
-                        "Button",
-                        "LIFECYCLE_BUTTON_CONTRACT_MISMATCH",
-                        expected_name,
-                        TASK_DIALOG_BUTTON_CLASS,
+                for decision, name in GUARD_BUTTON_NAMES.items():
+                    button = self.control_by_name(
+                        app.hwnd, name, "Button", "GUARD_BUTTON_UIA_CONTRACT_MISMATCH"
                     )
                     if button is None:
                         return None
-                    buttons[name] = button
+                    buttons[decision] = button
                 return buttons
             except HarnessFailure:
                 raise
@@ -1788,10 +2005,10 @@ class NativeHarness:
             return wait_until(
                 locate,
                 self.ui_timeout if timeout is None else timeout,
-                "LIFECYCLE_TASK_DIALOG_TIMEOUT",
+                "GUARD_CARD_UIA_TIMEOUT",
             )
         except HarnessFailure as error:
-            if error.code == "LIFECYCLE_TASK_DIALOG_TIMEOUT" and last_failure_type is not None:
+            if error.code == "GUARD_CARD_UIA_TIMEOUT" and last_failure_type is not None:
                 raise HarnessFailure(error.code, last_failure_type) from None
             raise
 
@@ -1854,12 +2071,8 @@ class NativeHarness:
         app: RunningApp,
         expected: Fingerprint | None,
         timeout: float,
-        *,
-        already_focused: bool = False,
     ) -> tuple[Fingerprint, float]:
         started = time.perf_counter()
-        if not already_focused:
-            self.focus_editor(app)
         saw_readable_value = False
         last_failure_type: str | None = None
 
@@ -1867,7 +2080,10 @@ class NativeHarness:
             nonlocal saw_readable_value, last_failure_type
             try:
                 actual = self.read_editor_fingerprint(app)
-            except HarnessFailure:
+            except (HarnessBlocked, HarnessFailure) as error:
+                if isinstance(error, HarnessFailure) and error.code == "EDITOR_COPY_TIMEOUT":
+                    last_failure_type = "HarnessFailure"
+                    return None
                 raise
             except Exception as error:
                 last_failure_type = safe_exception_name(error)
@@ -1877,7 +2093,7 @@ class NativeHarness:
             saw_readable_value = True
             return actual if expected is None or actual == expected else None
 
-        timeout_code = "EDITOR_UIA_VALUE_TIMEOUT" if expected is None else "EDITOR_EXACT_BYTES_TIMEOUT"
+        timeout_code = "EDITOR_TEXT_TIMEOUT" if expected is None else "EDITOR_EXACT_BYTES_TIMEOUT"
         try:
             actual = wait_until(matches, timeout, timeout_code, interval=0.1)
         except HarnessFailure as error:
@@ -1885,7 +2101,7 @@ class NativeHarness:
                 raise
             if expected is not None and saw_readable_value:
                 raise
-            raise HarnessFailure("EDITOR_UIA_VALUE_TIMEOUT", last_failure_type or "") from None
+            raise HarnessFailure("EDITOR_TEXT_TIMEOUT", last_failure_type or "") from None
         return actual, (time.perf_counter() - started) * 1000
 
 
@@ -1945,9 +2161,9 @@ def run_native_acceptance(
     evidence = plan.new_evidence(args.expect_exe_sha256)
     args.debug_workdir = None
 
-    # A missing executable is the first, unambiguous acceptance failure. The
-    # legacy source contracts target the removed GPUI shell and must not decide
-    # what an absent candidate executable reports.
+    # A missing executable is the first, unambiguous acceptance failure. A
+    # source contract checks the working tree, not the candidate executable,
+    # so it must not decide what an absent executable reports.
     if not args.exe.is_file():
         return _complete_early(
             evidence,
@@ -2193,12 +2409,16 @@ __all__ = [
     "REASON_CODE_RE",
     "SAFE_FAILURE_TYPES",
     "SHA256_RE",
-    "SOURCE_EDITOR_AUTOMATION_ID",
+    "EDITOR_NAME",
     "VK_A",
     "VK_BACK",
+    "VK_C",
     "VK_CONTROL",
+    "VK_RETURN",
     "VK_S",
+    "VK_V",
     "VK_W",
+    "VK_Z",
     "Fingerprint",
     "HarnessBlocked",
     "HarnessFailure",

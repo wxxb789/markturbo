@@ -259,12 +259,11 @@ class Goal07Fixtures:
                 item.update(
                     {
                         "editor_before": fingerprint,
-                        "selective_preview": changed_fingerprint,
+                        "selective_expected": changed_fingerprint,
                         "editor_after_apply": changed_fingerprint,
                         "editor_after_undo": fingerprint,
                         "source_before": fingerprint,
                         "source_after": fingerprint,
-                        "selective_matches_editor": True,
                         "selective_matches_expected": True,
                         "one_undo_transaction": True,
                         "undo_count": 1,
@@ -275,8 +274,8 @@ class Goal07Fixtures:
                     {
                         "editor_before_apply": fingerprint,
                         "editor_after_preview": fingerprint,
-                        "preview_fingerprint": changed_fingerprint,
-                        "final_preview": changed_fingerprint,
+                        "accept_all_expected": changed_fingerprint,
+                        "editor_after_done": changed_fingerprint,
                         "accept_all_matches_expected": True,
                         "copy_preview_fingerprint": changed_fingerprint,
                         "copy_preview_exact": True,
@@ -314,7 +313,7 @@ class Goal07Fixtures:
                         "editor_after_apply": changed_fingerprint,
                         "external_source_before": fingerprint,
                         "external_source_after": fingerprint,
-                        "save_shortcut_sent": True,
+                        "save_command_sent": True,
                         "conflict_visible_before_save": True,
                         "safe_save_conflict_visible": True,
                         "safe_save_no_overwrite": True,
@@ -333,6 +332,7 @@ class Goal07Fixtures:
                         "trust_revocation_order_source_contract": True,
                         "preview_inert_source_contract": True,
                         "preview_fingerprint": changed_fingerprint,
+                        "proposal_expected": changed_fingerprint,
                         "preview_matches_expected": True,
                         "preview_contains_executable_text": True,
                     }

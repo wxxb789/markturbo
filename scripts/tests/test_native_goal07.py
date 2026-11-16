@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -106,12 +105,11 @@ def common(case_id: str) -> dict:
         )
         observations.update(
             editor_before=editor_same,
-            selective_preview=selected,
+            selective_expected=selected,
             editor_after_apply=selected,
             editor_after_undo=editor_same,
             source_before=disk_same,
             source_after=disk_same,
-            selective_matches_editor=True,
             selective_matches_expected=True,
             one_undo_transaction=True,
             undo_count=1,
@@ -126,8 +124,8 @@ def common(case_id: str) -> dict:
         observations.update(
             editor_before_apply=editor_same,
             editor_after_preview=editor_same,
-            preview_fingerprint=final,
-            final_preview=final,
+            accept_all_expected=final,
+            editor_after_done=final,
             accept_all_matches_expected=True,
             copy_preview_fingerprint=final,
             copy_preview_exact=True,
@@ -168,7 +166,7 @@ def common(case_id: str) -> dict:
             ),
             external_source_before=external,
             external_source_after=external,
-            save_shortcut_sent=True,
+            save_command_sent=True,
             conflict_visible_before_save=False,
             safe_save_conflict_visible=True,
             safe_save_no_overwrite=True,
@@ -194,12 +192,8 @@ def common(case_id: str) -> dict:
             executable_change=True,
             trust_revocation_order_source_contract=True,
             preview_inert_source_contract=True,
-            preview_fingerprint=fingerprint(
-                HARNESS.apply_edits(
-                    HARNESS.HTML_EDITOR_SOURCE_BYTES,
-                    PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
-                )
-            ),
+            preview_fingerprint=fingerprint(b'<script>goal07 = "new"</script>'),
+            proposal_expected=fingerprint(b'<script>goal07 = "new"</script>'),
             preview_matches_expected=True,
             preview_contains_executable_text=True,
         )
@@ -229,181 +223,49 @@ def valid_evidence() -> dict:
     return evidence
 
 
-def _trust_contract_comment_decoy() -> str:
-    return """\
-        /* Historical implementation excerpt; this code is intentionally inert.
-        let revoke_trust = self.trust == Trust::Trusted
-            && matches!(self.document.doc_type(),
-                DocType::Html | DocType::Mdx)
-            && current_text != final_text;
-        if revoke_trust {
-            self.trust = Trust::Restricted;
-            self.preview.trust_changed(Trust::Restricted);
+REPO = Path(__file__).resolve().parents[2]
+STATE_RS = "crates/mt-app/src/state.rs"
+REVISION_RS = "crates/mt-app/src/ui/revision.rs"
+SAFE_APPLY = """\
+    pub fn apply_revision(&self) {
+        let current_snapshot = SourceSnapshot::new(tab.revision.get(), 0);
+        if tab.id != tab_id || !snapshot.matches(current_snapshot) {
+            return;
         }
-        self.replace_text(final_text, window, cx);
-        */
+        tab.web_trusted.set(false);
+        tab.text.set(SharedString::from(text));
+    }
+"""
+SAFE_REVISION = """\
+const LABELS: &[&str] = &["Accept", "Reject", "Done", "Stale — edited after review"];
+fn count(n: usize, m: usize) -> String { format!("{n} of {m} decided") }
+fn field(state: &AppState) {
+    let done_key_gate = state.clone();
+    when(move || state.revision_is_stale(), stale_note);
+    when(move || !done_key_gate.revision_is_stale(), bind_done_key);
+    view().test_id("revision-proposal-after");
+}
 """
 
 
 def _write_goal07_source_fixture(
-    root: Path,
-    *,
-    trust_body: str | None = None,
-    active_preview: bool = False,
-    test_only_trust_markers: bool = False,
-    test_only_preview_markers: bool = False,
+    root: Path, *, apply: str = SAFE_APPLY, revision: str = SAFE_REVISION
 ) -> None:
-    """Write the small Rust-source surface consumed by Goal07's checkers."""
-    views = root / "crates" / "mt-app" / "src" / "views"
-    workspace = views / "workspace.rs"
-    review = views / "workspace" / "review.rs"
-    document = views / "document.rs"
-    preview = views / "document" / "preview.rs"
-    for path in (workspace, review, document, preview):
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-    workspace_symbols = (
-        ("REVIEW_RUN_ACCESSIBILITY_ID", HARNESS.REVIEW_RUN_ACCESSIBILITY_ID),
-        ("REVIEW_RESULT_ACCESSIBILITY_ID", HARNESS.REVIEW_RESULT_ACCESSIBILITY_ID),
-        ("REVISION_RUN_ACCESSIBILITY_ID", HARNESS.REVISION_RUN_ACCESSIBILITY_ID),
-        ("REVISION_STALE_ACCESSIBILITY_ID", HARNESS.REVISION_STALE_ACCESSIBILITY_ID),
-        (
-            "REVISION_ACCEPT_ALL_ACCESSIBILITY_ID",
-            HARNESS.REVISION_ACCEPT_ALL_ACCESSIBILITY_ID,
-        ),
-        (
-            "REVISION_REJECT_ALL_ACCESSIBILITY_ID",
-            HARNESS.REVISION_REJECT_ALL_ACCESSIBILITY_ID,
-        ),
-        ("REVISION_APPLY_ACCESSIBILITY_ID", HARNESS.REVISION_APPLY_ACCESSIBILITY_ID),
-        ("REVISION_COPY_ACCESSIBILITY_ID", HARNESS.REVISION_COPY_ACCESSIBILITY_ID),
-        (
-            "REVISION_RESULT_DISMISS_ACCESSIBILITY_ID",
-            HARNESS.REVISION_RESULT_DISMISS_ACCESSIBILITY_ID,
-        ),
-        (
-            "REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID",
-            HARNESS.REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID,
-        ),
-    )
-    workspace.write_text(
-        "\n".join(
-            f'const {symbol}: &str = "{value}";'
-            for symbol, value in workspace_symbols
-        )
-        + "\nDocumentEvent::Conflict\n",
+    """The production UI files the selectors need, plus small check fixtures."""
+    for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((REPO / relative).read_bytes())
+    (root / STATE_RS).write_text(
+        'fn request_web_trust() {\n'
+        '    alert_dialog().destructive("trust", "Run scripts").cancel("cancel", "Cancel");\n'
+        '}\n'
+        + "impl Fixture {\n"
+        + apply
+        + "}\n",
         encoding="utf-8",
     )
-
-    if trust_body is None:
-        trust_body = """\
-        let revoke_trust = self.trust == Trust::Trusted
-            && matches!(self.document.doc_type(),
-                DocType::Html | DocType::Mdx)
-            && current_text != final_text;
-        if revoke_trust {
-            self.trust = Trust::Restricted;
-            self.preview.trust_changed(Trust::Restricted);
-        }
-        self.replace_text(final_text, window, cx);
-"""
-    document_source = f'''\
-Button::new("trust");
-accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID);
-const TRUST_ID: &str = "{HARNESS.TRUST_AUTOMATION_ID}";
-accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID);
-const CONFLICT_OVERWRITE_ID: &str = "{HARNESS.CONFLICT_OVERWRITE_ACCESSIBILITY_ID}";
-pub fn apply_approved_revision() {{
-{trust_body}}}
-'''
-    if test_only_trust_markers:
-        document_source += f'''\
-#[cfg(test)]
-mod tests {{
-    const TRUST_MARKER_DECOY: &str = {json.dumps(_trust_contract_comment_decoy())};
-}}
-'''
-    document.write_text(document_source, encoding="utf-8")
-
-    preview_region = f'''\
-.id("revision-preview")
-.role(gpui::Role::Group)
-.accessibility_id("{HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID}")
-.id("revision-preview-source")
-.role(gpui::Role::Label)
-.aria_value(preview.clone())
-.accessibility_id("{HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}")
-'''
-    if active_preview:
-        preview_region += ".child(WebSurface::new(preview.clone()))\n"
-    preview_region += ".child(preview)\n.into_any_element()\n"
-
-    review_symbols = tuple(symbol for symbol, _value in workspace_symbols)
-    review_accessibility = "\n".join(
-        f"accessibility_id({symbol});" for symbol in review_symbols
-    )
-    review_values = "\n".join(
-        f'const REVIEW_UIA_VALUE_{index}: &str = "{value}";'
-        for index, value in enumerate(
-            (
-                HARNESS.REVISION_RESULT_ACCESSIBILITY_ID,
-                HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID,
-                HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
-                HARNESS.REVISION_QUESTION_PREFIX,
-                HARNESS.REVISION_CHANGE_PREFIX,
-            )
-        )
-    )
-    review_source = f'''\
-{review_accessibility}
-{review_values}
-'''
-    if not test_only_preview_markers:
-        review_source += preview_region
-    else:
-        review_source += (
-            "// Preview IDs are also used by test fixtures: "
-            f"{HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID} "
-            f"{HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}\n"
-        )
-    review_source += f'''\
-.id("revision-stale")
-accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)
-.role(gpui::Role::Label)
-.aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))
-.into_any_element()
-Button::new("revision-apply")
-accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)
-.disabled(revision_stale)
-this.apply_revision(window, cx)
-Button::new("revision-save")
-'''
-    if test_only_preview_markers:
-        review_source += f'''\
-#[cfg(test)]
-mod tests {{
-    fn preview_marker_decoy() {{
-{preview_region}    }}
-}}
-'''
-    review.write_text(review_source, encoding="utf-8")
-
-    (views / "document").mkdir(parents=True, exist_ok=True)
-    preview.write_text(
-        """\
-pub(super) fn trust_changed() {
-    self.rebuild_web(document, source_path, trust, cx);
-}
-fn rebuild_web() {
-    self.web_revision = self.web_revision.wrapping_add(1);
-    self.web_html = Some(match trust {
-        Trust::Restricted => web::build_html_raw(document, trust),
-        _ => web::build_html_themed(document, trust),
-    });
-}
-""",
-        encoding="utf-8",
-    )
+    (root / REVISION_RS).write_text(revision, encoding="utf-8")
 
 
 class EvidenceTests(unittest.TestCase):
@@ -885,168 +747,125 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                         real_remove(args.debug_workdir)
 
 class SourceContractFixtureTests(unittest.TestCase):
-    def source_failure(
-        self,
-        *,
-        trust_body: str | None = None,
-        active_preview: bool = False,
-        test_only_trust_markers: bool = False,
-        test_only_preview_markers: bool = False,
-    ) -> str | None:
+    def checks(self, **fixture: str) -> tuple[str | None, bool, bool, bool]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            _write_goal07_source_fixture(
-                root,
-                trust_body=trust_body,
-                active_preview=active_preview,
-                test_only_trust_markers=test_only_trust_markers,
-                test_only_preview_markers=test_only_preview_markers,
-            )
+            _write_goal07_source_fixture(root, **fixture)
             with mock.patch.object(HARNESS, "REPO", root):
-                return HARNESS.source_contract_failure()
+                return (
+                    HARNESS.source_contract_failure(),
+                    HARNESS.trust_apply_source_contract_ok(),
+                    HARNESS.preview_inert_source_contract_ok(),
+                    HARNESS.stale_apply_source_contract_ok(),
+                )
+
+    def test_real_repository_satisfies_the_selector_contract(self) -> None:
+        self.assertIsNone(HARNESS.source_contract_failure())
+        self.assertTrue(HARNESS.preview_inert_source_contract_ok())
+        self.assertTrue(HARNESS.stale_apply_source_contract_ok())
 
     def test_safe_source_fixture_passes_all_goal07_source_checkers(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _write_goal07_source_fixture(root)
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertIsNone(HARNESS.source_contract_failure())
-                self.assertTrue(HARNESS.trust_apply_source_contract_ok())
-                self.assertTrue(HARNESS.preview_inert_source_contract_ok())
+        self.assertEqual(self.checks(), (None, True, True, True))
 
-    @unittest.skipUnless(
-        (Path(__file__).resolve().parents[2] / "crates/mt-app/src/views/workspace.rs").exists(),
-        "legacy GPUI source contract removed during the nsh migration; nsh native acceptance is pending",
-    )
-    def test_real_repository_satisfies_source_contract(self) -> None:
-        self.assertIsNone(HARNESS.source_contract_failure())
-
-    def test_alternate_test_modules_cannot_supply_any_source_surface(self) -> None:
-        cases = (
-            ("workspace.rs", "REVISION_UIA_CONTRACT_MISSING"),
-            ("workspace/review.rs", "REVISION_SOURCE_CONTRACT_MISSING"),
-            ("document.rs", "REVISION_BOUNDARY_CONTRACT_MISSING"),
-            ("document/preview.rs", "REVISION_TRUST_SOURCE_CONTRACT_MISSING"),
-        )
-        for relative, expected in cases:
-            with self.subTest(source=relative), tempfile.TemporaryDirectory() as directory:
+    def test_source_contract_requires_enter_to_answer_the_trust_alert_with_run_scripts(self) -> None:
+        # The harness answers the UIA-invisible alert with Enter, which presses
+        # the first button unless a Default-styled `.action` exists.
+        safe = 'alert_dialog().destructive("trust", "Run scripts").cancel("cancel", "Cancel")'
+        for unsafe in (
+            'alert_dialog().cancel("cancel", "Cancel").destructive("trust", "Run scripts")',
+            'alert_dialog().destructive("trust", "Run scripts").action("later", "Later")',
+        ):
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 _write_goal07_source_fixture(root)
-                source = root / "crates" / "mt-app" / "src" / "views" / relative
-                original = source.read_text(encoding="utf-8")
-                source.write_text(
-                    "#[cfg(test)] mod checks {\n"
-                    + original
-                    + "\n}\nfn production_after_tests() {}\n",
-                    encoding="utf-8",
-                )
+                state = root / STATE_RS
+                text = state.read_text(encoding="utf-8")
+                self.assertIn(safe, text)
+                state.write_text(text.replace(safe, unsafe), encoding="utf-8")
                 with mock.patch.object(HARNESS, "REPO", root):
-                    self.assertEqual(HARNESS.source_contract_failure(), expected)
+                    self.assertEqual(
+                        HARNESS.source_contract_failure(), "REVISION_SOURCE_CONTRACT_MISSING"
+                    )
 
-    def test_test_imports_and_modules_do_not_hide_later_production(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _write_goal07_source_fixture(root)
-            views = root / "crates" / "mt-app" / "src" / "views"
-            for relative in (
-                "workspace.rs", "workspace/review.rs",
-                "document.rs", "document/preview.rs",
-            ):
-                source = views / relative
-                original = source.read_text(encoding="utf-8")
-                source.write_text(
-                    "#[cfg(test)] use crate::fixtures::TestOnly;\n"
-                    "#[cfg(test)]\nmod tests { fn decoy() {} }\n"
-                    + original,
-                    encoding="utf-8",
-                )
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertIsNone(HARNESS.source_contract_failure())
+    def test_each_missing_selector_returns_the_source_contract_failure(self) -> None:
+        for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
+            for marker in markers:
+                with self.subTest(file=relative, marker=marker), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    _write_goal07_source_fixture(root)
+                    target = root / relative
+                    target.write_text(
+                        target.read_text(encoding="utf-8").replace(marker, ""),
+                        encoding="utf-8",
+                    )
+                    with mock.patch.object(HARNESS, "REPO", root):
+                        self.assertEqual(
+                            HARNESS.source_contract_failure(),
+                            "REVISION_SOURCE_CONTRACT_MISSING",
+                        )
 
-    def test_unsafe_projection_returns_existing_source_contract_codes(self) -> None:
-        cases = (
-            ("workspace.rs", "REVISION_UIA_CONTRACT_MISSING"),
-            ("workspace/review.rs", "REVISION_UIA_CONTRACT_MISSING"),
-            ("document.rs", "REVISION_BOUNDARY_CONTRACT_MISSING"),
-            ("document/preview.rs", "REVISION_TRUST_SOURCE_CONTRACT_MISSING"),
+    def test_unsafe_projection_fails_every_source_check(self) -> None:
+        malformed = "\n#[cfg(test)] mod checks {\n"
+        self.assertEqual(
+            self.checks(apply=SAFE_APPLY + malformed, revision=SAFE_REVISION + malformed),
+            ("REVISION_SOURCE_CONTRACT_MISSING", False, False, False),
         )
-        for relative, expected in cases:
-            with self.subTest(source=relative), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _write_goal07_source_fixture(root)
-                source = root / "crates" / "mt-app" / "src" / "views" / relative
-                original = source.read_text(encoding="utf-8")
-                source.write_text(
-                    original + "\n#[cfg(test)] mod checks {\n",
-                    encoding="utf-8",
-                )
-                with mock.patch.object(HARNESS, "REPO", root):
-                    self.assertEqual(HARNESS.source_contract_failure(), expected)
 
     def test_source_contract_rejects_replace_before_trust_revocation(self) -> None:
-        wrong_order = """\
-        self.replace_text(final_text, window, cx);
-        let revoke_trust = self.trust == Trust::Trusted
-            && matches!(self.document.doc_type(),
-                DocType::Html | DocType::Mdx)
-            && current_text != final_text;
-        if revoke_trust {
-            self.trust = Trust::Restricted;
-            self.preview.trust_changed(Trust::Restricted);
-        }
-"""
-        self.assertEqual(
-            self.source_failure(trust_body=wrong_order),
-            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
+        wrong_order = SAFE_APPLY.replace(
+            "        tab.web_trusted.set(false);\n        tab.text.set(SharedString::from(text));\n",
+            "        tab.text.set(SharedString::from(text));\n        tab.web_trusted.set(false);\n",
         )
-
-    def test_source_contract_rejects_active_revision_preview(self) -> None:
-        self.assertEqual(
-            self.source_failure(active_preview=True),
-            "REVISION_PREVIEW_INERT_CONTRACT_MISSING",
-        )
-
-    def test_source_contract_ignores_trust_markers_only_in_test_module(self) -> None:
-        self.assertEqual(
-            self.source_failure(
-                trust_body="",
-                test_only_trust_markers=True,
-            ),
-            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
-        )
-
-    def test_source_contract_ignores_preview_markers_only_in_test_module(self) -> None:
-        self.assertEqual(
-            self.source_failure(test_only_preview_markers=True),
-            "REVISION_PREVIEW_INERT_CONTRACT_MISSING",
-        )
-
-    def test_source_contract_rejects_review_values_only_in_comments(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _write_goal07_source_fixture(root)
-            review = root / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
-            source = review.read_text(encoding="utf-8")
-            value = HARNESS.REVISION_RESULT_ACCESSIBILITY_ID
-            source = source.replace(
-                f'const REVIEW_UIA_VALUE_0: &str = "{value}";',
-                f'// Removed result ID: {value}',
-                1,
-            )
-            review.write_text(source, encoding="utf-8")
-
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertEqual(
-                    HARNESS.source_contract_failure(),
-                    "REVISION_UIA_CONTRACT_MISSING",
-                )
+        self.assertNotEqual(wrong_order, SAFE_APPLY)
+        self.assertFalse(self.checks(apply=wrong_order)[1])
 
     def test_source_contract_rejects_comment_only_trust_markers(self) -> None:
-        comment_decoy = f"\n{_trust_contract_comment_decoy()}\n"
-        self.assertEqual(
-            self.source_failure(trust_body=comment_decoy),
-            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
+        for decoy in (
+            "// tab.web_trusted.set(false);\n",
+            "/* tab.web_trusted.set(false); */\n",
+            'let _ = "tab.web_trusted.set(false);";\n',
+        ):
+            with self.subTest(decoy=decoy):
+                apply = SAFE_APPLY.replace("        tab.web_trusted.set(false);\n", decoy)
+                self.assertFalse(self.checks(apply=apply)[1])
+
+    def test_source_contract_ignores_trust_markers_only_in_test_module(self) -> None:
+        test_only = (
+            "#[cfg(test)]\nmod tests {\n"
+            + SAFE_APPLY
+            + "}\n"
+            + SAFE_APPLY.replace("        tab.web_trusted.set(false);\n", "")
         )
+        self.assertFalse(self.checks(apply=test_only)[1])
+
+    def test_source_contract_rejects_active_revision_preview(self) -> None:
+        for active in (
+            "    web_view(html);\n",
+            "    let _ = WebView::new();\n",
+            "    .java_script_enabled(true);\n",
+        ):
+            with self.subTest(active=active):
+                revision = SAFE_REVISION.replace("}\n", active + "}\n", 1)
+                self.assertFalse(self.checks(revision=revision)[2])
+
+    def test_source_contract_ignores_preview_markers_only_in_test_module(self) -> None:
+        revision = (
+            SAFE_REVISION.replace('view().test_id("revision-proposal-after");\n', "")
+            + '#[cfg(test)]\nmod tests {\n    const ID: &str = "revision-proposal-after";\n}\n'
+        )
+        self.assertFalse(self.checks(revision=revision)[2])
+
+    def test_stale_apply_requires_the_snapshot_gate_and_withheld_done_key(self) -> None:
+        for name, fixture in (
+            ("apply", {"apply": SAFE_APPLY.replace("!snapshot.matches(current_snapshot)", "false")}),
+            ("note", {"revision": SAFE_REVISION.replace("state.revision_is_stale()", "true")}),
+            (
+                "done key",
+                {"revision": SAFE_REVISION.replace("!done_key_gate.revision_is_stale()", "true")},
+            ),
+        ):
+            with self.subTest(gate=name):
+                self.assertFalse(self.checks(**fixture)[3])
 
 
 class SourceAndCliTests(unittest.TestCase):
@@ -1054,12 +873,12 @@ class SourceAndCliTests(unittest.TestCase):
         for preserve in (False, True):
             with self.subTest(preserve_focus=preserve):
                 harness = object.__new__(HARNESS.Goal07Harness)
+                harness.ui_timeout = 1.0
                 harness.focus_editor = mock.Mock()
                 harness._require_foreground = mock.Mock()
                 harness.win32 = mock.Mock()
-                harness._click_id = mock.Mock()
                 harness._approve_consent = mock.Mock()
-                harness.find_control = mock.Mock()
+                harness.wait_name = mock.Mock()
                 app, provider = mock.Mock(), mock.Mock()
                 app.hwnd = 73
                 harness.win32.foreground_focus.return_value = app.hwnd
@@ -1070,14 +889,13 @@ class SourceAndCliTests(unittest.TestCase):
                 self.assertEqual(harness._require_foreground.call_count, 0 if preserve else 1)
                 if preserve:
                     harness.win32.foreground_focus.assert_called_once_with(app.hwnd)
-                keys = harness.win32.send_inputs.call_args.args[0]
-                self.assertEqual([item.ki.wVk for item in keys], [
-                    HARNESS.VK_CONTROL, HARNESS.VK_SHIFT, HARNESS.VK_R,
-                    HARNESS.VK_R, HARNESS.VK_SHIFT, HARNESS.VK_CONTROL,
-                ])
+                harness.win32.send_shortcut.assert_called_once_with(73, runtime.VK_RETURN)
                 harness._approve_consent.assert_called_once_with(
-                    app, "REVIEW_CONSENT_CLICK_FAILED", provider=provider,
+                    app, "REVIEW_CONSENT_HOLD_FAILED", provider=provider,
                     expected_request_count=0, open_gate=provider.grant_review_consent,
+                )
+                harness.wait_name.assert_called_once_with(
+                    app, HARNESS.REVIEW_RESULT_MARKER, "Text", "REVIEW_RESULT_UIA_TIMEOUT", 60.0
                 )
 
     def test_preserved_focus_never_sends_keys_to_a_different_native_owner(self) -> None:
@@ -1092,6 +910,7 @@ class SourceAndCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_LOST"):
                     harness.run_review(mock.Mock(hwnd=73), mock.Mock(), preserve_focus=True)
 
+                harness.win32.send_shortcut.assert_not_called()
                 harness.win32.send_inputs.assert_not_called()
                 harness.focus_editor.assert_not_called()
                 harness._require_foreground.assert_not_called()
@@ -1102,30 +921,40 @@ class SourceAndCliTests(unittest.TestCase):
                 harness = object.__new__(HARNESS.Goal07Harness)
                 harness.ui_timeout = 1.0
                 app, provider = mock.Mock(), mock.Mock()
+                app.hwnd = 73
                 app.security_context.evidence.return_value = process_context()
                 app.process.poll.return_value = None
                 provider.start.return_value = provider
                 harness.profile = mock.Mock(return_value=(Path("unused"),) * 6)
                 harness.launch_app = mock.Mock(return_value=app)
-                harness.find_control = mock.Mock()
-                harness.click_control = mock.Mock()
-                harness._trust_label = mock.Mock(side_effect=["Trusted", "Restricted"])
+                harness.menu_command = mock.Mock()
+                harness._press_named = mock.Mock()
+                harness.confirm_system_alert = mock.Mock()
+                harness.name_present = mock.Mock(return_value=False)
+                harness.wait_name = mock.Mock()
+                harness.editor_control = mock.Mock()
                 harness.activate_source_layout = mock.Mock(side_effect=AssertionError("premature Source"))
-                harness.activate_source_from_focused_web = mock.Mock()
                 harness.run_review = mock.Mock()
                 harness.request_revision = mock.Mock()
-                harness._click_id = mock.Mock()
+                harness.decide_hunks = mock.Mock()
+                harness.done = mock.Mock()
                 harness._require_foreground = mock.Mock(return_value=True)
                 final_text = HARNESS.apply_edits(
                     HARNESS.HTML_EDITOR_SOURCE_BYTES,
                     PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
                 ).decode("utf-8")
-                harness._preview_source_text = mock.Mock(return_value=final_text)
+                proposal_line = next(
+                    line for line in final_text.split("\n")
+                    if PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT)[0]["replacement"] in line
+                )
+                harness._named_texts = mock.Mock(return_value=proposal_line)
                 harness.editor_fingerprint = mock.Mock(side_effect=[
                     runtime.fingerprint_bytes(HARNESS.HTML_EDITOR_SOURCE_BYTES),
                     runtime.fingerprint_text(final_text),
                 ])
                 harness.win32 = mock.Mock()
+                harness.win32.foreground_focus.return_value = 0 if broken else app.hwnd
+                harness.quit_via_menu = mock.Mock()
                 harness.click_lifecycle_decision = mock.Mock()
                 harness.wait_process_exit = mock.Mock(
                     side_effect=lambda _app: setattr(app.process.poll, "return_value", 0)
@@ -1133,15 +962,19 @@ class SourceAndCliTests(unittest.TestCase):
                 harness.reap = mock.Mock()
                 harness._finalize_observations = lambda _provider, _root, _app, obs: obs
                 order = mock.Mock()
-                for name in ("activate_source_from_focused_web", "run_review", "editor_fingerprint"):
+                for name in ("menu_command", "editor_control", "run_review", "editor_fingerprint"):
                     order.attach_mock(getattr(harness, name), name)
-                if broken:
-                    harness.activate_source_from_focused_web.side_effect = runtime.HarnessFailure(
-                        "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"
-                    )
+                trust = mock.Mock()
+                for name in ("_press_named", "confirm_system_alert", "wait_name"):
+                    trust.attach_mock(getattr(harness, name), name)
+
+                def wait_once(check, _timeout, code, **_kwargs):
+                    if not check():
+                        raise runtime.HarnessFailure(code)
+
                 with (
                     mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
-                    mock.patch.object(HARNESS, "wait_until", side_effect=lambda check, *_a, **_k: check()),
+                    mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
                     mock.patch.object(HARNESS, "trust_apply_source_contract_ok", return_value=True),
                     mock.patch.object(HARNESS, "preview_inert_source_contract_ok", return_value=True),
                 ):
@@ -1154,11 +987,42 @@ class SourceAndCliTests(unittest.TestCase):
                     else:
                         observations = harness.scenario_trust_revoke()
                         self.assertTrue(observations["trust_before"])
-                        self.assertEqual(order.mock_calls[:2], [
-                            mock.call.activate_source_from_focused_web(app),
+                        self.assertTrue(observations["preview_matches_expected"])
+                        self.assertTrue(observations["preview_contains_executable_text"])
+                        self.assertTrue(observations["executable_matches_expected"])
+                        self.assertEqual(order.mock_calls[:4], [
+                            mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
+                            mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
+                            mock.call.editor_control(app),
                             mock.call.run_review(app, provider, preserve_focus=True),
                         ])
-                        harness.request_revision.assert_called_once_with(app, provider=provider)
+                        # The Run scripts alert is outside UIA: it is answered with
+                        # Enter only while trust is still off, then proven by the banner.
+                        self.assertEqual(trust.mock_calls[:3], [
+                            mock.call._press_named(app, HARNESS.TRUST_SCRIPTS_NAME, "TRUST_BUTTON"),
+                            mock.call.confirm_system_alert(
+                                app, mock.ANY, "TRUST_ENABLED_BEFORE_CONFIRMATION"
+                            ),
+                            mock.call.wait_name(
+                                app, HARNESS.TRUSTED_BANNER, "Text", "TRUST_ENABLE_STATE_TIMEOUT"
+                            ),
+                        ])
+                        self.assertEqual(
+                            [call.args[1] for call in harness._press_named.call_args_list],
+                            [HARNESS.TRUST_SCRIPTS_NAME],
+                        )
+                        still_undecided = harness.confirm_system_alert.call_args.args[1]
+                        self.assertTrue(still_undecided())
+                        harness.name_present.return_value = True
+                        self.assertFalse(still_undecided())
+                        harness.name_present.assert_called_with(app, HARNESS.TRUSTED_BANNER, "Text")
+                        harness.wait_name.assert_any_call(
+                            app, HARNESS.RESTRICTED_BANNER, "Text", "TRUST_RESTRICTED_STATE_TIMEOUT"
+                        )
+                        harness.request_revision.assert_called_once_with(
+                            app, provider=provider,
+                            hunks=len(PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT)),
+                        )
                         harness.click_lifecycle_decision.assert_called_once_with(app, "Discard")
                 harness.activate_source_layout.assert_not_called()
                 provider.close.assert_called_once_with()
@@ -1179,139 +1043,105 @@ class SourceAndCliTests(unittest.TestCase):
         HARNESS.complete_evidence(evidence, "BLOCKED")
         HARNESS.validate_evidence(evidence)
 
-    def test_preview_source_accepts_name_only_text_but_not_the_static_label(self) -> None:
-        class NoValuePattern(Exception):
-            pass
+    def test_proposal_text_joins_only_the_exposed_group_text_lines(self) -> None:
+        def child(name: object, control_type: str = "Text") -> object:
+            item = mock.Mock()
+            item.element_info.name = name
+            item.element_info.control_type = control_type
+            return item
 
-        class Control:
-            def __init__(self, name: str) -> None:
-                self.element_info = mock.Mock()
-                self.element_info.name = name
-
-            @property
-            def iface_value(self) -> object:
-                raise NoValuePattern
-
-            def children(self) -> list[object]:
-                return []
-
+        group = mock.Mock()
+        group.children.return_value = [
+            child("approved"), child("Accept", "Button"), child(None), child("preview"),
+        ]
         harness = object.__new__(HARNESS.Goal07Harness)
-        harness.no_pattern_error_class = NoValuePattern
-        harness.find_control = lambda *_args, **_kwargs: Control("approved\npreview")
+        harness.find_control = mock.Mock(return_value=group)
 
-        self.assertEqual(harness._preview_source_text(mock.Mock()), "approved\npreview")
-
-        harness.find_control = lambda *_args, **_kwargs: Control(
-            "Final approved Revision source"
+        self.assertEqual(
+            harness._named_texts(mock.Mock(), HARNESS.REVISION_PROPOSAL_AFTER_AUTOMATION_ID, "P"),
+            "approved\npreview",
         )
-        with self.assertRaisesRegex(
-            HARNESS.HarnessFailure, "REVISION_PREVIEW_SOURCE_TEXT_CONTRACT_MISMATCH"
-        ):
-            harness._preview_source_text(mock.Mock())
+        self.assertEqual(harness.find_control.call_args.args[2], "Group")
+
+        group.children.return_value = [child("Accept", "Button")]
+        with self.assertRaisesRegex(HARNESS.HarnessFailure, "P_TEXT_UNAVAILABLE"):
+            harness._named_texts(mock.Mock(), HARNESS.REVISION_PROPOSAL_AFTER_AUTOMATION_ID, "P")
 
     def test_answer_input_uses_the_focused_unicode_keyboard_path(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
         events: list[tuple[str, object]] = []
+        value = mock.Mock(CurrentValue="")
 
         class Control:
-            def is_enabled(self) -> bool:
-                return True
+            iface_value = value
+
+            def set_focus(self) -> None:
+                events.append(("focus", None))
 
         control = Control()
         app = mock.Mock(hwnd=41)
-        harness._click_id = lambda _app, automation_id: events.append(
-            ("answer-state", automation_id)
-        )
+        harness.find_control = lambda *_args, **_kwargs: control
         harness.control_by_id = lambda *_args, **_kwargs: control
         harness.win32 = mock.Mock()
-        harness.win32.send_unicode.side_effect = lambda hwnd, text: events.append(
-            ("send-unicode", (hwnd, text))
+
+        def type_text(hwnd: int, text: str) -> None:
+            events.append(("send-unicode", (hwnd, text)))
+            value.CurrentValue = text
+
+        harness.win32.send_unicode.side_effect = type_text
+        harness._press_named = lambda _app, name, code: events.append(("press", (name, code)))
+
+        harness._set_answer(app, "kept intent")
+
+        self.assertEqual(
+            events,
+            [
+                ("focus", None),
+                ("send-unicode", (41, "kept intent")),
+                ("press", (HARNESS.REVIEW_ANSWER_NAME, "REVIEW_ANSWER_SUBMIT")),
+            ],
         )
-        harness._text_control = lambda *_args, **_kwargs: "kept intent"
 
-        harness._set_answer(app, 0, "kept intent")
-
-        self.assertEqual(events[0][0], "answer-state")
-        self.assertEqual(events[1], ("send-unicode", (41, "kept intent")))
-
-    def test_bottom_bar_covered_revision_control_scrolls_from_visible_review_content(self) -> None:
+    def test_answer_input_times_out_before_submitting_a_wrong_value(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        window_rect = mock.Mock(top=50, bottom=1031)
-        offscreen = mock.Mock(top=972, bottom=1000)
-        onscreen = mock.Mock(top=864, bottom=892)
+        harness.ui_timeout = 0.01
         control = mock.Mock()
-        control.rectangle.side_effect = [offscreen, onscreen]
-        anchor = mock.Mock()
-        anchor.rectangle.return_value = mock.Mock(top=100, bottom=120)
-        app = mock.Mock(hwnd=41)
-        app.window.rectangle.return_value = window_rect
-        harness.control_by_id = mock.Mock(
-            side_effect=lambda _hwnd, automation_id, *_args: (
-                control if automation_id == "target" else anchor
-            )
-        )
+        control.iface_value.CurrentValue = "other"
+        harness.find_control = lambda *_args, **_kwargs: control
+        harness.control_by_id = lambda *_args, **_kwargs: control
+        harness.win32 = mock.Mock()
+        harness._press_named = mock.Mock()
 
-        result = harness._scroll_revision_control_into_view(
-            app, "target", "Button", control
-        )
+        with self.assertRaisesRegex(runtime.HarnessFailure, "REVIEW_ANSWER_INPUT_TIMEOUT"):
+            harness._set_answer(mock.Mock(hwnd=41), "kept intent")
+        harness._press_named.assert_not_called()
 
-        self.assertIs(result, control)
-        anchor.wheel_mouse_input.assert_called_once_with(wheel_dist=-3)
-
-    def test_stale_control_scrolls_up_until_accessible(self) -> None:
+    def test_hunk_decisions_wait_for_each_decided_count(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        stale = mock.Mock()
-        stale.rectangle.return_value = mock.Mock(top=120, bottom=140)
-        anchor = mock.Mock()
-        anchor.rectangle.return_value = mock.Mock(top=700, bottom=760)
-        app = mock.Mock(hwnd=41)
-        app.window.rectangle.return_value = mock.Mock(top=50, bottom=900)
-        stale_calls = 0
+        events: list[tuple[str, str]] = []
+        harness._press_named = lambda _app, name, _code: events.append(("press", name))
+        harness.wait_name = lambda _app, name, *_args: events.append(("wait", name))
 
-        def control_by_id(_hwnd, automation_id, *_args, **_kwargs):
-            nonlocal stale_calls
-            if automation_id == HARNESS.REVISION_STALE_ACCESSIBILITY_ID:
-                stale_calls += 1
-                return stale if stale_calls > 1 else None
-            if automation_id == HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID:
-                return anchor
-            return None
+        harness.decide_hunks(mock.Mock(), [True, False])
+        harness.done(mock.Mock())
 
-        harness.control_by_id = control_by_id
-
-        result = harness._find_stale_control(app)
-
-        self.assertIs(result, stale)
-        anchor.wheel_mouse_input.assert_called_once_with(wheel_dist=3)
-
-    def test_apply_state_scrolls_above_the_bottom_bar_before_querying(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        button = mock.Mock()
-        button.is_enabled.return_value = True
-        app = mock.Mock(hwnd=41)
-        harness.control_by_id = mock.Mock(return_value=button)
-        harness._scroll_revision_control_into_view = mock.Mock(return_value=button)
-
-        result, reported_enabled = harness._apply_button_state(app)
-
-        self.assertIs(result, button)
-        self.assertTrue(reported_enabled)
-        harness._scroll_revision_control_into_view.assert_called_once_with(
-            app,
-            HARNESS.REVISION_APPLY_ACCESSIBILITY_ID,
-            "Button",
-            button,
+        self.assertEqual(
+            events,
+            [
+                ("press", HARNESS.REVISION_ACCEPT_NAME),
+                ("wait", "1 of 2 decided"),
+                ("press", HARNESS.REVISION_REJECT_NAME),
+                ("wait", "2 of 2 decided"),
+                ("press", HARNESS.REVISION_DONE_NAME),
+            ],
         )
 
     def test_consent_gate_rejects_any_pre_click_request_snapshot(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
         harness.win32 = mock.Mock()
-        harness.win32.owned_task_dialogs.return_value = [99]
-        harness.control_by_id = lambda *_args, **_kwargs: object()
+        harness.find_control = lambda *_args, **_kwargs: object()
         events: list[str] = []
 
         class FakeProvider:
@@ -1329,7 +1159,7 @@ class SourceAndCliTests(unittest.TestCase):
         ):
             harness._approve_consent(
                 mock.Mock(process=mock.Mock(pid=7), hwnd=8),
-                "REVIEW_CONSENT_CLICK_FAILED",
+                "REVIEW_CONSENT_HOLD_FAILED",
                 provider=FakeProvider(),
                 expected_request_count=0,
                 open_gate=lambda: events.append("gate"),
@@ -1352,8 +1182,8 @@ class SourceAndCliTests(unittest.TestCase):
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
         harness.win32 = mock.Mock()
-        harness.win32.owned_task_dialogs.return_value = [99]
-        harness.control_by_id = lambda *_args, **_kwargs: object()
+        harness.find_control = lambda *_args, **_kwargs: object()
+        harness.hold_control = mock.Mock()
         provider = mock.Mock()
         app = mock.Mock(process=mock.Mock(pid=7), hwnd=8)
 
@@ -1371,15 +1201,22 @@ class SourceAndCliTests(unittest.TestCase):
                     expected_request_count=expected_request_count,
                     open_gate=open_gate,
                 )
+        provider.dispatch_consent_click.assert_not_called()
+        harness.hold_control.assert_not_called()
 
-    def test_consent_gate_opens_before_the_consent_button_click(self) -> None:
+    def test_consent_gate_opens_before_the_consent_hold(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
         events: list[str] = []
-        harness.win32 = mock.Mock()
-        harness.win32.owned_task_dialogs.return_value = [99]
-        harness.control_by_id = lambda *_args, **_kwargs: object()
-        harness.click_control = lambda _control, _failure: events.append("click")
+        send = object()
+        harness.find_control = lambda _app, automation_id, *_args: (
+            send if automation_id == HARNESS.CONSENT_SEND_AUTOMATION_ID else None
+        )
+        harness.hold_control = lambda _app, control, seconds, failure: events.append(
+            f"hold-{control is send}-{seconds}-{failure}"
+        )
+        harness.click_control = lambda *_args: events.append("click")
+        harness.invoke_control = lambda *_args: events.append("invoke")
 
         class FakeProvider:
             def request_snapshot(self) -> dict[str, int | bool]:
@@ -1393,15 +1230,19 @@ class SourceAndCliTests(unittest.TestCase):
 
         harness._approve_consent(
             mock.Mock(process=mock.Mock(pid=7), hwnd=8),
-            "REVIEW_CONSENT_CLICK_FAILED",
+            "REVIEW_CONSENT_HOLD_FAILED",
             provider=FakeProvider(),
             expected_request_count=0,
             open_gate=lambda: events.append("gate"),
         )
 
-        self.assertEqual(events, ["gate", "marker-0", "click"])
+        self.assertEqual(
+            events,
+            ["gate", "marker-0", f"hold-True-{HARNESS.CONSENT_HOLD_SECONDS}-REVIEW_CONSENT_HOLD_FAILED"],
+        )
+        self.assertGreater(HARNESS.CONSENT_HOLD_SECONDS, 1.2)
 
-    def test_app_owned_click_requires_foreground_first(self) -> None:
+    def test_named_press_requires_foreground_first(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
         events: list[str] = []
@@ -1409,41 +1250,45 @@ class SourceAndCliTests(unittest.TestCase):
         harness.win32.require_foreground.side_effect = lambda *_args: events.append(
             "foreground"
         )
-        harness.find_control = lambda *_args, **_kwargs: object()
-        harness._scroll_revision_control_into_view = (
-            lambda _app, _automation_id, _control_type, control: (
-                events.append("scroll") or control
-            )
+        harness.find_named = lambda _app, name, control_type, *_args: (
+            events.append(f"find-{name}-{control_type}") or object()
         )
-        harness.click_control = lambda _control, _failure: events.append("click")
+        harness.click_control = lambda _control, failure: events.append(f"click-{failure}")
 
-        harness._click_id(mock.Mock(hwnd=41), "markturbo-revision-accept-all")
+        harness._press_named(mock.Mock(hwnd=41), HARNESS.REVISION_ACCEPT_NAME, "REVISION_ACCEPT")
 
-        self.assertEqual(events, ["foreground", "scroll", "click"])
+        self.assertEqual(
+            events,
+            ["foreground", "find-Accept-Button", "click-REVISION_ACCEPT_CLICK_FAILED"],
+        )
 
-    def test_revision_run_waits_until_enabled_before_click(self) -> None:
+    def test_revision_request_submits_answer_prepares_and_waits_for_hunks(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
-        states = iter((False, True))
-        events: list[str] = []
+        order = mock.Mock()
+        for name in ("_set_answer", "_press_named", "_approve_consent", "wait_name"):
+            setattr(harness, name, getattr(order, name))
+        app, provider = mock.Mock(), mock.Mock()
 
-        class Control:
-            def is_enabled(self) -> bool:
-                events.append("enabled")
-                return next(states)
+        harness.request_revision(app, provider=provider, hunks=2)
 
-        control = Control()
-        harness.win32 = mock.Mock()
-        harness.find_control = lambda *_args, **_kwargs: control
-        harness._scroll_revision_control_into_view = (
-            lambda _app, _automation_id, _control_type, candidate: candidate
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call._set_answer(app, PROVIDER.ANSWER_TEXT),
+                mock.call._press_named(app, HARNESS.PREPARE_REVISION_NAME, "REVISION_PREPARE"),
+                mock.call._approve_consent(
+                    app,
+                    "REVISION_CONSENT_HOLD_FAILED",
+                    provider=provider,
+                    expected_request_count=1,
+                    open_gate=provider.grant_revision_consent,
+                ),
+                mock.call.wait_name(
+                    app, "0 of 2 decided", "Text", "REVISION_PROPOSAL_UIA_TIMEOUT", 60.0
+                ),
+            ],
         )
-        harness.control_by_id = lambda *_args, **_kwargs: control
-        harness.click_control = lambda _control, _failure: events.append("click")
-
-        harness._click_id(mock.Mock(hwnd=41), HARNESS.REVISION_RUN_ACCESSIBILITY_ID)
-
-        self.assertEqual(events, ["enabled", "enabled", "click"])
 
     def test_loopback_profile_is_keyless_and_uses_only_a_process_synthetic_key(self) -> None:
         settings = HARNESS.review_settings_document("http://127.0.0.1:4141/v1/").decode(
@@ -1492,16 +1337,6 @@ class SourceAndCliTests(unittest.TestCase):
             first,
             "io.github.wxxb789.markturbo:model-credential:v2|wire=openai-responses|"
             "host=127.0.0.1|identity-sha256=76d1c8cb04c37287006720b64f66be02bb85723be756cc668cbc0acc13bb1eb4",
-        )
-
-    def test_question_and_change_ids_match_production_shape(self) -> None:
-        self.assertRegex(
-            HARNESS.revision_question_accessibility_id(0),
-            r"^markturbo-revision-question-[0-9a-f]{64}$",
-        )
-        self.assertEqual(
-            HARNESS.revision_change_accessibility_id(7, "accept"),
-            "markturbo-revision-change-7-accept",
         )
 
     def test_parser_requires_hash_and_positive_timeout(self) -> None:

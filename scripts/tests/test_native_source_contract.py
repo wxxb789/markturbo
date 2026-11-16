@@ -6,7 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.markturbo_tools.native.source_contract import production_source, rust_source_views
+from scripts.markturbo_tools.native.source_contract import (
+    production_markers_present,
+    production_source,
+    rust_source_views,
+)
 
 
 class ProductionSourceTests(unittest.TestCase):
@@ -130,6 +134,50 @@ class ProductionSourceTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertIsNone(self.project("fn production() {}\n" + source))
 
+
+
+class ProductionMarkersPresentTests(unittest.TestCase):
+    """A native selector counts only when production code (not a test item or
+    a comment) carries it; a missing or unparsable file fails closed."""
+
+    def present(self, files: dict[str, str], requirements: dict[str, tuple[str, ...]]) -> bool:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative, text in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            return production_markers_present(root, requirements)
+
+    def test_markers_must_all_appear_in_production_code(self) -> None:
+        requirement = {"ui/a.rs": ('"id-a"', '"Label"')}
+        production = 'fn a() { view().test_id("id-a").label("Label"); }\n'
+        self.assertTrue(self.present({"ui/a.rs": production}, requirement))
+        self.assertFalse(
+            self.present({"ui/a.rs": production.replace('"Label"', '"x"')}, requirement)
+        )
+
+    def test_comments_and_test_items_cannot_supply_a_marker(self) -> None:
+        requirement = {"ui/a.rs": ('"id-a"',)}
+        for decoy in (
+            '// view().test_id("id-a")\n',
+            '/* "id-a" */\n',
+            '#[cfg(test)]\nmod tests { const ID: &str = "id-a"; }\n',
+        ):
+            with self.subTest(decoy=decoy):
+                self.assertFalse(self.present({"ui/a.rs": "fn a() {}\n" + decoy}, requirement))
+
+    def test_missing_or_unparsable_files_fail_closed(self) -> None:
+        requirement = {"ui/a.rs": ('"id-a"',), "ui/b.rs": ()}
+        production = 'const ID: &str = "id-a";\n'
+        self.assertFalse(self.present({"ui/a.rs": production}, requirement))
+        self.assertFalse(
+            self.present(
+                {"ui/a.rs": production, "ui/b.rs": "#[cfg(test)] mod checks {\n"},
+                requirement,
+            )
+        )
+        self.assertTrue(self.present({"ui/a.rs": production, "ui/b.rs": ""}, requirement))
 
 class RustSourceViewsTests(unittest.TestCase):
     def assert_position_preserved(self, source: str, *views: str) -> None:

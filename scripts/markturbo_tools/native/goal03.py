@@ -4,21 +4,27 @@ The harness is fail-closed. A PASS binds every observation to the supplied
 x64 executable SHA-256 and uses isolated MARKTURBO_DATA_DIR and
 MARKTURBO_CONFIG_DIR roots. Evidence contains fingerprints and booleans, never
 document text or filesystem paths.
+
+It drives the nsh welcome (`ui/welcome.rs`): Open folder carries its own
+AutomationId; New file, Paste and Open sample are anonymous Buttons named by
+their labels; the recent rows share the `welcome-recent` id. Save As runs from
+the title menu or Ctrl+Shift+S through the native IFileSaveDialog, whose own
+overwrite confirmation is the only overwrite decision. Editor text is read with
+the editor's Select All + Copy (see `runtime.EDITOR_NAME`).
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
-import ctypes.wintypes as wt
 import hashlib
 import json
 import math
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
-from .source_contract import production_source, rust_source_views
+from .source_contract import production_markers_present
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -26,10 +32,13 @@ from .runtime import (
     REASON_CODE_RE,
     SAFE_FAILURE_TYPES,
     SHA256_RE,
-    SOURCE_EDITOR_AUTOMATION_ID,
+    EDITOR_NAME,
+    MENU_SAVE_AS_AUTOMATION_ID,
     VK_A,
     VK_CONTROL,
+    VK_RETURN,
     VK_S,
+    VK_V,
     VK_W,
     Fingerprint,
     HarnessBlocked,
@@ -64,19 +73,32 @@ DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-03-native-accep
 SCHEMA = "markturbo.goal-03-native-acceptance"
 SCHEMA_VERSION = 1
 VK_SHIFT = 0x10
-VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
-VK_V = 0x56
-CF_UNICODETEXT = 13
-GMEM_MOVEABLE = 0x0002
 
-DOCUMENT_SAVE_AS_AUTOMATION_ID = "markturbo-document-save-as"
-WELCOME_NEW_AUTOMATION_ID = "markturbo-welcome-new"
-WELCOME_PASTE_AUTOMATION_ID = "markturbo-welcome-paste"
-WELCOME_OPEN_FILE_AUTOMATION_ID = "markturbo-welcome-open-file"
-WELCOME_OPEN_FOLDER_AUTOMATION_ID = "markturbo-welcome-open-folder"
-WELCOME_OPEN_SAMPLE_AUTOMATION_ID = "markturbo-welcome-open-sample"
-WELCOME_DONT_SHOW_AUTOMATION_ID = "markturbo-welcome-dont-show-again"
+WELCOME_OPEN_FOLDER_AUTOMATION_ID = "welcome-open-folder"
+WELCOME_NEW_NAME = "New file"
+WELCOME_PASTE_NAME = "Paste"
+WELCOME_SAMPLE_NAME = "Open sample"
+WELCOME_RECENT_AUTOMATION_ID = "welcome-recent"
+# What a stale recent row must say when it is not simply disabled.
+STALE_RECENT_MARKER = "Missing"
+UI_SOURCE_REQUIREMENTS = {
+    "crates/mt-app/src/ui/welcome.rs": (
+        '"welcome-open-folder"',
+        '"New file"',
+        '"Paste"',
+        '"Open sample"',
+        '"welcome-recent"',
+    ),
+    "crates/mt-app/src/ui/titlebar.rs": (
+        '"title-menu-save-as"',
+        'on_key("shift+mod+s"',
+    ),
+    "crates/mt-app/src/ui/rail.rs": ('on_key("mod+w"',),
+    "crates/mt-app/src/ui/notices.rs": ('"Close without saving?"', '"Don\'t save"'),
+    "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
+    "crates/mt-app/src/state.rs": ("pick_save_path(",),
+}
 
 CASE_WELCOME = "welcome_no_argument"
 CASE_NEW_PASTE = "new_and_paste_unicode"
@@ -95,12 +117,16 @@ REQUIRED_CASE_IDS = (
     CASE_CLI,
 )
 CASE_FLOWS = {
-    CASE_WELCOME: "no-argument welcome -> dont-show -> restart memory buffer",
-    CASE_NEW_PASTE: "welcome New and Paste -> editable Unicode buffers",
-    CASE_SAVE_CREATE: "new buffer -> Save As create -> direct reopen exact text",
-    CASE_SAVE_CANCEL_OVERWRITE: "Save As cancel -> Replace cancel -> Replace confirm",
-    CASE_SAMPLE: "welcome bundled sample -> editable source",
-    CASE_RECENTS: "load eleven persisted targets -> restart ten recents -> stale disabled",
+    CASE_WELCOME: "no-argument welcome -> four entry points -> restart welcome",
+    CASE_NEW_PASTE: "welcome New file and Paste -> editable Unicode buffers",
+    CASE_SAVE_CREATE: "new buffer -> menu Save As create -> direct reopen exact text",
+    CASE_SAVE_CANCEL_OVERWRITE: (
+        "Save As cancel -> native overwrite No -> native overwrite Yes"
+    ),
+    CASE_SAMPLE: "welcome Open sample -> sample workspace replaces welcome",
+    CASE_RECENTS: (
+        "eleven persisted targets -> reopen records bound of ten -> restart stale degraded"
+    ),
     CASE_CLI: "explicit file and directory arguments bypass welcome",
 }
 
@@ -120,11 +146,10 @@ ALLOWED_OBSERVATION_KEYS = {
     "config_files_scanned",
     "direct_directory_bypassed_welcome",
     "direct_file_bypassed_welcome",
-    "dont_show_memory_buffer",
-    "dont_show_visible",
     "editor_after_overwrite_cancel",
     "editor_after_save_as_cancel",
     "editor_before_cancellation",
+    "entry_points_visible",
     "files_scanned",
     "flow",
     "foreground_attempts",
@@ -143,6 +168,7 @@ ALLOWED_OBSERVATION_KEYS = {
     "process_contexts",
     "recent_count",
     "recent_restart_visible",
+    "recent_visible_count",
     "requested_hwnd",
     "reopened_editor",
     "runtime_scan",
@@ -168,12 +194,9 @@ ALLOWED_OBSERVATION_KEYS = {
     "overwrite_cancel_focus_preserved",
     "utf16le_sentinel_absent",
     "utf8_sentinel_absent",
+    "welcome_restart_visible",
     "welcome_visible",
 }
-
-
-def has_unicode_clipboard_text(formats: set[int]) -> bool:
-    return CF_UNICODETEXT in formats
 
 
 def recent_settings_document(documents: list[Path]) -> bytes:
@@ -277,8 +300,8 @@ def required_observations(case_id: str) -> set[str]:
     specifics = {
         CASE_WELCOME: {
             "welcome_visible",
-            "dont_show_visible",
-            "dont_show_memory_buffer",
+            "entry_points_visible",
+            "welcome_restart_visible",
         },
         CASE_NEW_PASTE: {
             "new_buffer_created",
@@ -312,6 +335,7 @@ def required_observations(case_id: str) -> set[str]:
         CASE_RECENTS: {
             "recent_restart_visible",
             "recent_count",
+            "recent_visible_count",
             "stale_recent_disabled",
         },
         CASE_CLI: {"direct_file_bypassed_welcome", "direct_directory_bypassed_welcome"},
@@ -327,7 +351,9 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
     require_true(observations, "foreground_verified")
     validate_runtime_scan(observations.get("runtime_scan"))
     if case_id == CASE_WELCOME:
-        require_true(observations, "welcome_visible", "dont_show_visible", "dont_show_memory_buffer")
+        require_true(
+            observations, "welcome_visible", "entry_points_visible", "welcome_restart_visible"
+        )
     elif case_id == CASE_NEW_PASTE:
         require_true(observations, "new_buffer_created", "paste_buffer_created")
         validate_fingerprint(observations.get("new_unicode_editor"))
@@ -391,6 +417,9 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         require_true(observations, "recent_restart_visible", "stale_recent_disabled")
         if observations.get("recent_count") != 10:
             raise ValueError("recent target bound was not exactly ten")
+        visible = observations.get("recent_visible_count")
+        if not isinstance(visible, int) or isinstance(visible, bool) or not 1 <= visible <= 10:
+            raise ValueError("recent rows must show between one and ten targets")
     elif case_id == CASE_CLI:
         require_true(observations, "direct_file_bypassed_welcome", "direct_directory_bypassed_welcome")
 
@@ -488,67 +517,22 @@ def validate_evidence(evidence: dict[str, Any]) -> None:
 
 
 def source_contract_failure() -> str | None:
-    workspace = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "workspace.rs"
-    )
-    try:
-        welcome = production_source(
-            REPO / "crates" / "mt-app" / "src" / "views" / "workspace" / "welcome.rs"
-        )
-    except OSError:
+    """The nsh selectors this harness drives must exist in production source."""
+    if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
         return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    document = production_source(
-        REPO / "crates" / "mt-app" / "src" / "views" / "document.rs"
-    )
-    if workspace is None or welcome is None:
-        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    if document is None:
-        return "SAVE_AS_SOURCE_CONTRACT_MISSING"
-    workspace_views = rust_source_views(workspace)
-    if workspace_views is None:
-        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    workspace_code, _ = workspace_views
-
-    welcome_views = rust_source_views(welcome)
-    if welcome_views is None:
-        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    welcome_code, welcome_comment_free = welcome_views
-
-    document_views = rust_source_views(document)
-    if document_views is None:
-        return "SAVE_AS_SOURCE_CONTRACT_MISSING"
-    document_code, document_comment_free = document_views
-
-    for value in (
-        WELCOME_NEW_AUTOMATION_ID,
-        WELCOME_PASTE_AUTOMATION_ID,
-        WELCOME_OPEN_FILE_AUTOMATION_ID,
-        WELCOME_OPEN_FOLDER_AUTOMATION_ID,
-        WELCOME_OPEN_SAMPLE_AUTOMATION_ID,
-        WELCOME_DONT_SHOW_AUTOMATION_ID,
-    ):
-        if value not in welcome_comment_free:
-            return "WELCOME_UIA_CONTRACT_MISSING"
-    if DOCUMENT_SAVE_AS_AUTOMATION_ID not in document_comment_free:
-        return "SAVE_AS_UIA_CONTRACT_MISSING"
-    if "initial.is_none() && show_welcome_on_startup" not in welcome_code:
-        return "NO_ARGUMENT_WELCOME_CONTRACT_MISSING"
-    if "fn dont_show_welcome_again" not in welcome_code:
-        return "DONT_SHOW_WELCOME_CONTRACT_MISSING"
-    for contract in ("fn open_bundled_sample", "fn record_recent_target"):
-        if contract not in welcome_code:
-            return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    for contract in (
-        "fn on_paste_into_new",
-        "cx.read_from_clipboard()",
-        "fn prompt_save_as_overwrite",
-        "PromptButton::ok(i18n::t(i18n::Key::Replace, cx))",
-    ):
-        if contract not in workspace_code:
-            return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    if "DocumentEvent::SaveAsRequested" not in document_code:
-        return "SAVE_AS_SOURCE_CONTRACT_MISSING"
     return None
+
+
+def persisted_recent_count(config_root: Path) -> int:
+    """How many recent targets the settings file holds (paths are not kept)."""
+    try:
+        settings = tomllib.loads((config_root / "settings.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise HarnessFailure("RECENT_SETTINGS_UNREADABLE", safe_exception_name(error)) from None
+    targets = settings.get("recent-targets", [])
+    if not isinstance(targets, list):
+        raise HarnessFailure("RECENT_SETTINGS_UNREADABLE")
+    return len(targets)
 
 
 def sample_inventory(root: Path) -> tuple[int, Fingerprint, Fingerprint]:
@@ -652,20 +636,30 @@ class Goal03Harness(BaseNativeHarness):
         case_root = data_root.parent
         return case_root, data_root, config_root, workspace_root, stderr_path
 
-    def welcome_control(self, app: Any, automation_id: str) -> Any:
+    def welcome_open_folder(self, app: Any) -> Any:
         return self.find_control(
             app,
-            automation_id,
+            WELCOME_OPEN_FOLDER_AUTOMATION_ID,
             "Button",
             "WELCOME_UIA_TIMEOUT",
             "WELCOME_UIA_CONTRACT_MISMATCH",
         )
 
+    def welcome_action(self, app: Any, name: str) -> Any:
+        return self.find_named(
+            app, name, "Button", "WELCOME_UIA_TIMEOUT", "WELCOME_UIA_CONTRACT_MISMATCH"
+        )
+
+    def welcome_entry_points(self, app: Any) -> None:
+        self.welcome_open_folder(app)
+        for name in (WELCOME_NEW_NAME, WELCOME_PASTE_NAME, WELCOME_SAMPLE_NAME):
+            self.welcome_action(app, name)
+
     def wait_welcome_absent(self, app: Any) -> None:
         wait_until(
             lambda: self.control_absent(
                 app,
-                WELCOME_NEW_AUTOMATION_ID,
+                WELCOME_OPEN_FOLDER_AUTOMATION_ID,
                 "Button",
                 "WELCOME_UIA_QUERY_FAILED",
                 "WELCOME_UIA_CONTRACT_MISMATCH",
@@ -679,11 +673,8 @@ class Goal03Harness(BaseNativeHarness):
 
     def source_editor_has_focus(self, app: Any) -> bool:
         try:
-            editor = self.control_by_id(
-                app.hwnd,
-                SOURCE_EDITOR_AUTOMATION_ID,
-                "Edit",
-                "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
+            editor = self.control_by_name(
+                app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
             )
             return editor is not None and bool(editor.has_keyboard_focus())
         except HarnessFailure:
@@ -708,15 +699,14 @@ class Goal03Harness(BaseNativeHarness):
             self.focus_editor(app)
             self.win32.send_shortcut(app.hwnd, VK_A)
             self.win32.send_shortcut(app.hwnd, VK_V)
-            expected = fingerprint_text(value)
-            actual, _ = self.wait_editor_fingerprint(
-                app, expected, self.ui_timeout, already_focused=True
-            )
-            return actual
         finally:
             self.write_text_clipboard(clipboard_before)
+        expected = fingerprint_text(value)
+        actual, _ = self.wait_editor_fingerprint(app, expected, self.ui_timeout)
+        return actual
 
     def discard_memory_document(self, app: Any) -> None:
+        self.focus_editor(app)
         self.win32.send_shortcut(app.hwnd, VK_W)
         self.click_lifecycle_decision(app, "Discard")
         wait_until(
@@ -725,86 +715,6 @@ class Goal03Harness(BaseNativeHarness):
             "MEMORY_DISCARD_TIMEOUT",
         )
         self.close_app(app)
-
-    def read_text_clipboard(self) -> str | None:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        user32.OpenClipboard.argtypes = [wt.HWND]
-        user32.OpenClipboard.restype = wt.BOOL
-        user32.CloseClipboard.restype = wt.BOOL
-        user32.EnumClipboardFormats.argtypes = [wt.UINT]
-        user32.EnumClipboardFormats.restype = wt.UINT
-        user32.IsClipboardFormatAvailable.argtypes = [wt.UINT]
-        user32.IsClipboardFormatAvailable.restype = wt.BOOL
-        user32.GetClipboardData.argtypes = [wt.UINT]
-        user32.GetClipboardData.restype = wt.HANDLE
-        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalLock.restype = wt.LPVOID
-        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalUnlock.restype = wt.BOOL
-        if not user32.OpenClipboard(None):
-            raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
-        try:
-            formats: set[int] = set()
-            format_id = 0
-            while format_id := int(user32.EnumClipboardFormats(format_id)):
-                formats.add(format_id)
-            if formats and not has_unicode_clipboard_text(formats):
-                raise HarnessBlocked("CLIPBOARD_CONTAINS_NON_TEXT")
-            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
-                return None
-            handle = user32.GetClipboardData(CF_UNICODETEXT)
-            if not handle:
-                raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
-            pointer = kernel32.GlobalLock(handle)
-            if not pointer:
-                raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
-            try:
-                return ctypes.wstring_at(pointer)
-            finally:
-                kernel32.GlobalUnlock(handle)
-        finally:
-            user32.CloseClipboard()
-
-    def write_text_clipboard(self, value: str | None) -> None:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        user32.OpenClipboard.argtypes = [wt.HWND]
-        user32.OpenClipboard.restype = wt.BOOL
-        user32.CloseClipboard.restype = wt.BOOL
-        user32.EmptyClipboard.restype = wt.BOOL
-        user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
-        user32.SetClipboardData.restype = wt.HANDLE
-        kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
-        kernel32.GlobalAlloc.restype = wt.HGLOBAL
-        kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalFree.restype = wt.HGLOBAL
-        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalLock.restype = wt.LPVOID
-        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalUnlock.restype = wt.BOOL
-        if not user32.OpenClipboard(None):
-            raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
-        try:
-            if not user32.EmptyClipboard():
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-            if value is None:
-                return
-            payload = value.encode("utf-16-le") + b"\0\0"
-            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
-            if not handle:
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-            pointer = kernel32.GlobalLock(handle)
-            if not pointer:
-                kernel32.GlobalFree(handle)
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-            ctypes.memmove(pointer, payload, len(payload))
-            kernel32.GlobalUnlock(handle)
-            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
-                kernel32.GlobalFree(handle)
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-        finally:
-            user32.CloseClipboard()
 
     def common_file_dialog(self, app: Any) -> tuple[int, Any]:
         last_error: str | None = None
@@ -851,53 +761,70 @@ class Goal03Harness(BaseNativeHarness):
                 raise HarnessFailure(error.code, last_error) from None
             raise
 
-    def accept_native_overwrite_confirmation(self, app: Any, file_dialog_hwnd: int) -> None:
-        def locate() -> tuple[int, Any] | bool | None:
+    def native_overwrite_confirmation(self, app: Any, file_dialog_hwnd: int) -> dict[str, Any]:
+        """The IFileSaveDialog's own overwrite prompt: Yes and No."""
+
+        def locate() -> dict[str, Any] | None:
             nested = self.win32.owned_task_dialogs(app.process.pid, file_dialog_hwnd)
             if len(nested) > 1:
                 raise HarnessFailure("MULTIPLE_NATIVE_OVERWRITE_DIALOGS")
-            if nested:
-                hwnd = nested[0]
-                confirm = self.control_by_id(
-                    hwnd,
-                    "CommandButton_6",
+            if not nested:
+                if file_dialog_hwnd not in self.win32.owned_task_dialogs(
+                    app.process.pid, app.hwnd
+                ):
+                    raise HarnessFailure("NATIVE_OVERWRITE_CONFIRMATION_MISSING")
+                return None
+            buttons = {}
+            for choice, automation_id in (("Yes", "CommandButton_6"), ("No", "CommandButton_7")):
+                button = self.control_by_id(
+                    nested[0],
+                    automation_id,
                     "Button",
                     "NATIVE_OVERWRITE_DIALOG_UIA_CONTRACT_MISMATCH",
                     expected_class_name="CCPushButton",
                 )
-                return (hwnd, confirm) if confirm is not None else None
-            if file_dialog_hwnd not in self.win32.owned_task_dialogs(
-                app.process.pid, app.hwnd
-            ):
-                return True
-            return None
+                if button is None:
+                    return None
+                buttons[choice] = button
+            return buttons
 
-        result = wait_until(
-            locate,
-            self.ui_timeout,
-            "NATIVE_OVERWRITE_DIALOG_TIMEOUT",
-            interval=0.05,
+        return wait_until(
+            locate, self.ui_timeout, "NATIVE_OVERWRITE_DIALOG_TIMEOUT", interval=0.05
         )
-        if result is True:
-            return
-        _, confirm = result
-        self.click_control(confirm, "NATIVE_OVERWRITE_CONFIRM_CLICK_FAILED")
 
-    def select_save_path(self, app: Any, path: Path) -> None:
+    def type_save_path(self, app: Any, path: Path) -> int:
         hwnd, edit = self.common_file_dialog(app)
         self.click_control(edit, "SAVE_AS_FILENAME_FOCUS_FAILED")
         self.win32.send_shortcut(hwnd, VK_A)
         self.win32.send_unicode(hwnd, str(path))
         self.win32.send_key(hwnd, VK_RETURN)
-        self.accept_native_overwrite_confirmation(app, hwnd)
+        return hwnd
+
+    def wait_file_dialog_closed(self, app: Any, hwnd: int, code: str) -> None:
         wait_until(
-            lambda: hwnd
-            not in self.win32.owned_task_dialogs(app.process.pid, app.hwnd),
+            lambda: hwnd not in self.win32.owned_task_dialogs(app.process.pid, app.hwnd),
             self.ui_timeout,
-            "SAVE_AS_FILE_DIALOG_CLOSE_TIMEOUT",
+            code,
             interval=0.05,
         )
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
+
+    def select_save_path(self, app: Any, path: Path) -> None:
+        """Save As to a path that does not exist yet."""
+        hwnd = self.type_save_path(app, path)
+        self.wait_file_dialog_closed(app, hwnd, "SAVE_AS_FILE_DIALOG_CLOSE_TIMEOUT")
+
+    def select_existing_save_path(self, app: Any, path: Path, *, replace: bool) -> None:
+        """Save As onto an existing file: answer the native overwrite prompt."""
+        hwnd = self.type_save_path(app, path)
+        choice = "Yes" if replace else "No"
+        button = self.native_overwrite_confirmation(app, hwnd)[choice]
+        self.click_control(button, f"NATIVE_OVERWRITE_{choice.upper()}_CLICK_FAILED")
+        if not replace:
+            # No returns to the picker; leaving it is the user's cancel.
+            self.common_file_dialog(app)
+            self.win32.send_key(hwnd, VK_ESCAPE)
+        self.wait_file_dialog_closed(app, hwnd, "SAVE_AS_FILE_DIALOG_CLOSE_TIMEOUT")
 
     def cancel_save_picker(self, app: Any, path: Path) -> None:
         hwnd, edit = self.common_file_dialog(app)
@@ -913,14 +840,7 @@ class Goal03Harness(BaseNativeHarness):
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
 
     def request_save_as(self, app: Any) -> None:
-        button = self.find_control(
-            app,
-            DOCUMENT_SAVE_AS_AUTOMATION_ID,
-            "Button",
-            "SAVE_AS_BUTTON_UIA_TIMEOUT",
-            "SAVE_AS_BUTTON_UIA_CONTRACT_MISMATCH",
-        )
-        self.click_control(button, "SAVE_AS_BUTTON_CLICK_FAILED")
+        self.menu_command(app, MENU_SAVE_AS_AUTOMATION_ID)
 
     def request_save_as_shortcut(self, app: Any) -> None:
         self.require_source_editor_focus(app, "SAVE_AS_SHORTCUT_EDITOR_NOT_FOCUSED")
@@ -936,131 +856,55 @@ class Goal03Harness(BaseNativeHarness):
             ]
         )
 
-    def overwrite_buttons(self, app: Any) -> dict[str, Any]:
-        def locate() -> dict[str, Any] | None:
-            dialogs = self.win32.owned_task_dialogs(app.process.pid, app.hwnd)
-            if len(dialogs) > 1:
-                raise HarnessFailure("MULTIPLE_OVERWRITE_DIALOGS")
-            if not dialogs:
-                return None
-            hwnd = dialogs[0]
-            replace = self.control_by_id(
-                hwnd,
-                "CommandButton_1",
-                "Button",
-                "OVERWRITE_DIALOG_UIA_CONTRACT_MISMATCH",
-                "Replace",
-                "CCPushButton",
-            )
-            cancel = self.control_by_id(
-                hwnd,
-                "CommandButton_2",
-                "Button",
-                "OVERWRITE_DIALOG_UIA_CONTRACT_MISMATCH",
-                "Cancel",
-                "CCPushButton",
-            )
-            if replace is None or cancel is None:
-                return None
-            return {"Replace": replace, "Cancel": cancel}
-
-        return wait_until(locate, self.ui_timeout, "OVERWRITE_DIALOG_TIMEOUT", interval=0.05)
-
-    def choose_overwrite(self, app: Any, choice: str) -> None:
-        self.click_control(self.overwrite_buttons(app)[choice], f"OVERWRITE_{choice.upper()}_CLICK_FAILED")
-
     def recent_controls(self, app: Any) -> list[Any]:
         try:
             uia = self.iuia_class()
-            condition = uia.iuia.CreateTrueCondition()
+            condition = uia.iuia.CreatePropertyCondition(
+                uia.UIA_dll.UIA_AutomationIdPropertyId, WELCOME_RECENT_AUTOMATION_ID
+            )
             elements = self.fresh_uia_root(app.hwnd).element.FindAll(
                 uia.tree_scope["descendants"], condition
             )
             controls = []
-            seen_ids: set[str] = set()
             expected_control_type = uia.known_control_types["Button"]
             for index in range(elements.Length):
                 element = elements.GetElement(index)
-                automation_id = element.CurrentAutomationId or ""
-                if automation_id.startswith(
-                    "markturbo-welcome-recent-"
-                ) and not automation_id.startswith(
-                    (
-                        "markturbo-welcome-recent-remove-",
-                        "markturbo-welcome-recent-status-",
-                    )
+                if (
+                    element.CurrentAutomationId != WELCOME_RECENT_AUTOMATION_ID
+                    or element.CurrentControlType != expected_control_type
                 ):
-                    if (
-                        automation_id in seen_ids
-                        or element.CurrentControlType != expected_control_type
-                    ):
-                        raise HarnessFailure("RECENT_UIA_CONTRACT_MISMATCH")
-                    control = self.uia_wrapper_class(self.uia_element_info_class(element))
-                    info = control.element_info
-                    if (
-                        info.automation_id != automation_id
-                        or info.control_type != "Button"
-                        or not control.is_visible()
-                    ):
-                        raise HarnessFailure("RECENT_UIA_CONTRACT_MISMATCH")
-                    seen_ids.add(automation_id)
-                    controls.append(control)
+                    raise HarnessFailure("RECENT_UIA_CONTRACT_MISMATCH")
+                control = self.uia_wrapper_class(self.uia_element_info_class(element))
+                info = control.element_info
+                if (
+                    info.automation_id != WELCOME_RECENT_AUTOMATION_ID
+                    or info.control_type != "Button"
+                    or not control.is_visible()
+                ):
+                    raise HarnessFailure("RECENT_UIA_CONTRACT_MISMATCH")
+                controls.append(control)
             return controls
         except HarnessFailure:
             raise
         except Exception as error:
             raise HarnessFailure("RECENT_UIA_QUERY_FAILED", safe_exception_name(error)) from None
 
-    def require_recent_status(self, app: Any, expected: str, failure_code: str) -> None:
-        try:
-            uia = self.iuia_class()
-            elements = self.fresh_uia_root(app.hwnd).element.FindAll(
-                uia.tree_scope["descendants"], uia.iuia.CreateTrueCondition()
-            )
-            expected_control_type = uia.known_control_types["Text"]
-            matches = []
-            for index in range(elements.Length):
-                element = elements.GetElement(index)
-                if (
-                    (element.CurrentAutomationId or "").startswith(
-                        "markturbo-welcome-recent-status-"
-                    )
-                    and
-                    element.CurrentName == expected
-                    and element.CurrentControlType == expected_control_type
-                ):
-                    control = self.uia_wrapper_class(self.uia_element_info_class(element))
-                    if control.is_visible():
-                        matches.append(control)
-            if len(matches) != 1:
-                raise HarnessFailure(failure_code)
-        except HarnessFailure:
-            raise
-        except Exception as error:
-            raise HarnessFailure(failure_code, safe_exception_name(error)) from None
-
     def scenario_welcome(self) -> dict[str, Any]:
         case_root, data, config, workspace, stderr = self.profile(CASE_WELCOME)
         first = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.welcome_control(first, WELCOME_NEW_AUTOMATION_ID)
-            self.welcome_control(first, WELCOME_PASTE_AUTOMATION_ID)
-            dont_show = self.welcome_control(first, WELCOME_DONT_SHOW_AUTOMATION_ID)
-            self.click_control(dont_show, "DONT_SHOW_WELCOME_CLICK_FAILED")
-            self.wait_welcome_absent(first)
-            self.source_editor_ready(first)
+            self.welcome_entry_points(first)
             self.close_app(first)
             second = self.launch_app(None, data, config, workspace, stderr)
             try:
-                self.wait_welcome_absent(second)
-                self.source_editor_ready(second)
+                self.welcome_entry_points(second)
                 self.close_app(second)
             finally:
                 self.reap(second)
             observations = {
                 "welcome_visible": True,
-                "dont_show_visible": True,
-                "dont_show_memory_buffer": True,
+                "entry_points_visible": True,
+                "welcome_restart_visible": True,
                 "flow": CASE_FLOWS[CASE_WELCOME],
                 "process_context": first.security_context.evidence(),
                 "foreground_verified": True,
@@ -1074,7 +918,7 @@ class Goal03Harness(BaseNativeHarness):
         case_root, data, config, workspace, stderr = self.profile(CASE_NEW_PASTE)
         new = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.click_control(self.welcome_control(new, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
+            self.click_control(self.welcome_action(new, WELCOME_NEW_NAME), "WELCOME_NEW_CLICK_FAILED")
             self.wait_welcome_absent(new)
             self.source_editor_ready(new)
             new_text = self.replace_editor(new, NEW_TEXT)
@@ -1088,7 +932,9 @@ class Goal03Harness(BaseNativeHarness):
                     if clipboard_text is None:
                         raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
                     clipboard_fingerprint = fingerprint_text(clipboard_text)
-                    self.click_control(self.welcome_control(paste, WELCOME_PASTE_AUTOMATION_ID), "WELCOME_PASTE_CLICK_FAILED")
+                    self.click_control(
+                        self.welcome_action(paste, WELCOME_PASTE_NAME), "WELCOME_PASTE_CLICK_FAILED"
+                    )
                     self.wait_welcome_absent(paste)
                     self.source_editor_ready(paste)
                     paste_text = self.editor_fingerprint(paste)
@@ -1118,7 +964,7 @@ class Goal03Harness(BaseNativeHarness):
         destination = (workspace / "created.md").resolve()
         first = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.click_control(self.welcome_control(first, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
+            self.click_control(self.welcome_action(first, WELCOME_NEW_NAME), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(first)
             editor = self.replace_editor(first, SAVE_TEXT)
             self.request_save_as(first)
@@ -1158,31 +1004,26 @@ class Goal03Harness(BaseNativeHarness):
         before = sha256_file(destination)
         app = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.click_control(self.welcome_control(app, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
+            self.click_control(self.welcome_action(app, WELCOME_NEW_NAME), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(app)
             editor = self.replace_editor(app, OVERWRITE_TEXT)
+            self.focus_editor(app)
             self.request_save_as_shortcut(app)
             self.cancel_save_picker(app, cancelled_destination)
             self.require_source_editor_focus(app, "SAVE_AS_PICKER_CANCEL_FOCUS_CHANGED")
             cancelled_after = sha256_file(cancelled_destination)
-            editor_after_save_as_cancel, _ = self.wait_editor_fingerprint(
-                app, editor, self.ui_timeout, already_focused=True
-            )
+            editor_after_save_as_cancel = self.editor_fingerprint(app)
             if cancelled_after != cancelled_before or editor_after_save_as_cancel != editor:
                 raise HarnessFailure("SAVE_AS_PICKER_CANCEL_CHANGED_STATE")
             self.request_save_as_shortcut(app)
-            self.select_save_path(app, destination)
-            self.choose_overwrite(app, "Cancel")
+            self.select_existing_save_path(app, destination, replace=False)
             self.require_source_editor_focus(app, "OVERWRITE_CANCEL_FOCUS_CHANGED")
             after_cancel = sha256_file(destination)
-            editor_after_overwrite_cancel, _ = self.wait_editor_fingerprint(
-                app, editor, self.ui_timeout, already_focused=True
-            )
+            editor_after_overwrite_cancel = self.editor_fingerprint(app)
             if after_cancel != before or editor_after_overwrite_cancel != editor:
                 raise HarnessFailure("OVERWRITE_CANCEL_CHANGED_STATE")
             self.request_save_as_shortcut(app)
-            self.select_save_path(app, destination)
-            self.choose_overwrite(app, "Replace")
+            self.select_existing_save_path(app, destination, replace=True)
             saved = self.wait_file(destination, editor, "OVERWRITE_CONFIRM_TIMEOUT")
             self.close_app(app)
             observations = {
@@ -1212,7 +1053,7 @@ class Goal03Harness(BaseNativeHarness):
         case_root, data, config, workspace, stderr = self.profile(CASE_SAMPLE)
         app = self.launch_app(None, data, config, workspace, stderr)
         try:
-            sample = self.welcome_control(app, WELCOME_OPEN_SAMPLE_AUTOMATION_ID)
+            sample = self.welcome_action(app, WELCOME_SAMPLE_NAME)
             self.click_control(sample, "WELCOME_SAMPLE_CLICK_FAILED")
             self.wait_welcome_absent(app)
             materialized = materialized_sample_inventory(data)
@@ -1241,34 +1082,33 @@ class Goal03Harness(BaseNativeHarness):
         )
         app = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.welcome_control(app, WELCOME_NEW_AUTOMATION_ID)
-
-            def ten_initial_recent_controls() -> list[Any] | None:
-                controls = self.recent_controls(app)
-                return controls if len(controls) == 10 else None
-
-            wait_until(
-                ten_initial_recent_controls,
+            self.welcome_open_folder(app)
+            controls = wait_until(
+                lambda: self.recent_controls(app),
                 self.ui_timeout,
-                "INITIAL_RECENT_TARGET_COUNT_TIMEOUT",
+                "INITIAL_RECENT_TARGETS_TIMEOUT",
             )
+            # Reopening a target records it: the persisted history is bounded.
+            self.click_control(controls[0], "RECENT_TARGET_CLICK_FAILED")
+            self.source_editor_ready(app)
             first_context = app.security_context
             self.close_app(app)
         finally:
             self.reap(app)
+        recent_count = persisted_recent_count(config)
+        if recent_count != 10:
+            raise HarnessFailure("RECENT_TARGET_BOUND_NOT_TEN")
         documents[1].unlink()
         restarted = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.welcome_control(restarted, WELCOME_NEW_AUTOMATION_ID)
-            def ten_recent_controls() -> list[Any] | None:
-                controls = self.recent_controls(restarted)
-                return controls if len(controls) == 10 else None
-
+            self.welcome_open_folder(restarted)
             controls = wait_until(
-                ten_recent_controls,
+                lambda: self.recent_controls(restarted),
                 self.ui_timeout,
-                "RECENT_TARGET_COUNT_TIMEOUT",
+                "RECENT_TARGETS_TIMEOUT",
             )
+            if not 1 <= len(controls) <= 10:
+                raise HarnessFailure("RECENT_TARGET_ROWS_OUT_OF_BOUND")
             stale_name = documents[1].name
             stale_matches = [
                 control
@@ -1278,16 +1118,16 @@ class Goal03Harness(BaseNativeHarness):
             if len(stale_matches) != 1:
                 raise HarnessFailure("STALE_RECENT_UIA_CONTRACT_MISMATCH")
             stale = stale_matches[0]
-            self.require_recent_status(restarted, "Missing", "STALE_RECENT_STATUS_MISSING")
-            if stale.is_enabled():
-                raise HarnessFailure("STALE_RECENT_ENABLED")
-            self.welcome_control(restarted, WELCOME_NEW_AUTOMATION_ID)
+            if stale.is_enabled() and STALE_RECENT_MARKER not in (stale.element_info.name or ""):
+                raise HarnessFailure("STALE_RECENT_NOT_DEGRADED")
+            self.welcome_open_folder(restarted)
             if not self.editor_absent_while_running(restarted):
                 raise HarnessFailure("STALE_RECENT_OPENED_DOCUMENT")
             self.close_app(restarted)
             observations = {
                 "recent_restart_visible": True,
-                "recent_count": len(controls),
+                "recent_count": recent_count,
+                "recent_visible_count": len(controls),
                 "stale_recent_disabled": True,
                 "flow": CASE_FLOWS[CASE_RECENTS],
                 "process_context": first_context.evidence(),
