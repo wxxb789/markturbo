@@ -47,7 +47,7 @@ use nsh_core::{
 
 use crate::{
     state::{AppState, Pane, Tab},
-    ui::{glow, motion, notices, preview, revision, tokens},
+    ui::{glow, motion, notices, preview, revision, titlebar, tokens},
 };
 
 /// The column's content for the active document, by pane. Empty while no
@@ -206,6 +206,20 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     let punctuation =
         computed(move || punctuation_decorations(&punctuation_tab.text.get(), tokens::palette()));
 
+    // `Ctrl+Enter` stays the app's from the editor: the editor binds its own
+    // `mod+enter` (insert a line below) each time it takes the focus, and the
+    // keymap fires the newest binding. The focus coming into the editor's box
+    // is heard at the end of that commit round, after the editor bound its
+    // keys, so the app's binding made then is the newer one.
+    let focus_ins = signal(0u64);
+    let editor_box = element_ref();
+    editor_box.on_focus_in(move || focus_ins.update(|count| *count += 1));
+    let keys_state = state.clone();
+    effect(move || {
+        focus_ins.get();
+        titlebar::bind_mod_enter(&keys_state);
+    });
+
     view()
         .test_id("source")
         .flex_1()
@@ -217,6 +231,7 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
             // around it does, and it is the editor's own box.
             view()
                 .test_id("source-editor")
+                .element_ref(&editor_box)
                 .flex_1()
                 .min_h(px(0.0))
                 .h(relative(1.0))

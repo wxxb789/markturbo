@@ -71,7 +71,7 @@ use nsh_core::{Color, TransformKind, prelude::*};
 use crate::{
     i18n::{self, Key},
     state::{AppState, OutboundConsent, OutboundItem, OutboundOrigin, ReviewScopeChoice},
-    ui::{motion, prims, tokens},
+    ui::{motion, prims, titlebar, tokens},
 };
 
 /// The filament's height: a 2px bar along the send control's bottom edge.
@@ -687,35 +687,32 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
 /// or charge a control the user never reached. `Ctrl+Enter` is the
 /// focus-independent hold: it charges the same filament wherever the keyboard
 /// is, which is the only keyboard route on a platform that focuses no views.
+/// It is the app's one `Ctrl+Enter` binding ([`titlebar::bind_mod_enter`]),
+/// which reaches this card's hold through [`key_hold`].
 fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
+    let slot = open_hold();
+    *slot.borrow_mut() = Some(hold.clone());
+    let mine = hold.spent.clone();
+    cleanup(move || {
+        let mut open = slot.borrow_mut();
+        if open
+            .as_ref()
+            .is_some_and(|hold| Rc::ptr_eq(&hold.spent, &mine))
+        {
+            *open = None;
+        }
+    });
+    // Bound as the card comes, so it is newer than any binding made before.
+    let ctrl_enter_state = state.clone();
+    effect(move || titlebar::bind_mod_enter(&ctrl_enter_state));
     let escape_state = state.clone();
     let enter_state = state.clone();
     let space_state = state.clone();
-    let ctrl_enter_state = state.clone();
-    let ctrl_enter_hold = hold.clone();
     effect(move || {
         on_key_with("escape", KeyOptions::default(), {
             let state = escape_state.clone();
             move |_| cancel(&state, is_revision)
         });
-        on_key_with(
-            "ctrl+enter",
-            KeyOptions {
-                repeat: true,
-                when: When::Always,
-                ..KeyOptions::default()
-            },
-            {
-                let state = ctrl_enter_state.clone();
-                let hold = ctrl_enter_hold.clone();
-                move |_| {
-                    if !is_open(&state) {
-                        return;
-                    }
-                    hold.key_press();
-                }
-            },
-        );
         for key in ["enter", "space"] {
             let state = if key == "enter" {
                 enter_state.clone()
@@ -743,6 +740,29 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
             );
         }
     });
+}
+
+/// The open card's hold, for `Ctrl+Enter`: the card puts it here as it comes
+/// and takes it out as it goes.
+#[derive(Default)]
+struct OpenHold(Rc<RefCell<Option<Hold>>>);
+
+fn open_hold() -> Rc<RefCell<Option<Hold>>> {
+    global::<OpenHold>().with_untracked(|open| open.0.clone())
+}
+
+/// One `Ctrl+Enter` press, or one of its auto-repeats, on the open card's
+/// hold ([`titlebar::bind_mod_enter`]); nothing without a card.
+///
+/// It runs under the card's owner: the binding that fired belongs to
+/// whichever effect run bound it last (a focus-in rebinds it, a tab switch
+/// unmounts it), and the hold's timers must not go with that run, or a press
+/// would never be released and the next tap would find the charge full.
+pub fn key_hold() {
+    let hold = open_hold().borrow().clone();
+    if let Some(hold) = hold {
+        hold.owner.run(|| hold.key_press());
+    }
 }
 
 /// Cancel the waiting consent, whatever it is.
@@ -1042,6 +1062,8 @@ struct Hold {
     notice: Rc<RefCell<Option<Spawned<()>>>>,
     /// The send fired: this consent is spent.
     spent: Rc<Cell<bool>>,
+    /// The card's owner: the hold's timers live under it, whoever presses.
+    owner: Owner,
 }
 
 impl Hold {
@@ -1062,6 +1084,7 @@ impl Hold {
             steps: Rc::new(RefCell::new(Vec::new())),
             notice: Rc::new(RefCell::new(None)),
             spent: Rc::new(Cell::new(false)),
+            owner: Owner::current(),
         }
     }
 

@@ -25,7 +25,7 @@ use crate::{
     ui::{
         consent,
         motion::HOVER_MS,
-        notices, prims, shell,
+        notices, prims, revision, shell,
         tokens::{
             self, COLUMN_GAP, HAIRLINE, RAIL_W, SPACE_1, SPACE_2, SPACE_3, TITLE_ROW_H, TYPE_UI,
             TYPE_UI_LINE,
@@ -37,31 +37,9 @@ use crate::{
 /// The title row. `state` is the shell's handle on the app; `language` is the
 /// language the shell was re-keyed with.
 pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
-    // `Review` is reachable from the editor itself: `enter` is a key a text
-    // input uses, so the binding asks for the focus wherever it is.
+    // `Review` (and the rest of `Ctrl+Enter`) from wherever the focus is.
     let review_state = state.clone();
-    on_key_with(
-        "mod+enter",
-        KeyOptions {
-            when: When::Always,
-            ..KeyOptions::default()
-        },
-        move |_: &str| {
-            // A revision on screen is a decision waiting: reviewing over it
-            // would drop the proposal being decided. While a consent card is
-            // up, Ctrl+Enter is its hold-to-send key; re-preparing the review
-            // there would rebuild the card under the user's hold. A review in
-            // flight or a guard decision is not restarted either.
-            if review_state.active.get().is_some()
-                && review_state.revision_hunks.get().is_empty()
-                && !consent::is_open(&review_state)
-                && !notices::guard_is_open(&review_state)
-                && !review_state.review_busy.get()
-            {
-                review_state.start_review();
-            }
-        },
-    );
+    effect(move || bind_mod_enter(&review_state));
 
     let menu = signal(false);
 
@@ -134,6 +112,64 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         .child(view().flex_1())
         .child(review_action(state.clone(), language))
         .child(menu_anchor(state.clone(), language, menu))
+}
+
+/// Binds `Ctrl+Enter` (`mod+enter`; on an Apple keyboard `ctrl+enter` too, the
+/// key the hints name) to [`mod_enter`], the app's one handler for it. Call it
+/// inside an effect: the binding is dropped with the effect's run, and it
+/// reads whether a consent card is up, whose hold takes the key's
+/// auto-repeats (anything else fires once per press).
+///
+/// The keymap fires the newest binding of a keystroke, and the source editor
+/// binds its own `mod+enter` (insert a line below) every time it takes the
+/// focus. So besides the title row, the editor's own box binds this again
+/// each time the focus comes into it (`document`), and the surfaces that
+/// claim the key (the consent card, the Revision field's `Done`) bind it as
+/// they come — every one of them the same binding.
+pub fn bind_mod_enter(state: &AppState) {
+    let held = consent::is_open(state);
+    let keys: &[&str] = if apple_keys() {
+        &["mod+enter", "ctrl+enter"]
+    } else {
+        &["mod+enter"]
+    };
+    for keystroke in keys {
+        let state = state.clone();
+        on_key_with(
+            keystroke,
+            KeyOptions {
+                // `enter` is a key a text input uses: the binding asks for
+                // the focus wherever it is.
+                when: When::Always,
+                repeat: held,
+                ..KeyOptions::default()
+            },
+            move |_: &str| mod_enter(&state),
+        );
+    }
+}
+
+/// `Ctrl+Enter`: the consent card's hold while one is up, `Done` while a
+/// fresh proposal is docked, else `Review`.
+fn mod_enter(state: &AppState) {
+    if consent::is_open(state) {
+        consent::key_hold();
+        return;
+    }
+    if revision::done_applies(state) {
+        revision::done(state);
+        return;
+    }
+    // A revision on screen is a decision waiting: reviewing over it would
+    // drop the proposal being decided. A review in flight or a guard decision
+    // is not restarted either.
+    if state.active.get().is_some()
+        && state.revision_hunks.get().is_empty()
+        && !notices::guard_is_open(state)
+        && !state.review_busy.get()
+    {
+        state.start_review();
+    }
 }
 
 /// The file's name, with its folder at non-text ink ahead of it so two files

@@ -76,7 +76,7 @@ use crate::{
     ui::{
         glow,
         motion::{self, Heat},
-        prims,
+        prims, titlebar,
         tokens::{self, SPACE_1, SPACE_2, SPACE_3},
     },
 };
@@ -449,17 +449,17 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
             move || hunks.with(|hunks| !hunks.is_empty()),
             move || key_hints(language),
         ))
-        // `Done`'s key, bound only while there is something it could apply: in
-        // every other state the keystroke stays the title row's `mod+enter`
-        // (`Review`), and a stale proposal has nothing to apply. The binding
-        // lives and dies with this region, which is out of the flex flow.
+        // `Done`'s key (`Ctrl+Enter`, the app's one binding of it), bound
+        // again while there is something it could apply, so it is newer than
+        // any binding made before the proposal came; in every other state the
+        // keystroke is `Review`'s, and a stale proposal has nothing to apply.
+        // The binding lives and dies with this region, which is out of the
+        // flex flow.
         .child(when(
+            move || done_applies(&done_key_gate),
             move || {
-                !done_key_gate.revision_hunks.with(|hunks| hunks.is_empty())
-                    && !done_key_gate.revision_is_stale()
-            },
-            move || {
-                bind_done_key(&done_key_state);
+                let state = done_key_state.clone();
+                effect(move || titlebar::bind_mod_enter(&state));
                 view().absolute().pointer_events(PointerEvents::None)
             },
         ))
@@ -1050,12 +1050,11 @@ fn bind_keys(state: &AppState, heat: Heat) {
     on_key("ctrl+z", move |_| undo_decision(&keys));
 }
 
-/// `Ctrl+Enter` is `Done` (also the title row's `mod+enter`, `Review`): the
-/// field claims it only while a proposal is on screen and fresh, so the
-/// shortcut keeps starting a Review from every other state.
-fn bind_done_key(state: &AppState) {
-    let keys = state.clone();
-    on_key("ctrl+enter", move |_| done(&keys));
+/// Whether `Ctrl+Enter` is `Done` (else it is `Review`,
+/// [`titlebar::bind_mod_enter`]): only while a proposal is on screen and
+/// fresh, so the shortcut keeps starting a Review from every other state.
+pub(crate) fn done_applies(state: &AppState) -> bool {
+    !state.revision_hunks.with(|hunks| hunks.is_empty()) && !state.revision_is_stale()
 }
 
 // ─── actions ──────────────────────────────────────────────────────────────
@@ -1147,7 +1146,7 @@ fn undo_decision(state: &AppState) {
 }
 
 /// `Done`, with the hunks still undecided counted as discarded.
-fn done(state: &AppState) {
+pub(crate) fn done(state: &AppState) {
     let hunks = state.revision_hunks.get();
     let (decided, all) = session().with(|now| now.synced(&hunks).counts(&hunks));
     state.finish_revision(all - decided);
