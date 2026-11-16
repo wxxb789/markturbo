@@ -120,6 +120,25 @@ fn the_title_row_holds_the_name_review_and_settings() {
         app.wait_for("id:title-review").expect("Review on the row");
         assert_row_fits(&app, width);
     }
+    // Windows reports its caption buttons only after the first frame (and
+    // again when the window is maximized): the row must make room for them
+    // whenever they change, not keep the area it was built with.
+    const CAPTION: f32 = 138.0;
+    app.set_environment("the caption buttons arrive", |env| {
+        env.title_bar = nsh_core::Edges {
+            top: Points(32.0),
+            left: Points(0.0),
+            right: Points(CAPTION),
+            bottom: Points(0.0),
+        };
+    })
+    .expect("caption buttons");
+    for width in [1440.0, 640.0] {
+        app.set_viewport(nsh_core::Size::new(Points(width), Points(800.0)))
+            .expect("viewport");
+        app.wait_for("id:title-review").expect("Review on the row");
+        assert_row_fits(&app, width - CAPTION);
+    }
     app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
         .expect("wide viewport");
 

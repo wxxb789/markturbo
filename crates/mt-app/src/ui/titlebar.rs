@@ -63,8 +63,6 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         },
     );
 
-    let insets = prims::caption_insets();
-    let height = TITLE_ROW_H.max(insets.top.0);
     let menu = signal(false);
 
     // The menu's document commands, reachable without it.
@@ -103,13 +101,20 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         // painted over. The shell's overlay layer (the consent card) belongs
         // to the window's root view and stays above the whole room.
         .z_index(5)
-        .h(px(height))
+        // The native controls' area arrives after the first frame and changes
+        // when the window is maximized: the row's height and insets are bound
+        // to it, so they follow without the row being rebuilt.
+        .h(move || Length::from(px(TITLE_ROW_H.max(prims::caption_insets().top.0))))
         .w_full()
         .flex_row()
         .items_center()
         .gap(px(SPACE_3))
-        .pl(px((RAIL_W + COLUMN_GAP).max(insets.left.0 + SPACE_3)))
-        .pr(px(insets.right.0 + SPACE_3))
+        .pl(move || {
+            Length::from(px(
+                (RAIL_W + COLUMN_GAP).max(prims::caption_insets().left.0 + SPACE_3)
+            ))
+        })
+        .pr(move || Length::from(px(prims::caption_insets().right.0 + SPACE_3)))
         .bg(move || tokens::palette().room)
         .window_drag(true)
         .child(when(move || menu.get(), {
