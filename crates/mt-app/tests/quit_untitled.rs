@@ -38,6 +38,26 @@ fn quit_save_all_saves_an_untitled_draft() {
     app.wait_for("id:title-menu").expect("the menu");
     app.press("id:title-menu-quit").expect("quit");
     app.wait_for("id:guard-card").expect("quit guard");
+    // Each control's id names the control itself — the element a press
+    // reaches and UI Automation exposes as its AutomationId.
+    for (id, label) in [
+        ("guard-save", "Save"),
+        ("guard-dont-save", "Don't save"),
+        ("guard-cancel", "Cancel"),
+    ] {
+        let control = app
+            .screen()
+            .press_target(&format!("id:guard-card >> role:button[{label}]"))
+            .expect("selector");
+        assert!(control.is_some(), "the {label} control");
+        assert_eq!(
+            app.screen()
+                .press_target(&format!("id:{id}"))
+                .expect("selector"),
+            control,
+            "`{id}` is the {label} control"
+        );
+    }
     app.press("id:guard-card >> label:Save")
         .expect("save before quitting");
 

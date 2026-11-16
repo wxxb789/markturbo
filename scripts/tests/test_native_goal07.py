@@ -238,6 +238,7 @@ SAFE_APPLY = """\
 """
 SAFE_REVISION = """\
 const LABELS: &[&str] = &["Accept", "Reject", "Done", "Stale — edited after review"];
+const IDS: &[&str] = &["revision-accept", "revision-reject", "revision-done"];
 fn count(n: usize, m: usize) -> String { format!("{n} of {m} decided") }
 fn field(state: &AppState) {
     let done_key_gate = state.clone();
@@ -928,7 +929,7 @@ class SourceAndCliTests(unittest.TestCase):
                 harness.profile = mock.Mock(return_value=(Path("unused"),) * 6)
                 harness.launch_app = mock.Mock(return_value=app)
                 harness.menu_command = mock.Mock()
-                harness._press_named = mock.Mock()
+                harness._press = mock.Mock()
                 harness.confirm_system_alert = mock.Mock()
                 harness.name_present = mock.Mock(return_value=False)
                 harness.wait_name = mock.Mock()
@@ -965,7 +966,7 @@ class SourceAndCliTests(unittest.TestCase):
                 for name in ("menu_command", "editor_control", "run_review", "editor_fingerprint"):
                     order.attach_mock(getattr(harness, name), name)
                 trust = mock.Mock()
-                for name in ("_press_named", "confirm_system_alert", "wait_name"):
+                for name in ("_press", "confirm_system_alert", "wait_name"):
                     trust.attach_mock(getattr(harness, name), name)
 
                 def wait_once(check, _timeout, code, **_kwargs):
@@ -999,7 +1000,7 @@ class SourceAndCliTests(unittest.TestCase):
                         # The Run scripts alert is outside UIA: it is answered with
                         # Enter only while trust is still off, then proven by the banner.
                         self.assertEqual(trust.mock_calls[:3], [
-                            mock.call._press_named(app, HARNESS.TRUST_SCRIPTS_NAME, "TRUST_BUTTON"),
+                            mock.call._press(app, HARNESS.TRUST_SCRIPTS_AUTOMATION_ID, "TRUST_BUTTON"),
                             mock.call.confirm_system_alert(
                                 app, mock.ANY, "TRUST_ENABLED_BEFORE_CONFIRMATION"
                             ),
@@ -1008,8 +1009,8 @@ class SourceAndCliTests(unittest.TestCase):
                             ),
                         ])
                         self.assertEqual(
-                            [call.args[1] for call in harness._press_named.call_args_list],
-                            [HARNESS.TRUST_SCRIPTS_NAME],
+                            [call.args[1] for call in harness._press.call_args_list],
+                            [HARNESS.TRUST_SCRIPTS_AUTOMATION_ID],
                         )
                         still_undecided = harness.confirm_system_alert.call_args.args[1]
                         self.assertTrue(still_undecided())
@@ -1090,7 +1091,7 @@ class SourceAndCliTests(unittest.TestCase):
             value.CurrentValue = text
 
         harness.win32.send_unicode.side_effect = type_text
-        harness._press_named = lambda _app, name, code: events.append(("press", (name, code)))
+        harness._press = lambda _app, name, code: events.append(("press", (name, code)))
 
         harness._set_answer(app, "kept intent")
 
@@ -1099,7 +1100,7 @@ class SourceAndCliTests(unittest.TestCase):
             [
                 ("focus", None),
                 ("send-unicode", (41, "kept intent")),
-                ("press", (HARNESS.REVIEW_ANSWER_NAME, "REVIEW_ANSWER_SUBMIT")),
+                ("press", (HARNESS.REVIEW_ANSWER_AUTOMATION_ID, "REVIEW_ANSWER_SUBMIT")),
             ],
         )
 
@@ -1111,16 +1112,16 @@ class SourceAndCliTests(unittest.TestCase):
         harness.find_control = lambda *_args, **_kwargs: control
         harness.control_by_id = lambda *_args, **_kwargs: control
         harness.win32 = mock.Mock()
-        harness._press_named = mock.Mock()
+        harness._press = mock.Mock()
 
         with self.assertRaisesRegex(runtime.HarnessFailure, "REVIEW_ANSWER_INPUT_TIMEOUT"):
             harness._set_answer(mock.Mock(hwnd=41), "kept intent")
-        harness._press_named.assert_not_called()
+        harness._press.assert_not_called()
 
     def test_hunk_decisions_wait_for_each_decided_count(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         events: list[tuple[str, str]] = []
-        harness._press_named = lambda _app, name, _code: events.append(("press", name))
+        harness._press = lambda _app, name, _code: events.append(("press", name))
         harness.wait_name = lambda _app, name, *_args: events.append(("wait", name))
 
         harness.decide_hunks(mock.Mock(), [True, False])
@@ -1129,11 +1130,11 @@ class SourceAndCliTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("press", HARNESS.REVISION_ACCEPT_NAME),
+                ("press", HARNESS.REVISION_ACCEPT_AUTOMATION_ID),
                 ("wait", "1 of 2 decided"),
-                ("press", HARNESS.REVISION_REJECT_NAME),
+                ("press", HARNESS.REVISION_REJECT_AUTOMATION_ID),
                 ("wait", "2 of 2 decided"),
-                ("press", HARNESS.REVISION_DONE_NAME),
+                ("press", HARNESS.REVISION_DONE_AUTOMATION_ID),
             ],
         )
 
@@ -1242,7 +1243,7 @@ class SourceAndCliTests(unittest.TestCase):
         )
         self.assertGreater(HARNESS.CONSENT_HOLD_SECONDS, 1.2)
 
-    def test_named_press_requires_foreground_first(self) -> None:
+    def test_press_requires_foreground_first_and_finds_the_control_by_id(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
         events: list[str] = []
@@ -1250,23 +1251,23 @@ class SourceAndCliTests(unittest.TestCase):
         harness.win32.require_foreground.side_effect = lambda *_args: events.append(
             "foreground"
         )
-        harness.find_named = lambda _app, name, control_type, *_args: (
-            events.append(f"find-{name}-{control_type}") or object()
+        harness.find_control = lambda _app, automation_id, control_type, *_args: (
+            events.append(f"find-{automation_id}-{control_type}") or object()
         )
         harness.click_control = lambda _control, failure: events.append(f"click-{failure}")
 
-        harness._press_named(mock.Mock(hwnd=41), HARNESS.REVISION_ACCEPT_NAME, "REVISION_ACCEPT")
+        harness._press(mock.Mock(hwnd=41), HARNESS.REVISION_ACCEPT_AUTOMATION_ID, "REVISION_ACCEPT")
 
         self.assertEqual(
             events,
-            ["foreground", "find-Accept-Button", "click-REVISION_ACCEPT_CLICK_FAILED"],
+            ["foreground", "find-revision-accept-Button", "click-REVISION_ACCEPT_CLICK_FAILED"],
         )
 
     def test_revision_request_submits_answer_prepares_and_waits_for_hunks(self) -> None:
         harness = object.__new__(HARNESS.Goal07Harness)
         harness.ui_timeout = 0.1
         order = mock.Mock()
-        for name in ("_set_answer", "_press_named", "_approve_consent", "wait_name"):
+        for name in ("_set_answer", "_press", "_approve_consent", "wait_name"):
             setattr(harness, name, getattr(order, name))
         app, provider = mock.Mock(), mock.Mock()
 
@@ -1276,7 +1277,7 @@ class SourceAndCliTests(unittest.TestCase):
             order.mock_calls,
             [
                 mock.call._set_answer(app, PROVIDER.ANSWER_TEXT),
-                mock.call._press_named(app, HARNESS.PREPARE_REVISION_NAME, "REVISION_PREPARE"),
+                mock.call._press(app, HARNESS.PREPARE_REVISION_AUTOMATION_ID, "REVISION_PREPARE"),
                 mock.call._approve_consent(
                     app,
                     "REVISION_CONSENT_HOLD_FAILED",

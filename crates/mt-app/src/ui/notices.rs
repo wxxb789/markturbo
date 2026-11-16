@@ -29,10 +29,7 @@ use std::{
 };
 
 use mt_core::{recovery::RecoveredRecord, settings::Language};
-use nsh_base::{
-    button,
-    editor::{EditorDecoration, EditorPosition, EditorRange},
-};
+use nsh_base::editor::{EditorDecoration, EditorPosition, EditorRange};
 use nsh_core::{
     Color, DecorationStyle, PropertyValue, StyleKey, TextDecoration,
     element::{KeyOptions, Style, on_key_with},
@@ -1083,7 +1080,6 @@ fn card_action(
 ) -> impl IntoElement {
     let selected = selected.into_reactive();
     view()
-        .test_id(test_id)
         .p(px(FOCUS_RING_OFFSET))
         .border(px(FOCUS_RING))
         .border_color({
@@ -1115,8 +1111,12 @@ fn card_action(
                 .transition_colors()
                 .duration(HOVER_MS)
                 .child(
-                    button()
-                        .accessibility_label(Some(SharedString::from(label)))
+                    // The control itself carries the test id (UI Automation's
+                    // AutomationId): a plain press target, as `prims`' are.
+                    view()
+                        .test_id(test_id)
+                        .role(AccessibilityRole::Button)
+                        .optional_label(Some(SharedString::from(label)))
                         .w_full()
                         .h_full()
                         .flex_col()

@@ -5,9 +5,9 @@ x64 executable SHA-256 and uses isolated MARKTURBO_DATA_DIR and
 MARKTURBO_CONFIG_DIR roots. Evidence contains fingerprints and booleans, never
 document text or filesystem paths.
 
-It drives the nsh welcome (`ui/welcome.rs`): Open folder carries its own
-AutomationId; New file, Paste and Open sample are anonymous Buttons named by
-their labels; the recent rows share the `welcome-recent` id. Save As runs from
+It drives the nsh welcome (`ui/welcome.rs`): Open folder, New file, Paste and
+Open sample are Buttons with their own AutomationIds; the recent rows share
+the `welcome-recent` id. Save As runs from
 the title menu or Ctrl+Shift+S through the native IFileSaveDialog, whose own
 overwrite confirmation is the only overwrite decision. Editor text is read with
 the editor's Select All + Copy (see `runtime.EDITOR_NAME`).
@@ -76,15 +76,18 @@ VK_SHIFT = 0x10
 VK_ESCAPE = 0x1B
 
 WELCOME_OPEN_FOLDER_AUTOMATION_ID = "welcome-open-folder"
-WELCOME_NEW_NAME = "New file"
-WELCOME_PASTE_NAME = "Paste"
-WELCOME_SAMPLE_NAME = "Open sample"
+WELCOME_NEW_AUTOMATION_ID = "welcome-new-file"
+WELCOME_PASTE_AUTOMATION_ID = "welcome-paste"
+WELCOME_SAMPLE_AUTOMATION_ID = "welcome-open-sample"
 WELCOME_RECENT_AUTOMATION_ID = "welcome-recent"
 # What a stale recent row must say when it is not simply disabled.
 STALE_RECENT_MARKER = "Missing"
 UI_SOURCE_REQUIREMENTS = {
     "crates/mt-app/src/ui/welcome.rs": (
         '"welcome-open-folder"',
+        '"welcome-new-file"',
+        '"welcome-paste"',
+        '"welcome-open-sample"',
         '"New file"',
         '"Paste"',
         '"Open sample"',
@@ -645,15 +648,19 @@ class Goal03Harness(BaseNativeHarness):
             "WELCOME_UIA_CONTRACT_MISMATCH",
         )
 
-    def welcome_action(self, app: Any, name: str) -> Any:
-        return self.find_named(
-            app, name, "Button", "WELCOME_UIA_TIMEOUT", "WELCOME_UIA_CONTRACT_MISMATCH"
+    def welcome_action(self, app: Any, automation_id: str) -> Any:
+        return self.find_control(
+            app, automation_id, "Button", "WELCOME_UIA_TIMEOUT", "WELCOME_UIA_CONTRACT_MISMATCH"
         )
 
     def welcome_entry_points(self, app: Any) -> None:
         self.welcome_open_folder(app)
-        for name in (WELCOME_NEW_NAME, WELCOME_PASTE_NAME, WELCOME_SAMPLE_NAME):
-            self.welcome_action(app, name)
+        for automation_id in (
+            WELCOME_NEW_AUTOMATION_ID,
+            WELCOME_PASTE_AUTOMATION_ID,
+            WELCOME_SAMPLE_AUTOMATION_ID,
+        ):
+            self.welcome_action(app, automation_id)
 
     def wait_welcome_absent(self, app: Any) -> None:
         wait_until(
@@ -918,7 +925,7 @@ class Goal03Harness(BaseNativeHarness):
         case_root, data, config, workspace, stderr = self.profile(CASE_NEW_PASTE)
         new = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.click_control(self.welcome_action(new, WELCOME_NEW_NAME), "WELCOME_NEW_CLICK_FAILED")
+            self.click_control(self.welcome_action(new, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.wait_welcome_absent(new)
             self.source_editor_ready(new)
             new_text = self.replace_editor(new, NEW_TEXT)
@@ -933,7 +940,7 @@ class Goal03Harness(BaseNativeHarness):
                         raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
                     clipboard_fingerprint = fingerprint_text(clipboard_text)
                     self.click_control(
-                        self.welcome_action(paste, WELCOME_PASTE_NAME), "WELCOME_PASTE_CLICK_FAILED"
+                        self.welcome_action(paste, WELCOME_PASTE_AUTOMATION_ID), "WELCOME_PASTE_CLICK_FAILED"
                     )
                     self.wait_welcome_absent(paste)
                     self.source_editor_ready(paste)
@@ -964,7 +971,7 @@ class Goal03Harness(BaseNativeHarness):
         destination = (workspace / "created.md").resolve()
         first = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.click_control(self.welcome_action(first, WELCOME_NEW_NAME), "WELCOME_NEW_CLICK_FAILED")
+            self.click_control(self.welcome_action(first, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(first)
             editor = self.replace_editor(first, SAVE_TEXT)
             self.request_save_as(first)
@@ -1004,7 +1011,7 @@ class Goal03Harness(BaseNativeHarness):
         before = sha256_file(destination)
         app = self.launch_app(None, data, config, workspace, stderr)
         try:
-            self.click_control(self.welcome_action(app, WELCOME_NEW_NAME), "WELCOME_NEW_CLICK_FAILED")
+            self.click_control(self.welcome_action(app, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(app)
             editor = self.replace_editor(app, OVERWRITE_TEXT)
             self.focus_editor(app)
@@ -1053,7 +1060,7 @@ class Goal03Harness(BaseNativeHarness):
         case_root, data, config, workspace, stderr = self.profile(CASE_SAMPLE)
         app = self.launch_app(None, data, config, workspace, stderr)
         try:
-            sample = self.welcome_action(app, WELCOME_SAMPLE_NAME)
+            sample = self.welcome_action(app, WELCOME_SAMPLE_AUTOMATION_ID)
             self.click_control(sample, "WELCOME_SAMPLE_CLICK_FAILED")
             self.wait_welcome_absent(app)
             materialized = materialized_sample_inventory(data)

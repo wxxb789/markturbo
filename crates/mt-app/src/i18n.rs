@@ -241,7 +241,6 @@ pub enum Key {
     NavigateForward,
 
     // Empty states
-    OpenFolderToBegin,
     OpenFolderToDiscover,
     OpenDocumentForOutline,
     NoHeadings,
@@ -1178,7 +1177,6 @@ fn english(key: Key) -> &'static str {
         Key::NavigateBack => "Back",
         Key::NavigateForward => "Forward",
 
-        Key::OpenFolderToBegin => "Open a folder to begin.",
         Key::OpenFolderToDiscover => "Open a folder to discover skills and instruction files.",
         Key::OpenDocumentForOutline => "Open a document to see its outline.",
         Key::NoHeadings => "This document has no headings.",
@@ -1641,7 +1639,6 @@ fn chinese(key: Key) -> &'static str {
         Key::NavigateBack => "后退",
         Key::NavigateForward => "前进",
 
-        Key::OpenFolderToBegin => "打开一个文件夹以开始。",
         Key::OpenFolderToDiscover => "打开一个文件夹以发现 skills 和指令文件。",
         Key::OpenDocumentForOutline => "打开一个文档以查看其大纲。",
         Key::NoHeadings => "此文档没有标题。",
@@ -2021,7 +2018,6 @@ mod tests {
         Key::UnsavedChanges,
         Key::NavigateBack,
         Key::NavigateForward,
-        Key::OpenFolderToBegin,
         Key::OpenFolderToDiscover,
         Key::OpenDocumentForOutline,
         Key::NoHeadings,

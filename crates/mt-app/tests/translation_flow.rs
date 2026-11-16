@@ -138,8 +138,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
             .expect("guard selector"),
         "Quit must still be pending"
     );
-    app.press("id:guard-save >> role:button")
-        .expect("save all and quit");
+    app.press("id:guard-save").expect("save all and quit");
 
     support::wait_for_file(
         &mut app,

@@ -6,15 +6,20 @@
 //! says the local work stays local.
 //!
 //! Contract: [`welcome`] is the column's content while no document is open;
-//! the shell gives it the column's measure and ground. It carries
-//! `test_id("welcome")` on its root.
+//! the shell gives it the column's measure and ground. Until a workspace is
+//! open it is the welcome, `test_id("welcome")` on its root; with one open it
+//! is the workspace's home, `test_id("workspace-home")`, listing its first
+//! files.
 //!
 //! There is no 'Don't show the welcome again' control: the setting that would
 //! back it (`show_welcome_on_startup`) is read by no launch path yet, so the
 //! control would write a value nothing reads. The chrome lane adds it when the
 //! startup path honours it.
 
-use mt_core::settings::{Language, RecentTarget, RecentTargetKind};
+use mt_core::{
+    settings::{Language, RecentTarget, RecentTargetKind},
+    workspace::tree,
+};
 use nsh_core::{
     Color,
     element::{Easing, Keyframe, KeyframeTiming},
@@ -25,7 +30,7 @@ use nsh_core::{
 use crate::{
     app_paths,
     i18n::{self, Key},
-    state::AppState,
+    state::{AppState, Entry},
     ui::{
         motion::HOVER_MS,
         prims,
@@ -39,8 +44,25 @@ use crate::{
 /// The paths the welcome lists under the four choices.
 const RECENTS: usize = 5;
 
-/// The welcome state.
+/// The workspace's files the column lists while none is open; Ctrl+P
+/// finds the rest.
+const WORKSPACE_FILES: usize = 12;
+
+/// The column while no document is open: the welcome until a workspace is
+/// open, then that workspace's home — a folder picked, the sample, a directory
+/// given on the command line or a recent workspace all leave the welcome.
 pub fn welcome(state: AppState, language: Language) -> impl IntoElement {
+    let no_workspace = state.clone();
+    let start_state = state.clone();
+    when(
+        move || no_workspace.root.get().is_none(),
+        move || start(start_state.clone(), language).into_element(),
+    )
+    .otherwise(move || workspace_home(state.clone(), language).into_element())
+}
+
+/// The welcome state.
+fn start(state: AppState, language: Language) -> impl IntoElement {
     let new_state = state.clone();
     let paste_state = state.clone();
     let sample_state = state.clone();
@@ -98,6 +120,95 @@ pub fn welcome(state: AppState, language: Language) -> impl IntoElement {
                     .child(prims::faint(s(S::StaysOnThisDevice, language))),
             ),
         )
+}
+
+/// An open workspace with no document on screen: its name, and its first
+/// files as quiet rows that open on a press.
+fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
+    let name_state = state.clone();
+    let files_state = state.clone();
+    // One read of the tree feeds both the rows and the empty line.
+    let files = computed(move || workspace_files(&files_state));
+    view()
+        .test_id("workspace-home")
+        .w_full()
+        .flex_col()
+        .gap(px(SPACE_1))
+        .pt(px(SPACE_5))
+        .child(
+            view()
+                .test_id("workspace-home-name")
+                .pb(px(SPACE_2))
+                .child(prims::ink(move || {
+                    let root = name_state.root.get().unwrap_or_default();
+                    SharedString::from(
+                        root.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| root.display().to_string()),
+                    )
+                })),
+        )
+        .child(each(
+            move || files.get(),
+            |entry: &Entry| entry.path.clone(),
+            move |entry: ReadSignal<Entry>, _| {
+                let entry = entry.get();
+                let state = state.clone();
+                let label = state
+                    .root
+                    .get_untracked()
+                    .map(|root| tree::display_relative(&root, &entry.path))
+                    .unwrap_or_else(|| entry.name.clone());
+                let path = entry.path.clone();
+                view()
+                    .test_id("workspace-home-file")
+                    .role(AccessibilityRole::Button)
+                    .optional_label(Some(SharedString::from(label.clone())))
+                    .window_drag(false)
+                    .cursor_pointer()
+                    .pl(px(SPACE_3))
+                    .py(px(SPACE_1))
+                    .hover(|s| s.text_color(tokens::palette().ink))
+                    .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                    .on_press(move || state.open_file(path.clone()))
+                    .child(
+                        text(label)
+                            .font_family(FONT_UI)
+                            .text_size(px(TYPE_UI))
+                            .line_height(px(TYPE_UI_LINE))
+                            .text_color(move || tokens::palette().ink_rest)
+                            .truncate(),
+                    )
+            },
+        ))
+        .child(when(
+            move || files.with(Vec::is_empty),
+            move || {
+                view()
+                    .test_id("workspace-home-empty")
+                    .child(prims::faint(s(S::NoFiles, language)))
+                    .into_element()
+            },
+        ))
+        .child(
+            view().pt(px(SPACE_6)).child(
+                view()
+                    .test_id("workspace-home-find")
+                    .child(prims::faint(s(S::FindAFile, language))),
+            ),
+        )
+}
+
+/// The files [`workspace_home`] lists: the workspace's files, in the
+/// tree's order, capped.
+fn workspace_files(state: &AppState) -> Vec<Entry> {
+    state
+        .entries
+        .get()
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .take(WORKSPACE_FILES)
+        .collect()
 }
 
 /// The blinking caret at the column origin: 2px of ink, 1.06s steps.
@@ -190,38 +301,79 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
             move |target: ReadSignal<RecentTarget>, _| {
                 let target = target.get();
                 let state = state.clone();
+                let kind = match target.kind {
+                    RecentTargetKind::Workspace => i18n::t(language, Key::Workspace),
+                    RecentTargetKind::File => i18n::t(language, Key::File),
+                };
+                // A target that is gone stays listed, marked and disabled: the
+                // row says what happened rather than failing on a press.
+                let missing = !target_exists(&target);
+                let label = if missing {
+                    format!(
+                        "{kind} {} \u{2014} {}",
+                        target.display_name,
+                        s(S::Missing, language)
+                    )
+                } else {
+                    format!("{kind} {}", target.display_name)
+                };
                 let target_for_open = target.clone();
                 view()
                     .test_id("welcome-recent")
+                    .role(AccessibilityRole::Button)
+                    .optional_label(Some(SharedString::from(label)))
+                    .disabled(missing)
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_2))
                     .pl(px(SPACE_3))
                     .py(px(SPACE_1))
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(tokens::palette().ink))
-                    .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-                    .on_press(move || state.open_recent(&target_for_open))
+                    .when(!missing, |row| {
+                        row.cursor_pointer()
+                            .hover(|s| s.text_color(tokens::palette().ink))
+                            .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                    })
+                    .on_press(move || {
+                        // Checked again at the press: the target may have gone
+                        // since the row was drawn.
+                        if target_exists(&target_for_open) {
+                            state.open_recent(&target_for_open);
+                        }
+                    })
                     .child(
-                        text(match target.kind {
-                            RecentTargetKind::Workspace => i18n::t(language, Key::Workspace),
-                            RecentTargetKind::File => i18n::t(language, Key::File),
-                        })
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || tokens::palette().ink_faint),
+                        text(kind)
+                            .font_family(FONT_UI)
+                            .text_size(px(TYPE_UI))
+                            .line_height(px(TYPE_UI_LINE))
+                            .text_color(move || tokens::palette().ink_faint),
                     )
                     .child(
                         text(target.display_name.clone())
                             .font_family(FONT_UI)
                             .text_size(px(TYPE_UI))
                             .line_height(px(TYPE_UI_LINE))
-                            .text_color(move || tokens::palette().ink_rest)
+                            .text_color(move || {
+                                if missing {
+                                    tokens::palette().ink_faint
+                                } else {
+                                    tokens::palette().ink_rest
+                                }
+                            })
                             .truncate(),
                     )
+                    .when(missing, |row| {
+                        row.child(prims::faint(s(S::Missing, language)))
+                    })
             },
         ))
+}
+
+/// Whether a recent target is still there, as the kind it was recorded as.
+fn target_exists(target: &RecentTarget) -> bool {
+    match target.kind {
+        RecentTargetKind::Workspace => target.path.is_dir(),
+        RecentTargetKind::File => target.path.is_file(),
+    }
 }
 
 /// Shows the system's folder picker and opens what the user picks; a cancel
@@ -253,6 +405,9 @@ enum S {
     Paste,
     OpenSample,
     StaysOnThisDevice,
+    Missing,
+    NoFiles,
+    FindAFile,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -263,6 +418,9 @@ fn s(key: S, language: Language) -> &'static str {
             S::Paste => "Paste",
             S::OpenSample => "Open sample",
             S::StaysOnThisDevice => "Opening, editing and search stay on this device.",
+            S::Missing => "Missing",
+            S::NoFiles => "No files in this folder yet.",
+            S::FindAFile => "Ctrl+P finds any file in this folder.",
         },
         Language::Chinese => match key {
             S::OpenFolder => "打开文件夹",
@@ -270,6 +428,9 @@ fn s(key: S, language: Language) -> &'static str {
             S::Paste => "粘贴",
             S::OpenSample => "打开示例",
             S::StaysOnThisDevice => "打开、编辑与搜索都在这台设备上完成。",
+            S::Missing => "已不存在",
+            S::NoFiles => "这个文件夹里还没有文件。",
+            S::FindAFile => "按 Ctrl+P 查找这个文件夹中的任意文件。",
         },
     }
 }

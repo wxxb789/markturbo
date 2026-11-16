@@ -236,10 +236,12 @@ REQUIRED_OBSERVATION_KEYS = {
 # id, clipped until the pointer widens the rail over a file row.
 RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
 TAB_CLOSE_AUTOMATION_ID = "rail-close"
-# Anonymous Buttons named by their accessibility labels (`ui/notices.rs`).
-# Keep mine's confirmation is an nsh system alert outside the UIA tree,
-# answered with Enter (`runtime.py` `confirm_system_alert`).
-KEEP_MINE_NAME = "Keep mine"
+# The conflict and recovery actions (`ui/notices.rs`), each a Button with its
+# own id and its label as Name. The one recovered record is row 0. Keep mine's
+# confirmation is an nsh system alert outside the UIA tree, answered with
+# Enter (`runtime.py` `confirm_system_alert`).
+KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
+RESTORE_AUTOMATION_ID = "recovery-restore-0"
 RESTORE_NAME = "Restore"
 UI_SOURCE_REQUIREMENTS = {
     "crates/mt-app/src/ui/rail.rs": (
@@ -255,7 +257,11 @@ UI_SOURCE_REQUIREMENTS = {
         '"Changed on disk"',
         '"Keep mine"',
         '"Restore"',
-        "accessibility_label(Some(SharedString::from(label)))",
+        '"guard-save"',
+        '"guard-dont-save"',
+        '"guard-cancel"',
+        '"conflict-keep-mine"',
+        '"recovery-restore-{index}"',
     ),
     "crates/mt-app/src/ui/titlebar.rs": (
         '"title-settings"',
@@ -887,9 +893,9 @@ class Goal02Harness(BaseNativeHarness):
             after_conflict = self.editor_fingerprint(app)
             if after_conflict != dirty:
                 raise HarnessFailure("CONFLICT_CHANGED_EDITOR")
-            keep_mine = self.find_named(
+            keep_mine = self.find_control(
                 app,
-                KEEP_MINE_NAME,
+                KEEP_MINE_AUTOMATION_ID,
                 "Button",
                 "CONFLICT_KEEP_MINE_UIA_TIMEOUT",
                 "CONFLICT_KEEP_MINE_UIA_CONTRACT_MISMATCH",
@@ -948,9 +954,9 @@ class Goal02Harness(BaseNativeHarness):
         second = self.launch(document, data, config, workspace, stderr)
         try:
             restore_started = time.perf_counter()
-            restore = self.find_named(
+            restore = self.find_control(
                 second,
-                RESTORE_NAME,
+                RESTORE_AUTOMATION_ID,
                 "Button",
                 "RECOVERY_RESTORE_UIA_TIMEOUT",
                 "RECOVERY_RESTORE_UIA_CONTRACT_MISMATCH",

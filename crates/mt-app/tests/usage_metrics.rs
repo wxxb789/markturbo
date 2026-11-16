@@ -57,20 +57,17 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     app.wait_for("text:Usage-counter preference saved.")
         .expect("consent persisted");
     assert!(mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
-    app.press("id:settings-close >> role:button")
-        .expect("close settings");
+    app.press("id:settings-close").expect("close settings");
     app.set_clipboard(Some("PRIVATE-PASTE-SENTINEL".to_owned()));
     // Paste is the welcome state's control: no document is open yet.
-    app.press("id:welcome-paste >> role:button")
-        .expect("paste an artifact");
+    app.press("id:welcome-paste").expect("paste an artifact");
     support::wait_for_path(&mut app, &store, "count the paste", Duration::from_secs(5));
     drop(app);
 
     let mut app = start();
     assert!(mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
     open_settings(&mut app);
-    app.press("id:usage-inspect >> role:button")
-        .expect("inspect daily counts");
+    app.press("id:usage-inspect").expect("inspect daily counts");
     app.wait_for("id:usage-details").expect("daily details");
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
     let day = json["days"].as_object().unwrap().values().next().unwrap();
@@ -78,8 +75,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     assert_eq!(day["events"]["first_launch"], 1);
     app.on_pick_save_path(Some(export.clone()))
         .expect("choose export destination");
-    app.press("id:usage-export >> role:button")
-        .expect("deliberate export");
+    app.press("id:usage-export").expect("deliberate export");
     support::wait_for_path(
         &mut app,
         &export,
@@ -106,10 +102,9 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         .expect("disable saved");
     assert!(!mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
     let disabled_bytes = std::fs::read(&store).unwrap();
-    app.press("id:settings-close >> role:button")
-        .expect("close settings");
+    app.press("id:settings-close").expect("close settings");
     app.set_clipboard(Some("ANOTHER-PRIVATE-PASTE".to_owned()));
-    app.press("id:welcome-paste >> role:button")
+    app.press("id:welcome-paste")
         .expect("local paste while disabled");
     app.wait_for("text:ANOTHER-PRIVATE-PASTE")
         .expect("paste completed");
@@ -120,8 +115,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     assert!(!mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
     assert_eq!(std::fs::read(&store).unwrap(), disabled_bytes);
     open_settings(&mut app);
-    app.press("id:usage-clear >> role:button")
-        .expect("clear local aggregate");
+    app.press("id:usage-clear").expect("clear local aggregate");
     app.wait_for(
         "text:Local counts deleted. Recording preference and exported copies are unchanged.",
     )
