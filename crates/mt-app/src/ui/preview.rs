@@ -101,7 +101,19 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
                             .is_some_and(|tab| matches!(tab.pane.get(), Pane::SplitWeb))
                     }
                 },
-                move || web(web_state.clone(), language).into_element(),
+                // Keyed by the active tab, as the column and the native
+                // preview are: switching between two SplitWeb tabs remounts
+                // the pane on the new document, its page and its trust.
+                move || {
+                    let tabs_state = web_state.clone();
+                    let pane_state = web_state.clone();
+                    each(
+                        move || tabs_state.active_tab().into_iter().collect::<Vec<_>>(),
+                        |tab: &Tab| tab.id,
+                        move |_, _| web(pane_state.clone(), language),
+                    )
+                    .into_element()
+                },
             )
             .otherwise(move || rendered(preview_state.clone(), language).into_element()),
         )
@@ -402,6 +414,33 @@ mod tests {
             .child(rendered(state, Language::English))
     }
 
+    /// Two documents in SplitWeb: the first trusted, the second (active)
+    /// restricted, and a button that switches to the first.
+    #[component]
+    fn SplitWebProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        state.new_document();
+        let tabs = state.tabs.get();
+        for tab in &tabs {
+            tab.pane.set(Pane::SplitWeb);
+        }
+        tabs[0].web_trusted.set(true);
+        let first = tabs[0].id;
+        let switch = state.clone();
+        view()
+            .test_id("probe-split-web")
+            .w(px(352.0))
+            .h(px(700.0))
+            .flex_col()
+            .child(prims::quiet_action(
+                "probe-switch",
+                "Probe switch",
+                move || switch.set_active(first),
+            ))
+            .child(field(state, Language::English))
+    }
+
     /// What a probe put on screen, for a failure message.
     fn dump(app: &Headless) -> String {
         app.screen()
@@ -502,6 +541,36 @@ mod tests {
             .expect("start the probe");
         app.wait_for("id:preview").expect("the preview renders");
         assert!(texts(&app).contains("Release plan"), "{}", dump(&app));
+    }
+
+    /// Switching straight between two SplitWeb tabs rebinds the field's web
+    /// pane to the new document: its trust banner follows the active tab.
+    #[test]
+    fn the_field_web_pane_follows_the_active_tab() {
+        let restricted = i18n::t(Language::English, Key::ScriptsRestricted);
+        let trusted = i18n::t(Language::English, Key::ScriptsTrusted);
+        let mut app = Headless::start(EngineConfig::new(Root::of::<SplitWebProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:web-pane").expect("the web pane renders");
+        app.settle();
+        let shown = texts(&app);
+        assert!(shown.contains(restricted), "{}", dump(&app));
+        assert!(!shown.contains(trusted), "{}", dump(&app));
+
+        app.press("label:Probe switch")
+            .expect("switch to the first tab");
+        app.settle();
+        let shown = texts(&app);
+        assert!(shown.contains(trusted), "{}", dump(&app));
+        assert!(!shown.contains(restricted), "{}", dump(&app));
+        assert!(
+            app.screen()
+                .layout_nodes()
+                .iter()
+                .all(|node| node.test_id.as_deref() != Some("web-trust")),
+            "a trusted document offers no Trust scripts action: {}",
+            dump(&app)
+        );
     }
 
     /// The whole app, with a document opened in Split: the shell's field holds

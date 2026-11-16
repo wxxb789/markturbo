@@ -91,7 +91,7 @@ const NOTICE_MS: f32 = 1500.0;
 const COOL_MS: f32 = 3.0 * motion::FILAMENT_RELEASE_TAU_MS;
 /// The row height the height rule counts with (type plus its gap).
 const ROW_H: f32 = 22.0;
-/// What the card may take of the window, and the chrome below its rows.
+/// What the card may take of the window, and the chrome around its rows.
 const CARD_MAX_FRACTION: f32 = 0.80;
 const CARD_CHROME_H: f32 = 320.0;
 /// A tap must never complete a hold: the watchdog a key tap charges for stays
@@ -182,13 +182,10 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
 /// A `dynamic` region, so a scope switch redraws all of it.
 fn card_body(state: &AppState, language: Language, hold: &Hold, is_revision: bool) -> AnyElement {
     let waiting = waiting(state);
-    let rows = waiting.consent.as_ref().map(|consent| {
-        rows(
-            consent,
-            language,
-            row_budget(window().height.0 * CARD_MAX_FRACTION),
-        )
-    });
+    let rows = waiting
+        .consent
+        .as_ref()
+        .map(|consent| rows(consent, language));
     let total = rows.as_ref().map_or(0, |rows| rows.total);
     hold.rebuild(waiting.consent.as_ref(), total);
     match waiting.consent.as_ref() {
@@ -247,7 +244,14 @@ fn disclosure_body(
             consent.disclosure.endpoint(),
         ))))
         .child(scope_row(scope_state, language, waiting))
-        .child(rows_section(language, rows, loopback))
+        .child(
+            // Every row is on the card: a long manifest scrolls in place, so
+            // the scope, the total and the controls stay in view.
+            scroll()
+                .test_id("consent-rows-scroll")
+                .max_h(px(rows_max_h(window().height.0 * CARD_MAX_FRACTION)))
+                .child(rows_section(language, rows, loopback)),
+        )
         .child(
             view()
                 .flex_col()
@@ -368,9 +372,8 @@ enum Tone {
     Unlit,
 }
 
-/// The content rows that leave, then the items that stay. Every group obeys
-/// the height rule: what does not fit collapses into one summed row, so no
-/// manifest can push the total and the buttons past the window.
+/// The content rows that leave, then the items that stay: every item, each
+/// with its path, size and reason. The caller bounds the section's height.
 fn rows_section(language: Language, rows: &Rows, loopback: bool) -> impl IntoElement {
     let tone = tone_of(loopback);
     let mut section = view()
@@ -763,110 +766,51 @@ struct Row {
 /// The card's rows, and the total that equals the sum on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rows {
-    /// The items whose content leaves, in display order, with any collapse row
-    /// last.
+    /// The items whose content leaves, in display order.
     leaving: Vec<Row>,
     /// Package entries that leave as path, size and hash only: listed with
     /// their file size, but not part of the total — what they contribute at
     /// the boundary is request framing, which the card discloses without a
-    /// figure. A collapse row closes the group.
+    /// figure.
     metadata: Vec<Row>,
-    /// The items that stay. A collapse row closes the group.
+    /// The items that stay.
     stays: Vec<Row>,
     /// The content bytes the rows above the total line sum to. Request framing
     /// is not part of it and is not counted anywhere.
     total: u64,
 }
 
-/// The rows of one consent, in the card's words. `cap` is how many rows the
-/// height rule leaves the whole table, captions included: a group that does
-/// not fit collapses its tail into one summed row, and every group reserves
-/// what the groups below it need, so the total and the buttons stay pinned.
-fn rows(consent: &OutboundConsent, language: Language, cap: usize) -> Rows {
-    let mut content_bytes = 0_u64;
-    for item in consent.items.iter().filter(|item| item.content_leaves) {
-        content_bytes = content_bytes.saturating_add(item.bytes);
-    }
-    let content_items: Vec<&OutboundItem> = consent
+/// The rows of one consent, in the card's words: one row per item, none
+/// hidden, because every file that leaves is disclosed before consent.
+fn rows(consent: &OutboundConsent, language: Language) -> Rows {
+    let content_bytes = consent
         .items
         .iter()
         .filter(|item| item.content_leaves)
+        .fold(0_u64, |sum, item| sum.saturating_add(item.bytes));
+    let leaving = consent
+        .items
+        .iter()
+        .filter(|item| item.content_leaves)
+        .map(|item| row_of(item, language))
         .collect();
-    let metadata_items: Vec<&OutboundItem> = consent
+    let metadata = consent
         .items
         .iter()
         .filter(|item| !item.content_leaves)
+        .map(|item| row_of(item, language))
         .collect();
-    let stays_items: Vec<&OutboundItem> = consent.stays.iter().collect();
-    let mut left = cap.max(2);
-    let mut leaving = Vec::new();
-    let caption = usize::from(!content_items.is_empty());
-    // What the groups below need whatever this one does: a caption and one
-    // row each.
-    let reserve =
-        2 * usize::from(!metadata_items.is_empty()) + 2 * usize::from(!stays_items.is_empty());
-    if !content_items.is_empty() {
-        let share = left.saturating_sub(caption).saturating_sub(reserve).max(1);
-        leaving = fit(&content_items, share, language, OutboundOrigin::PackageFile);
-    }
-    left = left.saturating_sub(caption + leaving.len());
-    let mut metadata = Vec::new();
-    if !metadata_items.is_empty() {
-        let share = left
-            .saturating_sub(1)
-            .saturating_sub(2 * usize::from(!stays_items.is_empty()))
-            .max(1);
-        metadata = fit(
-            &metadata_items,
-            share,
-            language,
-            OutboundOrigin::PackageFile,
-        );
-        left = left.saturating_sub(1 + metadata.len());
-    }
-    let mut stays = Vec::new();
-    if !stays_items.is_empty() {
-        let share = left.saturating_sub(1).max(1);
-        stays = fit(
-            &stays_items,
-            share,
-            language,
-            OutboundOrigin::ExcludedSource,
-        );
-    }
+    let stays = consent
+        .stays
+        .iter()
+        .map(|item| row_of(item, language))
+        .collect();
     Rows {
         leaving,
         metadata,
         stays,
         total: content_bytes,
     }
-}
-
-/// One group under the height rule: at most `share` rows, with the ones that
-/// do not fit summed into one collapse row.
-fn fit(
-    items: &[&OutboundItem],
-    share: usize,
-    language: Language,
-    collapse: OutboundOrigin,
-) -> Vec<Row> {
-    let share = share.max(1);
-    if items.len() <= share {
-        return items.iter().map(|item| row_of(item, language)).collect();
-    }
-    let shown = share - 1;
-    let mut rows: Vec<Row> = items[..shown]
-        .iter()
-        .map(|item| row_of(item, language))
-        .collect();
-    rows.push(Row {
-        origin: collapse,
-        label: more_files(language, items.len() - shown),
-        reason: String::new(),
-        bytes: items[shown..].iter().map(|item| item.bytes).sum(),
-        has_bytes: true,
-    });
-    rows
 }
 
 /// One item as a row.
@@ -883,15 +827,16 @@ fn row_of(item: &OutboundItem, language: Language) -> Row {
     }
 }
 
-/// How many rows the height rule leaves in a card that may take `height`
-/// points of the window.
-fn row_budget(height: f32) -> usize {
+/// How tall the scrolling rows may grow in a card that may take `height`
+/// points of the window: at least two rows, at most 64.
+fn rows_max_h(height: f32) -> f32 {
     let rows = ((height - CARD_CHROME_H) / ROW_H).floor();
-    if rows.is_finite() {
-        (rows.clamp(2.0, 64.0)) as usize
+    let rows = if rows.is_finite() {
+        rows.clamp(2.0, 64.0)
     } else {
-        2
-    }
+        2.0
+    };
+    rows * ROW_H
 }
 
 /// An item's own name when it has no path.
@@ -992,14 +937,6 @@ fn sent_bytes(language: Language, bytes: u64) -> String {
     match language {
         Language::English => format!("{} content bytes", bytes_label(bytes)),
         Language::Chinese => format!("{} 内容字节", bytes_label(bytes)),
-    }
-}
-
-/// The collapse row: what did not fit, and its bytes.
-fn more_files(language: Language, count: usize) -> String {
-    match language {
-        Language::English => format!("{count} more files"),
-        Language::Chinese => format!("另外 {count} 个文件"),
     }
 }
 
@@ -1571,7 +1508,7 @@ mod tests {
             ],
             stays: Vec::new(),
         };
-        let rows = rows(&consent, Language::English, 20);
+        let rows = rows(&consent, Language::English);
         assert_eq!(rows.total, 800);
         assert_eq!(
             rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
@@ -1598,7 +1535,7 @@ mod tests {
             ],
             stays: vec![item(OutboundOrigin::Omission, "notes/old.md", 0, false)],
         };
-        let rows = rows(&consent, Language::English, 20);
+        let rows = rows(&consent, Language::English);
         assert_eq!(rows.total, 3_528, "the package's content");
         assert_eq!(
             rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
@@ -1629,90 +1566,35 @@ mod tests {
             ],
             stays: Vec::new(),
         };
-        let rows = rows(&consent, Language::English, 20);
+        let rows = rows(&consent, Language::English);
         assert_eq!(rows.total, 1_420);
     }
 
     #[test]
-    fn overflow_collapses_into_a_row_that_keeps_the_total_whole() {
-        let items: Vec<OutboundItem> = (0..8)
-            .map(|index| {
-                item(
-                    OutboundOrigin::PackageFile,
-                    &format!("file{index}.md"),
-                    100,
-                    true,
-                )
-            })
-            .collect();
-        let consent = OutboundConsent {
-            disclosure: disclosure(OutboundScope::document(1)),
-            items,
-            stays: Vec::new(),
-        };
-        let rows = rows(&consent, Language::English, 4);
-        // Four rows of budget, one of them the caption: two files and the
-        // collapse row for the other six.
-        assert_eq!(rows.leaving.len(), 3, "two files and the collapse row");
-        assert_eq!(rows.leaving[2].bytes, 600, "the hidden six, summed");
-        let sum: u64 = rows.leaving.iter().map(|row| row.bytes).sum();
-        assert_eq!(sum, rows.total);
-    }
-
-    #[test]
-    fn every_group_obeys_the_height_rule() {
-        // A package with more rows than the window can take in every group:
-        // the total and the buttons stay above the fold because each group
-        // collapses its tail.
-        let mut items: Vec<OutboundItem> = (0..12)
-            .map(|index| {
-                item(
-                    OutboundOrigin::PackageFile,
-                    &format!("file{index}.md"),
-                    100,
-                    true,
-                )
-            })
-            .collect();
-        items.extend((0..12).map(|index| {
-            item(
-                OutboundOrigin::PackageFile,
-                &format!("asset{index}.png"),
-                4_000,
-                false,
-            )
-        }));
-        let consent = OutboundConsent {
-            disclosure: disclosure(OutboundScope::document(1)),
-            items,
-            stays: (0..12)
-                .map(|index| {
-                    item(
-                        OutboundOrigin::ExcludedSource,
-                        &format!("stay{index}.md"),
-                        50,
-                        false,
-                    )
-                })
-                .collect(),
-        };
-        let rows = rows(&consent, Language::English, 8);
-        // Three captions and the three groups' rows, nothing more.
-        let drawn = 3 + rows.leaving.len() + rows.metadata.len() + rows.stays.len();
-        assert!(drawn <= 8, "{drawn} rows drawn for a budget of 8");
-        for group in [&rows.leaving, &rows.metadata, &rows.stays] {
-            assert!(!group.is_empty(), "each group keeps a row of its own");
-            assert!(
-                group
-                    .last()
-                    .is_some_and(|row| row.label.contains("more files")),
-                "each group's tail collapses"
-            );
+    fn a_manifest_taller_than_the_card_scrolls_and_hides_no_file() {
+        // An Agent Skill package with more files in every group than the
+        // card's height holds: each file is still on the card, by path, size
+        // and reason, and the hold sends exactly the total of those rows.
+        let consent = large_consent();
+        let budget = (rows_max_h(800.0 * CARD_MAX_FRACTION) / ROW_H) as usize;
+        assert!(
+            consent.items.len() + consent.stays.len() > budget,
+            "the manifest overflows the {budget}-row region"
+        );
+        let (mut app, _config) = start_harness();
+        app.press("id:harness-large")
+            .expect("open the large manifest");
+        app.wait_for("text:skills/file39.md")
+            .expect("the last file that leaves");
+        for item in consent.items.iter().chain(&consent.stays) {
+            let path = item.path.as_deref().expect("a path");
+            assert!(app.shows(path), "{path} is on the card");
         }
-        assert_eq!(
-            rows.leaving.iter().map(|row| row.bytes).sum::<u64>(),
-            rows.total,
-            "the collapse row keeps the total whole"
+        assert!(app.shows("4,000 B"), "the total is every leaving row");
+        assert!(app.shows("Hold to send"), "the hold stays on the card");
+        assert!(
+            app.wait_for("id:consent-rows-scroll").is_ok(),
+            "the rows scroll in place"
         );
     }
 
@@ -1810,6 +1692,30 @@ mod tests {
         }
     }
 
+    /// An Agent Skill package taller than the card: 40 files leave, 12 leave
+    /// as metadata and 12 stay.
+    fn large_consent() -> OutboundConsent {
+        let file =
+            |name: String, bytes, leaves| item(OutboundOrigin::PackageFile, &name, bytes, leaves);
+        OutboundConsent {
+            disclosure: disclosure(OutboundScope::document(1)),
+            items: (0..40)
+                .map(|index| file(format!("skills/file{index}.md"), 100, true))
+                .chain((0..12).map(|index| file(format!("skills/asset{index}.png"), 4_000, false)))
+                .collect(),
+            stays: (0..12)
+                .map(|index| {
+                    item(
+                        OutboundOrigin::ExcludedSource,
+                        &format!("stay{index}.md"),
+                        50,
+                        false,
+                    )
+                })
+                .collect(),
+        }
+    }
+
     /// The card over a state that already has a consent waiting: the shell's
     /// `when(is_open)` around [`card`]. One control stands in for the scope
     /// switch, replacing the manifest the card is bound to (the card's own
@@ -1825,6 +1731,7 @@ mod tests {
         let card_state = state.clone();
         let switch_state = state.clone();
         let reopen_state = state.clone();
+        let large_state = state.clone();
         view()
             .w(px(1_200.0))
             .h(px(800.0))
@@ -1840,6 +1747,15 @@ mod tests {
                             .set(Some(sample_consent_without_context()));
                     })
                     .child(prims::rest("swap")),
+            )
+            .child(
+                view()
+                    .test_id("harness-large")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        large_state.review_manifest.set(Some(large_consent()));
+                    })
+                    .child(prims::rest("large")),
             )
             .child(
                 view()
