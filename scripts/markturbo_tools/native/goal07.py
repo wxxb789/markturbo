@@ -12,6 +12,13 @@ and both sends need a real pointer hold on `consent-send`. The Revision field
 decides one docked hunk at a time (`Accept` / `Reject`, counted by `n of m
 decided`) and `Done` performs the one write. Editor text is read with the
 editor's Select All + Copy; Save runs from the title menu.
+
+Ctrl+Enter is state-dependent: it starts Review from the title row
+(`ui/titlebar.rs`), sends from the consent card (`ui/consent.rs`), and is Done
+on the Revision field (`ui/revision.rs`). It is sent only to start a Review and,
+in the stale case, to prove Done stays unbound; consent is always a pointer
+hold. Trust scripts' Run scripts confirmation is an nsh system alert outside
+the UIA tree, answered with Enter (`runtime.py` `confirm_system_alert`).
 """
 
 from __future__ import annotations
@@ -27,7 +34,12 @@ from urllib.parse import urlsplit
 
 from . import goal07_provider as provider_fixtures
 from .goal03 import Goal03Harness as ClipboardNativeHarness
-from .source_contract import production_markers_present, production_source, rust_source_views
+from .source_contract import (
+    alert_enter_confirms,
+    production_markers_present,
+    production_source,
+    rust_source_views,
+)
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -165,9 +177,9 @@ REVISION_STALE_TEXT = "Stale \u2014 edited after review"
 # around the docked hunk's proposed lines.
 REVISION_COPY_AUTOMATION_ID = "revision-copy"
 REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
-# `ui/preview.rs` and `state.rs` `request_web_trust`.
+# `ui/preview.rs`. `state.rs` `request_web_trust` confirms with an nsh system
+# alert outside the UIA tree, answered with Enter (`confirm_system_alert`).
 TRUST_SCRIPTS_NAME = "Trust scripts"
-TRUST_CONFIRM_NAME = "Run scripts"
 TRUSTED_BANNER = "Trusted: scripts may run"
 RESTRICTED_BANNER = "Restricted: scripts disabled"
 UI_SOURCE_REQUIREMENTS = {
@@ -1163,6 +1175,10 @@ def stale_apply_source_contract_ok() -> bool:
 def source_contract_failure() -> str | None:
     if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
         return "REVISION_SOURCE_CONTRACT_MISSING"
+    if not alert_enter_confirms(
+        REPO / "crates/mt-app/src/state.rs", "fn request_web_trust(", "trust"
+    ):
+        return "REVISION_SOURCE_CONTRACT_MISSING"
     return None
 
 
@@ -1714,7 +1730,13 @@ class Goal07Harness(ClipboardNativeHarness):
             app = self.launch_app(source, data, config, workspace, stderr)
             self.menu_command(app, MENU_WEB_AUTOMATION_ID)
             self._press_named(app, TRUST_SCRIPTS_NAME, "TRUST_BUTTON")
-            self._press_named(app, TRUST_CONFIRM_NAME, "TRUST_CONFIRM")
+            # The Run scripts alert is outside the UIA tree; Enter answers it
+            # with Run scripts (`alert_enter_confirms`).
+            self.confirm_system_alert(
+                app,
+                lambda: not self.name_present(app, TRUSTED_BANNER, "Text"),
+                "TRUST_ENABLED_BEFORE_CONFIRMATION",
+            )
             self.wait_name(app, TRUSTED_BANNER, "Text", "TRUST_ENABLE_STATE_TIMEOUT")
             trust_before = True
             # Leaving the Web pane must hand keyboard ownership back to the

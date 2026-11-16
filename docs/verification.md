@@ -168,9 +168,30 @@ How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
 - UIA Invoke is one tap. The consent card's `consent-send` sends only after a
   held press, so the harnesses hold the real pointer past the control's 1.2 s
   threshold; an Invoke is never consent.
+- Ctrl+Enter depends on state: it starts Review from the title row, sends from
+  the consent card, and is Done on the Revision field. The harnesses send it
+  only in the state whose action they mean.
+- nsh system alerts (`alert_dialog()`) are not in the UIA tree: they are drawn
+  inside the window as hosted items, which have no accessibility hook. This
+  covers the Overwrite confirmation after Keep mine (goal 02) and the Run
+  scripts confirmation after Trust scripts (goal 07). While an alert shows it
+  takes every key. Enter presses its first button, or the last regular
+  `.action` when it has one. The harnesses therefore check that the press alone changed
+  nothing, then send Enter from the main window's keyboard focus, and prove the
+  decision by its effect: the file holds the edited bytes, or the Trusted
+  banner appears. The source check requires each alert to list the confirming
+  destructive button first and have no regular `.action`. Test-id'd, in-window
+  confirmation cards would let a harness select the button directly.
 
 Each harness checks that the selectors it uses still exist in production Rust
 source (test modules and comments do not count) before launching.
+
+Goal 07 evidence keeps `schema_version` 1 although the port renamed
+observation keys (`revision_evaluation.py` accepts only version 1). Three
+retained GPUI-era files, `docs/evidence/goal-07-final-ablation-f1ec266c.json`,
+`goal-07-final-ablation-f1ec266c-r2.json` and
+`goal-07-post-ablation-trust-f1ec266c.json`, no longer validate. Bumping the
+version needs a matching change in `revision_evaluation.py`.
 
 Known product gaps the ported cases will report as FAIL until the UI provides
 them: no selection Review command (goal 06/07 selection scope expects a

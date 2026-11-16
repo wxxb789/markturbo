@@ -257,7 +257,9 @@ def _write_goal07_source_fixture(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((REPO / relative).read_bytes())
     (root / STATE_RS).write_text(
-        'fn request_web_trust() { alert().destructive("trust", "Run scripts"); }\n'
+        'fn request_web_trust() {\n'
+        '    alert_dialog().destructive("trust", "Run scripts").cancel("cancel", "Cancel");\n'
+        '}\n'
         + "impl Fixture {\n"
         + apply
         + "}\n",
@@ -765,6 +767,26 @@ class SourceContractFixtureTests(unittest.TestCase):
     def test_safe_source_fixture_passes_all_goal07_source_checkers(self) -> None:
         self.assertEqual(self.checks(), (None, True, True, True))
 
+    def test_source_contract_requires_enter_to_answer_the_trust_alert_with_run_scripts(self) -> None:
+        # The harness answers the UIA-invisible alert with Enter, which presses
+        # the first button unless a Default-styled `.action` exists.
+        safe = 'alert_dialog().destructive("trust", "Run scripts").cancel("cancel", "Cancel")'
+        for unsafe in (
+            'alert_dialog().cancel("cancel", "Cancel").destructive("trust", "Run scripts")',
+            'alert_dialog().destructive("trust", "Run scripts").action("later", "Later")',
+        ):
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_goal07_source_fixture(root)
+                state = root / STATE_RS
+                text = state.read_text(encoding="utf-8")
+                self.assertIn(safe, text)
+                state.write_text(text.replace(safe, unsafe), encoding="utf-8")
+                with mock.patch.object(HARNESS, "REPO", root):
+                    self.assertEqual(
+                        HARNESS.source_contract_failure(), "REVISION_SOURCE_CONTRACT_MISSING"
+                    )
+
     def test_each_missing_selector_returns_the_source_contract_failure(self) -> None:
         for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
             for marker in markers:
@@ -907,6 +929,8 @@ class SourceAndCliTests(unittest.TestCase):
                 harness.launch_app = mock.Mock(return_value=app)
                 harness.menu_command = mock.Mock()
                 harness._press_named = mock.Mock()
+                harness.confirm_system_alert = mock.Mock()
+                harness.name_present = mock.Mock(return_value=False)
                 harness.wait_name = mock.Mock()
                 harness.editor_control = mock.Mock()
                 harness.activate_source_layout = mock.Mock(side_effect=AssertionError("premature Source"))
@@ -940,6 +964,9 @@ class SourceAndCliTests(unittest.TestCase):
                 order = mock.Mock()
                 for name in ("menu_command", "editor_control", "run_review", "editor_fingerprint"):
                     order.attach_mock(getattr(harness, name), name)
+                trust = mock.Mock()
+                for name in ("_press_named", "confirm_system_alert", "wait_name"):
+                    trust.attach_mock(getattr(harness, name), name)
 
                 def wait_once(check, _timeout, code, **_kwargs):
                     if not check():
@@ -969,10 +996,26 @@ class SourceAndCliTests(unittest.TestCase):
                             mock.call.editor_control(app),
                             mock.call.run_review(app, provider, preserve_focus=True),
                         ])
+                        # The Run scripts alert is outside UIA: it is answered with
+                        # Enter only while trust is still off, then proven by the banner.
+                        self.assertEqual(trust.mock_calls[:3], [
+                            mock.call._press_named(app, HARNESS.TRUST_SCRIPTS_NAME, "TRUST_BUTTON"),
+                            mock.call.confirm_system_alert(
+                                app, mock.ANY, "TRUST_ENABLED_BEFORE_CONFIRMATION"
+                            ),
+                            mock.call.wait_name(
+                                app, HARNESS.TRUSTED_BANNER, "Text", "TRUST_ENABLE_STATE_TIMEOUT"
+                            ),
+                        ])
                         self.assertEqual(
                             [call.args[1] for call in harness._press_named.call_args_list],
-                            [HARNESS.TRUST_SCRIPTS_NAME, HARNESS.TRUST_CONFIRM_NAME],
+                            [HARNESS.TRUST_SCRIPTS_NAME],
                         )
+                        still_undecided = harness.confirm_system_alert.call_args.args[1]
+                        self.assertTrue(still_undecided())
+                        harness.name_present.return_value = True
+                        self.assertFalse(still_undecided())
+                        harness.name_present.assert_called_with(app, HARNESS.TRUSTED_BANNER, "Text")
                         harness.wait_name.assert_any_call(
                             app, HARNESS.RESTRICTED_BANNER, "Text", "TRUST_RESTRICTED_STATE_TIMEOUT"
                         )

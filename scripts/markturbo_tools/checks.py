@@ -44,8 +44,7 @@ TOOLING_TESTS = (
 )
 
 # Native harness unit tests describe a Windows automation path that does not run
-# on PRs and still targets the retired GPUI surface. Run them only when changing
-# the harness, not for every product change.
+# on PRs. Run them only when changing the harness, not for every product change.
 NATIVE_TOOLING_TESTS = (
     "scripts.tests.test_native_goal02_evidence",
     "scripts.tests.test_native_goal02_uia",

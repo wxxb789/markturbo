@@ -261,7 +261,9 @@ class FakeEditorWin32:
     def send_shortcut(self, hwnd: int, key: int) -> None:
         self.shortcuts.append((hwnd, key))
         if key == VK_C:
-            copied = self.copies.pop(0) if self.copies else self.document
+            # nsh-base 0.5.1 copies an empty selection line-wise, so an empty
+            # document copies as its one empty line (`editor/commands.rs` `copy`).
+            copied = self.copies.pop(0) if self.copies else (self.document or "\n")
             if copied is not None:
                 self.clipboard = copied
 
@@ -875,13 +877,22 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH")
 
     def test_editor_text_is_copied_by_select_all_and_the_clipboard_restored(self) -> None:
-        for value in ("", "ASCII", "CJK-\u4fdd\u5b58-\U0001f680", "e\u0301", "a\nb"):
+        # An empty document copies line-wise as "\n" (nsh-base 0.5.1
+        # `editor/commands.rs` `copy`), like a document of one line break: a
+        # read cannot tell them apart and reports exactly what was copied.
+        for value, copied in (
+            ("", "\n"),
+            ("ASCII", "ASCII"),
+            ("CJK-\u4fdd\u5b58-\U0001f680", "CJK-\u4fdd\u5b58-\U0001f680"),
+            ("e\u0301", "e\u0301"),
+            ("a\nb", "a\nb"),
+        ):
             with self.subTest(value=value):
                 win32 = FakeEditorWin32(value)
                 harness, editor = editor_harness(win32)
 
                 self.assertEqual(
-                    harness.read_editor_fingerprint(running_app()), FINGERPRINT_TEXT(value)
+                    harness.read_editor_fingerprint(running_app()), FINGERPRINT_TEXT(copied)
                 )
                 self.assertEqual(win32.shortcuts, [(73, VK_A), (73, VK_C)])
                 self.assertEqual(win32.clipboard, "user clipboard")
@@ -1111,3 +1122,170 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertIn(("foreground", 73, 2.0), events)
         self.assertIn(("click", (400, 300)), events)
         self.assertEqual(events[-1], ("foreground", 73, 3.5))
+
+
+class AlertWin32:
+    """Keyboard ownership and the keys that reach an nsh system alert."""
+
+    def __init__(self, focus: int = 73, on_enter=None) -> None:
+        self.focus = focus
+        self.on_enter = on_enter
+        self.events: list[tuple[object, ...]] = []
+
+    def require_foreground(self, hwnd: int, _timeout: float = 2.0) -> None:
+        self.events.append(("foreground", hwnd))
+
+    def foreground_focus(self, _hwnd: int) -> int:
+        return self.focus
+
+    def send_key(self, hwnd: int, key: int) -> None:
+        self.events.append(("key", hwnd, key))
+        if key == runtime.VK_RETURN and self.on_enter is not None:
+            self.on_enter()
+
+
+class SystemAlertTests(unittest.TestCase):
+    """nsh 0.5.1 alerts are outside UIA: Enter answers them, effects prove them."""
+
+    def harness(self, win32: AlertWin32) -> object:
+        harness = native_harness(FreshRootFactory([FakeRoot()]))
+        harness.win32 = win32
+        return harness
+
+    def test_enter_answers_the_alert_from_the_main_windows_keyboard_focus(self) -> None:
+        win32 = AlertWin32()
+        with mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0):
+            self.harness(win32).confirm_system_alert(running_app(), lambda: True, "EARLY")
+        self.assertEqual(win32.events, [("foreground", 73), ("key", 73, runtime.VK_RETURN)])
+
+    def test_an_effect_before_enter_fails_without_sending_enter(self) -> None:
+        win32 = AlertWin32()
+        with (
+            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
+            self.assertRaises(HARNESS_FAILURE) as raised,
+        ):
+            self.harness(win32).confirm_system_alert(running_app(), lambda: False, "EARLY")
+        self.assertEqual(raised.exception.code, "EARLY")
+        self.assertEqual(win32.events, [])
+
+    def test_enter_is_withheld_while_another_window_owns_the_keyboard(self) -> None:
+        win32 = AlertWin32(focus=99)
+        with (
+            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
+            self.assertRaises(HARNESS_FAILURE) as raised,
+        ):
+            self.harness(win32).confirm_system_alert(running_app(), lambda: True, "EARLY")
+        self.assertEqual(raised.exception.code, "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT")
+        self.assertNotIn(("key", 73, runtime.VK_RETURN), win32.events)
+
+    def conflict_scenario(self, *, overwrite_on_keep_mine: bool, overwrite_on_enter: bool):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        harness = self.harness(AlertWin32())
+        harness.root = Path(directory.name)
+        app = running_app()
+        app.security_context = runtime.SecurityContext(1, 0x2000, "medium")
+        document = (
+            harness.root / "cases" / HARNESS.CASE_EXTERNAL_CONFLICT / "workspace" / "conflict.md"
+        ).resolve()
+        mine = HARNESS.CONFLICT_EDIT.encode("utf-8")
+        dirty = runtime.fingerprint_bytes(mine)
+        keep_mine = object()
+        harness.launch = mock.Mock(return_value=app)
+        harness.replace_editor = mock.Mock(return_value=dirty)
+        harness.save_via_menu = mock.Mock()
+        harness.wait_name = mock.Mock()
+        harness.editor_fingerprint = mock.Mock(return_value=dirty)
+        harness.find_named = mock.Mock(return_value=keep_mine)
+        harness.close_app = mock.Mock()
+        harness.reap = mock.Mock()
+
+        def keep_mine_pressed(control: object, _code: str) -> None:
+            self.assertIs(control, keep_mine)
+            if overwrite_on_keep_mine:
+                runtime.write_durable(document, mine)
+
+        harness.click_control = mock.Mock(side_effect=keep_mine_pressed)
+        if overwrite_on_enter:
+            harness.win32.on_enter = lambda: runtime.write_durable(document, mine)
+        patches = contextlib.ExitStack()
+        self.addCleanup(patches.close)
+        patches.enter_context(mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0))
+        patches.enter_context(mock.patch.object(HARNESS, "scan_runtime_artifacts", return_value={}))
+        return harness, app
+
+    def test_external_conflict_overwrites_only_after_enter_confirms_the_alert(self) -> None:
+        harness, app = self.conflict_scenario(
+            overwrite_on_keep_mine=False, overwrite_on_enter=True
+        )
+        observations = harness.scenario_external_conflict()
+        self.assertTrue(observations["explicit_overwrite_used"])
+        self.assertEqual(
+            observations["saved_after_explicit_overwrite"], observations["dirty_editor"]
+        )
+        self.assertIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
+        harness.find_named.assert_called_once()
+        self.assertEqual(harness.find_named.call_args.args[1:3], (HARNESS.KEEP_MINE_NAME, "Button"))
+
+    def test_external_conflict_fails_when_keep_mine_writes_without_the_alert(self) -> None:
+        harness, app = self.conflict_scenario(
+            overwrite_on_keep_mine=True, overwrite_on_enter=False
+        )
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.scenario_external_conflict()
+        self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+        self.assertNotIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
+
+    def test_external_conflict_fails_when_enter_never_confirms(self) -> None:
+        harness, _app = self.conflict_scenario(
+            overwrite_on_keep_mine=False, overwrite_on_enter=False
+        )
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.scenario_external_conflict()
+        self.assertEqual(raised.exception.code, "EXPLICIT_OVERWRITE_SAVE_TIMEOUT")
+
+    def test_alert_source_contract_requires_the_confirmation_first_and_no_default(self) -> None:
+        cases = {
+            'alert_dialog().destructive("overwrite", "Overwrite").cancel("cancel", "Cancel")': True,
+            'alert_dialog().cancel("cancel", "Cancel").destructive("overwrite", "Overwrite")': False,
+            'alert_dialog().destructive("overwrite", "Overwrite").action("keep", "Keep")': False,
+            'alert_dialog().destructive("other", "Overwrite").cancel("cancel", "Cancel")': False,
+            '/* alert_dialog().destructive("overwrite", "Overwrite") */': False,
+        }
+        for body, expected in cases.items():
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "state.rs"
+                path.write_text(
+                    f"impl S {{\n    pub fn overwrite_active(&self) {{\n        {body};\n    }}\n}}\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    HARNESS.alert_enter_confirms(path, "fn overwrite_active(", "overwrite"),
+                    expected,
+                )
+        self.assertTrue(
+            HARNESS.alert_enter_confirms(
+                HARNESS.REPO / "crates/mt-app/src/state.rs", "fn overwrite_active(", "overwrite"
+            )
+        )
+
+    def test_source_contract_fails_when_enter_would_cancel_the_overwrite_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(HARNESS.REPO / relative, target)
+            with mock.patch.object(HARNESS, "REPO", root):
+                self.assertIsNone(HARNESS.source_contract_failure())
+            state = root / "crates/mt-app/src/state.rs"
+            source = state.read_text(encoding="utf-8")
+            confirm = '.destructive("overwrite", "Overwrite")'
+            self.assertEqual(source.count(confirm), 1)
+            state.write_text(
+                source.replace(confirm, '.action("keep", "Keep")' + confirm), encoding="utf-8"
+            )
+            with mock.patch.object(HARNESS, "REPO", root):
+                self.assertEqual(
+                    HARNESS.source_contract_failure(), "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
+                )

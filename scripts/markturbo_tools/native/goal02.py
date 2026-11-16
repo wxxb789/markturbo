@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .source_contract import production_markers_present
+from .source_contract import alert_enter_confirms, production_markers_present
 from .runtime import (
     IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
@@ -236,10 +236,10 @@ REQUIRED_OBSERVATION_KEYS = {
 # id, clipped until the pointer widens the rail over a file row.
 RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
 TAB_CLOSE_AUTOMATION_ID = "rail-close"
-# Anonymous Buttons named by their accessibility labels (`ui/notices.rs`,
-# `state.rs` `overwrite_active`'s confirmation).
+# Anonymous Buttons named by their accessibility labels (`ui/notices.rs`).
+# Keep mine's confirmation is an nsh system alert outside the UIA tree,
+# answered with Enter (`runtime.py` `confirm_system_alert`).
 KEEP_MINE_NAME = "Keep mine"
-OVERWRITE_CONFIRM_NAME = "Overwrite"
 RESTORE_NAME = "Restore"
 UI_SOURCE_REQUIREMENTS = {
     "crates/mt-app/src/ui/rail.rs": (
@@ -623,6 +623,10 @@ def source_contract_failure() -> str | None:
     """The nsh selectors this harness drives must exist in production source."""
     if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
         return "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
+    if not alert_enter_confirms(
+        REPO / "crates/mt-app/src/state.rs", "fn overwrite_active(", "overwrite"
+    ):
+        return "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
     return None
 
 
@@ -891,16 +895,13 @@ class Goal02Harness(BaseNativeHarness):
                 "CONFLICT_KEEP_MINE_UIA_CONTRACT_MISMATCH",
             )
             self.click_control(keep_mine, "CONFLICT_KEEP_MINE_CLICK_FAILED")
-            if sha256_file(document) != external:
-                raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
-            confirm = self.find_named(
+            # Keep mine opens the Overwrite alert, which UIA cannot see; Enter
+            # answers it with Overwrite (`alert_enter_confirms`).
+            self.confirm_system_alert(
                 app,
-                OVERWRITE_CONFIRM_NAME,
-                "Button",
-                "CONFLICT_OVERWRITE_UIA_TIMEOUT",
-                "CONFLICT_OVERWRITE_UIA_CONTRACT_MISMATCH",
+                lambda: sha256_file(document) == external,
+                "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
             )
-            self.click_control(confirm, "CONFLICT_OVERWRITE_CLICK_FAILED")
             saved = self.wait_file(document, dirty, "EXPLICIT_OVERWRITE_SAVE_TIMEOUT")
             self.close_app(app)
             observations = {

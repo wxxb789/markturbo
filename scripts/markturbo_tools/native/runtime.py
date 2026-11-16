@@ -83,6 +83,16 @@ INTEGRITY_NAMES = {
 #   editor's own Select All + Copy, which writes the exact text
 #   (nsh-platform-windows src/system.rs:2046). SetFocus is supported
 #   (src/access/uia.rs:974).
+# * System alerts (`nsh::alert_dialog()`: the Overwrite and Run scripts
+#   confirmations in `state.rs`) are not in the UIA tree. They are drawn inside
+#   the surface as items the root hosts (src/system.rs:5-13, 1906), the
+#   `Hosted` trait has no accessibility hook, and the UIA tree walks views only
+#   (src/access.rs:373-384). While one shows, every key goes to it
+#   (src/system.rs:2022-2040); Enter presses its focused button, which starts on
+#   the last Default-styled button, else the first (src/system.rs:1461-1476,
+#   1674). `confirm_system_alert` answers with Enter, and
+#   `source_contract.alert_enter_confirms` pins the button order it relies on.
+SYSTEM_ALERT_SETTLE_SECONDS = 0.5
 EDITOR_NAME = "Markdown source"
 MENU_BUTTON_AUTOMATION_ID = "title-settings"
 MENU_SAVE_AUTOMATION_ID = "title-menu-save"
@@ -1693,6 +1703,31 @@ class NativeHarness:
         except Exception as error:
             raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
+    def confirm_system_alert(
+        self, app: RunningApp, still_undecided: Callable[[], bool], early_code: str
+    ) -> None:
+        """Answer the nsh system alert that the last press opened with Enter.
+
+        The alert is invisible to UIA (see the mapping above), so it is proven
+        by effect: `still_undecided` must hold after the press alone (else
+        `early_code`: the action ran without its confirmation), and the caller
+        must then wait for the confirmed effect. The alert opens from an async
+        task after the press; the settle delay keeps Enter from reaching the
+        app's own views first, where it could at most open the alert again.
+        Keys reach the alert only through the main window's own keyboard focus,
+        not a WebView's.
+        """
+        time.sleep(SYSTEM_ALERT_SETTLE_SECONDS)
+        if not still_undecided():
+            raise HarnessFailure(early_code)
+        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+        wait_until(
+            lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
+            self.ui_timeout,
+            "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT",
+        )
+        self.win32.send_key(app.hwnd, VK_RETURN)
+
     def hold_control(
         self, app: RunningApp, control: Any, seconds: float, failure_code: str
     ) -> None:
@@ -1927,11 +1962,16 @@ class NativeHarness:
         self.win32.send_shortcut(app.hwnd, VK_A)
         if value:
             self.win32.send_unicode(app.hwnd, value)
-        else:
-            self.win32.send_key(app.hwnd, VK_BACK)
-        expected = fingerprint_text(value)
-        actual, _ = self.wait_editor_fingerprint(app, expected, self.ui_timeout)
-        return actual
+            actual, _ = self.wait_editor_fingerprint(
+                app, fingerprint_text(value), self.ui_timeout
+            )
+            return actual
+        self.win32.send_key(app.hwnd, VK_BACK)
+        # An empty document copies line-wise as its one empty line, "\n"
+        # (nsh-base 0.5.1 `editor/commands.rs` `copy`). Backspace over Select
+        # All leaves no line break behind, so here "\n" can only mean empty.
+        self.wait_editor_fingerprint(app, fingerprint_text("\n"), self.ui_timeout)
+        return fingerprint_text("")
 
     def lifecycle_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
         """The in-window guard card (`ui/notices.rs` `guard_card`) and its decisions."""
