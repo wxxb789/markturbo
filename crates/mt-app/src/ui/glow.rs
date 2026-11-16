@@ -153,7 +153,6 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
     let Some(view) = view else {
         if current.view.is_some() {
             signal.set(Emission::default());
-            focus_watch().update(|step| *step += 1);
         }
         return;
     };
@@ -215,7 +214,6 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
         pulse: false,
         now_ms: 0.0,
     });
-    focus_watch().update(|step| *step += 1);
     ensure_ticker();
 }
 
@@ -250,25 +248,9 @@ pub fn focus_finding(finding: Option<usize>) {
                 .max(at + ignition_ms(reduced) + cooling_ms(reduced));
         }
     });
-    focus_watch().update(|step| *step += 1);
     if heating {
         ensure_ticker();
     }
-}
-
-/// Bumped whenever the focused finding changes (or a new result takes the
-/// column): what the document lane reads to re-centre the column on
-/// [`focused_range`].
-pub fn focus_watch() -> Signal<u64> {
-    global::<u64>()
-}
-
-/// The focused finding's range in the editor, for the column's camera: the
-/// document lane calls `reveal_position(range.start, center)` when
-/// [`focus_watch`] changes. `None` when nothing is focused, or when the
-/// finding has no anchor in this document.
-pub fn focused_range() -> Option<EditorRange> {
-    anchor_range_of(emission().get_untracked().focus?)
 }
 
 /// The 0-based line finding `finding` is anchored to in this document: what
@@ -453,8 +435,10 @@ fn line_of(text: &str, byte: usize) -> u64 {
     text[..byte].matches('\n').count() as u64
 }
 
-/// The editor range from byte `start` to byte `end` (`end` not included).
-fn positions(text: &str, start: usize, end: usize) -> Option<EditorRange> {
+/// The editor range from byte `start` to byte `end` (`end` not included);
+/// `None` for an empty range or one past the text. The revision's column
+/// marks (`ui::revision`) place their ranges with it too.
+pub(crate) fn positions(text: &str, start: usize, end: usize) -> Option<EditorRange> {
     if start >= end || start >= text.len() {
         return None;
     }

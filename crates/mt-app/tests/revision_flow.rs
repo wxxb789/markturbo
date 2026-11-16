@@ -428,6 +428,12 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
                     .map(|tab| tab.text.get())
                     .unwrap_or_default()
             )
+        }))
+        .child(text(move || {
+            format!(
+                "Dirty: {}",
+                tabs.get().first().is_some_and(|tab| tab.dirty.get())
+            )
         }));
     view()
         .flex_row()
@@ -683,6 +689,69 @@ fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
         app.screen().texts()
     );
     assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
+}
+
+/// `Copy` puts exactly the approved result on the clipboard — the buffer
+/// with the accepted change in it and nothing of the undecided one — and
+/// leaves the editor, the dirty flag, the decisions and the file as they
+/// were.
+#[test]
+fn copy_exports_only_the_approved_result_and_saves_nothing() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let source = "Original\nUnchanged\n";
+    let (mut app, document, _directory, _config) = start_field_over_buffer(source);
+
+    // One button, found by its id and named for a screen reader.
+    assert_eq!(
+        app.screen()
+            .count("role:button[Copy]")
+            .expect("the role selector"),
+        1,
+        "Copy is one named button: {:?}",
+        app.screen().texts()
+    );
+
+    // Nothing accepted yet: the approved result is the reviewed text.
+    app.set_clipboard(None);
+    app.press("id:revision-copy").expect("press Copy");
+    assert_eq!(
+        app.screen().clipboard(),
+        Some(source),
+        "nothing approved yet: the reviewed text"
+    );
+    assert!(
+        app.shows("Dirty: false"),
+        "Copy dirties nothing: {:?}",
+        app.screen().texts()
+    );
+
+    // Accept the first hunk, leave the second undecided.
+    app.press_key("a").expect("accept the first hunk");
+    app.wait_for("text:Buffer: Revised\nUnchanged\n")
+        .expect("the accepted hunk is written");
+    app.wait_for("text:Dirty: true").expect("the tab is dirty");
+    app.set_clipboard(None);
+    app.press("id:revision-copy").expect("press Copy");
+    assert_eq!(
+        app.screen().clipboard(),
+        Some("Revised\nUnchanged\n"),
+        "the approved result exactly: the accepted change, not the undecided one"
+    );
+    assert!(
+        buffer_shows(&app, "Revised\nUnchanged\n") && app.shows("1 of 2 decided"),
+        "Copy changes neither the editor nor the decisions: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        app.shows("Dirty: true"),
+        "Copy does not mark the document saved: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&document).unwrap(),
+        source,
+        "Copy writes nothing to the file"
+    );
 }
 
 /// Two documents and the Revision controls: the Revision is prepared for

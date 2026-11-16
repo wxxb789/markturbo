@@ -114,16 +114,22 @@ impl RevisionLedger {
     /// Whether the hunk at `index` no longer finds its current side intact
     /// in `current`: an edit touched it. Reads nothing but its arguments.
     pub(crate) fn part_changed(&self, index: usize, current: &str) -> bool {
-        let Some(hunk) = self.hunks.get(index) else {
-            return true;
-        };
+        self.current_range(index, current).is_none()
+    }
+
+    /// Where the hunk at `index` finds its current side intact in
+    /// `current` (the reviewed bytes until it is accepted, then the
+    /// replacement); `None` once an edit touched it. Reads nothing but its
+    /// arguments.
+    pub(crate) fn current_range(&self, index: usize, current: &str) -> Option<Range<usize>> {
+        let hunk = self.hunks.get(index)?;
         let range = if self.text == current {
             hunk.range.clone()
         } else {
             let span = EditSpan::between(&self.text, current);
             hunk.range.clone().and_then(|range| span.rebase(range))
-        };
-        range.is_none_or(|range| current.get(range) != Some(hunk.current_side()))
+        }?;
+        (current.get(range.clone()) == Some(hunk.current_side())).then_some(range)
     }
 
     /// Write the change as `applied` (its replacement) or not (its reviewed

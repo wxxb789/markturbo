@@ -2944,6 +2944,35 @@ impl AppState {
         tab.is_none_or(|tab| tab.text.with(|text| ledger.part_changed(index, text)))
     }
 
+    /// Where the hunk at `index` sits in the text of tab `tab_id` now: the
+    /// bytes of its current side, as the ledger places them. `None` when no
+    /// proposal is live, when it belongs to another tab, or once an edit
+    /// touched the hunk. Reads the tab's text, so a binding follows every
+    /// edit.
+    pub fn revision_hunk_range(&self, tab_id: u64, index: usize) -> Option<std::ops::Range<usize>> {
+        let ledger = self.revision_ledger.borrow();
+        let ledger = ledger.as_ref().filter(|ledger| ledger.tab_id() == tab_id)?;
+        let tab = self
+            .tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .cloned()?;
+        tab.text.with(|text| ledger.current_range(index, text))
+    }
+
+    /// The approved result of the live proposal: the text of the tab it
+    /// belongs to, as it stands — every accepted change is already in it,
+    /// nothing else of the proposal is. `None` when no proposal is live.
+    pub fn revision_approved_text(&self) -> Option<SharedString> {
+        let tab_id = self.revision_ledger.borrow().as_ref()?.tab_id();
+        self.tabs
+            .get_untracked()
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.text.get_untracked())
+    }
+
     /// Follow an edit of tab `id` with the live proposal's ledger, so each
     /// hunk the edit did not touch keeps its place.
     fn observe_revision_edit(&self, id: u64) {
