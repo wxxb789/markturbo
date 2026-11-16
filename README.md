@@ -187,11 +187,8 @@ There are no screenshots of the current UI in the repository.
   **Save As…**. There is no file watcher; the check happens on save and on
   recovery.
 - Ask **Close without saving?** (**Save**, **Don't save**, **Cancel**) when
-  closing a dirty tab or choosing **⚙ → Quit**. The window's close button and
-  `Alt+F4` do not ask; on Windows, unsaved work there is covered only by
-  recovery checkpoints. On macOS and Linux, closing the window through the
-  title bar or the OS loses unsaved changes with no prompt and nothing to
-  recover.
+  closing a dirty tab, choosing **⚙ → Quit**, or closing the window (its close
+  button or `Alt+F4`).
 - English and Chinese interface; System, Light, or Dark theme.
 
 No import step and no proprietary format: Codex, Claude Code, Cursor, OpenCode,

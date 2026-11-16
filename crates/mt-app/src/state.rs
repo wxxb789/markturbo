@@ -1882,15 +1882,12 @@ impl AppState {
         }
     }
 
-    /// Ask before discarding every dirty buffer, then close the window. This
-    /// is the guarded close path available inside the app: the in-app guard
-    /// (`ui::notices`) takes the decision. The platform title bar and Alt+F4
-    /// reach the window without it — nsh 0.5.1 can intercept them with
-    /// `WindowAttributes::close_on_press = false` and
-    /// `WindowRef::on_close_press`, which `app.rs` does not wire yet — so the
-    /// periodic checkpoint remains the recovery protection on that path. A
-    /// dirty buffer is checkpointed before the guard as a best-effort extra
-    /// guard against a failed save.
+    /// Ask before discarding every dirty buffer, then close the window. Quit
+    /// and every user close of the window (its close button, Alt+F4: `app.rs`
+    /// turns `close_on_press` off and routes `on_close_press` here) take this
+    /// path; the in-app guard (`ui::notices`) takes the decision. A dirty
+    /// buffer is checkpointed before the guard as a best-effort extra guard
+    /// against a failed save.
     pub fn request_quit(&self) {
         let dirty: Vec<u64> = self
             .tabs

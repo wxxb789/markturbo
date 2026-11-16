@@ -8,7 +8,7 @@
 use std::{cell::Cell, path::PathBuf, rc::Rc, time::Duration};
 
 use mt_core::settings::Language;
-use nsh_core::prelude::*;
+use nsh_core::{desktop::WindowAttributes, element::desktop::main_window, prelude::*};
 
 use crate::{
     state::AppState,
@@ -35,6 +35,7 @@ pub fn App() -> impl IntoElement {
             state.open_file(path);
         }
     }
+    guard_window_close(&state);
     let tick_state = state.clone();
     let ticker_alive = Rc::new(Cell::new(true));
     let ticker_flag = ticker_alive.clone();
@@ -72,6 +73,21 @@ pub fn App() -> impl IntoElement {
                 }
             },
         ))
+}
+
+/// Routes every user close of the main window (its close button, Alt+F4, the
+/// taskbar, the system menu) through the same guard as Quit: the window no
+/// longer closes by itself, and [`AppState::request_quit`] closes it at once
+/// when nothing is dirty, else raises the 'Close without saving?' guard.
+fn guard_window_close(state: &AppState) {
+    let window = main_window();
+    // The option structs are `#[non_exhaustive]`: built from their defaults,
+    // then set field by field.
+    let mut attributes = WindowAttributes::default();
+    attributes.close_on_press = Some(false);
+    window.set(attributes);
+    let state = state.clone();
+    window.on_close_press(move |_| state.request_quit());
 }
 
 fn language_code(language: Language) -> u8 {
