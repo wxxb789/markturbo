@@ -14,12 +14,12 @@
 //!   [`halo`] and [`emitter_plate`] take a [`Heat`] and are the only ways to
 //!   draw with the hot/ember colours.
 
-use nsh_base::{button, input};
+use nsh_base::input;
 use nsh_core::{
     Color,
     element::{
-        Accessible, AdaptiveColor, AnimatedNode, ComponentBuilder, Easing, Element, Interactive,
-        IntoReactive, ParentElement, SharedString, Styled,
+        Accessible, AdaptiveColor, AnimatedNode, Easing, Element, Interactive, IntoReactive,
+        ParentElement, SharedString, Styled,
     },
     prelude::*,
 };
@@ -119,35 +119,18 @@ pub fn quiet_action(
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
     let label: SharedString = label.into();
-    // The test id goes on the wrapper: `nsh_base`'s components are not views,
-    // so `test_id` reaches them through a plain element around them.
-    view()
-        .test_id(test_id)
-        .bg(Color::TRANSPARENT)
-        // A control is never a drag handle: inside a `window_drag` region (the
-        // title row) the innermost view decides, and a press here must reach
-        // the button.
-        .window_drag(false)
+    press_target(test_id, label.clone())
+        .px(px(2.0))
+        .py(px(4.0))
+        .hover(|s| s.text_color(tokens::palette().ink).underline())
+        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+        .on_press(on_press)
         .child(
-            button()
-                .accessibility_label(Some(label.clone()))
-                .px(px(2.0))
-                .py(px(4.0))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .rounded(px(0.0))
-                .transition_colors()
-                .duration(HOVER_MS)
-                .hover(|s| s.text_color(tokens::palette().ink).underline())
-                .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-                .on_press(on_press)
-                .child(
-                    text(label)
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || tokens::palette().ink_rest),
-                ),
+            text(label)
+                .font_family(FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink_rest),
         )
 }
 
@@ -159,32 +142,40 @@ pub fn primary_action(
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
     let label: SharedString = label.into();
+    press_target(test_id, label.clone())
+        .px(px(tokens::SPACE_3))
+        .py(px(tokens::SPACE_2))
+        .border(px(HAIRLINE))
+        .border_color(move || tokens::palette().ink_faint)
+        .hover(|s| s.border_color(tokens::palette().ink))
+        .focus_visible(|s| s.border_color(tokens::palette().ink))
+        .on_press(on_press)
+        .child(
+            text(label)
+                .font_family(FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink),
+        )
+}
+
+/// The control both actions are: a plain view that is the button itself, so
+/// its test id — UI Automation's AutomationId — names the element a press
+/// reaches and screen readers announce, rather than a view around it.
+fn press_target(test_id: &str, label: SharedString) -> View {
     view()
         .test_id(test_id)
-        .bg(Color::TRANSPARENT)
+        .role(AccessibilityRole::Button)
+        .optional_label(Some(label))
+        // A control is never a drag handle: inside a `window_drag` region (the
+        // title row) the innermost view decides, and a press here must reach
+        // the control.
         .window_drag(false)
-        .child(
-            button()
-                .accessibility_label(Some(label.clone()))
-                .px(px(tokens::SPACE_3))
-                .py(px(tokens::SPACE_2))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .border(px(HAIRLINE))
-                .border_color(move || tokens::palette().ink_faint)
-                .transition_colors()
-                .duration(HOVER_MS)
-                .hover(|s| s.border_color(tokens::palette().ink))
-                .focus_visible(|s| s.border_color(tokens::palette().ink))
-                .on_press(on_press)
-                .child(
-                    text(label)
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || tokens::palette().ink),
-                ),
-        )
+        .cursor_pointer()
+        .bg(Color::TRANSPARENT)
+        .rounded(px(0.0))
+        .transition_colors()
+        .duration(HOVER_MS)
 }
 
 /// A text field per spec: no plate of its own, a 1px hairline under it, ink
@@ -302,4 +293,72 @@ pub fn hover_easing() -> Easing {
 /// own scale.
 pub fn heat_levels(heat: Heat, cold: f32, ember: f32, hot: f32) -> AnimatedNode {
     heat.levels(cold, ember, hot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsh_engine::{EngineConfig, Root};
+    use nsh_testing::Headless;
+
+    /// One of each action, and a line that counts the presses they hear.
+    #[component]
+    fn Harness() -> impl IntoElement {
+        let presses = signal(0u32);
+        view()
+            .flex_col()
+            .child(quiet_action("harness-quiet", "Quiet", move || {
+                presses.update(|n| *n += 1)
+            }))
+            .child(primary_action("harness-primary", "Primary", move || {
+                presses.update(|n| *n += 1)
+            }))
+            .child(view().test_id("harness-presses").child(ink(move || {
+                SharedString::from(format!("{} presses", presses.get()))
+            })))
+    }
+
+    /// The node carrying `test_id` on the headless screen.
+    fn node_with(app: &Headless, test_id: &str) -> nsh_core::NodeId {
+        let nodes: Vec<_> = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .filter(|node| node.test_id.as_deref() == Some(test_id))
+            .collect();
+        assert_eq!(nodes.len(), 1, "one view carries `{test_id}`");
+        nodes[0].id
+    }
+
+    /// An action's test id names the pressable button itself — the element UI
+    /// Automation exposes, so its AutomationId — not a plain view around it
+    /// that no accessibility tree shows.
+    #[test]
+    fn an_actions_test_id_is_on_the_button_itself() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+        app.wait_for("id:harness-presses").expect("the harness");
+        for (id, name) in [("harness-quiet", "Quiet"), ("harness-primary", "Primary")] {
+            let node = node_with(&app, id);
+            assert_eq!(
+                app.screen()
+                    .press_target(&format!("id:{id}"))
+                    .expect("selector"),
+                Some(node),
+                "`{id}` is the control a press goes to"
+            );
+            assert_eq!(
+                app.screen()
+                    .press_target(&format!("role:button[{name}]"))
+                    .expect("selector"),
+                Some(node),
+                "`{id}` is the button named {name}"
+            );
+        }
+        app.press("id:harness-quiet")
+            .expect("press the quiet action");
+        app.press("id:harness-primary")
+            .expect("press the primary action");
+        app.wait_for("text:2 presses").expect("both presses heard");
+    }
 }
