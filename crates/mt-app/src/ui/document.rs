@@ -18,11 +18,18 @@
 //! The camera: a docked surface (the review's racked finding, a revision's
 //! current hunk) asks for a line with
 //! [`crate::state::AppState::focus_document_line`], and the source editor
-//! levels it with the field's docked reading position. With a docked surface
-//! open the editor's content carries half a viewport of room above its first
-//! row, so a line near the top of the document can be levelled too (the
-//! editor clamps its scroll at 0, so the room has to be in the content); the
-//! bottom half is `scroll_beyond_last_line`.
+//! levels it with the field's docked reading position, gliding there over
+//! [`motion::CAMERA_MS`] on the camera's curve (at once under reduced
+//! motion). With a docked surface open the editor's content carries half a
+//! viewport of room above its first row, so a line near the top of the
+//! document can be levelled too (the editor clamps its scroll at 0, so the
+//! room has to be in the content); the bottom half is
+//! `scroll_beyond_last_line`.
+
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use mt_core::settings::Language;
 use nsh_base::{
@@ -40,7 +47,7 @@ use nsh_core::{
 
 use crate::{
     state::{AppState, Pane, Tab},
-    ui::{glow, notices, preview, revision, tokens},
+    ui::{glow, motion, notices, preview, revision, tokens},
 };
 
 /// The column's content for the active document, by pane. Empty while no
@@ -125,34 +132,57 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     let camera = editor_ref;
 
     // The column's camera: a docked surface asked to level a line, and the
-    // editor's own `reveal_position(.., true)` centres it. Reading the signal
-    // subscribes; a request for another tab is ignored.
+    // column glides there ([`level_line`]). Reading the signal subscribes; a
+    // request for another tab is ignored.
     //
-    // The reveal waits one frame: the half-viewport inset (the `styles` below,
+    // The camera waits one frame: the half-viewport inset (the `styles` below,
     // which turns on with the same request) gives the editor its room to
     // scroll into, and the editor computes its scroll target from the rows as
     // laid out, so the inset must be a frame old by then.
+    //
+    // The effect's first run is this editor's mount (a tab switch or the mode
+    // toggle back to Source). A request it sees then is one the column already
+    // holds, not a new one, so the camera cuts: file switching and the mode
+    // toggle are instant.
+    let glide = Glide::default();
+    let camera_glide = glide.clone();
+    let mounting = Cell::new(true);
     effect(move || {
+        let cut = mounting.replace(false);
         let focus = camera_state.document_focus.get();
         if focus.tab != camera_tab.id || !docked_surfaces(&camera_state) {
             return;
         }
-        request_animation_frame(move |_| {
-            if let Some(api) = camera.api::<EditorApi>() {
-                api.reveal_position(EditorPosition::new(focus.line, 0), true);
-            }
-        });
+        let glide = camera_glide.clone();
+        request_animation_frame(move |_| level_line(camera, &glide, focus.line, cut));
     });
 
     // The half-viewport inset, in points: the visible height of the column's
     // text region, while a docked surface holds a camera request for this tab.
     let viewport = signal(0.0f32);
     let inset_tab = tab.id;
+    let room = computed(move || inset(&styles_state, inset_tab, viewport.get()));
+    // The inset is room above the text, not a move: the scroll offset grows
+    // (or shrinks) with it in the same update, so the text stays where it was
+    // and the camera glides from there instead of the document first jumping
+    // half a viewport.
+    let held = Cell::new(0.0f32);
+    effect(move || {
+        let now = room.get();
+        let before = held.replace(now);
+        if now == before {
+            return;
+        }
+        if let Some(api) = camera.api::<EditorApi>() {
+            let offset = api.scroll_offset();
+            api.set_scroll_offset(Point::new(offset.x, offset.y + px(now - before)));
+        }
+    });
     let styles = move || {
         let mut styles = EditorStyles::default();
         styles.content = Some(PartStyle::from(Style::from(
             StyleRefinement::default()
-                .pt(px(inset(&styles_state, inset_tab, viewport.get())))
+                .pt(px(room.get()))
                 // The editor draws its text in the theme's `foreground`; the
                 // source's ink is the room's, at the body level.
                 .text_color(tokens::palette().ink),
@@ -245,6 +275,8 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                             if edit_tab.text.get().as_str() == value.as_str() {
                                 return;
                             }
+                            // Typing is the user's: the camera lets go.
+                            glide.stop();
                             edit_tab.text.set(value.clone());
                             edit_tab.dirty.set(true);
                             edit_tab.revision.update(|revision| *revision += 1);
@@ -252,6 +284,95 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                         }),
                 ),
         )
+}
+
+/// How often the camera steps the column while it glides: a display frame
+/// at 60 Hz. The glide's position is read from the clock at each step, so a
+/// late step lands where the curve is by then, not behind it.
+const GLIDE_STEP: std::time::Duration = std::time::Duration::from_micros(16_667);
+
+/// The camera's glide in flight, if any. A new target, the user's own scroll
+/// and the user's typing end it.
+#[derive(Clone, Default)]
+struct Glide(Rc<RefCell<Option<Spawned<()>>>>);
+
+impl Glide {
+    /// Ends the glide in flight, leaving the column where it is.
+    fn stop(&self) {
+        if let Some(task) = self.0.borrow_mut().take() {
+            task.cancel();
+        }
+    }
+
+    /// Runs `task` as the glide, ending the one before it.
+    fn run(&self, task: Spawned<()>) {
+        self.stop();
+        *self.0.borrow_mut() = Some(task);
+    }
+}
+
+/// Levels line `line` with the field's docked reading position (the
+/// editor's own centre, as `reveal_position(.., center)` places it) by a
+/// [`motion::CAMERA_MS`] glide on the camera's curve from where the column is
+/// now; at once under reduced motion or when `cut` (the editor was just
+/// mounted).
+///
+/// The target is the editor's own: the reveal is asked for, its scroll offset
+/// read, and the offset put back before anything is drawn. A glide already in
+/// flight is replaced from the column's current position, so a new target
+/// mid-glide turns the column without a jump.
+fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, cut: bool) {
+    let Some(api) = editor.api::<EditorApi>() else {
+        return;
+    };
+    glide.stop();
+    let position = EditorPosition::new(line, 0);
+    if cut || motion::reduced_motion() {
+        api.reveal_position(position, true);
+        return;
+    }
+    let from = api.scroll_offset();
+    api.reveal_position(position, true);
+    let to = api.scroll_offset().y.0;
+    api.set_scroll_offset(from);
+    if (to - from.y.0).abs() < 0.5 {
+        return;
+    }
+    glide.run(spawn(glide_to(editor, from.y.0, to)));
+}
+
+/// The glide itself: steps the editor's scroll offset from `from` to `to`
+/// along [`motion::camera_progress`], one [`GLIDE_STEP`] at a time.
+///
+/// It ends early when the offset is no longer one it set: the user scrolled
+/// (a wheel, the scrollbar, a caret moved into view by typing), and the
+/// column is theirs again. A scroll the platform reports late is one the
+/// glide set a step before, or the target the reveal visited, so those are
+/// still its own.
+async fn glide_to(editor: ComponentRef<Editor>, from: f32, to: f32) {
+    let start = nsh_core::time::now();
+    let mut own = [from, from];
+    loop {
+        timer(GLIDE_STEP).await;
+        let Some(api) = editor.api::<EditorApi>() else {
+            return;
+        };
+        let at = api.scroll_offset().y.0;
+        if own
+            .iter()
+            .chain(std::iter::once(&to))
+            .all(|set| (at - set).abs() > 1.0)
+        {
+            return;
+        }
+        let elapsed = (nsh_core::time::now() - start).as_secs_f32() * 1000.0;
+        let y = from + (to - from) * motion::camera_progress(elapsed);
+        api.set_scroll_offset(Point::new(px(0.0), px(y)));
+        own = [own[1], y];
+        if elapsed >= motion::CAMERA_MS {
+            return;
+        }
+    }
 }
 
 /// Whether a document is open (the shell asks before it shows the column).
@@ -400,6 +521,8 @@ mod tests {
         state.review_open.set(true);
         let first_state = state.clone();
         let last_state = state.clone();
+        let preview_state = state.clone();
+        let source_state = state.clone();
         view()
             .test_id("probe")
             .flex_col()
@@ -429,6 +552,28 @@ mod tests {
                     .on_press(move || {
                         if let Some(tab) = last_state.active_tab() {
                             last_state.focus_document_line(tab.id, 58);
+                        }
+                    }),
+            )
+            .child(
+                view()
+                    .test_id("probe-pane-preview")
+                    .w_full()
+                    .h(px(8.0))
+                    .on_press(move || {
+                        if let Some(tab) = preview_state.active_tab() {
+                            preview_state.set_pane(tab.id, Pane::Preview);
+                        }
+                    }),
+            )
+            .child(
+                view()
+                    .test_id("probe-pane-source")
+                    .w_full()
+                    .h(px(8.0))
+                    .on_press(move || {
+                        if let Some(tab) = source_state.active_tab() {
+                            source_state.set_pane(tab.id, Pane::Source);
                         }
                     }),
             )
@@ -1000,6 +1145,168 @@ mod tests {
         assert!(
             offset.abs() <= tokens::TYPE_SOURCE_LINE,
             "the last line sits {offset} points off the editor's centre"
+        );
+    }
+
+    /// The probe on a manual clock, the camera's glide stepped by the test,
+    /// with the column laid out and nothing asked of the camera yet.
+    fn glide_probe(reduced: bool) -> Headless {
+        let mut config = EngineConfig::new(Root::of::<CameraProbe>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the probe");
+        if reduced {
+            app.set_environment("reduced motion", |env| env.reduce_motion = true)
+                .expect("reduce motion");
+        }
+        app.wait_for("label:Markdown source")
+            .expect("source editor");
+        app.settle();
+        app
+    }
+
+    /// The camera glides: `focus_document_line` (what `J`/`K`, a review's
+    /// arrival and a revision's current hunk call) moves the column over
+    /// [`motion::CAMERA_MS`] on the camera's curve, not at once, and ends
+    /// with the line level with the docked reading position.
+    #[test]
+    fn the_camera_glides_to_the_anchored_line() {
+        let mut app = glide_probe(false);
+        let start = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(start < -100.0, "the sentinel starts high: {start}");
+
+        app.press("id:probe-focus-first").expect("focus line 3");
+        let pressed = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            (pressed - start).abs() <= tokens::TYPE_SOURCE_LINE,
+            "the column jumped at the request: {pressed} from the centre (from {start})"
+        );
+
+        app.run_for(Duration::from_millis(60)).expect("mid-glide");
+        let mid = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            mid > start + 1.0 && mid < -1.0,
+            "mid-glide the line sits at {mid}, not between {start} and the centre"
+        );
+
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64))
+            .expect("the glide ends");
+        let end = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            end.abs() <= tokens::TYPE_SOURCE_LINE,
+            "after the glide line 3 sits {end} points off the editor's centre"
+        );
+    }
+
+    /// Under reduced motion the camera cuts: the line is level as soon as the
+    /// request is handled, with no time passing.
+    #[test]
+    fn under_reduced_motion_the_camera_cuts() {
+        let mut app = glide_probe(true);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        let offset = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            offset.abs() <= tokens::TYPE_SOURCE_LINE,
+            "under reduced motion line 3 sits {offset} points off the centre at once"
+        );
+    }
+
+    /// A new request mid-glide retargets from where the column is — no jump
+    /// back, no jump ahead — and ends on the new line.
+    #[test]
+    fn a_new_target_mid_glide_retargets_from_where_the_column_is() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        app.run_for(Duration::from_millis(60)).expect("mid-glide");
+        let (row, _) = row_and_editor(&app, "line 30");
+        let before = row.origin.y.0;
+
+        app.press("id:probe-focus-last")
+            .expect("focus the last line");
+        let (row, _) = row_and_editor(&app, "line 30");
+        assert!(
+            (row.origin.y.0 - before).abs() <= tokens::TYPE_SOURCE_LINE,
+            "the retarget jumped from {before} to {}",
+            row.origin.y.0
+        );
+
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64 + 60))
+            .expect("the new glide ends");
+        let end = level_offset(&app, "END-OF-THE-DOCUMENT");
+        assert!(
+            end.abs() <= tokens::TYPE_SOURCE_LINE,
+            "after the retarget the last line sits {end} points off the centre"
+        );
+    }
+
+    /// A camera request the column already holds is not a new one: when the
+    /// source editor is mounted again (the mode toggle back to Source, or a
+    /// tab switch and back) the line is level at once, because file switching
+    /// and the mode toggle are instant.
+    #[test]
+    fn a_remounted_editor_cuts_to_the_held_line() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64 + 60))
+            .expect("the glide ends");
+
+        app.press("id:probe-pane-preview").expect("to Preview");
+        assert!(
+            app.screen().matches("label:Markdown source") == Ok(false),
+            "Preview takes the column"
+        );
+        app.press("id:probe-pane-source").expect("back to Source");
+        let offset = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            offset.abs() <= tokens::TYPE_SOURCE_LINE,
+            "back in Source line 3 sits {offset} points off the centre with no time passing"
+        );
+    }
+
+    /// The user's typing ends the glide: the column stays where it was when
+    /// the text changed, not carried on to the camera's target.
+    #[test]
+    fn the_users_typing_ends_the_glide() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        app.run_for(Duration::from_millis(20))
+            .expect("early in the glide");
+        app.type_text("id:source-editor", "x")
+            .expect("the user types");
+        let typed = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64))
+            .expect("the glide's time passes");
+        let after = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            (after - typed).abs() < 1.0,
+            "the camera kept moving after the user typed: {typed} -> {after}"
+        );
+        assert!(
+            after < -tokens::TYPE_SOURCE_LINE,
+            "the camera finished its glide over the user's typing: {after} from the centre"
+        );
+    }
+
+    /// The user's own scroll ends the glide: the camera stops fighting the
+    /// wheel and leaves the column where the user put it.
+    #[test]
+    fn the_users_scroll_ends_the_glide() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        app.run_for(Duration::from_millis(20))
+            .expect("early in the glide");
+        app.scroll("id:source-editor", px(-10.0))
+            .expect("the user scrolls back");
+        let scrolled = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64))
+            .expect("the glide's time passes");
+        let after = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            (after - scrolled).abs() < 1.0,
+            "the camera kept moving after the user scrolled: {scrolled} -> {after}"
+        );
+        assert!(
+            after < -tokens::TYPE_SOURCE_LINE,
+            "the camera finished its glide over the user's scroll: {after} from the centre"
         );
     }
 
