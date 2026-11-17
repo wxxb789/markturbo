@@ -42,6 +42,45 @@ fn save_as_replaces_a_confirmed_existing_destination() {
         .expect("edit first");
     app.wait_for("id:title-dirty").expect("first is dirty");
 
+    // Ctrl+Shift+S from the focused editor, the dialog cancelled: the
+    // document, its path and its dirty mark stay, and no file is written.
+    app.on_pick_save_path(None).expect("cancel the picker");
+    app.press_key("shift+mod+s").expect("press Ctrl+Shift+S");
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !app
+        .screen()
+        .file_requests()
+        .iter()
+        .any(|request| matches!(request, nsh_core::file_dialog::FileRequest::SaveDialog(_)))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Ctrl+Shift+S never showed the save dialog"
+        );
+        app.next_change(Duration::from_millis(25)).expect("settle");
+    }
+    app.settle();
+    assert!(
+        app.screen()
+            .matches("id:source-editor >> text:Unsaved first. # First heading")
+            .expect("selector"),
+        "a cancelled Save As keeps the text: {:?}",
+        app.screen().texts()
+    );
+    app.wait_for("id:title-dirty")
+        .expect("a cancelled Save As keeps the dirty mark");
+    app.wait_for("text:first.md")
+        .expect("a cancelled Save As keeps the path");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("list dir").count(),
+        3,
+        "a cancelled Save As writes no file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("read first"),
+        "# First heading\n"
+    );
+
     // The edited first tab keeps its place; second.md opens beside it.
     app.press_key("mod+p").expect("open the palette");
     app.wait_for("id:palette-input").expect("the palette");

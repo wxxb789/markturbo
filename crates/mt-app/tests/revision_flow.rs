@@ -18,7 +18,9 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn partial_accept_records_the_final_split_once() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let review_output = serde_json::json!({
         "schema_version": "review-v1",
@@ -248,11 +250,30 @@ fn RevisionDecisionActions() -> impl IntoElement {
                 .map(|tab| tab.text.get())
                 .unwrap_or_default()
         }))
+        // The buffer escaped, so a selector compares every byte (a text
+        // selector ignores the spaces around a text).
+        .child(text(move || {
+            format!(
+                "Bytes: {:?}",
+                tabs.get()
+                    .first()
+                    .map(|tab| tab.text.get().to_string())
+                    .unwrap_or_default()
+            )
+        }))
+        .child(text(move || {
+            format!(
+                "Dirty: {}",
+                tabs.get().first().is_some_and(|tab| tab.dirty.get())
+            )
+        }))
 }
 
 #[test]
 fn all_rejected_apply_records_one_decision_and_finalizes() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let review_output = serde_json::json!({
         "schema_version": "review-v1",
         "scope": {"kind": "document"},
@@ -340,6 +361,13 @@ fn all_rejected_apply_records_one_decision_and_finalizes() {
     app.wait_for("text:No changes approved.")
         .expect("rejection status");
     app.wait_for("text:Hunks: 0").expect("proposal finalized");
+    // Rejecting every hunk leaves the buffer byte for byte as reviewed, and
+    // clean.
+    assert!(
+        app.shows(r#"Bytes: "First\nSecond\n""#) && app.shows("Dirty: false"),
+        "the buffer is the reviewed source, clean: {:?}",
+        app.screen().texts()
+    );
     assert_eq!(revision_usage_totals(), (1, 0, 2, 0));
     let store = config.path().join("data/usage.json");
     let finalized = std::fs::read(&store).expect("finalized usage aggregate");
@@ -561,7 +589,9 @@ fn start_field_over_buffer(
 /// unwritten, and nothing reaches the disk.
 #[test]
 fn decisions_write_at_once_and_undo_restores_the_exact_text() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let (mut app, document, _directory, _config) = start_field_over_buffer(source);
 
@@ -650,7 +680,9 @@ fn decisions_write_at_once_and_undo_restores_the_exact_text() {
 /// while the untouched hunk still lands on its own, moved bytes.
 #[test]
 fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let (mut app, document, _directory, _config) = start_field_over_buffer(source);
 
@@ -697,7 +729,9 @@ fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
 /// were.
 #[test]
 fn copy_exports_only_the_approved_result_and_saves_nothing() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let (mut app, document, _directory, _config) = start_field_over_buffer(source);
 
@@ -811,7 +845,9 @@ fn RevisionAcrossDocuments() -> impl IntoElement {
 /// hunks, and nothing of it can be accepted into either document.
 #[test]
 fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (review_output, revision_output) = two_change_outputs();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
