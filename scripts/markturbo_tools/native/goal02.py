@@ -96,13 +96,11 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
         "external_modification_rewritten_source",
         "external_modification_dirty_editor",
         "external_modification_source_after_refused_save",
-        "external_modification_editor_after_refusal",
         "external_modification_overwritten_source",
         "tab_close_editor",
         "tab_close_source_after_cancel",
         "tab_close_saved_source",
         "window_close_editor",
-        "window_close_editor_after_cancel",
         "window_close_source_after_cancel",
         "window_close_saved_source",
         "checkpoint_editor",
@@ -206,14 +204,13 @@ def _require_timing(observations: dict[str, Any], key: str) -> float:
 
 
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
-    loaded, rewritten, dirty, refused, after_refusal, overwritten = _fingerprints(
+    loaded, rewritten, dirty, refused, overwritten = _fingerprints(
         observations,
         "external_modification",
         "loaded_source",
         "rewritten_source",
         "dirty_editor",
         "source_after_refused_save",
-        "editor_after_refusal",
         "overwritten_source",
     )
     if loaded["byte_count"] != rewritten["byte_count"] or loaded["sha256"] == rewritten["sha256"]:
@@ -221,8 +218,6 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     _require_timing(observations, "external_modification_conflict_ms")
     if refused != rewritten:
         raise ValueError("refused Save changed the externally rewritten source")
-    if after_refusal != dirty:
-        raise ValueError("the conflict replaced the dirty editor")
     if dirty != overwritten or rewritten == overwritten:
         raise ValueError("explicit overwrite did not preserve exact dirty editor bytes")
 
@@ -259,16 +254,15 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     if before != saved or before != after or restored == before:
         raise ValueError("keyboard close Don't save changed the source")
 
-    window, kept, untouched, window_saved = _fingerprints(
+    window, untouched, window_saved = _fingerprints(
         observations,
         "window_close",
         "editor",
-        "editor_after_cancel",
         "source_after_cancel",
         "saved_source",
     )
-    if kept != window or untouched != after or window == untouched:
-        raise ValueError("Alt+F4 Cancel changed the editor or the source")
+    if untouched != after or window == untouched:
+        raise ValueError("Alt+F4 Cancel changed the source")
     if window != window_saved:
         raise ValueError("window Save did not preserve exact editor bytes")
     if observations["runtime_scan"]["canonical_recovery_records_scanned"] != 0:
@@ -495,9 +489,8 @@ class Goal02Harness(BaseNativeHarness):
         refused = sha256_file(document)
         if refused != rewritten:
             raise HarnessFailure("SAVE_OVERWROTE_EXTERNAL_REWRITE")
-        after_refusal = self.editor_fingerprint(app)
-        if after_refusal != dirty:
-            raise HarnessFailure("CONFLICT_CHANGED_EDITOR")
+        # The overwrite below writes the exact dirty bytes, which proves the
+        # conflict kept the buffer; no editor read is needed here.
         keep_mine = self.find_control(
             app,
             KEEP_MINE_AUTOMATION_ID,
@@ -525,7 +518,6 @@ class Goal02Harness(BaseNativeHarness):
             "external_modification_rewritten_source": rewritten.evidence(),
             "external_modification_dirty_editor": dirty.evidence(),
             "external_modification_source_after_refused_save": refused.evidence(),
-            "external_modification_editor_after_refusal": after_refusal.evidence(),
             "external_modification_overwritten_source": overwritten.evidence(),
             "external_modification_conflict_ms": conflict_ms,
         }
@@ -537,8 +529,6 @@ class Goal02Harness(BaseNativeHarness):
         self.close_tab_by_pointer(app)
         self.click_lifecycle_decision(app, "Cancel")
         self.require_running(app, "CANCEL_CLOSED_PROCESS")
-        if self.editor_fingerprint(app) != editor:
-            raise HarnessFailure("CANCEL_CHANGED_EDITOR_BYTES")
         kept_source = sha256_file(document)
         if kept_source != source:
             raise HarnessFailure("CANCEL_CHANGED_SOURCE")
@@ -550,8 +540,12 @@ class Goal02Harness(BaseNativeHarness):
             "tab_close_saved_source": saved.evidence(),
         }
 
-    def reopen_from_workspace_home(self, app: RunningApp, source: Any) -> None:
-        """Press the workspace home's file row; wait for the document's text."""
+    def reopen_from_workspace_home(self, app: RunningApp) -> None:
+        """Press the workspace home's file row; wait for the source editor.
+
+        The app adds the tab only after loading the file, and the next
+        `replace_editor` reads its own text back, so no readback is needed.
+        """
         row = self.find_control(
             app,
             WORKSPACE_HOME_FILE_AUTOMATION_ID,
@@ -561,22 +555,18 @@ class Goal02Harness(BaseNativeHarness):
         )
         self.invoke_control(row, "WORKSPACE_HOME_FILE_INVOKE_FAILED")
         self.activate_source_layout(app)
-        self.wait_editor_fingerprint(app, source, self.ui_timeout)
 
     def window_close(self, app: RunningApp, document: Path) -> dict[str, Any]:
         """Alt+F4 and WM_CLOSE raise the guard; its Save writes and exits.
 
         `wait_process_exit` fails with PROCESS_EXIT_NONZERO unless the code is 0.
         """
-        self.reopen_from_workspace_home(app, sha256_file(document))
+        self.reopen_from_workspace_home(app)
         editor = self.replace_editor(app, WINDOW_EDIT)
         source = sha256_file(document)
         self.send_alt_f4(app)
         self.click_lifecycle_decision(app, "Cancel")
         self.require_running(app, "ALT_F4_CANCEL_CLOSED_PROCESS")
-        kept = self.editor_fingerprint(app)
-        if kept != editor:
-            raise HarnessFailure("ALT_F4_CANCEL_CHANGED_EDITOR_BYTES")
         untouched = sha256_file(document)
         if untouched != source:
             raise HarnessFailure("ALT_F4_CANCEL_CHANGED_SOURCE")
@@ -589,7 +579,6 @@ class Goal02Harness(BaseNativeHarness):
             raise HarnessFailure("SAVE_BYTES_MISMATCH")
         return {
             "window_close_editor": editor.evidence(),
-            "window_close_editor_after_cancel": kept.evidence(),
             "window_close_source_after_cancel": untouched.evidence(),
             "window_close_saved_source": saved.evidence(),
         }

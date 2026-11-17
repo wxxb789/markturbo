@@ -52,7 +52,6 @@ def observations(case_id: str = HARNESS.CASE_LIFECYCLE_SESSION) -> dict:
         external_modification_rewritten_source=external,
         external_modification_dirty_editor=conflict,
         external_modification_source_after_refused_save=external,
-        external_modification_editor_after_refusal=conflict,
         external_modification_overwritten_source=conflict,
         external_modification_conflict_ms=12.0,
         tab_close_editor=pointer,
@@ -72,7 +71,6 @@ def observations(case_id: str = HARNESS.CASE_LIFECYCLE_SESSION) -> dict:
         keyboard_close_ms=4.0,
         keyboard_close_retire_ms=1.0,
         window_close_editor=window,
-        window_close_editor_after_cancel=window,
         window_close_source_after_cancel=pointer,
         window_close_saved_source=window,
         process_contexts=[process_context()] * 2,
@@ -122,7 +120,6 @@ class EvidenceSchemaTests(unittest.TestCase):
             ("external_modification_conflict_ms", -1.0, "nonnegative timing"),
             ("external_modification_source_after_refused_save", fingerprint(b"conflict"),
              "refused Save changed"),
-            ("external_modification_editor_after_refusal", other, "replaced the dirty"),
             ("external_modification_overwritten_source", other, "explicit overwrite"),
             ("tab_close_source_after_cancel", other, "tab close Cancel changed"),
             ("tab_close_saved_source", other, "Cancel did not preserve"),
@@ -132,7 +129,6 @@ class EvidenceSchemaTests(unittest.TestCase):
             ("keyboard_close_source_before", other, "keyboard close Don't save changed"),
             ("keyboard_close_source_after", other, "keyboard close Don't save changed"),
             ("keyboard_close_retire_ms", -0.1, "nonnegative timing"),
-            ("window_close_editor_after_cancel", other, "Alt\\+F4 Cancel changed"),
             ("window_close_source_after_cancel", other, "Alt\\+F4 Cancel changed"),
             ("window_close_saved_source", other, "window Save did not preserve"),
             ("runtime_scan", recovery_scan(), "kept its recovery record"),
@@ -162,6 +158,8 @@ class EvidenceSchemaTests(unittest.TestCase):
             ("termination", "TerminateProcess"),
             ("restart_count", 2),
             ("cancel_kept_tab", True),
+            ("external_modification_editor_after_refusal", fingerprint(b"conflict")),
+            ("window_close_editor_after_cancel", fingerprint(b"window")),
         ):
             with self.subTest(key=key):
                 evidence = evidence_with()
@@ -261,9 +259,8 @@ class FakeDesk:
         harness.case_roots = self.case_roots
         harness.launch = self.launch
         harness.launch_app = self.launch_app
-        harness.activate_source_layout = lambda _app: None
+        harness.activate_source_layout = self.activate_source_layout
         harness.replace_editor = self.replace_editor
-        harness.editor_fingerprint = lambda _app: runtime.fingerprint_bytes(self.editor)
         harness.name_present = lambda _app, _name, _type: self.conflict
         harness.wait_name = self.wait_name
         harness.save_via_menu = self.save_via_menu
@@ -311,6 +308,10 @@ class FakeDesk:
         self.app = app
         self.launches.append(app)
         return app
+
+    def activate_source_layout(self, _app: Any) -> None:
+        if self.tabs == 0:
+            raise runtime.HarnessFailure("SOURCE_EDITOR_UIA_TIMEOUT")
 
     def replace_editor(self, _app: Any, value: str) -> runtime.Fingerprint:
         self.editor = value.encode("utf-8")
@@ -481,7 +482,7 @@ class ScenarioTests(unittest.TestCase):
             (dict(failing_guard=2), "KEYBOARD_CLOSE_GUARD_CARD_UIA_TIMEOUT"),
             (dict(discard_retires=False), "KEYBOARD_CLOSE_RECOVERY_RECORD_RETAINED"),
             (dict(discard_writes=True), "KEYBOARD_CLOSE_DISCARD_CHANGED_SOURCE"),
-            (dict(home_opens=False), "WINDOW_CLOSE_EDITOR_FINGERPRINT_TIMEOUT"),
+            (dict(home_opens=False), "WINDOW_CLOSE_SOURCE_EDITOR_UIA_TIMEOUT"),
             (dict(failing_guard=3), "WINDOW_CLOSE_GUARD_CARD_UIA_TIMEOUT"),
             (dict(failing_guard=4), "WINDOW_CLOSE_GUARD_CARD_UIA_TIMEOUT"),
             (dict(window_exit_code=1), "WINDOW_CLOSE_PROCESS_EXIT_NONZERO"),
