@@ -18,7 +18,8 @@ fn external_change_shows_conflict_resolution() {
     let config = tempfile::tempdir().expect("config dir");
     let path = dir.path().join("AGENTS.md");
     let mut file = std::fs::File::create(&path).expect("create fixture");
-    writeln!(file, "# Original").expect("write fixture");
+    // The same length as the external rewrite below.
+    writeln!(file, "# Original header").expect("write fixture");
     drop(file);
 
     // SAFETY: this binary has one test, so no other test reads the
@@ -38,7 +39,25 @@ fn external_change_shows_conflict_resolution() {
     app.type_text("label:Markdown source", "\n\nLocal edit.")
         .expect("edit the buffer");
 
+    // A same-length rewrite with the original modification time restored:
+    // neither the size nor the stamp tells, so only the save's own check of
+    // the file can refuse the write.
+    let modified = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .expect("the fixture's modification time");
     std::fs::write(&path, "# External change\n").expect("replace the file");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(modified)))
+        .expect("restore the modification time");
+    assert_eq!(
+        std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("the rewritten file's modification time"),
+        modified,
+        "the test must neutralize the stamp check"
+    );
     app.wait_for("id:title-settings")
         .expect("the settings glyph");
     app.press("id:title-settings")
@@ -56,10 +75,26 @@ fn external_change_shows_conflict_resolution() {
         "# External change\n",
         "a refused save must not touch the disk"
     );
+    // The editor's whole text (a text selector trims the typed blank lines).
+    assert!(
+        app.screen()
+            .matches("id:source-editor >> text:Local edit.# Original header")
+            .expect("selector"),
+        "a refused save keeps the edit in the editor: {:?}",
+        app.screen().texts()
+    );
 
     // 'Keep mine' still asks before the destructive overwrite (the button's
     // accessibility label, so the press lands on the control that hears it).
-    app.on_dialog(|_| DialogAnswer::Press("Overwrite".to_owned()));
+    let asked = path.clone();
+    app.on_dialog(move |_| {
+        assert_eq!(
+            std::fs::read_to_string(&asked).expect("read the file while asked"),
+            "# External change\n",
+            "nothing is written before the overwrite is confirmed"
+        );
+        DialogAnswer::Press("Overwrite".to_owned())
+    });
     app.press("label:Keep mine").expect("choose keep mine");
     app.wait_for_gone("id:conflict-banner", Duration::from_secs(5))
         .expect("conflict resolved");

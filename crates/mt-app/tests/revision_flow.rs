@@ -224,6 +224,7 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
     let revision = state.clone();
     let send_revision = state.clone();
     let edit = state.clone();
+    let replace = state.clone();
     let review_view = state.review_view;
     let tabs = state.tabs;
     let open_state = state.clone();
@@ -245,6 +246,15 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
                 tab.dirty.set(true);
                 tab.revision.update(|revision| *revision += 1);
                 edit.note_edit(tab.id);
+            }
+        }))
+        // The whole buffer typed over, as select-all and typing make it.
+        .child(text("Replace the document").on_press(move || {
+            if let Some(tab) = replace.active_tab() {
+                tab.text.set(SharedString::from(REPLACEMENT));
+                tab.dirty.set(true);
+                tab.revision.update(|revision| *revision += 1);
+                replace.note_edit(tab.id);
             }
         }))
         .child(text(move || {
@@ -668,6 +678,64 @@ fn copy_exports_only_the_approved_result_and_saves_nothing() {
         std::fs::read_to_string(&document).unwrap(),
         source,
         "Copy writes nothing to the file"
+    );
+}
+
+/// What `Replace the document` types over the whole buffer.
+const REPLACEMENT: &str = "Typed over everything\n";
+
+/// The user types over the whole document after the hunks arrive: every
+/// hunk says it can't apply and offers no `Accept`, `Done` approves
+/// nothing, the buffer keeps the user's text and the disk keeps the
+/// reviewed bytes.
+#[test]
+fn an_edit_over_every_hunk_offers_no_accept_and_done_writes_nothing() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let (mut app, document, _directory, _config) = start_field_over_buffer(source);
+
+    app.press("text:Replace the document")
+        .expect("type over the document");
+    app.wait_for(&format!("text:Buffer: {REPLACEMENT}"))
+        .expect("the user's text is in the buffer");
+    app.wait_for("text:Can't apply — this part changed")
+        .expect("the docked hunk says it can't apply");
+    assert!(
+        !app.screen()
+            .matches("id:revision-accept")
+            .expect("the selector"),
+        "no Accept on a hunk whose part changed: {:?}",
+        app.screen().texts()
+    );
+    // `A` decides nothing, and the next hunk refuses too.
+    app.press_key("a").expect("press A");
+    app.press_key("j").expect("dock the second hunk");
+    app.settle();
+    assert!(
+        app.shows("0 of 2 decided")
+            && app.shows("Can't apply — this part changed")
+            && !app
+                .screen()
+                .matches("id:revision-accept")
+                .expect("the selector"),
+        "neither hunk accepts: {:?}",
+        app.screen().texts()
+    );
+
+    app.press_key("ctrl+enter").expect("Done");
+    app.wait_for("text:No changes approved.")
+        .expect("Done with nothing approved");
+    assert!(
+        buffer_shows(&app, REPLACEMENT),
+        "Done writes nothing over the user's text: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        std::fs::read(&document).unwrap(),
+        source.as_bytes(),
+        "the disk keeps the reviewed bytes"
     );
 }
 
