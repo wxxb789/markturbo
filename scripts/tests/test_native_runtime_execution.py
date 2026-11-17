@@ -38,6 +38,49 @@ class PhaseTests(unittest.TestCase):
                 raise runtime.HarnessBlocked("FOREGROUND_UNAVAILABLE")
         self.assertEqual(blocked.exception.code, "FOREGROUND_UNAVAILABLE")
 
+    def test_a_goal_run_records_each_phase_once_and_its_counters(self) -> None:
+        def passing() -> dict:
+            with runtime.phase("LAUNCH"):
+                with runtime.phase("LAUNCH_WINDOW"):
+                    runtime.count("uia_queries")
+            with runtime.phase("SAVE"):
+                runtime.count("editor_reads")
+                runtime.count("editor_reads")
+            return {}
+
+        def failing() -> dict:
+            with runtime.phase("CLOSE"):
+                raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT")
+
+        plan = dataclasses.replace(
+            synthetic_plan(({}, {}, {})),
+            validate_evidence=lambda value: evidence.validate_evidence(value, SYNTHETIC_CONTRACT),
+            scenarios=lambda _harness: (passing, failing, passing),
+        )
+        clock = iter(float(tick) for tick in range(100))
+        with tempfile.TemporaryDirectory() as temporary:
+            exe = Path(temporary) / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            with mock.patch.object(runtime.time, "perf_counter", lambda: next(clock)):
+                code, value, reason = runtime.run_native_acceptance(synthetic_args(exe), plan)
+
+        self.assertEqual((code, reason), (1, "CLOSE_GUARD_CARD_UIA_TIMEOUT"))
+        metrics = value["metrics"]
+        self.assertEqual(
+            [timing["phase"] for timing in metrics["phase_timings"]],
+            ["LAUNCH_WINDOW", "LAUNCH", "SAVE", "CLOSE"],
+        )
+        self.assertTrue(all(timing["ms"] > 0 for timing in metrics["phase_timings"]))
+        self.assertEqual(
+            metrics["counters"],
+            {"editor_reads": 2, "copy_resends": 0, "foreground_recoveries": 0, "uia_queries": 1},
+        )
+        evidence.validate_metrics(metrics)
+        # Outside a goal run nothing is recorded or counted.
+        self.assertIsNone(runtime._ACTIVE_METRICS.get())
+        with runtime.phase("LAUNCH"):
+            runtime.count("editor_reads")
+
 
 class PrivacyAndCliTests(unittest.TestCase):
     def test_isolation_cleanup_retries_transient_permission_errors(self) -> None:

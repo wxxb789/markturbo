@@ -268,6 +268,10 @@ class Goal07Fixtures:
                 "failed_case_count": 0,
                 "not_run_case_count": 0,
             },
+            "metrics": {
+                "phase_timings": [{"phase": "DECISIONS", "ms": 1.0}],
+                "counters": dict.fromkeys(native_evidence.METRIC_COUNTERS, 0),
+            },
         }
 
     def _owner_cases(self) -> dict[str, dict[str, Any]]:
@@ -943,7 +947,7 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
     def test_native_schema_follows_the_harness_and_refuses_earlier_versions(self) -> None:
         self.assertEqual(revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION, native_evidence.SCHEMA_VERSION)
         self.assertEqual(revision.NATIVE_REQUIRED_CASE_IDS, frozenset(native_goal07.REQUIRED_CASE_IDS))
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with self.subTest(version=version):
                 value = {**self.fixtures.native_value, "schema_version": version}
                 path = Path(self.temp.name) / f"native-v{version}.json"

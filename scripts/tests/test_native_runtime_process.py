@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes as wt
 import sys
 import tempfile
 import unittest
@@ -166,6 +168,62 @@ class ArtifactContainsTests(unittest.TestCase):
             self.assertEqual(
                 runtime.artifact_contains(path, (b"first", b"second")), b"first"
             )
+
+
+def replace_file(destination: Path, replacement: Path, backup: Path) -> None:
+    """The app's atomic save: mt-core `commit.rs` `replace_file`."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReplaceFileW.argtypes = [
+        wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, wt.LPVOID, wt.LPVOID,
+    ]
+    kernel32.ReplaceFileW.restype = wt.BOOL
+    replace_file_write_through = 0x00000001
+    if not kernel32.ReplaceFileW(
+        str(destination), str(replacement), str(backup), replace_file_write_through, None, None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+@unittest.skipUnless(sys.platform == "win32", "the app's save uses ReplaceFileW")
+class SharedFileReadTests(unittest.TestCase):
+    def test_the_apps_replace_succeeds_while_the_harness_hashes_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "document.md"
+            path.write_bytes(b"old bytes")
+            replacement = Path(temporary) / "document.md.tmp"
+            replacement.write_bytes(b"new bytes")
+            backup = Path(temporary) / "document.md.bak"
+            real_sha256 = runtime.hashlib.sha256
+            replaced: list[bool] = []
+
+            def sha256_replacing_mid_read():
+                digest = real_sha256()
+                update = digest.update
+
+                class Digest:
+                    def update(self, chunk: bytes) -> None:
+                        # The app's save lands while the harness holds the file open.
+                        if not replaced:
+                            replace_file(path, replacement, backup)
+                            replaced.append(True)
+                        update(chunk)
+
+                    def hexdigest(self) -> str:
+                        return digest.hexdigest()
+
+                return Digest()
+
+            with mock.patch.object(runtime.hashlib, "sha256", sha256_replacing_mid_read):
+                read = runtime.sha256_file(path)
+
+            self.assertEqual(replaced, [True])
+            self.assertEqual(read, runtime.fingerprint_bytes(b"old bytes"))
+            self.assertEqual(path.read_bytes(), b"new bytes")
+
+    def test_a_missing_file_is_an_os_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(FileNotFoundError):
+                runtime.sha256_file(Path(temporary) / "missing.md")
 
 
 class HarnessCleanupTests(unittest.TestCase):

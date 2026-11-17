@@ -80,7 +80,7 @@ class ToolingCliTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertLess(result.stdout.index("== goal-03"), result.stdout.index("== goal-07"))
+            self.assertLess(result.stdout.index("== goal-06"), result.stdout.index("== goal-03"))
             self.assertIn("overall: FAIL", result.stderr)
             reasons = {}
             for goal in cli.ACCEPT_ALL_ORDER:
@@ -90,9 +90,9 @@ class ToolingCliTests(unittest.TestCase):
                 self.assertEqual(value["status"], "FAIL")
                 reasons[goal] = {case["reason_code"] for case in value["cases"]}
 
-        self.assertEqual(cli.ACCEPT_ALL_ORDER, ("goal-03", "goal-02", "goal-06", "goal-07"))
-        self.assertEqual(reasons["goal-03"], {"EXECUTABLE_MISSING"})
-        for goal in ("goal-02", "goal-06", "goal-07"):
+        self.assertEqual(cli.ACCEPT_ALL_ORDER, ("goal-06", "goal-02", "goal-07", "goal-03"))
+        self.assertEqual(reasons["goal-06"], {"EXECUTABLE_MISSING"})
+        for goal in ("goal-02", "goal-07", "goal-03"):
             self.assertEqual(reasons[goal], {"SKIPPED_AFTER_FAILURE"})
 
     def test_accept_all_runs_each_goal_once_in_order_with_the_shared_options(self) -> None:

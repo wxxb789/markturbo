@@ -184,9 +184,23 @@ ES_DISPLAY_REQUIRED = 0x00000002
 # The one wait for the OS to hand the main window the foreground. Longer waits
 # do not help: a refused activation stays refused until the session changes.
 FOREGROUND_TIMEOUT_SECONDS = 3.0
+# How long a run waits for the operator to give the session a foreground
+# window back (`Win32.require_foreground`), and what it asks them.
+FOREGROUND_RECOVERY_SECONDS = 30.0
+FOREGROUND_RECOVERY_PROMPT = (
+    "No window has the foreground: restore the Remote Desktop window to continue "
+    f"(waiting up to {FOREGROUND_RECOVERY_SECONDS:.0f} s)."
+)
+# Where a launch clicks when Windows refuses it the foreground: in the title
+# row's left padding (`ui/titlebar.rs`, `RAIL_W + COLUMN_GAP` = 84 px wide,
+# `TITLE_ROW_H` = 32 px high), a drag region at any scale of at least 100 %,
+# which holds no control. Physical pixels from the window's top-left corner.
+TITLE_ROW_CLICK_POINT = (24, 16)
 # The longest a step nested inside an outer wait (one editor copy inside an
 # exact-bytes wait) may take, and never past the outer wait's deadline.
 INNER_WAIT_SECONDS = 2.0
+# How often a wait for a file's exact bytes hashes it.
+FILE_POLL_SECONDS = 0.1
 
 
 class GUITHREADINFO(ctypes.Structure):
@@ -407,10 +421,57 @@ def fingerprint_text(value: str) -> Fingerprint:
     return fingerprint_bytes(value.encode("utf-8"))
 
 
+GENERIC_READ = 0x80000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def open_shared_for_read(path: Path) -> Any:
+    """A binary reader of `path` that never blocks the app's own writes.
+
+    Python's `open` withholds FILE_SHARE_DELETE, so while the harness reads a
+    document the app's atomic save (`ReplaceFileW`, which renames over the
+    path) fails with a sharing violation. This handle grants read, write and
+    delete sharing; elsewhere than Windows `open` already shares them."""
+    if sys.platform != "win32":
+        return path.open("rb")
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wt.HANDLE
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    kernel32.CloseHandle.restype = wt.BOOL
+    handle = kernel32.CreateFileW(
+        str(path),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle is None or handle == INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        raise OSError(None, ctypes.FormatError(error).strip(), str(path), error)
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(descriptor, "rb")
+
+
 def sha256_file(path: Path) -> Fingerprint:
     digest = hashlib.sha256()
     byte_count = 0
-    with path.open("rb") as handle:
+    with open_shared_for_read(path) as handle:
         while chunk := handle.read(1024 * 1024):
             byte_count += len(chunk)
             digest.update(chunk)
@@ -843,6 +904,8 @@ class Win32:
         self.user32.CloseDesktop.restype = wt.BOOL
         self.user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
         self.user32.ShowWindow.restype = wt.BOOL
+        self.user32.IsIconic.argtypes = [wt.HWND]
+        self.user32.IsIconic.restype = wt.BOOL
         self.user32.SetForegroundWindow.argtypes = [wt.HWND]
         self.user32.SetForegroundWindow.restype = wt.BOOL
         self.user32.BringWindowToTop.argtypes = [wt.HWND]
@@ -1058,13 +1121,59 @@ class Win32:
             return None
         return None
 
+    # The foreground waits read these; tests replace them on an instance.
+    def clock(self) -> float:
+        return time.perf_counter()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
     def require_foreground(self, hwnd: int, timeout: float = FOREGROUND_TIMEOUT_SECONDS) -> None:
         """Make `hwnd` the foreground window within at most `FOREGROUND_TIMEOUT_SECONDS`.
 
         A caller's longer `timeout` is capped: the foreground has one timeout.
+        A window already in the foreground is left as it is. When no window
+        has the foreground at all (a minimized Remote Desktop client stops
+        the remote session's input), the operator is asked once on the
+        console to restore it; once any window has the foreground again,
+        within `FOREGROUND_RECOVERY_SECONDS`, the activation is retried once
+        and counted in `foreground_recoveries`. Another window holding the
+        foreground blocks at once.
         """
-        timeout = min(timeout, FOREGROUND_TIMEOUT_SECONDS)
-        show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+        if int(self.user32.GetForegroundWindow() or 0) == hwnd:
+            return
+        try:
+            self._activate(hwnd, min(timeout, FOREGROUND_TIMEOUT_SECONDS))
+        except HarnessBlocked as error:
+            if (
+                error.code != "FOREGROUND_PERMISSION_DENIED"
+                or error.diagnostics.get("foreground_hwnd") != 0
+            ):
+                raise
+            print(FOREGROUND_RECOVERY_PROMPT, file=sys.stderr, flush=True)
+            try:
+                wait_until(
+                    lambda: int(self.user32.GetForegroundWindow() or 0) != 0,
+                    FOREGROUND_RECOVERY_SECONDS,
+                    "FOREGROUND_RECOVERY_TIMEOUT",
+                    interval=0.1,
+                    clock=self.clock,
+                    sleep=self.sleep,
+                )
+            except HarnessFailure:
+                raise error from None
+            count("foreground_recoveries")
+            self._activate(hwnd, min(timeout, FOREGROUND_TIMEOUT_SECONDS))
+
+    def _restore_if_minimized(self, hwnd: int) -> bool:
+        """Restore a minimized window only: `SW_RESTORE` also un-maximizes a
+        maximized one, which moves every control."""
+        if not self.user32.IsIconic(hwnd):
+            return False
+        return bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+
+    def _activate(self, hwnd: int, timeout: float) -> None:
+        show_window = self._restore_if_minimized(hwnd)
         bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
         set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
         foreground = int(self.user32.GetForegroundWindow() or 0)
@@ -1077,23 +1186,23 @@ class Win32:
                 self.send_inputs([key_input(VK_MENU, True)])
             except HarnessFailure:
                 pass
-        show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+        show_window = self._restore_if_minimized(hwnd)
         bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
         set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
         foreground = int(self.user32.GetForegroundWindow() or 0)
         if foreground == hwnd:
             return
-        deadline = time.perf_counter() + timeout
+        deadline = self.clock() + timeout
         attempts = 0
-        while time.perf_counter() < deadline:
+        while self.clock() < deadline:
             attempts += 1
             foreground = int(self.user32.GetForegroundWindow() or 0)
             if foreground == hwnd:
                 return
-            show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+            show_window = self._restore_if_minimized(hwnd)
             bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
             set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
-            time.sleep(0.025)
+            self.sleep(0.025)
         diagnostics: dict[str, int | bool] = {
             "requested_hwnd": hwnd,
             "foreground_hwnd": foreground,
@@ -1157,15 +1266,17 @@ class Win32:
             raise HarnessFailure("SENDINPUT_INCOMPLETE")
 
     def send_shortcut(self, hwnd: int, key: int) -> None:
+        self.send_shortcuts(hwnd, (key,))
+
+    def send_shortcuts(self, hwnd: int, keys: tuple[int, ...]) -> None:
+        """Press each of `keys` in turn with Ctrl held, as one SendInput batch:
+        no other input can land between them."""
         self.require_foreground(hwnd)
-        self.send_inputs(
-            [
-                key_input(VK_CONTROL, False),
-                key_input(key, False),
-                key_input(key, True),
-                key_input(VK_CONTROL, True),
-            ]
-        )
+        inputs = [key_input(VK_CONTROL, False)]
+        for key in keys:
+            inputs.extend((key_input(key, False), key_input(key, True)))
+        inputs.append(key_input(VK_CONTROL, True))
+        self.send_inputs(inputs)
 
     def send_key(self, hwnd: int, key: int) -> None:
         self.require_foreground(hwnd)
@@ -1206,6 +1317,10 @@ class Win32:
 
 CLIPBOARD_OPEN_TIMEOUT_SECONDS = 3.0
 CLIPBOARD_OPEN_RETRY_SECONDS = 0.02
+# An editor read resends Ctrl+C once when the clipboard has not changed this
+# long after the copy, and polls its sequence number this often.
+COPY_RESEND_SECONDS = 0.3
+CLIPBOARD_SEQUENCE_POLL_SECONDS = 0.01
 
 
 def open_clipboard_with_retry(
@@ -1262,6 +1377,7 @@ class _ClipboardApi:
         user32.EmptyClipboard.restype = wt.BOOL
         user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
         user32.SetClipboardData.restype = wt.HANDLE
+        user32.GetClipboardSequenceNumber.restype = wt.DWORD
         kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
         kernel32.GlobalAlloc.restype = wt.HGLOBAL
         kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
@@ -1284,6 +1400,11 @@ class _ClipboardApi:
             lambda: bool(self.user32.OpenClipboard(None)),
             lambda: bool(self.user32.GetOpenClipboardWindow()),
         )
+
+
+def clipboard_sequence_number() -> int:
+    """The clipboard's change count; reading it does not open the clipboard."""
+    return int(_ClipboardApi.get().user32.GetClipboardSequenceNumber())
 
 
 def read_clipboard_text() -> str | None:
@@ -1421,18 +1542,56 @@ def wait_until(
     raise HarnessFailure(timeout_code)
 
 
+# The integer counters a goal run's `metrics` evidence carries.
+METRIC_COUNTERS = ("editor_reads", "copy_resends", "foreground_recoveries", "uia_queries")
+
+
+class RunMetrics:
+    """Content-free cost of one goal run: each phase's wall time (in the order
+    the phases ended, a nested phase before its parent) and the counters of
+    the harness's costly or recovering steps."""
+
+    def __init__(self) -> None:
+        self.phase_timings: list[dict[str, Any]] = []
+        self.counters = dict.fromkeys(METRIC_COUNTERS, 0)
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "phase_timings": [dict(timing) for timing in self.phase_timings],
+            "counters": dict(self.counters),
+        }
+
+
+_ACTIVE_METRICS: contextvars.ContextVar[RunMetrics | None] = contextvars.ContextVar(
+    "markturbo_native_metrics", default=None
+)
+
+
+def count(counter: str) -> None:
+    """Add one to the running goal's `counter`; nothing outside a goal run."""
+    metrics = _ACTIVE_METRICS.get()
+    if metrics is not None:
+        metrics.counters[counter] += 1
+
+
 @contextlib.contextmanager
 def phase(prefix: str) -> Iterator[None]:
     """Prefix every failure raised inside one phase of a merged session with
     the phase's name, so a shared helper's code stays locatable. A code that
     already carries the prefix is left alone; BLOCKED is the environment's,
-    not the phase's, and passes through unchanged."""
+    not the phase's, and passes through unchanged. The running goal records
+    the phase's wall time whatever its outcome."""
+    started = time.perf_counter()
     try:
         yield
     except HarnessFailure as error:
         if error.code.startswith(f"{prefix}_"):
             raise
         raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
+    finally:
+        metrics = _ACTIVE_METRICS.get()
+        if metrics is not None:
+            metrics.phase_timings.append({"phase": prefix, "ms": elapsed_ms(started)})
 
 
 def environment_preflight() -> tuple[Win32, SecurityContext, dict[str, Any]]:
@@ -1518,7 +1677,7 @@ class NativeSession:
     Its `preflight` hashes the executable and samples the environment once,
     asks Windows to keep the display and system on, and saves the user's text
     clipboard once (an empty or text-only clipboard is a precondition); per
-    editor read the harness then only clears, copies and reads. `close`
+    editor read the harness then only copies and reads. `close`
     restores the clipboard and releases the display once, after every app has
     exited. A harness killed mid-run cannot restore the clipboard.
 
@@ -1801,10 +1960,7 @@ class NativeHarness:
             if error.code != "FOREGROUND_PERMISSION_DENIED":
                 raise
             try:
-                bounds = window.rectangle()
-                window.click_input(
-                    coords=(max(1, bounds.width() // 2), max(1, bounds.height() // 2))
-                )
+                window.click_input(coords=TITLE_ROW_CLICK_POINT)
             except Exception:
                 raise error from None
             self.win32.require_foreground(hwnd, FOREGROUND_TIMEOUT_SECONDS)
@@ -1846,6 +2002,7 @@ class NativeHarness:
         expected_name: str | None = None,
         expected_class_name: str | None = None,
     ) -> Any | None:
+        count("uia_queries")
         uia = self.iuia_class()
         condition = uia.iuia.CreatePropertyCondition(
             uia.UIA_dll.UIA_AutomationIdPropertyId, automation_id
@@ -1902,6 +2059,7 @@ class NativeHarness:
     def controls_by_name(
         self, hwnd: int, name: str, control_type: str, *, anonymous: bool = True
     ) -> list[Any]:
+        count("uia_queries")
         uia = self.iuia_class()
         condition = uia.iuia.CreatePropertyCondition(uia.UIA_dll.UIA_NamePropertyId, name)
         elements = self.fresh_uia_root(hwnd).element.FindAll(
@@ -2192,15 +2350,38 @@ class NativeHarness:
             ) from None
 
     def focus_editor(self, app: RunningApp, timeout: float | None = None) -> None:
-        editor = self.editor_control(app, timeout)
+        self._focus_editor_control(app, self.editor_control(app, timeout))
+
+    def _focus_editor_control(self, app: RunningApp, editor: Any) -> None:
+        """Give `editor` the keyboard: UIA SetFocus only when it lacks the
+        focus, then the window the foreground."""
         try:
-            editor.set_focus()
-        except Exception as error:
-            raise HarnessFailure("EDITOR_FOCUS_FAILED", safe_exception_name(error)) from None
+            focused = bool(editor.has_keyboard_focus())
+        except Exception:
+            focused = False
+        if not focused:
+            try:
+                editor.set_focus()
+            except Exception as error:
+                raise HarnessFailure("EDITOR_FOCUS_FAILED", safe_exception_name(error)) from None
         self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
 
     def read_text_clipboard(self) -> str | None:
         return read_clipboard_text()
+
+    def clipboard_sequence(self) -> int:
+        return clipboard_sequence_number()
+
+    def _clipboard_changed_since(self, sequence: int, timeout: float) -> bool:
+        """Whether the clipboard changes after `sequence` within `timeout`
+        (checked at least once)."""
+        deadline = self.clock() + timeout
+        while True:
+            if self.clipboard_sequence() != sequence:
+                return True
+            if self.clock() >= deadline:
+                return False
+            self.sleep(CLIPBOARD_SEQUENCE_POLL_SECONDS)
 
     def write_text_clipboard(self, value: str | None) -> None:
         write_clipboard_text(value)
@@ -2227,26 +2408,48 @@ class NativeHarness:
         )
         return value
 
-    def read_editor_text(self, app: RunningApp) -> str:
+    def read_editor_text(self, app: RunningApp, editor: Any | None = None) -> str:
         """The editor's exact document through its own Select All + Copy.
 
-        Only clears, copies and reads: the session saved the user's clipboard
-        once and restores it when the run ends. Nothing read here is written
-        to evidence except its fingerprint.
+        Only copies and reads, never writes the clipboard: the session saved
+        the user's clipboard once and restores it when the run ends. The copy
+        is known to have landed when the clipboard's sequence number moves
+        past the one sampled before Ctrl+A Ctrl+C (one input batch); the text
+        is then read once. A copy that has not landed after
+        `COPY_RESEND_SECONDS` is resent once (`copy_resends`). Another
+        clipboard writer (the Remote Desktop clipboard relay) can move the
+        sequence too, so callers compare the fingerprint and retry. Nothing
+        read here is written to evidence except its fingerprint. `editor` is
+        the editor control a caller already found; without one it is looked
+        up here.
         """
-        self.write_text_clipboard(None)
-        self.focus_editor(app, self.inner_timeout())
-        self.win32.send_shortcut(app.hwnd, VK_A)
-        self.win32.send_shortcut(app.hwnd, VK_C)
+        count("editor_reads")
+        if editor is None:
+            editor = self.editor_control(app, self.inner_timeout())
+        self._focus_editor_control(app, editor)
+        timeout = self.inner_timeout()
+        timeout = self.ui_timeout if timeout is None else timeout
+        deadline = self.clock() + timeout
+        sequence = self.clipboard_sequence()
+        self.win32.send_shortcuts(app.hwnd, (VK_A, VK_C))
         self.last_editor_sample_at = self.clock()
+        if not self._clipboard_changed_since(sequence, min(COPY_RESEND_SECONDS, timeout)):
+            count("copy_resends")
+            self.win32.send_shortcut(app.hwnd, VK_C)
+            self.last_editor_sample_at = self.clock()
+            if not self._clipboard_changed_since(sequence, max(0.0, deadline - self.clock())):
+                raise HarnessFailure("EDITOR_COPY_TIMEOUT")
         return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
 
     def read_editor_fingerprint(self, app: RunningApp) -> Fingerprint | None:
-        if self.control_by_name(
+        """One editor read on one UIA query: the editor found here is the one
+        focused and copied; None while there is no ready editor."""
+        editor = self.control_by_name(
             app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
-        ) is None:
+        )
+        if editor is None or not editor.is_visible() or not editor.is_enabled():
             return None
-        return fingerprint_text(self.read_editor_text(app))
+        return fingerprint_text(self.read_editor_text(app, editor))
 
     def editor_fingerprint(self, app: RunningApp) -> Fingerprint:
         fingerprint, _ = self.wait_editor_fingerprint(app, None, self.ui_timeout)
@@ -2356,6 +2559,8 @@ class NativeHarness:
             raise failure
 
     def wait_file(self, path: Path, expected: Fingerprint, code: str) -> Fingerprint:
+        """Wait for `path` to hold `expected`, hashing it every 100 ms: each
+        read is a window in which the app's own save competes for the file."""
         last: Fingerprint | None = None
 
         def matches() -> Fingerprint | None:
@@ -2368,7 +2573,14 @@ class NativeHarness:
             return last if last == expected else None
 
         try:
-            return wait_until(matches, self.ui_timeout, code)
+            return wait_until(
+                matches,
+                self.ui_timeout,
+                code,
+                interval=FILE_POLL_SECONDS,
+                clock=self.clock,
+                sleep=self.sleep,
+            )
         except HarnessFailure as error:
             if error.code != code:
                 raise
@@ -2559,10 +2771,14 @@ def run_native_acceptance(
     """
     owned = session is None
     active = NativeSession() if session is None else session
+    metrics = RunMetrics()
     token = _ACTIVE_SESSION.set(active)
+    metrics_token = _ACTIVE_METRICS.set(metrics)
     try:
         returncode, evidence, code = _run_goal(args, plan, active)
+        evidence["metrics"] = metrics.evidence()
     finally:
+        _ACTIVE_METRICS.reset(metrics_token)
         _ACTIVE_SESSION.reset(token)
         close_failure = active.close() if owned else None
     if close_failure is not None:
@@ -2900,12 +3116,16 @@ __all__ = [
     "NativeSession",
     "FOREGROUND_TIMEOUT_SECONDS",
     "INNER_WAIT_SECONDS",
+    "METRIC_COUNTERS",
+    "RunMetrics",
     "RunningApp",
     "SecurityContext",
     "Win32",
     "artifact_contains",
     "build_launch_spec",
+    "clipboard_sequence_number",
     "complete_evidence",
+    "count",
     "elapsed_ms",
     "executable_hash_failure",
     "finite_nonnegative",

@@ -78,7 +78,7 @@ class EnvelopeTests(unittest.TestCase):
         evidence.validate_evidence(fresh, CONTRACT)
 
     def test_rejects_every_earlier_schema_version(self) -> None:
-        for version in (1, 2, True, "3"):
+        for version in (1, 2, 3, True, "4"):
             with self.subTest(version=version):
                 value = valid()
                 value["schema_version"] = version
@@ -114,6 +114,46 @@ class EnvelopeTests(unittest.TestCase):
         blocked["environment"] = {"platform": "Windows 11"}
         complete(blocked, "BLOCKED")
         self.assert_rejected(blocked, "environment keys")
+
+    def test_metrics_hold_phase_codes_and_exactly_the_known_integer_counters(self) -> None:
+        value = valid()
+        value["metrics"]["phase_timings"] = [
+            {"phase": "FIRST_LAUNCH", "ms": 812.5},
+            {"phase": "SAVE", "ms": 0},
+        ]
+        value["metrics"]["counters"].update(editor_reads=3, uia_queries=40)
+        evidence.validate_evidence(value, CONTRACT)
+        self.assertEqual(set(value["metrics"]["counters"]), set(runtime.METRIC_COUNTERS))
+
+        def counter(key: str, replacement: object):
+            return lambda metrics: metrics["counters"].__setitem__(key, replacement)
+
+        def timing(key: str, replacement: object):
+            return lambda metrics: metrics["phase_timings"].append(
+                {"phase": "SAVE", "ms": 1.0, key: replacement}
+            )
+
+        for mutate, message in (
+            (counter("clipboard_reads", 1), "metrics counters keys"),
+            (lambda metrics: metrics["counters"].pop("copy_resends"), "metrics counters keys"),
+            (counter("editor_reads", 1.0), "invalid editor_reads"),
+            (counter("editor_reads", True), "invalid editor_reads"),
+            (counter("foreground_recoveries", -1), "invalid foreground_recoveries"),
+            (lambda metrics: metrics.update(extra=[]), "metrics keys"),
+            (lambda metrics: metrics.update(phase_timings={}), "invalid phase timings"),
+            (timing("phase", "free text"), "invalid phase timing name"),
+            (timing("ms", -0.5), "phase timing must be nonnegative"),
+            (timing("ms", True), "phase timing must be nonnegative"),
+            (timing("detail", "x"), "phase timing keys"),
+        ):
+            with self.subTest(message=message):
+                broken = copy.deepcopy(value)
+                mutate(broken["metrics"])
+                self.assert_rejected(broken, message)
+
+        missing = valid()
+        del missing["metrics"]
+        self.assert_rejected(missing, "top-level evidence keys")
 
     def test_pass_binds_the_verified_original_and_copied_executable(self) -> None:
         mutations = (
@@ -287,7 +327,7 @@ class EnvelopeTests(unittest.TestCase):
                 runtime.mark_remaining_cases(value, 0, "NOT_RUN", "EXECUTABLE_MISSING")
                 runtime.complete_evidence(value, "FAIL", module.REQUIRED_CASE_IDS)
                 module.validate_evidence(value)
-                for version in (1, 2):
+                for version in (1, 2, 3):
                     value["schema_version"] = version
                     with self.assertRaisesRegex(ValueError, "unsupported evidence schema"):
                         module.validate_evidence(value)

@@ -28,8 +28,9 @@ ACCEPTANCE_GOALS = {
     "goal-06": "scripts.markturbo_tools.native.goal06",
     "goal-07": "scripts.markturbo_tools.native.goal07",
 }
-# `accept all` runs the cheap, environment-sensitive goals first.
-ACCEPT_ALL_ORDER = ("goal-03", "goal-02", "goal-06", "goal-07")
+# `accept all` runs the cheapest, most stable goals first, so a late BLOCKED
+# result discards as little evidence as possible.
+ACCEPT_ALL_ORDER = ("goal-06", "goal-02", "goal-07", "goal-03")
 NATIVE_EXIT_CODES = frozenset({0, 1, 2})
 
 
