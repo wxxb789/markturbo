@@ -104,7 +104,6 @@ MENU_SAVE_AS_AUTOMATION_ID = "title-menu-save-as"
 MENU_EDIT_AUTOMATION_ID = "title-menu-edit"
 MENU_WEB_AUTOMATION_ID = "title-menu-web"
 MENU_QUIT_AUTOMATION_ID = "title-menu-quit"
-DIRTY_MARK_AUTOMATION_ID = "title-dirty"
 GUARD_HEADING = "Close without saving?"
 GUARD_BUTTON_NAMES = {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"}
 GUARD_BUTTON_AUTOMATION_IDS = {
@@ -122,7 +121,6 @@ TASK_DIALOG_CLASS = "#32770"
 TASK_DIALOG_BUTTON_CLASS = "CCPushButton"
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
-ERROR_NOT_FOUND = 1168
 
 WM_CLOSE = 0x0010
 GW_OWNER = 4
@@ -225,24 +223,6 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 class JOBOBJECT_ASSOCIATE_COMPLETION_PORT(ctypes.Structure):
     _fields_ = [("CompletionKey", wt.LPVOID), ("CompletionPort", wt.HANDLE)]
 
-
-class CREDENTIALW(ctypes.Structure):
-    """Win32 credential metadata. The blob pointer is never dereferenced."""
-
-    _fields_ = [
-        ("Flags", wt.DWORD),
-        ("Type", wt.DWORD),
-        ("TargetName", wt.LPWSTR),
-        ("Comment", wt.LPWSTR),
-        ("LastWritten", wt.FILETIME),
-        ("CredentialBlobSize", wt.DWORD),
-        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
-        ("Persist", wt.DWORD),
-        ("AttributeCount", wt.DWORD),
-        ("Attributes", wt.LPVOID),
-        ("TargetAlias", wt.LPWSTR),
-        ("UserName", wt.LPWSTR),
-    ]
 
 class HarnessBlocked(RuntimeError):
     def __init__(
@@ -823,15 +803,6 @@ class Win32:
         self.advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
         self.advapi32.GetSidSubAuthority.argtypes = [wt.LPVOID, wt.DWORD]
         self.advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wt.DWORD)
-        self.advapi32.CredEnumerateW.argtypes = [
-            wt.LPCWSTR,
-            wt.DWORD,
-            ctypes.POINTER(wt.DWORD),
-            ctypes.POINTER(ctypes.POINTER(ctypes.POINTER(CREDENTIALW))),
-        ]
-        self.advapi32.CredEnumerateW.restype = wt.BOOL
-        self.advapi32.CredFree.argtypes = [wt.LPVOID]
-        self.advapi32.CredFree.restype = None
 
         self.wtsapi32.WTSQuerySessionInformationW.argtypes = [
             wt.HANDLE,
@@ -1165,31 +1136,6 @@ class Win32:
     def post_close(self, hwnd: int) -> None:
         if not self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
             raise HarnessFailure("WM_CLOSE_POST_FAILED")
-
-    def persistent_credential_target_exists(self, target: str) -> bool:
-        """Check an exact Credential Manager target without reading its blob."""
-        count = wt.DWORD()
-        credentials = ctypes.POINTER(ctypes.POINTER(CREDENTIALW))()
-        try:
-            found = self.advapi32.CredEnumerateW(
-                target,
-                0,
-                ctypes.byref(count),
-                ctypes.byref(credentials),
-            )
-        except OSError as error:
-            raise HarnessBlocked("PERSISTENT_CREDENTIAL_PREFLIGHT_UNAVAILABLE") from error
-        if not found:
-            if ctypes.get_last_error() == ERROR_NOT_FOUND:
-                return False
-            raise HarnessBlocked("PERSISTENT_CREDENTIAL_PREFLIGHT_UNAVAILABLE")
-        try:
-            return any(
-                credentials[index].contents.TargetName == target for index in range(count.value)
-            )
-        finally:
-            if credentials:
-                self.advapi32.CredFree(credentials)
 
     def send_inputs(self, inputs: list[INPUT]) -> None:
         if not inputs:
@@ -2185,17 +2131,6 @@ class NativeHarness:
             raise HarnessFailure(
                 "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED", safe_exception_name(error)
             ) from None
-
-    def document_dirty(self, app: RunningApp) -> bool:
-        """The title row's unsaved mark (`title-dirty`) for the active document."""
-        try:
-            return self.control_by_id(
-                app.hwnd, DIRTY_MARK_AUTOMATION_ID, "Text", "DIRTY_MARK_UIA_CONTRACT_MISMATCH"
-            ) is not None
-        except HarnessFailure:
-            raise
-        except Exception as error:
-            raise HarnessFailure("DIRTY_STATE_UIA_QUERY_FAILED", safe_exception_name(error)) from None
 
     def focus_editor(self, app: RunningApp, timeout: float | None = None) -> None:
         editor = self.editor_control(app, timeout)

@@ -15,7 +15,12 @@ observation-key prefix and failure-code prefix:
 1. `decisions` (`revision.md`): Accept writes one hunk, `Undo` takes it
    back, Accept writes it again, Reject writes nothing, `Undo` takes the
    rejection back, Accept completes the accept-all text, `Copy` round-trips
-   the OS clipboard, and `Done` writes nothing more or to disk.
+   the OS clipboard, and `Done` writes nothing more or to disk. The unsaved
+   mark (`title-dirty`) is a Text inside the `title-file` Button, which nsh
+   0.5.1's Windows UIA folds away, so dirty state is proven headless:
+   `tests/revision_flow.rs` `copy_exports_only_the_approved_result_and_saves_nothing`
+   (Copy saves nothing and leaves the mark) and
+   `rejecting_every_hunk_then_done_keeps_the_exact_bytes` (no decision, clean).
 2. `stale` (`stale.md`): a paste over the reviewed text leaves every hunk
    `Can't apply — this part changed` without an Accept; `Done` writes
    nothing.
@@ -195,17 +200,7 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
         "trust_editor_done",
     }
 )
-# The title row's unsaved mark: clean until the first decision writes, and
-# Copy leaves it as it was.
-EXPECTED_DIRTY = {
-    "decisions_dirty_before": False,
-    "decisions_dirty_proposed": False,
-    "decisions_dirty_before_copy": True,
-    "decisions_dirty_after_copy": True,
-}
-OBSERVATION_KEYS = (
-    FINGERPRINT_OBSERVATION_KEYS | frozenset(EXPECTED_DIRTY) | {"provider_request_count"}
-)
+OBSERVATION_KEYS = FINGERPRINT_OBSERVATION_KEYS | {"provider_request_count"}
 REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
 
@@ -390,9 +385,6 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     for key, expected in expected_fingerprints().items():
         if validate_fingerprint(observations[key]) != expected:
             raise ValueError(f"{key} does not hold the expected bytes")
-    for key, expected in EXPECTED_DIRTY.items():
-        if observations[key] is not expected:
-            raise ValueError(f"{key} does not hold the expected dirty state")
     if observations["provider_request_count"] != EXPECTED_REQUEST_COUNT:
         raise ValueError("loopback provider did not receive one Review and Revision per phase")
 
@@ -459,7 +451,7 @@ def review_settings_document(endpoint: str) -> bytes:
 
 @functools.cache
 def _expected_values() -> dict[str, Any]:
-    return {**expected_fingerprints(), **EXPECTED_DIRTY}
+    return expected_fingerprints()
 
 
 def record(observed: dict[str, Any], key: str, value: Any) -> None:
@@ -748,10 +740,8 @@ class Goal07Harness(NativeHarness):
         observed: dict[str, Any] = {}
         record(observed, "decisions_disk_before", sha256_file(source))
         record(observed, "decisions_editor_before", self.editor_fingerprint(app))
-        record(observed, "decisions_dirty_before", self.document_dirty(app))
         total = self.review_and_revise(app, provider, EDITOR_SOURCE_TEXT)
         record(observed, "decisions_editor_proposed", self.editor_fingerprint(app))
-        record(observed, "decisions_dirty_proposed", self.document_dirty(app))
         # Accept writes the first hunk at once; Undo takes exactly it back.
         self.decide_hunks(app, [True], total)
         record(observed, "decisions_editor_one_accepted", self.editor_fingerprint(app))
@@ -764,12 +754,10 @@ class Goal07Harness(NativeHarness):
         self.undo_decision(app, total - 1, total)
         self.decide_hunks(app, [True], total, decided=total - 1)
         record(observed, "decisions_editor_all_accepted", self.editor_fingerprint(app))
-        record(observed, "decisions_dirty_before_copy", self.document_dirty(app))
         record(
             observed, "decisions_clipboard_copied", fingerprint_text(self.copy_approved(app))
         )
         record(observed, "decisions_editor_after_copy", self.editor_fingerprint(app))
-        record(observed, "decisions_dirty_after_copy", self.document_dirty(app))
         self.done(app, REVISION_APPLIED)
         record(observed, "decisions_editor_done", self.editor_fingerprint(app))
         record(observed, "decisions_disk_after", sha256_file(source))

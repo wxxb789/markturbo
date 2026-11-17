@@ -836,10 +836,10 @@ mismatched entries remain visible and removable, while valid entries re-enter
 the same file/workspace open paths used by pickers and drag-and-drop.
 The ten-target bound is covered in settings state by
 `settings::tests::recent_targets_are_mru_deduplicated_and_capped` and across a
-restart by the native acceptance harness scenario `recent_bound_restart_stale`
-in `scripts/mt.py accept goal-03`, which loads eleven isolated persisted
-targets, requires exactly ten Welcome recent controls, restarts, and proves a
-missing entry remains visibly marked and inert.
+restart by the `RECENTS` phase of `scripts/mt.py accept goal-03`, which seeds
+eleven isolated persisted targets, requires ten persisted after a restart and
+the Welcome's five rows, and proves a missing entry remains visibly marked and
+inert.
 
 ### Background parsing
 

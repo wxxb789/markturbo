@@ -240,7 +240,7 @@ def validate_environment(value: Any) -> dict[str, Any]:
     return validate_context(value["harness_process"])
 
 
-def _count(value: Any, key: str) -> int:
+def nonnegative_count(value: Any, key: str) -> int:
     count = value.get(key)
     if not isinstance(count, int) or isinstance(count, bool) or count < 0:
         raise ValueError(f"invalid {key}")
@@ -255,7 +255,7 @@ def validate_runtime_scan(
         raise ValueError("missing runtime scan evidence")
     require_exact_keys(value, RUNTIME_SCAN_KEYS | extra_counts, "runtime scan")
     for key in RUNTIME_SCAN_KEYS | extra_counts:
-        _count(value, key)
+        nonnegative_count(value, key)
     files = value["files_scanned"]
     logs = value["app_logs_scanned"]
     config = value["config_files_scanned"]

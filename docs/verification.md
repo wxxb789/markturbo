@@ -209,30 +209,32 @@ the app only where the behaviour itself needs a restart.
   row opens the exact text). Headless only: a directory argument
   (`tests/welcome_leaves.rs`) and LRU eviction order (`tests/welcome_recents.rs`,
   mt-core settings tests).
-- Goal 02, two cases, three launches. `guarded-session` (one launch):
-  `EXTERNAL_MODIFICATION` (a same-length rewrite with the loaded mtime is
-  refused, then Keep mine and the Overwrite alert write the exact bytes),
-  `TAB_CLOSE` (the rail close raises the guard; Cancel keeps text, dirty mark
-  and file; Save writes the exact bytes) and `WINDOW_CLOSE` (Alt+F4 and
+- Goal 02, one case `lifecycle-session`, two launches (the interruption is
+  the only restart). First launch: `EXTERNAL_MODIFICATION` (a same-length
+  rewrite with the loaded mtime is refused, then Keep mine and the Overwrite
+  alert write the exact bytes), `TAB_CLOSE` (the rail close raises the guard;
+  Cancel keeps text and file; Save writes the exact bytes) and `CHECKPOINT`
+  (an encrypted canonical record within 10 000 ms, no sentinel leak, then
+  TerminateProcess). Relaunch on the workspace folder: `RESTORE` (Restore
+  brings back the exact checkpointed bytes), `KEYBOARD_CLOSE` (Ctrl+W, Don't
+  save closes the tab without writing and retires the record) and
+  `WINDOW_CLOSE` (the workspace home's row reopens the file; Alt+F4 and
   WM_CLOSE raise the guard; Save writes the exact bytes and the process exits
-  0; no recovery record survives a save). `recovery-session` (two launches,
-  the only restart): `CHECKPOINT` (an encrypted canonical record within
-  10 000 ms, no sentinel leak, then TerminateProcess), `RESTORE` (a relaunch
-  with no argv document offers Restore; the restored tab holds the exact
-  checkpointed bytes) and `KEYBOARD_CLOSE` (Ctrl+W, Don't save closes the tab
-  without writing and retires the record, before and after exit). Launch
-  failures carry `GUARDED_LAUNCH_`, `CHECKPOINT_LAUNCH_` or `RESTORE_LAUNCH_`.
-  Headless: `tests/tab_close_guard.rs`, `tests/recovery_restore.rs` (a
-  discarded record is not offered on the next launch),
+  0; no recovery record survives). Launch failures carry `FIRST_LAUNCH_` or
+  `RESTORE_LAUNCH_`. Headless: `tests/tab_close_guard.rs` (Cancel keeps the
+  dirty mark, which nsh 0.5.1's UIA folds into the `title-file` Button),
+  `tests/recovery_restore.rs` (a discarded record is not offered on the next
+  launch),
   `tests/save_as_overwrite.rs` and `ui/revision.rs` `SaveConflictProbe`.
 - Goal 06, default mode: one case `fresh_endpoint_not_set_up`, one launch.
   Phases `SHORTCUT` (Ctrl+Enter shows `No model set up`), `CLOSE` (its Close
   removes the card) and `MENU` (the title menu's `Review selection` row shows
   it again); neither outcome changes the editor or the file, and a clean
   WM_CLOSE proves the document stayed clean. `--configured-provider` (opt-in,
-  `accept goal-06` only) runs `configured_provider_document` and
-  `configured_provider_selection` against a real provider, one launch each;
-  the selection consent card shows the `Selection` scope. Localized findings,
+  `accept goal-06` only) runs `configured_provider_session` against a real
+  provider in one launch: `DOCUMENT` (Ctrl+Enter, consent hold, result, Close)
+  then `SELECTION` (Select All, the menu row; the consent card shows the
+  `Selection` scope). Localized findings,
   clarification questions and the keyless Review variants are headless
   mt-core/mt-app tests.
 - Goal 07, one case `revision_session`, one launch, three Review→Revision
@@ -240,7 +242,8 @@ the app only where the behaviour itself needs a restart.
   at once; `Undo` (`revision-undo`) takes back exactly one; Reject writes
   nothing; accept-all and Done leave the exact bytes; `Copy`
   (`revision-copy`) puts exactly the approved text on the clipboard without
-  changing the editor, dirty mark or file; nothing is saved. `STALE`: an edit
+  changing the editor or file; nothing is saved (the dirty mark, folded away
+  by nsh 0.5.1's UIA, is asserted headless in `tests/revision_flow.rs`). `STALE`: an edit
   over a hunk's part shows `Can't apply — this part changed`, no Accept is
   offered, and Done approves and writes nothing. `TRUST`: an accepted
   executable change turns the trusted Web pane back to Restricted. `QUIT`:

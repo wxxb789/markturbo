@@ -5,17 +5,23 @@ required case runs against the expected x64 release executable in an active,
 unlocked Windows 11 session. Document text is never written to stdout or JSON;
 observations contain only UTF-8 byte counts, SHA-256 digests, and timings.
 
-Two cases, three launches. The guarded session runs in one app: a same-length
-external rewrite (mtime restored) must be refused by menu Save until Keep mine
-is confirmed; the rail's close control, revealed by a real pointer hover, must
-raise the in-window guard card (Save / Don't save / Cancel), whose Cancel keeps
-the text, then menu Save writes it; Alt+F4 and the native window close
-(WM_CLOSE) must raise the guard, never close a dirty document unasked, and the
-guard's Save writes the exact bytes, retires the recovery record and exits 0.
-The recovery session needs a restart: an interrupted dirty buffer (CJK + emoji)
-must leave a canonical recovery record within 10 000 ms; the relaunch, given no
-document so the restored tab is the only one, offers it to Restore, and Ctrl+W's
-guard Don't save then closes the tab without writing and retires the record.
+One case, two launches; only the interruption needs the restart. The first
+launch opens the document: a same-length external rewrite (mtime restored)
+must be refused by menu Save until Keep mine is confirmed; the rail's close
+control, revealed by a real pointer hover, must raise the in-window guard card
+(Save / Don't save / Cancel), whose Cancel keeps the text, then menu Save
+writes it; an edited buffer (CJK + emoji) must then leave a canonical recovery
+record within 10 000 ms before TerminateProcess interrupts it. The relaunch is
+given the workspace folder, so no document opens beside the recovered one: it
+offers the record to Restore; Ctrl+W's guard Don't save closes the restored tab
+without writing and retires the record; the workspace home's file row reopens
+the document, and Alt+F4 and the native window close (WM_CLOSE) must raise the
+guard, never close it unasked, and the guard's Save writes the exact bytes,
+retires the recovery record and exits 0.
+
+The unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
+which nsh 0.5.1's Windows UIA folds away, so the guard's Cancel keeping the
+mark is proven headless (`tests/tab_close_guard.rs`).
 
 Every phase has its own observation-key prefix and failure-code prefix
 (`PHASE_*`), and each launch its own failure-code prefix (`LAUNCH_*`), so a
@@ -58,17 +64,15 @@ from .runtime import (
 )
 
 SCHEMA = "markturbo.goal-02-native-acceptance"
-CASE_GUARDED_SESSION = "guarded-session"
-CASE_RECOVERY_SESSION = "recovery-session"
+CASE_LIFECYCLE_SESSION = "lifecycle-session"
 CASE_FLOWS = {
-    CASE_GUARDED_SESSION: (
+    CASE_LIFECYCLE_SESSION: (
         "same-length rewrite -> menu Save refused with conflict -> Keep mine -> "
         "Overwrite; pointer rail close -> guard Cancel -> menu Save; "
-        "SendInput Alt+F4 -> guard Cancel -> WM_CLOSE -> guard Save -> exit"
-    ),
-    CASE_RECOVERY_SESSION: (
-        "edit -> recovery record -> TerminateProcess -> relaunch -> Restore; "
-        "SendInput Ctrl+W -> guard Don't save -> recovery record retired"
+        "edit -> recovery record -> TerminateProcess -> relaunch on the workspace -> "
+        "Restore; SendInput Ctrl+W -> guard Don't save -> recovery record retired; "
+        "workspace home file -> SendInput Alt+F4 -> guard Cancel -> WM_CLOSE -> "
+        "guard Save -> exit"
     ),
 }
 REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
@@ -83,8 +87,7 @@ PHASE_CHECKPOINT = "CHECKPOINT"
 PHASE_RESTORE = "RESTORE"
 PHASE_KEYBOARD_CLOSE = "KEYBOARD_CLOSE"
 # Launch failure-code prefixes; a phase wrapping a launch keeps them.
-LAUNCH_GUARDED = "GUARDED_LAUNCH"
-LAUNCH_CHECKPOINT = f"{PHASE_CHECKPOINT}_LAUNCH"
+LAUNCH_FIRST = "FIRST_LAUNCH"
 LAUNCH_RESTORE = f"{PHASE_RESTORE}_LAUNCH"
 
 FINGERPRINT_OBSERVATION_KEYS = frozenset(
@@ -109,40 +112,17 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
     }
 )
 REQUIRED_OBSERVATIONS = {
-    CASE_GUARDED_SESSION: frozenset(
-        {
-            "external_modification_loaded_source",
-            "external_modification_rewritten_source",
-            "external_modification_dirty_editor",
-            "external_modification_source_after_refused_save",
-            "external_modification_editor_after_refusal",
-            "external_modification_overwritten_source",
-            "external_modification_conflict_ms",
-            "tab_close_editor",
-            "tab_close_source_after_cancel",
-            "tab_close_saved_source",
-            "window_close_editor",
-            "window_close_editor_after_cancel",
-            "window_close_source_after_cancel",
-            "window_close_saved_source",
-            "process_context",
-        }
-    ),
-    CASE_RECOVERY_SESSION: frozenset(
-        {
-            "checkpoint_editor",
-            "checkpoint_ms",
-            "checkpoint_live_records",
-            "checkpoint_runtime_scan",
-            "restore_editor",
-            "restore_ms",
-            "keyboard_close_source_before",
-            "keyboard_close_source_after",
-            "keyboard_close_ms",
-            "keyboard_close_retire_ms",
-            "process_contexts",
-        }
-    ),
+    CASE_LIFECYCLE_SESSION: FINGERPRINT_OBSERVATION_KEYS
+    | {
+        "external_modification_conflict_ms",
+        "checkpoint_ms",
+        "checkpoint_live_records",
+        "checkpoint_runtime_scan",
+        "restore_ms",
+        "keyboard_close_ms",
+        "keyboard_close_retire_ms",
+        "process_contexts",
+    }
 }
 RECOVERY_SCAN_KEYS = frozenset(
     {
@@ -167,6 +147,9 @@ TAB_CLOSE_AUTOMATION_ID = "rail-close"
 # Enter (`runtime.py` `confirm_system_alert`).
 KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
 RESTORE_AUTOMATION_ID = "recovery-restore-0"
+# The workspace home's file rows (`ui/welcome.rs` `workspace_home`), shown
+# while a workspace is open and no document is; the workspace holds one file.
+WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
 VK_F4 = 0x73
 DOCUMENT_SENTINEL = "MTG02-NATIVE-SENTINEL-\u4fdd\u5b58-\U0001f680"
 CANONICAL_RECOVERY_RECORD_RE = re.compile(r"^[0-9a-f]{64}\.mtrecovery$")
@@ -222,7 +205,7 @@ def _require_timing(observations: dict[str, Any], key: str) -> float:
     return value
 
 
-def validate_guarded_session(observations: dict[str, Any]) -> None:
+def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     loaded, rewritten, dirty, refused, after_refusal, overwritten = _fingerprints(
         observations,
         "external_modification",
@@ -251,23 +234,6 @@ def validate_guarded_session(observations: dict[str, Any]) -> None:
     if editor != saved:
         raise ValueError("Cancel did not preserve exact editor bytes for Save")
 
-    window, kept, untouched, window_saved = _fingerprints(
-        observations,
-        "window_close",
-        "editor",
-        "editor_after_cancel",
-        "source_after_cancel",
-        "saved_source",
-    )
-    if kept != window or untouched != saved or window == untouched:
-        raise ValueError("Alt+F4 Cancel changed the editor or the source")
-    if window != window_saved:
-        raise ValueError("window Save did not preserve exact editor bytes")
-    if observations["runtime_scan"]["canonical_recovery_records_scanned"] != 0:
-        raise ValueError("saved document kept its recovery record")
-
-
-def validate_recovery_session(observations: dict[str, Any]) -> None:
     (edited,) = _fingerprints(observations, "checkpoint", "editor")
     signal_ms = _require_timing(observations, "checkpoint_ms")
     if signal_ms > RECOVERY_LOSS_WINDOW_MS:
@@ -290,19 +256,25 @@ def validate_recovery_session(observations: dict[str, Any]) -> None:
     )
     _require_timing(observations, "keyboard_close_ms")
     _require_timing(observations, "keyboard_close_retire_ms")
-    if before != after or restored == before:
+    if before != saved or before != after or restored == before:
         raise ValueError("keyboard close Don't save changed the source")
+
+    window, kept, untouched, window_saved = _fingerprints(
+        observations,
+        "window_close",
+        "editor",
+        "editor_after_cancel",
+        "source_after_cancel",
+        "saved_source",
+    )
+    if kept != window or untouched != after or window == untouched:
+        raise ValueError("Alt+F4 Cancel changed the editor or the source")
+    if window != window_saved:
+        raise ValueError("window Save did not preserve exact editor bytes")
     if observations["runtime_scan"]["canonical_recovery_records_scanned"] != 0:
-        raise ValueError("discarded recovery record was retained")
+        raise ValueError("a saved or discarded document kept its recovery record")
     if len(observations["process_contexts"]) != 2:
-        raise ValueError("recovery session requires one interrupted and one relaunched process")
-
-
-def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
-    if case_id == CASE_GUARDED_SESSION:
-        validate_guarded_session(observations)
-    elif case_id == CASE_RECOVERY_SESSION:
-        validate_recovery_session(observations)
+        raise ValueError("the session requires one interrupted and one relaunched process")
 
 
 CONTRACT = evidence.EvidenceContract(
@@ -345,8 +317,9 @@ def canonical_recovery_records(data_root: Path) -> list[Path]:
 def retained_recovery_artifacts(data_root: Path) -> list[Path]:
     """Recovery records and their transaction or retirement artifacts.
 
-    After a deliberate Don't save none may remain: the next launch offers only
-    what these hold. The lease is the running app's and is not counted.
+    After a deliberate Don't save or Save none may remain: the next launch
+    offers only what these hold. The lease is the running app's and is not
+    counted.
     """
     try:
         return sorted(
@@ -525,8 +498,7 @@ class Goal02Harness(BaseNativeHarness):
         overwritten = self.wait_file(document, dirty, "OVERWRITE_SAVE_TIMEOUT")
         # The next phases start from a clean, conflict-free document.
         wait_until(
-            lambda: not self.name_present(app, CONFLICT_HEADING, "Text")
-            and not self.document_dirty(app),
+            lambda: not self.name_present(app, CONFLICT_HEADING, "Text"),
             self.ui_timeout,
             "CONFLICT_NOT_RESOLVED",
         )
@@ -549,8 +521,6 @@ class Goal02Harness(BaseNativeHarness):
         self.require_running(app, "CANCEL_CLOSED_PROCESS")
         if self.editor_fingerprint(app) != editor:
             raise HarnessFailure("CANCEL_CHANGED_EDITOR_BYTES")
-        if not self.document_dirty(app):
-            raise HarnessFailure("CANCEL_CLEARED_DIRTY_MARK")
         kept_source = sha256_file(document)
         if kept_source != source:
             raise HarnessFailure("CANCEL_CHANGED_SOURCE")
@@ -562,11 +532,25 @@ class Goal02Harness(BaseNativeHarness):
             "tab_close_saved_source": saved.evidence(),
         }
 
+    def reopen_from_workspace_home(self, app: RunningApp, source: Any) -> None:
+        """Press the workspace home's file row; wait for the document's text."""
+        row = self.find_control(
+            app,
+            WORKSPACE_HOME_FILE_AUTOMATION_ID,
+            "Button",
+            "WORKSPACE_HOME_FILE_UIA_TIMEOUT",
+            "WORKSPACE_HOME_FILE_UIA_CONTRACT_MISMATCH",
+        )
+        self.invoke_control(row, "WORKSPACE_HOME_FILE_INVOKE_FAILED")
+        self.activate_source_layout(app)
+        self.wait_editor_fingerprint(app, source, self.ui_timeout)
+
     def window_close(self, app: RunningApp, document: Path) -> dict[str, Any]:
         """Alt+F4 and WM_CLOSE raise the guard; its Save writes and exits.
 
         `wait_process_exit` fails with PROCESS_EXIT_NONZERO unless the code is 0.
         """
+        self.reopen_from_workspace_home(app, sha256_file(document))
         editor = self.replace_editor(app, WINDOW_EDIT)
         source = sha256_file(document)
         self.send_alt_f4(app)
@@ -592,131 +576,118 @@ class Goal02Harness(BaseNativeHarness):
             "window_close_saved_source": saved.evidence(),
         }
 
-    def scenario_guarded_session(self) -> dict[str, Any]:
-        """One launch: external modification, then tab close, then window close.
+    def checkpoint(self, app: RunningApp, data: Path) -> tuple[dict[str, Any], Any]:
+        """An edited buffer leaves a canonical record within the loss window."""
+        if canonical_recovery_records(data):
+            raise HarnessFailure("RECORD_BEFORE_EDIT")
+        input_started = time.perf_counter()
+        edited = self.replace_editor(app, RECOVERY_EDIT)
+        checkpoint_ms = round(self.wait_checkpoint_record(data, input_started), 3)
+        return {
+            "checkpoint_editor": edited.evidence(),
+            "checkpoint_ms": checkpoint_ms,
+            "checkpoint_live_records": scan_live_recovery_records(data),
+        }, edited
+
+    def restore(self, app: RunningApp, edited: Any) -> dict[str, Any]:
+        """The relaunch offers the record; Restore brings back the exact text."""
+        started = time.perf_counter()
+        restore = self.find_control(
+            app,
+            RESTORE_AUTOMATION_ID,
+            "Button",
+            "UIA_TIMEOUT",
+            "UIA_CONTRACT_MISMATCH",
+            max(self.ui_timeout, 20.0),
+        )
+        self.click_control(restore, "CLICK_FAILED")
+        self.activate_source_layout(app)
+        restored, _ = self.wait_editor_fingerprint(app, edited, max(self.ui_timeout, 20.0))
+        return {"restore_editor": restored.evidence(), "restore_ms": elapsed_ms(started)}
+
+    def keyboard_close(self, app: RunningApp, document: Path, data: Path) -> dict[str, Any]:
+        """Ctrl+W's guard Don't save closes the restored tab unwritten and
+        retires its recovery record."""
+        source = sha256_file(document)
+        started = time.perf_counter()
+        self.focus_editor(app)
+        self.win32.send_shortcut(app.hwnd, VK_W)
+        self.click_lifecycle_decision(app, "Discard")
+        discard_started = time.perf_counter()
+        wait_until(
+            lambda: self.editor_absent_while_running(app),
+            max(self.ui_timeout, 20.0),
+            "TAB_CLOSE_TIMEOUT",
+        )
+        close_ms = elapsed_ms(started)
+        wait_until(
+            lambda: not retained_recovery_artifacts(data),
+            self.ui_timeout,
+            "RECOVERY_RECORD_RETAINED",
+        )
+        retire_ms = elapsed_ms(discard_started)
+        after = sha256_file(document)
+        if after != source:
+            raise HarnessFailure("DISCARD_CHANGED_SOURCE")
+        return {
+            "keyboard_close_source_before": source.evidence(),
+            "keyboard_close_source_after": after.evidence(),
+            "keyboard_close_ms": close_ms,
+            "keyboard_close_retire_ms": retire_ms,
+        }
+
+    def scenario_lifecycle_session(self) -> dict[str, Any]:
+        """Two launches: the interruption alone needs the restart.
 
         The conflict runs first so its stamp is the one the app loaded; each
-        later phase starts from the clean document the previous one saved, and
-        window close ends the process.
+        later phase starts from the document the previous one saved, restored
+        or discarded, and window close ends the second process. The relaunch
+        gets the workspace folder, not the document: an argv document would
+        open as its own clean tab beside the restored one
+        (`AppState::add_tab_with` does not deduplicate paths), and closing the
+        restored tab would leave that tab's editor on screen.
         """
-        data, config, workspace, stderr = self.case_roots(CASE_GUARDED_SESSION)
+        data, config, workspace, stderr = self.case_roots(CASE_LIFECYCLE_SESSION)
         document = (workspace / "guarded.md").resolve()
         write_durable(document, ORIGINAL_BYTES)
-        app: RunningApp | None = None
-        try:
-            with phase(LAUNCH_GUARDED):
-                app = self.launch(document, data, config, workspace, stderr)
-            with phase(PHASE_EXTERNAL):
-                observations = self.external_modification(app, document)
-            with phase(PHASE_TAB_CLOSE):
-                observations |= self.tab_close(app, document)
-            with phase(PHASE_WINDOW_CLOSE):
-                observations |= self.window_close(app, document)
-            observations |= {
-                "flow": CASE_FLOWS[CASE_GUARDED_SESSION],
-                "process_context": app.security_context.evidence(),
-            }
-        finally:
-            if app is not None:
-                self.reap(app)
-        observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
-        # Every Save retired the document's record; none may outlive the exit.
-        if observations["runtime_scan"]["canonical_recovery_records_scanned"]:
-            raise HarnessFailure(f"{PHASE_WINDOW_CLOSE}_RECOVERY_RECORD_RETAINED_AFTER_SAVE")
-        return observations
-
-    def scenario_recovery_session(self) -> dict[str, Any]:
-        """Two launches: the interruption needs a restart; Ctrl+W closes the restored tab.
-
-        The relaunch opens no document: an argv document would open as its own
-        clean tab beside the restored one (`AppState::add_tab_with` does not
-        deduplicate paths), and closing the restored tab would leave that tab's
-        editor on screen.
-        """
-        data, config, workspace, stderr = self.case_roots(CASE_RECOVERY_SESSION)
-        document = (workspace / "recovery.md").resolve()
-        write_durable(document, ORIGINAL_BYTES)
-        source = sha256_file(document)
-        long_timeout = max(self.ui_timeout, 20.0)
-
-        with phase(PHASE_CHECKPOINT):
-            with phase(LAUNCH_CHECKPOINT):
-                first = self.launch(document, data, config, workspace, stderr)
-            try:
-                if canonical_recovery_records(data):
-                    raise HarnessFailure("RECORD_BEFORE_EDIT")
-                input_started = time.perf_counter()
-                edited = self.replace_editor(first, RECOVERY_EDIT)
-                checkpoint_ms = round(self.wait_checkpoint_record(data, input_started), 3)
-                live_records = scan_live_recovery_records(data)
-                self.terminate(first)
-            finally:
-                self.reap(first)
-            live_scan = scan_runtime_artifacts(data, stderr)
-
+        first: RunningApp | None = None
         second: RunningApp | None = None
         try:
+            with phase(LAUNCH_FIRST):
+                first = self.launch(document, data, config, workspace, stderr)
+            with phase(PHASE_EXTERNAL):
+                observations = self.external_modification(first, document)
+            with phase(PHASE_TAB_CLOSE):
+                observations |= self.tab_close(first, document)
+            with phase(PHASE_CHECKPOINT):
+                checkpoint, edited = self.checkpoint(first, data)
+                observations |= checkpoint
+                self.terminate(first)
+                self.reap(first)
+                observations["checkpoint_runtime_scan"] = scan_runtime_artifacts(data, stderr)
             with phase(PHASE_RESTORE):
                 with phase(LAUNCH_RESTORE):
-                    second = self.launch_app(None, data, config, workspace, stderr)
-                restore_started = time.perf_counter()
-                restore = self.find_control(
-                    second,
-                    RESTORE_AUTOMATION_ID,
-                    "Button",
-                    "UIA_TIMEOUT",
-                    "UIA_CONTRACT_MISMATCH",
-                    long_timeout,
-                )
-                self.click_control(restore, "CLICK_FAILED")
-                self.activate_source_layout(second)
-                restored, _ = self.wait_editor_fingerprint(second, edited, long_timeout)
-                restore_ms = elapsed_ms(restore_started)
+                    second = self.launch_app(workspace, data, config, workspace, stderr)
+                observations |= self.restore(second, edited)
             with phase(PHASE_KEYBOARD_CLOSE):
-                close_started = time.perf_counter()
-                self.focus_editor(second)
-                self.win32.send_shortcut(second.hwnd, VK_W)
-                self.click_lifecycle_decision(second, "Discard")
-                discard_started = time.perf_counter()
-                wait_until(
-                    lambda: self.editor_absent_while_running(second),
-                    long_timeout,
-                    "TAB_CLOSE_TIMEOUT",
-                )
-                close_ms = elapsed_ms(close_started)
-                wait_until(
-                    lambda: not retained_recovery_artifacts(data),
-                    self.ui_timeout,
-                    "RECOVERY_RECORD_RETAINED",
-                )
-                retire_ms = elapsed_ms(discard_started)
-                after = sha256_file(document)
-                if after != source:
-                    raise HarnessFailure("DISCARD_CHANGED_SOURCE")
-                self.close_app(second)
-                if retained_recovery_artifacts(data):
-                    raise HarnessFailure("RECOVERY_RECORD_RETAINED_AFTER_EXIT")
-            observations = {
-                "checkpoint_editor": edited.evidence(),
-                "checkpoint_ms": checkpoint_ms,
-                "checkpoint_live_records": live_records,
-                "checkpoint_runtime_scan": live_scan,
-                "restore_editor": restored.evidence(),
-                "restore_ms": restore_ms,
-                "keyboard_close_source_before": source.evidence(),
-                "keyboard_close_source_after": after.evidence(),
-                "keyboard_close_ms": close_ms,
-                "keyboard_close_retire_ms": retire_ms,
-                "flow": CASE_FLOWS[CASE_RECOVERY_SESSION],
+                observations |= self.keyboard_close(second, document, data)
+            with phase(PHASE_WINDOW_CLOSE):
+                observations |= self.window_close(second, document)
+            observations |= {
+                "flow": CASE_FLOWS[CASE_LIFECYCLE_SESSION],
                 "process_contexts": [
                     first.security_context.evidence(),
                     second.security_context.evidence(),
                 ],
             }
         finally:
-            if second is not None:
-                self.reap(second)
+            for app in (first, second):
+                if app is not None:
+                    self.reap(app)
         observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
+        # Every Save and Don't save retired the record; none may outlive the exit.
+        if observations["runtime_scan"]["canonical_recovery_records_scanned"]:
+            raise HarnessFailure(f"{PHASE_WINDOW_CLOSE}_RECOVERY_RECORD_RETAINED_AFTER_SAVE")
         return observations
 
 
@@ -729,10 +700,7 @@ def native_run_plan() -> NativeRunPlan:
         preflight=preflight,
         ui_types_loader=load_pywinauto,
         harness_factory=Goal02Harness,
-        scenarios=lambda harness: (
-            harness.scenario_guarded_session,
-            harness.scenario_recovery_session,
-        ),
+        scenarios=lambda harness: (harness.scenario_lifecycle_session,),
     )
 
 

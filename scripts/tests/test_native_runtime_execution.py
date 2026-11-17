@@ -168,10 +168,8 @@ class PrivacyAndCliTests(unittest.TestCase):
             def __init__(self, *_args):
                 pass
 
-            def scenario_guarded_session(self):
+            def scenario_lifecycle_session(self):
                 return {}
-
-            scenario_recovery_session = scenario_guarded_session
 
             def cleanup(self):
                 pass
@@ -213,10 +211,8 @@ class PrivacyAndCliTests(unittest.TestCase):
             def __init__(self, _exe, root, *_args):
                 roots.append(root)
 
-            def scenario_guarded_session(self):
+            def scenario_lifecycle_session(self):
                 return {}
-
-            scenario_recovery_session = scenario_guarded_session
 
             def cleanup(self):
                 pass
@@ -262,7 +258,7 @@ class PrivacyAndCliTests(unittest.TestCase):
         roots.clear()
 
         class FailingHarness(FakeHarness):
-            def scenario_guarded_session(self):
+            def scenario_lifecycle_session(self):
                 raise runtime.HarnessFailure("TEST_CASE_FAILURE")
 
         with tempfile.TemporaryDirectory() as temporary:

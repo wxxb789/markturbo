@@ -1174,7 +1174,7 @@ class SystemAlertTests(unittest.TestCase):
         harness = self.harness(AlertWin32())
         harness.root = Path(directory.name)
         app = running_app()
-        workspace = harness.root / "cases" / HARNESS.CASE_GUARDED_SESSION / "workspace"
+        workspace = harness.root / "cases" / HARNESS.CASE_LIFECYCLE_SESSION / "workspace"
         workspace.mkdir(parents=True)
         document = (workspace / "guarded.md").resolve()
         runtime.write_durable(document, HARNESS.ORIGINAL_BYTES)
@@ -1187,7 +1187,6 @@ class SystemAlertTests(unittest.TestCase):
         harness.editor_fingerprint = mock.Mock(return_value=dirty)
         harness.find_control = mock.Mock(return_value=keep_mine)
         harness.name_present = mock.Mock(return_value=False)
-        harness.document_dirty = mock.Mock(return_value=False)
 
         def keep_mine_pressed(control: object, _code: str) -> None:
             self.assertIs(control, keep_mine)

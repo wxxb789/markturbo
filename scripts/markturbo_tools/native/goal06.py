@@ -2,7 +2,7 @@
 
 The default mode needs one app session. Its profile names a fresh
 `https://review-<uuid>.invalid/v1/` endpoint and no credential, so no
-document content can leave; the harness never queries Credential Manager.
+document content can leave.
 Ctrl+Enter from the focused editor must show the explicit local diagnostic
 (`No model set up`); the card's Close (`review-close`) must take it away; and
 the title menu's Review row (`title-menu-review-selection`) must bring it back.
@@ -11,10 +11,17 @@ including one a shared helper raises, carries the phase's code prefix.
 
 The opt-in configured-provider mode sends only the fixed test document to an
 already-running loopback provider using a fresh process-only credential, in
-two sessions: the document Review (Ctrl+Enter) and the selection Review
-(Select All, then the menu row), whose consent card must show the
-`Selection` scope. The consent card authorizes only a real pointer hold on
-`consent-send` (a UIA Invoke is a tap and sends nothing).
+one session of two phases: the document Review (Ctrl+Enter), closed with
+`review-close`, then the selection Review (Select All, then the menu row),
+whose consent card must show the `Selection` scope. The consent card
+authorizes only a real pointer hold on `consent-send` (a UIA Invoke is a tap
+and sends nothing).
+
+The harness itself never queries Credential Manager. The shipped app it
+drives still resolves a Review's credential through the platform store first
+(`mt-core` `CredentialVault::resolve`), so a run reads the store at its
+endpoint's target: a fresh one in the default mode, the fixed loopback
+identity in the configured-provider mode.
 
 Both modes bind PASS evidence to an executable hash and prove the editor and
 source file stayed byte-identical and the document clean.
@@ -36,7 +43,6 @@ from .runtime import (
     INTEGRITY_NAMES,
     VK_A,
     VK_RETURN,
-    HarnessBlocked,
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
@@ -46,7 +52,6 @@ from .runtime import (
     main_native_acceptance,
     phase,
     preflight,
-    require_true,
     sha256_file,
     validate_fingerprint,
     wait_until,
@@ -74,8 +79,7 @@ CONFIGURED_PROVIDER_MODE = "configured_provider_success"
 CONFIGURED_PROVIDER_ENDPOINT = "http://127.0.0.1:4141/v1/"
 
 CASE_NOT_SET_UP = "fresh_endpoint_not_set_up"
-CASE_DOCUMENT = "configured_provider_document"
-CASE_SELECTION = "configured_provider_selection"
+CASE_CONFIGURED = "configured_provider_session"
 CASE_FLOWS = {
     NOT_SET_UP_MODE: {
         CASE_NOT_SET_UP: (
@@ -84,13 +88,10 @@ CASE_FLOWS = {
         ),
     },
     CONFIGURED_PROVIDER_MODE: {
-        CASE_DOCUMENT: (
+        CASE_CONFIGURED: (
             "configured provider with ephemeral credential -> Ctrl+Enter document review -> "
-            "hold-to-send consent -> structured success"
-        ),
-        CASE_SELECTION: (
-            "configured provider with ephemeral credential -> menu selection review -> "
-            "selection-scope hold-to-send consent -> structured success"
+            "hold-to-send consent -> structured success -> Close -> Select All -> "
+            "menu selection review -> selection-scope hold-to-send consent -> structured success"
         ),
     },
 }
@@ -108,20 +109,20 @@ SAFE_STRINGS = (
     | INTEGRITY_NAMES
 )
 
-# Per mode: the fingerprints (each `*_after` must equal its `*_before`), the
-# measured booleans a PASS needs False, and the measured durations.
+# Per mode: the fingerprints (each `*_after` must equal its `*_before`) and
+# the measured durations.
 # `clean_close_ms` is how the document's clean state is measured: the title
 # row's unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
 # which nsh 0.5.1's UIA folds away, so a close request that ends the process
 # without the 'Close without saving?' guard is the native proof.
 NOT_SET_UP_PHASES = ("shortcut", "menu")
+CONFIGURED_PHASES = ("document", "selection")
 OBSERVATIONS = {
     NOT_SET_UP_MODE: {
         "fingerprints": frozenset(
             {"editor_before", "source_before"}
             | {f"{phase}_{side}_after" for phase in NOT_SET_UP_PHASES for side in ("editor", "source")}
         ),
-        "false": frozenset({"shortcut_diagnostic_before"}),
         "durations": frozenset(
             {
                 "shortcut_diagnostic_ms",
@@ -133,14 +134,19 @@ OBSERVATIONS = {
     },
     CONFIGURED_PROVIDER_MODE: {
         "fingerprints": frozenset(
-            {"editor_before", "source_before", "editor_after", "source_after"}
+            {"editor_before", "source_before"}
+            | {
+                f"{phase}_{side}_after"
+                for phase in CONFIGURED_PHASES
+                for side in ("editor", "source")
+            }
         ),
-        "false": frozenset(),
-        "durations": frozenset({"consent_ms", "result_ms", "clean_close_ms"}),
+        "durations": frozenset(
+            {"document_consent_ms", "document_result_ms", "document_close_ms"}
+            | {"selection_consent_ms", "selection_result_ms", "clean_close_ms"}
+        ),
     },
 }
-# The selection binding alone must show its scope on the consent card.
-CASE_TRUE_OBSERVATIONS = {CASE_SELECTION: frozenset({"consent_selection_scope"})}
 
 
 def _after_pairs(fingerprints: frozenset[str]) -> list[tuple[str, str]]:
@@ -169,13 +175,7 @@ def review_settings_document(
 
 def _contract(mode: str) -> evidence.EvidenceContract:
     keys = OBSERVATIONS[mode]
-    required = {
-        case_id: keys["fingerprints"]
-        | keys["false"]
-        | keys["durations"]
-        | CASE_TRUE_OBSERVATIONS.get(case_id, frozenset())
-        for case_id in CASE_IDS[mode]
-    }
+    required = {case_id: keys["fingerprints"] | keys["durations"] for case_id in CASE_IDS[mode]}
 
     def validate_runtime_scan(value: Any) -> None:
         evidence.validate_runtime_scan(value, require_config=True)
@@ -185,10 +185,6 @@ def _contract(mode: str) -> evidence.EvidenceContract:
             raise ValueError("invalid native Review mode")
 
     def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
-        require_true(observations, *CASE_TRUE_OBSERVATIONS.get(case_id, ()))
-        for key in sorted(keys["false"]):
-            if observations.get(key) is not False:
-                raise ValueError(f"passed case requires false {key}")
         for key in sorted(keys["durations"]):
             if not finite_nonnegative(observations.get(key)):
                 raise ValueError(f"passed case requires a measured {key}")
@@ -242,20 +238,6 @@ def scan_case_artifacts(case_root: Path, ephemeral_credential: str | None = None
     return evidence.scan_case_artifacts(case_root, codes, require_config=True)
 
 
-def goal06_preflight(configured_provider: bool):
-    """Return the mode-specific preflight before any child process is created."""
-
-    def verify(exe: Path, expected_hash: str, evidence: dict[str, Any]) -> tuple[Any, Any]:
-        win32, parent_context = preflight(exe, expected_hash, evidence)
-        if configured_provider and win32.persistent_credential_target_exists(
-            credential_target(CONFIGURED_PROVIDER_ENDPOINT, "openai-responses")
-        ):
-            raise HarnessBlocked("PERSISTENT_CREDENTIAL_PRESENT")
-        return win32, parent_context
-
-    return verify
-
-
 def _window_exists(win32: Any, hwnd: int) -> bool:
     return bool(win32.user32.IsWindow(hwnd))
 
@@ -303,17 +285,17 @@ class Goal06Harness(BaseNativeHarness):
         )
         self.win32.send_shortcut(app.hwnd, key)
 
-    def request_review(self, app: Any, target: str) -> None:
+    def request_review(self, app: Any, selection: bool) -> None:
         """Document: Ctrl+Enter from the editor. Selection: Select All in the
         editor, then the title menu's Review row."""
-        if target != CASE_SELECTION:
+        if not selection:
             self.send_from_editor(app, VK_RETURN, "REVIEW_SHORTCUT")
             return
         self.send_from_editor(app, VK_A, "REVIEW_SELECT_ALL")
         self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
 
-    def approve_review_consent(self, app: Any, target: str) -> bool | None:
-        """Hold `consent-send`; for a selection, first measure its scope word."""
+    def approve_review_consent(self, app: Any, selection: bool) -> None:
+        """Hold `consent-send`; a selection's card must first show its scope."""
         send = self.find_control(
             app,
             CONSENT_SEND_AUTOMATION_ID,
@@ -321,13 +303,9 @@ class Goal06Harness(BaseNativeHarness):
             "REVIEW_CONSENT_UIA_TIMEOUT",
             "REVIEW_CONSENT_UIA_CONTRACT_MISMATCH",
         )
-        scope_shown = None
-        if target == CASE_SELECTION:
-            scope_shown = self.name_present(app, CONSENT_SELECTION_SCOPE, "Text")
-            if not scope_shown:
-                raise HarnessFailure("REVIEW_CONSENT_SELECTION_SCOPE_MISSING")
+        if selection and not self.name_present(app, CONSENT_SELECTION_SCOPE, "Text"):
+            raise HarnessFailure("REVIEW_CONSENT_SELECTION_SCOPE_MISSING")
         self.hold_control(app, send, CONSENT_HOLD_SECONDS, "REVIEW_CONSENT_HOLD_FAILED")
-        return scope_shown
 
     def read_only_phase(
         self, app: Any, source: Path, before: dict[str, Any], phase: str | None
@@ -368,17 +346,14 @@ class Goal06Harness(BaseNativeHarness):
         self.wait_process_exit(app)
         return elapsed_ms(started)
 
-    def not_set_up_shown(self, app: Any) -> bool:
-        return self.name_present(app, NOT_SET_UP_MESSAGE, "Text")
-
     def wait_not_set_up(self, app: Any, timeout_code: str) -> float:
         started = time.perf_counter()
         self.wait_name(app, NOT_SET_UP_MESSAGE, "Text", timeout_code)
         return elapsed_ms(started)
 
-    def close_not_set_up(self, app: Any) -> float:
-        """Close the diagnostic card and wait until neither its text nor its
-        Close remains, so the menu phase cannot pass on the old card."""
+    def close_review_card(self, app: Any, shown_text: str) -> float:
+        """Close the Review card and wait until neither `shown_text` nor its
+        Close remains, so the next phase cannot pass on the old card."""
         close = self.find_control(
             app,
             REVIEW_CLOSE_AUTOMATION_ID,
@@ -389,7 +364,7 @@ class Goal06Harness(BaseNativeHarness):
         started = time.perf_counter()
         self.invoke_control(close, "CLOSE_REVIEW_INVOKE_FAILED")
         wait_until(
-            lambda: not self.not_set_up_shown(app)
+            lambda: not self.name_present(app, shown_text, "Text")
             and self.control_absent(
                 app,
                 REVIEW_CLOSE_AUTOMATION_ID,
@@ -398,7 +373,7 @@ class Goal06Harness(BaseNativeHarness):
                 "CLOSE_REVIEW_UIA_CONTRACT_MISMATCH",
             ),
             self.ui_timeout,
-            "CLOSE_DIAGNOSTIC_STILL_SHOWN",
+            "CLOSE_REVIEW_STILL_SHOWN",
         )
         return elapsed_ms(started)
 
@@ -418,9 +393,8 @@ class Goal06Harness(BaseNativeHarness):
         # Shortcut phase: the card must be absent first, so its appearance
         # is this key's effect.
         with phase("SHORTCUT"):
-            observations["shortcut_diagnostic_before"] = self.not_set_up_shown(app)
-            if observations["shortcut_diagnostic_before"]:
-                raise HarnessFailure("SHORTCUT_DIAGNOSTIC_PRESENT_BEFORE_REVIEW")
+            if self.name_present(app, NOT_SET_UP_MESSAGE, "Text"):
+                raise HarnessFailure("DIAGNOSTIC_PRESENT_BEFORE_REVIEW")
             self.send_from_editor(app, VK_RETURN, "SHORTCUT")
             observations["shortcut_diagnostic_ms"] = self.wait_not_set_up(
                 app, "SHORTCUT_DIAGNOSTIC_UIA_TIMEOUT"
@@ -428,7 +402,9 @@ class Goal06Harness(BaseNativeHarness):
             observations.update(self.read_only_phase(app, source, observations, "shortcut"))
         # Close phase, then the menu phase on an empty field.
         with phase("CLOSE"):
-            observations["close_diagnostic_gone_ms"] = self.close_not_set_up(app)
+            observations["close_diagnostic_gone_ms"] = self.close_review_card(
+                app, NOT_SET_UP_MESSAGE
+            )
         with phase("MENU"):
             started = time.perf_counter()
             self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
@@ -437,20 +413,38 @@ class Goal06Harness(BaseNativeHarness):
             observations.update(self.read_only_phase(app, source, observations, "menu"))
         return observations
 
-    def configured_session(self, app: Any, source: Path, case_id: str) -> dict[str, Any]:
+    def configured_review(
+        self, app: Any, source: Path, before: dict[str, Any], name: str
+    ) -> dict[str, Any]:
+        """One successful Review (`name`: document or selection) and its
+        read-only proof, under its own observation and failure prefixes."""
+        selection = name == "selection"
+        with phase(name.upper()):
+            started = time.perf_counter()
+            self.request_review(app, selection)
+            self.approve_review_consent(app, selection)
+            observed = {f"{name}_consent_ms": elapsed_ms(started)}
+            started = time.perf_counter()
+            self.wait_name(
+                app,
+                REVIEW_RESULT_MARKER,
+                "Text",
+                "REVIEW_RESULT_UIA_TIMEOUT",
+                max(self.ui_timeout, 60.0),
+            )
+            observed[f"{name}_result_ms"] = elapsed_ms(started)
+            observed.update(self.read_only_phase(app, source, before, name))
+            if not selection:
+                # The next phase must not pass on this card's result.
+                observed["document_close_ms"] = self.close_review_card(
+                    app, REVIEW_RESULT_MARKER
+                )
+            return observed
+
+    def configured_session(self, app: Any, source: Path) -> dict[str, Any]:
         observations = self.initial_state(app, source)
-        started = time.perf_counter()
-        self.request_review(app, case_id)
-        scope_shown = self.approve_review_consent(app, case_id)
-        observations["consent_ms"] = elapsed_ms(started)
-        if scope_shown is not None:
-            observations["consent_selection_scope"] = scope_shown
-        started = time.perf_counter()
-        self.wait_name(
-            app, REVIEW_RESULT_MARKER, "Text", "REVIEW_RESULT_UIA_TIMEOUT", max(self.ui_timeout, 60.0)
-        )
-        observations["result_ms"] = elapsed_ms(started)
-        observations.update(self.read_only_phase(app, source, observations, None))
+        for name in CONFIGURED_PHASES:
+            observations.update(self.configured_review(app, source, observations, name))
         return observations
 
     def scenario(self, case_id: str) -> dict[str, Any]:
@@ -458,7 +452,7 @@ class Goal06Harness(BaseNativeHarness):
         app = self.launch_app(source, data, config, workspace, stderr)
         try:
             if self.configured_provider:
-                observations = self.configured_session(app, source, case_id)
+                observations = self.configured_session(app, source)
             else:
                 observations = self.not_set_up_session(app, source)
             observations["clean_close_ms"] = self.close_clean(app)
@@ -481,7 +475,7 @@ def native_run_plan(configured_provider: bool = False) -> NativeRunPlan:
         workdir_prefix="markturbo-goal-06-native-",
         new_evidence=lambda expected_hash: new_evidence(expected_hash, configured_provider),
         validate_evidence=validate_evidence,
-        preflight=goal06_preflight(configured_provider),
+        preflight=preflight,
         ui_types_loader=load_pywinauto,
         harness_factory=lambda *args: Goal06Harness(
             *args, configured_provider=configured_provider

@@ -95,11 +95,9 @@ class LoopbackProviderTests(unittest.TestCase):
                     == {
                         "request_index",
                         "byte_count",
-                        "path_exact",
                         "stream",
                         "review",
                         "revision",
-                        "consent_gate_open",
                         "source_sha256_match",
                         "source_snapshot_match",
                         "answer_sentinel_present",

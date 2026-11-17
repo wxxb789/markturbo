@@ -387,11 +387,9 @@ class LoopbackRevisionServer:
                         )
                     )
                 ),
-                "path_exact": True,
                 "stream": stream,
                 "review": operation == "read_only_review",
                 "revision": operation == "revision",
-                "consent_gate_open": True,
                 "source_sha256_match": source_hash_match,
                 "source_snapshot_match": source_snapshot_match,
                 "answer_sentinel_present": answer_sentinel_present,

@@ -204,18 +204,13 @@ def validate_runtime_scan(value: Any) -> None:
     evidence.validate_runtime_scan(value, require_config=False)
 
 
-def _count(observations: dict[str, Any], key: str) -> int:
-    value = observations.get(key)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"invalid {key}")
-    return value
-
-
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     if case_id != CASE_FIRST_USE:
         return
     fp = {key: validate_fingerprint(observations.get(key)) for key in FINGERPRINT_OBSERVATION_KEYS}
-    count = {key: _count(observations, key) for key in COUNT_OBSERVATION_KEYS}
+    count = {
+        key: evidence.nonnegative_count(observations, key) for key in COUNT_OBSERVATION_KEYS
+    }
     contexts = observations.get("process_contexts")
     if not isinstance(contexts, list) or len(contexts) != LAUNCH_COUNT:
         raise ValueError("the case must record one process context per launch")

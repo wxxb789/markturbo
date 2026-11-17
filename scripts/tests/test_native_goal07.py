@@ -46,7 +46,6 @@ def passing_observations(case_id: str = CASE) -> dict[str, Any]:
     return case_observations(
         HARNESS.CASE_FLOWS[case_id],
         **HARNESS.expected_fingerprints(),
-        **HARNESS.EXPECTED_DIRTY,
         provider_request_count=HARNESS.EXPECTED_REQUEST_COUNT,
     )
 
@@ -99,14 +98,6 @@ class EvidenceTests(unittest.TestCase):
                 evidence = valid_evidence()
                 evidence["cases"][0]["observations"][key] = fingerprint(b"other bytes")
                 with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected bytes"):
-                    HARNESS.validate_evidence(evidence)
-
-    def test_dirty_marks_follow_the_decisions_and_copy(self) -> None:
-        for key, expected in HARNESS.EXPECTED_DIRTY.items():
-            with self.subTest(key=key):
-                evidence = valid_evidence()
-                evidence["cases"][0]["observations"][key] = not expected
-                with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected dirty"):
                     HARNESS.validate_evidence(evidence)
 
     def test_each_phase_needs_its_own_review_and_revision(self) -> None:
@@ -506,7 +497,7 @@ class SessionTests(unittest.TestCase):
     def test_an_unexpected_measurement_fails_with_its_phase_key(self) -> None:
         for key, value, code in (
             ("decisions_editor_undone", ONE_ACCEPTED, "DECISIONS_EDITOR_UNDONE_UNEXPECTED"),
-            ("decisions_dirty_proposed", True, "DECISIONS_DIRTY_PROPOSED_UNEXPECTED"),
+            ("decisions_editor_proposed", ALL_ACCEPTED, "DECISIONS_EDITOR_PROPOSED_UNEXPECTED"),
             ("stale_disk_after", REVIEWED, "STALE_DISK_AFTER_UNEXPECTED"),
             ("trust_editor_done", ALL_ACCEPTED, "TRUST_EDITOR_DONE_UNEXPECTED"),
         ):
@@ -518,11 +509,7 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(observed, {})
         observed = {}
         HARNESS.record(observed, "decisions_editor_undone", REVIEWED)
-        HARNESS.record(observed, "decisions_dirty_proposed", False)
-        self.assertEqual(
-            observed,
-            {"decisions_editor_undone": REVIEWED.evidence(), "decisions_dirty_proposed": False},
-        )
+        self.assertEqual(observed, {"decisions_editor_undone": REVIEWED.evidence()})
 
     def test_scenario_contract_failure_is_raised_before_shared_pass_status(self) -> None:
         observations = passing_observations()
@@ -541,7 +528,7 @@ class PhaseTests(unittest.TestCase):
         harness = bare_harness()
         for name in (
             "activate_source_layout", "review_and_revise", "decide_hunks", "undo_decision",
-            "copy_approved", "done", "close_review", "editor_fingerprint", "document_dirty",
+            "copy_approved", "done", "close_review", "editor_fingerprint",
         ):
             setattr(harness, name, getattr(order, name))
         order.review_and_revise.return_value = len(EDITS)
@@ -549,7 +536,6 @@ class PhaseTests(unittest.TestCase):
             REVIEWED, REVIEWED, ONE_ACCEPTED, REVIEWED, ONE_ACCEPTED, ALL_ACCEPTED,
             ALL_ACCEPTED, ALL_ACCEPTED,
         ]
-        order.document_dirty.side_effect = [False, False, True, True]
         order.copy_approved.return_value = HARNESS.apply_edits(
             HARNESS.EDITOR_SOURCE_BYTES, EDITS
         ).decode("utf-8")
@@ -564,7 +550,7 @@ class PhaseTests(unittest.TestCase):
             observed = harness.phase_decisions(app, provider, source)
 
         self.assertEqual(
-            [call for call in order.mock_calls if call[0] != "document_dirty"],
+            order.mock_calls,
             [
                 mock.call.activate_source_layout(app),
                 mock.call.editor_fingerprint(app),
