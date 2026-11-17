@@ -2189,6 +2189,137 @@ mod tests {
         );
     }
 
+    /// A credential store with nothing in it: no probe reaches the
+    /// platform's secure store.
+    struct EmptyStore;
+
+    impl mt_core::credentials::SecureCredentialStore for EmptyStore {
+        fn is_supported(&self) -> bool {
+            false
+        }
+        fn read(
+            &self,
+            _: &str,
+        ) -> Result<Option<mt_core::credentials::Secret>, mt_core::credentials::CredentialError>
+        {
+            Ok(None)
+        }
+        fn write(
+            &self,
+            _: &str,
+            _: &mt_core::credentials::Secret,
+        ) -> Result<(), mt_core::credentials::CredentialError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), mt_core::credentials::CredentialError> {
+            Ok(())
+        }
+    }
+
+    /// The file the save-conflict probe opens.
+    static CONFLICT_DOCUMENT: std::sync::Mutex<Option<std::path::PathBuf>> =
+        std::sync::Mutex::new(None);
+
+    /// The source on disk the save-conflict probe opens.
+    const CONFLICT_SOURCE: &str = "Original\nUnchanged\n";
+
+    /// The field over a document opened from disk, with the title row's Save
+    /// and the banner the column shows when a save is refused. The proposal
+    /// arrives on `propose`, once the file has loaded; no Review runs.
+    #[component]
+    fn SaveConflictProbe() -> impl IntoElement {
+        let path = CONFLICT_DOCUMENT
+            .lock()
+            .expect("the document path")
+            .clone()
+            .expect("the test set the document path");
+        let state = AppState::with_vault(mt_core::credentials::CredentialVault::with_store(
+            std::sync::Arc::new(EmptyStore),
+        ));
+        state.open_file(path);
+        let propose_state = state.clone();
+        let save_state = state.clone();
+        let conflict_state = state.clone();
+        let banner_state = state.clone();
+        let tabs = state.tabs;
+        view()
+            .child(text("propose").on_press(move || {
+                present(
+                    &propose_state,
+                    CONFLICT_SOURCE,
+                    &[("Revise the word.", "Original", "Revised")],
+                );
+            }))
+            .child(text("save").on_press(move || save_state.save_active()))
+            .child(when(
+                move || crate::ui::notices::has_conflict(&conflict_state),
+                move || {
+                    crate::ui::notices::conflict_banner(banner_state.clone(), Language::English)
+                },
+            ))
+            .child(text(move || {
+                let tabs = tabs.get();
+                let tab = tabs.first();
+                format!(
+                    "Buffer: {:?} dirty={}",
+                    tab.map(|tab| tab.text.get().to_string())
+                        .unwrap_or_default(),
+                    tab.is_some_and(|tab| tab.dirty.get())
+                )
+            }))
+            .child(field(state, Language::English))
+    }
+
+    /// An accepted change, applied with `Done`, saves through the same
+    /// conflict check as any edit: after another writer changes the file,
+    /// Save is refused with the conflict banner and the disk keeps the other
+    /// writer's bytes; the accepted text stays in the buffer, unsaved.
+    #[test]
+    fn an_applied_change_does_not_overwrite_a_file_changed_on_disk() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("plan.md");
+        std::fs::write(&path, CONFLICT_SOURCE).expect("the file on disk");
+        *CONFLICT_DOCUMENT.lock().expect("the document path") = Some(path.clone());
+
+        let mut app = Headless::start(EngineConfig::new(Root::of::<SaveConflictProbe>()))
+            .expect("start the probe");
+        let opened = format!("Buffer: {CONFLICT_SOURCE:?} dirty=false");
+        app.wait_for(&format!("text:{opened}"))
+            .expect("the file is open");
+        app.press("text:propose").expect("present the proposal");
+        app.wait_for("id:revision-field").expect("the field");
+        app.press_key("a").expect("accept the hunk");
+        let applied = format!("Buffer: {:?} dirty=true", "Revised\nUnchanged\n");
+        app.wait_for(&format!("text:{applied}"))
+            .expect("the accepted hunk is in the buffer");
+        app.press_key("ctrl+enter").expect("press Ctrl+Enter");
+        app.wait_for("text:Approved changes applied to the buffer.")
+            .expect("Done ran");
+        assert_eq!(
+            app.screen()
+                .count("id:conflict-banner")
+                .expect("the selector"),
+            0,
+            "no conflict before the other writer"
+        );
+
+        let external = "Changed elsewhere, at another length.\n";
+        std::fs::write(&path, external).expect("the other writer's change");
+        app.press("text:save").expect("save");
+        app.wait_for("id:conflict-banner")
+            .expect("the save is refused as a conflict");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the file"),
+            external,
+            "a refused save leaves the disk alone"
+        );
+        assert!(
+            app.shows(&applied),
+            "the accepted text stays, unsaved: {:?}",
+            app.screen().texts()
+        );
+    }
+
     /// One untitled document holding `text`, the source a probe's proposal
     /// is read from.
     fn open_probe_document(state: &AppState, text: &str) {

@@ -3940,6 +3940,13 @@ mod tests {
             .expect("the source editor");
         app.type_text("label:Markdown source", "")
             .expect("focus the editor");
+        assert_eq!(
+            app.screen()
+                .count("id:review-unavailable")
+                .expect("the selector"),
+            0,
+            "nothing says so before Review is asked for"
+        );
         app.press_key("ctrl+enter").expect("press Ctrl+Enter");
         app.wait_for("id:review-unavailable")
             .expect("Review says why it cannot run");

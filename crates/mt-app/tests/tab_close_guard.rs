@@ -16,17 +16,23 @@ use nsh_testing::Headless;
 const EDITOR: &str = "label:Markdown source";
 const ORIGINAL: &str = "# Notes\n";
 
-/// The bounds of the one view with test id `id`.
-fn bounds(app: &Headless, id: &str) -> nsh_core::Bounds<Points> {
+/// The one view with test id `id`, as layout placed it.
+fn node(app: &Headless, id: &str) -> nsh_testing::LayoutNode {
     let nodes = app.screen().layout_nodes();
     let mut matching = nodes
         .iter()
         .filter(|node| node.test_id.as_deref() == Some(id));
     let node = matching
         .next()
-        .unwrap_or_else(|| panic!("no `{id}` on screen"));
+        .unwrap_or_else(|| panic!("no `{id}` on screen"))
+        .clone();
     assert!(matching.next().is_none(), "one `{id}`");
-    node.bounds
+    node
+}
+
+/// The bounds of the one view with test id `id`.
+fn bounds(app: &Headless, id: &str) -> nsh_core::Bounds<Points> {
+    node(app, id).bounds
 }
 
 /// Whether the close button lies inside the strip that clips it.
@@ -72,6 +78,10 @@ fn a_dirty_tab_close_is_guarded_from_the_rail_and_from_ctrl_w() {
 
     // At rest the strip clips the close button away; the pointer over the
     // strip widens it over the button.
+    assert!(
+        node(&app, "rail-hover").clips,
+        "the strip clips what lies outside it"
+    );
     assert!(
         !close_is_inside_strip(&app),
         "the resting strip shows no close button"

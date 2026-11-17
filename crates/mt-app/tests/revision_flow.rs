@@ -18,7 +18,9 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn partial_accept_records_the_final_split_once() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let review_output = serde_json::json!({
         "schema_version": "review-v1",
@@ -269,7 +271,9 @@ fn RevisionDecisionActions() -> impl IntoElement {
 
 #[test]
 fn all_rejected_apply_records_one_decision_and_finalizes() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let review_output = serde_json::json!({
         "schema_version": "review-v1",
         "scope": {"kind": "document"},
@@ -415,9 +419,6 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
     let revision = state.clone();
     let send_revision = state.clone();
     let edit = state.clone();
-    let save = state.clone();
-    let conflict_state = state.clone();
-    let banner_state = state.clone();
     let review_view = state.review_view;
     let tabs = state.tabs;
     let open_state = state.clone();
@@ -441,13 +442,6 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
                 edit.note_edit(tab.id);
             }
         }))
-        // The title row's Save, and the banner the column shows when the
-        // save is refused.
-        .child(text("Save the document").on_press(move || save.save_active()))
-        .child(when(
-            move || mt_app::ui::notices::has_conflict(&conflict_state),
-            move || mt_app::ui::notices::conflict_banner(banner_state.clone(), Language::English),
-        ))
         .child(text(move || {
             review_view
                 .get()
@@ -595,7 +589,9 @@ fn start_field_over_buffer(
 /// unwritten, and nothing reaches the disk.
 #[test]
 fn decisions_write_at_once_and_undo_restores_the_exact_text() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let (mut app, document, _directory, _config) = start_field_over_buffer(source);
 
@@ -684,7 +680,9 @@ fn decisions_write_at_once_and_undo_restores_the_exact_text() {
 /// while the untouched hunk still lands on its own, moved bytes.
 #[test]
 fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let (mut app, document, _directory, _config) = start_field_over_buffer(source);
 
@@ -725,45 +723,15 @@ fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
     assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
 }
 
-/// A buffer with an accepted change saves through the same conflict check as
-/// any edit: after the file changes on disk, Save is refused with the
-/// conflict banner, and neither the other writer's bytes nor the accepted
-/// text is lost.
-#[test]
-fn an_accepted_change_does_not_overwrite_a_file_changed_on_disk() {
-    let _guard = TEST_LOCK.lock().unwrap();
-    let source = "Original\nUnchanged\n";
-    let (mut app, document, _directory, _config) = start_field_over_buffer(source);
-
-    app.press_key("a").expect("accept the first hunk");
-    app.wait_for("text:Buffer: Revised\nUnchanged\n")
-        .expect("the accepted hunk is in the buffer");
-    app.wait_for("text:Dirty: true").expect("the tab is dirty");
-
-    let external = "Changed elsewhere, at another length.\n";
-    std::fs::write(&document, external).expect("the other writer's change");
-    app.press("text:Save the document").expect("save");
-    app.wait_for("id:conflict-banner")
-        .expect("the save is refused as a conflict");
-    assert_eq!(
-        std::fs::read_to_string(&document).unwrap(),
-        external,
-        "a refused save leaves the disk alone"
-    );
-    assert!(
-        buffer_shows(&app, "Revised\nUnchanged\n") && app.shows("Dirty: true"),
-        "the accepted text stays, unsaved: {:?}",
-        app.screen().texts()
-    );
-}
-
 /// `Copy` puts exactly the approved result on the clipboard — the buffer
 /// with the accepted change in it and nothing of the undecided one — and
 /// leaves the editor, the dirty flag, the decisions and the file as they
 /// were.
 #[test]
 fn copy_exports_only_the_approved_result_and_saves_nothing() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let (mut app, document, _directory, _config) = start_field_over_buffer(source);
 
@@ -877,7 +845,9 @@ fn RevisionAcrossDocuments() -> impl IntoElement {
 /// hunks, and nothing of it can be accepted into either document.
 #[test]
 fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (review_output, revision_output) = two_change_outputs();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
