@@ -184,6 +184,18 @@ ES_DISPLAY_REQUIRED = 0x00000002
 # The one wait for the OS to hand the main window the foreground. Longer waits
 # do not help: a refused activation stays refused until the session changes.
 FOREGROUND_TIMEOUT_SECONDS = 3.0
+# How long a run waits for the operator to give the session a foreground
+# window back (`Win32.require_foreground`), and what it asks them.
+FOREGROUND_RECOVERY_SECONDS = 30.0
+FOREGROUND_RECOVERY_PROMPT = (
+    "No window has the foreground: restore the Remote Desktop window to continue "
+    f"(waiting up to {FOREGROUND_RECOVERY_SECONDS:.0f} s)."
+)
+# Where a launch clicks when Windows refuses it the foreground: in the title
+# row's left padding (`ui/titlebar.rs`, `RAIL_W + COLUMN_GAP` = 84 px wide,
+# `TITLE_ROW_H` = 32 px high), a drag region at any scale of at least 100 %,
+# which holds no control. Physical pixels from the window's top-left corner.
+TITLE_ROW_CLICK_POINT = (24, 16)
 # The longest a step nested inside an outer wait (one editor copy inside an
 # exact-bytes wait) may take, and never past the outer wait's deadline.
 INNER_WAIT_SECONDS = 2.0
@@ -892,6 +904,8 @@ class Win32:
         self.user32.CloseDesktop.restype = wt.BOOL
         self.user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
         self.user32.ShowWindow.restype = wt.BOOL
+        self.user32.IsIconic.argtypes = [wt.HWND]
+        self.user32.IsIconic.restype = wt.BOOL
         self.user32.SetForegroundWindow.argtypes = [wt.HWND]
         self.user32.SetForegroundWindow.restype = wt.BOOL
         self.user32.BringWindowToTop.argtypes = [wt.HWND]
@@ -1107,13 +1121,59 @@ class Win32:
             return None
         return None
 
+    # The foreground waits read these; tests replace them on an instance.
+    def clock(self) -> float:
+        return time.perf_counter()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
     def require_foreground(self, hwnd: int, timeout: float = FOREGROUND_TIMEOUT_SECONDS) -> None:
         """Make `hwnd` the foreground window within at most `FOREGROUND_TIMEOUT_SECONDS`.
 
         A caller's longer `timeout` is capped: the foreground has one timeout.
+        A window already in the foreground is left as it is. When no window
+        has the foreground at all (a minimized Remote Desktop client stops
+        the remote session's input), the operator is asked once on the
+        console to restore it; once any window has the foreground again,
+        within `FOREGROUND_RECOVERY_SECONDS`, the activation is retried once
+        and counted in `foreground_recoveries`. Another window holding the
+        foreground blocks at once.
         """
-        timeout = min(timeout, FOREGROUND_TIMEOUT_SECONDS)
-        show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+        if int(self.user32.GetForegroundWindow() or 0) == hwnd:
+            return
+        try:
+            self._activate(hwnd, min(timeout, FOREGROUND_TIMEOUT_SECONDS))
+        except HarnessBlocked as error:
+            if (
+                error.code != "FOREGROUND_PERMISSION_DENIED"
+                or error.diagnostics.get("foreground_hwnd") != 0
+            ):
+                raise
+            print(FOREGROUND_RECOVERY_PROMPT, file=sys.stderr, flush=True)
+            try:
+                wait_until(
+                    lambda: int(self.user32.GetForegroundWindow() or 0) != 0,
+                    FOREGROUND_RECOVERY_SECONDS,
+                    "FOREGROUND_RECOVERY_TIMEOUT",
+                    interval=0.1,
+                    clock=self.clock,
+                    sleep=self.sleep,
+                )
+            except HarnessFailure:
+                raise error from None
+            count("foreground_recoveries")
+            self._activate(hwnd, min(timeout, FOREGROUND_TIMEOUT_SECONDS))
+
+    def _restore_if_minimized(self, hwnd: int) -> bool:
+        """Restore a minimized window only: `SW_RESTORE` also un-maximizes a
+        maximized one, which moves every control."""
+        if not self.user32.IsIconic(hwnd):
+            return False
+        return bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+
+    def _activate(self, hwnd: int, timeout: float) -> None:
+        show_window = self._restore_if_minimized(hwnd)
         bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
         set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
         foreground = int(self.user32.GetForegroundWindow() or 0)
@@ -1126,23 +1186,23 @@ class Win32:
                 self.send_inputs([key_input(VK_MENU, True)])
             except HarnessFailure:
                 pass
-        show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+        show_window = self._restore_if_minimized(hwnd)
         bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
         set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
         foreground = int(self.user32.GetForegroundWindow() or 0)
         if foreground == hwnd:
             return
-        deadline = time.perf_counter() + timeout
+        deadline = self.clock() + timeout
         attempts = 0
-        while time.perf_counter() < deadline:
+        while self.clock() < deadline:
             attempts += 1
             foreground = int(self.user32.GetForegroundWindow() or 0)
             if foreground == hwnd:
                 return
-            show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
+            show_window = self._restore_if_minimized(hwnd)
             bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
             set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
-            time.sleep(0.025)
+            self.sleep(0.025)
         diagnostics: dict[str, int | bool] = {
             "requested_hwnd": hwnd,
             "foreground_hwnd": foreground,
@@ -1888,10 +1948,7 @@ class NativeHarness:
             if error.code != "FOREGROUND_PERMISSION_DENIED":
                 raise
             try:
-                bounds = window.rectangle()
-                window.click_input(
-                    coords=(max(1, bounds.width() // 2), max(1, bounds.height() // 2))
-                )
+                window.click_input(coords=TITLE_ROW_CLICK_POINT)
             except Exception:
                 raise error from None
             self.win32.require_foreground(hwnd, FOREGROUND_TIMEOUT_SECONDS)

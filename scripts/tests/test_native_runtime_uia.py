@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -362,6 +363,9 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
 
     def test_foreground_failure_exposes_only_content_free_diagnostics(self) -> None:
         class FakeUser32:
+            def IsIconic(self, _hwnd):
+                return 1
+
             def ShowWindow(self, _hwnd, _command):
                 return 1
 
@@ -401,6 +405,9 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
                 self.foreground = 0
                 self.set_calls = 0
 
+            def IsIconic(self, _hwnd):
+                return 0
+
             def ShowWindow(self, _hwnd, _command):
                 return 1
 
@@ -431,6 +438,9 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.foreground = 0
                 self.alt_sent = False
+
+            def IsIconic(self, _hwnd):
+                return 0
 
             def ShowWindow(self, _hwnd, _command):
                 return 1
@@ -1102,7 +1112,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(events[-1], ("foreground", 73, runtime.FOREGROUND_TIMEOUT_SECONDS))
         owned.assert_called_once_with(harness.win32, app.spec)
 
-    def test_launch_clicks_the_window_center_before_retrying_foreground(self) -> None:
+    def test_launch_clicks_the_title_row_before_retrying_foreground(self) -> None:
         events: list[tuple[object, ...]] = []
         context = runtime.SecurityContext(1, 0x2000, "medium")
 
@@ -1187,10 +1197,14 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             [event for event in events if event[0] in {"foreground", "click"}],
             [
                 ("foreground", 73, runtime.FOREGROUND_TIMEOUT_SECONDS),
-                ("click", (400, 300)),
+                ("click", runtime.TITLE_ROW_CLICK_POINT),
                 ("foreground", 73, runtime.FOREGROUND_TIMEOUT_SECONDS),
             ],
         )
+        # Inside the title row's left padding (84 x 32 px at 100 %), whatever
+        # the window's size: never the centre, where a Welcome button sits.
+        x, y = runtime.TITLE_ROW_CLICK_POINT
+        self.assertTrue(0 < x < 84 and 0 < y < 32)
 
 
 class AlertWin32:
@@ -1488,6 +1502,9 @@ class NestedTimeoutTests(unittest.TestCase):
 
 class ForegroundCauseTests(unittest.TestCase):
     class RefusingUser32:
+        def IsIconic(self, _hwnd):
+            return 0
+
         def ShowWindow(self, _hwnd, _command):
             return 1
 
@@ -1529,15 +1546,139 @@ class ForegroundCauseTests(unittest.TestCase):
         def sleep(seconds: float) -> None:
             now[0] += seconds
 
+        stderr = io.StringIO()
         with (
             mock.patch.object(runtime.time, "perf_counter", clock),
             mock.patch.object(runtime.time, "sleep", sleep),
+            contextlib.redirect_stderr(stderr),
             self.assertRaises(runtime.HarnessBlocked),
         ):
             win32.require_foreground(123, timeout=15.0)
 
         self.assertGreaterEqual(now[0], runtime.FOREGROUND_TIMEOUT_SECONDS)
         self.assertLess(now[0], runtime.FOREGROUND_TIMEOUT_SECONDS + 0.1)
+        # Another window holds the foreground: no recovery prompt, no wait.
+        self.assertEqual(stderr.getvalue(), "")
+
+
+class ForegroundRecoveryUser32:
+    """A session whose foreground the operator can lose and give back."""
+
+    def __init__(self, foreground: int = 0, iconic: bool = False) -> None:
+        self.foreground = foreground
+        self.iconic = iconic
+        self.restored_at: float | None = None
+        self.now = [0.0]
+        self.calls: list[tuple[str, ...]] = []
+
+    def current(self) -> int:
+        if self.foreground == 0 and self.restored_at is not None and self.now[0] >= self.restored_at:
+            self.foreground = 456  # the operator's Remote Desktop window
+        return self.foreground
+
+    def IsIconic(self, _hwnd):
+        self.calls.append(("IsIconic",))
+        return int(self.iconic)
+
+    def ShowWindow(self, _hwnd, command):
+        self.calls.append(("ShowWindow", command))
+        self.iconic = False
+        return 1
+
+    def BringWindowToTop(self, _hwnd):
+        return 1
+
+    def SetForegroundWindow(self, hwnd):
+        self.calls.append(("SetForegroundWindow",))
+        # Windows grants the foreground only while the session has one.
+        if self.current() != 0:
+            self.foreground = hwnd
+        return self.foreground == hwnd
+
+    def GetForegroundWindow(self):
+        return self.current()
+
+
+class ForegroundRecoveryTests(unittest.TestCase):
+    def win32(self, user32: ForegroundRecoveryUser32) -> runtime.Win32:
+        win32 = object.__new__(runtime.Win32)
+        win32.user32 = user32
+        win32.send_inputs = lambda _inputs: None
+        win32.interactive_session_blocker = lambda: None
+        win32.clock = lambda: user32.now[0]
+        win32.sleep = lambda seconds: user32.now.__setitem__(0, user32.now[0] + seconds)
+        return win32
+
+    def require(self, win32: runtime.Win32) -> tuple[str, runtime.RunMetrics]:
+        metrics = runtime.RunMetrics()
+        token = runtime._ACTIVE_METRICS.set(metrics)
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                win32.require_foreground(123)
+        finally:
+            runtime._ACTIVE_METRICS.reset(token)
+        return stderr.getvalue(), metrics
+
+    def test_a_window_already_in_the_foreground_is_left_alone(self) -> None:
+        user32 = ForegroundRecoveryUser32(foreground=123)
+
+        self.require(self.win32(user32))
+
+        self.assertEqual(user32.calls, [])
+
+    def test_only_a_minimized_window_is_restored(self) -> None:
+        for iconic, restores in ((False, []), (True, [("ShowWindow", runtime.SW_RESTORE)])):
+            with self.subTest(iconic=iconic):
+                user32 = ForegroundRecoveryUser32(foreground=456, iconic=iconic)
+
+                self.require(self.win32(user32))
+
+                self.assertEqual(user32.foreground, 123)
+                self.assertEqual([call for call in user32.calls if call[0] == "ShowWindow"], restores)
+
+    def test_a_session_without_a_foreground_asks_once_and_recovers_once(self) -> None:
+        user32 = ForegroundRecoveryUser32(foreground=0)
+        user32.restored_at = 12.0
+
+        prompt, metrics = self.require(self.win32(user32))
+
+        self.assertEqual(prompt, runtime.FOREGROUND_RECOVERY_PROMPT + "\n")
+        self.assertEqual(user32.foreground, 123)
+        self.assertEqual(metrics.counters["foreground_recoveries"], 1)
+        self.assertLess(user32.now[0], 12.0 + 1.0)
+
+    def test_a_foreground_that_never_returns_blocks_after_the_recovery_window(self) -> None:
+        user32 = ForegroundRecoveryUser32(foreground=0)
+
+        with self.assertRaises(runtime.HarnessBlocked) as raised:
+            self.require(self.win32(user32))
+
+        self.assertEqual(raised.exception.code, "FOREGROUND_PERMISSION_DENIED")
+        self.assertEqual(raised.exception.diagnostics["foreground_hwnd"], 0)
+        self.assertGreaterEqual(
+            user32.now[0], runtime.FOREGROUND_TIMEOUT_SECONDS + runtime.FOREGROUND_RECOVERY_SECONDS
+        )
+        self.assertLess(
+            user32.now[0], runtime.FOREGROUND_TIMEOUT_SECONDS + runtime.FOREGROUND_RECOVERY_SECONDS + 1
+        )
+
+    def test_a_recovery_that_hands_the_foreground_to_another_window_still_blocks(self) -> None:
+        user32 = ForegroundRecoveryUser32(foreground=0)
+        user32.restored_at = 1.0 + runtime.FOREGROUND_TIMEOUT_SECONDS
+        user32.SetForegroundWindow = lambda _hwnd: 0  # the retry is refused too
+        metrics = runtime.RunMetrics()
+        token = runtime._ACTIVE_METRICS.set(metrics)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(runtime.HarnessBlocked) as raised:
+                    self.win32(user32).require_foreground(123)
+        finally:
+            runtime._ACTIVE_METRICS.reset(token)
+
+        self.assertEqual(raised.exception.diagnostics["foreground_hwnd"], 456)
+        self.assertEqual(stderr.getvalue().count(runtime.FOREGROUND_RECOVERY_PROMPT), 1)
+        self.assertEqual(metrics.counters["foreground_recoveries"], 1)
 
     def test_session_resampling_names_the_first_failed_precondition(self) -> None:
         win32 = object.__new__(runtime.Win32)
