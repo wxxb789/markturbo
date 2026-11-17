@@ -435,18 +435,6 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(stderr.name, "stderr.log")
         self.assertEqual(win32.mock_calls, [])
 
-    def test_phase_failures_carry_the_phase_and_leave_blocked_alone(self) -> None:
-        with self.assertRaises(runtime.HarnessFailure) as raised:
-            with HARNESS.phase_failures("stale"):
-                raise runtime.HarnessFailure("REVISION_DONE_OUTCOME_TIMEOUT", "detail")
-        self.assertEqual(
-            (raised.exception.code, raised.exception.detail),
-            ("STALE_REVISION_DONE_OUTCOME_TIMEOUT", "detail"),
-        )
-        with self.assertRaisesRegex(runtime.HarnessBlocked, "^FOREGROUND_PERMISSION_DENIED$"):
-            with HARNESS.phase_failures("trust"):
-                raise runtime.HarnessBlocked("FOREGROUND_PERMISSION_DENIED")
-
     def session_harness(self) -> tuple[HARNESS.Goal07Harness, mock.Mock, mock.Mock, mock.Mock]:
         order = mock.Mock()
         app, provider = mock.Mock(hwnd=73), mock.Mock()
@@ -464,7 +452,6 @@ class SessionTests(unittest.TestCase):
             quit_via_menu=order.quit_via_menu,
             click_lifecycle_decision=order.click_lifecycle_decision,
             wait_process_exit=order.wait_process_exit,
-            _require_foreground=mock.Mock(return_value=True),
             reap=order.reap,
             _finalize_observations=lambda _provider, _root, _app, observations: observations,
         )
@@ -501,7 +488,6 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(observations["stale_disk_before"], DISK.evidence())
         self.assertEqual(observations["trust_editor_done"], HTML_APPLIED.evidence())
         self.assertEqual(observations["flow"], HARNESS.CASE_FLOWS[CASE])
-        self.assertIs(observations["foreground_verified"], True)
         provider.close.assert_called_once_with()
 
     def test_a_phase_failure_names_its_phase_and_stops_the_session(self) -> None:
@@ -527,7 +513,7 @@ class SessionTests(unittest.TestCase):
             with self.subTest(code=code):
                 observed: dict[str, Any] = {}
                 with self.assertRaisesRegex(runtime.HarnessFailure, f"^{code}$"):
-                    with HARNESS.phase_failures(key.partition("_")[0]):
+                    with HARNESS.phase(key.partition("_")[0].upper()):
                         HARNESS.record(observed, key, value)
                 self.assertEqual(observed, {})
         observed = {}
@@ -939,12 +925,11 @@ class StepTests(unittest.TestCase):
         ):
             harness.close_review(app)
 
-    def test_stale_paste_restores_the_users_clipboard_only_after_the_app_took_it(self) -> None:
+    def test_stale_paste_waits_for_the_field_to_report_the_changed_part(self) -> None:
         order = mock.Mock()
         harness = bare_harness(win32=order.win32)
         for name in ("read_text_clipboard", "write_text_clipboard", "focus_editor", "wait_name"):
             setattr(harness, name, getattr(order, name))
-        order.read_text_clipboard.return_value = "user text"
         app = mock.Mock(hwnd=73)
 
         harness.paste_stale_edit(app)
@@ -952,7 +937,6 @@ class StepTests(unittest.TestCase):
         self.assertEqual(
             order.mock_calls,
             [
-                mock.call.read_text_clipboard(),
                 mock.call.write_text_clipboard(HARNESS.STALE_EDIT_TEXT),
                 mock.call.focus_editor(app),
                 mock.call.win32.send_shortcut(73, runtime.VK_A),
@@ -961,7 +945,6 @@ class StepTests(unittest.TestCase):
                     app, HARNESS.REVISION_PART_CHANGED_TEXT, "Text",
                     "REVISION_PART_CHANGED_UIA_TIMEOUT",
                 ),
-                mock.call.write_text_clipboard("user text"),
             ],
         )
 
@@ -1005,7 +988,7 @@ class StepTests(unittest.TestCase):
             ],
         )
 
-    def test_copy_reads_the_os_clipboard_and_restores_the_users_text(self) -> None:
+    def test_copy_reads_the_os_clipboard_after_clearing_it(self) -> None:
         order = mock.Mock()
         harness = bare_harness()
         for name in (
@@ -1013,7 +996,6 @@ class StepTests(unittest.TestCase):
             "wait_clipboard_text",
         ):
             setattr(harness, name, getattr(order, name))
-        order.read_text_clipboard.return_value = "user text"
         order.wait_clipboard_text.return_value = "approved"
         app = mock.Mock()
 
@@ -1021,7 +1003,6 @@ class StepTests(unittest.TestCase):
         self.assertEqual(
             order.mock_calls,
             [
-                mock.call.read_text_clipboard(),
                 mock.call.write_text_clipboard(None),
                 mock.call.find_control(
                     app, HARNESS.REVISION_COPY_AUTOMATION_ID, "Button",
@@ -1029,7 +1010,6 @@ class StepTests(unittest.TestCase):
                 ),
                 mock.call.click_control(order.find_control.return_value, "REVISION_COPY_CLICK_FAILED"),
                 mock.call.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT"),
-                mock.call.write_text_clipboard("user text"),
             ],
         )
 

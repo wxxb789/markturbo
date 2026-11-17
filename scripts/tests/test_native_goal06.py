@@ -140,7 +140,6 @@ class EvidenceSchemaTests(unittest.TestCase):
             (False, "close_diagnostic_gone_ms", -1.0, "measured close_diagnostic_gone_ms"),
             (False, "menu_diagnostic_ms", True, "measured menu_diagnostic_ms"),
             (True, "result_ms", float("nan"), "measured result_ms"),
-            (False, "foreground_verified", False, "true foreground_verified"),
         ):
             with self.subTest(key=key, value=value):
                 evidence = valid_evidence(configured)
@@ -462,7 +461,6 @@ class NotSetUpSessionTests(unittest.TestCase):
                 ("menu", HARNESS.REVIEW_MENU_AUTOMATION_ID),
             ],
         )
-        self.assertIs(observations["foreground_verified"], True)
         self.assertIs(observations["shortcut_diagnostic_before"], False)
         for phase in ("shortcut", "menu"):
             self.assertEqual(observations[f"{phase}_editor_after"], observations["editor_before"])
@@ -471,7 +469,7 @@ class NotSetUpSessionTests(unittest.TestCase):
         # exactly what a PASS case requires.
         contract = HARNESS.CONTRACTS[HARNESS.NOT_SET_UP_MODE]
         self.assertEqual(
-            set(observations) - {"foreground_verified"} | {"clean_close_ms"},
+            set(observations) | {"clean_close_ms"},
             set(contract.required_observations[CASE_NOT_SET_UP]),
         )
 
@@ -508,7 +506,7 @@ class NotSetUpSessionTests(unittest.TestCase):
     def test_the_shortcut_waits_for_activation_to_hand_over_the_keyboard(self) -> None:
         observations = self.run_session(FakeApp(), focus_lag=2)
 
-        self.assertIs(observations["foreground_verified"], True)
+        self.assertIs(observations["shortcut_diagnostic_before"], False)
 
 
 class CleanCloseTests(unittest.TestCase):
@@ -680,7 +678,7 @@ class ConfiguredReviewTests(unittest.TestCase):
                 app = FakeApp()
                 harness = fake_harness(app, Path(temporary) / "review.md")
 
-                self.assertIs(harness.request_review(app, case_id), True)
+                harness.request_review(app, case_id)
                 self.assertEqual(app.events, expected)
 
     def test_each_review_request_needs_the_keyboard_on_the_app_window(self) -> None:

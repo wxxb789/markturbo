@@ -49,8 +49,6 @@ import argparse
 import functools
 import json
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +71,7 @@ from .runtime import (
     fingerprint_text,
     load_pywinauto,
     main_native_acceptance,
+    phase,
     preflight,
     safe_exception_name,
     sha256_file,
@@ -467,25 +466,13 @@ def record(observed: dict[str, Any], key: str, value: Any) -> None:
     """Record one measurement as evidence, failing at once if it is unexpected.
 
     The check runs as the value is read, so a later step cannot fail first
-    and hide it. The key's phase prefix comes back through `phase_failures`,
+    and hide it. The key's phase prefix comes back through `phase`,
     giving `<KEY>_UNEXPECTED`; `validate_passed_case` checks them all again.
     """
     recorded = value.evidence() if isinstance(value, Fingerprint) else value
     if recorded != _expected_values()[key]:
         raise HarnessFailure(f"{key.partition('_')[2].upper()}_UNEXPECTED")
     observed[key] = recorded
-
-
-@contextmanager
-def phase_failures(phase: str) -> Iterator[None]:
-    """Prefix a phase's failure codes with its name, so a FAIL is locatable.
-
-    A BLOCKED environment stays as it is: it is not the phase's behaviour.
-    """
-    try:
-        yield
-    except HarnessFailure as error:
-        raise HarnessFailure(f"{phase.upper()}_{error.code}", error.detail) from None
 
 
 class Goal07Harness(NativeHarness):
@@ -510,9 +497,8 @@ class Goal07Harness(NativeHarness):
         write_durable(config_root / "settings.toml", review_settings_document(endpoint))
         return data_root.parent, data_root, config_root, workspace_root, stderr_path
 
-    def _require_foreground(self, app: Any) -> bool:
+    def _require_foreground(self, app: Any) -> None:
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
-        return True
 
     def _press(self, app: Any, automation_id: str, code: str) -> None:
         self._require_foreground(app)
@@ -704,45 +690,36 @@ class Goal07Harness(NativeHarness):
         self._wait_decided(app, decided_after, total, "REVISION_UNDO_TIMEOUT")
 
     def paste_stale_edit(self, app: Any) -> None:
-        """Replace the document with one OS paste (Ctrl+A, Ctrl+V).
-
-        The user's clipboard comes back only once the field reports the
-        changed part, so the app cannot paste it in the edit's place.
-        """
-        clipboard_before = self.read_text_clipboard()
-        try:
-            self.write_text_clipboard(STALE_EDIT_TEXT)
-            self.focus_editor(app)
-            self.win32.send_shortcut(app.hwnd, VK_A)
-            self.win32.send_shortcut(app.hwnd, VK_V)
-            self.wait_name(
-                app, REVISION_PART_CHANGED_TEXT, "Text", "REVISION_PART_CHANGED_UIA_TIMEOUT"
-            )
-        finally:
-            self.write_text_clipboard(clipboard_before)
+        """Replace the document with one OS paste (Ctrl+A, Ctrl+V), then wait
+        for the field to report the changed part. The session restores the
+        user's clipboard when the run ends."""
+        self.write_text_clipboard(STALE_EDIT_TEXT)
+        self.focus_editor(app)
+        self.win32.send_shortcut(app.hwnd, VK_A)
+        self.win32.send_shortcut(app.hwnd, VK_V)
+        self.wait_name(
+            app, REVISION_PART_CHANGED_TEXT, "Text", "REVISION_PART_CHANGED_UIA_TIMEOUT"
+        )
 
     def done(self, app: Any, outcome: str) -> None:
         self._press(app, REVISION_DONE_AUTOMATION_ID, "REVISION_DONE")
         self.wait_name(app, outcome, "Text", "REVISION_DONE_OUTCOME_TIMEOUT")
 
     def copy_approved(self, app: Any) -> str:
-        """`Copy`'s text through the real OS clipboard; the user's text comes back."""
-        clipboard_before = self.read_text_clipboard()
-        try:
-            # Clear the clipboard first so an unchanged old value cannot
-            # accidentally satisfy the copy assertion.
-            self.write_text_clipboard(None)
-            copy = self.find_control(
-                app,
-                REVISION_COPY_AUTOMATION_ID,
-                "Button",
-                "REVISION_COPY_UIA_TIMEOUT",
-                "REVISION_COPY_UIA_CONTRACT_MISMATCH",
-            )
-            self.click_control(copy, "REVISION_COPY_CLICK_FAILED")
-            return self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
-        finally:
-            self.write_text_clipboard(clipboard_before)
+        """`Copy`'s text through the real OS clipboard; the session restores the
+        user's text when the run ends."""
+        # Clear the clipboard first so an unchanged old value cannot
+        # accidentally satisfy the copy assertion.
+        self.write_text_clipboard(None)
+        copy = self.find_control(
+            app,
+            REVISION_COPY_AUTOMATION_ID,
+            "Button",
+            "REVISION_COPY_UIA_TIMEOUT",
+            "REVISION_COPY_UIA_CONTRACT_MISMATCH",
+        )
+        self.click_control(copy, "REVISION_COPY_CLICK_FAILED")
+        return self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
 
     def close_review(self, app: Any) -> None:
         """Consume Done's outcome, then close the Review, before the next phase."""
@@ -897,12 +874,11 @@ class Goal07Harness(NativeHarness):
                 (self.phase_stale, STALE_FILE),
                 (self.phase_trust, TRUST_FILE),
             )
-            for (run, name), phase in zip(phases, PHASES, strict=True):
-                with phase_failures(phase):
+            for (run, name), name_of_phase in zip(phases, PHASES, strict=True):
+                with phase(name_of_phase.upper()):
                     observations.update(run(app, provider, workspace / name))
-            observations["foreground_verified"] = self._require_foreground(app)
             # Every tab is dirty: quit through the guard, unsaved.
-            with phase_failures("quit"):
+            with phase("QUIT"):
                 self.quit_via_menu(app)
                 self.click_lifecycle_decision(app, "Discard")
                 self.wait_process_exit(app)

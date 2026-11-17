@@ -26,8 +26,6 @@ import argparse
 import json
 import time
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +40,11 @@ from .runtime import (
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
+    elapsed_ms,
     finite_nonnegative,
     load_pywinauto,
     main_native_acceptance,
+    phase,
     preflight,
     require_true,
     sha256_file,
@@ -256,22 +256,6 @@ def goal06_preflight(configured_provider: bool):
     return verify
 
 
-def _elapsed_ms(started: float) -> float:
-    return round((time.perf_counter() - started) * 1000, 3)
-
-
-@contextmanager
-def _phase(prefix: str) -> Iterator[None]:
-    """Give every failure in one phase of a merged session the phase's prefix,
-    so a shared helper's code (e.g. `EDITOR_TEXT_TIMEOUT`) stays locatable."""
-    try:
-        yield
-    except HarnessFailure as error:
-        if error.code.startswith(f"{prefix}_"):
-            raise
-        raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
-
-
 def _window_exists(win32: Any, hwnd: int) -> bool:
     return bool(win32.user32.IsWindow(hwnd))
 
@@ -307,28 +291,26 @@ class Goal06Harness(BaseNativeHarness):
         )
         return case_root, data_root, config_root, workspace_root, stderr_path, source
 
-    def send_from_editor(self, app: Any, key: int, code: str) -> bool:
-        """Ctrl+`key` from the focused editor. Returns the measured fact that
-        the app's main window owned the keyboard as the key went out; the
-        activation that hands it over is awaited, not sampled once."""
+    def send_from_editor(self, app: Any, key: int, code: str) -> None:
+        """Ctrl+`key` from the focused editor, once the app's main window owns
+        the keyboard; the activation that hands it over is awaited, not
+        sampled once."""
         self.focus_editor(app)
-        owned = wait_until(
+        wait_until(
             lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
             self.ui_timeout,
             f"{code}_NATIVE_FOCUS_LOST",
         )
         self.win32.send_shortcut(app.hwnd, key)
-        return owned
 
-    def request_review(self, app: Any, target: str) -> bool:
+    def request_review(self, app: Any, target: str) -> None:
         """Document: Ctrl+Enter from the editor. Selection: Select All in the
-        editor, then the title menu's Review row. Returns the measured
-        keyboard ownership of the key sent."""
+        editor, then the title menu's Review row."""
         if target != CASE_SELECTION:
-            return self.send_from_editor(app, VK_RETURN, "REVIEW_SHORTCUT")
-        owned = self.send_from_editor(app, VK_A, "REVIEW_SELECT_ALL")
+            self.send_from_editor(app, VK_RETURN, "REVIEW_SHORTCUT")
+            return
+        self.send_from_editor(app, VK_A, "REVIEW_SELECT_ALL")
         self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
-        return owned
 
     def approve_review_consent(self, app: Any, target: str) -> bool | None:
         """Hold `consent-send`; for a selection, first measure its scope word."""
@@ -351,7 +333,7 @@ class Goal06Harness(BaseNativeHarness):
         self, app: Any, source: Path, before: dict[str, Any], phase: str | None
     ) -> dict[str, Any]:
         """Measure the editor and the file after one Review phase (`phase`
-        names its observation keys; `_phase` prefixes its failure codes)."""
+        names its observation keys; `phase` prefixes its failure codes)."""
         prefix = f"{phase}_" if phase else ""
         editor = self.editor_fingerprint(app)
         file = sha256_file(source)
@@ -384,7 +366,7 @@ class Goal06Harness(BaseNativeHarness):
         if wait_until(settled, self.ui_timeout, "PROCESS_EXIT_TIMEOUT") == "guard":
             raise HarnessFailure("REVIEW_LEFT_DOCUMENT_DIRTY")
         self.wait_process_exit(app)
-        return _elapsed_ms(started)
+        return elapsed_ms(started)
 
     def not_set_up_shown(self, app: Any) -> bool:
         return self.name_present(app, NOT_SET_UP_MESSAGE, "Text")
@@ -392,7 +374,7 @@ class Goal06Harness(BaseNativeHarness):
     def wait_not_set_up(self, app: Any, timeout_code: str) -> float:
         started = time.perf_counter()
         self.wait_name(app, NOT_SET_UP_MESSAGE, "Text", timeout_code)
-        return _elapsed_ms(started)
+        return elapsed_ms(started)
 
     def close_not_set_up(self, app: Any) -> float:
         """Close the diagnostic card and wait until neither its text nor its
@@ -418,7 +400,7 @@ class Goal06Harness(BaseNativeHarness):
             self.ui_timeout,
             "CLOSE_DIAGNOSTIC_STILL_SHOWN",
         )
-        return _elapsed_ms(started)
+        return elapsed_ms(started)
 
     def initial_state(self, app: Any, source: Path) -> dict[str, Any]:
         self.activate_source_layout(app)
@@ -435,41 +417,39 @@ class Goal06Harness(BaseNativeHarness):
         observations = self.initial_state(app, source)
         # Shortcut phase: the card must be absent first, so its appearance
         # is this key's effect.
-        with _phase("SHORTCUT"):
+        with phase("SHORTCUT"):
             observations["shortcut_diagnostic_before"] = self.not_set_up_shown(app)
             if observations["shortcut_diagnostic_before"]:
                 raise HarnessFailure("SHORTCUT_DIAGNOSTIC_PRESENT_BEFORE_REVIEW")
-            observations["foreground_verified"] = self.send_from_editor(
-                app, VK_RETURN, "SHORTCUT"
-            )
+            self.send_from_editor(app, VK_RETURN, "SHORTCUT")
             observations["shortcut_diagnostic_ms"] = self.wait_not_set_up(
                 app, "SHORTCUT_DIAGNOSTIC_UIA_TIMEOUT"
             )
             observations.update(self.read_only_phase(app, source, observations, "shortcut"))
         # Close phase, then the menu phase on an empty field.
-        with _phase("CLOSE"):
+        with phase("CLOSE"):
             observations["close_diagnostic_gone_ms"] = self.close_not_set_up(app)
-        with _phase("MENU"):
+        with phase("MENU"):
             started = time.perf_counter()
             self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
             self.wait_name(app, NOT_SET_UP_MESSAGE, "Text", "MENU_DIAGNOSTIC_UIA_TIMEOUT")
-            observations["menu_diagnostic_ms"] = _elapsed_ms(started)
+            observations["menu_diagnostic_ms"] = elapsed_ms(started)
             observations.update(self.read_only_phase(app, source, observations, "menu"))
         return observations
 
     def configured_session(self, app: Any, source: Path, case_id: str) -> dict[str, Any]:
         observations = self.initial_state(app, source)
         started = time.perf_counter()
-        observations["foreground_verified"] = self.request_review(app, case_id)
+        self.request_review(app, case_id)
         scope_shown = self.approve_review_consent(app, case_id)
-        observations["consent_ms"] = _elapsed_ms(started)
+        observations["consent_ms"] = elapsed_ms(started)
         if scope_shown is not None:
             observations["consent_selection_scope"] = scope_shown
         started = time.perf_counter()
         self.wait_name(
             app, REVIEW_RESULT_MARKER, "Text", "REVIEW_RESULT_UIA_TIMEOUT", max(self.ui_timeout, 60.0)
         )
-        observations["result_ms"] = _elapsed_ms(started)
+        observations["result_ms"] = elapsed_ms(started)
         observations.update(self.read_only_phase(app, source, observations, None))
         return observations
 

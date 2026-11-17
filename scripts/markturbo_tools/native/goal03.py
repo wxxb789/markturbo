@@ -44,8 +44,7 @@ import json
 import re
 import time
 import tomllib
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +68,7 @@ from .runtime import (
     key_input,
     load_pywinauto,
     main_native_acceptance,
+    phase,
     preflight,
     safe_exception_name,
     sha256_file,
@@ -167,15 +167,6 @@ STALE_RECENT_PRESS_SECONDS = 0.05
 # How long a press on the stale row must keep opening nothing: open_file is
 # asynchronous, so one look right after the press could miss a late open.
 STALE_RECENT_OBSERVE_SECONDS = 1.0
-
-
-@contextmanager
-def phase(name: str) -> Iterator[None]:
-    """Prefix a failure inside the block with the phase's name."""
-    try:
-        yield
-    except HarnessFailure as error:
-        raise HarnessFailure(f"{name}_{error.code}", error.detail) from None
 
 
 def require(condition: bool, code: str) -> None:
@@ -717,26 +708,23 @@ class Goal03Harness(BaseNativeHarness):
             require(len(rows) == 2, "RECENT_COUNT")
 
         with phase("PASTE"):
-            clipboard_before = self.read_text_clipboard()
-            try:
-                self.write_text_clipboard(PASTE_TEXT)
-                clipboard_text = self.read_text_clipboard()
-                if clipboard_text is None:
-                    raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
-                clipboard = fingerprint_text(clipboard_text)
-                if clipboard != fingerprint_text(PASTE_TEXT):
-                    raise HarnessBlocked("CLIPBOARD_TEXT_MISMATCH")
-                self.click_control(
-                    self.welcome_action(app, WELCOME_PASTE_AUTOMATION_ID),
-                    "WELCOME_PASTE_CLICK_FAILED",
-                )
-                self.wait_welcome_absent(app)
-                self.source_editor_ready(app)
-                pasted = self.editor_fingerprint(app)
-                if pasted != clipboard:
-                    raise HarnessFailure("EXACT_TEXT_MISMATCH")
-            finally:
-                self.write_text_clipboard(clipboard_before)
+            # The session restores the user's clipboard when the run ends.
+            self.write_text_clipboard(PASTE_TEXT)
+            clipboard_text = self.read_text_clipboard()
+            if clipboard_text is None:
+                raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
+            clipboard = fingerprint_text(clipboard_text)
+            if clipboard != fingerprint_text(PASTE_TEXT):
+                raise HarnessBlocked("CLIPBOARD_TEXT_MISMATCH")
+            self.click_control(
+                self.welcome_action(app, WELCOME_PASTE_AUTOMATION_ID),
+                "WELCOME_PASTE_CLICK_FAILED",
+            )
+            self.wait_welcome_absent(app)
+            self.source_editor_ready(app)
+            pasted = self.editor_fingerprint(app)
+            if pasted != clipboard:
+                raise HarnessFailure("EXACT_TEXT_MISMATCH")
             observed["paste_clipboard"] = clipboard.evidence()
             observed["paste_editor"] = pasted.evidence()
 
@@ -833,7 +821,6 @@ class Goal03Harness(BaseNativeHarness):
         saved = fingerprint_text(RESAVE_TEXT)
         observations: dict[str, Any] = {
             "flow": CASE_FLOWS[CASE_FIRST_USE],
-            "foreground_verified": True,
         }
         contexts = []
 

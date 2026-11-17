@@ -28,8 +28,6 @@ import argparse
 import os
 import re
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -44,11 +42,13 @@ from .runtime import (
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
     RunningApp,
+    elapsed_ms,
     finite_nonnegative,
     fingerprint_bytes,
     key_input,
     load_pywinauto,
     main_native_acceptance,
+    phase,
     preflight,
     safe_exception_name,
     sha256_file,
@@ -178,17 +178,6 @@ CONFLICT_EDIT = f"{DOCUMENT_SENTINEL}:conflict"
 POINTER_EDIT = f"{DOCUMENT_SENTINEL}:pointer"
 WINDOW_EDIT = f"{DOCUMENT_SENTINEL}:window"
 RECOVERY_EDIT = f"{DOCUMENT_SENTINEL}:recovery"
-
-
-@contextmanager
-def phase(prefix: str) -> Iterator[None]:
-    """Prefix every failure raised inside one phase with the phase's name."""
-    try:
-        yield
-    except HarnessFailure as error:
-        if error.code.startswith(f"{prefix}_"):
-            raise
-        raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
 
 
 def validate_runtime_scan(value: Any) -> None:
@@ -433,10 +422,6 @@ def scan_runtime_artifacts(data_root: Path, stderr_path: Path) -> dict[str, Any]
     }
 
 
-def elapsed_ms(started: float) -> float:
-    return round((time.perf_counter() - started) * 1000, 3)
-
-
 class Goal02Harness(BaseNativeHarness):
     def wait_checkpoint_record(self, data_root: Path, started: float) -> float:
         """Wait for the dirty buffer's canonical record within the loss window."""
@@ -630,7 +615,6 @@ class Goal02Harness(BaseNativeHarness):
             observations |= {
                 "flow": CASE_FLOWS[CASE_GUARDED_SESSION],
                 "process_context": app.security_context.evidence(),
-                "foreground_verified": True,
             }
         finally:
             if app is not None:
@@ -728,7 +712,6 @@ class Goal02Harness(BaseNativeHarness):
                     first.security_context.evidence(),
                     second.security_context.evidence(),
                 ],
-                "foreground_verified": True,
             }
         finally:
             if second is not None:

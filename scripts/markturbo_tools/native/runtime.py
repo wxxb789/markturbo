@@ -362,6 +362,11 @@ class TOKEN_MANDATORY_LABEL_STRUCT(ctypes.Structure):
     _fields_ = [("Label", SID_AND_ATTRIBUTES)]
 
 
+def elapsed_ms(started: float) -> float:
+    """Milliseconds since `started` (a `time.perf_counter()` reading), rounded to microseconds."""
+    return round((time.perf_counter() - started) * 1000, 3)
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
@@ -1457,6 +1462,20 @@ def wait_until(
             return result
         sleep(interval)
     raise HarnessFailure(timeout_code)
+
+
+@contextlib.contextmanager
+def phase(prefix: str) -> Iterator[None]:
+    """Prefix every failure raised inside one phase of a merged session with
+    the phase's name, so a shared helper's code stays locatable. A code that
+    already carries the prefix is left alone; BLOCKED is the environment's,
+    not the phase's, and passes through unchanged."""
+    try:
+        yield
+    except HarnessFailure as error:
+        if error.code.startswith(f"{prefix}_"):
+            raise
+        raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
 
 
 def environment_preflight() -> tuple[Win32, SecurityContext, dict[str, Any]]:
@@ -2864,6 +2883,7 @@ __all__ = [
     "artifact_contains",
     "build_launch_spec",
     "complete_evidence",
+    "elapsed_ms",
     "executable_hash_failure",
     "finite_nonnegative",
     "fingerprint_bytes",
@@ -2877,6 +2897,7 @@ __all__ = [
     "main_native_acceptance",
     "normalize_expected_hash",
     "parse_outcome_line",
+    "phase",
     "platform_preflight_failure",
     "preflight",
     "require_true",

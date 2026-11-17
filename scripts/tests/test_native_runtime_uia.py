@@ -1174,21 +1174,20 @@ class SystemAlertTests(unittest.TestCase):
         harness = self.harness(AlertWin32())
         harness.root = Path(directory.name)
         app = running_app()
-        app.security_context = runtime.SecurityContext(1, 0x2000, "medium")
-        document = (
-            harness.root / "cases" / HARNESS.CASE_EXTERNAL_CONFLICT / "workspace" / "conflict.md"
-        ).resolve()
+        workspace = harness.root / "cases" / HARNESS.CASE_GUARDED_SESSION / "workspace"
+        workspace.mkdir(parents=True)
+        document = (workspace / "guarded.md").resolve()
+        runtime.write_durable(document, HARNESS.ORIGINAL_BYTES)
         mine = HARNESS.CONFLICT_EDIT.encode("utf-8")
         dirty = runtime.fingerprint_bytes(mine)
         keep_mine = object()
-        harness.launch = mock.Mock(return_value=app)
         harness.replace_editor = mock.Mock(return_value=dirty)
         harness.save_via_menu = mock.Mock()
         harness.wait_name = mock.Mock()
         harness.editor_fingerprint = mock.Mock(return_value=dirty)
         harness.find_control = mock.Mock(return_value=keep_mine)
-        harness.close_app = mock.Mock()
-        harness.reap = mock.Mock()
+        harness.name_present = mock.Mock(return_value=False)
+        harness.document_dirty = mock.Mock(return_value=False)
 
         def keep_mine_pressed(control: object, _code: str) -> None:
             self.assertIs(control, keep_mine)
@@ -1201,17 +1200,16 @@ class SystemAlertTests(unittest.TestCase):
         patches = contextlib.ExitStack()
         self.addCleanup(patches.close)
         patches.enter_context(mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0))
-        patches.enter_context(mock.patch.object(HARNESS, "scan_runtime_artifacts", return_value={}))
-        return harness, app
+        return harness, app, document
 
     def test_external_conflict_overwrites_only_after_enter_confirms_the_alert(self) -> None:
-        harness, app = self.conflict_scenario(
+        harness, app, document = self.conflict_scenario(
             overwrite_on_keep_mine=False, overwrite_on_enter=True
         )
-        observations = harness.scenario_external_conflict()
-        self.assertTrue(observations["explicit_overwrite_used"])
+        observations = harness.external_modification(app, document)
         self.assertEqual(
-            observations["saved_after_explicit_overwrite"], observations["dirty_editor"]
+            observations["external_modification_overwritten_source"],
+            observations["external_modification_dirty_editor"],
         )
         self.assertIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
         harness.find_control.assert_called_once()
@@ -1220,21 +1218,21 @@ class SystemAlertTests(unittest.TestCase):
         )
 
     def test_external_conflict_fails_when_keep_mine_writes_without_the_alert(self) -> None:
-        harness, app = self.conflict_scenario(
+        harness, app, document = self.conflict_scenario(
             overwrite_on_keep_mine=True, overwrite_on_enter=False
         )
         with self.assertRaises(runtime.HarnessFailure) as raised:
-            harness.scenario_external_conflict()
+            harness.external_modification(app, document)
         self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
         self.assertNotIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
 
     def test_external_conflict_fails_when_enter_never_confirms(self) -> None:
-        harness, _app = self.conflict_scenario(
+        harness, app, document = self.conflict_scenario(
             overwrite_on_keep_mine=False, overwrite_on_enter=False
         )
         with self.assertRaises(runtime.HarnessFailure) as raised:
-            harness.scenario_external_conflict()
-        self.assertEqual(raised.exception.code, "EXPLICIT_OVERWRITE_SAVE_TIMEOUT")
+            harness.external_modification(app, document)
+        self.assertEqual(raised.exception.code, "OVERWRITE_SAVE_TIMEOUT")
 
 
 class SourceEditorTests(unittest.TestCase):

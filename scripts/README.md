@@ -89,6 +89,13 @@ process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The `accept` commands drive real Windows UI workflows and
 write fail-closed, hash-bound evidence; `accept all` runs every goal in one
 process and session (see [verification](../docs/verification.md#running-native-acceptance)).
+Its cases, in run order: goal-03 `first_use_lifecycle` (three launches);
+goal-02 `guarded-session` (one launch) and `recovery-session` (two launches,
+the crash restart); goal-06 `fresh_endpoint_not_set_up` (one launch;
+`accept goal-06 -- --configured-provider` instead runs
+`configured_provider_document` and `configured_provider_selection`); goal-07
+`revision_session` (one launch). The per-phase contents are in
+[verification](../docs/verification.md#native-harness-status).
 
 `release` owns the Windows installer contract. `versions` requires Cargo,
 `crates/mt-app/nsh.json` and the release tag to agree; `package` runs

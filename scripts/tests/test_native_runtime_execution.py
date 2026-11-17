@@ -20,6 +20,25 @@ from scripts.markturbo_tools.native import goal02 as HARNESS
 from ._native_support import HASH
 
 
+class PhaseTests(unittest.TestCase):
+    def test_a_phase_prefixes_failures_once_and_leaves_blocks_alone(self) -> None:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            with runtime.phase("TAB_CLOSE"):
+                raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT", "TimeoutError")
+        self.assertEqual(raised.exception.code, "TAB_CLOSE_GUARD_CARD_UIA_TIMEOUT")
+        self.assertEqual(raised.exception.detail, "TimeoutError")
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            with runtime.phase("TAB_CLOSE"):
+                raise runtime.HarnessFailure("TAB_CLOSE_DONE")
+        self.assertEqual(raised.exception.code, "TAB_CLOSE_DONE")
+
+        with self.assertRaises(runtime.HarnessBlocked) as blocked:
+            with runtime.phase("TAB_CLOSE"):
+                raise runtime.HarnessBlocked("FOREGROUND_UNAVAILABLE")
+        self.assertEqual(blocked.exception.code, "FOREGROUND_UNAVAILABLE")
+
+
 class PrivacyAndCliTests(unittest.TestCase):
     def test_isolation_cleanup_retries_transient_permission_errors(self) -> None:
         root = Path("temporary-native-root")
@@ -149,13 +168,10 @@ class PrivacyAndCliTests(unittest.TestCase):
             def __init__(self, *_args):
                 pass
 
-            def scenario_pointer_cancel(self):
+            def scenario_guarded_session(self):
                 return {}
 
-            scenario_keyboard_discard = scenario_pointer_cancel
-            scenario_window_save = scenario_pointer_cancel
-            scenario_external_conflict = scenario_pointer_cancel
-            scenario_recovery = scenario_pointer_cancel
+            scenario_recovery_session = scenario_guarded_session
 
             def cleanup(self):
                 pass
@@ -197,13 +213,10 @@ class PrivacyAndCliTests(unittest.TestCase):
             def __init__(self, _exe, root, *_args):
                 roots.append(root)
 
-            def scenario_pointer_cancel(self):
+            def scenario_guarded_session(self):
                 return {}
 
-            scenario_keyboard_discard = scenario_pointer_cancel
-            scenario_window_save = scenario_pointer_cancel
-            scenario_external_conflict = scenario_pointer_cancel
-            scenario_recovery = scenario_pointer_cancel
+            scenario_recovery_session = scenario_guarded_session
 
             def cleanup(self):
                 pass
@@ -249,7 +262,7 @@ class PrivacyAndCliTests(unittest.TestCase):
         roots.clear()
 
         class FailingHarness(FakeHarness):
-            def scenario_pointer_cancel(self):
+            def scenario_guarded_session(self):
                 raise runtime.HarnessFailure("TEST_CASE_FAILURE")
 
         with tempfile.TemporaryDirectory() as temporary:

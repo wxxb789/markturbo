@@ -123,11 +123,8 @@ BLOCKED_DIAGNOSTIC_KEYS = frozenset(
         "clipboard_owner_window_present",
     }
 )
-# `foreground_verified` was a constant True and proves nothing; it is no longer
-# required. It stays allowed only until every goal flow stops recording it.
 COMMON_OBSERVATION_KEYS = (
-    frozenset({"flow", "process_context", "runtime_scan", "foreground_verified"})
-    | BLOCKED_DIAGNOSTIC_KEYS
+    frozenset({"flow", "process_context", "runtime_scan"}) | BLOCKED_DIAGNOSTIC_KEYS
 )
 COMMON_REQUIRED_OBSERVATIONS = frozenset({"flow", "runtime_scan"})
 

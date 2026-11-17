@@ -289,20 +289,6 @@ class ParserAndIsolationTests(unittest.TestCase):
             BUILD_LAUNCH_SPEC(Path("markturbo.exe"), None, Path("data"), Path("config"), Path("workspace"), Path("stderr.log"))
 
 
-class PhaseTests(unittest.TestCase):
-    def test_a_failure_carries_its_phase_name_and_detail(self) -> None:
-        with self.assertRaises(HARNESS_FAILURE) as raised, HARNESS.phase("OVERWRITE_NO"):
-            raise HARNESS_FAILURE("NATIVE_OVERWRITE_DIALOG_TIMEOUT", "COMError")
-        self.assertEqual(raised.exception.code, "OVERWRITE_NO_NATIVE_OVERWRITE_DIALOG_TIMEOUT")
-        self.assertEqual(raised.exception.detail, "COMError")
-
-    def test_an_environment_block_is_not_renamed(self) -> None:
-        blocked = runtime.HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
-        with self.assertRaises(runtime.HarnessBlocked) as raised, HARNESS.phase("PASTE"):
-            raise blocked
-        self.assertIs(raised.exception, blocked)
-
-
 def fake_session_harness() -> mock.Mock:
     """A harness whose UI primitives are mocks over a tiny editor/clipboard
     model; the phase methods are real. Saves write real files."""

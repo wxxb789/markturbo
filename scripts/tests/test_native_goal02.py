@@ -190,25 +190,6 @@ class EvidenceSchemaTests(unittest.TestCase):
             HARNESS.validate_evidence(evidence)
 
 
-class PhaseTests(unittest.TestCase):
-    def test_a_phase_prefixes_failures_once_and_leaves_blocks_alone(self) -> None:
-        with self.assertRaises(runtime.HarnessFailure) as raised:
-            with HARNESS.phase("TAB_CLOSE"):
-                raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT", "TimeoutError")
-        self.assertEqual(raised.exception.code, "TAB_CLOSE_GUARD_CARD_UIA_TIMEOUT")
-        self.assertEqual(raised.exception.detail, "TimeoutError")
-
-        with self.assertRaises(runtime.HarnessFailure) as raised:
-            with HARNESS.phase("TAB_CLOSE"):
-                raise runtime.HarnessFailure("TAB_CLOSE_DONE")
-        self.assertEqual(raised.exception.code, "TAB_CLOSE_DONE")
-
-        with self.assertRaises(runtime.HarnessBlocked) as blocked:
-            with HARNESS.phase("TAB_CLOSE"):
-                raise runtime.HarnessBlocked("FOREGROUND_UNAVAILABLE")
-        self.assertEqual(blocked.exception.code, "FOREGROUND_UNAVAILABLE")
-
-
 class FakeWin32:
     def __init__(self, desk: "FakeDesk") -> None:
         self.desk = desk

@@ -190,28 +190,64 @@ How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
 The harnesses do not scan Rust source; a renamed selector fails the live run
 with that control's UIA timeout or contract-mismatch code.
 
-What the ported cases expect, matching the merged UI:
+What each goal runs (`mt.py accept all` runs all four). Every phase of a
+merged session has its own observation-key prefix and failure-code prefix
+(`runtime.phase`), so a FAIL names the phase it happened in. A goal restarts
+the app only where the behaviour itself needs a restart.
 
-- Goal 02: Alt+F4 (SendInput) and WM_CLOSE on a dirty window raise the
-  'Close without saving?' guard; Cancel keeps the window, the editor bytes and
-  the file, and Save writes the exact editor bytes before the window exits.
-- Goal 03: the welcome's four entry points are found by their own ids; a
-  recent target that no longer exists is a disabled row named
-  `File <name> — Missing`, and a real pointer press on it opens nothing; Open
-  sample and a directory argument replace the welcome with the workspace home
-  (`workspace-home-file` rows); Save As onto an existing file replaces it after
-  the native dialog's own Yes and keeps it after No.
-- Goal 06: the selection Review selects the source and runs the title menu's
-  `Review selection` row (`title-menu-review-selection`); with a provider the
-  consent card shows the `Selection` scope.
-- Goal 07: each decision writes at once; one `Undo` (`revision-undo`) restores
-  the exact pre-accept text; Done writes nothing more; `Copy`
+- Goal 03, one case `first_use_lifecycle`, three launches (clean profile;
+  cold reopen through argv; restart onto the recent list). Phases: `WELCOME`
+  (the four entry points by their own ids, on a clean profile), `NEW`,
+  `SAVE_AS_CANCEL` (Escape keeps the editor, focus and file), `OVERWRITE_NO`
+  and `OVERWRITE_YES` (the native dialog's own No and Yes), `SAVE_AS_CREATE`,
+  `SUBSEQUENT_SAVE` (only the new path is written), `SAVED_CLOSE` (recents,
+  newest first), `PASTE` (CF_UNICODETEXT with CJK and a surrogate-pair emoji),
+  `PASTE_DISCARD` (a discarded buffer does not touch recents), `SAMPLE`
+  (workspace home), `REOPEN` (exact text, no welcome, the 10-entry bound) and
+  `RECENTS` (five rows; the stale one disabled and named
+  `File <name> — Missing`; a real press on it opens nothing for 1 s; the saved
+  row opens the exact text). Headless only: a directory argument
+  (`tests/welcome_leaves.rs`) and LRU eviction order (`tests/welcome_recents.rs`,
+  mt-core settings tests).
+- Goal 02, two cases, three launches. `guarded-session` (one launch):
+  `EXTERNAL_MODIFICATION` (a same-length rewrite with the loaded mtime is
+  refused, then Keep mine and the Overwrite alert write the exact bytes),
+  `TAB_CLOSE` (the rail close raises the guard; Cancel keeps text, dirty mark
+  and file; Save writes the exact bytes) and `WINDOW_CLOSE` (Alt+F4 and
+  WM_CLOSE raise the guard; Save writes the exact bytes and the process exits
+  0; no recovery record survives a save). `recovery-session` (two launches,
+  the only restart): `CHECKPOINT` (an encrypted canonical record within
+  10 000 ms, no sentinel leak, then TerminateProcess), `RESTORE` (a relaunch
+  with no argv document offers Restore; the restored tab holds the exact
+  checkpointed bytes) and `KEYBOARD_CLOSE` (Ctrl+W, Don't save closes the tab
+  without writing and retires the record, before and after exit). Launch
+  failures carry `GUARDED_LAUNCH_`, `CHECKPOINT_LAUNCH_` or `RESTORE_LAUNCH_`.
+  Headless: `tests/tab_close_guard.rs`, `tests/recovery_restore.rs` (a
+  discarded record is not offered on the next launch),
+  `tests/save_as_overwrite.rs` and `ui/revision.rs` `SaveConflictProbe`.
+- Goal 06, default mode: one case `fresh_endpoint_not_set_up`, one launch.
+  Phases `SHORTCUT` (Ctrl+Enter shows `No model set up`), `CLOSE` (its Close
+  removes the card) and `MENU` (the title menu's `Review selection` row shows
+  it again); neither outcome changes the editor or the file, and a clean
+  WM_CLOSE proves the document stayed clean. `--configured-provider` (opt-in,
+  `accept goal-06` only) runs `configured_provider_document` and
+  `configured_provider_selection` against a real provider, one launch each;
+  the selection consent card shows the `Selection` scope. Localized findings,
+  clarification questions and the keyless Review variants are headless
+  mt-core/mt-app tests.
+- Goal 07, one case `revision_session`, one launch, three Review→Revision
+  chains (six loopback provider requests). `DECISIONS`: each decision writes
+  at once; `Undo` (`revision-undo`) takes back exactly one; Reject writes
+  nothing; accept-all and Done leave the exact bytes; `Copy`
   (`revision-copy`) puts exactly the approved text on the clipboard without
-  changing the editor, dirty mark or file; the docked hunk's proposed lines are
-  read from the `revision-proposal-after` group named `Proposed text`; an edit
-  over a hunk's part shows `Can't apply — this part changed`, withholds Accept
-  (button and A key) and Done writes nothing; the Web pane shows Restricted
-  after an accepted executable change.
+  changing the editor, dirty mark or file; nothing is saved. `STALE`: an edit
+  over a hunk's part shows `Can't apply — this part changed`, no Accept is
+  offered, and Done approves and writes nothing. `TRUST`: an accepted
+  executable change turns the trusted Web pane back to Restricted. `QUIT`:
+  one guard, Discard, the process exits. Headless: the A, R and Ctrl+Z keys
+  and A refused on a changed part (`ui/revision.rs`), reject-all
+  (`tests/revision_flow.rs`) and a safe save over a file changed on disk
+  (`ui/revision.rs`).
 
 All four harnesses write one evidence schema (`native/evidence.py`,
 `schema_version` 3) to `target/native-acceptance/goal-NN-native-acceptance.json`
