@@ -619,13 +619,16 @@ class NativeSessionTests(unittest.TestCase):
             self.assertTrue(value["executable"]["copy_hash_verified"])
         self.assertIn("overall: PASS", stdout.getvalue())
 
-    def run_suite(self, first: tuple[object, ...], keep_going: bool) -> tuple[int, list[dict]]:
+    def run_suite(
+        self, first: tuple[object, ...], keep_going: bool, first_harness: type = SyntheticHarness
+    ) -> tuple[int, list[dict]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             exe = root / "markturbo.exe"
             exe.write_bytes(b"test executable")
+            first_plan = dataclasses.replace(synthetic_plan(first), harness_factory=first_harness)
             runs = [
-                ("goal-a", synthetic_args(exe, root / "a.json"), synthetic_plan(first)),
+                ("goal-a", synthetic_args(exe, root / "a.json"), first_plan),
                 ("goal-b", synthetic_args(exe, root / "b.json"), synthetic_plan(({}, {}, {}))),
             ]
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -645,6 +648,22 @@ class NativeSessionTests(unittest.TestCase):
         code, (first, second) = self.run_suite(failing, keep_going=True)
         self.assertEqual((code, first["status"], second["status"]), (1, "FAIL", "PASS"))
         self.assertEqual(first["cases"][1]["status"], "PASS")
+
+    def test_a_suite_always_stops_after_a_goal_cleanup_failure(self) -> None:
+        class CleanupFails(SyntheticHarness):
+            def cleanup(self) -> None:
+                shutil.rmtree(self.root)  # keep the test's temp space clean
+                raise runtime.HarnessFailure("PROCESS_CLEANUP_FAILED")
+
+        code, (first, second) = self.run_suite(
+            ({}, {}, {}), keep_going=True, first_harness=CleanupFails
+        )
+
+        self.assertEqual((code, first["status"], second["status"]), (1, "FAIL", "FAIL"))
+        self.assertEqual(
+            {case["reason_code"] for case in second["cases"]}, {"SKIPPED_AFTER_CLEANUP_FAILURE"}
+        )
+        self.assertEqual(second["summary"]["not_run_case_count"], len(SYNTHETIC_CASES))
 
     def test_a_suite_always_stops_after_a_blocked_goal(self) -> None:
         code, (first, second) = self.run_suite(

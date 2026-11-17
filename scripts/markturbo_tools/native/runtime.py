@@ -1710,9 +1710,15 @@ def require_true(observations: dict[str, Any], *keys: str) -> None:
 
 
 class NativeHarness:
-    # The harness's own waits read these; tests replace them with a fake clock.
-    clock: Callable[[], float] = staticmethod(time.perf_counter)
-    sleep: Callable[[float], None] = staticmethod(time.sleep)
+    # The harness's own waits read these; tests replace them on an instance
+    # with a fake clock. They resolve `time.*` per call, so patching the
+    # module's `time` also reaches them.
+    def clock(self) -> float:
+        return time.perf_counter()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
     # The deadline of the outermost wait in progress (`bounded_by`).
     _deadline: float | None = None
     # `clock()` when the last editor read asked the app to copy: the instant
@@ -2362,10 +2368,11 @@ class NativeHarness:
         started = self.clock()
         saw_readable_value = False
         last_failure_type: str | None = None
+        last_failure_code: str | None = None
         matched_at = started
 
         def matches() -> Fingerprint | None:
-            nonlocal saw_readable_value, last_failure_type, matched_at
+            nonlocal saw_readable_value, last_failure_type, last_failure_code, matched_at
             self.last_editor_sample_at = None
             try:
                 actual = self.read_editor_fingerprint(app)
@@ -2375,17 +2382,21 @@ class NativeHarness:
                     "SOURCE_EDITOR_UIA_TIMEOUT",
                 }:
                     last_failure_type = "HarnessFailure"
+                    last_failure_code = error.code
                     return None
                 raise
             except Exception as error:
                 last_failure_type = safe_exception_name(error)
+                last_failure_code = None
                 return None
             if actual is None:
                 return None
             saw_readable_value = True
             if expected is not None and actual != expected:
                 return None
-            matched_at = self.last_editor_sample_at or self.clock()
+            matched_at = (
+                self.clock() if self.last_editor_sample_at is None else self.last_editor_sample_at
+            )
             return actual
 
         timeout_code = "EDITOR_TEXT_TIMEOUT" if expected is None else "EDITOR_EXACT_BYTES_TIMEOUT"
@@ -2399,6 +2410,9 @@ class NativeHarness:
                 raise
             if expected is not None and saw_readable_value:
                 raise
+            if not saw_readable_value and last_failure_code == "SOURCE_EDITOR_UIA_TIMEOUT":
+                # The editor control never appeared: keep that locatable code.
+                raise HarnessFailure("SOURCE_EDITOR_UIA_TIMEOUT") from None
             raise HarnessFailure("EDITOR_TEXT_TIMEOUT", last_failure_type or "") from None
         return actual, (matched_at - started) * 1000
 
@@ -2511,6 +2525,7 @@ def run_native_acceptance(
         close_failure = active.close() if owned else None
     if close_failure is not None:
         returncode, code = 1, close_failure
+        args.cleanup_failed = True
         started = [index for index, case in enumerate(evidence["cases"]) if case["status"] != "NOT_RUN"]
         _record_cleanup_failure(
             evidence,
@@ -2530,6 +2545,9 @@ def _run_goal(
 ) -> tuple[int, dict[str, Any], str]:
     evidence = plan.new_evidence(args.expect_exe_sha256)
     args.debug_workdir = None
+    # Set when the goal's processes or workdir may outlive it, so a suite
+    # stops rather than run the next goal beside them.
+    args.cleanup_failed = False
 
     # A missing executable is the first, unambiguous acceptance failure.
     if not args.exe.is_file():
@@ -2708,6 +2726,7 @@ def _run_goal(
                 safe_exception_name(error),
             )
 
+        args.cleanup_failed = not cleanup_succeeded
         if not cleanup_succeeded or (
             returncode != 0 and getattr(args, "keep_workdir_on_failure", False)
         ):
@@ -2717,6 +2736,7 @@ def _run_goal(
                 remove_tree_with_retry(root)
             except OSError as error:
                 returncode, code = 1, "ISOLATION_CLEANUP_FAILED"
+                args.cleanup_failed = True
                 _record_cleanup_failure(
                     evidence,
                     plan.required_case_ids,
@@ -2771,7 +2791,8 @@ def main_native_acceptance_suite(
     the executable copied once; each goal keeps its own workdir and writes its
     own evidence. `keep_going` applies to every goal's cases and across goals:
     a goal BLOCKED stops the later goals, and so does a goal FAIL unless
-    `keep_going`; a stopped goal still writes its evidence (every
+    `keep_going`; a goal whose cleanup failed (`args.cleanup_failed`) stops
+    them regardless; a stopped goal still writes its evidence (every
     case BLOCKED or NOT_RUN with a SKIPPED_AFTER_* reason). The exit status is
     the worst goal status (`worst_returncode`); a session that cannot restore
     the clipboard fails the command without changing any goal's evidence.
@@ -2785,7 +2806,9 @@ def main_native_acceptance_suite(
             args.keep_going = keep_going
             if stopped is None:
                 returncode = main_native_acceptance(args, plan, session)
-                if returncode == 2:
+                if getattr(args, "cleanup_failed", False):
+                    stopped = (1, "SKIPPED_AFTER_CLEANUP_FAILURE")
+                elif returncode == 2:
                     stopped = (2, "SKIPPED_AFTER_BLOCKED")
                 elif returncode == 1 and not keep_going:
                     stopped = (1, "SKIPPED_AFTER_FAILURE")

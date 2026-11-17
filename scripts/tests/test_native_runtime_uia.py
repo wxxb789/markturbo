@@ -1348,6 +1348,22 @@ class NestedTimeoutTests(unittest.TestCase):
         self.assertLessEqual(max(copy_waits), runtime.INNER_WAIT_SECONDS + 0.025)
         self.assertIsNone(harness._deadline)
 
+    def test_an_editor_that_never_appears_keeps_its_own_code(self) -> None:
+        fake = FakeClock()
+        harness, _editor = editor_harness(FakeEditorWin32(), timeout=15.0)
+        harness.clock, harness.sleep = fake.clock, fake.sleep
+
+        def missing_editor(_app: object) -> None:
+            fake.now += 0.5
+            raise runtime.HarnessFailure("SOURCE_EDITOR_UIA_TIMEOUT")
+
+        harness.read_editor_fingerprint = missing_editor
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.wait_editor_fingerprint(running_app(), None, 2.0)
+
+        self.assertEqual(raised.exception.code, "SOURCE_EDITOR_UIA_TIMEOUT")
+
     def test_a_copy_wait_on_its_own_keeps_the_ui_timeout(self) -> None:
         fake = FakeClock()
         win32 = FakeEditorWin32()

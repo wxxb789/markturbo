@@ -245,8 +245,10 @@ same hash binding. Exit status: `0` PASS (every goal passed), `1` FAIL (any
 goal failed, or the clipboard could not be restored), `2` BLOCKED (the
 environment stopped the run and nothing failed). FAIL outranks BLOCKED. A goal
 BLOCKED stops the later goals, and a goal FAIL does too unless `--keep-going`;
-a stopped goal still writes its evidence, every case marked
-`SKIPPED_AFTER_BLOCKED` or `SKIPPED_AFTER_FAILURE`. With `--keep-going` a case
+a goal whose cleanup failed (its processes or workdir may remain) stops them
+even with `--keep-going`. A stopped goal still writes its evidence, every case
+marked `SKIPPED_AFTER_BLOCKED`, `SKIPPED_AFTER_FAILURE` or
+`SKIPPED_AFTER_CLEANUP_FAILURE`. With `--keep-going` a case
 FAIL also lets the goal's later cases run; the first failure is the reported
 code and the goal stays FAIL. BLOCKED and a cleanup failure always stop.
 `mt.py accept goal-0N -- ...` (with `--case` or `--keep-going`) remains for

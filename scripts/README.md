@@ -188,7 +188,7 @@ $decisionDir = "docs/evidence/goal-07\composition-decisions"
 $machineReceipt = "docs/evidence/goal-07\machine-receipt.json"
 $registry = "docs/evidence/goal-07\eligibility.json"
 $ownerDir = "docs/evidence/goal-07\owner-input"
-$nativeEvidence = "target/native-acceptance/goal-07-native-acceptance-v3.json"
+$nativeEvidence = "target/native-acceptance/goal-07-native-acceptance.json"
 $evidence = "docs/evidence/goal-07\revision-evaluation.json"
 
 cargo build --release --locked -p mt-core --bin markturbo-goal07-evaluate
@@ -317,17 +317,17 @@ uv run --project scripts scripts/mt.py probe -- startup --rounds 10
 uv run --project scripts scripts/mt.py accept goal-03 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence target/native-acceptance/goal-03-native-acceptance-v3.json
+  --evidence target/native-acceptance/goal-03-native-acceptance.json
 
 uv run --project scripts scripts/mt.py accept goal-06 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence target/native-acceptance/goal-06-native-acceptance-v3.json
+  --evidence target/native-acceptance/goal-06-native-acceptance.json
 
 uv run --project scripts scripts/mt.py accept goal-07 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence target/native-acceptance/goal-07-native-acceptance-v3.json
+  --evidence target/native-acceptance/goal-07-native-acceptance.json
 ```
 
 Delegated commands run from the repository root. Therefore paths supplied to
