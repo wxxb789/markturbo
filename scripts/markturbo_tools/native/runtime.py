@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
+import copy
 import ctypes
 import ctypes.wintypes as wt
 import datetime as dt
@@ -18,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -166,6 +169,15 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO = 4
 JOB_OBJECT_COMPLETION_KEY = 1
 WAIT_TIMEOUT = 258
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+# The one wait for the OS to hand the main window the foreground. Longer waits
+# do not help: a refused activation stays refused until the session changes.
+FOREGROUND_TIMEOUT_SECONDS = 3.0
+# The longest a step nested inside an outer wait (one editor copy inside an
+# exact-bytes wait) may take, and never past the outer wait's deadline.
+INNER_WAIT_SECONDS = 2.0
 
 
 class GUITHREADINFO(ctypes.Structure):
@@ -786,6 +798,8 @@ class Win32:
         self.kernel32.WaitForSingleObject.restype = wt.DWORD
         self.kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
         self.kernel32.GetExitCodeProcess.restype = wt.BOOL
+        self.kernel32.SetThreadExecutionState.argtypes = [wt.DWORD]
+        self.kernel32.SetThreadExecutionState.restype = wt.DWORD
 
         self.ntdll.RtlGetVersion.argtypes = [wt.LPVOID]
         self.ntdll.RtlGetVersion.restype = wt.LONG
@@ -1031,7 +1045,38 @@ class Win32:
             raise HarnessBlocked("INPUT_DESKTOP_MISMATCH")
         return input_name, thread_name
 
-    def require_foreground(self, hwnd: int, timeout: float = 2.0) -> None:
+    def keep_display_awake(self) -> None:
+        """Keep the display and system on for this thread until `allow_display_sleep`."""
+        if not self.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+        ):
+            raise HarnessBlocked("EXECUTION_STATE_REQUEST_FAILED")
+
+    def allow_display_sleep(self) -> None:
+        self.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+    def interactive_session_blocker(self) -> HarnessBlocked | None:
+        """Re-sample what the preflight proved: an active session on the Default desktop.
+
+        A lost foreground is the symptom; a disconnected or locked session is
+        the cause worth reporting.
+        """
+        try:
+            if self.wts_state(self.process_session_id(os.getpid())) != WTS_ACTIVE:
+                return HarnessBlocked("SESSION_NOT_ACTIVE")
+            self.input_desktop()
+        except HarnessBlocked as error:
+            return error
+        except (HarnessFailure, OSError):
+            return None
+        return None
+
+    def require_foreground(self, hwnd: int, timeout: float = FOREGROUND_TIMEOUT_SECONDS) -> None:
+        """Make `hwnd` the foreground window within at most `FOREGROUND_TIMEOUT_SECONDS`.
+
+        A caller's longer `timeout` is capped: the foreground has one timeout.
+        """
+        timeout = min(timeout, FOREGROUND_TIMEOUT_SECONDS)
         show_window = bool(self.user32.ShowWindow(hwnd, SW_RESTORE))
         bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
         set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
@@ -1062,17 +1107,17 @@ class Win32:
             bring_to_top = bool(self.user32.BringWindowToTop(hwnd))
             set_foreground = bool(self.user32.SetForegroundWindow(hwnd))
             time.sleep(0.025)
-        raise HarnessBlocked(
-            "FOREGROUND_PERMISSION_DENIED",
-            diagnostics={
-                "requested_hwnd": hwnd,
-                "foreground_hwnd": foreground,
-                "show_window_return": show_window,
-                "bring_to_top_return": bring_to_top,
-                "set_foreground_return": set_foreground,
-                "foreground_attempts": attempts,
-            },
-        )
+        diagnostics: dict[str, int | bool] = {
+            "requested_hwnd": hwnd,
+            "foreground_hwnd": foreground,
+            "show_window_return": show_window,
+            "bring_to_top_return": bring_to_top,
+            "set_foreground_return": set_foreground,
+            "foreground_attempts": attempts,
+        }
+        cause = self.interactive_session_blocker()
+        code = "FOREGROUND_PERMISSION_DENIED" if cause is None else cause.code
+        raise HarnessBlocked(code, diagnostics=diagnostics)
 
     def foreground_focus(self, hwnd: int) -> int:
         """Observe OS keyboard ownership, not UIA's logical control focus."""
@@ -1197,30 +1242,144 @@ class Win32:
             self.kernel32.CloseHandle(process)
 
 
-CLIPBOARD_OPEN_TIMEOUT_SECONDS = 1.0
+CLIPBOARD_OPEN_TIMEOUT_SECONDS = 3.0
 CLIPBOARD_OPEN_RETRY_SECONDS = 0.02
 
 
 def open_clipboard_with_retry(
     open_clipboard: Callable[[], bool],
+    owner_window_present: Callable[[], bool],
     timeout: float = CLIPBOARD_OPEN_TIMEOUT_SECONDS,
     *,
     clock: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], None] = time.sleep,
-) -> bool:
-    """Open the clipboard, retrying while another process holds it.
+) -> int:
+    """Open the clipboard, retrying while another process holds it; the attempt count.
 
     Windows lets one process open the clipboard at a time, and clipboard
     listeners (the RDP clipboard redirector, clipboard managers) open it
     briefly after every change: a single failed attempt is contention, not
-    an unavailable clipboard."""
+    an unavailable clipboard. A clipboard still held at the deadline blocks
+    the run with content-free diagnostics: the attempt count and whether a
+    window (the holder) has it open."""
     deadline = clock() + timeout
+    attempts = 0
     while True:
+        attempts += 1
         if open_clipboard():
-            return True
+            return attempts
         if clock() >= deadline:
-            return False
+            raise HarnessBlocked(
+                "CLIPBOARD_UNAVAILABLE",
+                diagnostics={
+                    "clipboard_open_attempts": attempts,
+                    "clipboard_owner_window_present": owner_window_present(),
+                },
+            )
         sleep(CLIPBOARD_OPEN_RETRY_SECONDS)
+
+
+class _ClipboardApi:
+    """The Win32 text clipboard, declared once."""
+
+    _instance: _ClipboardApi | None = None
+
+    def __init__(self) -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.OpenClipboard.argtypes = [wt.HWND]
+        user32.OpenClipboard.restype = wt.BOOL
+        user32.CloseClipboard.restype = wt.BOOL
+        user32.GetOpenClipboardWindow.restype = wt.HWND
+        user32.EnumClipboardFormats.argtypes = [wt.UINT]
+        user32.EnumClipboardFormats.restype = wt.UINT
+        user32.IsClipboardFormatAvailable.argtypes = [wt.UINT]
+        user32.IsClipboardFormatAvailable.restype = wt.BOOL
+        user32.GetClipboardData.argtypes = [wt.UINT]
+        user32.GetClipboardData.restype = wt.HANDLE
+        user32.EmptyClipboard.restype = wt.BOOL
+        user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+        user32.SetClipboardData.restype = wt.HANDLE
+        kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wt.HGLOBAL
+        kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalFree.restype = wt.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalLock.restype = wt.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wt.BOOL
+        self.user32 = user32
+        self.kernel32 = kernel32
+
+    @classmethod
+    def get(cls) -> _ClipboardApi:
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def open(self) -> None:
+        open_clipboard_with_retry(
+            lambda: bool(self.user32.OpenClipboard(None)),
+            lambda: bool(self.user32.GetOpenClipboardWindow()),
+        )
+
+
+def read_clipboard_text() -> str | None:
+    """The clipboard's Unicode text, None when it holds none.
+
+    A clipboard with other formats but no text blocks the run: the harness
+    could neither use nor restore it faithfully."""
+    api = _ClipboardApi.get()
+    user32, kernel32 = api.user32, api.kernel32
+    api.open()
+    try:
+        formats: set[int] = set()
+        format_id = 0
+        while format_id := int(user32.EnumClipboardFormats(format_id)):
+            formats.add(format_id)
+        if formats and not has_unicode_clipboard_text(formats):
+            raise HarnessBlocked("CLIPBOARD_CONTAINS_NON_TEXT")
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return None
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def write_clipboard_text(value: str | None) -> None:
+    """Replace the clipboard with `value`, or empty it for None."""
+    api = _ClipboardApi.get()
+    user32, kernel32 = api.user32, api.kernel32
+    api.open()
+    try:
+        if not user32.EmptyClipboard():
+            raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+        if value is None:
+            return
+        payload = value.encode("utf-16-le") + b"\0\0"
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
+        if not handle:
+            raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            kernel32.GlobalFree(handle)
+            raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+        ctypes.memmove(pointer, payload, len(payload))
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            kernel32.GlobalFree(handle)
+            raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
+    finally:
+        user32.CloseClipboard()
 
 
 def key_input(key: int, key_up: bool) -> INPUT:
@@ -1276,10 +1435,18 @@ def write_durable(path: Path, value: bytes) -> None:
 
 
 def wait_until(
-    predicate: Callable[[], Any], timeout: float, timeout_code: str, interval: float = 0.05
+    predicate: Callable[[], Any],
+    timeout: float,
+    timeout_code: str,
+    interval: float = 0.05,
+    *,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> Any:
-    deadline = time.perf_counter() + timeout
-    while time.perf_counter() < deadline:
+    clock = clock or time.perf_counter
+    sleep = sleep or time.sleep
+    deadline = clock() + timeout
+    while clock() < deadline:
         try:
             result = predicate()
         except (HarnessBlocked, HarnessFailure):
@@ -1288,7 +1455,7 @@ def wait_until(
             result = None
         if result:
             return result
-        time.sleep(interval)
+        sleep(interval)
     raise HarnessFailure(timeout_code)
 
 
@@ -1305,7 +1472,7 @@ def environment_preflight() -> tuple[Win32, SecurityContext, dict[str, Any]]:
         raise HarnessFailure(failure)
     parent = win32.security_context(os.getpid())
     if win32.wts_state(parent.session_id) != WTS_ACTIVE:
-        raise HarnessBlocked("WTS_SESSION_NOT_ACTIVE")
+        raise HarnessBlocked("SESSION_NOT_ACTIVE")
     active_console = int(win32.kernel32.WTSGetActiveConsoleSessionId())
     input_name, thread_name = win32.input_desktop()
     environment = {
@@ -1333,6 +1500,24 @@ def preflight(
     *,
     fingerprint: Fingerprint | None = None,
 ) -> tuple[Win32, SecurityContext]:
+    """Bind the executable hash and prove the interactive environment.
+
+    Inside `run_native_acceptance` this is the active `NativeSession`'s
+    preflight: done once per session, its facts copied into every goal's
+    evidence.
+    """
+    session = _ACTIVE_SESSION.get()
+    if session is not None and fingerprint is None:
+        return session.preflight(exe, expected_hash, evidence)
+    return _preflight(exe, expected_hash, evidence, fingerprint)
+
+
+def _preflight(
+    exe: Path,
+    expected_hash: str,
+    evidence: dict[str, Any],
+    fingerprint: Fingerprint | None = None,
+) -> tuple[Win32, SecurityContext]:
     if not exe.is_file():
         raise HarnessFailure("EXECUTABLE_MISSING")
     actual = sha256_file(exe) if fingerprint is None else fingerprint
@@ -1349,6 +1534,101 @@ def preflight(
     win32, parent, environment = environment_preflight()
     evidence["environment"] = environment
     return win32, parent
+
+
+class NativeSession:
+    """What one `mt.py accept` invocation shares across the goals it runs.
+
+    Its `preflight` hashes the executable and samples the environment once,
+    asks Windows to keep the display and system on, and saves the user's text
+    clipboard once (an empty or text-only clipboard is a precondition); per
+    editor read the harness then only clears, copies and reads. `close`
+    restores the clipboard and releases the display once, after every app has
+    exited. A harness killed mid-run cannot restore the clipboard.
+
+    A `shared` session (`accept all`) also copies the executable once for
+    every goal; otherwise the copy lives in the goal's own workdir.
+    """
+
+    def __init__(self, *, shared: bool = False) -> None:
+        self.shared = shared
+        self._binding: tuple[Path, str] | None = None
+        self._preflight_evidence: dict[str, Any] = {}
+        self._preflight_result: tuple[Win32, SecurityContext] | None = None
+        self._preflight_error: BaseException | None = None
+        self._awake: Win32 | None = None
+        self._clipboard_saved = False
+        self._clipboard: str | None = None
+        self._root: Path | None = None
+        self._copy: tuple[Path, Fingerprint] | None = None
+
+    def preflight(
+        self, exe: Path, expected_hash: str, evidence: dict[str, Any]
+    ) -> tuple[Win32, SecurityContext]:
+        if self._binding is None:
+            self._binding = (exe, expected_hash)
+            scratch: dict[str, Any] = {"executable": {}, "environment": {}}
+            try:
+                win32, parent = _preflight(exe, expected_hash, scratch)
+                win32.keep_display_awake()
+                self._awake = win32
+                self._clipboard = read_clipboard_text()
+                self._clipboard_saved = True
+                self._preflight_result = (win32, parent)
+            except Exception as error:
+                self._preflight_error = error
+            self._preflight_evidence = scratch
+        elif self._binding != (exe, expected_hash):
+            raise RuntimeError("a native session binds one executable")
+        evidence["executable"].update(self._preflight_evidence["executable"])
+        evidence["environment"] = copy.deepcopy(self._preflight_evidence["environment"])
+        if self._preflight_error is not None:
+            raise self._preflight_error
+        assert self._preflight_result is not None
+        return self._preflight_result
+
+    def copy_executable(self, exe: Path, workdir: Path) -> tuple[Path, Fingerprint]:
+        """The isolated executable copy the apps launch from, and its hash."""
+        if self._copy is not None:
+            return self._copy
+        if self.shared:
+            if self._root is None:
+                self._root = Path(tempfile.mkdtemp(prefix="markturbo-native-session-")).resolve()
+            directory = self._root
+        else:
+            directory = workdir / "bin"
+            directory.mkdir()
+        copied = Path(shutil.copy2(exe, directory / exe.name)).resolve()
+        result = (copied, sha256_file(copied))
+        if self.shared:
+            self._copy = result
+        return result
+
+    def close(self) -> str | None:
+        """Undo what the session changed; the first failure's code, if any."""
+        failure: str | None = None
+        if self._clipboard_saved:
+            self._clipboard_saved = False
+            try:
+                write_clipboard_text(self._clipboard)
+            except Exception:
+                failure = "CLIPBOARD_RESTORE_FAILED"
+            self._clipboard = None
+        if self._awake is not None:
+            self._awake.allow_display_sleep()
+            self._awake = None
+        if self._root is not None:
+            try:
+                remove_tree_with_retry(self._root)
+            except OSError:
+                failure = failure or "SESSION_CLEANUP_FAILED"
+            self._root = None
+        return failure
+
+
+_ACTIVE_SESSION: contextvars.ContextVar[NativeSession | None] = contextvars.ContextVar(
+    "markturbo_native_session", default=None
+)
 
 
 def mark_remaining_cases(
@@ -1430,6 +1710,15 @@ def require_true(observations: dict[str, Any], *keys: str) -> None:
 
 
 class NativeHarness:
+    # The harness's own waits read these; tests replace them with a fake clock.
+    clock: Callable[[], float] = staticmethod(time.perf_counter)
+    sleep: Callable[[float], None] = staticmethod(time.sleep)
+    # The deadline of the outermost wait in progress (`bounded_by`).
+    _deadline: float | None = None
+    # `clock()` when the last editor read asked the app to copy: the instant
+    # the read's text was sampled, before any clipboard wait.
+    last_editor_sample_at: float | None = None
+
     def __init__(
         self,
         copied_exe: Path,
@@ -1454,6 +1743,24 @@ class NativeHarness:
         self.no_pattern_error_class = no_pattern_error_class
         self.parent_context = parent_context
         self.processes: list[OwnedProcess] = []
+
+    @contextlib.contextmanager
+    def bounded_by(self, timeout: float) -> Iterator[None]:
+        """Run waits nested inside an outer wait that must end within `timeout`."""
+        previous = self._deadline
+        deadline = self.clock() + timeout
+        self._deadline = deadline if previous is None else min(previous, deadline)
+        try:
+            yield
+        finally:
+            self._deadline = previous
+
+    def inner_timeout(self) -> float | None:
+        """A nested step's wait: at most `INNER_WAIT_SECONDS` and never past the
+        outer deadline; None (the step's own default) outside any outer wait."""
+        if self._deadline is None:
+            return None
+        return max(0.0, min(INNER_WAIT_SECONDS, self._deadline - self.clock()))
 
     def case_roots(self, case_id: str) -> tuple[Path, Path, Path, Path]:
         case_root = (self.root / "cases" / case_id).resolve()
@@ -1507,7 +1814,7 @@ class NativeHarness:
         if not hwnd:
             raise HarnessBlocked("UIA_MAIN_WINDOW_HANDLE_MISSING")
         try:
-            self.win32.require_foreground(hwnd, min(self.ui_timeout, 2.0))
+            self.win32.require_foreground(hwnd, FOREGROUND_TIMEOUT_SECONDS)
         except HarnessBlocked as error:
             if error.code != "FOREGROUND_PERMISSION_DENIED":
                 raise
@@ -1518,7 +1825,7 @@ class NativeHarness:
                 )
             except Exception:
                 raise error from None
-            self.win32.require_foreground(hwnd, self.ui_timeout)
+            self.win32.require_foreground(hwnd, FOREGROUND_TIMEOUT_SECONDS)
         return RunningApp(
             process,
             window,
@@ -1661,6 +1968,8 @@ class NativeHarness:
                 self.ui_timeout if timeout is None else timeout,
                 timeout_code,
                 interval=0.025,
+                clock=self.clock,
+                sleep=self.sleep,
             )
         except HarnessFailure as error:
             if error.code == timeout_code and last_failure_type is not None:
@@ -1751,7 +2060,7 @@ class NativeHarness:
         time.sleep(SYSTEM_ALERT_SETTLE_SECONDS)
         if not still_undecided():
             raise HarnessFailure(early_code)
-        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+        self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
         wait_until(
             lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
             self.ui_timeout,
@@ -1863,119 +2172,55 @@ class NativeHarness:
         except Exception as error:
             raise HarnessFailure("DIRTY_STATE_UIA_QUERY_FAILED", safe_exception_name(error)) from None
 
-    def focus_editor(self, app: RunningApp) -> None:
-        editor = self.editor_control(app)
+    def focus_editor(self, app: RunningApp, timeout: float | None = None) -> None:
+        editor = self.editor_control(app, timeout)
         try:
             editor.set_focus()
         except Exception as error:
             raise HarnessFailure("EDITOR_FOCUS_FAILED", safe_exception_name(error)) from None
-        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+        self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
 
     def read_text_clipboard(self) -> str | None:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        user32.OpenClipboard.argtypes = [wt.HWND]
-        user32.OpenClipboard.restype = wt.BOOL
-        user32.CloseClipboard.restype = wt.BOOL
-        user32.EnumClipboardFormats.argtypes = [wt.UINT]
-        user32.EnumClipboardFormats.restype = wt.UINT
-        user32.IsClipboardFormatAvailable.argtypes = [wt.UINT]
-        user32.IsClipboardFormatAvailable.restype = wt.BOOL
-        user32.GetClipboardData.argtypes = [wt.UINT]
-        user32.GetClipboardData.restype = wt.HANDLE
-        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalLock.restype = wt.LPVOID
-        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalUnlock.restype = wt.BOOL
-        if not open_clipboard_with_retry(lambda: bool(user32.OpenClipboard(None))):
-            raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
-        try:
-            formats: set[int] = set()
-            format_id = 0
-            while format_id := int(user32.EnumClipboardFormats(format_id)):
-                formats.add(format_id)
-            if formats and not has_unicode_clipboard_text(formats):
-                raise HarnessBlocked("CLIPBOARD_CONTAINS_NON_TEXT")
-            if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
-                return None
-            handle = user32.GetClipboardData(CF_UNICODETEXT)
-            if not handle:
-                raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
-            pointer = kernel32.GlobalLock(handle)
-            if not pointer:
-                raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
-            try:
-                return ctypes.wstring_at(pointer)
-            finally:
-                kernel32.GlobalUnlock(handle)
-        finally:
-            user32.CloseClipboard()
+        return read_clipboard_text()
 
     def write_text_clipboard(self, value: str | None) -> None:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        user32.OpenClipboard.argtypes = [wt.HWND]
-        user32.OpenClipboard.restype = wt.BOOL
-        user32.CloseClipboard.restype = wt.BOOL
-        user32.EmptyClipboard.restype = wt.BOOL
-        user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
-        user32.SetClipboardData.restype = wt.HANDLE
-        kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
-        kernel32.GlobalAlloc.restype = wt.HGLOBAL
-        kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalFree.restype = wt.HGLOBAL
-        kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalLock.restype = wt.LPVOID
-        kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
-        kernel32.GlobalUnlock.restype = wt.BOOL
-        if not open_clipboard_with_retry(lambda: bool(user32.OpenClipboard(None))):
-            raise HarnessBlocked("CLIPBOARD_PRESERVATION_UNAVAILABLE")
-        try:
-            if not user32.EmptyClipboard():
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-            if value is None:
-                return
-            payload = value.encode("utf-16-le") + b"\0\0"
-            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
-            if not handle:
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-            pointer = kernel32.GlobalLock(handle)
-            if not pointer:
-                kernel32.GlobalFree(handle)
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-            ctypes.memmove(pointer, payload, len(payload))
-            kernel32.GlobalUnlock(handle)
-            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
-                kernel32.GlobalFree(handle)
-                raise HarnessBlocked("CLIPBOARD_WRITE_FAILED")
-        finally:
-            user32.CloseClipboard()
+        write_clipboard_text(value)
 
     def wait_clipboard_text(self, timeout_code: str) -> str:
-        """The clipboard's text once something (even an empty text) arrives."""
+        """The clipboard's text once something (even an empty text) arrives.
+
+        Inside an outer wait (`bounded_by`) this is a nested step and waits at
+        most `inner_timeout()`; on its own it waits `ui_timeout`.
+        """
 
         def copied() -> tuple[str] | None:
             value = self.read_text_clipboard()
             return None if value is None else (value,)
 
-        (value,) = wait_until(copied, self.ui_timeout, timeout_code, interval=0.025)
+        timeout = self.inner_timeout()
+        (value,) = wait_until(
+            copied,
+            self.ui_timeout if timeout is None else timeout,
+            timeout_code,
+            interval=0.025,
+            clock=self.clock,
+            sleep=self.sleep,
+        )
         return value
 
     def read_editor_text(self, app: RunningApp) -> str:
         """The editor's exact document through its own Select All + Copy.
 
-        The user's text clipboard is restored afterwards; nothing read here is
-        written to evidence except its fingerprint.
+        Only clears, copies and reads: the session saved the user's clipboard
+        once and restores it when the run ends. Nothing read here is written
+        to evidence except its fingerprint.
         """
-        before = self.read_text_clipboard()
-        try:
-            self.write_text_clipboard(None)
-            self.focus_editor(app)
-            self.win32.send_shortcut(app.hwnd, VK_A)
-            self.win32.send_shortcut(app.hwnd, VK_C)
-            return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
-        finally:
-            self.write_text_clipboard(before)
+        self.write_text_clipboard(None)
+        self.focus_editor(app, self.inner_timeout())
+        self.win32.send_shortcut(app.hwnd, VK_A)
+        self.win32.send_shortcut(app.hwnd, VK_C)
+        self.last_editor_sample_at = self.clock()
+        return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
 
     def read_editor_fingerprint(self, app: RunningApp) -> Fingerprint | None:
         if self.control_by_name(
@@ -2107,16 +2352,28 @@ class NativeHarness:
         expected: Fingerprint | None,
         timeout: float,
     ) -> tuple[Fingerprint, float]:
-        started = time.perf_counter()
+        """Wait up to `timeout` for the editor's copied text (to equal `expected`).
+
+        Every nested step (finding the editor, the copy wait) is bounded by
+        what is left of `timeout`. The returned milliseconds end when the
+        matching read asked the app to copy (`last_editor_sample_at`), so
+        they exclude the harness's own clipboard waits after that sample.
+        """
+        started = self.clock()
         saw_readable_value = False
         last_failure_type: str | None = None
+        matched_at = started
 
         def matches() -> Fingerprint | None:
-            nonlocal saw_readable_value, last_failure_type
+            nonlocal saw_readable_value, last_failure_type, matched_at
+            self.last_editor_sample_at = None
             try:
                 actual = self.read_editor_fingerprint(app)
             except (HarnessBlocked, HarnessFailure) as error:
-                if isinstance(error, HarnessFailure) and error.code == "EDITOR_COPY_TIMEOUT":
+                if isinstance(error, HarnessFailure) and error.code in {
+                    "EDITOR_COPY_TIMEOUT",
+                    "SOURCE_EDITOR_UIA_TIMEOUT",
+                }:
                     last_failure_type = "HarnessFailure"
                     return None
                 raise
@@ -2126,18 +2383,24 @@ class NativeHarness:
             if actual is None:
                 return None
             saw_readable_value = True
-            return actual if expected is None or actual == expected else None
+            if expected is not None and actual != expected:
+                return None
+            matched_at = self.last_editor_sample_at or self.clock()
+            return actual
 
         timeout_code = "EDITOR_TEXT_TIMEOUT" if expected is None else "EDITOR_EXACT_BYTES_TIMEOUT"
         try:
-            actual = wait_until(matches, timeout, timeout_code, interval=0.1)
+            with self.bounded_by(timeout):
+                actual = wait_until(
+                    matches, timeout, timeout_code, interval=0.1, clock=self.clock, sleep=self.sleep
+                )
         except HarnessFailure as error:
             if error.code != timeout_code:
                 raise
             if expected is not None and saw_readable_value:
                 raise
             raise HarnessFailure("EDITOR_TEXT_TIMEOUT", last_failure_type or "") from None
-        return actual, (time.perf_counter() - started) * 1000
+        return actual, (matched_at - started) * 1000
 
     def source_editor_has_focus(self, app: RunningApp) -> bool:
         try:
@@ -2162,15 +2425,12 @@ class NativeHarness:
 
     def paste_editor(self, app: RunningApp, value: str) -> Fingerprint:
         """Replace the document with one OS paste (Ctrl+A, Ctrl+V), unlike
-        `replace_editor`'s typed input, and restore the user's clipboard."""
-        clipboard_before = self.read_text_clipboard()
-        try:
-            self.write_text_clipboard(value)
-            self.focus_editor(app)
-            self.win32.send_shortcut(app.hwnd, VK_A)
-            self.win32.send_shortcut(app.hwnd, VK_V)
-        finally:
-            self.write_text_clipboard(clipboard_before)
+        `replace_editor`'s typed input. The session restores the user's
+        clipboard when the run ends."""
+        self.write_text_clipboard(value)
+        self.focus_editor(app)
+        self.win32.send_shortcut(app.hwnd, VK_A)
+        self.win32.send_shortcut(app.hwnd, VK_V)
         actual, _ = self.wait_editor_fingerprint(app, fingerprint_text(value), self.ui_timeout)
         return actual
 
@@ -2224,10 +2484,50 @@ def _record_cleanup_failure(
             )
 
 
+def worst_returncode(*returncodes: int) -> int:
+    """The decisive exit status: FAIL (1) over BLOCKED (2) over PASS (0).
+
+    A FAIL is a behavioural verdict; BLOCKED only says the environment kept a
+    run from reaching one.
+    """
+    return max(returncodes, key=lambda code: {0: 0, 2: 1, 1: 2}[code])
+
+
 def run_native_acceptance(
-    args: argparse.Namespace, plan: NativeRunPlan
+    args: argparse.Namespace, plan: NativeRunPlan, session: NativeSession | None = None
 ) -> tuple[int, dict[str, Any], str]:
-    """Run one goal's native cases with one fail-closed lifecycle."""
+    """Run one goal's native cases with one fail-closed lifecycle.
+
+    `session` is the invocation's shared `NativeSession` (`accept all`);
+    without one the run owns a session and closes it before returning.
+    """
+    owned = session is None
+    active = NativeSession() if session is None else session
+    token = _ACTIVE_SESSION.set(active)
+    try:
+        returncode, evidence, code = _run_goal(args, plan, active)
+    finally:
+        _ACTIVE_SESSION.reset(token)
+        close_failure = active.close() if owned else None
+    if close_failure is not None:
+        returncode, code = 1, close_failure
+        started = [index for index, case in enumerate(evidence["cases"]) if case["status"] != "NOT_RUN"]
+        _record_cleanup_failure(
+            evidence,
+            plan.required_case_ids,
+            started[-1] if started else 0,
+            code,
+            "HarnessFailure",
+        )
+        if plan.finalize_evidence is not None:
+            plan.finalize_evidence(evidence)
+        complete_evidence(evidence, "FAIL", plan.required_case_ids)
+    return returncode, evidence, code
+
+
+def _run_goal(
+    args: argparse.Namespace, plan: NativeRunPlan, session: NativeSession
+) -> tuple[int, dict[str, Any], str]:
     evidence = plan.new_evidence(args.expect_exe_sha256)
     args.debug_workdir = None
 
@@ -2289,15 +2589,13 @@ def run_native_acceptance(
     selected_index = (
         plan.required_case_ids.index(args.case) if getattr(args, "case", None) else 0
     )
+    keep_going = bool(getattr(args, "keep_going", False))
     current_index = selected_index
     harness: NativeHarness | None = None
     returncode, code = 1, "INTERNAL_NO_RESULT"
     try:
         try:
-            bin_root = root / "bin"
-            bin_root.mkdir()
-            copied_exe = Path(shutil.copy2(exe, bin_root / exe.name)).resolve()
-            copied = sha256_file(copied_exe)
+            copied_exe, copied = session.copy_executable(exe, root)
             evidence["executable"]["copied_sha256"] = copied.sha256
             evidence["executable"]["copy_hash_verified"] = (
                 copied.sha256 == args.expect_exe_sha256
@@ -2335,6 +2633,9 @@ def run_native_acceptance(
                 if getattr(args, "case", None)
                 else tuple(enumerate(scenarios))
             )
+            # With `keep_going` a FAIL does not stop the later cases; the
+            # first FAIL still decides the run. BLOCKED always stops.
+            first_failure: str | None = None
             for current_index, scenario in selected:
                 case = evidence["cases"][current_index]
                 started = time.perf_counter()
@@ -2350,39 +2651,38 @@ def run_native_acceptance(
                     mark_remaining_cases(
                         evidence, current_index + 1, "BLOCKED", "SKIPPED_AFTER_BLOCKED"
                     )
-                    returncode, code = 2, error.code
-                    break
-                except HarnessFailure as error:
-                    case.update(
-                        status="FAIL",
-                        reason_code=error.code,
-                        failure_type=safe_failure_type(error),
-                        duration_ms=round((time.perf_counter() - started) * 1000, 3),
-                    )
-                    mark_remaining_cases(
-                        evidence, current_index + 1, "NOT_RUN", "SKIPPED_AFTER_FAILURE"
-                    )
-                    returncode, code = 1, error.code
+                    returncode, code = (1, first_failure) if first_failure else (2, error.code)
                     break
                 except Exception as error:
+                    failure_code = (
+                        error.code if isinstance(error, HarnessFailure) else "INTERNAL_FAILURE"
+                    )
                     case.update(
                         status="FAIL",
-                        reason_code="INTERNAL_FAILURE",
-                        failure_type=safe_exception_name(error),
+                        reason_code=failure_code,
+                        failure_type=(
+                            safe_failure_type(error)
+                            if isinstance(error, HarnessFailure)
+                            else safe_exception_name(error)
+                        ),
                         duration_ms=round((time.perf_counter() - started) * 1000, 3),
                     )
+                    first_failure = first_failure or failure_code
+                    if keep_going:
+                        continue
                     mark_remaining_cases(
                         evidence, current_index + 1, "NOT_RUN", "SKIPPED_AFTER_FAILURE"
                     )
-                    returncode, code = 1, "INTERNAL_FAILURE"
+                    returncode, code = 1, failure_code
                     break
                 case.update(status="PASS", duration_ms=round((time.perf_counter() - started) * 1000, 3))
             else:
-                returncode, code = (
-                    (1, "PARTIAL_CASE_RUN")
-                    if getattr(args, "case", None)
-                    else (0, "ALL_REQUIRED_CASES")
-                )
+                if first_failure is not None:
+                    returncode, code = 1, first_failure
+                elif getattr(args, "case", None):
+                    returncode, code = 1, "PARTIAL_CASE_RUN"
+                else:
+                    returncode, code = 0, "ALL_REQUIRED_CASES"
     finally:
         cleanup_succeeded = False
         try:
@@ -2433,9 +2733,13 @@ def run_native_acceptance(
     return returncode, evidence, code
 
 
-def main_native_acceptance(args: argparse.Namespace, plan: NativeRunPlan) -> int:
-    """Run, atomically persist, and report a native acceptance result."""
-    returncode, evidence, code = run_native_acceptance(args, plan)
+def _persist_and_report(
+    args: argparse.Namespace,
+    plan: NativeRunPlan,
+    returncode: int,
+    evidence: dict[str, Any],
+    code: str,
+) -> int:
     try:
         write_evidence(args.evidence, evidence, plan.validate_evidence)
     except (OSError, ValueError):
@@ -2445,9 +2749,65 @@ def main_native_acceptance(args: argparse.Namespace, plan: NativeRunPlan) -> int
     stream = sys.stdout if returncode == 0 else sys.stderr
     print(f"{status}: {code}", file=stream)
     print(f"evidence: {args.evidence.resolve()}", file=stream)
-    if args.debug_workdir is not None:
+    if getattr(args, "debug_workdir", None) is not None:
         print(f"debug workdir: {args.debug_workdir}", file=stream)
     return returncode
+
+
+def main_native_acceptance(
+    args: argparse.Namespace, plan: NativeRunPlan, session: NativeSession | None = None
+) -> int:
+    """Run, atomically persist, and report a native acceptance result."""
+    returncode, evidence, code = run_native_acceptance(args, plan, session)
+    return _persist_and_report(args, plan, returncode, evidence, code)
+
+
+def main_native_acceptance_suite(
+    runs: list[tuple[str, argparse.Namespace, NativeRunPlan]], *, keep_going: bool
+) -> int:
+    """Run several goals in one process and one shared `NativeSession`.
+
+    The executable is hashed, the environment sampled, the clipboard saved and
+    the executable copied once; each goal keeps its own workdir and writes its
+    own evidence. `keep_going` applies to every goal's cases and across goals:
+    a goal BLOCKED stops the later goals, and so does a goal FAIL unless
+    `keep_going`; a stopped goal still writes its evidence (every
+    case BLOCKED or NOT_RUN with a SKIPPED_AFTER_* reason). The exit status is
+    the worst goal status (`worst_returncode`); a session that cannot restore
+    the clipboard fails the command without changing any goal's evidence.
+    """
+    session = NativeSession(shared=True)
+    overall = 0
+    stopped: tuple[int, str] | None = None
+    try:
+        for name, args, plan in runs:
+            print(f"== {name}", flush=True)
+            args.keep_going = keep_going
+            if stopped is None:
+                returncode = main_native_acceptance(args, plan, session)
+                if returncode == 2:
+                    stopped = (2, "SKIPPED_AFTER_BLOCKED")
+                elif returncode == 1 and not keep_going:
+                    stopped = (1, "SKIPPED_AFTER_FAILURE")
+            else:
+                args.debug_workdir = None
+                skipped, evidence, code = _complete_early(
+                    plan.new_evidence(args.expect_exe_sha256),
+                    plan.required_case_ids,
+                    stopped[0],
+                    stopped[1],
+                    blocked=stopped[0] == 2,
+                    finalize_evidence=plan.finalize_evidence,
+                )
+                returncode = _persist_and_report(args, plan, skipped, evidence, code)
+            overall = worst_returncode(overall, returncode)
+    finally:
+        close_failure = session.close()
+    if close_failure is not None:
+        print(f"FAIL: {close_failure}", file=sys.stderr)
+        overall = worst_returncode(overall, 1)
+    print(f"overall: {_completion_status(overall)}", file=sys.stdout if overall == 0 else sys.stderr)
+    return overall
 
 __all__ = [
     "IMAGE_FILE_MACHINE_AMD64",
@@ -2472,6 +2832,9 @@ __all__ = [
     "LaunchSpec",
     "NativeHarness",
     "NativeRunPlan",
+    "NativeSession",
+    "FOREGROUND_TIMEOUT_SECONDS",
+    "INNER_WAIT_SECONDS",
     "RunningApp",
     "SecurityContext",
     "Win32",
@@ -2506,4 +2869,8 @@ __all__ = [
     "write_durable",
     "write_evidence",
     "run_native_acceptance",
+    "main_native_acceptance_suite",
+    "read_clipboard_text",
+    "write_clipboard_text",
+    "worst_returncode",
 ]

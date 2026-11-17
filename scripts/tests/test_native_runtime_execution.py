@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -347,3 +349,309 @@ class PrivacyAndCliTests(unittest.TestCase):
             self.assertEqual(returncode, 1)
             self.assertEqual(evidence["status"], "FAIL")
             self.assertTrue(all(case["status"] == "NOT_RUN" for case in evidence["cases"]))
+
+
+SYNTHETIC_CASES = ("first", "second", "third")
+SYNTHETIC_CONTRACT = evidence.EvidenceContract(
+    schema="markturbo.synthetic-native-acceptance",
+    case_flows={case: case for case in SYNTHETIC_CASES},
+    observation_keys=frozenset(),
+    fingerprint_keys=frozenset(),
+    required_observations={case: frozenset() for case in SYNTHETIC_CASES},
+    validate_runtime_scan=lambda _value: None,
+    validate_passed_case=lambda _case, _observations: None,
+    private_sentinels=("UNIQUE-DOCUMENT-CONTENT",),
+)
+
+
+class SyntheticHarness:
+    def __init__(self, _exe, root, *_args) -> None:
+        self.root = root
+
+    def cleanup(self) -> None:
+        pass
+
+
+def synthetic_plan(
+    outcomes: tuple[object, ...], preflight: object | None = None
+) -> runtime.NativeRunPlan:
+    """A plan whose cases pass ({}), FAIL or BLOCK (an exception to raise)."""
+
+    def scenario(outcome: object):
+        def run() -> dict:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return {}
+
+        return run
+
+    return runtime.NativeRunPlan(
+        required_case_ids=SYNTHETIC_CASES,
+        workdir_prefix="markturbo-synthetic-native-",
+        new_evidence=lambda expected: evidence.new_evidence(SYNTHETIC_CONTRACT, expected),
+        # The envelope validator is tested on its own; these runs bind no real executable.
+        validate_evidence=lambda _value: None,
+        preflight=preflight or (lambda *_args: (object(), object())),
+        ui_types_loader=lambda: (),
+        harness_factory=SyntheticHarness,
+        scenarios=lambda _harness: tuple(scenario(outcome) for outcome in outcomes),
+    )
+
+
+def synthetic_args(exe: Path, evidence_path: Path | None = None, **extra: object) -> argparse.Namespace:
+    return argparse.Namespace(
+        exe=exe,
+        expect_exe_sha256=hashlib.sha256(exe.read_bytes()).hexdigest(),
+        evidence=evidence_path,
+        ui_timeout=1.0,
+        case=None,
+        keep_workdir_on_failure=False,
+        keep_going=False,
+        **extra,
+    )
+
+
+class KeepGoingTests(unittest.TestCase):
+    def run_cases(self, outcomes: tuple[object, ...], keep_going: bool) -> tuple[int, dict, str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            exe = Path(temporary) / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            args = synthetic_args(exe)
+            args.keep_going = keep_going
+            return runtime.run_native_acceptance(args, synthetic_plan(outcomes))
+
+    def statuses(self, value: dict) -> list[tuple[str, str | None]]:
+        return [(case["status"], case["reason_code"]) for case in value["cases"]]
+
+    def test_a_failure_stops_the_later_cases_by_default(self) -> None:
+        code, value, reason = self.run_cases(
+            (runtime.HarnessFailure("FIRST_FAILED"), {}, {}), keep_going=False
+        )
+
+        self.assertEqual((code, value["status"], reason), (1, "FAIL", "FIRST_FAILED"))
+        self.assertEqual(
+            self.statuses(value),
+            [
+                ("FAIL", "FIRST_FAILED"),
+                ("NOT_RUN", "SKIPPED_AFTER_FAILURE"),
+                ("NOT_RUN", "SKIPPED_AFTER_FAILURE"),
+            ],
+        )
+
+    def test_keep_going_runs_every_case_and_the_first_failure_decides(self) -> None:
+        code, value, reason = self.run_cases(
+            (runtime.HarnessFailure("FIRST_FAILED"), {}, RuntimeError("UNIQUE-DOCUMENT-CONTENT")),
+            keep_going=True,
+        )
+
+        self.assertEqual((code, value["status"], reason), (1, "FAIL", "FIRST_FAILED"))
+        self.assertEqual(
+            self.statuses(value),
+            [("FAIL", "FIRST_FAILED"), ("PASS", None), ("FAIL", "INTERNAL_FAILURE")],
+        )
+
+    def test_keep_going_still_stops_at_blocked(self) -> None:
+        code, value, reason = self.run_cases(
+            (runtime.HarnessFailure("FIRST_FAILED"), runtime.HarnessBlocked("SESSION_NOT_ACTIVE"), {}),
+            keep_going=True,
+        )
+
+        self.assertEqual((code, value["status"], reason), (1, "FAIL", "FIRST_FAILED"))
+        self.assertEqual(
+            self.statuses(value),
+            [
+                ("FAIL", "FIRST_FAILED"),
+                ("BLOCKED", "SESSION_NOT_ACTIVE"),
+                ("BLOCKED", "SKIPPED_AFTER_BLOCKED"),
+            ],
+        )
+
+    def test_keep_going_passes_only_when_every_case_passes(self) -> None:
+        code, value, reason = self.run_cases(({}, {}, {}), keep_going=True)
+
+        self.assertEqual((code, value["status"], reason), (0, "PASS", "ALL_REQUIRED_CASES"))
+
+    def test_fail_outranks_blocked_and_pass(self) -> None:
+        self.assertEqual(runtime.worst_returncode(0, 2), 2)
+        self.assertEqual(runtime.worst_returncode(2, 1, 0), 1)
+        self.assertEqual(runtime.worst_returncode(0, 0), 0)
+
+
+class SessionFake:
+    """The real preflight's boundaries: hash + environment, Win32, clipboard."""
+
+    def __init__(self, clipboard: str | None = "user clipboard", restore_fails: bool = False) -> None:
+        self.events: list[object] = []
+        self.clipboard = clipboard
+        self.restore_fails = restore_fails
+        fake = self
+
+        class Win32:
+            def keep_display_awake(self) -> None:
+                fake.events.append("awake")
+
+            def allow_display_sleep(self) -> None:
+                fake.events.append("sleep")
+
+        self.win32 = Win32()
+
+    def preflight(self, exe: Path, expected: str, scratch: dict, _fingerprint=None):
+        self.events.append("preflight")
+        scratch["executable"].update(sha256=expected, hash_verified=True)
+        scratch["environment"] = {"input_desktop": "Default"}
+        return self.win32, runtime.SecurityContext(1, 0x2000, "medium")
+
+    def read(self) -> str | None:
+        self.events.append("save-clipboard")
+        return self.clipboard
+
+    def write(self, value: str | None) -> None:
+        self.events.append(("restore-clipboard", value))
+        if self.restore_fails:
+            raise runtime.HarnessBlocked("CLIPBOARD_UNAVAILABLE")
+
+    def patches(self) -> contextlib.ExitStack:
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(runtime, "_preflight", self.preflight))
+        stack.enter_context(mock.patch.object(runtime, "read_clipboard_text", self.read))
+        stack.enter_context(mock.patch.object(runtime, "write_clipboard_text", self.write))
+        return stack
+
+
+class NativeSessionTests(unittest.TestCase):
+    def test_a_single_goal_run_saves_and_restores_the_clipboard_once(self) -> None:
+        fake = SessionFake()
+        observed: list[object] = []
+
+        def scenario_events() -> dict:
+            observed.append(list(fake.events))
+            return {}
+
+        plan = synthetic_plan(({}, {}, {}), preflight=runtime.preflight)
+        plan = dataclasses.replace(
+            plan, scenarios=lambda _harness: (scenario_events,) * len(SYNTHETIC_CASES)
+        )
+        with tempfile.TemporaryDirectory() as temporary, fake.patches():
+            exe = Path(temporary) / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            code, value, reason = runtime.run_native_acceptance(synthetic_args(exe), plan)
+
+        self.assertEqual((code, reason), (0, "ALL_REQUIRED_CASES"))
+        self.assertEqual(observed[0], ["preflight", "awake", "save-clipboard"])
+        self.assertEqual(
+            fake.events,
+            ["preflight", "awake", "save-clipboard", ("restore-clipboard", "user clipboard"), "sleep"],
+        )
+        self.assertEqual(value["environment"], {"input_desktop": "Default"})
+        self.assertIsNone(runtime._ACTIVE_SESSION.get())
+
+    def test_a_clipboard_that_cannot_be_restored_fails_the_run(self) -> None:
+        fake = SessionFake(restore_fails=True)
+        with tempfile.TemporaryDirectory() as temporary, fake.patches():
+            exe = Path(temporary) / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            code, value, reason = runtime.run_native_acceptance(
+                synthetic_args(exe), synthetic_plan(({}, {}, {}), preflight=runtime.preflight)
+            )
+
+        self.assertEqual((code, value["status"], reason), (1, "FAIL", "CLIPBOARD_RESTORE_FAILED"))
+        self.assertEqual(value["cases"][-1]["reason_code"], "CLIPBOARD_RESTORE_FAILED")
+        self.assertIn("sleep", fake.events)
+
+    def test_a_non_text_clipboard_blocks_before_any_case(self) -> None:
+        fake = SessionFake()
+
+        def non_text() -> str | None:
+            raise runtime.HarnessBlocked("CLIPBOARD_CONTAINS_NON_TEXT")
+
+        with tempfile.TemporaryDirectory() as temporary, fake.patches():
+            exe = Path(temporary) / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            with mock.patch.object(runtime, "read_clipboard_text", non_text):
+                code, value, reason = runtime.run_native_acceptance(
+                    synthetic_args(exe), synthetic_plan(({}, {}, {}), preflight=runtime.preflight)
+                )
+
+        self.assertEqual((code, value["status"], reason), (2, "BLOCKED", "CLIPBOARD_CONTAINS_NON_TEXT"))
+        # Nothing was saved, so nothing is written back; the display is released.
+        self.assertEqual(fake.events, ["preflight", "awake", "sleep"])
+
+    def test_a_suite_preflights_copies_and_saves_the_clipboard_once(self) -> None:
+        fake = SessionFake()
+        copies: list[Path] = []
+        real_copy = runtime.shutil.copy2
+
+        def copy2(source, target):
+            copies.append(Path(target))
+            return real_copy(source, target)
+
+        with tempfile.TemporaryDirectory() as temporary, fake.patches():
+            root = Path(temporary)
+            exe = root / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            runs = [
+                (
+                    name,
+                    synthetic_args(exe, root / f"{name}.json"),
+                    synthetic_plan(({}, {}, {}), preflight=runtime.preflight),
+                )
+                for name in ("goal-a", "goal-b")
+            ]
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(runtime.shutil, "copy2", copy2),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = runtime.main_native_acceptance_suite(runs, keep_going=False)
+
+            values = [json.loads((root / f"{name}.json").read_text("utf-8")) for name in ("goal-a", "goal-b")]
+            self.assertFalse(copies[0].parent.exists())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            fake.events,
+            ["preflight", "awake", "save-clipboard", ("restore-clipboard", "user clipboard"), "sleep"],
+        )
+        self.assertEqual(len(copies), 1)
+        for value in values:
+            self.assertEqual(value["status"], "PASS")
+            self.assertTrue(value["executable"]["copy_hash_verified"])
+        self.assertIn("overall: PASS", stdout.getvalue())
+
+    def run_suite(self, first: tuple[object, ...], keep_going: bool) -> tuple[int, list[dict]]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe = root / "markturbo.exe"
+            exe.write_bytes(b"test executable")
+            runs = [
+                ("goal-a", synthetic_args(exe, root / "a.json"), synthetic_plan(first)),
+                ("goal-b", synthetic_args(exe, root / "b.json"), synthetic_plan(({}, {}, {}))),
+            ]
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = runtime.main_native_acceptance_suite(runs, keep_going=keep_going)
+            return code, [json.loads((root / name).read_text("utf-8")) for name in ("a.json", "b.json")]
+
+    def test_a_suite_stops_after_a_failed_goal_unless_keep_going(self) -> None:
+        failing = (runtime.HarnessFailure("FIRST_FAILED"), {}, {})
+
+        code, (first, second) = self.run_suite(failing, keep_going=False)
+        self.assertEqual((code, first["status"], second["status"]), (1, "FAIL", "FAIL"))
+        self.assertEqual(
+            {case["reason_code"] for case in second["cases"]}, {"SKIPPED_AFTER_FAILURE"}
+        )
+        self.assertEqual(second["summary"]["not_run_case_count"], len(SYNTHETIC_CASES))
+
+        code, (first, second) = self.run_suite(failing, keep_going=True)
+        self.assertEqual((code, first["status"], second["status"]), (1, "FAIL", "PASS"))
+        self.assertEqual(first["cases"][1]["status"], "PASS")
+
+    def test_a_suite_always_stops_after_a_blocked_goal(self) -> None:
+        code, (first, second) = self.run_suite(
+            (runtime.HarnessBlocked("SESSION_NOT_ACTIVE"), {}, {}), keep_going=True
+        )
+
+        self.assertEqual((code, first["status"], second["status"]), (2, "BLOCKED", "BLOCKED"))
+        self.assertEqual(
+            {case["reason_code"] for case in second["cases"]}, {"SKIPPED_AFTER_BLOCKED"}
+        )

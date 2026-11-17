@@ -1072,7 +1072,7 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
             )
 
         invalid_semantics = json.loads(json.dumps(self.fixtures.native_value))
-        invalid_semantics["cases"][0]["observations"]["foreground_verified"] = False
+        invalid_semantics["cases"][0]["observations"]["flow"] = "not the required flow"
         path = Path(self.temp.name) / "native-invalid-semantics.json"
         path.write_text(json.dumps(invalid_semantics, sort_keys=True) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(revision.RevisionEvaluationError, "full harness validation"):

@@ -73,7 +73,7 @@ class EnvelopeTests(unittest.TestCase):
         self.assertEqual(value["schema_version"], evidence.SCHEMA_VERSION)
 
         fresh = evidence.new_evidence(CONTRACT, HASH)
-        runtime.mark_remaining_cases(fresh, 0, "BLOCKED", "WTS_SESSION_NOT_ACTIVE")
+        runtime.mark_remaining_cases(fresh, 0, "BLOCKED", "SESSION_NOT_ACTIVE")
         complete(fresh, "BLOCKED")
         evidence.validate_evidence(fresh, CONTRACT)
 
@@ -235,7 +235,7 @@ class EnvelopeTests(unittest.TestCase):
             status="BLOCKED",
             reason_code="FOREGROUND_PERMISSION_DENIED",
             duration_ms=1.0,
-            observations={key: 0 for key in evidence.FOREGROUND_DIAGNOSTIC_KEYS},
+            observations={key: 0 for key in evidence.BLOCKED_DIAGNOSTIC_KEYS},
         )
         complete(blocked, "BLOCKED")
         evidence.validate_evidence(blocked, CONTRACT)
@@ -257,9 +257,6 @@ class EnvelopeTests(unittest.TestCase):
         value["cases"][0]["observations"]["flow"] = "flow two"
         self.assert_rejected(value, "flow mechanics")
 
-        value = valid()
-        value["cases"][0]["observations"]["foreground_verified"] = False
-        self.assert_rejected(value, "requires true foreground_verified")
 
         for key in ("editor", "runtime_scan", "flow"):
             with self.subTest(key=key):
@@ -416,13 +413,20 @@ class ParserTests(unittest.TestCase):
                     evidence.REPO
                     / "target"
                     / "native-acceptance"
-                    / f"{goal}-native-acceptance-v{evidence.SCHEMA_VERSION}.json",
+                    / f"{goal}-native-acceptance.json",
                 )
+                self.assertFalse(args.keep_going)
                 case = module.REQUIRED_CASE_IDS[-1]
                 args = module.parse_args(
-                    ["--expect-exe-sha256", HASH, "--case", case, "--keep-workdir-on-failure", "--ui-timeout", "1.5"]
+                    [
+                        "--expect-exe-sha256", HASH, "--case", case, "--keep-workdir-on-failure",
+                        "--keep-going", "--ui-timeout", "1.5",
+                    ]
                 )
-                self.assertEqual((args.case, args.keep_workdir_on_failure, args.ui_timeout), (case, True, 1.5))
+                self.assertEqual(
+                    (args.case, args.keep_workdir_on_failure, args.keep_going, args.ui_timeout),
+                    (case, True, True, 1.5),
+                )
                 for argv in (
                     [],
                     ["--expect-exe-sha256", "not-a-hash"],

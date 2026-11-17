@@ -37,7 +37,6 @@ from .runtime import (
     artifact_contains,
     finite_nonnegative,
     normalize_expected_hash,
-    require_true,
     safe_exception_name,
     utc_now,
     validate_environment as validate_runtime_environment,
@@ -110,8 +109,9 @@ SUMMARY_KEYS = frozenset(
 FINGERPRINT_KEYS = frozenset({"byte_count", "sha256"})
 RUNTIME_SCAN_KEYS = frozenset({"files_scanned", "app_logs_scanned", "config_files_scanned"})
 PRIVATE_KEYS = frozenset({"request_body", "credential", "api_key", "api-key"})
-# `runtime.Win32.require_foreground` adds these to a BLOCKED case.
-FOREGROUND_DIAGNOSTIC_KEYS = frozenset(
+# Content-free diagnostics a BLOCKED case carries: `runtime.Win32.require_foreground`'s
+# and `runtime.open_clipboard_with_retry`'s.
+BLOCKED_DIAGNOSTIC_KEYS = frozenset(
     {
         "requested_hwnd",
         "foreground_hwnd",
@@ -119,13 +119,17 @@ FOREGROUND_DIAGNOSTIC_KEYS = frozenset(
         "bring_to_top_return",
         "set_foreground_return",
         "foreground_attempts",
+        "clipboard_open_attempts",
+        "clipboard_owner_window_present",
     }
 )
+# `foreground_verified` was a constant True and proves nothing; it is no longer
+# required. It stays allowed only until every goal flow stops recording it.
 COMMON_OBSERVATION_KEYS = (
-    frozenset({"flow", "process_context", "foreground_verified", "runtime_scan"})
-    | FOREGROUND_DIAGNOSTIC_KEYS
+    frozenset({"flow", "process_context", "runtime_scan", "foreground_verified"})
+    | BLOCKED_DIAGNOSTIC_KEYS
 )
-COMMON_REQUIRED_OBSERVATIONS = frozenset({"flow", "foreground_verified", "runtime_scan"})
+COMMON_REQUIRED_OBSERVATIONS = frozenset({"flow", "runtime_scan"})
 
 
 @dataclass(frozen=True)
@@ -325,7 +329,6 @@ def validate_case(
     for context in contexts:
         if validate_context(context) != parent:
             raise ValueError("case process context differs from harness context")
-    require_true(observations, "foreground_verified")
     contract.validate_passed_case(case_id, observations)
 
 
@@ -519,7 +522,7 @@ def credential_target(endpoint: str, wire: str) -> str:
     )
 
 
-def _ui_timeout(value: str) -> float:
+def ui_timeout_seconds(value: str) -> float:
     timeout = float(value)
     if not math.isfinite(timeout) or timeout <= 0:
         raise argparse.ArgumentTypeError("--ui-timeout must be greater than zero")
@@ -547,12 +550,12 @@ def build_parser(description: str, goal: str, case_ids: tuple[str, ...]) -> argp
         default=REPO
         / "target"
         / "native-acceptance"
-        / f"{goal}-native-acceptance-v{SCHEMA_VERSION}.json",
+        / f"{goal}-native-acceptance.json",
         help="JSON run receipt path (default: target/native-acceptance)",
     )
     parser.add_argument(
         "--ui-timeout",
-        type=_ui_timeout,
+        type=ui_timeout_seconds,
         default=15.0,
         help="seconds allowed for ordinary UI state transitions (default: 15)",
     )
@@ -560,6 +563,11 @@ def build_parser(description: str, goal: str, case_ids: tuple[str, ...]) -> argp
         "--case",
         choices=case_ids,
         help="run one case for debugging; it never produces acceptance PASS",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="after a case FAIL, still run the later cases (the run stays FAIL); BLOCKED stops",
     )
     parser.add_argument(
         "--keep-workdir-on-failure",

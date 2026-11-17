@@ -377,6 +377,7 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
         win32 = object.__new__(runtime.Win32)
         win32.user32 = FakeUser32()
         win32.send_inputs = lambda _inputs: None
+        win32.interactive_session_blocker = lambda: None
 
         with self.assertRaises(runtime.HarnessBlocked) as raised:
             win32.require_foreground(123, timeout=0.0)
@@ -859,7 +860,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH")
 
-    def test_editor_text_is_copied_by_select_all_and_the_clipboard_restored(self) -> None:
+    def test_editor_text_is_copied_by_select_all_into_a_cleared_clipboard(self) -> None:
         # An empty document copies line-wise as "\n" (nsh-base 0.5.1
         # `editor/commands.rs` `copy`), like a document of one line break: a
         # read cannot tell them apart and reports exactly what was copied.
@@ -878,7 +879,9 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                     harness.read_editor_fingerprint(running_app()), runtime.fingerprint_text(copied)
                 )
                 self.assertEqual(win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_C)])
-                self.assertEqual(win32.clipboard, "user clipboard")
+                # One read clears, copies and reads; the session restores the
+                # user's clipboard once, at the end of the run.
+                self.assertEqual(win32.clipboard, copied)
                 self.assertEqual(editor.focus_count, 1)
                 self.assertEqual(editor.value_pattern_count, 0)
 
@@ -900,7 +903,6 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(actual, runtime.fingerprint_text("after"))
         self.assertEqual(win32.shortcuts.count((73, runtime.VK_C)), 2)
-        self.assertEqual(win32.clipboard, "user clipboard")
 
     def test_editor_timeouts_distinguish_wrong_and_uncopyable_text(self) -> None:
         wrong, _editor = editor_harness(FakeEditorWin32("wrong"), timeout=0.001)
@@ -916,7 +918,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             )
         self.assertEqual(unreadable.exception.code, "EDITOR_TEXT_TIMEOUT")
         self.assertEqual(unreadable.exception.detail, "HarnessFailure")
-        self.assertEqual(silent.clipboard, "user clipboard")
+        self.assertIsNone(silent.clipboard)
 
     def test_replace_editor_types_over_select_all_and_verifies_the_copy(self) -> None:
         value = "CJK-\u4fdd\u5b58-\U0001f680"
@@ -1018,7 +1020,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(app.spec.args, (str(root / "markturbo.exe"),))
         self.assertEqual(events[0], ("start",))
-        self.assertEqual(events[-1], ("foreground", 73, 2.0))
+        self.assertEqual(events[-1], ("foreground", 73, runtime.FOREGROUND_TIMEOUT_SECONDS))
         owned.assert_called_once_with(harness.win32, app.spec)
 
     def test_launch_clicks_the_window_center_before_retrying_foreground(self) -> None:
@@ -1102,9 +1104,14 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                 harness.launch_app(None, data, config, workspace, stderr)
 
         self.assertEqual(events[0], ("start",))
-        self.assertIn(("foreground", 73, 2.0), events)
-        self.assertIn(("click", (400, 300)), events)
-        self.assertEqual(events[-1], ("foreground", 73, 3.5))
+        self.assertEqual(
+            [event for event in events if event[0] in {"foreground", "click"}],
+            [
+                ("foreground", 73, runtime.FOREGROUND_TIMEOUT_SECONDS),
+                ("click", (400, 300)),
+                ("foreground", 73, runtime.FOREGROUND_TIMEOUT_SECONDS),
+            ],
+        )
 
 
 class AlertWin32:
@@ -1231,7 +1238,7 @@ class SystemAlertTests(unittest.TestCase):
 
 
 class SourceEditorTests(unittest.TestCase):
-    def test_paste_editor_pastes_and_restores_the_text_clipboard(self) -> None:
+    def test_paste_editor_pastes_one_os_clipboard_text(self) -> None:
         events = []
 
         class FakeWin32:
@@ -1241,10 +1248,6 @@ class SourceEditorTests(unittest.TestCase):
         class FakeHarness:
             ui_timeout = 1.0
             win32 = FakeWin32()
-
-            def read_text_clipboard(self):
-                events.append(("read",))
-                return "previous text"
 
             def write_text_clipboard(self, value):
                 events.append(("write", value))
@@ -1263,12 +1266,10 @@ class SourceEditorTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("read",),
                 ("write", "emoji \U0001f680"),
                 ("focus", 42),
                 ("shortcut", 42, runtime.VK_A),
                 ("shortcut", 42, runtime.VK_V),
-                ("write", "previous text"),
                 ("wait", 1.0),
             ],
         )
@@ -1301,3 +1302,170 @@ class SourceEditorTests(unittest.TestCase):
             (raised.exception.code, raised.exception.detail),
             ("SOURCE_EDITOR_FOCUS_QUERY_FAILED", "RuntimeError"),
         )
+
+
+class FakeClock:
+    """Harness time that only moves when the harness sleeps or a step costs time."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class NestedTimeoutTests(unittest.TestCase):
+    def test_a_copy_wait_inside_an_exact_bytes_wait_ends_with_the_outer_deadline(self) -> None:
+        # The copy never arrives. Before, every read waited a whole ui_timeout
+        # (15 s) for the clipboard, so a 5 s wait could run for 15 s or more.
+        fake = FakeClock()
+        win32 = FakeEditorWin32("UNIQUE-DOCUMENT-CONTENT", copies=[None] * 10_000)
+        harness, _editor = editor_harness(win32, timeout=15.0)
+        harness.clock, harness.sleep = fake.clock, fake.sleep
+        copy_waits: list[float] = []
+        wait_clipboard_text = harness.wait_clipboard_text
+
+        def measured_copy_wait(code: str) -> str:
+            started = fake.now
+            try:
+                return wait_clipboard_text(code)
+            finally:
+                copy_waits.append(fake.now - started)
+
+        harness.wait_clipboard_text = measured_copy_wait
+        started = fake.now
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.wait_editor_fingerprint(running_app(), runtime.fingerprint_text("x"), 5.0)
+
+        self.assertEqual(raised.exception.code, "EDITOR_TEXT_TIMEOUT")
+        # At most one outer poll interval past the deadline.
+        self.assertLessEqual(fake.now - started, 5.0 + 0.1 + 1e-6)
+        self.assertGreater(len(copy_waits), 1)
+        self.assertLessEqual(max(copy_waits), runtime.INNER_WAIT_SECONDS + 0.025)
+        self.assertIsNone(harness._deadline)
+
+    def test_a_copy_wait_on_its_own_keeps_the_ui_timeout(self) -> None:
+        fake = FakeClock()
+        win32 = FakeEditorWin32()
+        win32.clipboard = None
+        harness, _editor = editor_harness(win32, timeout=7.0)
+        harness.clock, harness.sleep = fake.clock, fake.sleep
+
+        with self.assertRaises(runtime.HarnessFailure):
+            harness.wait_clipboard_text("COPY_TIMEOUT")
+
+        self.assertGreaterEqual(fake.now - 100.0, 7.0)
+
+    def test_measured_milliseconds_end_at_the_copy_not_after_clipboard_retries(self) -> None:
+        fake = FakeClock()
+        win32 = FakeEditorWin32("after", copies=["before", "after"])
+        harness, _editor = editor_harness(win32, timeout=15.0)
+        harness.clock, harness.sleep = fake.clock, fake.sleep
+        read = harness.read_text_clipboard
+
+        def slow_read() -> str | None:
+            # Every clipboard read costs the harness 0.5 s of contention.
+            fake.now += 0.5
+            return read()
+
+        harness.read_text_clipboard = slow_read
+        sample_times: list[float] = []
+        send_shortcut = win32.send_shortcut
+
+        def shortcut(hwnd: int, key: int) -> None:
+            send_shortcut(hwnd, key)
+            if key == runtime.VK_C:
+                sample_times.append(fake.now)
+
+        win32.send_shortcut = shortcut
+        started = fake.now
+
+        actual, elapsed_ms = harness.wait_editor_fingerprint(
+            running_app(), runtime.fingerprint_text("after"), 15.0
+        )
+
+        self.assertEqual(actual, runtime.fingerprint_text("after"))
+        self.assertEqual(len(sample_times), 2)
+        self.assertAlmostEqual(elapsed_ms, (sample_times[-1] - started) * 1000)
+        self.assertLess(elapsed_ms, (fake.now - started) * 1000)
+
+
+class ForegroundCauseTests(unittest.TestCase):
+    class RefusingUser32:
+        def ShowWindow(self, _hwnd, _command):
+            return 1
+
+        def BringWindowToTop(self, _hwnd):
+            return 1
+
+        def SetForegroundWindow(self, _hwnd):
+            return 0
+
+        def GetForegroundWindow(self):
+            return 456
+
+    def refusing_win32(self) -> runtime.Win32:
+        win32 = object.__new__(runtime.Win32)
+        win32.user32 = self.RefusingUser32()
+        win32.send_inputs = lambda _inputs: None
+        return win32
+
+    def test_a_lost_foreground_reports_the_session_or_desktop_cause(self) -> None:
+        for cause in ("SESSION_NOT_ACTIVE", "INPUT_DESKTOP_MISMATCH", "INPUT_DESKTOP_LOCKED"):
+            with self.subTest(cause=cause):
+                win32 = self.refusing_win32()
+                win32.interactive_session_blocker = lambda cause=cause: runtime.HarnessBlocked(cause)
+
+                with self.assertRaises(runtime.HarnessBlocked) as raised:
+                    win32.require_foreground(123, timeout=0.0)
+
+                self.assertEqual(raised.exception.code, cause)
+                self.assertEqual(raised.exception.diagnostics["foreground_hwnd"], 456)
+
+    def test_the_foreground_has_one_timeout_whatever_the_caller_asks(self) -> None:
+        win32 = self.refusing_win32()
+        win32.interactive_session_blocker = lambda: None
+        now = [0.0]
+
+        def clock() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        with (
+            mock.patch.object(runtime.time, "perf_counter", clock),
+            mock.patch.object(runtime.time, "sleep", sleep),
+            self.assertRaises(runtime.HarnessBlocked),
+        ):
+            win32.require_foreground(123, timeout=15.0)
+
+        self.assertGreaterEqual(now[0], runtime.FOREGROUND_TIMEOUT_SECONDS)
+        self.assertLess(now[0], runtime.FOREGROUND_TIMEOUT_SECONDS + 0.1)
+
+    def test_session_resampling_names_the_first_failed_precondition(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        win32.process_session_id = lambda _pid: 7
+        desktop_checks: list[str] = []
+
+        def input_desktop() -> tuple[str, str]:
+            desktop_checks.append("checked")
+            return "Default", "Default"
+
+        win32.input_desktop = input_desktop
+        win32.wts_state = lambda _session: runtime.WTS_ACTIVE + 1
+        self.assertEqual(win32.interactive_session_blocker().code, "SESSION_NOT_ACTIVE")
+        self.assertEqual(desktop_checks, [])
+
+        win32.wts_state = lambda _session: runtime.WTS_ACTIVE
+        self.assertIsNone(win32.interactive_session_blocker())
+
+        def mismatch() -> tuple[str, str]:
+            raise runtime.HarnessBlocked("INPUT_DESKTOP_MISMATCH")
+
+        win32.input_desktop = mismatch
+        self.assertEqual(win32.interactive_session_blocker().code, "INPUT_DESKTOP_MISMATCH")

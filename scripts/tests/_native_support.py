@@ -45,7 +45,6 @@ def case_observations(flow: str, **observations: Any) -> dict[str, Any]:
     return {
         "flow": flow,
         "process_context": process_context(),
-        "foreground_verified": True,
         "runtime_scan": runtime_scan(),
         **observations,
     }

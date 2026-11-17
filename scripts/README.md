@@ -73,6 +73,7 @@ uv run --project scripts scripts/mt.py release versions --tag v<version>
 uv run --project scripts scripts/mt.py release package --out dist --no-sign
 uv run --project scripts scripts/mt.py release package --out dist --self-signed
 uv run --project scripts scripts/mt.py release verify --manifest dist/release.json
+uv run --project scripts scripts/mt.py accept all --help
 uv run --project scripts scripts/mt.py accept goal-02 -- --help
 uv run --project scripts scripts/mt.py accept goal-03 -- --help
 uv run --project scripts scripts/mt.py accept goal-06 -- --help
@@ -86,7 +87,8 @@ outputs. `fixtures` deterministically regenerates committed performance
 fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The `accept` commands drive real Windows UI workflows and
-write fail-closed, hash-bound evidence.
+write fail-closed, hash-bound evidence; `accept all` runs every goal in one
+process and session (see [verification](../docs/verification.md#running-native-acceptance)).
 
 `release` owns the Windows installer contract. `versions` requires Cargo,
 `crates/mt-app/nsh.json` and the release tag to agree; `package` runs
@@ -99,9 +101,10 @@ not launch the app or prove clean-machine acceptance. `--self-signed` creates a
 throwaway test certificate and publishes its `.cer`; it is not trusted
 Authenticode and cannot satisfy stable publication.
 
-Goal 02/03/06/07 acceptance defaults write working receipts under the ignored
-`target/native-acceptance/` directory, including failed and single-case runs.
-Use `--evidence` to choose another output path. Review a completed receipt before
+Goal 02/03/06/07 acceptance defaults write working receipts
+(`goal-0N-native-acceptance.json`) under the ignored `target/native-acceptance/`
+directory, including failed and single-case runs. Use `--evidence` (one goal)
+or `--evidence-dir` (`accept all`) to choose another output location. Review a completed receipt before
 copying it into `docs/evidence/` under a distinct name for retention; do not use
 an existing historical receipt as a routine run destination.
 
