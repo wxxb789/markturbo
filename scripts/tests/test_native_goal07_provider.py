@@ -268,8 +268,11 @@ class LoopbackProviderTests(unittest.TestCase):
     def test_revision_response_uses_utf8_byte_ranges_and_complete_coverage(self) -> None:
         decoded = json.loads(PROVIDER.revision_response(HARNESS.EDITOR_SOURCE_TEXT))
         self.assertEqual(decoded["schema_version"], "revision-v1")
-        self.assertEqual(len(decoded["groups"]), 2)
-        self.assertEqual(len(decoded["question_coverage"]), 3)
+        # One group per hunk, in document order, each the fixture's own edit.
+        self.assertEqual(
+            [group["edits"] for group in decoded["groups"]],
+            [[edit] for edit in PROVIDER.fixture_edits(HARNESS.EDITOR_SOURCE_TEXT)],
+        )
         for group in decoded["groups"]:
             for edit in group["edits"]:
                 start = edit["range"]["start"]
@@ -278,13 +281,25 @@ class LoopbackProviderTests(unittest.TestCase):
                     HARNESS.EDITOR_SOURCE_BYTES[start:end],
                     edit["expected_source"].encode("utf-8"),
                 )
+        # Every represented question names an existing change, each change once.
+        coverage = decoded["question_coverage"]
+        self.assertEqual(
+            [entry["question_id"] for entry in coverage], list(PROVIDER.QUESTION_IDS)
+        )
+        represented = [
+            change_id
+            for entry in coverage
+            if entry["status"]["kind"] == "represented"
+            for change_id in entry["status"]["change_ids"]
+        ]
+        self.assertEqual(represented, list(range(len(decoded["groups"]))))
 
-    def test_apply_edits_preserves_crlf_cjk_emoji_fences_and_links(self) -> None:
+    def test_apply_edits_preserves_crlf_cjk_and_emoji(self) -> None:
         edited = HARNESS.apply_edits(
             HARNESS.SOURCE_BYTES, PROVIDER.fixture_edits(HARNESS.SOURCE_TEXT)
         )
-        self.assertIn("计划 🚀".encode("utf-8"), edited)
-        self.assertIn(b"\x60\x60\x60rust\r\n", edited)
-        self.assertIn(b"[link](https://example.invalid)", edited)
-        self.assertIn(b"title: new\r\nowner: team\r\n", edited)
+        self.assertIn("<p>trusted 文档 🚀</p>\r\n".encode("utf-8"), edited)
+        self.assertIn(
+            b'<script>window.goal07 = "new";</script>\r\n<p>owner: team</p>\r\n', edited
+        )
         self.assertEqual(edited.count(b"\r\n"), HARNESS.SOURCE_BYTES.count(b"\r\n"))

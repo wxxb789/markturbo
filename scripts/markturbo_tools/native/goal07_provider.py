@@ -12,12 +12,12 @@ from .runtime import HarnessFailure
 
 ANSWER_SENTINEL = "MTG07-NATIVE-ANSWER-SENTINEL"
 RAW_RESPONSE_SENTINEL = "MTG07-NATIVE-RAW-RESPONSE-SENTINEL"
-ANSWER_TEXT = f"Use the new title for the revised plan. {ANSWER_SENTINEL}"
+ANSWER_TEXT = f"Set the new script value and name the team as owner. {ANSWER_SENTINEL}"
 
-QUESTION_0 = "Which title should the revised plan use?"
+QUESTION_0 = "Which value should the page script set?"
 QUESTION_1 = "Should the owner field remain explicit?"
 QUESTION_2 = "Which rollout detail is intentionally left open?"
-QUESTION_IMPACT_0 = "A title choice changes the artifact's audience and identity."
+QUESTION_IMPACT_0 = "A script value changes what the page does when it runs."
 QUESTION_IMPACT_1 = "An owner choice changes accountability for the first step."
 QUESTION_IMPACT_2 = "A rollout choice changes the success evidence."
 
@@ -54,34 +54,26 @@ def _source_edit(source: str, old: str, new: str) -> dict[str, Any]:
 
 
 def fixture_edits(source: str) -> list[dict[str, Any]]:
-    if "window.goal07" in source:
-        return [_source_edit(source, 'goal07 = "old"', 'goal07 = "new"')]
+    """The proposal's two hunks, in document order: h1 the executable script
+    value, h2 the owner line."""
     return [
-        _source_edit(source, "title: old", "title: new"),
+        _source_edit(source, 'goal07 = "old"', 'goal07 = "new"'),
         _source_edit(source, "owner: TBD", "owner: team"),
     ]
 
 
 def revision_response(source: str) -> str:
-    groups = (
-        [
-            {
-                "rationale": "The executable fixture changes only the requested script value.",
-                "edits": [_source_edit(source, 'goal07 = "old"', 'goal07 = "new"')],
-            }
-        ]
-        if "window.goal07" in source
-        else [
-            {
-                "rationale": "The answered title decision changes only the title line.",
-                "edits": [_source_edit(source, "title: old", "title: new")],
-            },
-            {
-                "rationale": "The answered owner decision changes only the owner line.",
-                "edits": [_source_edit(source, "owner: TBD", "owner: team")],
-            },
-        ]
-    )
+    script, owner = fixture_edits(source)
+    groups = [
+        {
+            "rationale": "The answered decision changes only the script value.",
+            "edits": [script],
+        },
+        {
+            "rationale": "The answered owner decision changes only the owner line.",
+            "edits": [owner],
+        },
+    ]
     coverage = [
         {
             "question_index": 0,
@@ -91,10 +83,7 @@ def revision_response(source: str) -> str:
         {
             "question_index": 1,
             "question_id": QUESTION_IDS[1],
-            "status": {
-                "kind": "intentionally_omitted",
-                "reason": "The owner deliberately left this decision unchanged.",
-            },
+            "status": {"kind": "represented", "change_ids": [1]},
         },
         {
             "question_index": 2,
