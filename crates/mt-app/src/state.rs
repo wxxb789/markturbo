@@ -3875,6 +3875,101 @@ mod tests {
         );
     }
 
+    const UNSET_SOURCE: &str = "# Plan\n\nKeep this text.\n";
+
+    /// The whole room over one clean document, on an endpoint no environment
+    /// key is allowed for and an empty credential store: no model is set up,
+    /// and nothing can reach the platform's secure store or the network.
+    /// Beside the room, the document's exact text and dirty flag.
+    fn not_set_up_room(language: Language) -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        state.settings.update(|settings| {
+            settings.language = language;
+            settings.model_provider = mt_core::model::Provider::OpenAiResponses.key().to_owned();
+            settings.model_base_url = "https://review.markturbo-test.invalid/v1/".to_owned();
+            settings.model_environment_key_identity = String::new();
+        });
+        state.new_document();
+        let tab = state.active_tab().expect("the new document");
+        tab.text.set(SharedString::from(UNSET_SOURCE));
+        let (source, dirty) = (tab.text, tab.dirty);
+        view()
+            .flex_1()
+            .w_full()
+            .h(relative(1.0))
+            .child(text(move || {
+                format!("Probe: {:?} dirty={}", source.get(), dirty.get())
+            }))
+            .child(crate::ui::shell(
+                state,
+                language,
+                crate::ui::tokens::Layout::Wide,
+            ))
+    }
+
+    #[component]
+    fn NotSetUpProbe() -> impl IntoElement {
+        not_set_up_room(Language::English)
+    }
+
+    #[component]
+    fn NotSetUpChineseProbe() -> impl IntoElement {
+        not_set_up_room(Language::Chinese)
+    }
+
+    /// `Ctrl+Enter` from the focused source editor with no model set up:
+    /// the field says so, with the way to Settings, and the document's text
+    /// and dirty flag are as they were.
+    fn review_says_not_set_up<P: Component>(headline: &str, open_settings: &str)
+    where
+        P::Props: Default,
+    {
+        let mut engine = nsh_engine::EngineConfig::new(nsh_engine::Root::of::<P>());
+        engine.environment.os = nsh_core::platform::Os::Windows;
+        engine.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = nsh_testing::Headless::start(engine).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(
+            nsh_engine::Points(1440.0),
+            nsh_engine::Points(900.0),
+        ))
+        .expect("viewport");
+        let probe = format!("Probe: {UNSET_SOURCE:?} dirty=false");
+        app.wait_for(&format!("text:{probe}"))
+            .expect("the clean document");
+        app.wait_for("label:Markdown source")
+            .expect("the source editor");
+        app.type_text("label:Markdown source", "")
+            .expect("focus the editor");
+        app.press_key("ctrl+enter").expect("press Ctrl+Enter");
+        app.wait_for("id:review-unavailable")
+            .expect("Review says why it cannot run");
+        let screen = app.screen();
+        for (what, copy) in [("headline", headline), ("way forward", open_settings)] {
+            assert!(
+                screen
+                    .matches(&format!("id:review-unavailable >> text:{copy}"))
+                    .expect("the selector"),
+                "the {what} `{copy}`: {:?}",
+                screen.texts()
+            );
+        }
+        assert!(
+            app.shows(&probe),
+            "the text and dirty flag are unchanged: {:?}",
+            app.screen().texts()
+        );
+    }
+
+    #[test]
+    fn review_without_a_model_says_no_model_set_up() {
+        review_says_not_set_up::<NotSetUpProbe>("No model set up", "Open settings");
+    }
+
+    #[test]
+    fn review_without_a_model_says_so_in_chinese() {
+        review_says_not_set_up::<NotSetUpChineseProbe>("未配置模型", "打开设置");
+    }
+
     static REPLACED: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
 
     /// Lands a translation, then takes the disk version (the conflict's

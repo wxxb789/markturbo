@@ -1742,12 +1742,16 @@ mod tests {
             .child(field(state, Language::English))
     }
 
+    /// A proposed line that would run as script in a web view.
+    const SCRIPT_LINE: &str = "<script>alert('proposal')</script>";
+
     /// A proposal whose hunk is taller than the docked position shows at
-    /// once.
+    /// once, its last proposed line markup that would run as script.
     #[component]
     fn TallHunkProbe() -> impl IntoElement {
         let state = AppState::new();
         let (before, after) = tall_sides();
+        let after = format!("{after}\n{SCRIPT_LINE}");
         let source = format!("{before}\n");
         open_probe_document(&state, &source);
         present(&state, &source, &[("Rewrite the block.", &before, &after)]);
@@ -2166,6 +2170,23 @@ mod tests {
                 "the old text is not part of the proposal"
             );
         }
+        // Proposed markup is inert: its script is a line of text in the
+        // proposal, and nothing in the field renders it as a page.
+        assert_eq!(
+            screen
+                .count(&format!("id:revision-proposal-after >> text:{SCRIPT_LINE}"))
+                .expect("the selector"),
+            1,
+            "the script reads as text: {:?}",
+            screen.texts()
+        );
+        assert!(
+            screen
+                .layout_nodes()
+                .iter()
+                .all(|node| node.kind != nsh_core::ViewKind::WebView),
+            "the field holds no web view"
+        );
     }
 
     /// One untitled document holding `text`, the source a probe's proposal

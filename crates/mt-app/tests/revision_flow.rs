@@ -248,6 +248,23 @@ fn RevisionDecisionActions() -> impl IntoElement {
                 .map(|tab| tab.text.get())
                 .unwrap_or_default()
         }))
+        // The buffer escaped, so a selector compares every byte (a text
+        // selector ignores the spaces around a text).
+        .child(text(move || {
+            format!(
+                "Bytes: {:?}",
+                tabs.get()
+                    .first()
+                    .map(|tab| tab.text.get().to_string())
+                    .unwrap_or_default()
+            )
+        }))
+        .child(text(move || {
+            format!(
+                "Dirty: {}",
+                tabs.get().first().is_some_and(|tab| tab.dirty.get())
+            )
+        }))
 }
 
 #[test]
@@ -340,6 +357,13 @@ fn all_rejected_apply_records_one_decision_and_finalizes() {
     app.wait_for("text:No changes approved.")
         .expect("rejection status");
     app.wait_for("text:Hunks: 0").expect("proposal finalized");
+    // Rejecting every hunk leaves the buffer byte for byte as reviewed, and
+    // clean.
+    assert!(
+        app.shows(r#"Bytes: "First\nSecond\n""#) && app.shows("Dirty: false"),
+        "the buffer is the reviewed source, clean: {:?}",
+        app.screen().texts()
+    );
     assert_eq!(revision_usage_totals(), (1, 0, 2, 0));
     let store = config.path().join("data/usage.json");
     let finalized = std::fs::read(&store).expect("finalized usage aggregate");
@@ -391,6 +415,9 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
     let revision = state.clone();
     let send_revision = state.clone();
     let edit = state.clone();
+    let save = state.clone();
+    let conflict_state = state.clone();
+    let banner_state = state.clone();
     let review_view = state.review_view;
     let tabs = state.tabs;
     let open_state = state.clone();
@@ -414,6 +441,13 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
                 edit.note_edit(tab.id);
             }
         }))
+        // The title row's Save, and the banner the column shows when the
+        // save is refused.
+        .child(text("Save the document").on_press(move || save.save_active()))
+        .child(when(
+            move || mt_app::ui::notices::has_conflict(&conflict_state),
+            move || mt_app::ui::notices::conflict_banner(banner_state.clone(), Language::English),
+        ))
         .child(text(move || {
             review_view
                 .get()
@@ -689,6 +723,38 @@ fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
         app.screen().texts()
     );
     assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
+}
+
+/// A buffer with an accepted change saves through the same conflict check as
+/// any edit: after the file changes on disk, Save is refused with the
+/// conflict banner, and neither the other writer's bytes nor the accepted
+/// text is lost.
+#[test]
+fn an_accepted_change_does_not_overwrite_a_file_changed_on_disk() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let source = "Original\nUnchanged\n";
+    let (mut app, document, _directory, _config) = start_field_over_buffer(source);
+
+    app.press_key("a").expect("accept the first hunk");
+    app.wait_for("text:Buffer: Revised\nUnchanged\n")
+        .expect("the accepted hunk is in the buffer");
+    app.wait_for("text:Dirty: true").expect("the tab is dirty");
+
+    let external = "Changed elsewhere, at another length.\n";
+    std::fs::write(&document, external).expect("the other writer's change");
+    app.press("text:Save the document").expect("save");
+    app.wait_for("id:conflict-banner")
+        .expect("the save is refused as a conflict");
+    assert_eq!(
+        std::fs::read_to_string(&document).unwrap(),
+        external,
+        "a refused save leaves the disk alone"
+    );
+    assert!(
+        buffer_shows(&app, "Revised\nUnchanged\n") && app.shows("Dirty: true"),
+        "the accepted text stays, unsaved: {:?}",
+        app.screen().texts()
+    );
 }
 
 /// `Copy` puts exactly the approved result on the clipboard — the buffer
