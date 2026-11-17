@@ -3805,6 +3805,25 @@ mod tests {
     /// the hunk card does.
     #[component]
     fn TrustProbe() -> impl IntoElement {
+        let (state, tab) = proposed();
+
+        // Whatever watches the text (the Web pane) must never see revised
+        // text under the trust granted to the text before it.
+        let seen = watch_text_and_trust(&tab);
+
+        tab.web_trusted.set(true);
+        assert!(state.set_revision_change_applied(0, true), "accept");
+        let accepted = read(&tab);
+        tab.web_trusted.set(true);
+        assert!(state.set_revision_change_applied(0, false), "undo");
+        let undone = read(&tab);
+        *OUTCOME.lock().expect("the outcome") = Some((accepted, undone, seen.borrow().clone()));
+        view()
+    }
+
+    /// A new document holding [`SOURCE`] with a one-change Revision on
+    /// screen, over an empty credential store.
+    fn proposed() -> (AppState, Tab) {
         let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
         state.new_document();
         let tab = state.active_tab().expect("the new document");
@@ -3825,19 +3844,7 @@ mod tests {
         )
         .expect("a valid proposal");
         state.present_revision(proposal);
-
-        // Whatever watches the text (the Web pane) must never see revised
-        // text under the trust granted to the text before it.
-        let seen = watch_text_and_trust(&tab);
-
-        tab.web_trusted.set(true);
-        assert!(state.set_revision_change_applied(0, true), "accept");
-        let accepted = read(&tab);
-        tab.web_trusted.set(true);
-        assert!(state.set_revision_change_applied(0, false), "undo");
-        let undone = read(&tab);
-        *OUTCOME.lock().expect("the outcome") = Some((accepted, undone, seen.borrow().clone()));
-        view()
+        (state, tab)
     }
 
     #[test]
@@ -3867,6 +3874,43 @@ mod tests {
             seen.iter().skip(1).all(|(_, trusted)| !trusted),
             "a watcher saw revised text under old trust: {seen:?}"
         );
+    }
+
+    /// The status after a first and a second `Done` over one proposal.
+    static DONE_TWICE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+    #[component]
+    fn DoneTwiceProbe() -> impl IntoElement {
+        let (state, _tab) = proposed();
+        let status = || {
+            state
+                .revision_status
+                .get()
+                .map(|status| status.to_string())
+                .unwrap_or_default()
+        };
+        state.finish_revision(1);
+        let first = status();
+        state.finish_revision(1);
+        *DONE_TWICE.lock().expect("the outcome") = Some((first, status()));
+        view()
+    }
+
+    #[test]
+    fn a_second_done_without_a_proposal_decides_nothing() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                DoneTwiceProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (first, second) = DONE_TWICE
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert_eq!(first, "No changes approved.");
+        assert_eq!(second, REVISION_UNAVAILABLE);
     }
 
     const UNSET_SOURCE: &str = "# Plan\n\nKeep this text.\n";
