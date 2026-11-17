@@ -9,13 +9,22 @@ One case, one profile, three launches; only the behaviour that needs a
 restart gets one:
 
 1. A no-argument launch on the clean profile (nothing is written before it):
-   the welcome, New file, the Save As lifecycle, Paste, the Goal 02 guard and
-   Open sample, all in one session.
+   the welcome (its four actions, New file among them, are enabled Buttons),
+   Paste from the real OS clipboard, Save As onto an existing file answered
+   No (then the picker's Escape: the one cancel proof) and Yes, a typed edit
+   saved to the new path, the clean close into the recent list and Open
+   sample, all in one session.
 2. A cold launch with the saved file as its argument (the reopen and the
    command-line bypass need a new process). Before it the harness replaces
    the recent history with eleven targets, one of them missing.
 3. A no-argument launch reading the history the second launch wrote: the
    bounded rows, the stale row and a reopen from the list.
+
+Headless tests carry what needs no real OS: New file saving through Save As
+(`untitled_save.rs`), Save after Save As writing only the new path
+(`save_as_overwrite.rs`) and discarding an untitled draft without a recent
+entry (`untitled_discard.rs`); Goal 02's KEYBOARD_CLOSE proves Ctrl+W, the
+guard and Don't save natively.
 
 Every phase prefixes its failure codes with its own name (`phase`), so a
 FAIL names the phase that broke.
@@ -29,9 +38,12 @@ the accessible label to the Name). The recent rows are Buttons sharing the
 listed. A target that no longer exists stays listed, disabled, named
 `<kind> <name> — Missing`, and a press opens nothing. An open workspace
 replaces the welcome with the workspace home, whose file rows are Buttons
-sharing `workspace-home-file`. Save As runs from the title menu or
-Ctrl+Shift+S through the native IFileSaveDialog, whose own overwrite
-confirmation is the only overwrite decision: Yes replaces the existing file.
+sharing `workspace-home-file`. Save As runs from Ctrl+Shift+S through the
+native IFileSaveDialog, whose own overwrite confirmation is the only overwrite
+decision: Yes replaces the existing file. The app writes the file before it
+swaps the tab, so the harness waits for the title row's file name
+(`title-file`, a Button named after the active tab) before it edits the
+swapped tab. Each open tab has one rail row (`rail-file-row`).
 Editor text is read with the editor's Select All + Copy (see
 `runtime.EDITOR_NAME`).
 """
@@ -42,9 +54,7 @@ import argparse
 import hashlib
 import json
 import re
-import time
 import tomllib
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +62,6 @@ from . import evidence
 from .evidence import leak_codes
 from .runtime import (
     INTEGRITY_NAMES,
-    MENU_SAVE_AS_AUTOMATION_ID,
     VK_A,
     VK_CONTROL,
     VK_RETURN,
@@ -87,6 +96,14 @@ WELCOME_NEW_AUTOMATION_ID = "welcome-new-file"
 WELCOME_PASTE_AUTOMATION_ID = "welcome-paste"
 WELCOME_SAMPLE_AUTOMATION_ID = "welcome-open-sample"
 WELCOME_RECENT_AUTOMATION_ID = "welcome-recent"
+WELCOME_ACTION_AUTOMATION_IDS = (
+    WELCOME_OPEN_FOLDER_AUTOMATION_ID,
+    WELCOME_NEW_AUTOMATION_ID,
+    WELCOME_PASTE_AUTOMATION_ID,
+    WELCOME_SAMPLE_AUTOMATION_ID,
+)
+TITLE_FILE_AUTOMATION_ID = "title-file"
+RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
 # A file recent row is named `File <name>`; once its target is gone it is
 # disabled and named `File <name> — Missing` (`ui/welcome.rs` `recents`).
 RECENT_ROW_NAME = "File {name}"
@@ -101,19 +118,19 @@ LAUNCH_COUNT = 3
 CASE_FIRST_USE = "first_use_lifecycle"
 CASE_FLOWS = {
     CASE_FIRST_USE: (
-        "clean no-argument welcome -> New -> Save As cancel, overwrite No, overwrite Yes,"
-        " menu create, Save -> Paste -> guard discard -> sample"
+        "clean no-argument welcome -> Paste -> Save As overwrite No and picker cancel,"
+        " overwrite Yes -> typed Save -> clean close -> sample"
         " | argv cold reopen | restart recents bound, stale row, reopen from list"
     ),
 }
 REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
 
 DOCUMENT_SENTINEL = "MTG03-NATIVE-SENTINEL-保存-\U0001f680"
-NEW_TEXT = f"# {DOCUMENT_SENTINEL}: New\n\nExact CJK 你好 and emoji \U0001f680\n"
-RESAVE_TEXT = f"# {DOCUMENT_SENTINEL}: Save\n\nExact CJK 保存 and emoji \U0001f9ea\n"
+# Typed into the saved tab with SendInput (as Goal 02 types): one line with
+# CJK and emoji, so the cold reopens compare exact non-ASCII bytes.
+RESAVE_TEXT = f"{DOCUMENT_SENTINEL}: Save 你好 \U0001f9ea"
 PASTE_TEXT = f"# {DOCUMENT_SENTINEL}: Paste\n\n日本語 and emoji \U0001f9ea\n"
 EXISTING_DESTINATION = b"goal-03 original destination\n"
-CANCELLED_DESTINATION = b"goal-03 cancelled destination\n"
 # The seeded history: eleven file targets, newest first; this one is never
 # written, so it is stale from the start.
 SEEDED_RECENT_COUNT = 11
@@ -123,35 +140,27 @@ SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
 SAMPLE_VERSION_RE = re.compile(r"^[0-9a-f]{24}$")
 FINGERPRINT_OBSERVATION_KEYS = frozenset(
     {
-        "new_editor",
-        "save_as_cancel_editor",
-        "save_as_cancel_destination_before",
-        "save_as_cancel_destination_after",
-        "overwrite_no_editor",
+        "paste_clipboard",
+        "paste_editor",
         "overwrite_no_destination_before",
         "overwrite_no_destination_after",
         "overwrite_yes_destination",
-        "save_as_create_destination",
         "subsequent_save_destination",
-        "subsequent_save_previous_destination",
-        "paste_clipboard",
-        "paste_editor",
         "sample_manifest",
         "sample_content",
         "reopen_editor",
-        "recents_reopen_editor",
     }
 )
 COUNT_OBSERVATION_KEYS = frozenset(
     {
         "welcome_recent_rows",
         "saved_close_recent_rows",
-        "paste_discard_recent_rows",
         "sample_file_count",
         "sample_home_rows",
         "reopen_recent_count",
         "recents_rows",
         "recents_disabled_rows",
+        "recents_open_tabs",
         "recents_count_after_restart",
     }
 )
@@ -164,25 +173,18 @@ REQUIRED_OBSERVATIONS = {
 
 # A press, not a hold: long enough for the pointer down and up to register.
 STALE_RECENT_PRESS_SECONDS = 0.05
-# How long a press on the stale row must keep opening nothing: open_file is
-# asynchronous, so one look right after the press could miss a late open.
-STALE_RECENT_OBSERVE_SECONDS = 1.0
+# The stale-row fence. A press opens its file asynchronously, so no look right
+# after the stale press can prove it opened nothing. The saved row is clicked
+# after it; once that tab is shown the earlier press has been handled, and
+# this settle lets a late tab from either press reach the rail before the
+# harness counts the rows (the one fixed wait the phase keeps).
+OPEN_TABS_SETTLE_SECONDS = 0.3
 
 
 def require(condition: bool, code: str) -> None:
     """Fail the current phase with `code` unless `condition` holds."""
     if not condition:
         raise HarnessFailure(code)
-
-
-def require_for(predicate: Callable[[], bool], seconds: float, code: str) -> None:
-    """Fail with `code` as soon as `predicate` stops holding within `seconds`."""
-    deadline = time.monotonic() + seconds
-    while True:
-        require(predicate(), code)
-        if time.monotonic() >= deadline:
-            return
-        time.sleep(0.05)
 
 
 def recent_settings_document(documents: list[Path]) -> bytes:
@@ -216,33 +218,22 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
         raise ValueError("the case must record one process context per launch")
     if count["welcome_recent_rows"] != 0:
         raise ValueError("the first launch did not start from a clean profile")
-    new = fp["new_editor"]
-    if fp["save_as_cancel_editor"] != new or fp["overwrite_no_editor"] != new:
-        raise ValueError("cancellation changed the unsaved editor")
-    if fp["save_as_cancel_destination_before"] != fp["save_as_cancel_destination_after"]:
-        raise ValueError("Save As picker cancellation changed the named destination")
-    if fp["overwrite_no_destination_before"] != fp["overwrite_no_destination_after"]:
-        raise ValueError("overwrite cancellation changed the destination")
-    if (
-        fp["overwrite_yes_destination"] != new
-        or fp["overwrite_yes_destination"] == fp["overwrite_no_destination_before"]
-    ):
-        raise ValueError("confirmed overwrite did not replace the destination")
-    if fp["save_as_create_destination"] != new:
-        raise ValueError("menu Save As did not create the exact text")
-    if (
-        fp["subsequent_save_destination"] == fp["save_as_create_destination"]
-        or fp["subsequent_save_previous_destination"] != fp["overwrite_yes_destination"]
-    ):
-        raise ValueError("Save after Save As did not write only the new path")
-    if count["saved_close_recent_rows"] != 2:
-        raise ValueError("the Save As destinations were not both recorded as recent")
-    if count["paste_discard_recent_rows"] != count["saved_close_recent_rows"]:
-        raise ValueError("discarding the pasted buffer changed the recent targets")
     if fp["paste_clipboard"] != fingerprint_text(PASTE_TEXT).evidence():
         raise ValueError("the clipboard did not hold the CJK and emoji paste text")
     if fp["paste_editor"] != fp["paste_clipboard"]:
         raise ValueError("Paste did not create the exact clipboard text")
+    if fp["overwrite_no_destination_before"] != fp["overwrite_no_destination_after"]:
+        raise ValueError("overwrite cancellation changed the destination")
+    # The cancelled buffer is the one the confirmed overwrite then wrote.
+    if (
+        fp["overwrite_yes_destination"] != fp["paste_editor"]
+        or fp["overwrite_yes_destination"] == fp["overwrite_no_destination_before"]
+    ):
+        raise ValueError("confirmed overwrite did not replace the destination")
+    if fp["subsequent_save_destination"] != fingerprint_text(RESAVE_TEXT).evidence():
+        raise ValueError("Save after Save As did not write the typed text to the new path")
+    if count["saved_close_recent_rows"] != 1:
+        raise ValueError("the Save As destination was not the one recent target")
     if count["sample_file_count"] <= 0 or count["sample_home_rows"] <= 0:
         raise ValueError("sample file inventory must be nonempty")
     if fp["sample_manifest"]["byte_count"] <= 0 or fp["sample_content"]["byte_count"] <= 0:
@@ -255,8 +246,8 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     saved = fp["subsequent_save_destination"]
     if fp["reopen_editor"] != saved:
         raise ValueError("direct reopen did not preserve exact Save As text")
-    if fp["recents_reopen_editor"] != saved:
-        raise ValueError("reopen from the recent list did not show the saved text")
+    if count["recents_open_tabs"] != 1:
+        raise ValueError("the recent rows must open exactly the saved file")
     if (
         count["reopen_recent_count"] != RECENT_TARGET_BOUND
         or count["recents_count_after_restart"] != RECENT_TARGET_BOUND
@@ -395,14 +386,50 @@ class Goal03Harness(BaseNativeHarness):
             app, automation_id, "Button", "WELCOME_UIA_TIMEOUT", "WELCOME_UIA_CONTRACT_MISMATCH"
         )
 
-    def welcome_entry_points(self, app: Any) -> None:
-        self.welcome_open_folder(app)
-        for automation_id in (
-            WELCOME_NEW_AUTOMATION_ID,
-            WELCOME_PASTE_AUTOMATION_ID,
-            WELCOME_SAMPLE_AUTOMATION_ID,
-        ):
-            self.welcome_action(app, automation_id)
+    def welcome_buttons(self, app: Any) -> dict[str, list[Any]]:
+        """The visible welcome action and recent-row Buttons by AutomationId,
+        from one UIA query over every Button."""
+        try:
+            uia = self.iuia_class()
+            condition = uia.iuia.CreatePropertyCondition(
+                uia.UIA_dll.UIA_ControlTypePropertyId, uia.known_control_types["Button"]
+            )
+            elements = self.fresh_uia_root(app.hwnd).element.FindAll(
+                uia.tree_scope["descendants"], condition
+            )
+            buttons: dict[str, list[Any]] = {
+                automation_id: []
+                for automation_id in (*WELCOME_ACTION_AUTOMATION_IDS, WELCOME_RECENT_AUTOMATION_ID)
+            }
+            for index in range(elements.Length):
+                element = elements.GetElement(index)
+                found = buttons.get(element.CurrentAutomationId)
+                if found is None:
+                    continue
+                control = self.uia_wrapper_class(self.uia_element_info_class(element))
+                if control.is_visible():
+                    found.append(control)
+            return buttons
+        except HarnessFailure:
+            raise
+        except Exception as error:
+            raise HarnessFailure("WELCOME_UIA_QUERY_FAILED", safe_exception_name(error)) from None
+
+    def welcome_entry_points(self, app: Any) -> int:
+        """Wait until Open folder, New file, Paste and Open sample are each one
+        enabled Button; return how many recent rows the same query saw."""
+
+        def ready() -> tuple[int] | None:
+            buttons = self.welcome_buttons(app)
+            actions = [buttons[automation_id] for automation_id in WELCOME_ACTION_AUTOMATION_IDS]
+            if any(len(found) > 1 for found in actions):
+                raise HarnessFailure("WELCOME_UIA_CONTRACT_MISMATCH")
+            if all(len(found) == 1 and found[0].is_enabled() for found in actions):
+                return (len(buttons[WELCOME_RECENT_AUTOMATION_ID]),)
+            return None
+
+        (recent_rows,) = wait_until(ready, self.ui_timeout, "WELCOME_UIA_TIMEOUT", interval=0.025)
+        return recent_rows
 
     def welcome_absent(self, app: Any) -> bool:
         return self.control_absent(
@@ -517,11 +544,6 @@ class Goal03Harness(BaseNativeHarness):
         )
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
 
-    def select_save_path(self, app: Any, path: Path) -> None:
-        """Save As to a path that does not exist yet."""
-        hwnd = self.type_save_path(app, path)
-        self.wait_file_dialog_closed(app, hwnd, "SAVE_AS_FILE_DIALOG_CLOSE_TIMEOUT")
-
     def select_existing_save_path(self, app: Any, path: Path, *, replace: bool) -> None:
         """Save As onto an existing file: answer the native overwrite prompt."""
         hwnd = self.type_save_path(app, path)
@@ -529,26 +551,26 @@ class Goal03Harness(BaseNativeHarness):
         button = self.native_overwrite_confirmation(app, hwnd)[choice]
         self.click_control(button, f"NATIVE_OVERWRITE_{choice.upper()}_CLICK_FAILED")
         if not replace:
-            # No returns to the picker; leaving it is the user's cancel.
+            # No returns to the picker; its Escape is the user's cancel, the
+            # one picker-cancel proof (the app sees no path either way).
             self.common_file_dialog(app)
             self.win32.send_key(hwnd, VK_ESCAPE)
         self.wait_file_dialog_closed(app, hwnd, "SAVE_AS_FILE_DIALOG_CLOSE_TIMEOUT")
 
-    def cancel_save_picker(self, app: Any, path: Path) -> None:
-        hwnd, edit = self.common_file_dialog(app)
-        self.click_control(edit, "SAVE_AS_FILENAME_FOCUS_FAILED")
-        self.win32.send_shortcut(hwnd, VK_A)
-        self.win32.send_unicode(hwnd, str(path))
-        self.win32.send_key(hwnd, VK_ESCAPE)
-        wait_until(
-            lambda: not self.win32.owned_task_dialogs(app.process.pid, app.hwnd),
-            self.ui_timeout,
-            "SAVE_AS_PICKER_CANCEL_TIMEOUT",
-        )
-        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+    def wait_title_file(self, app: Any, name: str) -> None:
+        """Wait until the title row names `name` as the active tab's file."""
 
-    def request_save_as(self, app: Any) -> None:
-        self.menu_command(app, MENU_SAVE_AS_AUTOMATION_ID)
+        def named() -> bool:
+            control = self.control_by_id(
+                app.hwnd, TITLE_FILE_AUTOMATION_ID, "Button", "TITLE_FILE_UIA_CONTRACT_MISMATCH"
+            )
+            return control is not None and control.element_info.name == name
+
+        wait_until(named, self.ui_timeout, "TITLE_FILE_TIMEOUT", interval=0.025)
+
+    def open_tab_count(self, app: Any) -> int:
+        """How many tabs are open: one rail row each."""
+        return len(self.buttons_sharing_id(app, RAIL_FILE_ROW_AUTOMATION_ID, "RAIL_FILE_ROW"))
 
     def request_save_as_shortcut(self, app: Any) -> None:
         self.require_source_editor_focus(app, "SAVE_AS_SHORTCUT_EDITOR_NOT_FOCUSED")
@@ -621,91 +643,15 @@ class Goal03Harness(BaseNativeHarness):
     # Launch 1: the clean-profile, no-argument session.
 
     def first_session(self, app: RunningApp, data: Path, workspace: Path) -> dict[str, Any]:
-        cancelled = (workspace / "cancelled.md").resolve()
         replaced = (workspace / "replace.md").resolve()
-        created = (workspace / "created.md").resolve()
-        write_durable(cancelled, CANCELLED_DESTINATION)
         write_durable(replaced, EXISTING_DESTINATION)
         observed: dict[str, Any] = {}
 
         with phase("WELCOME"):
-            self.welcome_entry_points(app)
-            observed["welcome_recent_rows"] = len(self.recent_controls(app))
+            # New file stays proven here as an enabled Button; its press and
+            # Save As are headless (`untitled_save.rs`).
+            observed["welcome_recent_rows"] = self.welcome_entry_points(app)
             require(observed["welcome_recent_rows"] == 0, "PROFILE_NOT_CLEAN")
-
-        with phase("NEW"):
-            self.click_control(
-                self.welcome_action(app, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED"
-            )
-            self.wait_welcome_absent(app)
-            self.source_editor_ready(app)
-            editor = self.paste_editor(app, NEW_TEXT)
-            observed["new_editor"] = editor.evidence()
-
-        with phase("SAVE_AS_CANCEL"):
-            cancelled_before = sha256_file(cancelled)
-            observed["save_as_cancel_destination_before"] = cancelled_before.evidence()
-            self.request_save_as_shortcut(app)
-            self.cancel_save_picker(app, cancelled)
-            self.require_source_editor_focus(app, "FOCUS_NOT_RESTORED")
-            cancel_editor = self.editor_fingerprint(app)
-            observed["save_as_cancel_editor"] = cancel_editor.evidence()
-            require(
-                cancel_editor == editor and sha256_file(cancelled) == cancelled_before,
-                "CHANGED_STATE",
-            )
-
-        with phase("OVERWRITE_NO"):
-            replaced_before = sha256_file(replaced)
-            observed["overwrite_no_destination_before"] = replaced_before.evidence()
-            self.request_save_as_shortcut(app)
-            self.select_existing_save_path(app, replaced, replace=False)
-            self.require_source_editor_focus(app, "FOCUS_NOT_RESTORED")
-            replaced_after = sha256_file(replaced)
-            no_editor = self.editor_fingerprint(app)
-            observed["overwrite_no_destination_after"] = replaced_after.evidence()
-            observed["overwrite_no_editor"] = no_editor.evidence()
-            require(no_editor == editor and replaced_after == replaced_before, "CHANGED_STATE")
-
-        with phase("OVERWRITE_YES"):
-            self.request_save_as_shortcut(app)
-            self.select_existing_save_path(app, replaced, replace=True)
-            overwritten = self.wait_file(replaced, editor, "DESTINATION_TIMEOUT")
-            observed["overwrite_yes_destination"] = overwritten.evidence()
-
-        with phase("SAVE_AS_CREATE"):
-            self.source_editor_ready(app)
-            self.request_save_as(app)
-            self.select_save_path(app, created)
-            observed["save_as_create_destination"] = self.wait_file(
-                created, editor, "DESTINATION_TIMEOUT"
-            ).evidence()
-
-        with phase("SUBSEQUENT_SAVE"):
-            self.source_editor_ready(app)
-            resaved = self.paste_editor(app, RESAVE_TEXT)
-            self.save_via_menu(app)
-            observed["subsequent_save_destination"] = self.wait_file(
-                created, resaved, "DESTINATION_TIMEOUT"
-            ).evidence()
-            previous = sha256_file(replaced)
-            observed["subsequent_save_previous_destination"] = previous.evidence()
-            require(previous == overwritten, "PREVIOUS_PATH_CHANGED")
-            # The picker's cancelled destination stays byte-identical to the end.
-            cancelled_after = sha256_file(cancelled)
-            observed["save_as_cancel_destination_after"] = cancelled_after.evidence()
-            require(cancelled_after == cancelled_before, "CANCELLED_PATH_CHANGED")
-
-        with phase("SAVED_CLOSE"):
-            # The tab is clean: Ctrl+W closes it without a guard, and the
-            # welcome lists the paths Save As wrote, the newest first.
-            self.close_tab_by_keyboard(app)
-            rows = self.wait_recent_controls(app)
-            if (rows[0].element_info.name or "") != RECENT_ROW_NAME.format(name=created.name):
-                raise HarnessFailure("RECENT_NOT_NEW_PATH")
-            observed["saved_close_recent_rows"] = len(rows)
-            # Save As recorded both destinations; the untitled buffer none.
-            require(len(rows) == 2, "RECENT_COUNT")
 
         with phase("PASTE"):
             # The session restores the user's clipboard when the run ends.
@@ -728,15 +674,45 @@ class Goal03Harness(BaseNativeHarness):
             observed["paste_clipboard"] = clipboard.evidence()
             observed["paste_editor"] = pasted.evidence()
 
-        with phase("PASTE_DISCARD"):
-            # The pasted buffer is unsaved: Ctrl+W asks Goal 02's guard.
+        with phase("OVERWRITE_NO"):
+            # No, then the picker's Escape. The buffer staying exact is proven
+            # by the bytes OVERWRITE_YES writes from it.
+            replaced_before = sha256_file(replaced)
+            observed["overwrite_no_destination_before"] = replaced_before.evidence()
+            self.request_save_as_shortcut(app)
+            self.select_existing_save_path(app, replaced, replace=False)
+            self.require_source_editor_focus(app, "FOCUS_NOT_RESTORED")
+            replaced_after = sha256_file(replaced)
+            observed["overwrite_no_destination_after"] = replaced_after.evidence()
+            require(replaced_after == replaced_before, "CHANGED_STATE")
+
+        with phase("OVERWRITE_YES"):
+            self.request_save_as_shortcut(app)
+            self.select_existing_save_path(app, replaced, replace=True)
+            overwritten = self.wait_file(replaced, pasted, "DESTINATION_TIMEOUT")
+            observed["overwrite_yes_destination"] = overwritten.evidence()
+            # The file is written before the tab is swapped for it.
+            self.wait_title_file(app, replaced.name)
+
+        with phase("SUBSEQUENT_SAVE"):
+            # A typed edit of the swapped, file-backed tab; Save writes it to
+            # the new path (that it writes only there is `save_as_overwrite.rs`).
+            self.source_editor_ready(app)
+            resaved = self.replace_editor(app, RESAVE_TEXT)
+            self.save_via_menu(app)
+            observed["subsequent_save_destination"] = self.wait_file(
+                replaced, resaved, "DESTINATION_TIMEOUT"
+            ).evidence()
+
+        with phase("SAVED_CLOSE"):
+            # The tab is clean: Ctrl+W closes it without a guard, and the
+            # welcome lists the path Save As wrote; the untitled paste none.
             self.close_tab_by_keyboard(app)
-            self.click_lifecycle_decision(app, "Discard")
-            observed["paste_discard_recent_rows"] = len(self.wait_recent_controls(app))
-            require(
-                observed["paste_discard_recent_rows"] == observed["saved_close_recent_rows"],
-                "RECENT_CHANGED",
-            )
+            rows = self.wait_recent_controls(app)
+            if (rows[0].element_info.name or "") != RECENT_ROW_NAME.format(name=replaced.name):
+                raise HarnessFailure("RECENT_NOT_NEW_PATH")
+            observed["saved_close_recent_rows"] = len(rows)
+            require(len(rows) == 1, "RECENT_COUNT")
 
         with phase("SAMPLE"):
             self.click_control(
@@ -768,7 +744,7 @@ class Goal03Harness(BaseNativeHarness):
     # Launch 3: a restart onto the history the second launch wrote.
 
     def restart_recents(
-        self, app: RunningApp, config: Path, stale: Path, saved_path: Path, saved: Fingerprint
+        self, app: RunningApp, config: Path, stale: Path, saved_path: Path
     ) -> dict[str, Any]:
         with phase("RECENTS"):
             rows = self.wait_recent_controls(app)
@@ -783,14 +759,6 @@ class Goal03Harness(BaseNativeHarness):
                 raise HarnessFailure("STALE_NOT_DEGRADED")
             disabled_rows = sum(1 for row in rows if not row.is_enabled())
             require(disabled_rows == 1, "DISABLED_COUNT")
-            # A real pointer press on the disabled row opens nothing.
-            self.hold_control(app, stale_row, STALE_RECENT_PRESS_SECONDS, "STALE_PRESS_FAILED")
-            self.welcome_open_folder(app)
-            require_for(
-                lambda: self.editor_absent_while_running(app),
-                STALE_RECENT_OBSERVE_SECONDS,
-                "STALE_OPENED_DOCUMENT",
-            )
             saved_rows = [
                 row
                 for row in rows
@@ -798,11 +766,19 @@ class Goal03Harness(BaseNativeHarness):
             ]
             if len(saved_rows) != 1:
                 raise HarnessFailure("SAVED_ROW_UIA_CONTRACT_MISMATCH")
+            # A real pointer press on the disabled row, then a real click on
+            # the saved row: the saved tab shown fences the stale press, and
+            # one rail row afterwards proves the stale press (or a mis-hit
+            # neighbour) opened nothing.
+            self.hold_control(app, stale_row, STALE_RECENT_PRESS_SECONDS, "STALE_PRESS_FAILED")
             self.click_control(saved_rows[0], "SAVED_ROW_CLICK_FAILED")
             self.source_editor_ready(app)
-            reopened = self.editor_fingerprint(app)
-            if reopened != saved:
-                raise HarnessFailure("EXACT_TEXT_MISMATCH")
+            self.wait_title_file(app, saved_path.name)
+            self.sleep(OPEN_TABS_SETTLE_SECONDS)
+            # Nothing runs between this count and the close, so it is also
+            # the count just before WM_CLOSE.
+            open_tabs = self.open_tab_count(app)
+            require(open_tabs == 1, "EXTRA_TAB_OPENED")
             self.close_app(app)
             recent_count = persisted_recent_count(config)
             if recent_count != RECENT_TARGET_BOUND:
@@ -810,14 +786,14 @@ class Goal03Harness(BaseNativeHarness):
         return {
             "recents_rows": len(rows),
             "recents_disabled_rows": disabled_rows,
-            "recents_reopen_editor": reopened.evidence(),
+            "recents_open_tabs": open_tabs,
             "recents_count_after_restart": recent_count,
         }
 
     def scenario_first_use(self) -> dict[str, Any]:
         data, config, workspace, stderr = self.case_roots(CASE_FIRST_USE)
         case_root = data.parent
-        created = (workspace / "created.md").resolve()
+        saved_path = (workspace / "replace.md").resolve()
         saved = fingerprint_text(RESAVE_TEXT)
         observations: dict[str, Any] = {
             "flow": CASE_FLOWS[CASE_FIRST_USE],
@@ -837,7 +813,7 @@ class Goal03Harness(BaseNativeHarness):
             stale = seed_recent_history(config, workspace)[STALE_SEED_INDEX]
 
         with phase("REOPEN"):
-            second = self.launch_app(created, data, config, workspace, stderr)
+            second = self.launch_app(saved_path, data, config, workspace, stderr)
         try:
             contexts.append(second.security_context.evidence())
             observations.update(self.cold_reopen(second, config, saved))
@@ -848,7 +824,7 @@ class Goal03Harness(BaseNativeHarness):
             third = self.launch_app(None, data, config, workspace, stderr)
         try:
             contexts.append(third.security_context.evidence())
-            observations.update(self.restart_recents(third, config, stale, created, saved))
+            observations.update(self.restart_recents(third, config, stale, saved_path))
         finally:
             self.reap(third)
 
