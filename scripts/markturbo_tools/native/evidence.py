@@ -2,7 +2,8 @@
 
 Every goal writes the same envelope: schema, `schema_version`, status, times,
 the executable binding, the environment, one record per required case and a
-summary, plus the goal's own top-level keys (goal 06 `mode`, goal 07
+summary, the run's content-free `metrics` (phase wall times and step
+counters), plus the goal's own top-level keys (goal 06 `mode`, goal 07
 `transport`). Validation is exact: every object has exactly its keys, an
 observation is a goal-allowed key holding a scalar or one of the structured
 records validated here, strings are fixed safe values, and no document,
@@ -11,8 +12,8 @@ answer or credential sentinel may appear anywhere.
 A goal supplies only an `EvidenceContract`: its case flows, observation keys,
 required observations, runtime-scan validator and `validate_passed_case`.
 
-`SCHEMA_VERSION` 3 is shared by all four goals. Versions 1 (GPUI-era goals
-02/03/06/07) and 2 (the first nsh goal 07) are not accepted.
+`SCHEMA_VERSION` 4 is shared by all four goals. Versions 1 (GPUI-era goals
+02/03/06/07), 2 (the first nsh goal 07) and 3 (no `metrics`) are not accepted.
 """
 
 from __future__ import annotations
@@ -33,7 +34,9 @@ from .runtime import (
     REASON_CODE_RE,
     SAFE_FAILURE_TYPES,
     SHA256_RE,
+    METRIC_COUNTERS,
     HarnessFailure,
+    RunMetrics,
     artifact_contains,
     finite_nonnegative,
     normalize_expected_hash,
@@ -46,7 +49,7 @@ from .runtime import (
 
 
 REPO = Path(__file__).resolve().parents[3]
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_EXE = REPO / "crates" / "mt-app" / ".nsh" / "out" / "MarkTurbo" / "MarkTurbo.exe"
 
 EVIDENCE_KEYS = frozenset(
@@ -60,6 +63,7 @@ EVIDENCE_KEYS = frozenset(
         "environment",
         "cases",
         "summary",
+        "metrics",
     }
 )
 EXECUTABLE_KEYS = frozenset(
@@ -107,6 +111,8 @@ SUMMARY_KEYS = frozenset(
     }
 )
 FINGERPRINT_KEYS = frozenset({"byte_count", "sha256"})
+METRICS_KEYS = frozenset({"phase_timings", "counters"})
+PHASE_TIMING_KEYS = frozenset({"phase", "ms"})
 RUNTIME_SCAN_KEYS = frozenset({"files_scanned", "app_logs_scanned", "config_files_scanned"})
 PRIVATE_KEYS = frozenset({"request_body", "credential", "api_key", "api-key"})
 # Content-free diagnostics a BLOCKED case carries: `runtime.Win32.require_foreground`'s
@@ -197,6 +203,7 @@ def new_evidence(
             for case_id in contract.case_ids
         ],
         "summary": {},
+        "metrics": RunMetrics().evidence(),
     }
 
 
@@ -364,6 +371,26 @@ def _validate_executable(executable: Any, passed: bool) -> None:
         raise ValueError("PASS requires a nonempty executable")
 
 
+def validate_metrics(value: Any) -> None:
+    """A `runtime.RunMetrics` record: phase codes with their milliseconds and
+    exactly the known counters, each a nonnegative integer."""
+    require_exact_keys(value, METRICS_KEYS, "metrics")
+    timings = value["phase_timings"]
+    if not isinstance(timings, list):
+        raise ValueError("invalid phase timings")
+    for timing in timings:
+        require_exact_keys(timing, PHASE_TIMING_KEYS, "phase timing")
+        name = timing["phase"]
+        if not isinstance(name, str) or not REASON_CODE_RE.fullmatch(name):
+            raise ValueError("invalid phase timing name")
+        if not finite_nonnegative(timing["ms"]):
+            raise ValueError("phase timing must be nonnegative")
+    counters = value["counters"]
+    require_exact_keys(counters, frozenset(METRIC_COUNTERS), "metrics counters")
+    for key in METRIC_COUNTERS:
+        nonnegative_count(counters, key)
+
+
 def validate_evidence(evidence: Any, contract: EvidenceContract) -> None:
     if not isinstance(evidence, dict):
         raise ValueError("invalid top-level evidence")
@@ -378,6 +405,7 @@ def validate_evidence(evidence: Any, contract: EvidenceContract) -> None:
     if contract.validate_extra is not None:
         contract.validate_extra(evidence)
     _validate_executable(evidence["executable"], status == "PASS")
+    validate_metrics(evidence["metrics"])
 
     cases = evidence["cases"]
     case_ids = contract.case_ids

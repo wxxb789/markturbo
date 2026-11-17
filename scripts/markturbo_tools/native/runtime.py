@@ -1421,18 +1421,56 @@ def wait_until(
     raise HarnessFailure(timeout_code)
 
 
+# The integer counters a goal run's `metrics` evidence carries.
+METRIC_COUNTERS = ("editor_reads", "copy_resends", "foreground_recoveries", "uia_queries")
+
+
+class RunMetrics:
+    """Content-free cost of one goal run: each phase's wall time (in the order
+    the phases ended, a nested phase before its parent) and the counters of
+    the harness's costly or recovering steps."""
+
+    def __init__(self) -> None:
+        self.phase_timings: list[dict[str, Any]] = []
+        self.counters = dict.fromkeys(METRIC_COUNTERS, 0)
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "phase_timings": [dict(timing) for timing in self.phase_timings],
+            "counters": dict(self.counters),
+        }
+
+
+_ACTIVE_METRICS: contextvars.ContextVar[RunMetrics | None] = contextvars.ContextVar(
+    "markturbo_native_metrics", default=None
+)
+
+
+def count(counter: str) -> None:
+    """Add one to the running goal's `counter`; nothing outside a goal run."""
+    metrics = _ACTIVE_METRICS.get()
+    if metrics is not None:
+        metrics.counters[counter] += 1
+
+
 @contextlib.contextmanager
 def phase(prefix: str) -> Iterator[None]:
     """Prefix every failure raised inside one phase of a merged session with
     the phase's name, so a shared helper's code stays locatable. A code that
     already carries the prefix is left alone; BLOCKED is the environment's,
-    not the phase's, and passes through unchanged."""
+    not the phase's, and passes through unchanged. The running goal records
+    the phase's wall time whatever its outcome."""
+    started = time.perf_counter()
     try:
         yield
     except HarnessFailure as error:
         if error.code.startswith(f"{prefix}_"):
             raise
         raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
+    finally:
+        metrics = _ACTIVE_METRICS.get()
+        if metrics is not None:
+            metrics.phase_timings.append({"phase": prefix, "ms": elapsed_ms(started)})
 
 
 def environment_preflight() -> tuple[Win32, SecurityContext, dict[str, Any]]:
@@ -1846,6 +1884,7 @@ class NativeHarness:
         expected_name: str | None = None,
         expected_class_name: str | None = None,
     ) -> Any | None:
+        count("uia_queries")
         uia = self.iuia_class()
         condition = uia.iuia.CreatePropertyCondition(
             uia.UIA_dll.UIA_AutomationIdPropertyId, automation_id
@@ -1902,6 +1941,7 @@ class NativeHarness:
     def controls_by_name(
         self, hwnd: int, name: str, control_type: str, *, anonymous: bool = True
     ) -> list[Any]:
+        count("uia_queries")
         uia = self.iuia_class()
         condition = uia.iuia.CreatePropertyCondition(uia.UIA_dll.UIA_NamePropertyId, name)
         elements = self.fresh_uia_root(hwnd).element.FindAll(
@@ -2559,10 +2599,14 @@ def run_native_acceptance(
     """
     owned = session is None
     active = NativeSession() if session is None else session
+    metrics = RunMetrics()
     token = _ACTIVE_SESSION.set(active)
+    metrics_token = _ACTIVE_METRICS.set(metrics)
     try:
         returncode, evidence, code = _run_goal(args, plan, active)
+        evidence["metrics"] = metrics.evidence()
     finally:
+        _ACTIVE_METRICS.reset(metrics_token)
         _ACTIVE_SESSION.reset(token)
         close_failure = active.close() if owned else None
     if close_failure is not None:
@@ -2900,12 +2944,15 @@ __all__ = [
     "NativeSession",
     "FOREGROUND_TIMEOUT_SECONDS",
     "INNER_WAIT_SECONDS",
+    "METRIC_COUNTERS",
+    "RunMetrics",
     "RunningApp",
     "SecurityContext",
     "Win32",
     "artifact_contains",
     "build_launch_spec",
     "complete_evidence",
+    "count",
     "elapsed_ms",
     "executable_hash_failure",
     "finite_nonnegative",
