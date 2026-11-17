@@ -3956,8 +3956,12 @@ mod tests {
 
     /// `Ctrl+Enter` from the focused source editor with no model set up:
     /// the field says so, with the way to Settings, and the document's text
-    /// and dirty flag are as they were.
-    fn review_says_not_set_up<P: Component>(headline: &str, open_settings: &str)
+    /// and dirty flag are as they were. Returns the app with the diagnostic
+    /// on screen.
+    fn review_says_not_set_up<P: Component>(
+        headline: &str,
+        open_settings: &str,
+    ) -> nsh_testing::Headless
     where
         P::Props: Default,
     {
@@ -4004,6 +4008,7 @@ mod tests {
             "the text and dirty flag are unchanged: {:?}",
             app.screen().texts()
         );
+        app
     }
 
     #[test]
@@ -4014,6 +4019,30 @@ mod tests {
     #[test]
     fn review_without_a_model_says_so_in_chinese() {
         review_says_not_set_up::<NotSetUpChineseProbe>("未配置模型", "打开设置");
+    }
+
+    /// With no model set up, the field's Close takes the diagnostic away,
+    /// and the title menu's Review row brings it back; neither touches the
+    /// document's text or dirty flag.
+    #[test]
+    fn review_without_a_model_closes_and_the_menu_row_shows_it_again() {
+        let mut app = review_says_not_set_up::<NotSetUpProbe>("No model set up", "Open settings");
+        let probe = format!("Probe: {UNSET_SOURCE:?} dirty=false");
+
+        app.press("id:review-close").expect("close the field");
+        app.wait_for_gone("id:review-unavailable", std::time::Duration::from_secs(5))
+            .expect("Close takes the diagnostic away");
+
+        app.press("id:title-settings").expect("open the title menu");
+        app.press("id:title-menu-review-selection")
+            .expect("the menu's Review row");
+        app.wait_for_within("id:review-unavailable", std::time::Duration::from_secs(20))
+            .expect("the menu row says why Review cannot run");
+        assert!(
+            app.shows(&probe),
+            "the text and dirty flag are unchanged: {:?}",
+            app.screen().texts()
+        );
     }
 
     static REPLACED: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);

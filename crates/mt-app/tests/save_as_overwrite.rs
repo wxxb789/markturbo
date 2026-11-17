@@ -132,4 +132,34 @@ fn save_as_replaces_a_confirmed_existing_destination() {
         std::fs::read_to_string(&first).expect("read first"),
         "# First heading\n"
     );
+
+    // A later Save writes only the path Save As moved the tab to.
+    app.type_text("label:Markdown source", "Saved again. ")
+        .expect("edit the replaced file");
+    app.wait_for("id:title-dirty").expect("the edit is dirty");
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-save").expect("Save");
+    support::wait_for_file(
+        &mut app,
+        &existing,
+        |text| text == "Saved again. Edited second. # Second heading\n",
+        "Save after Save As never wrote the new path",
+        TIMEOUT,
+    );
+    app.wait_for_gone("id:title-dirty", Duration::from_secs(5))
+        .expect("the saved tab is clean again");
+    assert_eq!(
+        std::fs::read_to_string(&second).expect("read second"),
+        "# Second heading\n",
+        "Save after Save As leaves the old file alone"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("read first"),
+        "# First heading\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("list dir").count(),
+        3,
+        "Save after Save As creates no file"
+    );
 }
