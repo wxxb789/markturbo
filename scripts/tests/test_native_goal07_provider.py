@@ -281,18 +281,28 @@ class LoopbackProviderTests(unittest.TestCase):
                     HARNESS.EDITOR_SOURCE_BYTES[start:end],
                     edit["expected_source"].encode("utf-8"),
                 )
-        # Every represented question names an existing change, each change once.
+        # mt-core's rule: only an answered question may be `represented`, and
+        # each listed change exists and appears once. The harness answers only
+        # the first question; the rest reach the provider unanswered.
         coverage = decoded["question_coverage"]
         self.assertEqual(
             [entry["question_id"] for entry in coverage], list(PROVIDER.QUESTION_IDS)
         )
-        represented = [
-            change_id
-            for entry in coverage
-            if entry["status"]["kind"] == "represented"
-            for change_id in entry["status"]["change_ids"]
-        ]
-        self.assertEqual(represented, list(range(len(decoded["groups"]))))
+        answered = {0}
+        represented = []
+        for entry in coverage:
+            status = entry["status"]
+            if entry["question_index"] in answered:
+                self.assertIn(status["kind"], {"represented", "intentionally_omitted"})
+            else:
+                self.assertIn(status["kind"], {"intentionally_omitted", "not_addressed"})
+            if status["kind"] == "represented":
+                represented.extend(status["change_ids"])
+            if status["kind"] == "intentionally_omitted":
+                self.assertTrue(status["reason"].strip())
+        self.assertTrue(represented)
+        self.assertEqual(len(represented), len(set(represented)))
+        self.assertLessEqual(set(represented), set(range(len(decoded["groups"]))))
 
     def test_apply_edits_preserves_crlf_cjk_and_emoji(self) -> None:
         edited = HARNESS.apply_edits(

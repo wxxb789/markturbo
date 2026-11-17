@@ -83,7 +83,10 @@ def revision_response(source: str) -> str:
         {
             "question_index": 1,
             "question_id": QUESTION_IDS[1],
-            "status": {"kind": "represented", "change_ids": [1]},
+            "status": {
+                "kind": "intentionally_omitted",
+                "reason": "The owner deliberately left this decision unchanged.",
+            },
         },
         {
             "question_index": 2,
