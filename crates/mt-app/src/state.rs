@@ -3985,7 +3985,9 @@ mod tests {
             "nothing says so before Review is asked for"
         );
         app.press_key("ctrl+enter").expect("press Ctrl+Enter");
-        app.wait_for("id:review-unavailable")
+        // Review prepares off the UI thread; under a loaded parallel suite
+        // that can outlast the default wait, as in the other Review tests.
+        app.wait_for_within("id:review-unavailable", std::time::Duration::from_secs(20))
             .expect("Review says why it cannot run");
         let screen = app.screen();
         for (what, copy) in [("headline", headline), ("way forward", open_settings)] {

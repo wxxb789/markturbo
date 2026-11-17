@@ -47,7 +47,7 @@ from .runtime import (
 
 REPO = Path(__file__).resolve().parents[3]
 SCHEMA_VERSION = 3
-DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
+DEFAULT_EXE = REPO / "crates" / "mt-app" / ".nsh" / "out" / "MarkTurbo" / "MarkTurbo.exe"
 
 EVIDENCE_KEYS = frozenset(
     {

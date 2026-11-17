@@ -71,10 +71,10 @@ locally merely to open a PR, require a clean worktree while iterating, or run
 full/native suites for every small task. Re-run after relevant
 code/configuration/dependency changes or an unresolved failure, not arbitrarily.
 
-Native acceptance remains explicit (`mt.py accept <goal> -- ...`), on an active,
-unlocked Windows 11 x64 desktop with current hash-bound evidence. The
-goal-02/03/06/07 harnesses (every `mt.py accept` goal) still target retired GPUI
-automation IDs; record their acceptance as pending until ported.
+Native acceptance remains explicit (`mt.py accept all --exe ... --expect-exe-sha256 ...`
+runs goal-02/03/06/07 in one pass; `mt.py accept <goal> -- ...` diagnoses one), on
+an active, unlocked Windows 11 x64 desktop with current hash-bound evidence. The
+harnesses target the nsh UI; their acceptance stays pending until a live PASS.
 Check only the changed workflow while iterating; batch full suites and the visual
 matrix at integrated milestones. A single-case run or BLOCKED is not acceptance.
 Make at most one retry after a concrete environment correction; otherwise record
