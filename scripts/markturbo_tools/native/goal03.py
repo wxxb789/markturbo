@@ -42,8 +42,9 @@ import argparse
 import hashlib
 import json
 import re
+import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,9 @@ REQUIRED_OBSERVATIONS = {
 
 # A press, not a hold: long enough for the pointer down and up to register.
 STALE_RECENT_PRESS_SECONDS = 0.05
+# How long a press on the stale row must keep opening nothing: open_file is
+# asynchronous, so one look right after the press could miss a late open.
+STALE_RECENT_OBSERVE_SECONDS = 1.0
 
 
 @contextmanager
@@ -172,6 +176,22 @@ def phase(name: str) -> Iterator[None]:
         yield
     except HarnessFailure as error:
         raise HarnessFailure(f"{name}_{error.code}", error.detail) from None
+
+
+def require(condition: bool, code: str) -> None:
+    """Fail the current phase with `code` unless `condition` holds."""
+    if not condition:
+        raise HarnessFailure(code)
+
+
+def require_for(predicate: Callable[[], bool], seconds: float, code: str) -> None:
+    """Fail with `code` as soon as `predicate` stops holding within `seconds`."""
+    deadline = time.monotonic() + seconds
+    while True:
+        require(predicate(), code)
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.05)
 
 
 def recent_settings_document(documents: list[Path]) -> bytes:
@@ -233,6 +253,8 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
         raise ValueError("the Save As destinations were not both recorded as recent")
     if count["paste_discard_recent_rows"] != count["saved_close_recent_rows"]:
         raise ValueError("discarding the pasted buffer changed the recent targets")
+    if fp["paste_clipboard"] != fingerprint_text(PASTE_TEXT).evidence():
+        raise ValueError("the clipboard did not hold the CJK and emoji paste text")
     if fp["paste_editor"] != fp["paste_clipboard"]:
         raise ValueError("Paste did not create the exact clipboard text")
     if count["sample_file_count"] <= 0 or count["sample_home_rows"] <= 0:
@@ -618,6 +640,7 @@ class Goal03Harness(BaseNativeHarness):
         with phase("WELCOME"):
             self.welcome_entry_points(app)
             observed["welcome_recent_rows"] = len(self.recent_controls(app))
+            require(observed["welcome_recent_rows"] == 0, "PROFILE_NOT_CLEAN")
 
         with phase("NEW"):
             self.click_control(
@@ -629,19 +652,29 @@ class Goal03Harness(BaseNativeHarness):
             observed["new_editor"] = editor.evidence()
 
         with phase("SAVE_AS_CANCEL"):
-            observed["save_as_cancel_destination_before"] = sha256_file(cancelled).evidence()
+            cancelled_before = sha256_file(cancelled)
+            observed["save_as_cancel_destination_before"] = cancelled_before.evidence()
             self.request_save_as_shortcut(app)
             self.cancel_save_picker(app, cancelled)
             self.require_source_editor_focus(app, "FOCUS_NOT_RESTORED")
-            observed["save_as_cancel_editor"] = self.editor_fingerprint(app).evidence()
+            cancel_editor = self.editor_fingerprint(app)
+            observed["save_as_cancel_editor"] = cancel_editor.evidence()
+            require(
+                cancel_editor == editor and sha256_file(cancelled) == cancelled_before,
+                "CHANGED_STATE",
+            )
 
         with phase("OVERWRITE_NO"):
-            observed["overwrite_no_destination_before"] = sha256_file(replaced).evidence()
+            replaced_before = sha256_file(replaced)
+            observed["overwrite_no_destination_before"] = replaced_before.evidence()
             self.request_save_as_shortcut(app)
             self.select_existing_save_path(app, replaced, replace=False)
             self.require_source_editor_focus(app, "FOCUS_NOT_RESTORED")
-            observed["overwrite_no_destination_after"] = sha256_file(replaced).evidence()
-            observed["overwrite_no_editor"] = self.editor_fingerprint(app).evidence()
+            replaced_after = sha256_file(replaced)
+            no_editor = self.editor_fingerprint(app)
+            observed["overwrite_no_destination_after"] = replaced_after.evidence()
+            observed["overwrite_no_editor"] = no_editor.evidence()
+            require(no_editor == editor and replaced_after == replaced_before, "CHANGED_STATE")
 
         with phase("OVERWRITE_YES"):
             self.request_save_as_shortcut(app)
@@ -664,9 +697,13 @@ class Goal03Harness(BaseNativeHarness):
             observed["subsequent_save_destination"] = self.wait_file(
                 created, resaved, "DESTINATION_TIMEOUT"
             ).evidence()
-            observed["subsequent_save_previous_destination"] = sha256_file(replaced).evidence()
+            previous = sha256_file(replaced)
+            observed["subsequent_save_previous_destination"] = previous.evidence()
+            require(previous == overwritten, "PREVIOUS_PATH_CHANGED")
             # The picker's cancelled destination stays byte-identical to the end.
-            observed["save_as_cancel_destination_after"] = sha256_file(cancelled).evidence()
+            cancelled_after = sha256_file(cancelled)
+            observed["save_as_cancel_destination_after"] = cancelled_after.evidence()
+            require(cancelled_after == cancelled_before, "CANCELLED_PATH_CHANGED")
 
         with phase("SAVED_CLOSE"):
             # The tab is clean: Ctrl+W closes it without a guard, and the
@@ -676,6 +713,8 @@ class Goal03Harness(BaseNativeHarness):
             if (rows[0].element_info.name or "") != RECENT_ROW_NAME.format(name=created.name):
                 raise HarnessFailure("RECENT_NOT_NEW_PATH")
             observed["saved_close_recent_rows"] = len(rows)
+            # Save As recorded both destinations; the untitled buffer none.
+            require(len(rows) == 2, "RECENT_COUNT")
 
         with phase("PASTE"):
             clipboard_before = self.read_text_clipboard()
@@ -685,6 +724,8 @@ class Goal03Harness(BaseNativeHarness):
                 if clipboard_text is None:
                     raise HarnessBlocked("CLIPBOARD_TEXT_READ_FAILED")
                 clipboard = fingerprint_text(clipboard_text)
+                if clipboard != fingerprint_text(PASTE_TEXT):
+                    raise HarnessBlocked("CLIPBOARD_TEXT_MISMATCH")
                 self.click_control(
                     self.welcome_action(app, WELCOME_PASTE_AUTOMATION_ID),
                     "WELCOME_PASTE_CLICK_FAILED",
@@ -704,6 +745,10 @@ class Goal03Harness(BaseNativeHarness):
             self.close_tab_by_keyboard(app)
             self.click_lifecycle_decision(app, "Discard")
             observed["paste_discard_recent_rows"] = len(self.wait_recent_controls(app))
+            require(
+                observed["paste_discard_recent_rows"] == observed["saved_close_recent_rows"],
+                "RECENT_CHANGED",
+            )
 
         with phase("SAMPLE"):
             self.click_control(
@@ -739,6 +784,7 @@ class Goal03Harness(BaseNativeHarness):
     ) -> dict[str, Any]:
         with phase("RECENTS"):
             rows = self.wait_recent_controls(app)
+            require(len(rows) == WELCOME_RECENT_ROWS, "ROW_COUNT")
             stale_rows = [row for row in rows if stale.name in (row.element_info.name or "")]
             if len(stale_rows) != 1:
                 raise HarnessFailure("STALE_UIA_CONTRACT_MISMATCH")
@@ -748,11 +794,15 @@ class Goal03Harness(BaseNativeHarness):
             ):
                 raise HarnessFailure("STALE_NOT_DEGRADED")
             disabled_rows = sum(1 for row in rows if not row.is_enabled())
+            require(disabled_rows == 1, "DISABLED_COUNT")
             # A real pointer press on the disabled row opens nothing.
             self.hold_control(app, stale_row, STALE_RECENT_PRESS_SECONDS, "STALE_PRESS_FAILED")
             self.welcome_open_folder(app)
-            if not self.editor_absent_while_running(app):
-                raise HarnessFailure("STALE_OPENED_DOCUMENT")
+            require_for(
+                lambda: self.editor_absent_while_running(app),
+                STALE_RECENT_OBSERVE_SECONDS,
+                "STALE_OPENED_DOCUMENT",
+            )
             saved_rows = [
                 row
                 for row in rows
