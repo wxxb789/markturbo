@@ -152,12 +152,13 @@ avoid glob-importing Kit's `test` macro over Rust's built-in `#[test]`.
 `scripts/mt.py check fast` runs the explicit current-tooling manifest as
 deterministically partitioned subprocess shards. It includes CLI/privacy,
 evaluation, performance-fixture and recovery-capacity contracts. Native
-acceptance harness unit tests (including the retired GPUI selectors) moved to
-`scripts/mt.py check native`; run that only when changing the harness. Neither
-tier launches the app or a Windows UIA session. Real desktop automation runs
-through `scripts/mt.py accept goal-02`, `goal-03`, `goal-06`, or `goal-07` with a
-final executable hash and full required case set; `--case` is a diagnostic run,
-not acceptance.
+acceptance harness unit tests moved to `scripts/mt.py check native`; run that
+only when changing the harness. Neither tier launches the app or a Windows UIA
+session. Real desktop automation runs through `scripts/mt.py accept all` (every
+goal in one session, one evidence file per goal; see
+[verification](verification.md#running-native-acceptance)) with a final
+executable hash and full required case sets; `accept goal-0N` diagnoses one
+goal, and `--case` is a diagnostic run, not acceptance.
 
 These helpers test events, state, focus and layout, not rendered pixels. Do not
 add screenshot/foreground automation for ordinary state changes, or replace
@@ -250,6 +251,7 @@ not be edited into a passing result.
 
 - Prefer the existing harness. Its `--case` option is useful for debugging a
   changed workflow, but intentionally cannot produce full acceptance PASS.
+  `--keep-going` reports every failing case of a run instead of the first.
 - For ordinary UI changes, a short manual check of the changed state is enough
   for development feedback. Record what was actually observed; it does not
   replace automated safety invariants or full milestone evidence.
