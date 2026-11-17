@@ -53,6 +53,7 @@ class FakeControl:
         self.click_count = 0
         self.invoke_count = 0
         self.focus_count = 0
+        self.keyboard_focus = False
         self.value_pattern_count = 0
 
     def _property(self, value: str) -> str:
@@ -180,6 +181,10 @@ class FakeUIAWrapper:
 
     def set_focus(self) -> None:
         self.control.focus_count += 1
+        self.control.keyboard_focus = True
+
+    def has_keyboard_focus(self) -> bool:
+        return self.control.keyboard_focus
 
     def rectangle(self) -> object:
         left, top, right, bottom = self.control.bounds
@@ -971,6 +976,40 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                 self.assertEqual(win32.clipboard, copied)
                 self.assertEqual(editor.focus_count, 1)
                 self.assertEqual(editor.value_pattern_count, 0)
+
+    def test_one_editor_read_queries_ui_automation_once(self) -> None:
+        win32 = FakeEditorWin32("text")
+        root = FakeRoot([editor_control()])
+        harness = native_harness(FreshRootFactory([root]))
+        harness.win32 = win32
+        harness.read_text_clipboard = lambda: win32.clipboard
+        harness.write_text_clipboard = lambda value: setattr(win32, "clipboard", value)
+        metrics = runtime.RunMetrics()
+        token = runtime._ACTIVE_METRICS.set(metrics)
+        try:
+            for _ in range(2):
+                self.assertEqual(
+                    harness.read_editor_fingerprint(running_app()), runtime.fingerprint_text("text")
+                )
+        finally:
+            runtime._ACTIVE_METRICS.reset(token)
+
+        self.assertEqual(len(root.find_calls), 2)
+        self.assertEqual(metrics.counters["uia_queries"], 2)
+        self.assertEqual(metrics.counters["editor_reads"], 2)
+        # The second read finds the editor already focused: no second SetFocus.
+        self.assertEqual(root.controls[0].focus_count, 1)
+        self.assertEqual(win32.foreground, [73, 73])
+
+    def test_an_editor_not_yet_ready_is_read_as_absent(self) -> None:
+        win32 = FakeEditorWin32("text")
+        hidden = editor_control()
+        hidden.visible = False
+        harness = native_harness(FreshRootFactory([FakeRoot([hidden])]))
+        harness.win32 = win32
+
+        self.assertIsNone(harness.read_editor_fingerprint(running_app()))
+        self.assertEqual(win32.shortcuts, [])
 
     def test_editor_read_is_none_without_an_editor(self) -> None:
         win32 = FakeEditorWin32("text")

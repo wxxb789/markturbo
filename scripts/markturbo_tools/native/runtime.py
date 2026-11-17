@@ -2338,11 +2338,20 @@ class NativeHarness:
             ) from None
 
     def focus_editor(self, app: RunningApp, timeout: float | None = None) -> None:
-        editor = self.editor_control(app, timeout)
+        self._focus_editor_control(app, self.editor_control(app, timeout))
+
+    def _focus_editor_control(self, app: RunningApp, editor: Any) -> None:
+        """Give `editor` the keyboard: UIA SetFocus only when it lacks the
+        focus, then the window the foreground."""
         try:
-            editor.set_focus()
-        except Exception as error:
-            raise HarnessFailure("EDITOR_FOCUS_FAILED", safe_exception_name(error)) from None
+            focused = bool(editor.has_keyboard_focus())
+        except Exception:
+            focused = False
+        if not focused:
+            try:
+                editor.set_focus()
+            except Exception as error:
+                raise HarnessFailure("EDITOR_FOCUS_FAILED", safe_exception_name(error)) from None
         self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
 
     def read_text_clipboard(self) -> str | None:
@@ -2373,26 +2382,33 @@ class NativeHarness:
         )
         return value
 
-    def read_editor_text(self, app: RunningApp) -> str:
+    def read_editor_text(self, app: RunningApp, editor: Any | None = None) -> str:
         """The editor's exact document through its own Select All + Copy.
 
         Only clears, copies and reads: the session saved the user's clipboard
         once and restores it when the run ends. Nothing read here is written
-        to evidence except its fingerprint.
+        to evidence except its fingerprint. `editor` is the editor control a
+        caller already found; without one it is looked up here.
         """
+        count("editor_reads")
+        if editor is None:
+            editor = self.editor_control(app, self.inner_timeout())
         self.write_text_clipboard(None)
-        self.focus_editor(app, self.inner_timeout())
+        self._focus_editor_control(app, editor)
         self.win32.send_shortcut(app.hwnd, VK_A)
         self.win32.send_shortcut(app.hwnd, VK_C)
         self.last_editor_sample_at = self.clock()
         return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
 
     def read_editor_fingerprint(self, app: RunningApp) -> Fingerprint | None:
-        if self.control_by_name(
+        """One editor read on one UIA query: the editor found here is the one
+        focused and copied; None while there is no ready editor."""
+        editor = self.control_by_name(
             app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
-        ) is None:
+        )
+        if editor is None or not editor.is_visible() or not editor.is_enabled():
             return None
-        return fingerprint_text(self.read_editor_text(app))
+        return fingerprint_text(self.read_editor_text(app, editor))
 
     def editor_fingerprint(self, app: RunningApp) -> Fingerprint:
         fingerprint, _ = self.wait_editor_fingerprint(app, None, self.ui_timeout)
