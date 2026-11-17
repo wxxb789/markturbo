@@ -455,6 +455,23 @@ def review_settings_document(endpoint: str) -> bytes:
     ).encode("utf-8")
 
 
+def require_expected(observed: dict[str, Any]) -> dict[str, Any]:
+    """A phase's measurements as evidence, failing on the first unexpected one.
+
+    The key carries its phase, so the failure code (`<KEY>_UNEXPECTED`) says
+    which phase measured what; `validate_passed_case` checks them all again.
+    """
+    expected = {**expected_fingerprints(), **EXPECTED_DIRTY}
+    recorded = {
+        key: value.evidence() if isinstance(value, Fingerprint) else value
+        for key, value in observed.items()
+    }
+    for key, value in recorded.items():
+        if value != expected[key]:
+            raise HarnessFailure(f"{key.upper()}_UNEXPECTED")
+    return recorded
+
+
 @contextmanager
 def phase_failures(phase: str) -> Iterator[None]:
     """Prefix a phase's failure codes with its name, so a FAIL is locatable.
@@ -898,10 +915,7 @@ class Goal07Harness(NativeHarness):
             for (run, name), phase in zip(phases, PHASES, strict=True):
                 with phase_failures(phase):
                     observed = run(app, provider, workspace / name)
-                observations.update(
-                    (key, value.evidence() if isinstance(value, Fingerprint) else value)
-                    for key, value in observed.items()
-                )
+                observations.update(require_expected(observed))
             observations["foreground_verified"] = self._require_foreground(app)
             # Every tab is dirty: quit through the guard, unsaved.
             with phase_failures("quit"):

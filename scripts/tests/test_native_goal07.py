@@ -29,6 +29,12 @@ REVIEWED = runtime.fingerprint_bytes(HARNESS.EDITOR_SOURCE_BYTES)
 ONE_ACCEPTED = runtime.fingerprint_bytes(HARNESS.apply_edits(HARNESS.EDITOR_SOURCE_BYTES, EDITS[:1]))
 ALL_ACCEPTED = runtime.fingerprint_bytes(HARNESS.apply_edits(HARNESS.EDITOR_SOURCE_BYTES, EDITS))
 DISK = runtime.fingerprint_bytes(HARNESS.SOURCE_BYTES)
+HTML_APPLIED = runtime.fingerprint_bytes(
+    HARNESS.apply_edits(
+        HARNESS.HTML_EDITOR_SOURCE_BYTES,
+        PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
+    )
+)
 
 
 def credential_target(endpoint: str) -> str:
@@ -465,7 +471,7 @@ class SessionTests(unittest.TestCase):
         order.launch_app.return_value = app
         order.phase_decisions.return_value = {"decisions_editor_before": REVIEWED}
         order.phase_stale.return_value = {"stale_disk_before": DISK}
-        order.phase_trust.return_value = {"trust_editor_done": ALL_ACCEPTED}
+        order.phase_trust.return_value = {"trust_editor_done": HTML_APPLIED}
         return harness, order, app, provider
 
     def test_one_launch_runs_every_phase_then_quits_through_the_guard(self) -> None:
@@ -493,7 +499,7 @@ class SessionTests(unittest.TestCase):
         )
         self.assertEqual(observations["decisions_editor_before"], REVIEWED.evidence())
         self.assertEqual(observations["stale_disk_before"], DISK.evidence())
-        self.assertEqual(observations["trust_editor_done"], ALL_ACCEPTED.evidence())
+        self.assertEqual(observations["trust_editor_done"], HTML_APPLIED.evidence())
         self.assertEqual(observations["flow"], HARNESS.CASE_FLOWS[CASE])
         self.assertIs(observations["foreground_verified"], True)
         provider.close.assert_called_once_with()
@@ -510,6 +516,24 @@ class SessionTests(unittest.TestCase):
         order.quit_via_menu.assert_not_called()
         order.reap.assert_called_once_with(app)
         provider.close.assert_called_once_with()
+
+    def test_an_unexpected_measurement_fails_with_its_phase_key(self) -> None:
+        for phase, observed, code in (
+            ("phase_decisions", {"decisions_editor_undone": ONE_ACCEPTED}, "DECISIONS_EDITOR_UNDONE_UNEXPECTED"),
+            ("phase_decisions", {"decisions_dirty_proposed": True}, "DECISIONS_DIRTY_PROPOSED_UNEXPECTED"),
+            ("phase_stale", {"stale_disk_after": REVIEWED}, "STALE_DISK_AFTER_UNEXPECTED"),
+            ("phase_trust", {"trust_editor_done": ALL_ACCEPTED}, "TRUST_EDITOR_DONE_UNEXPECTED"),
+        ):
+            with self.subTest(code=code):
+                harness, order, app, provider = self.session_harness()
+                getattr(order, phase).return_value = observed
+                with (
+                    mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
+                    self.assertRaisesRegex(runtime.HarnessFailure, f"^{code}$"),
+                ):
+                    harness.scenario_revision_session()
+                order.quit_via_menu.assert_not_called()
+                order.reap.assert_called_once_with(app)
 
     def test_scenario_contract_failure_is_raised_before_shared_pass_status(self) -> None:
         observations = passing_observations()
