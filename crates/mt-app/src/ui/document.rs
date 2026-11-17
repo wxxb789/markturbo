@@ -208,15 +208,15 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
 
     // `Ctrl+Enter` stays the app's from the editor: the editor binds its own
     // `mod+enter` (insert a line below) each time it takes the focus, and the
-    // keymap fires the newest binding. The focus coming into the editor's box
-    // is heard at the end of that commit round, after the editor bound its
-    // keys, so the app's binding made then is the newer one.
-    let focus_ins = signal(0u64);
-    let editor_box = element_ref();
-    editor_box.on_focus_in(move || focus_ins.update(|count| *count += 1));
+    // keymap fires the newest binding. The editor binds its keys in the round
+    // that sets its focus and only queues its `Focus` event for the core, so
+    // the app's binding made when that event arrives is always the newer one.
+    // (Rebinding on the box's focus-in instead left the editor's binding the
+    // newer one in about one `cargo test -p mt-app --lib` run in four.)
+    let focuses = signal(0u64);
     let keys_state = state.clone();
     effect(move || {
-        focus_ins.get();
+        focuses.get();
         titlebar::bind_mod_enter(&keys_state);
     });
 
@@ -231,7 +231,6 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
             // around it does, and it is the editor's own box.
             view()
                 .test_id("source-editor")
-                .element_ref(&editor_box)
                 .flex_1()
                 .min_h(px(0.0))
                 .h(relative(1.0))
@@ -292,6 +291,7 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                         })
                         .w_full()
                         .flex_1()
+                        .on_focus(move || focuses.update(|count| *count += 1))
                         .on_change(move |value: &SharedString| {
                             // nsh reports the bound value once on mount. A document is
                             // dirty only after the buffer differs from what the editor

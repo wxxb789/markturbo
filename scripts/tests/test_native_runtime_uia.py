@@ -1085,6 +1085,40 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(unreadable.exception.detail, "HarnessFailure")
         self.assertEqual(silent.clipboard, "user clipboard")
 
+    def test_a_dropped_copy_never_passes_the_awaited_text_left_on_the_clipboard(self) -> None:
+        class RelayedWin32(FakeEditorWin32):
+            """Every copy is dropped, yet another writer moves the sequence."""
+
+            def send_shortcut(self, hwnd: int, key: int) -> None:
+                self.shortcuts.append((hwnd, key))
+                if key == runtime.VK_C:
+                    self.sequence += 1
+
+        win32 = RelayedWin32("other")
+        win32.clipboard = "awaited"
+        harness, _editor = editor_harness(win32, timeout=0.001)
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.wait_editor_fingerprint(
+                running_app(), runtime.fingerprint_text("awaited"), 0.001
+            )
+
+        self.assertEqual(raised.exception.code, "EDITOR_TEXT_TIMEOUT")
+        self.assertIsNone(win32.clipboard)
+
+    def test_a_clipboard_holding_other_text_is_left_alone(self) -> None:
+        win32 = FakeEditorWin32("after")
+        harness, _editor = editor_harness(win32, timeout=1.0)
+        writes: list[str | None] = []
+        harness.write_text_clipboard = writes.append
+
+        actual, _ = harness.wait_editor_fingerprint(
+            running_app(), runtime.fingerprint_text("after"), 1.0
+        )
+
+        self.assertEqual(actual, runtime.fingerprint_text("after"))
+        self.assertEqual(writes, [])
+
     def stalled_copy_harness(self, copies: list[str | None]) -> tuple[object, FakeEditorWin32, list[float]]:
         win32 = FakeEditorWin32("text", copies=copies)
         harness, _editor = editor_harness(win32, timeout=5.0)

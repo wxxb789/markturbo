@@ -168,8 +168,10 @@ How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
 - The editor's accessible element is the `Markdown source` IME input; its UIA
   Value is not the document. The harness reads the document with Ctrl+A, Ctrl+C
   sent as one input batch, waits for the clipboard sequence number to advance
-  (resending Ctrl+C once after 300 ms), then reads the text; it never empties
-  the clipboard for a read. The run saves the user's text clipboard once and
+  (resending Ctrl+C once after 300 ms), then reads the text. Another writer
+  can also advance the sequence, so before awaiting a text the harness
+  empties a clipboard that already holds it; otherwise a read never writes
+  the clipboard. The run saves the user's text clipboard once and
   restores it once at its end. Selection and Review use the editor's own keys
   (Ctrl+A, Ctrl+Enter).
 - UIA Invoke is one tap. The consent card's `consent-send` sends only after a
@@ -269,7 +271,8 @@ the app only where the behaviour itself needs a restart.
   entry (`tests/untitled_discard.rs`), with Ctrl+W, the guard and Don't save
   proven natively by Goal 02's `KEYBOARD_CLOSE`; a directory argument
   (`tests/welcome_leaves.rs`) and LRU eviction order
-  (`tests/welcome_recents.rs`, mt-core settings tests).
+  (`tests/welcome_recents.rs`, mt-core settings tests). Launch failures
+  carry `FIRST_LAUNCH_`, `REOPEN_LAUNCH_` or `RECENTS_LAUNCH_`.
 
 All four harnesses write one evidence schema (`native/evidence.py`,
 `schema_version` 4) to `target/native-acceptance/goal-NN-native-acceptance.json`

@@ -2385,6 +2385,20 @@ class NativeHarness:
     def write_text_clipboard(self, value: str | None) -> None:
         write_clipboard_text(value)
 
+    def forget_clipboard_text(self, expected: Fingerprint) -> None:
+        """Empties the clipboard when it already holds `expected`.
+
+        An editor read takes any sequence move as its copy landing, and
+        another writer (the Remote Desktop clipboard relay) can move it too.
+        A dropped copy would then read the text left from an earlier read,
+        which passes only when that text is the one awaited. Emptying the
+        clipboard then leaves a dropped copy nothing to pass on; any other
+        text only fails the comparison and is read again.
+        """
+        current = self.read_text_clipboard()
+        if current is not None and fingerprint_text(current) == expected:
+            self.write_text_clipboard(None)
+
     def wait_clipboard_text(self, timeout_code: str) -> str:
         """The clipboard's text once something (even an empty text) arrives.
 
@@ -2417,7 +2431,9 @@ class NativeHarness:
         is then read once. A copy that has not landed after
         `COPY_RESEND_SECONDS` is resent once (`copy_resends`). Another
         clipboard writer (the Remote Desktop clipboard relay) can move the
-        sequence too, so callers compare the fingerprint and retry. Nothing
+        sequence too, so callers compare the fingerprint and retry, first
+        emptying a clipboard that already holds the text they await
+        (`forget_clipboard_text`). Nothing
         read here is written to evidence except its fingerprint. `editor` is
         the editor control a caller already found; without one it is looked
         up here.
@@ -2646,6 +2662,8 @@ class NativeHarness:
             return actual
 
         timeout_code = "EDITOR_TEXT_TIMEOUT" if expected is None else "EDITOR_EXACT_BYTES_TIMEOUT"
+        if expected is not None:
+            self.forget_clipboard_text(expected)
         try:
             with self.bounded_by(timeout):
                 actual = wait_until(

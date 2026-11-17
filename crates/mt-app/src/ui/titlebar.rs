@@ -122,8 +122,8 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
 ///
 /// The keymap fires the newest binding of a keystroke, and the source editor
 /// binds its own `mod+enter` (insert a line below) every time it takes the
-/// focus. So besides the title row, the editor's own box binds this again
-/// each time the focus comes into it (`document`), and the surfaces that
+/// focus. So besides the title row, the source editor binds this again on
+/// each of its `Focus` events (`document`), and the surfaces that
 /// claim the key (the consent card, the Revision field's `Done`) bind it as
 /// they come — every one of them the same binding.
 pub fn bind_mod_enter(state: &AppState) {

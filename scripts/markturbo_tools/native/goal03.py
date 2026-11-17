@@ -731,6 +731,8 @@ class Goal03Harness(BaseNativeHarness):
             self.source_editor_ready(app)
             if not self.welcome_absent(app):
                 raise HarnessFailure("WELCOME_SHOWN")
+            # SUBSEQUENT_SAVE left the saved text on the clipboard.
+            self.forget_clipboard_text(saved)
             reopened = self.editor_fingerprint(app)
             if reopened != saved:
                 raise HarnessFailure("EXACT_TEXT_MISMATCH")
@@ -812,7 +814,7 @@ class Goal03Harness(BaseNativeHarness):
         with phase("RECENTS_SEED"):
             stale = seed_recent_history(config, workspace)[STALE_SEED_INDEX]
 
-        with phase("REOPEN"):
+        with phase("REOPEN_LAUNCH"):
             second = self.launch_app(saved_path, data, config, workspace, stderr)
         try:
             contexts.append(second.security_context.evidence())
@@ -820,7 +822,7 @@ class Goal03Harness(BaseNativeHarness):
         finally:
             self.reap(second)
 
-        with phase("RECENTS"):
+        with phase("RECENTS_LAUNCH"):
             third = self.launch_app(None, data, config, workspace, stderr)
         try:
             contexts.append(third.security_context.evidence())

@@ -141,14 +141,3 @@
   per-chain `requests`, and `scripts/tests/test_native_goal07_provider.py`
   still runs a three-chain test (`request_count == 6`). Revalidate that no
   caller needs more than one chain, then drop the extra state and test.
-- [ ] **`review_without_a_model_*` lib tests flake under the full lib suite** —
-  In `crates/mt-app/src/state.rs` `review_says_not_set_up`, the Ctrl+Enter sent
-  after focusing the editor sometimes reaches the editor's own `mod+enter`
-  (insert a line below) instead of the app's binding (`ui/document.rs`
-  focus-in rebinding, `titlebar::bind_mod_enter`): the probe then reads
-  `"# Plan\n\n\nKeep this text.\n" dirty=true` and the 20 s wait for
-  `review-unavailable` fails. Seen at d8c17cf (1 of 6 `cargo test -p mt-app
-  --lib` runs) and after the v2 integration (about 1 in 4); never when the
-  three tests run alone. An extra `settle()` or a 500 ms `idle` before the
-  key did not stop it, so it is a binding-order race, not a short wait.
-  Find why the focus-in rebinding is sometimes older than the editor's.

@@ -536,6 +536,24 @@ class FirstUseScenarioTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, code)
 
 
+class ColdReopenClipboardTests(unittest.TestCase):
+    def test_the_saved_text_left_on_the_clipboard_is_forgotten_before_the_read(self) -> None:
+        harness = fake_session_harness()
+        saved = HARNESS.fingerprint_text(HARNESS.RESAVE_TEXT)
+
+        with mock.patch.object(
+            HARNESS, "persisted_recent_count", return_value=HARNESS.RECENT_TARGET_BOUND
+        ):
+            harness.cold_reopen(mock.Mock(), Path("config"), saved)
+
+        reads = [
+            name for name, *_ in harness.mock_calls
+            if name in {"forget_clipboard_text", "editor_fingerprint"}
+        ]
+        self.assertEqual(reads, ["forget_clipboard_text", "editor_fingerprint"])
+        harness.forget_clipboard_text.assert_called_once_with(saved)
+
+
 class RecentControlBehaviorTests(unittest.TestCase):
     @staticmethod
     def harness(elements: list[object], query_error: BaseException | None = None) -> object:
