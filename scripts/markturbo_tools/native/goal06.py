@@ -4,8 +4,9 @@ The default mode needs one app session. Its profile names a fresh
 `https://review-<uuid>.invalid/v1/` endpoint and no credential, so no
 document content can leave.
 Ctrl+Enter from the focused editor must show the explicit local diagnostic
-(`No model set up`); the card's Close (`review-close`) must take it away; and
-the title menu's Review row (`title-menu-review-selection`) must bring it back.
+(`No model set up`). The card's Close and the title menu's Review row are UIA
+Invokes with no native-only behaviour; the headless `state.rs` test
+`review_without_a_model_closes_and_the_menu_row_shows_it_again` proves them.
 Each phase has its own observation keys, and every failure inside a phase,
 including one a shared helper raises, carries the phase's code prefix.
 
@@ -23,8 +24,9 @@ drives still resolves a Review's credential through the platform store first
 endpoint's target: a fresh one in the default mode, the fixed loopback
 identity in the configured-provider mode.
 
-Both modes bind PASS evidence to an executable hash and prove the editor and
-source file stayed byte-identical and the document clean.
+Both modes bind PASS evidence to an executable hash and prove the source file
+stayed byte-identical and the document clean (a close request ends the
+process without the unsaved-changes guard).
 """
 
 from __future__ import annotations
@@ -62,7 +64,7 @@ from .runtime import (
 SCHEMA = "markturbo.goal-06-native-acceptance"
 # `ui/review.rs` `unavailable`: the explicit local diagnostic, an anonymous Text.
 NOT_SET_UP_MESSAGE = "No model set up"
-# `ui/review.rs` `unavailable`: the card's Close, a Button with its own id.
+# `ui/review.rs`: the result card's Close, a Button with its own id.
 REVIEW_CLOSE_AUTOMATION_ID = "review-close"
 # `ui/review.rs` `intent`: the first line of a structured result.
 REVIEW_RESULT_MARKER = "Understood:"
@@ -84,7 +86,7 @@ CASE_FLOWS = {
     NOT_SET_UP_MODE: {
         CASE_NOT_SET_UP: (
             "fresh .invalid endpoint without credential -> Ctrl+Enter review -> "
-            "No model set up -> Close -> title menu Review row -> No model set up"
+            "No model set up -> clean close"
         ),
     },
     CONFIGURED_PROVIDER_MODE: {
@@ -109,37 +111,21 @@ SAFE_STRINGS = (
     | INTEGRITY_NAMES
 )
 
-# Per mode: the fingerprints (each `*_after` must equal its `*_before`) and
-# the measured durations.
+# Per mode: the source file fingerprints (each `*_source_after` must equal
+# `source_before`) and the measured durations.
 # `clean_close_ms` is how the document's clean state is measured: the title
 # row's unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
 # which nsh 0.5.1's UIA folds away, so a close request that ends the process
 # without the 'Close without saving?' guard is the native proof.
-NOT_SET_UP_PHASES = ("shortcut", "menu")
 CONFIGURED_PHASES = ("document", "selection")
 OBSERVATIONS = {
     NOT_SET_UP_MODE: {
-        "fingerprints": frozenset(
-            {"editor_before", "source_before"}
-            | {f"{phase}_{side}_after" for phase in NOT_SET_UP_PHASES for side in ("editor", "source")}
-        ),
-        "durations": frozenset(
-            {
-                "shortcut_diagnostic_ms",
-                "close_diagnostic_gone_ms",
-                "menu_diagnostic_ms",
-                "clean_close_ms",
-            }
-        ),
+        "fingerprints": frozenset({"source_before", "shortcut_source_after"}),
+        "durations": frozenset({"shortcut_diagnostic_ms", "clean_close_ms"}),
     },
     CONFIGURED_PROVIDER_MODE: {
         "fingerprints": frozenset(
-            {"editor_before", "source_before"}
-            | {
-                f"{phase}_{side}_after"
-                for phase in CONFIGURED_PHASES
-                for side in ("editor", "source")
-            }
+            {"source_before"} | {f"{phase}_source_after" for phase in CONFIGURED_PHASES}
         ),
         "durations": frozenset(
             {"document_consent_ms", "document_result_ms", "document_close_ms"}
@@ -147,15 +133,6 @@ OBSERVATIONS = {
         ),
     },
 }
-
-
-def _after_pairs(fingerprints: frozenset[str]) -> list[tuple[str, str]]:
-    """(after, before) fingerprint pairs: editor to editor, source to source."""
-    return [
-        (key, "editor_before" if key.endswith("editor_after") else "source_before")
-        for key in sorted(fingerprints)
-        if key.endswith("_after")
-    ]
 
 
 def review_settings_document(
@@ -189,12 +166,9 @@ def _contract(mode: str) -> evidence.EvidenceContract:
             if not finite_nonnegative(observations.get(key)):
                 raise ValueError(f"passed case requires a measured {key}")
         prints = {key: validate_fingerprint(observations.get(key)) for key in keys["fingerprints"]}
-        if prints["editor_before"] != prints["source_before"]:
-            raise ValueError("editor and source text differ before Review")
-        for after, before in _after_pairs(keys["fingerprints"]):
-            if prints[after] != prints[before]:
-                kind = "editor" if before == "editor_before" else "source"
-                raise ValueError(f"Review changed {kind} text ({after})")
+        for after in sorted(keys["fingerprints"] - {"source_before"}):
+            if prints[after] != prints["source_before"]:
+                raise ValueError(f"Review changed source text ({after})")
 
     return evidence.EvidenceContract(
         schema=SCHEMA,
@@ -308,21 +282,15 @@ class Goal06Harness(BaseNativeHarness):
         self.hold_control(app, send, CONSENT_HOLD_SECONDS, "REVIEW_CONSENT_HOLD_FAILED")
 
     def read_only_phase(
-        self, app: Any, source: Path, before: dict[str, Any], phase: str | None
+        self, source: Path, before: dict[str, Any], phase: str
     ) -> dict[str, Any]:
-        """Measure the editor and the file after one Review phase (`phase`
-        names its observation keys; `phase` prefixes its failure codes)."""
-        prefix = f"{phase}_" if phase else ""
-        editor = self.editor_fingerprint(app)
+        """Hash the source file after one Review phase (`phase` names its
+        observation key). The editor is not read: the guard-free close
+        proves the buffer stayed clean."""
         file = sha256_file(source)
-        if editor.evidence() != before["editor_before"]:
-            raise HarnessFailure("REVIEW_CHANGED_EDITOR")
         if file.evidence() != before["source_before"]:
             raise HarnessFailure("REVIEW_CHANGED_SOURCE")
-        return {
-            f"{prefix}editor_after": editor.evidence(),
-            f"{prefix}source_after": file.evidence(),
-        }
+        return {f"{phase}_source_after": file.evidence()}
 
     def close_clean(self, app: Any) -> float:
         """Request the window's close and measure until the process ends.
@@ -379,14 +347,7 @@ class Goal06Harness(BaseNativeHarness):
 
     def initial_state(self, app: Any, source: Path) -> dict[str, Any]:
         self.activate_source_layout(app)
-        editor_before = self.editor_fingerprint(app)
-        source_before = sha256_file(source)
-        if editor_before != source_before:
-            raise HarnessFailure("INITIAL_EDITOR_SOURCE_MISMATCH")
-        return {
-            "editor_before": editor_before.evidence(),
-            "source_before": source_before.evidence(),
-        }
+        return {"source_before": sha256_file(source).evidence()}
 
     def not_set_up_session(self, app: Any, source: Path) -> dict[str, Any]:
         observations = self.initial_state(app, source)
@@ -399,18 +360,7 @@ class Goal06Harness(BaseNativeHarness):
             observations["shortcut_diagnostic_ms"] = self.wait_not_set_up(
                 app, "SHORTCUT_DIAGNOSTIC_UIA_TIMEOUT"
             )
-            observations.update(self.read_only_phase(app, source, observations, "shortcut"))
-        # Close phase, then the menu phase on an empty field.
-        with phase("CLOSE"):
-            observations["close_diagnostic_gone_ms"] = self.close_review_card(
-                app, NOT_SET_UP_MESSAGE
-            )
-        with phase("MENU"):
-            started = time.perf_counter()
-            self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
-            self.wait_name(app, NOT_SET_UP_MESSAGE, "Text", "MENU_DIAGNOSTIC_UIA_TIMEOUT")
-            observations["menu_diagnostic_ms"] = elapsed_ms(started)
-            observations.update(self.read_only_phase(app, source, observations, "menu"))
+            observations.update(self.read_only_phase(source, observations, "shortcut"))
         return observations
 
     def configured_review(
@@ -433,7 +383,7 @@ class Goal06Harness(BaseNativeHarness):
                 max(self.ui_timeout, 60.0),
             )
             observed[f"{name}_result_ms"] = elapsed_ms(started)
-            observed.update(self.read_only_phase(app, source, before, name))
+            observed.update(self.read_only_phase(source, before, name))
             if not selection:
                 # The next phase must not pass on this card's result.
                 observed["document_close_ms"] = self.close_review_card(

@@ -44,29 +44,20 @@ def valid_evidence(configured_provider: bool = False) -> dict:
             own = {
                 "document_consent_ms": 2100.5,
                 "document_result_ms": 900.0,
-                "document_editor_after": DOCUMENT_PRINT,
                 "document_source_after": DOCUMENT_PRINT,
                 "document_close_ms": 40.0,
                 "selection_consent_ms": 2200.0,
                 "selection_result_ms": 950.0,
-                "selection_editor_after": DOCUMENT_PRINT,
                 "selection_source_after": DOCUMENT_PRINT,
                 "clean_close_ms": 300.0,
             }
         else:
             own = {
-                "shortcut_diagnostic_ms": 120.0,
-                "shortcut_editor_after": DOCUMENT_PRINT,
+                "shortcut_diagnostic_ms": 120,
                 "shortcut_source_after": DOCUMENT_PRINT,
-                "close_diagnostic_gone_ms": 40.0,
-                "menu_diagnostic_ms": 80,
-                "menu_editor_after": DOCUMENT_PRINT,
-                "menu_source_after": DOCUMENT_PRINT,
                 "clean_close_ms": 250.0,
             }
-        return case_observations(
-            flows[case_id], editor_before=DOCUMENT_PRINT, source_before=DOCUMENT_PRINT, **own
-        )
+        return case_observations(flows[case_id], source_before=DOCUMENT_PRINT, **own)
 
     return passed_evidence(NEW_EVIDENCE(HASH, configured_provider), observations, complete)
 
@@ -106,11 +97,10 @@ class EvidenceSchemaTests(unittest.TestCase):
 
     def test_each_phase_fails_on_its_own_change(self) -> None:
         for configured, key, message in (
-            (False, "shortcut_editor_after", r"changed editor text \(shortcut_editor_after\)"),
-            (False, "menu_source_after", r"changed source text \(menu_source_after\)"),
-            (True, "document_editor_after", r"changed editor text \(document_editor_after\)"),
+            (False, "shortcut_source_after", r"changed source text \(shortcut_source_after\)"),
+            (False, "source_before", r"changed source text \(shortcut_source_after\)"),
+            (True, "document_source_after", r"changed source text \(document_source_after\)"),
             (True, "selection_source_after", r"changed source text \(selection_source_after\)"),
-            (False, "source_before", "differ before Review"),
         ):
             with self.subTest(key=key):
                 evidence = valid_evidence(configured)
@@ -118,11 +108,26 @@ class EvidenceSchemaTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     VALIDATE_EVIDENCE(evidence)
 
+    def test_dropped_editor_and_card_keys_are_unknown(self) -> None:
+        # The editor is no longer read and Close/menu are proven headless.
+        for configured, key, value in (
+            (False, "editor_before", DOCUMENT_PRINT),
+            (False, "shortcut_editor_after", DOCUMENT_PRINT),
+            (False, "close_diagnostic_gone_ms", 40.0),
+            (False, "menu_diagnostic_ms", 80.0),
+            (True, "document_editor_after", DOCUMENT_PRINT),
+        ):
+            with self.subTest(key=key):
+                evidence = valid_evidence(configured)
+                evidence["cases"][0]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, "unknown observation field"):
+                    VALIDATE_EVIDENCE(evidence)
+
     def test_measured_durations_must_hold(self) -> None:
         for configured, key, value, message in (
             (True, "clean_close_ms", None, "measured clean_close_ms"),
-            (False, "close_diagnostic_gone_ms", -1.0, "measured close_diagnostic_gone_ms"),
-            (False, "menu_diagnostic_ms", True, "measured menu_diagnostic_ms"),
+            (False, "shortcut_diagnostic_ms", -1.0, "measured shortcut_diagnostic_ms"),
+            (False, "clean_close_ms", True, "measured clean_close_ms"),
             (True, "selection_result_ms", float("nan"), "measured selection_result_ms"),
             (True, "document_close_ms", -1.0, "measured document_close_ms"),
         ):
@@ -244,8 +249,8 @@ class PreflightTests(unittest.TestCase):
 
 
 class FakeApp:
-    """The few app facts the Review flow reads: the diagnostic card and the
-    title menu, with switches that break one step at a time."""
+    """The few app facts the Review flow reads: the Review card and its
+    Close, with switches that break one step at a time."""
 
     hwnd = 42
 
@@ -254,19 +259,19 @@ class FakeApp:
         *,
         shown_at_start: bool = False,
         close_works: bool = True,
-        close_exposed: bool = True,
-        menu_works: bool = True,
-        breaks: tuple[str, str] | None = None,
+        breaks: str | None = None,
     ) -> None:
         self.card = shown_at_start
         self.close_works = close_works
-        self.close_exposed = close_exposed
-        self.menu_works = menu_works
-        # (phase, what): after `phase`'s Review, change the "editor" or the
-        # "source", or make the editor's re-read time out ("read").
+        # The phase whose Review rewrites the source file.
         self.breaks = breaks
-        self.phase = "start"
+        self.source: Path | None = None
         self.events: list[tuple[str, object]] = []
+
+    def reviewed(self, phase: str, card: bool = True) -> None:
+        self.card = card
+        if self.breaks == phase:
+            self.source.write_text(HARNESS.DOCUMENT_TEXT + "x", encoding="utf-8", newline="")
 
 
 class FakeWin32:
@@ -285,8 +290,7 @@ class FakeWin32:
     def send_shortcut(self, hwnd: int, key: int) -> None:
         self.app.events.append(("shortcut", key))
         if key == runtime.VK_RETURN:
-            self.app.card = True
-            self.app.phase = "shortcut"
+            self.app.reviewed("shortcut")
 
 
 def fake_harness(app: FakeApp, source: Path, **win32: Any) -> HARNESS.Goal06Harness:
@@ -295,12 +299,12 @@ def fake_harness(app: FakeApp, source: Path, **win32: Any) -> HARNESS.Goal06Harn
     harness.ui_timeout = 0.2
     harness.configured_provider = False
     harness.win32 = FakeWin32(app, **win32)
-    document = runtime.fingerprint_text(HARNESS.DOCUMENT_TEXT)
+    app.source = source
     close_button = object()
 
     def find_control(_app, automation_id, control_type, timeout_code, _mismatch):
         app.events.append(("find", automation_id))
-        if automation_id == HARNESS.REVIEW_CLOSE_AUTOMATION_ID and app.card and app.close_exposed:
+        if automation_id == HARNESS.REVIEW_CLOSE_AUTOMATION_ID and app.card:
             return close_button
         raise runtime.HarnessFailure(timeout_code)
 
@@ -309,24 +313,13 @@ def fake_harness(app: FakeApp, source: Path, **win32: Any) -> HARNESS.Goal06Harn
         if control is close_button and app.close_works:
             app.card = False
 
-    def menu_command(_app, automation_id):
-        app.events.append(("menu", automation_id))
-        if automation_id == HARNESS.REVIEW_MENU_AUTOMATION_ID and app.menu_works:
-            app.card = True
-            app.phase = "menu"
+    def editor_fingerprint(_app):
+        raise AssertionError("the Review flow must not read the editor")
 
     harness.activate_source_layout = lambda _app: app.events.append(("layout", None))
     harness.focus_editor = lambda _app: app.events.append(("focus", None))
-    def editor_fingerprint(_app):
-        if app.breaks == (app.phase, "read"):
-            raise runtime.HarnessFailure("EDITOR_TEXT_TIMEOUT")
-        if app.breaks == (app.phase, "editor"):
-            return runtime.fingerprint_text(HARNESS.DOCUMENT_TEXT + "x")
-        if app.breaks == (app.phase, "source"):
-            source.write_text(HARNESS.DOCUMENT_TEXT + "x", encoding="utf-8", newline="")
-        return document
-
     harness.editor_fingerprint = editor_fingerprint
+    harness.menu_command = lambda _app, automation_id: app.events.append(("menu", automation_id))
     harness.name_present = lambda _app, name, _type: (
         name in (HARNESS.NOT_SET_UP_MESSAGE, HARNESS.REVIEW_RESULT_MARKER) and app.card
     )
@@ -335,7 +328,6 @@ def fake_harness(app: FakeApp, source: Path, **win32: Any) -> HARNESS.Goal06Harn
     )
     harness.find_control = find_control
     harness.invoke_control = invoke_control
-    harness.menu_command = menu_command
     source.write_text(HARNESS.DOCUMENT_TEXT, encoding="utf-8", newline="")
     return harness
 
@@ -352,22 +344,18 @@ class NotSetUpSessionTests(unittest.TestCase):
             self.run_session(app, **win32)
         self.assertEqual(raised.exception.code, code)
 
-    def test_one_session_proves_the_shortcut_close_and_menu_phases(self) -> None:
+    def test_one_session_proves_the_shortcut_and_hashes_only_the_file(self) -> None:
         app = FakeApp()
 
         observations = self.run_session(app)
 
+        # Close and the menu row are headless-proven; the native session sends
+        # only the shortcut and never reads the editor (the fake would raise).
         self.assertEqual(
             [event for event in app.events if event[0] in {"shortcut", "invoke", "menu"}],
-            [
-                ("shortcut", runtime.VK_RETURN),
-                ("invoke", "close"),
-                ("menu", HARNESS.REVIEW_MENU_AUTOMATION_ID),
-            ],
+            [("shortcut", runtime.VK_RETURN)],
         )
-        for phase in ("shortcut", "menu"):
-            self.assertEqual(observations[f"{phase}_editor_after"], observations["editor_before"])
-            self.assertEqual(observations[f"{phase}_source_after"], observations["source_before"])
+        self.assertEqual(observations["shortcut_source_after"], observations["source_before"])
         # With the clean close the scenario adds, the session's own keys are
         # exactly what a PASS case requires.
         contract = HARNESS.CONTRACTS[HARNESS.NOT_SET_UP_MODE]
@@ -382,29 +370,8 @@ class NotSetUpSessionTests(unittest.TestCase):
     def test_the_shortcut_needs_the_keyboard_on_the_app_window(self) -> None:
         self.assert_fails("SHORTCUT_NATIVE_FOCUS_LOST", FakeApp(), owns_keyboard=False)
 
-    def test_a_card_that_does_not_close_cannot_stand_in_for_the_menu_row(self) -> None:
-        app = FakeApp(close_works=False)
-
-        self.assert_fails("CLOSE_REVIEW_STILL_SHOWN", app)
-        self.assertNotIn("menu", [event[0] for event in app.events])
-
-    def test_a_menu_row_that_shows_nothing_fails_its_own_phase(self) -> None:
-        self.assert_fails("MENU_DIAGNOSTIC_UIA_TIMEOUT", FakeApp(menu_works=False))
-
-    def test_every_failure_names_the_phase_it_happened_in(self) -> None:
-        # The same helper failure, or the same change, in two phases of the
-        # one session must yield two different, locatable codes.
-        for code, app in (
-            ("SHORTCUT_REVIEW_CHANGED_EDITOR", FakeApp(breaks=("shortcut", "editor"))),
-            ("SHORTCUT_REVIEW_CHANGED_SOURCE", FakeApp(breaks=("shortcut", "source"))),
-            ("SHORTCUT_EDITOR_TEXT_TIMEOUT", FakeApp(breaks=("shortcut", "read"))),
-            ("MENU_REVIEW_CHANGED_EDITOR", FakeApp(breaks=("menu", "editor"))),
-            ("MENU_REVIEW_CHANGED_SOURCE", FakeApp(breaks=("menu", "source"))),
-            ("MENU_EDITOR_TEXT_TIMEOUT", FakeApp(breaks=("menu", "read"))),
-            ("CLOSE_REVIEW_UIA_TIMEOUT", FakeApp(close_exposed=False)),
-        ):
-            with self.subTest(code=code):
-                self.assert_fails(code, app)
+    def test_a_changed_file_fails_the_shortcut_phase(self) -> None:
+        self.assert_fails("SHORTCUT_REVIEW_CHANGED_SOURCE", FakeApp(breaks="shortcut"))
 
     def test_the_shortcut_waits_for_activation_to_hand_over_the_keyboard(self) -> None:
         observations = self.run_session(FakeApp(), focus_lag=2)
@@ -426,8 +393,7 @@ class ConfiguredSessionTests(unittest.TestCase):
 
             def approve_review_consent(_app, selection):
                 app.events.append(("consent", selection))
-                app.phase = "selection" if selection else "document"
-                app.card = result_shown
+                app.reviewed("selection" if selection else "document", result_shown)
 
             def wait_name(_app, name, _type, timeout_code, *_timeout):
                 if not harness.name_present(app, name, _type):
@@ -466,8 +432,8 @@ class ConfiguredSessionTests(unittest.TestCase):
 
     def test_every_failure_names_the_review_it_happened_in(self) -> None:
         for code, app, kwargs in (
-            ("DOCUMENT_REVIEW_CHANGED_EDITOR", FakeApp(breaks=("document", "editor")), {}),
-            ("SELECTION_REVIEW_CHANGED_SOURCE", FakeApp(breaks=("selection", "source")), {}),
+            ("DOCUMENT_REVIEW_CHANGED_SOURCE", FakeApp(breaks="document"), {}),
+            ("SELECTION_REVIEW_CHANGED_SOURCE", FakeApp(breaks="selection"), {}),
             ("DOCUMENT_REVIEW_RESULT_UIA_TIMEOUT", FakeApp(), {"result_shown": False}),
             ("DOCUMENT_CLOSE_REVIEW_STILL_SHOWN", FakeApp(close_works=False), {}),
         ):
@@ -667,21 +633,6 @@ class ConfiguredReviewTests(unittest.TestCase):
 
                 self.assertEqual(raised.exception.code, code)
                 self.assertNotIn("shortcut", [event[0] for event in app.events])
-
-    def test_a_review_that_changes_the_editor_or_file_fails_its_case(self) -> None:
-        for what, code in (("editor", "REVIEW_CHANGED_EDITOR"), ("source", "REVIEW_CHANGED_SOURCE")):
-            with self.subTest(what=what), tempfile.TemporaryDirectory() as temporary:
-                source = Path(temporary) / "review.md"
-                app = FakeApp(breaks=("result", what))
-                harness = fake_harness(app, source)
-                before = {"editor_before": DOCUMENT_PRINT, "source_before": DOCUMENT_PRINT}
-                app.phase = "result"
-
-                with self.assertRaises(runtime.HarnessFailure) as raised:
-                    harness.read_only_phase(app, source, before, None)
-
-                self.assertEqual(raised.exception.code, code)
-
 
 class PlanAndArgumentTests(unittest.TestCase):
     def test_each_mode_runs_one_scenario_per_case(self) -> None:
