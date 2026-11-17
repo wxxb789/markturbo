@@ -45,9 +45,9 @@ def valid_evidence(configured_provider: bool = False) -> dict:
             own = {
                 "editor_after": DOCUMENT_PRINT,
                 "source_after": DOCUMENT_PRINT,
-                "document_dirty": False,
                 "consent_ms": 2100.5,
                 "result_ms": 900.0,
+                "clean_close_ms": 300.0,
             }
             if case_id == CASE_SELECTION:
                 own["consent_selection_scope"] = True
@@ -57,12 +57,11 @@ def valid_evidence(configured_provider: bool = False) -> dict:
                 "shortcut_diagnostic_ms": 120.0,
                 "shortcut_editor_after": DOCUMENT_PRINT,
                 "shortcut_source_after": DOCUMENT_PRINT,
-                "shortcut_document_dirty": False,
                 "close_diagnostic_gone_ms": 40.0,
                 "menu_diagnostic_ms": 80,
                 "menu_editor_after": DOCUMENT_PRINT,
                 "menu_source_after": DOCUMENT_PRINT,
-                "menu_document_dirty": False,
+                "clean_close_ms": 250.0,
             }
         return case_observations(
             flows[case_id], editor_before=DOCUMENT_PRINT, source_before=DOCUMENT_PRINT, **own
@@ -110,7 +109,7 @@ class EvidenceSchemaTests(unittest.TestCase):
             VALIDATE_EVIDENCE(evidence)
 
         evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["document_dirty"] = False
+        evidence["cases"][0]["observations"]["consent_ms"] = 1.0
         with self.assertRaisesRegex(ValueError, "unknown observation field"):
             VALIDATE_EVIDENCE(evidence)
 
@@ -135,9 +134,8 @@ class EvidenceSchemaTests(unittest.TestCase):
     def test_measured_booleans_and_durations_must_hold(self) -> None:
         for configured, key, value, message in (
             (False, "shortcut_diagnostic_before", True, "false shortcut_diagnostic_before"),
-            (False, "menu_document_dirty", True, "false menu_document_dirty"),
-            (False, "shortcut_document_dirty", None, "false shortcut_document_dirty"),
-            (True, "document_dirty", True, "false document_dirty"),
+            (False, "shortcut_diagnostic_before", None, "false shortcut_diagnostic_before"),
+            (True, "clean_close_ms", None, "measured clean_close_ms"),
             (False, "close_diagnostic_gone_ms", -1.0, "measured close_diagnostic_gone_ms"),
             (False, "menu_diagnostic_ms", True, "measured menu_diagnostic_ms"),
             (True, "result_ms", float("nan"), "measured result_ms"),
@@ -353,12 +351,10 @@ class FakeApp:
         shown_at_start: bool = False,
         close_works: bool = True,
         menu_works: bool = True,
-        dirty_after: str | None = None,
     ) -> None:
         self.card = shown_at_start
         self.close_works = close_works
         self.menu_works = menu_works
-        self.dirty_after = dirty_after
         self.phase = "start"
         self.events: list[tuple[str, object]] = []
 
@@ -407,7 +403,6 @@ def fake_harness(app: FakeApp, source: Path, **win32: bool) -> HARNESS.Goal06Har
     harness.activate_source_layout = lambda _app: app.events.append(("layout", None))
     harness.focus_editor = lambda _app: app.events.append(("focus", None))
     harness.editor_fingerprint = lambda _app: document
-    harness.document_dirty = lambda _app: app.dirty_after == app.phase
     harness.name_present = lambda _app, name, _type: (
         name == HARNESS.NOT_SET_UP_MESSAGE and app.card
     )
@@ -451,11 +446,11 @@ class NotSetUpSessionTests(unittest.TestCase):
         for phase in ("shortcut", "menu"):
             self.assertEqual(observations[f"{phase}_editor_after"], observations["editor_before"])
             self.assertEqual(observations[f"{phase}_source_after"], observations["source_before"])
-            self.assertIs(observations[f"{phase}_document_dirty"], False)
-        # The session's own keys are exactly what a PASS case requires.
+        # With the clean close the scenario adds, the session's own keys are
+        # exactly what a PASS case requires.
         contract = HARNESS.CONTRACTS[HARNESS.NOT_SET_UP_MODE]
         self.assertEqual(
-            set(observations) - {"foreground_verified"},
+            set(observations) - {"foreground_verified"} | {"clean_close_ms"},
             set(contract.required_observations[CASE_NOT_SET_UP]),
         )
 
@@ -474,12 +469,57 @@ class NotSetUpSessionTests(unittest.TestCase):
     def test_a_menu_row_that_shows_nothing_fails_its_own_phase(self) -> None:
         self.assert_fails("MENU_DIAGNOSTIC_UIA_TIMEOUT", FakeApp(menu_works=False))
 
-    def test_a_dirty_document_fails_the_phase_that_dirtied_it(self) -> None:
-        for phase in ("shortcut", "menu"):
-            with self.subTest(phase=phase):
-                self.assert_fails(
-                    f"{phase.upper()}_REVIEW_MARKED_DOCUMENT_DIRTY", FakeApp(dirty_after=phase)
-                )
+
+
+class CleanCloseTests(unittest.TestCase):
+    """The document's clean state, measured by how a close request ends."""
+
+    @staticmethod
+    def harness(exits_with: int | None, guard: bool) -> HARNESS.Goal06Harness:
+        events: list[str] = []
+
+        class Process:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def poll(self) -> int | None:
+                return exits_with if self.closed else None
+
+            def wait(self, timeout: float) -> int:
+                return exits_with
+
+        process = Process()
+
+        class Win32:
+            def post_close(self, hwnd: int) -> None:
+                events.append("close")
+                process.closed = True
+
+        harness = object.__new__(HARNESS.Goal06Harness)
+        harness.ui_timeout = 0.2
+        harness.win32 = Win32()
+        harness.name_present = lambda _app, name, _type: (
+            guard and process.closed and name == runtime.GUARD_HEADING
+        )
+        harness.app = type("App", (), {"hwnd": 42, "process": process})()
+        return harness
+
+    def test_a_clean_document_closes_without_the_guard(self) -> None:
+        harness = self.harness(exits_with=0, guard=False)
+
+        self.assertTrue(runtime.finite_nonnegative(harness.close_clean(harness.app)))
+
+    def test_a_dirty_document_fails_on_the_guard_it_raises(self) -> None:
+        for exits_with, guard, code in (
+            (None, True, "REVIEW_LEFT_DOCUMENT_DIRTY"),
+            (None, False, "PROCESS_EXIT_TIMEOUT"),
+            (1, False, "PROCESS_EXIT_NONZERO"),
+        ):
+            with self.subTest(code=code):
+                harness = self.harness(exits_with=exits_with, guard=guard)
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    harness.close_clean(harness.app)
+                self.assertEqual(raised.exception.code, code)
 
 
 class ConfiguredReviewTests(unittest.TestCase):

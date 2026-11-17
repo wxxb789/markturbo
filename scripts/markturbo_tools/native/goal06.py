@@ -31,6 +31,7 @@ from typing import Any
 from . import evidence
 from .evidence import credential_target, leak_codes
 from .runtime import (
+    GUARD_HEADING,
     INTEGRITY_NAMES,
     VK_A,
     VK_RETURN,
@@ -106,6 +107,10 @@ SAFE_STRINGS = (
 
 # Per mode: the fingerprints (each `*_after` must equal its `*_before`), the
 # measured booleans a PASS needs False, and the measured durations.
+# `clean_close_ms` is how the document's clean state is measured: the title
+# row's unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
+# which nsh 0.5.1's UIA folds away, so a close request that ends the process
+# without the 'Close without saving?' guard is the native proof.
 NOT_SET_UP_PHASES = ("shortcut", "menu")
 OBSERVATIONS = {
     NOT_SET_UP_MODE: {
@@ -113,20 +118,22 @@ OBSERVATIONS = {
             {"editor_before", "source_before"}
             | {f"{phase}_{side}_after" for phase in NOT_SET_UP_PHASES for side in ("editor", "source")}
         ),
-        "false": frozenset(
-            {"shortcut_diagnostic_before"}
-            | {f"{phase}_document_dirty" for phase in NOT_SET_UP_PHASES}
-        ),
+        "false": frozenset({"shortcut_diagnostic_before"}),
         "durations": frozenset(
-            {"shortcut_diagnostic_ms", "close_diagnostic_gone_ms", "menu_diagnostic_ms"}
+            {
+                "shortcut_diagnostic_ms",
+                "close_diagnostic_gone_ms",
+                "menu_diagnostic_ms",
+                "clean_close_ms",
+            }
         ),
     },
     CONFIGURED_PROVIDER_MODE: {
         "fingerprints": frozenset(
             {"editor_before", "source_before", "editor_after", "source_after"}
         ),
-        "false": frozenset({"document_dirty"}),
-        "durations": frozenset({"consent_ms", "result_ms"}),
+        "false": frozenset(),
+        "durations": frozenset({"consent_ms", "result_ms", "clean_close_ms"}),
     },
 }
 # The selection binding alone must show its scope on the consent card.
@@ -321,24 +328,41 @@ class Goal06Harness(BaseNativeHarness):
     def read_only_phase(
         self, app: Any, source: Path, before: dict[str, Any], phase: str | None
     ) -> dict[str, Any]:
-        """Measure the editor, the file and the dirty mark after one Review
-        phase; each change fails with the phase's own code."""
+        """Measure the editor and the file after one Review phase; each change
+        fails with the phase's own code."""
         prefix = f"{phase}_" if phase else ""
         code = f"{phase.upper()}_REVIEW" if phase else "REVIEW"
         editor = self.editor_fingerprint(app)
         file = sha256_file(source)
-        dirty = self.document_dirty(app)
         if editor.evidence() != before["editor_before"]:
             raise HarnessFailure(f"{code}_CHANGED_EDITOR")
         if file.evidence() != before["source_before"]:
             raise HarnessFailure(f"{code}_CHANGED_SOURCE")
-        if dirty:
-            raise HarnessFailure(f"{code}_MARKED_DOCUMENT_DIRTY")
         return {
             f"{prefix}editor_after": editor.evidence(),
             f"{prefix}source_after": file.evidence(),
-            f"{prefix}document_dirty": dirty,
         }
+
+    def close_clean(self, app: Any) -> float:
+        """Request the window's close and measure until the process ends.
+        A dirty document raises the in-app guard instead (`request_quit`)."""
+
+        def settled() -> str | None:
+            if app.process.poll() is not None:
+                return "exited"
+            try:
+                return "guard" if self.name_present(app, GUARD_HEADING, "Text") else None
+            except HarnessFailure:
+                if app.process.poll() is not None:
+                    return "exited"
+                raise
+
+        started = time.perf_counter()
+        self.win32.post_close(app.hwnd)
+        if wait_until(settled, self.ui_timeout, "PROCESS_EXIT_TIMEOUT") == "guard":
+            raise HarnessFailure("REVIEW_LEFT_DOCUMENT_DIRTY")
+        self.wait_process_exit(app)
+        return _elapsed_ms(started)
 
     def not_set_up_shown(self, app: Any) -> bool:
         return self.name_present(app, NOT_SET_UP_MESSAGE, "Text")
@@ -430,7 +454,7 @@ class Goal06Harness(BaseNativeHarness):
                 observations = self.configured_session(app, source, case_id)
             else:
                 observations = self.not_set_up_session(app, source)
-            self.close_app(app)
+            observations["clean_close_ms"] = self.close_clean(app)
             observations.update(
                 flow=CASE_FLOWS[_mode(self.configured_provider)][case_id],
                 process_context=app.security_context.evidence(),
