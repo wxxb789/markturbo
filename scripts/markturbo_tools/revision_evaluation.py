@@ -1439,7 +1439,6 @@ def load_native_acceptance(
     return acceptance
 
 
-
 def load_owner_inputs(
     directory: Path,
     verification: evaluation.ManifestVerification | None = None,

@@ -12,7 +12,6 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 from scripts.markturbo_tools import evaluation
 from scripts.markturbo_tools import revision_evaluation as revision

@@ -173,7 +173,8 @@ def new_evidence(expected_hash: str, configured_provider: bool = False) -> dict[
 
 
 def validate_evidence(value: dict[str, Any]) -> None:
-    contract = CONTRACTS.get(value.get("mode")) if isinstance(value, dict) else None
+    mode = value.get("mode") if isinstance(value, dict) else None
+    contract = CONTRACTS.get(mode) if isinstance(mode, str) else None
     if contract is None:
         raise ValueError("invalid native Review mode")
     evidence.validate_evidence(value, contract)

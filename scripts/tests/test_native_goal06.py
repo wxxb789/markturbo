@@ -92,9 +92,10 @@ class EvidenceSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown observation field"):
             VALIDATE_EVIDENCE(evidence)
 
-        evidence["mode"] = "unknown"
-        with self.assertRaisesRegex(ValueError, "invalid native Review mode"):
-            VALIDATE_EVIDENCE(evidence)
+        for mode in ("unknown", ["unhashable"]):
+            evidence["mode"] = mode
+            with self.assertRaisesRegex(ValueError, "invalid native Review mode"):
+                VALIDATE_EVIDENCE(evidence)
 
     def test_pass_requires_identical_editor_and_file_fingerprints(self) -> None:
         evidence = valid_evidence()

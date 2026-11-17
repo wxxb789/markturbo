@@ -315,8 +315,12 @@ def validate_case(
         raise ValueError("passed case evidence is incomplete")
     if observations.get("flow") != contract.case_flows[case_id]:
         raise ValueError("case flow mechanics do not match the required scenario")
-    contexts = observations.get("process_contexts", [observations.get("process_context")])
-    if not isinstance(contexts, list) or not contexts:
+    contexts = observations.get("process_contexts", [])
+    if not isinstance(contexts, list):
+        raise ValueError("passed case requires process context")
+    if "process_context" in observations:
+        contexts = [*contexts, observations["process_context"]]
+    if not contexts:
         raise ValueError("passed case requires process context")
     for context in contexts:
         if validate_context(context) != parent:

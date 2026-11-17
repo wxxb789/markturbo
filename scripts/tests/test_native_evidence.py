@@ -207,6 +207,11 @@ class EnvelopeTests(unittest.TestCase):
         }
         self.assert_rejected(value, "differs from harness context")
 
+        value = valid()
+        value["cases"][0]["observations"]["process_contexts"] = [process_context()]
+        value["cases"][0]["observations"]["process_context"]["session_id"] = 8
+        self.assert_rejected(value, "differs from harness context")
+
     def test_observations_are_allowed_keys_with_scalar_or_validated_values(self) -> None:
         for key, replacement, message in (
             ("raw_text", 1, "unknown observation field"),

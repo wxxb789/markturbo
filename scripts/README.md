@@ -46,7 +46,7 @@ uv run --project scripts scripts/mt.py check fast --base <base-sha> --head <head
 The test list lives in `markturbo_tools/checks.py`. It is deliberately explicit:
 native UI acceptance cannot enter a test run through discovery. The runtime
 probe is Windows-only, but its geometry unit test and the other tooling tests
-validate portable input, source contracts, or fixture behavior without a desktop.
+validate portable input or fixture behavior without a desktop.
 
 A-B-B-A scheduling, arithmetic, and paired sample tests are in the explicit
 `test_probe` suite and run with `fast`, `ci`, and `full`. Actual Windows process
@@ -124,8 +124,9 @@ The canonical `evaluation verify-manifest` command also verifies Goal 07's
 immutable corpus. `revision-evaluation scaffold` writes a fail-closed v2 record
 without inventing owner values. `revision-evaluation record` consumes an external
 eligibility registry, a v2 machine receipt, a separately hash-bound native
-Goal 07 `PASS` receipt (`schema_version` 2; the retained version 1 files are
-historical GPUI-era records and are refused), and one metadata-only owner JSON
+Goal 07 `PASS` receipt (`schema_version` 3, the shared native evidence schema;
+every earlier version, including the GPUI-era records under `docs/evidence/`,
+is refused), and one metadata-only owner JSON
 per artifact. The
 machine receipt schema is `markturbo-goal-07-machine-receipt-v2`. Per case,
 `editable_source_sha256` and `editable_source_byte_count` are the SHA-256 and
@@ -184,7 +185,7 @@ $decisionDir = "docs/evidence/goal-07\composition-decisions"
 $machineReceipt = "docs/evidence/goal-07\machine-receipt.json"
 $registry = "docs/evidence/goal-07\eligibility.json"
 $ownerDir = "docs/evidence/goal-07\owner-input"
-$nativeEvidence = "docs/evidence/goal-07\goal-07-native-acceptance-v2.json"
+$nativeEvidence = "target/native-acceptance/goal-07-native-acceptance-v3.json"
 $evidence = "docs/evidence/goal-07\revision-evaluation.json"
 
 cargo build --release --locked -p mt-core --bin markturbo-goal07-evaluate
@@ -313,17 +314,17 @@ uv run --project scripts scripts/mt.py probe -- startup --rounds 10
 uv run --project scripts scripts/mt.py accept goal-03 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence docs/evidence/goal-03-native-acceptance-v1.json
+  --evidence target/native-acceptance/goal-03-native-acceptance-v3.json
 
 uv run --project scripts scripts/mt.py accept goal-06 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence docs/evidence/goal-06-native-acceptance-v1.json
+  --evidence target/native-acceptance/goal-06-native-acceptance-v3.json
 
 uv run --project scripts scripts/mt.py accept goal-07 -- \
   --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence docs/evidence/goal-07-native-acceptance-v2.json
+  --evidence target/native-acceptance/goal-07-native-acceptance-v3.json
 ```
 
 Delegated commands run from the repository root. Therefore paths supplied to
@@ -352,13 +353,12 @@ The native command exit status is part of that contract: `0` is `PASS`, `1` is
 `FAIL` by the CLI.
 
 `native/runtime.py` owns hash-bound case execution, shared UIA/process
-primitives and bounded privacy byte search. Each goal module retains its own
-cases, artifact scan policy and evidence validation; Goal 07's private
+primitives and bounded privacy byte search. `native/evidence.py` owns the one
+shared evidence schema, its validation and the case artifact scan; each goal
+module retains its own cases, allowed observations and passed-case checks; Goal 07's private
 `native/goal07_provider.py` owns its synthetic Responses loopback protocol.
 The Goal 07 transport count is derived per run from recorded case observations,
-not from module-global state. Goal 03 preflight checks both the Workspace shell
-and its Welcome production module; source checks are structural safeguards, not
-proof that the shipped executable exposed those controls.
+not from module-global state.
 
 ## Evidence data
 
