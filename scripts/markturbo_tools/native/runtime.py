@@ -1266,15 +1266,17 @@ class Win32:
             raise HarnessFailure("SENDINPUT_INCOMPLETE")
 
     def send_shortcut(self, hwnd: int, key: int) -> None:
+        self.send_shortcuts(hwnd, (key,))
+
+    def send_shortcuts(self, hwnd: int, keys: tuple[int, ...]) -> None:
+        """Press each of `keys` in turn with Ctrl held, as one SendInput batch:
+        no other input can land between them."""
         self.require_foreground(hwnd)
-        self.send_inputs(
-            [
-                key_input(VK_CONTROL, False),
-                key_input(key, False),
-                key_input(key, True),
-                key_input(VK_CONTROL, True),
-            ]
-        )
+        inputs = [key_input(VK_CONTROL, False)]
+        for key in keys:
+            inputs.extend((key_input(key, False), key_input(key, True)))
+        inputs.append(key_input(VK_CONTROL, True))
+        self.send_inputs(inputs)
 
     def send_key(self, hwnd: int, key: int) -> None:
         self.require_foreground(hwnd)
@@ -1315,6 +1317,10 @@ class Win32:
 
 CLIPBOARD_OPEN_TIMEOUT_SECONDS = 3.0
 CLIPBOARD_OPEN_RETRY_SECONDS = 0.02
+# An editor read resends Ctrl+C once when the clipboard has not changed this
+# long after the copy, and polls its sequence number this often.
+COPY_RESEND_SECONDS = 0.3
+CLIPBOARD_SEQUENCE_POLL_SECONDS = 0.01
 
 
 def open_clipboard_with_retry(
@@ -1371,6 +1377,7 @@ class _ClipboardApi:
         user32.EmptyClipboard.restype = wt.BOOL
         user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
         user32.SetClipboardData.restype = wt.HANDLE
+        user32.GetClipboardSequenceNumber.restype = wt.DWORD
         kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
         kernel32.GlobalAlloc.restype = wt.HGLOBAL
         kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
@@ -1393,6 +1400,11 @@ class _ClipboardApi:
             lambda: bool(self.user32.OpenClipboard(None)),
             lambda: bool(self.user32.GetOpenClipboardWindow()),
         )
+
+
+def clipboard_sequence_number() -> int:
+    """The clipboard's change count; reading it does not open the clipboard."""
+    return int(_ClipboardApi.get().user32.GetClipboardSequenceNumber())
 
 
 def read_clipboard_text() -> str | None:
@@ -1665,7 +1677,7 @@ class NativeSession:
     Its `preflight` hashes the executable and samples the environment once,
     asks Windows to keep the display and system on, and saves the user's text
     clipboard once (an empty or text-only clipboard is a precondition); per
-    editor read the harness then only clears, copies and reads. `close`
+    editor read the harness then only copies and reads. `close`
     restores the clipboard and releases the display once, after every app has
     exited. A harness killed mid-run cannot restore the clipboard.
 
@@ -2357,6 +2369,20 @@ class NativeHarness:
     def read_text_clipboard(self) -> str | None:
         return read_clipboard_text()
 
+    def clipboard_sequence(self) -> int:
+        return clipboard_sequence_number()
+
+    def _clipboard_changed_since(self, sequence: int, timeout: float) -> bool:
+        """Whether the clipboard changes after `sequence` within `timeout`
+        (checked at least once)."""
+        deadline = self.clock() + timeout
+        while True:
+            if self.clipboard_sequence() != sequence:
+                return True
+            if self.clock() >= deadline:
+                return False
+            self.sleep(CLIPBOARD_SEQUENCE_POLL_SECONDS)
+
     def write_text_clipboard(self, value: str | None) -> None:
         write_clipboard_text(value)
 
@@ -2385,19 +2411,34 @@ class NativeHarness:
     def read_editor_text(self, app: RunningApp, editor: Any | None = None) -> str:
         """The editor's exact document through its own Select All + Copy.
 
-        Only clears, copies and reads: the session saved the user's clipboard
-        once and restores it when the run ends. Nothing read here is written
-        to evidence except its fingerprint. `editor` is the editor control a
-        caller already found; without one it is looked up here.
+        Only copies and reads, never writes the clipboard: the session saved
+        the user's clipboard once and restores it when the run ends. The copy
+        is known to have landed when the clipboard's sequence number moves
+        past the one sampled before Ctrl+A Ctrl+C (one input batch); the text
+        is then read once. A copy that has not landed after
+        `COPY_RESEND_SECONDS` is resent once (`copy_resends`). Another
+        clipboard writer (the Remote Desktop clipboard relay) can move the
+        sequence too, so callers compare the fingerprint and retry. Nothing
+        read here is written to evidence except its fingerprint. `editor` is
+        the editor control a caller already found; without one it is looked
+        up here.
         """
         count("editor_reads")
         if editor is None:
             editor = self.editor_control(app, self.inner_timeout())
-        self.write_text_clipboard(None)
         self._focus_editor_control(app, editor)
-        self.win32.send_shortcut(app.hwnd, VK_A)
-        self.win32.send_shortcut(app.hwnd, VK_C)
+        timeout = self.inner_timeout()
+        timeout = self.ui_timeout if timeout is None else timeout
+        deadline = self.clock() + timeout
+        sequence = self.clipboard_sequence()
+        self.win32.send_shortcuts(app.hwnd, (VK_A, VK_C))
         self.last_editor_sample_at = self.clock()
+        if not self._clipboard_changed_since(sequence, min(COPY_RESEND_SECONDS, timeout)):
+            count("copy_resends")
+            self.win32.send_shortcut(app.hwnd, VK_C)
+            self.last_editor_sample_at = self.clock()
+            if not self._clipboard_changed_since(sequence, max(0.0, deadline - self.clock())):
+                raise HarnessFailure("EDITOR_COPY_TIMEOUT")
         return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
 
     def read_editor_fingerprint(self, app: RunningApp) -> Fingerprint | None:
@@ -3082,6 +3123,7 @@ __all__ = [
     "Win32",
     "artifact_contains",
     "build_launch_spec",
+    "clipboard_sequence_number",
     "complete_evidence",
     "count",
     "elapsed_ms",

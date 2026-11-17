@@ -269,6 +269,8 @@ class FakeEditorWin32:
         self.document = document
         self.copies = copies
         self.clipboard: str | None = "user clipboard"
+        # The clipboard's change count (GetClipboardSequenceNumber).
+        self.sequence = 7
         self.shortcuts: list[tuple[int, int]] = []
         self.keys: list[tuple[int, int]] = []
         self.unicode_writes: list[tuple[int, str]] = []
@@ -285,6 +287,11 @@ class FakeEditorWin32:
             copied = self.copies.pop(0) if self.copies else (self.document or "\n")
             if copied is not None:
                 self.clipboard = copied
+                self.sequence += 1
+
+    def send_shortcuts(self, hwnd: int, keys: tuple[int, ...]) -> None:
+        for key in keys:
+            self.send_shortcut(hwnd, key)
 
     def send_unicode(self, hwnd: int, value: str) -> None:
         self.unicode_writes.append((hwnd, value))
@@ -304,6 +311,7 @@ def editor_harness(
     harness.win32 = win32
     harness.read_text_clipboard = lambda: win32.clipboard
     harness.write_text_clipboard = lambda value: setattr(win32, "clipboard", value)
+    harness.clipboard_sequence = lambda: win32.sequence
     return harness, editor
 
 
@@ -481,6 +489,31 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
             [0, runtime.KEYEVENTF_KEYUP],
         )
         self.assertEqual(user32.foreground, 123)
+
+
+class ShortcutBatchTests(unittest.TestCase):
+    def test_select_all_and_copy_go_out_as_one_input_batch_with_ctrl_held(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        foreground: list[int] = []
+        batches: list[list[runtime.INPUT]] = []
+        win32.require_foreground = foreground.append
+        win32.send_inputs = batches.append
+
+        win32.send_shortcuts(73, (runtime.VK_A, runtime.VK_C))
+
+        self.assertEqual(foreground, [73])
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(
+            [(item.ki.wVk, item.ki.dwFlags) for item in batches[0]],
+            [
+                (runtime.VK_CONTROL, 0),
+                (runtime.VK_A, 0),
+                (runtime.VK_A, runtime.KEYEVENTF_KEYUP),
+                (runtime.VK_C, 0),
+                (runtime.VK_C, runtime.KEYEVENTF_KEYUP),
+                (runtime.VK_CONTROL, runtime.KEYEVENTF_KEYUP),
+            ],
+        )
 
 
 class FocusUser32:
@@ -952,7 +985,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH")
 
-    def test_editor_text_is_copied_by_select_all_into_a_cleared_clipboard(self) -> None:
+    def test_editor_text_is_copied_by_select_all_and_read_once_it_lands(self) -> None:
         # An empty document copies line-wise as "\n" (nsh-base 0.5.1
         # `editor/commands.rs` `copy`), like a document of one line break: a
         # read cannot tell them apart and reports exactly what was copied.
@@ -966,13 +999,16 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             with self.subTest(value=value):
                 win32 = FakeEditorWin32(value)
                 harness, editor = editor_harness(win32)
+                writes: list[str | None] = []
+                harness.write_text_clipboard = writes.append
 
                 self.assertEqual(
                     harness.read_editor_fingerprint(running_app()), runtime.fingerprint_text(copied)
                 )
                 self.assertEqual(win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_C)])
-                # One read clears, copies and reads; the session restores the
-                # user's clipboard once, at the end of the run.
+                # One read only copies and reads, never writes the clipboard;
+                # the session restores the user's clipboard once, at the end.
+                self.assertEqual(writes, [])
                 self.assertEqual(win32.clipboard, copied)
                 self.assertEqual(editor.focus_count, 1)
                 self.assertEqual(editor.value_pattern_count, 0)
@@ -984,6 +1020,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         harness.win32 = win32
         harness.read_text_clipboard = lambda: win32.clipboard
         harness.write_text_clipboard = lambda value: setattr(win32, "clipboard", value)
+        harness.clipboard_sequence = lambda: win32.sequence
         metrics = runtime.RunMetrics()
         token = runtime._ACTIVE_METRICS.set(metrics)
         try:
@@ -1046,7 +1083,56 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             )
         self.assertEqual(unreadable.exception.code, "EDITOR_TEXT_TIMEOUT")
         self.assertEqual(unreadable.exception.detail, "HarnessFailure")
-        self.assertIsNone(silent.clipboard)
+        self.assertEqual(silent.clipboard, "user clipboard")
+
+    def stalled_copy_harness(self, copies: list[str | None]) -> tuple[object, FakeEditorWin32, list[float]]:
+        win32 = FakeEditorWin32("text", copies=copies)
+        harness, _editor = editor_harness(win32, timeout=5.0)
+        now = [0.0]
+        harness.clock = lambda: now[0]
+        harness.sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
+        return harness, win32, now
+
+    def read_counting(self, harness: object) -> tuple[runtime.RunMetrics, object]:
+        metrics = runtime.RunMetrics()
+        token = runtime._ACTIVE_METRICS.set(metrics)
+        try:
+            return metrics, harness.read_editor_fingerprint(running_app())
+        finally:
+            runtime._ACTIVE_METRICS.reset(token)
+
+    def test_a_copy_that_has_not_landed_after_300_ms_is_resent_once(self) -> None:
+        harness, win32, now = self.stalled_copy_harness([None, "text"])
+
+        metrics, read = self.read_counting(harness)
+
+        self.assertEqual(read, runtime.fingerprint_text("text"))
+        self.assertEqual(
+            win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_C), (73, runtime.VK_C)]
+        )
+        self.assertEqual(metrics.counters["copy_resends"], 1)
+        self.assertGreaterEqual(now[0], runtime.COPY_RESEND_SECONDS)
+        self.assertLess(now[0], runtime.COPY_RESEND_SECONDS + 0.05)
+
+    def test_a_prompt_copy_is_never_resent(self) -> None:
+        harness, win32, now = self.stalled_copy_harness(["text"])
+
+        metrics, read = self.read_counting(harness)
+
+        self.assertEqual(read, runtime.fingerprint_text("text"))
+        self.assertEqual(win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_C)])
+        self.assertEqual(metrics.counters["copy_resends"], 0)
+        self.assertEqual(now[0], 0.0)
+
+    def test_a_copy_that_never_lands_is_resent_once_then_times_out(self) -> None:
+        harness, win32, now = self.stalled_copy_harness([None] * 10)
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            self.read_counting(harness)
+
+        self.assertEqual(raised.exception.code, "EDITOR_COPY_TIMEOUT")
+        self.assertEqual(win32.shortcuts.count((73, runtime.VK_C)), 2)
+        self.assertGreaterEqual(now[0], 5.0)
 
     def test_replace_editor_types_over_select_all_and_verifies_the_copy(self) -> None:
         value = "CJK-\u4fdd\u5b58-\U0001f680"
@@ -1455,16 +1541,16 @@ class NestedTimeoutTests(unittest.TestCase):
         harness, _editor = editor_harness(win32, timeout=15.0)
         harness.clock, harness.sleep = fake.clock, fake.sleep
         copy_waits: list[float] = []
-        wait_clipboard_text = harness.wait_clipboard_text
+        read_editor_text = harness.read_editor_text
 
-        def measured_copy_wait(code: str) -> str:
+        def measured_copy_wait(app: object, editor: object = None) -> str:
             started = fake.now
             try:
-                return wait_clipboard_text(code)
+                return read_editor_text(app, editor)
             finally:
                 copy_waits.append(fake.now - started)
 
-        harness.wait_clipboard_text = measured_copy_wait
+        harness.read_editor_text = measured_copy_wait
         started = fake.now
 
         with self.assertRaises(runtime.HarnessFailure) as raised:
@@ -1474,7 +1560,9 @@ class NestedTimeoutTests(unittest.TestCase):
         # At most one outer poll interval past the deadline.
         self.assertLessEqual(fake.now - started, 5.0 + 0.1 + 1e-6)
         self.assertGreater(len(copy_waits), 1)
-        self.assertLessEqual(max(copy_waits), runtime.INNER_WAIT_SECONDS + 0.025)
+        self.assertLessEqual(
+            max(copy_waits), runtime.INNER_WAIT_SECONDS + runtime.CLIPBOARD_SEQUENCE_POLL_SECONDS
+        )
         self.assertIsNone(harness._deadline)
 
     def test_an_editor_that_never_appears_keeps_its_own_code(self) -> None:
