@@ -20,6 +20,10 @@ default = ["model-transport"]
 # The public build keeps this default; disabling it is only the compile-time
 # upper bound for the model/network closure.
 model-transport = ["mt-core/model-transport"]
+# Test builds only: `AppState::new` uses an in-memory credential store, never
+# the platform's. Enabled for integration tests by the dev-dependency on this
+# crate below; a release build does not build dev-dependencies.
+test-vault = []
 
 [dependencies]
 mt-core.workspace = true
@@ -46,6 +50,7 @@ nsh-platform-macos = { version = "0.5.1", default-features = false }
 nsh-platform-windows = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]
+mt-app = { path = ".", features = ["test-vault"] }
 mt-core = { workspace = true, features = ["test-support"] }
 nsh-engine = "0.5.1"
 nsh-testing = "0.5.1"

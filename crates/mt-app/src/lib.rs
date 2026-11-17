@@ -20,6 +20,9 @@ pub mod logging;
 pub mod state;
 #[cfg(test)]
 mod test_env;
+#[cfg(any(test, feature = "test-vault"))]
+#[doc(hidden)]
+pub mod test_vault;
 pub mod ui;
 pub mod web;
 

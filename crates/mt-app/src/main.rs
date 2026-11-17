@@ -11,6 +11,16 @@ use nsh_platform_windows as platform;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
+    // `cargo test` builds this binary with the crate's test features, so the
+    // copy it leaves in target/<profile>/ keeps keys in memory only. Such a
+    // build must never pass for the shipped app or accept a person's key.
+    if cfg!(feature = "test-vault") {
+        eprintln!(
+            "This markturbo build was made by `cargo test` and has no secure credential store; \
+             rebuild with `cargo build -p mt-app` to run the app."
+        );
+        std::process::exit(2);
+    }
     mt_app::logging::init();
     if let Some(path) = std::env::args_os().nth(1) {
         // SAFETY: this runs before the app starts and no other thread reads the

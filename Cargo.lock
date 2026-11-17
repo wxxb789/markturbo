@@ -3319,6 +3319,7 @@ dependencies = [
  "env_logger",
  "log",
  "markdown",
+ "mt-app",
  "mt-core",
  "nsh-base",
  "nsh-core",
