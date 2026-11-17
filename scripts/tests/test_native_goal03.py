@@ -50,32 +50,23 @@ def sample_observation() -> dict[str, int | str | dict[str, int | str]]:
 
 def observations(case_id: str) -> dict:
     original = fingerprint(b"original")
-    new = fingerprint(b"new")
-    resaved = fingerprint(b"resaved")
+    resaved = fingerprint(HARNESS.RESAVE_TEXT.encode("utf-8"))
     pasted = fingerprint(HARNESS.PASTE_TEXT.encode("utf-8"))
     return case_observations(
         HARNESS.CASE_FLOWS[case_id],
         welcome_recent_rows=0,
-        new_editor=new,
-        save_as_cancel_editor=new,
-        save_as_cancel_destination_before=original,
-        save_as_cancel_destination_after=original,
-        overwrite_no_editor=new,
-        overwrite_no_destination_before=original,
-        overwrite_no_destination_after=original,
-        overwrite_yes_destination=new,
-        save_as_create_destination=new,
-        subsequent_save_destination=resaved,
-        subsequent_save_previous_destination=new,
-        saved_close_recent_rows=2,
         paste_clipboard=pasted,
         paste_editor=pasted,
-        paste_discard_recent_rows=2,
+        overwrite_no_destination_before=original,
+        overwrite_no_destination_after=original,
+        overwrite_yes_destination=pasted,
+        subsequent_save_destination=resaved,
+        saved_close_recent_rows=1,
         reopen_editor=resaved,
         reopen_recent_count=10,
         recents_rows=5,
         recents_disabled_rows=1,
-        recents_reopen_editor=resaved,
+        recents_open_tabs=1,
         recents_count_after_restart=10,
         process_contexts=[process_context()] * HARNESS.LAUNCH_COUNT,
         **sample_observation(),
@@ -111,21 +102,17 @@ class EvidenceSchemaTests(unittest.TestCase):
         changed = fingerprint(b"changed")
         for key, value, message in (
             ("welcome_recent_rows", 1, "clean profile"),
-            ("save_as_cancel_editor", changed, "unsaved editor"),
-            ("overwrite_no_editor", changed, "unsaved editor"),
-            ("save_as_cancel_destination_after", changed, "Save As picker cancellation"),
             ("overwrite_no_destination_after", changed, "overwrite cancellation"),
             ("overwrite_yes_destination", changed, "confirmed overwrite"),
-            ("save_as_create_destination", changed, "menu Save As"),
-            ("subsequent_save_previous_destination", changed, "only the new path"),
-            ("saved_close_recent_rows", 3, "both recorded"),
-            ("paste_discard_recent_rows", 3, "pasted buffer"),
+            ("subsequent_save_destination", changed, "typed text to the new path"),
+            ("saved_close_recent_rows", 2, "one recent target"),
+            ("saved_close_recent_rows", 0, "one recent target"),
             ("paste_editor", changed, "exact clipboard text"),
             ("paste_clipboard", changed, "CJK and emoji paste text"),
             ("sample_home_rows", 0, "sample file inventory"),
             ("sample_version", "b" * 24, "sample version does not match"),
             ("reopen_editor", changed, "direct reopen"),
-            ("recents_reopen_editor", changed, "recent list"),
+            ("recents_open_tabs", 2, "exactly the saved file"),
             ("reopen_recent_count", 11, "exactly ten"),
             ("recents_count_after_restart", 9, "exactly ten"),
             ("recents_rows", 10, "exactly five"),
@@ -228,12 +215,6 @@ class ParserAndIsolationTests(unittest.TestCase):
         # an anonymous by-name lookup would never see them.
         harness = mock.Mock()
         app = object()
-        GOAL_03_HARNESS.welcome_entry_points(harness, app)
-
-        self.assertEqual(
-            [call.args[1] for call in harness.welcome_action.call_args_list],
-            ["welcome-new-file", "welcome-paste", "welcome-open-sample"],
-        )
         GOAL_03_HARNESS.welcome_action(harness, app, HARNESS.WELCOME_SAMPLE_AUTOMATION_ID)
         harness.find_control.assert_called_once_with(
             app,
@@ -312,17 +293,19 @@ def fake_session_harness() -> mock.Mock:
     for name in ("first_session", "cold_reopen", "restart_recents"):
         setattr(harness, name, getattr(GOAL_03_HARNESS, name).__get__(harness))
     state = {"editor": HARNESS.RESAVE_TEXT, "clipboard": None}
-    texts = {}
     harness.state = state
 
-    def paste_editor(_app, value):
+    def replace_editor(_app, value):
         state["editor"] = value
-        texts[HARNESS.fingerprint_text(value)] = value
         return HARNESS.fingerprint_text(value)
 
-    def wait_file(path, expected, _code):
-        runtime.write_durable(path, texts[expected].encode("utf-8"))
-        return runtime.sha256_file(path)
+    def wait_file(path, expected, code):
+        # The fake product saves the editor's text when the harness waits.
+        runtime.write_durable(path, state["editor"].encode("utf-8"))
+        actual = runtime.sha256_file(path)
+        if actual != expected:
+            raise HARNESS_FAILURE(code)
+        return actual
 
     def welcome_action(_app, automation_id):
         return automation_id
@@ -331,7 +314,7 @@ def fake_session_harness() -> mock.Mock:
         if control == HARNESS.WELCOME_PASTE_AUTOMATION_ID:
             state["editor"] = state["clipboard"]
 
-    harness.paste_editor.side_effect = paste_editor
+    harness.replace_editor.side_effect = replace_editor
     harness.wait_file.side_effect = wait_file
     harness.welcome_action.side_effect = welcome_action
     harness.click_control.side_effect = click_control
@@ -340,13 +323,13 @@ def fake_session_harness() -> mock.Mock:
     )
     harness.write_text_clipboard.side_effect = lambda value: state.update(clipboard=value)
     harness.read_text_clipboard.side_effect = lambda: state["clipboard"]
-    created_row = mock.Mock()
-    created_row.element_info.name = "File created.md"
-    harness.wait_recent_controls.return_value = [created_row, mock.Mock()]
-    harness.recent_controls.return_value = []
+    saved_row = mock.Mock()
+    saved_row.element_info.name = "File replace.md"
+    harness.wait_recent_controls.return_value = [saved_row]
+    harness.welcome_entry_points.return_value = 0
     harness.wait_workspace_home.return_value = [mock.Mock()]
     harness.welcome_absent.return_value = True
-    harness.editor_absent_while_running.return_value = True
+    harness.open_tab_count.return_value = 1
     return harness
 
 
@@ -371,29 +354,23 @@ class FirstUseScenarioTests(unittest.TestCase):
                     else None
                 )
                 launches.append((target, seeded))
-                return mock.Mock()
-
-            def launch(target, *_roots, _launch=launch):
                 if target is not None:
                     # The argv reopen shows the saved file.
                     harness.state["editor"] = HARNESS.RESAVE_TEXT
-                return _launch(target, *_roots)
+                return mock.Mock()
 
             harness.launch_app.side_effect = launch
             stale_row = mock.Mock()
             stale_row.element_info.name = "File recent-01.md — Missing"
             stale_row.is_enabled.return_value = False
-            created_row = mock.Mock()
-            created_row.element_info.name = "File created.md"
+            saved_row = RestartRecentsTests.row("File replace.md")
             harness.wait_recent_controls.side_effect = [
-                [created_row, mock.Mock()],
-                [created_row, mock.Mock()],
-                [created_row, *(RestartRecentsTests.row(name) for name in (
+                [saved_row],
+                [saved_row, *(RestartRecentsTests.row(name) for name in (
                     "Workspace workspace", "File recent-00.md")), stale_row,
                  RestartRecentsTests.row("File recent-02.md")],
             ]
             with (
-                mock.patch.object(HARNESS, "STALE_RECENT_OBSERVE_SECONDS", 0),
                 mock.patch.object(HARNESS, "persisted_recent_count", return_value=10),
                 mock.patch.object(
                     HARNESS, "materialized_sample_inventory", return_value=sample_observation()
@@ -402,15 +379,22 @@ class FirstUseScenarioTests(unittest.TestCase):
             ):
                 observations = GOAL_03_HARNESS.scenario_first_use(harness)
 
-        created = (root / "case" / "workspace" / "created.md").resolve()
-        # A clean profile first; the seeded eleven before the argv reopen, and
-        # nothing rewritten by the harness before the restart.
-        self.assertEqual(launches, [(None, None), (created, 11), (None, 11)])
+        saved = (root / "case" / "workspace" / "replace.md").resolve()
+        # A clean profile first; the seeded eleven before the argv reopen of
+        # the overwritten file, and nothing rewritten before the restart.
+        self.assertEqual(launches, [(None, None), (saved, 11), (None, 11)])
         self.assertEqual(harness.reap.call_count, HARNESS.LAUNCH_COUNT)
         required = HARNESS.REQUIRED_OBSERVATIONS[CASE_FIRST_USE] | {"flow", "runtime_scan"}
         self.assertEqual(required - set(observations), set())
+        # The fake run's own observations satisfy the PASS contract (bar the
+        # fakes' process contexts and scan).
+        observations.update(process_contexts=[process_context()] * HARNESS.LAUNCH_COUNT)
+        observations.pop("runtime_scan")
+        checked = valid_evidence()
+        checked["cases"][0]["observations"].update(observations)
+        VALIDATE_EVIDENCE(checked)
 
-    def test_the_first_session_passes_on_the_fake_product(self) -> None:
+    def test_the_first_session_runs_the_phases_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             harness = fake_session_harness()
@@ -418,8 +402,41 @@ class FirstUseScenarioTests(unittest.TestCase):
                 HARNESS, "materialized_sample_inventory", return_value=sample_observation()
             ):
                 observed = harness.first_session(mock.Mock(), workspace, workspace)
+            replaced = workspace / "replace.md"
+            self.assertEqual(replaced.read_text(encoding="utf-8"), HARNESS.RESAVE_TEXT)
         self.assertEqual(observed["paste_editor"], observed["paste_clipboard"])
-        self.assertEqual(observed["saved_close_recent_rows"], 2)
+        self.assertEqual(observed["overwrite_yes_destination"], observed["paste_editor"])
+        self.assertEqual(observed["saved_close_recent_rows"], 1)
+        steps = [
+            (call[0], call[1][1:] if call[0] == "select_existing_save_path" else ())
+            for call in harness.mock_calls
+            if call[0] in {
+                "welcome_entry_points", "click_control", "select_existing_save_path",
+                "wait_title_file", "replace_editor", "save_via_menu", "close_tab_by_keyboard",
+            }
+        ]
+        self.assertEqual(
+            [name for name, _ in steps],
+            [
+                "welcome_entry_points",
+                "click_control",  # Paste
+                "select_existing_save_path",  # No, then the picker's Escape
+                "select_existing_save_path",  # Yes
+                "wait_title_file",
+                "replace_editor",
+                "save_via_menu",
+                "close_tab_by_keyboard",
+                "click_control",  # Open sample
+            ],
+        )
+        self.assertEqual(
+            [call.kwargs for call in harness.select_existing_save_path.call_args_list],
+            [{"replace": False}, {"replace": True}],
+        )
+        harness.wait_title_file.assert_called_once_with(mock.ANY, "replace.md")
+        harness.replace_editor.assert_called_once_with(mock.ANY, HARNESS.RESAVE_TEXT)
+        harness.paste_editor.assert_not_called()
+        harness.click_lifecycle_decision.assert_not_called()
 
     def test_each_behaviour_failure_names_its_phase(self) -> None:
         """A regression fails inside its phase with its own code, before any
@@ -431,56 +448,50 @@ class FirstUseScenarioTests(unittest.TestCase):
 
             return write
 
-        def fail_focus_on_call(number: int):
-            calls = []
-
-            def focus(_app, code):
-                if code == "FOCUS_NOT_RESTORED":
-                    calls.append(code)
-                    if len(calls) == number:
-                        raise HARNESS_FAILURE(code)
-
-            return focus
-
         def other_row_first(harness):
             row = mock.Mock()
             row.element_info.name = "File other.md"
-            harness.wait_recent_controls.return_value = [row, mock.Mock()]
+            harness.wait_recent_controls.return_value = [row]
 
-        def three_rows(harness):
+        def two_rows(harness):
             harness.wait_recent_controls.return_value = (
                 harness.wait_recent_controls.return_value + [mock.Mock()]
             )
 
-        def discard_drops_a_row(harness):
-            rows = harness.wait_recent_controls.return_value
-            harness.wait_recent_controls.side_effect = [rows, rows[:1]]
-
         def paste_other_text(harness):
             harness.click_control.side_effect = lambda *_: harness.state.update(editor="other")
 
+        def overwrite_kept_other_text(harness):
+            # Cancelling changed the buffer: Yes then writes the wrong bytes.
+            harness.select_existing_save_path.side_effect = (
+                lambda *_args, replace: replace or harness.state.update(editor="other")
+            )
+
+        def save_dropped_the_edit(harness):
+            harness.replace_editor.side_effect = lambda _app, value: HARNESS.fingerprint_text(value)
+
         cases = (
             ("WELCOME_PROFILE_NOT_CLEAN",
-             lambda h: setattr(h.recent_controls, "return_value", [mock.Mock()])),
-            ("SAVE_AS_CANCEL_CHANGED_STATE",
-             lambda h: setattr(h.cancel_save_picker, "side_effect", tamper("cancelled.md", b"x"))),
-            ("SAVE_AS_CANCEL_FOCUS_NOT_RESTORED",
-             lambda h: setattr(h.require_source_editor_focus, "side_effect", fail_focus_on_call(1))),
+             lambda h: setattr(h.welcome_entry_points, "return_value", 1)),
+            ("WELCOME_UIA_TIMEOUT",
+             lambda h: setattr(h.welcome_entry_points, "side_effect",
+                               HARNESS_FAILURE("WELCOME_UIA_TIMEOUT"))),
+            ("PASTE_EXACT_TEXT_MISMATCH", paste_other_text),
             ("OVERWRITE_NO_CHANGED_STATE",
              lambda h: setattr(h.select_existing_save_path, "side_effect", tamper("replace.md", b"x"))),
             ("OVERWRITE_NO_FOCUS_NOT_RESTORED",
-             lambda h: setattr(h.require_source_editor_focus, "side_effect", fail_focus_on_call(2))),
+             lambda h: setattr(h.require_source_editor_focus, "side_effect",
+                               HARNESS_FAILURE("FOCUS_NOT_RESTORED"))),
             ("OVERWRITE_NO_NATIVE_OVERWRITE_DIALOG_TIMEOUT",
              lambda h: setattr(h.select_existing_save_path, "side_effect",
                                HARNESS_FAILURE("NATIVE_OVERWRITE_DIALOG_TIMEOUT"))),
-            ("SUBSEQUENT_SAVE_PREVIOUS_PATH_CHANGED",
-             lambda h: setattr(h.save_via_menu, "side_effect", tamper("replace.md", b"x"))),
-            ("SUBSEQUENT_SAVE_CANCELLED_PATH_CHANGED",
-             lambda h: setattr(h.save_via_menu, "side_effect", tamper("cancelled.md", b"x"))),
+            ("OVERWRITE_YES_DESTINATION_TIMEOUT", overwrite_kept_other_text),
+            ("OVERWRITE_YES_TITLE_FILE_TIMEOUT",
+             lambda h: setattr(h.wait_title_file, "side_effect",
+                               HARNESS_FAILURE("TITLE_FILE_TIMEOUT"))),
+            ("SUBSEQUENT_SAVE_DESTINATION_TIMEOUT", save_dropped_the_edit),
             ("SAVED_CLOSE_RECENT_NOT_NEW_PATH", other_row_first),
-            ("SAVED_CLOSE_RECENT_COUNT", three_rows),
-            ("PASTE_EXACT_TEXT_MISMATCH", paste_other_text),
-            ("PASTE_DISCARD_RECENT_CHANGED", discard_drops_a_row),
+            ("SAVED_CLOSE_RECENT_COUNT", two_rows),
         )
         for code, arrange in cases:
             with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
@@ -549,7 +560,14 @@ class RecentControlBehaviorTests(unittest.TestCase):
                 return (property_id, value)
 
         class FakeUIA:
-            UIA_dll = type("UIADll", (), {"UIA_AutomationIdPropertyId": "automation-id"})()
+            UIA_dll = type(
+                "UIADll",
+                (),
+                {
+                    "UIA_AutomationIdPropertyId": "automation-id",
+                    "UIA_ControlTypePropertyId": "control-type",
+                },
+            )()
             iuia = FakeIUIA()
             tree_scope = {"descendants": object()}
             known_control_types = {"Button": 1}
@@ -559,6 +577,7 @@ class RecentControlBehaviorTests(unittest.TestCase):
                 self.automation_id = element.CurrentAutomationId
                 self.control_type = "Button" if element.CurrentControlType == 1 else "Text"
                 self.visible = element.visible
+                self.enabled = element.enabled
 
         class Control:
             def __init__(self, element_info: ElementInfo) -> None:
@@ -567,7 +586,11 @@ class RecentControlBehaviorTests(unittest.TestCase):
             def is_visible(self) -> bool:
                 return self.element_info.visible
 
+            def is_enabled(self) -> bool:
+                return self.element_info.enabled
+
         harness = object.__new__(HARNESS.Goal03Harness)
+        harness.ui_timeout = 0.1
         harness.iuia_class = FakeUIA
         harness.fresh_uia_root = lambda _hwnd: type(
             "Root", (), {"element": RootElement()}
@@ -577,7 +600,9 @@ class RecentControlBehaviorTests(unittest.TestCase):
         return harness
 
     @staticmethod
-    def element(automation_id: str, control_type: int, *, visible: bool = True) -> object:
+    def element(
+        automation_id: str, control_type: int, *, visible: bool = True, enabled: bool = True
+    ) -> object:
         return type(
             "Element",
             (),
@@ -585,8 +610,78 @@ class RecentControlBehaviorTests(unittest.TestCase):
                 "CurrentAutomationId": automation_id,
                 "CurrentControlType": control_type,
                 "visible": visible,
+                "enabled": enabled,
             },
         )()
+
+    def welcome(self, *, recent_rows: int = 0, **overrides: dict) -> list[object]:
+        """The welcome's Buttons: each action once (or as `overrides` says),
+        `recent_rows` recent rows and an unrelated title-row Button."""
+        elements = [self.element("title-settings", 1)]
+        for automation_id in HARNESS.WELCOME_ACTION_AUTOMATION_IDS:
+            options = overrides.get(automation_id, {})
+            elements.extend(
+                self.element(
+                    automation_id,
+                    1,
+                    visible=options.get("visible", True),
+                    enabled=options.get("enabled", True),
+                )
+                for _ in range(options.get("count", 1))
+            )
+        elements.extend(
+            self.element(HARNESS.WELCOME_RECENT_AUTOMATION_ID, 1) for _ in range(recent_rows)
+        )
+        return elements
+
+    def test_welcome_requires_each_action_as_one_enabled_button_in_one_query(self) -> None:
+        app = type("App", (), {"hwnd": 42})()
+        self.assertEqual(self.harness(self.welcome()).welcome_entry_points(app), 0)
+        self.assertEqual(self.harness(self.welcome(recent_rows=2)).welcome_entry_points(app), 2)
+
+        new = HARNESS.WELCOME_NEW_AUTOMATION_ID
+        for overrides, code in (
+            ({new: {"enabled": False}}, "WELCOME_UIA_TIMEOUT"),
+            ({new: {"count": 0}}, "WELCOME_UIA_TIMEOUT"),
+            ({new: {"visible": False}}, "WELCOME_UIA_TIMEOUT"),
+            ({new: {"count": 2}}, "WELCOME_UIA_CONTRACT_MISMATCH"),
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(HARNESS_FAILURE) as raised:
+                self.harness(self.welcome(**overrides)).welcome_entry_points(app)
+            self.assertEqual(raised.exception.code, code)
+
+    def test_welcome_query_failures_keep_their_type(self) -> None:
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            self.harness([], RuntimeError("gone")).welcome_buttons(type("App", (), {"hwnd": 42})())
+        self.assertEqual(
+            (raised.exception.code, raised.exception.detail),
+            ("WELCOME_UIA_QUERY_FAILED", "RuntimeError"),
+        )
+
+    def test_open_tabs_are_counted_by_their_rail_rows(self) -> None:
+        app = type("App", (), {"hwnd": 42})()
+        rows = [self.element(HARNESS.RAIL_FILE_ROW_AUTOMATION_ID, 1)] * 2
+        self.assertEqual(self.harness(rows).open_tab_count(app), 2)
+
+    def test_the_title_file_wait_ends_when_the_active_tab_is_named(self) -> None:
+        app = type("App", (), {"hwnd": 42})()
+        names = iter(["Untitled", "replace.md"])
+
+        def control_by_id(hwnd, automation_id, control_type, code):
+            self.assertEqual(
+                (hwnd, automation_id, control_type, code),
+                (42, "title-file", "Button", "TITLE_FILE_UIA_CONTRACT_MISMATCH"),
+            )
+            control = mock.Mock()
+            control.element_info.name = next(names, "replace.md")
+            return control
+
+        harness = self.harness([])
+        harness.control_by_id = control_by_id
+        harness.wait_title_file(app, "replace.md")
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.wait_title_file(app, "other.md")
+        self.assertEqual(raised.exception.code, "TITLE_FILE_TIMEOUT")
 
     def test_recent_query_returns_every_recent_row_button(self) -> None:
         elements = [
@@ -633,8 +728,8 @@ class RecentControlBehaviorTests(unittest.TestCase):
 
 class RestartRecentsTests(unittest.TestCase):
     """The restart phase: five rows, the stale one disabled and named
-    `File <name> — Missing`, a real press on it opens nothing, and the saved
-    file reopens from its row."""
+    `File <name> — Missing`; a real press on it, then a click on the saved
+    row, leaves exactly the saved file open."""
 
     @staticmethod
     def row(name: str, *, enabled: bool = True) -> mock.Mock:
@@ -647,39 +742,54 @@ class RestartRecentsTests(unittest.TestCase):
         self, stale: mock.Mock, arrange=lambda harness, rows: None, count: int = 10
     ) -> tuple[mock.Mock, dict, mock.Mock]:
         harness = fake_session_harness()
-        saved_row = self.row("File created.md")
+        saved_row = self.row("File replace.md")
         rows = [saved_row, self.row("Workspace workspace"), self.row("File recent-00.md"), stale,
                 self.row("File recent-02.md")]
         harness.wait_recent_controls.return_value = rows
         arrange(harness, rows)
-        with (
-            mock.patch.object(HARNESS, "STALE_RECENT_OBSERVE_SECONDS", 0),
-            mock.patch.object(HARNESS, "persisted_recent_count", return_value=count),
-        ):
+        with mock.patch.object(HARNESS, "persisted_recent_count", return_value=count):
             observed = harness.restart_recents(
-                mock.Mock(),
-                Path("config"),
-                Path("recent-01.md"),
-                Path("created.md"),
-                HARNESS.fingerprint_text(HARNESS.RESAVE_TEXT),
+                mock.Mock(), Path("config"), Path("recent-01.md"), Path("replace.md")
             )
         return harness, observed, saved_row
 
-    def test_a_disabled_missing_row_is_pressed_and_opens_nothing(self) -> None:
-        stale = self.row("File recent-01.md \u2014 Missing", enabled=False)
+    def test_the_saved_row_fences_the_stale_press_before_the_tabs_are_counted(self) -> None:
+        stale = self.row("File recent-01.md — Missing", enabled=False)
         harness, observed, saved_row = self.run_phase(stale)
-        harness.hold_control.assert_called_once_with(
-            mock.ANY, stale, HARNESS.STALE_RECENT_PRESS_SECONDS, "STALE_PRESS_FAILED"
-        )
-        harness.click_control.assert_called_once_with(saved_row, "SAVED_ROW_CLICK_FAILED")
+        fence = [
+            call
+            for call in harness.mock_calls
+            if call[0] in {
+                "hold_control", "click_control", "wait_title_file", "sleep", "open_tab_count",
+                "close_app",
+            }
+        ]
         self.assertEqual(
-            {key: observed[key] for key in ("recents_rows", "recents_disabled_rows", "recents_count_after_restart")},
-            {"recents_rows": 5, "recents_disabled_rows": 1, "recents_count_after_restart": 10},
+            fence,
+            [
+                mock.call.hold_control(
+                    mock.ANY, stale, HARNESS.STALE_RECENT_PRESS_SECONDS, "STALE_PRESS_FAILED"
+                ),
+                mock.call.click_control(saved_row, "SAVED_ROW_CLICK_FAILED"),
+                mock.call.wait_title_file(mock.ANY, "replace.md"),
+                mock.call.sleep(HARNESS.OPEN_TABS_SETTLE_SECONDS),
+                mock.call.open_tab_count(mock.ANY),
+                mock.call.close_app(mock.ANY),
+            ],
+        )
+        # No clipboard read: the title row and the tab count prove the reopen.
+        harness.editor_fingerprint.assert_not_called()
+        self.assertEqual(
+            {key: observed[key] for key in (
+                "recents_rows", "recents_disabled_rows", "recents_open_tabs",
+                "recents_count_after_restart")},
+            {"recents_rows": 5, "recents_disabled_rows": 1, "recents_open_tabs": 1,
+             "recents_count_after_restart": 10},
         )
 
     def test_an_enabled_or_unmarked_stale_row_fails(self) -> None:
         for stale in (
-            self.row("File recent-01.md \u2014 Missing", enabled=True),
+            self.row("File recent-01.md — Missing", enabled=True),
             self.row("File recent-01.md", enabled=False),
         ):
             with self.subTest(name=stale.element_info.name), self.assertRaises(
@@ -691,32 +801,25 @@ class RestartRecentsTests(unittest.TestCase):
     def test_each_restart_failure_names_its_phase(self) -> None:
         stale = self.row("File recent-01.md — Missing", enabled=False)
 
-        def set_editor(text):
-            return lambda harness, _rows: harness.state.update(editor=text)
-
         for code, arrange, count in (
             ("RECENTS_ROW_COUNT", lambda _h, rows: rows.append(self.row("File more.md")), 10),
             ("RECENTS_DISABLED_COUNT", lambda _h, rows: rows[2].is_enabled.configure_mock(
                 return_value=False), 10),
             ("RECENTS_STALE_UIA_CONTRACT_MISMATCH",
              lambda _h, rows: rows.__setitem__(4, self.row("File recent-01.md copy")), 10),
-            ("RECENTS_STALE_OPENED_DOCUMENT",
-             lambda h, _rows: setattr(h.editor_absent_while_running, "return_value", False), 10),
+            # A stale press that opened something, or a mis-hit neighbour.
+            ("RECENTS_EXTRA_TAB_OPENED",
+             lambda h, _rows: setattr(h.open_tab_count, "return_value", 2), 10),
             ("RECENTS_SAVED_ROW_UIA_CONTRACT_MISMATCH",
              lambda _h, rows: rows.__setitem__(0, self.row("File renamed.md")), 10),
-            ("RECENTS_EXACT_TEXT_MISMATCH", set_editor("other"), 10),
+            ("RECENTS_TITLE_FILE_TIMEOUT",
+             lambda h, _rows: setattr(h.wait_title_file, "side_effect",
+                                      HARNESS_FAILURE("TITLE_FILE_TIMEOUT")), 10),
             ("RECENTS_RECENT_BOUND_NOT_TEN", lambda _h, _rows: None, 11),
         ):
             with self.subTest(code=code), self.assertRaises(HARNESS_FAILURE) as raised:
                 self.run_phase(stale, arrange, count)
             self.assertEqual(raised.exception.code, code)
-
-    def test_the_stale_press_must_keep_opening_nothing(self) -> None:
-        polls = iter([True, True, False])
-        with self.assertRaises(HARNESS_FAILURE) as raised:
-            HARNESS.require_for(lambda: next(polls), 5.0, "STALE_OPENED_DOCUMENT")
-        self.assertEqual(raised.exception.code, "STALE_OPENED_DOCUMENT")
-        HARNESS.require_for(lambda: True, 0.1, "STALE_OPENED_DOCUMENT")
 
 
 class RuntimeArtifactPrivacyTests(unittest.TestCase):
