@@ -30,6 +30,49 @@ impl std::io::Write for LogTee {
 
 static INIT: Once = Once::new();
 
+/// The crates whose records follow `RUST_LOG`. A dependency's debug record
+/// can quote the document it parses (html5ever logs every token), so other
+/// crates log errors only, whatever `RUST_LOG` asks for.
+const OWN_CRATES: [&str; 3] = ["markturbo", "mt_app", "mt_core"];
+
+fn own_target(target: &str) -> bool {
+    OWN_CRATES.iter().any(|name| {
+        target
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
+/// `env_logger` with dependencies capped at `Error`.
+struct OwnRecords(env_logger::Logger);
+
+impl log::Log for OwnRecords {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        (own_target(metadata.target()) || metadata.level() <= log::Level::Error)
+            && self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+/// Installs `builder`'s logger behind the dependency cap, unless a logger is
+/// already installed.
+fn try_install(mut builder: env_logger::Builder) {
+    let logger = builder.build();
+    let max = logger.filter();
+    if log::set_boxed_logger(Box::new(OwnRecords(logger))).is_ok() {
+        log::set_max_level(max);
+    }
+}
+
 /// Claims tracing's dispatcher so dependency events can never reach the log.
 ///
 /// `genai` traces complete provider response bodies. Where a dependency enables
@@ -49,14 +92,14 @@ pub fn init() {
     claim_tracing_dispatcher();
     INIT.call_once(|| {
         let Some(path) = mt_core::runtime_paths::log_path() else {
-            let _ = env_logger::try_init();
+            try_install(env_logger::Builder::from_default_env());
             return;
         };
         if let Some(directory) = path.parent()
             && let Err(error) = std::fs::create_dir_all(directory)
         {
             eprintln!("markturbo: cannot create log directory {directory:?}: {error}");
-            let _ = env_logger::try_init();
+            try_install(env_logger::Builder::from_default_env());
             return;
         }
         let Ok(mut file) = std::fs::OpenOptions::new()
@@ -64,16 +107,16 @@ pub fn init() {
             .append(true)
             .open(&path)
         else {
-            let _ = env_logger::try_init();
+            try_install(env_logger::Builder::from_default_env());
             return;
         };
 
         if let Ok(tee_file) = file.try_clone() {
-            let _ = env_logger::Builder::from_default_env()
-                .target(env_logger::Target::Pipe(Box::new(LogTee {
-                    file: tee_file,
-                })))
-                .try_init();
+            let mut builder = env_logger::Builder::from_default_env();
+            builder.target(env_logger::Target::Pipe(Box::new(LogTee {
+                file: tee_file,
+            })));
+            try_install(builder);
         }
         let _ = writeln!(
             file,
@@ -177,6 +220,58 @@ mod tests {
                 "{case}: {}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn a_raised_rust_log_keeps_dependency_debug_records_out_of_the_log() {
+        const CHILD_CASE: &str = "MARKTURBO_DEPENDENCY_LOG_TEST";
+        const CANARY: &str = "MARKTURBO_DEPENDENCY_LOG_CANARY";
+        const OWN: &str = "MARKTURBO_OWN_DEBUG_RECORD";
+        if std::env::var_os(CHILD_CASE).is_some() {
+            super::init();
+            // What html5ever logs while it parses a document's comment.
+            log::debug!(target: "html5ever::tree_builder", "processing {CANARY}");
+            log::debug!(target: "mt_app::logging", "{OWN}");
+            log::logger().flush();
+            return;
+        }
+
+        let temporary = tempfile::tempdir().expect("test data directory");
+        let data_dir = temporary.path().join("data");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "logging::tests::a_raised_rust_log_keeps_dependency_debug_records_out_of_the_log",
+                "--nocapture",
+            ])
+            .env(CHILD_CASE, "1")
+            .env("RUST_LOG", "debug")
+            .env("MARKTURBO_DATA_DIR", &data_dir)
+            .output()
+            .expect("run the logging child");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = std::fs::read_dir(data_dir.join("logs"))
+            .expect("the child wrote its log directory")
+            .map(|entry| {
+                std::fs::read_to_string(entry.expect("log entry").path()).expect("read the log")
+            })
+            .collect::<String>();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            log.contains(OWN),
+            "the app's own debug record is kept: {log:?}"
+        );
+        for (what, text) in [("log", log.as_str()), ("stderr", stderr.as_ref())] {
+            assert!(
+                !text.contains(CANARY),
+                "a dependency's debug record reached the {what}"
             );
         }
     }
