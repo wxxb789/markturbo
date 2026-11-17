@@ -40,9 +40,25 @@ def loopback_request(operation: str) -> dict[str, object]:
     }
 
 
+def chain_server(source: str = HARNESS.EDITOR_SOURCE_TEXT) -> PROVIDER.LoopbackRevisionServer:
+    server = PROVIDER.LoopbackRevisionServer()
+    server.begin_chain(source)
+    return server
+
+
+def post(server: PROVIDER.LoopbackRevisionServer, payload: dict[str, object]) -> bytes:
+    request = urllib.request.Request(
+        server.base_url + "responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request) as response:
+        return response.read()
+
+
 class LoopbackProviderTests(unittest.TestCase):
     def test_server_is_loopback_deterministic_and_content_free(self) -> None:
-        with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
+        with chain_server() as server:
             server.grant_review_consent()
             server.dispatch_consent_click(0, lambda: None)
             for operation in ("review", "revision"):
@@ -100,13 +116,14 @@ class LoopbackProviderTests(unittest.TestCase):
             self.assertFalse(server.requests[0]["stream"])
             self.assertTrue(server.requests[1]["stream"])
             self.assertEqual(server.request_snapshot()["request_count"], 2)
-            self.assertEqual(server.contract_evidence()["provider_request_count"], 2)
+            server.verify_chain()
+            self.assertEqual(server.request_count, 2)
             self.assertTrue(
                 all(record["request_after_consent_click"] for record in server.requests)
             )
 
     def test_server_rejects_request_after_gate_but_before_click_marker(self) -> None:
-        with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
+        with chain_server() as server:
             server.grant_review_consent()
             request = urllib.request.Request(
                 server.base_url + "responses",
@@ -123,7 +140,7 @@ class LoopbackProviderTests(unittest.TestCase):
     def test_server_rejects_the_wrong_stream_mode_for_each_operation(self) -> None:
         for operation in ("review", "revision"):
             with self.subTest(operation=operation):
-                with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
+                with chain_server() as server:
                     server.grant_review_consent()
                     server.dispatch_consent_click(0, lambda: None)
                     if operation == "revision":
@@ -150,7 +167,7 @@ class LoopbackProviderTests(unittest.TestCase):
                     self.assertTrue(server.request_snapshot()["invalid_request"])
 
     def test_request_arrival_sequence_cannot_be_reordered_by_slow_body_validation(self) -> None:
-        with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
+        with chain_server() as server:
             server.grant_review_consent()
             payload = loopback_request("review")
             arrival = server._next_event_sequence()
@@ -162,7 +179,7 @@ class LoopbackProviderTests(unittest.TestCase):
             self.assertEqual(failure, "LOOPBACK_REQUEST_BEFORE_CONSENT_CLICK")
 
     def test_server_rejects_wrong_path_and_request_before_consent(self) -> None:
-        with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
+        with chain_server() as server:
             body = json.dumps(loopback_request("review")).encode("utf-8")
             request = urllib.request.Request(
                 server.base_url + "wrong",
@@ -173,7 +190,7 @@ class LoopbackProviderTests(unittest.TestCase):
                 urllib.request.urlopen(request)
             raised.exception.close()
 
-        with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
+        with chain_server() as server:
             request = urllib.request.Request(
                 server.base_url + "responses",
                 data=body,
@@ -187,7 +204,7 @@ class LoopbackProviderTests(unittest.TestCase):
             )
 
     def test_server_rejects_wrong_fixture_binding_and_missing_answer(self) -> None:
-        with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
+        with chain_server() as server:
             server.grant_review_consent()
             server.dispatch_consent_click(0, lambda: None)
             review = urllib.request.Request(
@@ -212,7 +229,43 @@ class LoopbackProviderTests(unittest.TestCase):
                 urllib.request.urlopen(request)
             raised.exception.close()
             with self.assertRaisesRegex(runtime.HarnessFailure, "SOURCE_SHA256"):
-                server.contract_evidence()
+                server.verify_chain()
+
+    def test_each_chain_needs_its_own_source_and_consent_and_counts_toward_the_total(self) -> None:
+        with PROVIDER.LoopbackRevisionServer() as server:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                post(server, loopback_request("review"))
+            raised.exception.close()
+            self.assertTrue(server.request_snapshot()["invalid_request"])
+            with self.assertRaisesRegex(runtime.HarnessFailure, "LOOPBACK_CHAIN_NOT_STARTED"):
+                server.verify_chain()
+
+        with PROVIDER.LoopbackRevisionServer() as server:
+            for chain in range(3):
+                with self.subTest(chain=chain):
+                    server.begin_chain(HARNESS.EDITOR_SOURCE_TEXT)
+                    self.assertEqual(
+                        server.request_snapshot(), {"request_count": 0, "invalid_request": False}
+                    )
+                    with self.assertRaisesRegex(runtime.HarnessFailure, "SEQUENCE_INCOMPLETE"):
+                        server.verify_chain()
+                    server.grant_review_consent()
+                    server.dispatch_consent_click(0, lambda: None)
+                    post(server, loopback_request("review"))
+                    server.grant_revision_consent()
+                    server.dispatch_consent_click(1, lambda: None)
+                    post(server, loopback_request("revision"))
+                    server.verify_chain()
+            self.assertEqual(server.request_count, 6)
+
+            # A new chain starts with its consent gates closed.
+            server.begin_chain(HARNESS.EDITOR_SOURCE_TEXT)
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                post(server, loopback_request("review"))
+            raised.exception.close()
+            with self.assertRaisesRegex(runtime.HarnessFailure, "LOOPBACK_REQUEST_BEFORE_CONSENT"):
+                server.verify_chain()
+            self.assertEqual(server.request_count, 6)
 
     def test_revision_response_uses_utf8_byte_ranges_and_complete_coverage(self) -> None:
         decoded = json.loads(PROVIDER.revision_response(HARNESS.EDITOR_SOURCE_TEXT))
