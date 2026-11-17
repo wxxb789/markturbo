@@ -518,8 +518,14 @@ pub struct SearchHit {
 }
 
 impl AppState {
+    /// The state over the platform's secure store; in a test build, over
+    /// this process's in-memory store instead (the `test_vault` module).
     pub fn new() -> Self {
-        Self::build(CredentialVault::production())
+        #[cfg(not(any(test, feature = "test-vault")))]
+        let vault = CredentialVault::production();
+        #[cfg(any(test, feature = "test-vault"))]
+        let vault = crate::test_vault::vault();
+        Self::build(vault)
     }
 
     /// The state with the credential vault given: a test passes its own
