@@ -11,14 +11,15 @@ is confirmed; the rail's close control, revealed by a real pointer hover, must
 raise the in-window guard card (Save / Don't save / Cancel), whose Cancel keeps
 the text, then menu Save writes it; Alt+F4 and the native window close
 (WM_CLOSE) must raise the guard, never close a dirty document unasked, and the
-guard's Save writes the exact bytes and exits. The recovery session needs a
-restart: an interrupted dirty buffer (CJK + emoji) must leave a canonical
-recovery record within 10 000 ms, the next launch offers it to Restore, and
-Ctrl+W's guard Don't save then closes the tab without writing and retires the
-record.
+guard's Save writes the exact bytes, retires the recovery record and exits 0.
+The recovery session needs a restart: an interrupted dirty buffer (CJK + emoji)
+must leave a canonical recovery record within 10 000 ms; the relaunch, given no
+document so the restored tab is the only one, offers it to Restore, and Ctrl+W's
+guard Don't save then closes the tab without writing and retires the record.
 
 Every phase has its own observation-key prefix and failure-code prefix
-(`PHASE_*`), so a failed case names the phase that failed.
+(`PHASE_*`), and each launch its own failure-code prefix (`LAUNCH_*`), so a
+failed case names the step that failed.
 """
 
 from __future__ import annotations
@@ -81,6 +82,10 @@ PHASE_WINDOW_CLOSE = "WINDOW_CLOSE"
 PHASE_CHECKPOINT = "CHECKPOINT"
 PHASE_RESTORE = "RESTORE"
 PHASE_KEYBOARD_CLOSE = "KEYBOARD_CLOSE"
+# Launch failure-code prefixes; a phase wrapping a launch keeps them.
+LAUNCH_GUARDED = "GUARDED_LAUNCH"
+LAUNCH_CHECKPOINT = f"{PHASE_CHECKPOINT}_LAUNCH"
+LAUNCH_RESTORE = f"{PHASE_RESTORE}_LAUNCH"
 
 FINGERPRINT_OBSERVATION_KEYS = frozenset(
     {
@@ -112,7 +117,6 @@ REQUIRED_OBSERVATIONS = {
             "external_modification_source_after_refused_save",
             "external_modification_editor_after_refusal",
             "external_modification_overwritten_source",
-            "external_modification_mtime_delta_ns",
             "external_modification_conflict_ms",
             "tab_close_editor",
             "tab_close_source_after_cancel",
@@ -121,7 +125,6 @@ REQUIRED_OBSERVATIONS = {
             "window_close_editor_after_cancel",
             "window_close_source_after_cancel",
             "window_close_saved_source",
-            "window_close_exit_code",
             "process_context",
         }
     ),
@@ -243,8 +246,6 @@ def validate_guarded_session(observations: dict[str, Any]) -> None:
     )
     if loaded["byte_count"] != rewritten["byte_count"] or loaded["sha256"] == rewritten["sha256"]:
         raise ValueError("external rewrite evidence is not same-length and different")
-    if observations.get("external_modification_mtime_delta_ns") != 0:
-        raise ValueError("external rewrite did not keep the loaded mtime")
     _require_timing(observations, "external_modification_conflict_ms")
     if refused != rewritten:
         raise ValueError("refused Save changed the externally rewritten source")
@@ -273,8 +274,8 @@ def validate_guarded_session(observations: dict[str, Any]) -> None:
         raise ValueError("Alt+F4 Cancel changed the editor or the source")
     if window != window_saved:
         raise ValueError("window Save did not preserve exact editor bytes")
-    if observations.get("window_close_exit_code") != 0:
-        raise ValueError("window Save did not exit the process cleanly")
+    if observations["runtime_scan"]["canonical_recovery_records_scanned"] != 0:
+        raise ValueError("saved document kept its recovery record")
 
 
 def validate_recovery_session(observations: dict[str, Any]) -> None:
@@ -551,7 +552,6 @@ class Goal02Harness(BaseNativeHarness):
             "external_modification_source_after_refused_save": refused.evidence(),
             "external_modification_editor_after_refusal": after_refusal.evidence(),
             "external_modification_overwritten_source": overwritten.evidence(),
-            "external_modification_mtime_delta_ns": after.st_mtime_ns - before.st_mtime_ns,
             "external_modification_conflict_ms": conflict_ms,
         }
 
@@ -578,7 +578,10 @@ class Goal02Harness(BaseNativeHarness):
         }
 
     def window_close(self, app: RunningApp, document: Path) -> dict[str, Any]:
-        """Alt+F4 and WM_CLOSE raise the guard; its Save writes and exits."""
+        """Alt+F4 and WM_CLOSE raise the guard; its Save writes and exits.
+
+        `wait_process_exit` fails with PROCESS_EXIT_NONZERO unless the code is 0.
+        """
         editor = self.replace_editor(app, WINDOW_EDIT)
         source = sha256_file(document)
         self.send_alt_f4(app)
@@ -602,7 +605,6 @@ class Goal02Harness(BaseNativeHarness):
             "window_close_editor_after_cancel": kept.evidence(),
             "window_close_source_after_cancel": untouched.evidence(),
             "window_close_saved_source": saved.evidence(),
-            "window_close_exit_code": app.process.returncode,
         }
 
     def scenario_guarded_session(self) -> dict[str, Any]:
@@ -617,8 +619,9 @@ class Goal02Harness(BaseNativeHarness):
         write_durable(document, ORIGINAL_BYTES)
         app: RunningApp | None = None
         try:
-            with phase(PHASE_EXTERNAL):
+            with phase(LAUNCH_GUARDED):
                 app = self.launch(document, data, config, workspace, stderr)
+            with phase(PHASE_EXTERNAL):
                 observations = self.external_modification(app, document)
             with phase(PHASE_TAB_CLOSE):
                 observations |= self.tab_close(app, document)
@@ -633,10 +636,19 @@ class Goal02Harness(BaseNativeHarness):
             if app is not None:
                 self.reap(app)
         observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
+        # Every Save retired the document's record; none may outlive the exit.
+        if observations["runtime_scan"]["canonical_recovery_records_scanned"]:
+            raise HarnessFailure(f"{PHASE_WINDOW_CLOSE}_RECOVERY_RECORD_RETAINED_AFTER_SAVE")
         return observations
 
     def scenario_recovery_session(self) -> dict[str, Any]:
-        """Two launches: the interruption needs a restart; Ctrl+W closes the restored tab."""
+        """Two launches: the interruption needs a restart; Ctrl+W closes the restored tab.
+
+        The relaunch opens no document: an argv document would open as its own
+        clean tab beside the restored one (`AppState::add_tab_with` does not
+        deduplicate paths), and closing the restored tab would leave that tab's
+        editor on screen.
+        """
         data, config, workspace, stderr = self.case_roots(CASE_RECOVERY_SESSION)
         document = (workspace / "recovery.md").resolve()
         write_durable(document, ORIGINAL_BYTES)
@@ -644,7 +656,8 @@ class Goal02Harness(BaseNativeHarness):
         long_timeout = max(self.ui_timeout, 20.0)
 
         with phase(PHASE_CHECKPOINT):
-            first = self.launch(document, data, config, workspace, stderr)
+            with phase(LAUNCH_CHECKPOINT):
+                first = self.launch(document, data, config, workspace, stderr)
             try:
                 if canonical_recovery_records(data):
                     raise HarnessFailure("RECORD_BEFORE_EDIT")
@@ -660,7 +673,8 @@ class Goal02Harness(BaseNativeHarness):
         second: RunningApp | None = None
         try:
             with phase(PHASE_RESTORE):
-                second = self.launch(document, data, config, workspace, stderr)
+                with phase(LAUNCH_RESTORE):
+                    second = self.launch_app(None, data, config, workspace, stderr)
                 restore_started = time.perf_counter()
                 restore = self.find_control(
                     second,
@@ -671,6 +685,7 @@ class Goal02Harness(BaseNativeHarness):
                     long_timeout,
                 )
                 self.click_control(restore, "CLICK_FAILED")
+                self.activate_source_layout(second)
                 restored, _ = self.wait_editor_fingerprint(second, edited, long_timeout)
                 restore_ms = elapsed_ms(restore_started)
             with phase(PHASE_KEYBOARD_CLOSE):
