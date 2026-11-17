@@ -1453,42 +1453,6 @@ class SystemAlertTests(unittest.TestCase):
 
 
 class SourceEditorTests(unittest.TestCase):
-    def test_paste_editor_pastes_one_os_clipboard_text(self) -> None:
-        events = []
-
-        class FakeWin32:
-            def send_shortcut(self, hwnd, key):
-                events.append(("shortcut", hwnd, key))
-
-        class FakeHarness:
-            ui_timeout = 1.0
-            win32 = FakeWin32()
-
-            def write_text_clipboard(self, value):
-                events.append(("write", value))
-
-            def focus_editor(self, app):
-                events.append(("focus", app.hwnd))
-
-            def wait_editor_fingerprint(self, app, expected, timeout):
-                events.append(("wait", timeout))
-                return expected, 0.0
-
-        app = type("App", (), {"hwnd": 42})()
-        result = runtime.NativeHarness.paste_editor(FakeHarness(), app, "emoji \U0001f680")
-
-        self.assertEqual(result, runtime.fingerprint_text("emoji \U0001f680"))
-        self.assertEqual(
-            events,
-            [
-                ("write", "emoji \U0001f680"),
-                ("focus", 42),
-                ("shortcut", 42, runtime.VK_A),
-                ("shortcut", 42, runtime.VK_V),
-                ("wait", 1.0),
-            ],
-        )
-
     def test_source_editor_focus_reads_uia_without_refocusing(self) -> None:
         class FakeControl:
             def has_keyboard_focus(self):

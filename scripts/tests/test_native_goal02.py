@@ -688,7 +688,14 @@ class RuntimeArtifactTests(unittest.TestCase):
                     raise PermissionError(secret)
                 return original_read_bytes(path)
 
-            with mock.patch.object(Path, "read_bytes", new=denied):
+            original_open = HARNESS.open_shared_for_read
+
+            def denied_open(path: Path):
+                if path == record:
+                    raise PermissionError(secret)
+                return original_open(path)
+
+            with mock.patch.object(HARNESS, "open_shared_for_read", new=denied_open):
                 with self.assertRaises(runtime.HarnessFailure) as live:
                     HARNESS.scan_live_recovery_records(data)
             self.assertEqual(live.exception.code, "LIVE_RECOVERY_RECORD_SCAN_FAILED")

@@ -142,7 +142,6 @@ VK_A = 0x41
 VK_BACK = 0x08
 VK_C = 0x43
 VK_RETURN = 0x0D
-VK_V = 0x56
 VK_Z = 0x5A
 VK_S = 0x53
 VK_W = 0x57
@@ -2691,17 +2690,6 @@ class NativeHarness:
             interval=0.025,
         )
 
-    def paste_editor(self, app: RunningApp, value: str) -> Fingerprint:
-        """Replace the document with one OS paste (Ctrl+A, Ctrl+V), unlike
-        `replace_editor`'s typed input. The session restores the user's
-        clipboard when the run ends."""
-        self.write_text_clipboard(value)
-        self.focus_editor(app)
-        self.win32.send_shortcut(app.hwnd, VK_A)
-        self.win32.send_shortcut(app.hwnd, VK_V)
-        actual, _ = self.wait_editor_fingerprint(app, fingerprint_text(value), self.ui_timeout)
-        return actual
-
 
 def _completion_status(returncode: int) -> str:
     return {0: "PASS", 1: "FAIL", 2: "BLOCKED"}[returncode]
@@ -3104,7 +3092,6 @@ __all__ = [
     "VK_CONTROL",
     "VK_RETURN",
     "VK_S",
-    "VK_V",
     "VK_W",
     "VK_Z",
     "Fingerprint",

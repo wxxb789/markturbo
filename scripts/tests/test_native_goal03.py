@@ -435,7 +435,6 @@ class FirstUseScenarioTests(unittest.TestCase):
         )
         harness.wait_title_file.assert_called_once_with(mock.ANY, "replace.md")
         harness.replace_editor.assert_called_once_with(mock.ANY, HARNESS.RESAVE_TEXT)
-        harness.paste_editor.assert_not_called()
         harness.click_lifecycle_decision.assert_not_called()
 
     def test_each_behaviour_failure_names_its_phase(self) -> None:

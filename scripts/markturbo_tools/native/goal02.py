@@ -54,6 +54,7 @@ from .runtime import (
     key_input,
     load_pywinauto,
     main_native_acceptance,
+    open_shared_for_read,
     phase,
     preflight,
     safe_exception_name,
@@ -339,7 +340,8 @@ def scan_live_recovery_records(data_root: Path) -> dict[str, Any]:
     fingerprints = []
     for path in records:
         try:
-            value = path.read_bytes()
+            with open_shared_for_read(path) as handle:
+                value = handle.read()
         except OSError as error:
             raise HarnessFailure(
                 "LIVE_RECOVERY_RECORD_SCAN_FAILED", safe_exception_name(error)
