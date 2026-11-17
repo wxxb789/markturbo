@@ -605,6 +605,59 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         harness.win32.press_and_hold.assert_called_once_with(73, 182, 58, 1.8)
         self.assertEqual((control.click_count, control.invoke_count), (0, 0))
 
+    def test_wait_name_retries_a_query_that_fails_while_the_ui_rebuilds(self) -> None:
+        harness = native_harness(FreshRootFactory([FakeRoot()]), timeout=1.0)
+        harness.controls_by_name = mock.Mock(
+            side_effect=[RuntimeError("element gone"), [], [object()]]
+        )
+
+        harness.wait_name(running_app(), "0 of 2 decided", "Text", "PROPOSAL_TIMEOUT")
+
+        self.assertEqual(harness.controls_by_name.call_count, 3)
+
+        harness.controls_by_name = mock.Mock(side_effect=RuntimeError("element gone"))
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.wait_name(running_app(), "0 of 2 decided", "Text", "PROPOSAL_TIMEOUT", 0.1)
+        self.assertEqual(
+            (raised.exception.code, raised.exception.detail), ("PROPOSAL_TIMEOUT", "RuntimeError")
+        )
+
+    def test_a_file_wait_reports_only_how_the_bytes_differ(self) -> None:
+        harness = native_harness(FreshRootFactory([FakeRoot()]), timeout=0.05)
+        expected = runtime.fingerprint_bytes(b"expected bytes")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "document.md"
+            for content, relation in (
+                (None, "FileUnreadable"),
+                (b"short", "FileShorter"),
+                (b"expected bytes and more", "FileLonger"),
+                (b"EXPECTED BYTES", "FileSameLength"),
+            ):
+                with self.subTest(relation=relation):
+                    if content is not None:
+                        path.write_bytes(content)
+                    with self.assertRaises(runtime.HarnessFailure) as raised:
+                        harness.wait_file(path, expected, "DESTINATION_TIMEOUT")
+                    self.assertEqual(
+                        (raised.exception.code, raised.exception.detail),
+                        ("DESTINATION_TIMEOUT", relation),
+                    )
+
+    def test_hold_control_waits_for_a_gliding_control_to_settle(self) -> None:
+        rectangles = [
+            mock.Mock(left=0, right=164, top=0, bottom=36),
+            mock.Mock(left=60, right=224, top=20, bottom=56),
+            mock.Mock(left=100, right=264, top=40, bottom=76),
+        ]
+        control = mock.Mock()
+        control.rectangle.side_effect = rectangles + [rectangles[-1]] * 10
+        harness = native_harness(FreshRootFactory([FakeRoot()]), timeout=1.0)
+        harness.win32 = mock.Mock()
+
+        harness.hold_control(running_app(), control, 1.8, "HOLD_FAILED")
+
+        harness.win32.press_and_hold.assert_called_once_with(73, 182, 58, 1.8)
+
     def test_find_control_refreshes_root_after_a_stale_lookup(self) -> None:
         stale = FakeRoot()
         current_control = FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")
@@ -909,6 +962,8 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         with self.assertRaises(runtime.HarnessFailure) as wrong_timeout:
             wrong.wait_editor_fingerprint(running_app(), runtime.fingerprint_text("expected"), 0.001)
         self.assertEqual(wrong_timeout.exception.code, "EDITOR_EXACT_BYTES_TIMEOUT")
+        # Only the byte-length relation leaves the harness, never the text.
+        self.assertEqual(wrong_timeout.exception.detail, "EditorShorter")
 
         silent = FakeEditorWin32("UNIQUE-DOCUMENT-CONTENT", copies=[None] * 1000)
         uncopyable, _editor = editor_harness(silent, timeout=0.001)

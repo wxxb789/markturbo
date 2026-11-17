@@ -303,11 +303,8 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
     disk = fingerprint_bytes(SOURCE_BYTES)
     edited = fingerprint_text(STALE_EDIT_TEXT)
     html_applied = apply_edits(HTML_EDITOR_SOURCE_BYTES, html_edits)
-    proposed_line = next(
-        line
-        for line in html_applied.decode("utf-8").split("\n")
-        if html_edits[0]["replacement"] in line
-    )
+    # The field shows the hunk's replacement itself, not the line around it.
+    proposed = html_edits[0]["replacement"]
     expected = {
         "decisions_editor_before": reviewed,
         "decisions_editor_proposed": reviewed,
@@ -326,7 +323,7 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
         "stale_disk_before": disk,
         "stale_disk_after": disk,
         "trust_editor_proposed": fingerprint_bytes(HTML_EDITOR_SOURCE_BYTES),
-        "trust_proposal_after": fingerprint_text(proposed_line),
+        "trust_proposal_after": fingerprint_text(proposed),
         "trust_editor_done": fingerprint_bytes(html_applied),
     }
     return {key: value.evidence() for key, value in expected.items()}
@@ -595,8 +592,13 @@ class Goal07Harness(NativeHarness):
             expected_request_count=0,
             open_gate=provider.grant_review_consent,
         )
-        self.wait_name(
-            app, REVIEW_RESULT_MARKER, "Text", "REVIEW_RESULT_UIA_TIMEOUT", max(self.ui_timeout, 60.0)
+        self._wait_for_provider_answer(
+            app,
+            provider,
+            REVIEW_RESULT_MARKER,
+            1,
+            "REVIEW_RESULT_UIA_TIMEOUT",
+            "REVIEW_REQUEST_NOT_SENT",
         )
 
     def _set_answer(self, app: Any, value: str) -> None:
@@ -619,13 +621,35 @@ class Goal07Harness(NativeHarness):
             expected_request_count=1,
             open_gate=provider.grant_revision_consent,
         )
-        self.wait_name(
+        self._wait_for_provider_answer(
             app,
+            provider,
             f"0 of {hunks} decided",
-            "Text",
+            2,
             "REVISION_PROPOSAL_UIA_TIMEOUT",
-            max(self.ui_timeout, 60.0),
+            "REVISION_REQUEST_NOT_SENT",
         )
+
+    def _wait_for_provider_answer(
+        self,
+        app: Any,
+        provider: provider_fixtures.LoopbackRevisionServer,
+        name: str,
+        requests: int,
+        timeout_code: str,
+        not_sent_code: str,
+    ) -> None:
+        """Wait for the UI to show the provider's answer; when it never does,
+        tell a request the consent hold never sent from an answer not shown."""
+        try:
+            self.wait_name(app, name, "Text", timeout_code, max(self.ui_timeout, 60.0))
+        except HarnessFailure as error:
+            if (
+                error.code == timeout_code
+                and provider.request_snapshot()["request_count"] < requests
+            ):
+                raise HarnessFailure(not_sent_code) from None
+            raise
 
     def review_and_revise(
         self,

@@ -533,7 +533,7 @@ def build_parser(description: str, goal: str, case_ids: tuple[str, ...]) -> argp
         "--exe",
         type=Path,
         default=DEFAULT_EXE,
-        help="release executable to copy and test (default: target/release/markturbo.exe)",
+        help="release executable to copy and test (default: the packaged MarkTurbo.exe)",
     )
     parser.add_argument(
         "--expect-exe-sha256",

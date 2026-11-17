@@ -320,7 +320,12 @@ def seed_recent_history(config_root: Path, workspace_root: Path) -> list[Path]:
 
 def sample_inventory(root: Path) -> tuple[int, Fingerprint, Fingerprint]:
     """Fingerprint a sample tree without retaining paths or file contents."""
-    files = sorted(path for path in root.rglob("*") if path.is_file())
+    # The app names its sample version after the files sorted by their UTF-8
+    # path bytes; Windows path order ignores case, so sort the bytes here too.
+    files = sorted(
+        (path for path in root.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(root).as_posix().encode("utf-8"),
+    )
     manifest = hashlib.sha256()
     content = hashlib.sha256()
     content_byte_count = 0

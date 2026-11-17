@@ -36,7 +36,18 @@ SAFE_FAILURE_TYPES = frozenset(
     {
         "AttributeError",
         "COMError",
+        # Content-free byte-length relations of an editor read that never
+        # matched (wait_editor_fingerprint).
+        "EditorLonger",
+        "EditorSameLength",
+        "EditorShorter",
         "FileExistsError",
+        # The same relations for a file that never held the expected bytes
+        # (wait_file), or that could not be read at all.
+        "FileLonger",
+        "FileSameLength",
+        "FileShorter",
+        "FileUnreadable",
         "FileNotFoundError",
         "HarnessFailure",
         "ImportError",
@@ -1994,12 +2005,32 @@ class NativeHarness:
         self, app: RunningApp, name: str, control_type: str, timeout_code: str,
         timeout: float | None = None,
     ) -> None:
-        wait_until(
-            lambda: self.name_present(app, name, control_type),
-            self.ui_timeout if timeout is None else timeout,
-            timeout_code,
-            interval=0.05,
-        )
+        """Wait for a control named `name`. A query that fails while the UI
+        rebuilds (an element gone mid-read) is a poll that saw nothing yet,
+        as in `_wait_ready`; the timeout keeps the last failure's type."""
+        last_failure_type: str | None = None
+
+        def present() -> bool:
+            nonlocal last_failure_type
+            try:
+                return self.name_present(app, name, control_type)
+            except HarnessFailure as error:
+                if error.code != "UIA_NAME_QUERY_FAILED":
+                    raise
+                last_failure_type = error.detail or None
+                return False
+
+        try:
+            wait_until(
+                present,
+                self.ui_timeout if timeout is None else timeout,
+                timeout_code,
+                interval=0.05,
+            )
+        except HarnessFailure as error:
+            if error.code == timeout_code and last_failure_type is not None:
+                raise HarnessFailure(timeout_code, last_failure_type) from None
+            raise
 
     def click_control(self, control: Any, failure_code: str) -> None:
         try:
@@ -2042,13 +2073,41 @@ class NativeHarness:
     def hold_control(
         self, app: RunningApp, control: Any, seconds: float, failure_code: str
     ) -> None:
-        """Press and hold the pointer at the control's centre, then release."""
-        try:
-            rectangle = control.rectangle()
-            x = (rectangle.left + rectangle.right) // 2
-            y = (rectangle.top + rectangle.bottom) // 2
-        except Exception as error:
-            raise HarnessFailure(failure_code, safe_exception_name(error)) from None
+        """Press and hold the pointer at the control's centre, then release.
+
+        A card glides in, so the centre is taken only once two reads 50 ms
+        apart agree: a hold aimed mid-glide can land beside the control.
+        """
+
+        def centre() -> tuple[int, int]:
+            try:
+                rectangle = control.rectangle()
+            except Exception as error:
+                raise HarnessFailure(failure_code, safe_exception_name(error)) from None
+            return (
+                (rectangle.left + rectangle.right) // 2,
+                (rectangle.top + rectangle.bottom) // 2,
+            )
+
+        previous = centre()
+        self.sleep(0.05)
+
+        def settled() -> tuple[int, int] | None:
+            nonlocal previous
+            current = centre()
+            if current == previous:
+                return current
+            previous = current
+            return None
+
+        x, y = wait_until(
+            settled,
+            self.ui_timeout,
+            f"{failure_code}_TARGET_UNSETTLED",
+            interval=0.05,
+            clock=self.clock,
+            sleep=self.sleep,
+        )
         self.win32.press_and_hold(app.hwnd, x, y, seconds)
 
     def menu_command(self, app: RunningApp, automation_id: str) -> None:
@@ -2297,14 +2356,33 @@ class NativeHarness:
             raise failure
 
     def wait_file(self, path: Path, expected: Fingerprint, code: str) -> Fingerprint:
-        def matches() -> Fingerprint | None:
-            try:
-                actual = sha256_file(path)
-            except OSError:
-                return None
-            return actual if actual == expected else None
+        last: Fingerprint | None = None
 
-        return wait_until(matches, self.ui_timeout, code)
+        def matches() -> Fingerprint | None:
+            nonlocal last
+            try:
+                last = sha256_file(path)
+            except OSError:
+                last = None
+                return None
+            return last if last == expected else None
+
+        try:
+            return wait_until(matches, self.ui_timeout, code)
+        except HarnessFailure as error:
+            if error.code != code:
+                raise
+            # Only the byte-length relation leaves the harness.
+            if last is None:
+                relation = "FileUnreadable"
+            else:
+                difference = last.byte_count - expected.byte_count
+                relation = (
+                    "FileLonger" if difference > 0
+                    else "FileShorter" if difference < 0
+                    else "FileSameLength"
+                )
+            raise HarnessFailure(code, relation) from None
 
     def wait_editor_fingerprint(
         self,
@@ -2321,12 +2399,14 @@ class NativeHarness:
         """
         started = self.clock()
         saw_readable_value = False
+        last_actual: Fingerprint | None = None
         last_failure_type: str | None = None
         last_failure_code: str | None = None
         matched_at = started
 
         def matches() -> Fingerprint | None:
-            nonlocal saw_readable_value, last_failure_type, last_failure_code, matched_at
+            nonlocal saw_readable_value, last_actual, last_failure_type, last_failure_code
+            nonlocal matched_at
             self.last_editor_sample_at = None
             try:
                 actual = self.read_editor_fingerprint(app)
@@ -2346,6 +2426,7 @@ class NativeHarness:
             if actual is None:
                 return None
             saw_readable_value = True
+            last_actual = actual
             if expected is not None and actual != expected:
                 return None
             matched_at = (
@@ -2362,8 +2443,15 @@ class NativeHarness:
         except HarnessFailure as error:
             if error.code != timeout_code:
                 raise
-            if expected is not None and saw_readable_value:
-                raise
+            if expected is not None and last_actual is not None:
+                # Only the byte-length relation leaves the harness.
+                difference = last_actual.byte_count - expected.byte_count
+                relation = (
+                    "EditorLonger" if difference > 0
+                    else "EditorShorter" if difference < 0
+                    else "EditorSameLength"
+                )
+                raise HarnessFailure(timeout_code, relation) from None
             if not saw_readable_value and last_failure_code == "SOURCE_EDITOR_UIA_TIMEOUT":
                 # The editor control never appeared: keep that locatable code.
                 raise HarnessFailure("SOURCE_EDITOR_UIA_TIMEOUT") from None

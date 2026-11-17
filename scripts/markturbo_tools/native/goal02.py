@@ -396,13 +396,31 @@ def scan_runtime_artifacts(data_root: Path, stderr_path: Path) -> dict[str, Any]
 
 
 class Goal02Harness(BaseNativeHarness):
-    def wait_checkpoint_record(self, data_root: Path, started: float) -> float:
-        """Wait for the dirty buffer's canonical record within the loss window."""
+    def wait_checkpoint_record(
+        self, data_root: Path, started: float, written_after_ns: int = 0
+    ) -> float:
+        """Wait for the dirty buffer's canonical record within the loss window.
+
+        The app writes its first checkpoint without waiting for typing to
+        pause, so a record may hold part of the edit. Only one written at or
+        after `written_after_ns` (wall clock, once the editor showed the
+        whole edit) can hold all of it.
+        """
         remaining = 10.0 - (time.perf_counter() - started)
         if remaining <= 0:
             raise HarnessFailure("RECOVERY_RECORD_EXCEEDED_10_SECONDS")
+
+        def written() -> bool:
+            try:
+                return any(
+                    path.stat().st_mtime_ns >= written_after_ns
+                    for path in canonical_recovery_records(data_root)
+                )
+            except OSError:
+                return False
+
         wait_until(
-            lambda: canonical_recovery_records(data_root),
+            written,
             remaining,
             "RECOVERY_RECORD_EXCEEDED_10_SECONDS",
             interval=0.025,
@@ -578,11 +596,17 @@ class Goal02Harness(BaseNativeHarness):
 
     def checkpoint(self, app: RunningApp, data: Path) -> tuple[dict[str, Any], Any]:
         """An edited buffer leaves a canonical record within the loss window."""
-        if canonical_recovery_records(data):
-            raise HarnessFailure("RECORD_BEFORE_EDIT")
+        # The earlier phases' saves retire their checkpoints off the UI
+        # thread; the edit starts from a store they have emptied.
+        wait_until(
+            lambda: not canonical_recovery_records(data),
+            self.ui_timeout,
+            "RECORD_BEFORE_EDIT",
+        )
         input_started = time.perf_counter()
         edited = self.replace_editor(app, RECOVERY_EDIT)
-        checkpoint_ms = round(self.wait_checkpoint_record(data, input_started), 3)
+        shown_ns = time.time_ns()
+        checkpoint_ms = round(self.wait_checkpoint_record(data, input_started, shown_ns), 3)
         return {
             "checkpoint_editor": edited.evidence(),
             "checkpoint_ms": checkpoint_ms,

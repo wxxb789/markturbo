@@ -87,10 +87,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertNotEqual(ALL_ACCEPTED, ONE_ACCEPTED)
         self.assertNotEqual(DISK, REVIEWED)
         self.assertEqual(expected["decisions_clipboard_copied"], ALL_ACCEPTED.evidence())
-        self.assertEqual(
-            expected["trust_proposal_after"],
-            fingerprint(b'<script>window.goal07 = "new";</script>'),
-        )
+        # The field shows each hunk's replacement as the model sent it (the
+        # edit's span, not its whole line): RevisionHunkView.after.
+        self.assertEqual(expected["trust_proposal_after"], fingerprint(b'goal07 = "new"'))
 
     def test_each_fingerprint_must_hold_its_expected_bytes(self) -> None:
         for key in sorted(HARNESS.FINGERPRINT_OBSERVATION_KEYS):
@@ -663,7 +662,7 @@ class PhaseTests(unittest.TestCase):
         harness.name_present = mock.Mock(return_value=False)
         harness.win32.foreground_focus.return_value = app.hwnd if focus_returns else 0
         order.review_and_revise.return_value = 1
-        order._named_texts.return_value = '<script>window.goal07 = "new";</script>'
+        order._named_texts.return_value = 'goal07 = "new"'
         order.editor_fingerprint.side_effect = [
             runtime.fingerprint_bytes(HARNESS.HTML_EDITOR_SOURCE_BYTES),
             HTML_APPLIED,
@@ -816,6 +815,26 @@ class StepTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_a_proposal_wait_tells_an_unsent_request_from_an_unshown_answer(self) -> None:
+        for request_count, code in (
+            (1, "REVISION_REQUEST_NOT_SENT"),
+            (2, "REVISION_PROPOSAL_UIA_TIMEOUT"),
+        ):
+            with self.subTest(request_count=request_count):
+                harness = bare_harness()
+                harness._set_answer = harness._press = harness._approve_consent = mock.Mock()
+                harness.wait_name = mock.Mock(
+                    side_effect=runtime.HarnessFailure("REVISION_PROPOSAL_UIA_TIMEOUT")
+                )
+                provider = mock.Mock()
+                provider.request_snapshot.return_value = {
+                    "request_count": request_count,
+                    "invalid_request": False,
+                }
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    harness.request_revision(mock.Mock(), provider=provider, hunks=2)
+                self.assertEqual(raised.exception.code, code)
 
     def typing_harness(self, accepted_value: Callable[[str], str]) -> tuple[HARNESS.Goal07Harness, list]:
         events: list[tuple[str, object]] = []
@@ -1025,12 +1044,12 @@ class StepTests(unittest.TestCase):
         self.assertEqual(harness.find_control.call_args.args[2], "Group")
 
         group.children.return_value = [child("Accept", "Button")]
-        with self.assertRaisesRegex(HARNESS.HarnessFailure, "P_TEXT_UNAVAILABLE"):
+        with self.assertRaisesRegex(runtime.HarnessFailure, "P_TEXT_UNAVAILABLE"):
             texts()
 
         group.children.return_value = [child("approved")]
         group.element_info.name = "Something else"
-        with self.assertRaisesRegex(HARNESS.HarnessFailure, "P_UIA_CONTRACT_MISMATCH"):
+        with self.assertRaisesRegex(runtime.HarnessFailure, "P_UIA_CONTRACT_MISMATCH"):
             texts()
 
     def test_press_requires_foreground_first_and_finds_the_control_by_id(self) -> None:

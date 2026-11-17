@@ -207,6 +207,22 @@ class ParserAndIsolationTests(unittest.TestCase):
                 HARNESS.materialized_sample_inventory(data)
             self.assertEqual(raised.exception.code, "SAMPLE_MATERIALIZATION_INCOMPLETE")
 
+    def test_sample_version_orders_paths_by_their_bytes_like_the_app(self) -> None:
+        # The app names the materialized sample after its files sorted by
+        # their UTF-8 path bytes ("B.md" before "a.md"); Windows path order
+        # ignores case and would put "a.md" first.
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            digest = hashlib.sha256(b"B.md\0b\n\0a.md\0a\n\0").hexdigest()
+            materialized = data / "sample" / digest[:24]
+            materialized.mkdir(parents=True)
+            (materialized / "a.md").write_bytes(b"a\n")
+            (materialized / "B.md").write_bytes(b"b\n")
+
+            evidence = HARNESS.materialized_sample_inventory(data)
+
+            self.assertEqual(evidence["sample_version"], digest[:24])
+
     def test_welcome_actions_are_found_by_their_own_automation_ids(self) -> None:
         # The nsh welcome's actions are Buttons that carry their test ids, so
         # an anonymous by-name lookup would never see them.

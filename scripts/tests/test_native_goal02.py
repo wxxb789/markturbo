@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -317,6 +319,9 @@ class FakeDesk:
             recovery = self.data / "recovery"
             recovery.mkdir(parents=True, exist_ok=True)
             (recovery / RECORD_NAME).write_bytes(b"ciphertext")
+            # The app's idle checkpoint, written after the whole edit shows.
+            later = time.time_ns() + 1_000_000_000
+            os.utime(recovery / RECORD_NAME, ns=(later, later))
             (recovery / HARNESS.RECOVERY_LEASE_NAME).write_bytes(b"")
         return runtime.fingerprint_bytes(self.editor)
 
@@ -551,10 +556,44 @@ class RuntimeArtifactTests(unittest.TestCase):
                 harness.wait_checkpoint_record(data, started - 10.5)
             self.assertEqual(late.exception.code, "RECOVERY_RECORD_EXCEEDED_10_SECONDS")
 
+            # A record written before the whole edit showed cannot count.
+            with self.assertRaises(runtime.HarnessFailure) as partial:
+                harness.wait_checkpoint_record(
+                    data, time.perf_counter() - 9.95, time.time_ns() + 10**12
+                )
+            self.assertEqual(partial.exception.code, "RECOVERY_RECORD_EXCEEDED_10_SECONDS")
+
             empty = Path(temporary) / "empty"
             with self.assertRaises(runtime.HarnessFailure) as missing:
                 harness.wait_checkpoint_record(empty, time.perf_counter() - 9.95)
             self.assertEqual(missing.exception.code, "RECOVERY_RECORD_EXCEEDED_10_SECONDS")
+
+    def test_checkpoint_waits_for_earlier_records_to_retire_before_the_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            (data / "recovery").mkdir(parents=True)
+            earlier = data / "recovery" / (("a" * 64) + ".mtrecovery")
+            earlier.write_bytes(b"sealed")
+            harness = object.__new__(HARNESS.Goal02Harness)
+            harness.ui_timeout = 0.2
+
+            def edit(_app: object, _value: str) -> object:
+                raise AssertionError("edited before the earlier record retired")
+
+            harness.replace_editor = edit
+            with self.assertRaises(runtime.HarnessFailure) as raised:
+                harness.checkpoint(object(), data)
+            self.assertEqual(raised.exception.code, "RECORD_BEFORE_EDIT")
+
+            # A record the app retires while the harness waits is not a failure.
+            timer = threading.Timer(0.05, earlier.unlink)
+            timer.start()
+            harness.ui_timeout = 5.0
+            harness.replace_editor = mock.Mock(side_effect=runtime.HarnessFailure("EDITED"))
+            with self.assertRaises(runtime.HarnessFailure) as edited:
+                harness.checkpoint(object(), data)
+            timer.join()
+            self.assertEqual(edited.exception.code, "EDITED")
 
     def test_live_recovery_scan_requires_canonical_encrypted_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
