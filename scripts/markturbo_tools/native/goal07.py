@@ -7,40 +7,45 @@ hashes, byte counts, booleans, counts and safe reason codes. The harness never
 reads or writes the Windows Credential Manager: the child process gets one
 fresh synthetic key in its environment only.
 
-One launch runs three phases, each with its own Review -> answer -> Revision
-chain against the loopback, each on its own workspace file opened in a new
-tab through the files palette (`Ctrl+P`, `ui/rail.rs`), and each with its own
-observation-key prefix and failure-code prefix:
+One launch opens `trusted.html` from argv (a new tab opens in Split) and runs
+one Review -> answer -> Revision chain against the loopback, across two
+phases, each with its own observation-key prefix and failure-code prefix:
 
-1. `decisions` (`revision.md`): Accept writes one hunk, `Undo` takes it
-   back, Accept writes it again, Reject writes nothing, `Undo` takes the
-   rejection back, Accept completes the accept-all text, `Copy` round-trips
-   the OS clipboard, and `Done` writes nothing more or to disk. The unsaved
-   mark (`title-dirty`) is a Text inside the `title-file` Button, which nsh
-   0.5.1's Windows UIA folds away, so dirty state is proven headless:
-   `tests/revision_flow.rs` `copy_exports_only_the_approved_result_and_saves_nothing`
-   (Copy saves nothing and leaves the mark) and
-   `rejecting_every_hunk_then_done_keeps_the_exact_bytes` (no decision, clean).
-2. `stale` (`stale.md`): a paste over the reviewed text leaves every hunk
-   `Can't apply — this part changed` without an Accept; `Done` writes
-   nothing.
-3. `trust` (`trusted.html`): scripts are trusted through the Web pane's
-   `Trust scripts` and its Run scripts system alert, the keyboard comes back
-   from the WebView, and accepting the executable change leaves the Web pane
-   Restricted.
+1. `trust`: scripts are trusted first, through the Web pane's
+   `Trust scripts` and its Run scripts system alert; the Edit mode then hands
+   the keyboard back from the WebView before the Review shortcut is sent.
+2. `decisions`: the proposal holds two hunks, h1 the executable script value
+   after the CJK/emoji line and h2 the owner line. Accept(h1) writes across
+   the multibyte offsets at once; Reject(h2) reads `2 of 2 decided`; `Undo`
+   takes the rejection back to `1 of 2 decided`; `Copy` round-trips the
+   approved result through the OS clipboard; one replacement over the whole
+   document leaves h2 `Can't apply — this part changed` without an `Accept`;
+   `Done` writes nothing to disk; and the Web pane is Restricted, because the
+   accepted write revoked the trust.
+
+Proven headless or in mt-core instead: `Undo` restoring an accepted hunk's
+bytes after the write (`tests/revision_flow.rs`); every hunk accepted
+(`one_accepted` here plus `revision_flow.rs`); an edit over every hunk, then
+`Done` writing nothing; and frontmatter, fence and link anchoring. The unsaved
+mark (`title-dirty`) is a Text inside the `title-file` Button, which nsh
+0.5.1's Windows UIA folds away, so dirty state is proven headless:
+`tests/revision_flow.rs` `copy_exports_only_the_approved_result_and_saves_nothing`
+(Copy saves nothing and leaves the mark) and
+`rejecting_every_hunk_then_done_keeps_the_exact_bytes` (no decision, clean).
 
 On the nsh UI a Review starts with Ctrl+Enter from the editor, the question is
 answered in `review-answer-input`, `Prepare revision` asks for the Revision,
-and both sends need a real pointer hold on `consent-send`. The Revision field
-decides one docked hunk at a time (`Accept` / `Reject`, counted by
-`n of m decided`). Each decision writes at once (`ui/revision.rs`). The
-harness presses the field's buttons, never its keys: reading the editor
-focuses it, and on nsh 0.5.1 Windows no press or UIA focus moves the keyboard
-off a text input again, so `A` and `Ctrl+Z` would reach the editor. The
-field's keys (`A`, `R`, `Ctrl+Z`, `A` refused on a changed part) are proven
-headless in `ui/revision.rs`. `Done` leaves an outcome line that
-`revision-dismiss` consumes; `review-close` then closes the Review before the
-next phase. Editor text is read with the editor's Select All + Copy.
+and both sends need a real pointer hold on `consent-send`. A hold whose
+request does not reach the loopback within `REQUEST_SENT_TIMEOUT_SECONDS`
+fails at once (`REVIEW_REQUEST_NOT_SENT` / `REVISION_REQUEST_NOT_SENT`). The
+Revision field decides one docked hunk at a time (`Accept` / `Reject`,
+counted by `n of m decided`). Each decision writes at once
+(`ui/revision.rs`). The harness presses the field's buttons, never its keys:
+reading the editor focuses it, and on nsh 0.5.1 Windows no press or UIA focus
+moves the keyboard off a text input again, so `A` and `Ctrl+Z` would reach the
+editor. The field's keys (`A`, `R`, `Ctrl+Z`, `A` refused on a changed part)
+are proven headless in `ui/revision.rs`. Editor text is read with the editor's
+Select All + Copy.
 
 Trust scripts' Run scripts confirmation is an nsh system alert outside the UIA
 tree, answered with Enter (`runtime.py` `confirm_system_alert`).
@@ -64,9 +69,7 @@ from .runtime import (
     INTEGRITY_NAMES,
     MENU_EDIT_AUTOMATION_ID,
     MENU_WEB_AUTOMATION_ID,
-    VK_A,
     VK_RETURN,
-    VK_V,
     Fingerprint,
     HarnessFailure,
     NativeHarness,
@@ -89,7 +92,6 @@ from .runtime import (
 SCHEMA = "markturbo.goal-07-native-acceptance"
 MAX_EDIT_OUTPUT_BYTES = 4 * 1024 * 1024
 TRANSPORT_KEYS = frozenset({"mode", "provider", "deterministic", "request_count"})
-VK_P = 0x50
 
 # `ui/review.rs`: the structured result's first line, the answer input, and
 # the Buttons, each carrying its own AutomationId (`prims` actions).
@@ -97,29 +99,28 @@ REVIEW_RESULT_MARKER = "Understood:"
 REVIEW_ANSWER_INPUT_AUTOMATION_ID = "review-answer-input"
 REVIEW_ANSWER_AUTOMATION_ID = "review-answer-submit"
 PREPARE_REVISION_AUTOMATION_ID = "review-prepare"
-REVIEW_CLOSE_AUTOMATION_ID = "review-close"
 # `ui/consent.rs` `send_button`: only a pointer hold past `HOLD_MS` sends.
 CONSENT_SEND_AUTOMATION_ID = "consent-send"
 CONSENT_HOLD_SECONDS = 1.8
+# How long a request may take to reach the loopback after its consent hold
+# returns; a hold that sent nothing fails here, not at the answer's wait.
+REQUEST_SENT_TIMEOUT_SECONDS = 5.0
+# The answer's wait once its request has arrived.
+ANSWER_TIMEOUT_SECONDS = 60.0
 # `ui/revision.rs`: the docked hunk's decisions, the count, Undo, Copy and Done.
-# Accept's Name is checked for absence across the whole window. A decided
-# docked hunk shows its decision word until the next undecided one is docked.
-REVISION_ACCEPT_NAME = "Accept"
+# A decided docked hunk shows its decision word until the next undecided one
+# is docked.
 REVISION_ACCEPT_AUTOMATION_ID = "revision-accept"
 REVISION_REJECT_AUTOMATION_ID = "revision-reject"
 REVISION_DONE_AUTOMATION_ID = "revision-done"
 REVISION_UNDO_AUTOMATION_ID = "revision-undo"
-REVISION_DISMISS_AUTOMATION_ID = "revision-dismiss"
 REVISION_DECISION_WORDS = ("Accepted", "Rejected")
 REVISION_PART_CHANGED_TEXT = "Can't apply \u2014 this part changed"
 REVISION_COPY_AUTOMATION_ID = "revision-copy"
 REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
 REVISION_PROPOSAL_AFTER_NAME = "Proposed text"
-# `state.rs` `finish_revision`: Done's outcome line.
+# `state.rs` `finish_revision`: Done's outcome line with an accepted hunk.
 REVISION_APPLIED = "Approved changes applied to the buffer."
-REVISION_NOTHING_APPROVED = "No changes approved."
-# `ui/rail.rs`: `Ctrl+P` opens the workspace's files; Enter opens the first row.
-PALETTE_INPUT_AUTOMATION_ID = "palette-input"
 # `ui/preview.rs`. `state.rs` `request_web_trust` confirms with an nsh system
 # alert outside the UIA tree, answered with Enter (`confirm_system_alert`).
 TRUST_SCRIPTS_AUTOMATION_ID = "web-trust"
@@ -129,49 +130,34 @@ RESTRICTED_BANNER = "Restricted: scripts disabled"
 CASE_REVISION_SESSION = "revision_session"
 CASE_FLOWS = {
     CASE_REVISION_SESSION: (
-        "one launch: decisions (Accept, Undo, Accept, Reject, Undo, Accept, Copy, Done) "
-        "-> stale proposal offers no Accept -> trusted HTML Accept leaves Restricted"
+        "one launch on trusted HTML: trust scripts -> one Review and Revision -> "
+        "Accept, Reject, Undo, Copy -> an edit over the open hunk offers no Accept "
+        "-> Done -> Restricted; Undo after a write, every hunk accepted and "
+        "frontmatter, fence and link anchoring are proven headless"
     ),
 }
 REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
 # Each phase's observation-key prefix; upper-cased, its failure-code prefix.
-PHASES = ("decisions", "stale", "trust")
-# One Review and one Revision request per phase.
-EXPECTED_REQUEST_COUNT = 2 * len(PHASES)
+PHASES = ("trust", "decisions")
+# The session's one chain: one Review and one Revision request.
+EXPECTED_REQUEST_COUNT = 2
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
+# h1 (the executable script value) sits after the CJK/emoji line, so its
+# accepted write proves multibyte and CRLF offsets; h2 is the owner line.
 SOURCE_TEXT = (
-    "---\r\n"
-    "title: old\r\n"
-    "owner: TBD\r\n"
-    "---\r\n"
-    "\r\n"
-    "# Plan 计划 🚀\r\n"
-    "\r\n"
-    "\x60\x60\x60rust\r\n"
-    "fn main() {}\r\n"
-    "\x60\x60\x60\r\n"
-    "\r\n"
-    "[link](https://example.invalid)\r\n"
-    f"\r\n<!-- {DOCUMENT_SENTINEL} -->\r\n"
+    "<!doctype html>\r\n"
+    "<p>trusted 文档 🚀</p>\r\n"
+    "<script>window.goal07 = \"old\";</script>\r\n"
+    "<p>owner: TBD</p>\r\n"
+    f"<!-- {DOCUMENT_SENTINEL} -->\r\n"
 )
 SOURCE_BYTES = SOURCE_TEXT.encode("utf-8")
 EDITOR_SOURCE_TEXT = SOURCE_TEXT.replace("\r\n", "\n").replace("\r", "\n")
 EDITOR_SOURCE_BYTES = EDITOR_SOURCE_TEXT.encode("utf-8")
-HTML_SOURCE_TEXT = (
-    "<!doctype html>\r\n"
-    "<script>window.goal07 = \"old\";</script>\r\n"
-    "<p>trusted 文档 🚀</p>\r\n"
-    f"<!-- {DOCUMENT_SENTINEL} -->\r\n"
-)
-HTML_SOURCE_BYTES = HTML_SOURCE_TEXT.encode("utf-8")
-HTML_EDITOR_SOURCE_TEXT = HTML_SOURCE_TEXT.replace("\r\n", "\n").replace("\r", "\n")
-HTML_EDITOR_SOURCE_BYTES = HTML_EDITOR_SOURCE_TEXT.encode("utf-8")
-STALE_EDIT_TEXT = "---\ntitle: locally edited\nowner: TBD\n---\n"
-# The workspace: one file per phase, all written before the launch so the
-# files palette lists them.
-DECISIONS_FILE = "revision.md"
-STALE_FILE = "stale.md"
+# Typed over the whole document after the decisions: it touches the open
+# hunk's part.
+STALE_EDIT = f"{DOCUMENT_SENTINEL}:stale"
 TRUST_FILE = "trusted.html"
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
@@ -179,25 +165,13 @@ SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
 # (`expected_fingerprints`); the names say when it was read.
 FINGERPRINT_OBSERVATION_KEYS = frozenset(
     {
-        "decisions_editor_before",
+        "trust_disk_before",
+        "decisions_proposal_after",
         "decisions_editor_proposed",
         "decisions_editor_one_accepted",
-        "decisions_editor_undone",
-        "decisions_editor_one_rejected",
-        "decisions_editor_all_accepted",
         "decisions_clipboard_copied",
-        "decisions_editor_after_copy",
-        "decisions_editor_done",
-        "decisions_disk_before",
+        "decisions_editor_stale",
         "decisions_disk_after",
-        "stale_editor_proposed",
-        "stale_editor_edited",
-        "stale_editor_done",
-        "stale_disk_before",
-        "stale_disk_after",
-        "trust_editor_proposed",
-        "trust_proposal_after",
-        "trust_editor_done",
     }
 )
 OBSERVATION_KEYS = FINGERPRINT_OBSERVATION_KEYS | {"provider_request_count"}
@@ -296,37 +270,26 @@ def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
 def expected_fingerprints() -> dict[str, dict[str, Any]]:
     """The exact bytes every fingerprint observation must have."""
     edits = provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT)
-    html_edits = provider_fixtures.fixture_edits(HTML_EDITOR_SOURCE_TEXT)
-    reviewed = fingerprint_bytes(EDITOR_SOURCE_BYTES)
-    one = fingerprint_bytes(apply_edits(EDITOR_SOURCE_BYTES, edits[:1]))
-    approved = fingerprint_bytes(apply_edits(EDITOR_SOURCE_BYTES, edits))
     disk = fingerprint_bytes(SOURCE_BYTES)
-    edited = fingerprint_text(STALE_EDIT_TEXT)
-    html_applied = apply_edits(HTML_EDITOR_SOURCE_BYTES, html_edits)
-    # The field shows the hunk's replacement itself, not the line around it.
-    proposed = html_edits[0]["replacement"]
+    # Accept(h1) alone: Reject(h2) writes nothing and its Undo leaves h2 open,
+    # so this is also the approved result Copy exports.
+    one_accepted = fingerprint_bytes(apply_edits(EDITOR_SOURCE_BYTES, edits[:1]))
     expected = {
-        "decisions_editor_before": reviewed,
-        "decisions_editor_proposed": reviewed,
-        "decisions_editor_one_accepted": one,
-        "decisions_editor_undone": reviewed,
-        "decisions_editor_one_rejected": one,
-        "decisions_editor_all_accepted": approved,
-        "decisions_clipboard_copied": approved,
-        "decisions_editor_after_copy": approved,
-        "decisions_editor_done": approved,
-        "decisions_disk_before": disk,
+        "trust_disk_before": disk,
+        # The field shows the docked h1's replacement itself, not its line.
+        "decisions_proposal_after": fingerprint_text(edits[0]["replacement"]),
+        "decisions_editor_proposed": fingerprint_bytes(EDITOR_SOURCE_BYTES),
+        "decisions_editor_one_accepted": one_accepted,
+        "decisions_clipboard_copied": one_accepted,
+        "decisions_editor_stale": fingerprint_text(STALE_EDIT),
         "decisions_disk_after": disk,
-        "stale_editor_proposed": reviewed,
-        "stale_editor_edited": edited,
-        "stale_editor_done": edited,
-        "stale_disk_before": disk,
-        "stale_disk_after": disk,
-        "trust_editor_proposed": fingerprint_bytes(HTML_EDITOR_SOURCE_BYTES),
-        "trust_proposal_after": fingerprint_text(proposed),
-        "trust_editor_done": fingerprint_bytes(html_applied),
     }
     return {key: value.evidence() for key, value in expected.items()}
+
+
+def _operation(expected_request_count: int) -> str:
+    """The failure-code prefix of the request a consent hold sends."""
+    return "REVIEW" if expected_request_count == 0 else "REVISION"
 
 
 def _request_count(evidence: dict[str, Any]) -> int:
@@ -383,7 +346,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
         if validate_fingerprint(observations[key]) != expected:
             raise ValueError(f"{key} does not hold the expected bytes")
     if observations["provider_request_count"] != EXPECTED_REQUEST_COUNT:
-        raise ValueError("loopback provider did not receive one Review and Revision per phase")
+        raise ValueError("loopback provider did not receive one Review and one Revision")
 
 
 CONTRACT = evidence.EvidenceContract(
@@ -473,16 +436,11 @@ class Goal07Harness(NativeHarness):
         return self._credential
 
     def profile(self, endpoint: str) -> tuple[Path, Path, Path, Path, Path]:
-        """The session's isolated roots, its workspace files and its settings."""
+        """The session's isolated roots, its one document and its settings."""
         data_root, config_root, workspace_root, stderr_path = self.case_roots(
             CASE_REVISION_SESSION
         )
-        for name, value in (
-            (DECISIONS_FILE, SOURCE_BYTES),
-            (STALE_FILE, SOURCE_BYTES),
-            (TRUST_FILE, HTML_SOURCE_BYTES),
-        ):
-            write_durable(workspace_root / name, value)
+        write_durable(workspace_root / TRUST_FILE, SOURCE_BYTES)
         write_durable(config_root / "settings.toml", review_settings_document(endpoint))
         return data_root.parent, data_root, config_root, workspace_root, stderr_path
 
@@ -548,9 +506,30 @@ class Goal07Harness(NativeHarness):
             or snapshot["request_count"] != expected_request_count
             or snapshot["invalid_request"] is not False
         ):
-            operation = "REVIEW" if expected_request_count == 0 else "REVISION"
-            raise HarnessFailure(f"{operation}_REQUEST_BEFORE_CONSENT_CLICK")
+            raise HarnessFailure(
+                f"{_operation(expected_request_count)}_REQUEST_BEFORE_CONSENT_CLICK"
+            )
         open_gate()
+
+    def _wait_request_sent(
+        self, provider: provider_fixtures.LoopbackRevisionServer, expected_request_count: int
+    ) -> None:
+        """Fail fast when the consent hold sent nothing: the request must reach
+        the loopback within `REQUEST_SENT_TIMEOUT_SECONDS`. A request the
+        loopback refused fails with the loopback's own code."""
+
+        def sent() -> bool:
+            snapshot = provider.request_snapshot()
+            if snapshot["invalid_request"]:
+                provider.verify_chain()
+            return snapshot["request_count"] > expected_request_count
+
+        wait_until(
+            sent,
+            REQUEST_SENT_TIMEOUT_SECONDS,
+            f"{_operation(expected_request_count)}_REQUEST_NOT_SENT",
+            interval=0.05,
+        )
 
     def _approve_consent(
         self,
@@ -573,17 +552,13 @@ class Goal07Harness(NativeHarness):
         self._open_consent_gate(provider, expected_request_count, open_gate)
         hold = lambda: self.hold_control(app, send, CONSENT_HOLD_SECONDS, failure_code)
         provider.dispatch_consent_click(expected_request_count, hold)
+        self._wait_request_sent(provider, expected_request_count)
 
-    def run_review(
-        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer,
-        *, preserve_focus: bool = False,
-    ) -> None:
-        if preserve_focus:
-            if self.win32.foreground_focus(app.hwnd) != app.hwnd:
-                raise HarnessFailure("WEB_TO_SOURCE_NATIVE_FOCUS_LOST")
-        else:
-            self.focus_editor(app)
-            self._require_foreground(app)
+    def run_review(self, app: Any, provider: provider_fixtures.LoopbackRevisionServer) -> None:
+        """Ctrl+Enter reaches the editor the Web pane handed the keyboard back
+        to, never after a refocus."""
+        if self.win32.foreground_focus(app.hwnd) != app.hwnd:
+            raise HarnessFailure("WEB_TO_SOURCE_NATIVE_FOCUS_LOST")
         self.win32.send_shortcut(app.hwnd, VK_RETURN)
         self._approve_consent(
             app,
@@ -592,13 +567,12 @@ class Goal07Harness(NativeHarness):
             expected_request_count=0,
             open_gate=provider.grant_review_consent,
         )
-        self._wait_for_provider_answer(
+        self.wait_name(
             app,
-            provider,
             REVIEW_RESULT_MARKER,
-            1,
+            "Text",
             "REVIEW_RESULT_UIA_TIMEOUT",
-            "REVIEW_REQUEST_NOT_SENT",
+            max(self.ui_timeout, ANSWER_TIMEOUT_SECONDS),
         )
 
     def _set_answer(self, app: Any, value: str) -> None:
@@ -621,48 +595,21 @@ class Goal07Harness(NativeHarness):
             expected_request_count=1,
             open_gate=provider.grant_revision_consent,
         )
-        self._wait_for_provider_answer(
+        self.wait_name(
             app,
-            provider,
             f"0 of {hunks} decided",
-            2,
+            "Text",
             "REVISION_PROPOSAL_UIA_TIMEOUT",
-            "REVISION_REQUEST_NOT_SENT",
+            max(self.ui_timeout, ANSWER_TIMEOUT_SECONDS),
         )
 
-    def _wait_for_provider_answer(
-        self,
-        app: Any,
-        provider: provider_fixtures.LoopbackRevisionServer,
-        name: str,
-        requests: int,
-        timeout_code: str,
-        not_sent_code: str,
-    ) -> None:
-        """Wait for the UI to show the provider's answer; when it never does,
-        tell a request the consent hold never sent from an answer not shown."""
-        try:
-            self.wait_name(app, name, "Text", timeout_code, max(self.ui_timeout, 60.0))
-        except HarnessFailure as error:
-            if (
-                error.code == timeout_code
-                and provider.request_snapshot()["request_count"] < requests
-            ):
-                raise HarnessFailure(not_sent_code) from None
-            raise
-
     def review_and_revise(
-        self,
-        app: Any,
-        provider: provider_fixtures.LoopbackRevisionServer,
-        source: str,
-        *,
-        preserve_focus: bool = False,
+        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer
     ) -> int:
-        """One phase's own Review -> answer -> Revision chain; its hunk count."""
-        provider.begin_chain(source)
-        hunks = len(provider_fixtures.fixture_edits(source))
-        self.run_review(app, provider, preserve_focus=preserve_focus)
+        """The session's Review -> answer -> Revision chain; its hunk count."""
+        provider.begin_chain(EDITOR_SOURCE_TEXT)
+        hunks = len(provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT))
+        self.run_review(app, provider)
         self.request_revision(app, provider=provider, hunks=hunks)
         return hunks
 
@@ -705,18 +652,6 @@ class Goal07Harness(NativeHarness):
         self._press(app, REVISION_UNDO_AUTOMATION_ID, "REVISION_UNDO")
         self._wait_decided(app, decided_after, total, "REVISION_UNDO_TIMEOUT")
 
-    def paste_stale_edit(self, app: Any) -> None:
-        """Replace the document with one OS paste (Ctrl+A, Ctrl+V), then wait
-        for the field to report the changed part. The session restores the
-        user's clipboard when the run ends."""
-        self.write_text_clipboard(STALE_EDIT_TEXT)
-        self.focus_editor(app)
-        self.win32.send_shortcut(app.hwnd, VK_A)
-        self.win32.send_shortcut(app.hwnd, VK_V)
-        self.wait_name(
-            app, REVISION_PART_CHANGED_TEXT, "Text", "REVISION_PART_CHANGED_UIA_TIMEOUT"
-        )
-
     def done(self, app: Any, outcome: str) -> None:
         self._press(app, REVISION_DONE_AUTOMATION_ID, "REVISION_DONE")
         self.wait_name(app, outcome, "Text", "REVISION_DONE_OUTCOME_TIMEOUT")
@@ -737,82 +672,12 @@ class Goal07Harness(NativeHarness):
         self.click_control(copy, "REVISION_COPY_CLICK_FAILED")
         return self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
 
-    def close_review(self, app: Any) -> None:
-        """Consume Done's outcome, then close the Review, before the next phase."""
-        self._press(app, REVISION_DISMISS_AUTOMATION_ID, "REVISION_DISMISS")
-        self._press(app, REVIEW_CLOSE_AUTOMATION_ID, "REVIEW_CLOSE")
-        wait_until(
-            lambda: not self.name_present(app, REVIEW_RESULT_MARKER, "Text"),
-            self.ui_timeout,
-            "REVIEW_CLOSE_TIMEOUT",
-            interval=0.05,
-        )
-
-    def open_workspace_file(self, app: Any, name: str, editor_bytes: bytes) -> None:
-        """Open `name` in a new tab from the files palette; wait for its exact text."""
-        self._require_foreground(app)
-        self.win32.send_shortcut(app.hwnd, VK_P)
-        self._type_into(app, PALETTE_INPUT_AUTOMATION_ID, name, "PALETTE")
-        self.win32.send_key(app.hwnd, VK_RETURN)
-        self.activate_source_layout(app)
-        self.wait_editor_fingerprint(app, fingerprint_bytes(editor_bytes), self.ui_timeout)
-
-    def phase_decisions(
-        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer, source: Path
-    ) -> dict[str, Any]:
-        self.activate_source_layout(app)
-        observed: dict[str, Any] = {}
-        record(observed, "decisions_disk_before", sha256_file(source))
-        record(observed, "decisions_editor_before", self.editor_fingerprint(app))
-        total = self.review_and_revise(app, provider, EDITOR_SOURCE_TEXT)
-        record(observed, "decisions_editor_proposed", self.editor_fingerprint(app))
-        # Accept writes the first hunk at once; Undo takes exactly it back.
-        self.decide_hunks(app, [True], total)
-        record(observed, "decisions_editor_one_accepted", self.editor_fingerprint(app))
-        self.undo_decision(app, 0, total)
-        record(observed, "decisions_editor_undone", self.editor_fingerprint(app))
-        # Accept it again; Reject writes nothing for the rest.
-        self.decide_hunks(app, [True] + [False] * (total - 1), total)
-        record(observed, "decisions_editor_one_rejected", self.editor_fingerprint(app))
-        # Undo takes the last rejection back; Accept completes the accept-all text.
-        self.undo_decision(app, total - 1, total)
-        self.decide_hunks(app, [True], total, decided=total - 1)
-        record(observed, "decisions_editor_all_accepted", self.editor_fingerprint(app))
-        record(
-            observed, "decisions_clipboard_copied", fingerprint_text(self.copy_approved(app))
-        )
-        record(observed, "decisions_editor_after_copy", self.editor_fingerprint(app))
-        self.done(app, REVISION_APPLIED)
-        record(observed, "decisions_editor_done", self.editor_fingerprint(app))
-        record(observed, "decisions_disk_after", sha256_file(source))
-        provider.verify_chain()
-        self.close_review(app)
-        return observed
-
-    def phase_stale(
-        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer, source: Path
-    ) -> dict[str, Any]:
-        self.open_workspace_file(app, source.name, EDITOR_SOURCE_BYTES)
-        observed: dict[str, Any] = {}
-        record(observed, "stale_disk_before", sha256_file(source))
-        self.review_and_revise(app, provider, EDITOR_SOURCE_TEXT)
-        record(observed, "stale_editor_proposed", self.editor_fingerprint(app))
-        # One paste over the whole text touches every hunk's part.
-        self.paste_stale_edit(app)
-        record(observed, "stale_editor_edited", self.editor_fingerprint(app))
-        if self.name_present(app, REVISION_ACCEPT_NAME, "Button"):
-            raise HarnessFailure("REVISION_OFFERS_ACCEPT")
-        self.done(app, REVISION_NOTHING_APPROVED)
-        record(observed, "stale_editor_done", self.editor_fingerprint(app))
-        record(observed, "stale_disk_after", sha256_file(source))
-        provider.verify_chain()
-        self.close_review(app)
-        return observed
-
     def phase_trust(
-        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer, source: Path
+        self, app: Any, _provider: provider_fixtures.LoopbackRevisionServer, source: Path
     ) -> dict[str, Any]:
-        self.open_workspace_file(app, source.name, HTML_EDITOR_SOURCE_BYTES)
+        """Trust the page's scripts, then hand the keyboard back to the editor."""
+        observed: dict[str, Any] = {}
+        record(observed, "trust_disk_before", sha256_file(source))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
         self._press(app, TRUST_SCRIPTS_AUTOMATION_ID, "WEB_TRUST")
         # The Run scripts alert is outside the UIA tree; Enter answers it
@@ -832,13 +697,16 @@ class Goal07Harness(NativeHarness):
             self.ui_timeout,
             "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
         )
-        total = self.review_and_revise(
-            app, provider, HTML_EDITOR_SOURCE_TEXT, preserve_focus=True
-        )
+        return observed
+
+    def phase_decisions(
+        self, app: Any, provider: provider_fixtures.LoopbackRevisionServer, source: Path
+    ) -> dict[str, Any]:
+        total = self.review_and_revise(app, provider)
         observed: dict[str, Any] = {}
         record(
             observed,
-            "trust_proposal_after",
+            "decisions_proposal_after",
             fingerprint_text(
                 self._named_texts(
                     app,
@@ -848,10 +716,34 @@ class Goal07Harness(NativeHarness):
                 )
             ),
         )
-        record(observed, "trust_editor_proposed", self.editor_fingerprint(app))
-        self.decide_hunks(app, [True] * total, total)
+        record(observed, "decisions_editor_proposed", self.editor_fingerprint(app))
+        # Accept(h1) writes the executable hunk at once, across the CJK/emoji
+        # line's offsets.
+        self.decide_hunks(app, [True], total)
+        record(observed, "decisions_editor_one_accepted", self.editor_fingerprint(app))
+        # Reject(h2) decides the last hunk; Undo takes only the rejection back.
+        self.decide_hunks(app, [False], total, decided=1)
+        self.undo_decision(app, 1, total)
+        record(
+            observed, "decisions_clipboard_copied", fingerprint_text(self.copy_approved(app))
+        )
+        # An edit over the whole document touches the open h2's part: the
+        # field says so and offers no Accept.
+        record(observed, "decisions_editor_stale", self.replace_editor(app, STALE_EDIT))
+        self.wait_name(
+            app, REVISION_PART_CHANGED_TEXT, "Text", "REVISION_PART_CHANGED_UIA_TIMEOUT"
+        )
+        if not self.control_absent(
+            app,
+            REVISION_ACCEPT_AUTOMATION_ID,
+            "Button",
+            "REVISION_ACCEPT_UIA_QUERY_FAILED",
+            "REVISION_ACCEPT_UIA_CONTRACT_MISMATCH",
+        ):
+            raise HarnessFailure("REVISION_OFFERS_ACCEPT")
         self.done(app, REVISION_APPLIED)
-        record(observed, "trust_editor_done", self.editor_fingerprint(app))
+        record(observed, "decisions_disk_after", sha256_file(source))
+        # The accepted write revoked the trust granted to the text before it.
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
         self.wait_name(app, RESTRICTED_BANNER, "Text", "SCRIPTS_RESTRICTED_TIMEOUT")
         provider.verify_chain()
@@ -876,20 +768,17 @@ class Goal07Harness(NativeHarness):
         app = None
         try:
             case_root, data, config, workspace, stderr = self.profile(provider.base_url)
-            app = self.launch_app(workspace / DECISIONS_FILE, data, config, workspace, stderr)
+            source = workspace / TRUST_FILE
+            app = self.launch_app(source, data, config, workspace, stderr)
             observations: dict[str, Any] = {
                 "flow": CASE_FLOWS[CASE_REVISION_SESSION],
                 "process_context": app.security_context.evidence(),
             }
-            phases = (
-                (self.phase_decisions, DECISIONS_FILE),
-                (self.phase_stale, STALE_FILE),
-                (self.phase_trust, TRUST_FILE),
-            )
-            for (run, name), name_of_phase in zip(phases, PHASES, strict=True):
+            phases = (self.phase_trust, self.phase_decisions)
+            for run, name_of_phase in zip(phases, PHASES, strict=True):
                 with phase(name_of_phase.upper()):
-                    observations.update(run(app, provider, workspace / name))
-            # Every tab is dirty: quit through the guard, unsaved.
+                    observations.update(run(app, provider, source))
+            # The tab is dirty: quit through the guard, unsaved.
             with phase("QUIT"):
                 self.quit_via_menu(app)
                 self.click_lifecycle_decision(app, "Discard")
