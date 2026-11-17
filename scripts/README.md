@@ -134,7 +134,7 @@ The canonical `evaluation verify-manifest` command also verifies Goal 07's
 immutable corpus. `revision-evaluation scaffold` writes a fail-closed v2 record
 without inventing owner values. `revision-evaluation record` consumes an external
 eligibility registry, a v2 machine receipt, a separately hash-bound native
-Goal 07 `PASS` receipt (`schema_version` 3, the shared native evidence schema;
+Goal 07 `PASS` receipt (`schema_version` 4, the shared native evidence schema;
 every earlier version, including the GPUI-era records under `docs/evidence/`,
 is refused), and one metadata-only owner JSON
 per artifact. The
