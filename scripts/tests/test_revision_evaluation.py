@@ -18,6 +18,8 @@ from scripts.markturbo_tools import revision_evaluation as revision
 from scripts.markturbo_tools.native import evidence as native_evidence
 from scripts.markturbo_tools.native import goal07 as native_goal07
 
+from .test_native_goal07 import passing_observations as native_goal07_observations
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -204,118 +206,11 @@ class Goal07Fixtures:
     def _native_value(self) -> dict[str, Any]:
         executable = digest("markturbo.exe")
         parent = {"session_id": 1, "integrity_rid": 1000, "integrity": "medium"}
-        fingerprint = {"byte_count": 1, "sha256": digest("native-before")}
-        changed_fingerprint = {"byte_count": 2, "sha256": digest("native-after")}
-        runtime_scan = {
-            "files_scanned": 3,
-            "app_logs_scanned": 1,
-            "config_files_scanned": 1,
+        # The native harness's own passing session, under this parent context.
+        observations = {
+            case_id: {**native_goal07_observations(case_id), "process_context": parent}
+            for case_id in native_goal07.REQUIRED_CASE_IDS
         }
-        common = {
-            "process_context": parent,
-            "foreground_verified": True,
-            "provider_request_count": 2,
-            "provider_review_count": 1,
-            "provider_revision_count": 1,
-            "provider_paths_exact": True,
-            "provider_no_request_before_consent_click": True,
-            "provider_review_before_revision": True,
-            "provider_review_source_sha256_match": True,
-            "provider_revision_source_sha256_match": True,
-            "provider_revision_snapshot_match": True,
-            "provider_revision_answer_sentinel_present": True,
-            "runtime_scan": runtime_scan,
-        }
-        observations: dict[str, dict[str, Any]] = {}
-        for case_id in native_goal07.REQUIRED_CASE_IDS:
-            item = {"flow": native_goal07.CASE_FLOWS[case_id], **common}
-            if case_id == native_goal07.CASE_REJECT_ALL:
-                item.update(
-                    {
-                        "proposal_received": True,
-                        "reviewed_source_match": True,
-                        "editor_before": fingerprint,
-                        "editor_after": fingerprint,
-                        "source_before": fingerprint,
-                        "source_after": fingerprint,
-                        "reject_all_byte_identity": True,
-                        "dirty_before": False,
-                        "dirty_after": False,
-                        "reject_all_dirty_unchanged": True,
-                    }
-                )
-            elif case_id == native_goal07.CASE_SELECTIVE_UNDO:
-                item.update(
-                    {
-                        "editor_before": fingerprint,
-                        "selective_expected": changed_fingerprint,
-                        "editor_after_apply": changed_fingerprint,
-                        "editor_after_undo": fingerprint,
-                        "editor_after_done": changed_fingerprint,
-                        "source_before": fingerprint,
-                        "source_after": fingerprint,
-                        "selective_matches_expected": True,
-                        "one_undo_transaction": True,
-                    }
-                )
-            elif case_id == native_goal07.CASE_ACCEPT_ALL_PREVIEW:
-                item.update(
-                    {
-                        "editor_before_apply": fingerprint,
-                        "editor_after_accept_all": changed_fingerprint,
-                        "accept_all_expected": changed_fingerprint,
-                        "editor_after_done": changed_fingerprint,
-                        "accept_all_matches_expected": True,
-                        "copy_preview_fingerprint": changed_fingerprint,
-                        "copy_preview_exact": True,
-                        "copy_editor_before": changed_fingerprint,
-                        "copy_editor_after": changed_fingerprint,
-                        "copy_editor_unchanged": True,
-                        "copy_dirty_before": True,
-                        "copy_dirty_after": True,
-                        "copy_dirty_unchanged": True,
-                        "copy_source_before": fingerprint,
-                        "copy_source_after": fingerprint,
-                        "copy_source_unchanged": True,
-                    }
-                )
-            elif case_id == native_goal07.CASE_STALE:
-                item.update(
-                    {
-                        "editor_before": fingerprint,
-                        "editor_after_edit": changed_fingerprint,
-                        "editor_after_activation_attempt": changed_fingerprint,
-                        "editor_after_done": changed_fingerprint,
-                        "source_before": fingerprint,
-                        "source_after": fingerprint,
-                        "stale_no_mutation": True,
-                    }
-                )
-            elif case_id == native_goal07.CASE_SAVE_CONFLICT:
-                item.update(
-                    {
-                        "editor_after_apply": changed_fingerprint,
-                        "external_source_before": fingerprint,
-                        "external_source_after": fingerprint,
-                        "conflict_visible_before_save": True,
-                        "safe_save_no_overwrite": True,
-                    }
-                )
-            else:
-                item.update(
-                    {
-                        "editor_before_apply": fingerprint,
-                        "editor_after_apply": changed_fingerprint,
-                        "executable_change": True,
-                        "executable_expected": changed_fingerprint,
-                        "executable_matches_expected": True,
-                        "preview_fingerprint": changed_fingerprint,
-                        "proposal_expected": changed_fingerprint,
-                        "preview_matches_expected": True,
-                        "preview_contains_executable_text": True,
-                    }
-                )
-            observations[case_id] = item
         return {
             "schema": revision.NATIVE_ACCEPTANCE_SCHEMA,
             "schema_version": revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION,
@@ -326,7 +221,7 @@ class Goal07Fixtures:
                 "mode": "keyless_loopback",
                 "provider": "openai-responses",
                 "deterministic": True,
-                "request_count": 12,
+                "request_count": native_goal07.EXPECTED_REQUEST_COUNT,
             },
             "executable": {
                 "expected_sha256": executable,
