@@ -6,6 +6,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 from scripts.markturbo_tools.native import goal02 as HARNESS
@@ -24,244 +26,473 @@ RECOVERY_SCAN = {
     "canonical_recovery_records_scanned": 1,
     "recovery_leases_scanned": 1,
 }
+RECORD_NAME = ("a" * 64) + ".mtrecovery"
 
 
-def recovery_scan() -> dict[str, int]:
-    return {**runtime_scan(), **RECOVERY_SCAN, "files_scanned": 5}
+def recovery_scan(**counts: int) -> dict[str, int]:
+    return {**runtime_scan(), **RECOVERY_SCAN, "files_scanned": 5, **counts}
+
+
+def retired_scan() -> dict[str, int]:
+    return recovery_scan(recovery_artifacts_scanned=1, canonical_recovery_records_scanned=0)
 
 
 def observations(case_id: str) -> dict:
-    original = fingerprint(b"orig")
-    edited = fingerprint(b"edit")
-    external = fingerprint(b"swap")
-    flow = HARNESS.CASE_FLOWS[case_id]
-    specific = {
-        HARNESS.CASE_POINTER_CANCEL: dict(
-            editor=edited,
-            source_before=original,
-            source_after_cancel_save=edited,
-            cancel_kept_tab=True,
-        ),
-        HARNESS.CASE_KEYBOARD_DISCARD: dict(
-            discarded_editor=edited,
-            source_before=original,
-            source_after_discard=original,
-            discard_closed_tab=True,
-        ),
-        HARNESS.CASE_WINDOW_SAVE: dict(
-            editor=edited,
-            alt_f4_cancel_kept_window=True,
-            editor_after_alt_f4_cancel=edited,
-            source_after_alt_f4_cancel=fingerprint(HARNESS.ORIGINAL_BYTES),
-            saved_source=edited,
-            window_exited=True,
-        ),
-        HARNESS.CASE_EXTERNAL_CONFLICT: dict(
-            loaded_source=original,
-            external_source=external,
-            dirty_editor=edited,
-            source_after_refused_save=external,
-            editor_after_conflict=edited,
-            saved_after_explicit_overwrite=edited,
-            same_length=True,
-            same_mtime_ns=True,
-            save_refused_with_conflict=True,
-            explicit_overwrite_used=True,
-        ),
-        HARNESS.CASE_RECOVERY: dict(
-            edited_text=edited,
-            checkpoint_record_seen=True,
-            checkpoint_signal=HARNESS.CHECKPOINT_SIGNAL,
-            live_runtime_scan=recovery_scan(),
-            live_recovery_scan={
+    original = fingerprint(HARNESS.ORIGINAL_BYTES)
+    external = fingerprint(HARNESS.EXTERNAL_BYTES)
+    conflict = fingerprint(b"conflict")
+    pointer = fingerprint(b"pointer")
+    window = fingerprint(b"window")
+    edited = fingerprint(b"recovered")
+    if case_id == HARNESS.CASE_GUARDED_SESSION:
+        specific = dict(
+            external_modification_loaded_source=original,
+            external_modification_rewritten_source=external,
+            external_modification_dirty_editor=conflict,
+            external_modification_source_after_refused_save=external,
+            external_modification_editor_after_refusal=conflict,
+            external_modification_overwritten_source=conflict,
+            external_modification_mtime_delta_ns=0,
+            external_modification_conflict_ms=12.0,
+            tab_close_editor=pointer,
+            tab_close_source_after_cancel=conflict,
+            tab_close_saved_source=pointer,
+            window_close_editor=window,
+            window_close_editor_after_cancel=window,
+            window_close_source_after_cancel=pointer,
+            window_close_saved_source=window,
+            window_close_exit_code=0,
+            runtime_scan=retired_scan(),
+        )
+    else:
+        specific = dict(
+            checkpoint_editor=edited,
+            checkpoint_ms=9999.0,
+            checkpoint_live_records={
                 "canonical_record_count": 1,
                 "canonical_records": [fingerprint(b"ciphertext")],
             },
-            edit_to_signal_ms=9999.0,
-            recovery_offer_seen=True,
-            restored_editor=edited,
-            recovery_restored_exact=True,
+            checkpoint_runtime_scan=recovery_scan(),
+            restore_editor=edited,
             restore_ms=3.0,
-            source_after_recovery_discard=original,
-            restart_editor=original,
-            discarded_recovery_absent=True,
-            discard_restart_absent_ms=4.0,
-            termination="TerminateProcess",
-            restart_count=2,
-            startup_signal=HARNESS.STARTUP_SIGNAL,
-            startup_observed_before_restart_editor=True,
-            process_contexts=[process_context()] * 3,
-        ),
-    }[case_id]
-    return case_observations(flow, **specific, runtime_scan=recovery_scan())
+            keyboard_close_source_before=original,
+            keyboard_close_source_after=original,
+            keyboard_close_ms=4.0,
+            keyboard_close_retire_ms=1.0,
+            process_contexts=[process_context()] * 2,
+            runtime_scan=retired_scan(),
+        )
+    return case_observations(HARNESS.CASE_FLOWS[case_id], **specific)
 
 
-def valid_evidence() -> dict:
+def evidence_with(guarded: dict | None = None, recovery: dict | None = None) -> dict:
+    supplied = {
+        HARNESS.CASE_GUARDED_SESSION: guarded,
+        HARNESS.CASE_RECOVERY_SESSION: recovery,
+    }
     return passed_evidence(
         HARNESS.new_evidence("a" * 64),
-        observations,
+        lambda case_id: supplied[case_id] or observations(case_id),
         lambda value, status: runtime.complete_evidence(value, status, HARNESS.REQUIRED_CASE_IDS),
     )
 
 
+GUARDED, RECOVERY = 0, 1
+
+
 class EvidenceSchemaTests(unittest.TestCase):
-    def test_accepts_complete_versioned_evidence(self) -> None:
-        evidence = valid_evidence()
+    def test_accepts_two_cases_with_every_phase_observed(self) -> None:
+        evidence = evidence_with()
 
         HARNESS.validate_evidence(evidence)
 
-        self.assertEqual([case["id"] for case in evidence["cases"]], list(HARNESS.REQUIRED_CASE_IDS))
+        self.assertEqual(
+            [case["id"] for case in evidence["cases"]],
+            [HARNESS.CASE_GUARDED_SESSION, HARNESS.CASE_RECOVERY_SESSION],
+        )
 
-    def test_window_case_requires_an_alt_f4_cancel_that_changed_nothing(self) -> None:
-        for key, value in (
-            ("editor_after_alt_f4_cancel", {"byte_count": 1, "sha256": "c" * 64}),
-            ("source_after_alt_f4_cancel", {"byte_count": 1, "sha256": "c" * 64}),
-        ):
-            with self.subTest(key=key):
-                evidence = valid_evidence()
-                evidence["cases"][2]["observations"][key] = value
-                with self.assertRaisesRegex(ValueError, "Alt\\+F4 Cancel changed"):
+    def test_every_phase_has_its_own_observation_prefix(self) -> None:
+        prefixes = {
+            HARNESS.CASE_GUARDED_SESSION: ("external_modification_", "tab_close_", "window_close_"),
+            HARNESS.CASE_RECOVERY_SESSION: ("checkpoint_", "restore_", "keyboard_close_"),
+        }
+        for case_id, required in HARNESS.REQUIRED_OBSERVATIONS.items():
+            with self.subTest(case=case_id):
+                phase_keys = required - {"process_context", "process_contexts"}
+                for prefix in prefixes[case_id]:
+                    self.assertTrue(any(key.startswith(prefix) for key in phase_keys), prefix)
+                self.assertTrue(
+                    all(key.startswith(prefixes[case_id]) for key in phase_keys), phase_keys
+                )
+
+    def test_each_phase_rejects_its_own_broken_fact(self) -> None:
+        other = fingerprint(b"other")
+        cases = (
+            (GUARDED, "external_modification_rewritten_source", fingerprint(b"longer external"),
+             "not same-length"),
+            (GUARDED, "external_modification_mtime_delta_ns", 1, "loaded mtime"),
+            (GUARDED, "external_modification_conflict_ms", -1.0, "nonnegative timing"),
+            (GUARDED, "external_modification_source_after_refused_save", fingerprint(b"conflict"),
+             "refused Save changed"),
+            (GUARDED, "external_modification_editor_after_refusal", other, "replaced the dirty"),
+            (GUARDED, "external_modification_overwritten_source", other, "explicit overwrite"),
+            (GUARDED, "tab_close_source_after_cancel", other, "tab close Cancel changed"),
+            (GUARDED, "tab_close_saved_source", other, "Cancel did not preserve"),
+            (GUARDED, "window_close_editor_after_cancel", other, "Alt\\+F4 Cancel changed"),
+            (GUARDED, "window_close_source_after_cancel", other, "Alt\\+F4 Cancel changed"),
+            (GUARDED, "window_close_saved_source", other, "window Save did not preserve"),
+            (GUARDED, "window_close_exit_code", 1, "exit the process cleanly"),
+            (RECOVERY, "checkpoint_ms", 10_000.001, "exceeds 10000ms"),
+            (RECOVERY, "restore_editor", other, "did not restore exact"),
+            (RECOVERY, "restore_ms", float("nan"), "nonnegative timing"),
+            (RECOVERY, "keyboard_close_source_after", other, "keyboard close Don't save changed"),
+            (RECOVERY, "keyboard_close_retire_ms", -0.1, "nonnegative timing"),
+            (RECOVERY, "runtime_scan", recovery_scan(), "discarded recovery record was retained"),
+            (RECOVERY, "process_contexts", [process_context()] * 3, "one interrupted"),
+            (RECOVERY, "checkpoint_runtime_scan", recovery_scan(recovery_leases_scanned=0),
+             "omitted recovery lease"),
+            (RECOVERY, "checkpoint_runtime_scan",
+             recovery_scan(canonical_recovery_records_scanned=0, recovery_artifacts_scanned=1),
+             "omitted canonical recovery records"),
+            (RECOVERY, "checkpoint_live_records",
+             {"canonical_record_count": 0, "canonical_records": []}, "requires a canonical record"),
+        )
+        for index, key, value, message in cases:
+            with self.subTest(key=key, value=value):
+                evidence = evidence_with()
+                evidence["cases"][index]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, message):
                     HARNESS.validate_evidence(evidence)
 
-        evidence = valid_evidence()
-        evidence["cases"][2]["observations"]["alt_f4_cancel_kept_window"] = False
-        with self.assertRaisesRegex(ValueError, "requires true alt_f4_cancel_kept_window"):
+    def test_rejects_missing_phase_and_retired_constant_observations(self) -> None:
+        evidence = evidence_with()
+        del evidence["cases"][GUARDED]["observations"]["tab_close_saved_source"]
+        with self.assertRaisesRegex(ValueError, "incomplete"):
             HARNESS.validate_evidence(evidence)
 
-    def test_window_scenario_cancels_alt_f4_before_saving_through_wm_close(self) -> None:
-        harness = object.__new__(HARNESS.Goal02Harness)
-        harness.ui_timeout = 1.0
-        order = mock.Mock()
-        app = order.app
-        app.hwnd = 73
-        app.process.poll.return_value = None
-        app.security_context.evidence.return_value = {}
-        edited = HARNESS.fingerprint_bytes(b"edit")
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            harness.case_roots = mock.Mock(
-                return_value=(root / "data", root / "config", root, root / "stderr.log")
-            )
-            harness.launch = mock.Mock(return_value=app)
-            harness.replace_editor = mock.Mock(return_value=edited)
-            harness.editor_fingerprint = mock.Mock(return_value=edited)
-            harness.win32 = order.win32
-            harness.click_lifecycle_decision = order.click_lifecycle_decision
+        for key, value in (
+            ("termination", "TerminateProcess"),
+            ("restart_count", 2),
+            ("cancel_kept_tab", True),
+        ):
+            with self.subTest(key=key):
+                evidence = evidence_with()
+                evidence["cases"][RECOVERY]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, "unknown observation field"):
+                    HARNESS.validate_evidence(evidence)
 
-            def exit_after_save(_app, _timeout):
-                (root / "window.md").write_bytes(b"edit")
-
-            harness.wait_process_exit = mock.Mock(side_effect=exit_after_save)
-            harness.reap = mock.Mock()
-            with mock.patch.object(HARNESS, "scan_runtime_artifacts", return_value={}):
-                observations = harness.scenario_window_save()
-
-        calls = [call for call in order.mock_calls if not call[0].startswith("app.")]
-        sent = calls[1].args[0]
-        self.assertEqual(
-            [(item.ki.wVk, item.ki.dwFlags) for item in sent],
-            [
-                (HARNESS.VK_MENU, 0),
-                (HARNESS.VK_F4, 0),
-                (HARNESS.VK_F4, runtime.KEYEVENTF_KEYUP),
-                (HARNESS.VK_MENU, runtime.KEYEVENTF_KEYUP),
-            ],
-        )
-        self.assertEqual(
-            calls,
-            [
-                mock.call.win32.require_foreground(73, 1.0),
-                mock.call.win32.send_inputs(sent),
-                mock.call.click_lifecycle_decision(app, "Cancel"),
-                mock.call.win32.post_close(73),
-                mock.call.click_lifecycle_decision(app, "Save"),
-            ],
-        )
-        self.assertTrue(observations["alt_f4_cancel_kept_window"])
-        self.assertEqual(
-            observations["source_after_alt_f4_cancel"],
-            HARNESS.fingerprint_bytes(HARNESS.ORIGINAL_BYTES).evidence(),
-        )
-
-    def test_pass_requires_true_case_facts_and_runtime_scan(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][3]["observations"]["save_refused_with_conflict"] = False
-        with self.assertRaisesRegex(ValueError, "requires true save_refused_with_conflict"):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["runtime_scan"]["recovery_leases_scanned"] = 2
+    def test_runtime_scan_counts_must_be_consistent(self) -> None:
+        evidence = evidence_with()
+        evidence["cases"][GUARDED]["observations"]["runtime_scan"]["recovery_leases_scanned"] = 2
         with self.assertRaisesRegex(ValueError, "recovery artifact counts are inconsistent"):
             HARNESS.validate_evidence(evidence)
 
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["runtime_scan"]["files_scanned"] = 4
+        evidence = evidence_with()
+        evidence["cases"][GUARDED]["observations"]["runtime_scan"]["files_scanned"] = 3
         with self.assertRaisesRegex(ValueError, "file count is incomplete"):
             HARNESS.validate_evidence(evidence)
 
-    def test_pass_rejects_signal_over_budget_and_negative_duration(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][4]["observations"]["edit_to_signal_ms"] = 10_000.001
-        with self.assertRaisesRegex(ValueError, "exceeds 10000ms"):
-            HARNESS.validate_evidence(evidence)
 
-        evidence = valid_evidence()
-        evidence["cases"][2]["duration_ms"] = -0.1
-        with self.assertRaisesRegex(ValueError, "duration must be nonnegative"):
-            HARNESS.validate_evidence(evidence)
+class PhaseTests(unittest.TestCase):
+    def test_a_phase_prefixes_failures_once_and_leaves_blocks_alone(self) -> None:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            with HARNESS.phase("TAB_CLOSE"):
+                raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT", "TimeoutError")
+        self.assertEqual(raised.exception.code, "TAB_CLOSE_GUARD_CARD_UIA_TIMEOUT")
+        self.assertEqual(raised.exception.detail, "TimeoutError")
 
-        evidence = valid_evidence()
-        evidence["cases"][2]["duration_ms"] = float("nan")
-        with self.assertRaisesRegex(ValueError, "duration must be nonnegative"):
-            HARNESS.validate_evidence(evidence)
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            with HARNESS.phase("TAB_CLOSE"):
+                raise runtime.HarnessFailure("TAB_CLOSE_DONE")
+        self.assertEqual(raised.exception.code, "TAB_CLOSE_DONE")
 
-    def test_pass_rejects_case_specific_hash_mismatch(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["source_after_cancel_save"] = {
-            "byte_count": 4,
-            "sha256": "b" * 64,
-        }
+        with self.assertRaises(runtime.HarnessBlocked) as blocked:
+            with HARNESS.phase("TAB_CLOSE"):
+                raise runtime.HarnessBlocked("FOREGROUND_UNAVAILABLE")
+        self.assertEqual(blocked.exception.code, "FOREGROUND_UNAVAILABLE")
 
-        with self.assertRaisesRegex(ValueError, "Cancel did not preserve exact"):
-            HARNESS.validate_evidence(evidence)
 
-    def test_pass_rejects_contradictory_flow_mechanics(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][1]["observations"]["flow"] = HARNESS.CASE_FLOWS[HARNESS.REQUIRED_CASE_IDS[2]]
-        with self.assertRaisesRegex(ValueError, "flow mechanics"):
-            HARNESS.validate_evidence(evidence)
+class FakeWin32:
+    def __init__(self, desk: "FakeDesk") -> None:
+        self.desk = desk
 
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["restart_count"] = 1
-        with self.assertRaisesRegex(ValueError, "requires two restarts"):
-            HARNESS.validate_evidence(evidence)
+    def require_foreground(self, hwnd: int, _timeout: float) -> None:
+        self.desk.events.append(("foreground", hwnd))
 
-    def test_pass_requires_startup_barrier_and_live_canonical_record(self) -> None:
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["startup_observed_before_restart_editor"] = False
-        with self.assertRaisesRegex(ValueError, "startup_observed_before_restart_editor"):
-            HARNESS.validate_evidence(evidence)
+    def foreground_focus(self, hwnd: int) -> int:
+        return hwnd
 
-        evidence = valid_evidence()
-        live = evidence["cases"][4]["observations"]["live_recovery_scan"]
-        live["canonical_record_count"] = 0
-        live["canonical_records"] = []
-        with self.assertRaisesRegex(ValueError, "requires a canonical record"):
-            HARNESS.validate_evidence(evidence)
+    def send_inputs(self, inputs: list[Any]) -> None:
+        keys = [(item.ki.wVk, item.ki.dwFlags) for item in inputs]
+        self.desk.events.append(("inputs", tuple(keys)))
+        if keys[:2] == [(HARNESS.VK_MENU, 0), (HARNESS.VK_F4, 0)]:
+            self.desk.guard = "window"
 
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["live_runtime_scan"]["canonical_recovery_records_scanned"] = 0
-        with self.assertRaisesRegex(ValueError, "omitted canonical recovery records"):
-            HARNESS.validate_evidence(evidence)
+    def send_key(self, _hwnd: int, key: int) -> None:
+        self.desk.events.append(("key", key))
+        if key == runtime.VK_RETURN and self.desk.enter_overwrites:
+            self.desk.write_editor()
 
-        evidence = valid_evidence()
-        recovery = evidence["cases"][4]["observations"]
-        recovery["live_runtime_scan"]["recovery_leases_scanned"] = 0
-        with self.assertRaisesRegex(ValueError, "omitted recovery lease"):
-            HARNESS.validate_evidence(evidence)
+    def send_shortcut(self, _hwnd: int, key: int) -> None:
+        self.desk.events.append(("shortcut", key))
+        if key == HARNESS.VK_W:
+            self.desk.guard = "tab"
+
+    def post_close(self, _hwnd: int) -> None:
+        self.desk.events.append(("wm_close",))
+        self.desk.guard = "window"
+
+
+class FakeDesk:
+    """The app's observable side: editor bytes, dirty mark, conflict, the file."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        keep_mine_writes: bool = False,
+        enter_overwrites: bool = True,
+        cancel_clears_dirty: bool = False,
+        discard_retires: bool = True,
+        failing_guard: int | None = None,
+    ) -> None:
+        self.root = root
+        self.keep_mine_writes = keep_mine_writes
+        self.enter_overwrites = enter_overwrites
+        self.cancel_clears_dirty = cancel_clears_dirty
+        self.discard_retires = discard_retires
+        self.failing_guard = failing_guard
+        self.guards = 0
+        self.events: list[tuple[Any, ...]] = []
+        self.editor = b""
+        self.dirty = False
+        self.conflict = False
+        self.guard: str | None = None
+        self.tab_open = True
+        self.document: Path | None = None
+        self.known: bytes | None = None
+        self.launches: list[Any] = []
+
+    def harness(self) -> HARNESS.Goal02Harness:
+        harness = object.__new__(HARNESS.Goal02Harness)
+        harness.ui_timeout = 0.2
+        harness.win32 = FakeWin32(self)
+        harness.case_roots = self.case_roots
+        harness.launch = self.launch
+        harness.replace_editor = self.replace_editor
+        harness.editor_fingerprint = lambda _app: runtime.fingerprint_bytes(self.editor)
+        harness.document_dirty = lambda _app: self.dirty
+        harness.name_present = lambda _app, _name, _type: self.conflict
+        harness.wait_name = self.wait_name
+        harness.save_via_menu = self.save_via_menu
+        harness.find_control = lambda _app, automation_id, *_args: automation_id
+        harness.click_control = self.click_control
+        harness.close_tab_by_pointer = self.close_tab_by_pointer
+        harness.click_lifecycle_decision = self.click_lifecycle_decision
+        harness.wait_process_exit = self.wait_process_exit
+        harness.close_app = self.close_app
+        harness.terminate = self.terminate
+        harness.reap = mock.Mock()
+        harness.focus_editor = lambda _app: None
+        harness.wait_editor_fingerprint = self.wait_editor_fingerprint
+        harness.editor_absent_while_running = lambda _app: not self.tab_open
+        return harness
+
+    def case_roots(self, case_id: str) -> tuple[Path, Path, Path, Path]:
+        case = self.root / case_id
+        roots = (case / "data", case / "config", case / "workspace")
+        for directory in roots:
+            directory.mkdir(parents=True, exist_ok=True)
+        return (*roots, case / "stderr.log")
+
+    def launch(self, document: Path, data: Path, *_roots: Path) -> SimpleNamespace:
+        self.document, self.data = document, data
+        self.known = document.read_bytes()
+        self.editor, self.dirty, self.tab_open = self.known, False, True
+        self.events.append(("launch",))
+        app = SimpleNamespace(
+            hwnd=73,
+            process=SimpleNamespace(returncode=None),
+            security_context=runtime.SecurityContext(7, 0x2000, "medium"),
+        )
+        app.process.poll = lambda: app.process.returncode
+        self.app = app
+        self.launches.append(app)
+        return app
+
+    def replace_editor(self, _app: Any, value: str) -> runtime.Fingerprint:
+        self.editor, self.dirty = value.encode("utf-8"), True
+        self.events.append(("edit",))
+        if value == HARNESS.RECOVERY_EDIT:
+            recovery = self.data / "recovery"
+            recovery.mkdir(parents=True, exist_ok=True)
+            (recovery / RECORD_NAME).write_bytes(b"ciphertext")
+            (recovery / HARNESS.RECOVERY_LEASE_NAME).write_bytes(b"")
+        return runtime.fingerprint_bytes(self.editor)
+
+    def write_editor(self) -> None:
+        runtime.write_durable(self.document, self.editor)
+        self.known, self.dirty, self.conflict = self.editor, False, False
+
+    def wait_name(self, _app: Any, _name: str, _type: str, code: str) -> None:
+        if not self.conflict:
+            raise runtime.HarnessFailure(code)
+
+    def save_via_menu(self, _app: Any) -> None:
+        self.events.append(("menu save",))
+        if self.document.read_bytes() != self.known:
+            self.conflict = True
+        else:
+            self.write_editor()
+
+    def click_control(self, control: str, _code: str) -> None:
+        self.events.append(("click", control))
+        if control == HARNESS.KEEP_MINE_AUTOMATION_ID and self.keep_mine_writes:
+            self.write_editor()
+        elif control == HARNESS.RESTORE_AUTOMATION_ID:
+            self.editor, self.dirty = HARNESS.RECOVERY_EDIT.encode("utf-8"), True
+
+    def close_tab_by_pointer(self, _app: Any) -> None:
+        self.events.append(("rail close",))
+        self.guard = "tab"
+
+    def click_lifecycle_decision(self, app: Any, name: str) -> None:
+        self.guards += 1
+        if self.guards == self.failing_guard or self.guard is None:
+            raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT")
+        self.events.append(("guard", name))
+        guard, self.guard = self.guard, None
+        if name == "Cancel":
+            self.dirty = self.dirty and not self.cancel_clears_dirty
+        elif name == "Save" and guard == "window":
+            self.write_editor()
+            app.process.returncode = 0
+        elif name == "Discard":
+            self.tab_open = False
+            if self.discard_retires:
+                (self.data / "recovery" / RECORD_NAME).unlink()
+
+    def wait_process_exit(self, app: Any, _timeout: float | None = None) -> None:
+        if app.process.returncode != 0:
+            raise runtime.HarnessFailure("PROCESS_EXIT_TIMEOUT")
+
+    def close_app(self, app: Any) -> None:
+        self.events.append(("close app",))
+        app.process.returncode = 0
+
+    def terminate(self, app: Any) -> None:
+        self.events.append(("terminate",))
+        app.process.returncode = 1
+
+    def wait_editor_fingerprint(
+        self, _app: Any, expected: runtime.Fingerprint | None, _timeout: float
+    ) -> tuple[runtime.Fingerprint, float]:
+        actual = runtime.fingerprint_bytes(self.editor)
+        if expected is not None and actual != expected:
+            raise runtime.HarnessFailure("EDITOR_FINGERPRINT_TIMEOUT")
+        return actual, 0.0
+
+
+class ScenarioTests(unittest.TestCase):
+    def run_scenario(self, name: str, scans: list[dict[str, int]], **desk_options: Any):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        desk = FakeDesk(Path(directory.name), **desk_options)
+        harness = desk.harness()
+        with (
+            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
+            mock.patch.object(HARNESS, "scan_runtime_artifacts", side_effect=scans),
+        ):
+            return getattr(harness, name)(), desk
+
+    def run_guarded(self, **desk_options: Any):
+        return self.run_scenario("scenario_guarded_session", [retired_scan()], **desk_options)
+
+    def run_recovery(self, **desk_options: Any):
+        return self.run_scenario(
+            "scenario_recovery_session", [recovery_scan(), retired_scan()], **desk_options
+        )
+
+    def test_guarded_session_runs_every_phase_in_one_launch(self) -> None:
+        observations, desk = self.run_guarded()
+
+        self.assertEqual(len(desk.launches), 1)
+        alt_f4 = (
+            (HARNESS.VK_MENU, 0),
+            (HARNESS.VK_F4, 0),
+            (HARNESS.VK_F4, runtime.KEYEVENTF_KEYUP),
+            (HARNESS.VK_MENU, runtime.KEYEVENTF_KEYUP),
+        )
+        self.assertEqual(
+            [event for event in desk.events if event[0] != "foreground"],
+            [
+                ("launch",),
+                ("edit",),
+                ("menu save",),
+                ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
+                ("key", runtime.VK_RETURN),
+                ("edit",),
+                ("rail close",),
+                ("guard", "Cancel"),
+                ("menu save",),
+                ("edit",),
+                ("inputs", alt_f4),
+                ("guard", "Cancel"),
+                ("wm_close",),
+                ("guard", "Save"),
+            ],
+        )
+        self.assertEqual(desk.document.read_bytes(), HARNESS.WINDOW_EDIT.encode("utf-8"))
+        HARNESS.validate_evidence(evidence_with(guarded=observations))
+
+    def test_external_modification_overwrites_only_after_enter_confirms(self) -> None:
+        for options, code in (
+            (dict(keep_mine_writes=True, enter_overwrites=False),
+             "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
+            (dict(enter_overwrites=False), "EXTERNAL_MODIFICATION_OVERWRITE_SAVE_TIMEOUT"),
+        ):
+            with self.subTest(code=code):
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    self.run_guarded(**options)
+                self.assertEqual(raised.exception.code, code)
+
+    def test_guarded_session_failures_name_their_phase(self) -> None:
+        for options, code in (
+            (dict(failing_guard=1), "TAB_CLOSE_GUARD_CARD_UIA_TIMEOUT"),
+            (dict(failing_guard=2), "WINDOW_CLOSE_GUARD_CARD_UIA_TIMEOUT"),
+            (dict(failing_guard=3), "WINDOW_CLOSE_GUARD_CARD_UIA_TIMEOUT"),
+            (dict(cancel_clears_dirty=True), "TAB_CLOSE_CANCEL_CLEARED_DIRTY_MARK"),
+        ):
+            with self.subTest(code=code, options=options):
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    self.run_guarded(**options)
+                self.assertEqual(raised.exception.code, code)
+
+    def test_recovery_session_restarts_once_and_closes_with_ctrl_w(self) -> None:
+        observations, desk = self.run_recovery()
+
+        self.assertEqual(len(desk.launches), 2)
+        self.assertEqual(
+            [event for event in desk.events if event[0] != "foreground"],
+            [
+                ("launch",),
+                ("edit",),
+                ("terminate",),
+                ("launch",),
+                ("click", HARNESS.RESTORE_AUTOMATION_ID),
+                ("shortcut", HARNESS.VK_W),
+                ("guard", "Discard"),
+                ("close app",),
+            ],
+        )
+        self.assertEqual(desk.document.read_bytes(), HARNESS.ORIGINAL_BYTES)
+        self.assertLessEqual(observations["checkpoint_ms"], 10_000)
+        HARNESS.validate_evidence(evidence_with(recovery=observations))
+
+    def test_recovery_session_fails_when_dont_save_keeps_the_record(self) -> None:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            self.run_recovery(discard_retires=False)
+        self.assertEqual(raised.exception.code, "KEYBOARD_CLOSE_RECOVERY_RECORD_RETAINED")
 
 
 class RuntimeArtifactTests(unittest.TestCase):
@@ -279,6 +510,21 @@ class RuntimeArtifactTests(unittest.TestCase):
             canonical = recovery / (("a" * 64) + ".mtrecovery")
             canonical.write_bytes(b"sealed")
             self.assertEqual(HARNESS.canonical_recovery_records(data), [canonical])
+
+    def test_retained_recovery_artifacts_ignore_only_the_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            self.assertEqual(HARNESS.retained_recovery_artifacts(data), [])
+            recovery = data / "recovery"
+            recovery.mkdir(parents=True)
+            (recovery / HARNESS.RECOVERY_LEASE_NAME).write_bytes(b"")
+            self.assertEqual(HARNESS.retained_recovery_artifacts(data), [])
+
+            marker = recovery / (".markturbo-recovery-retiring-" + "a" * 64)
+            marker.write_bytes(b"")
+            record = recovery / RECORD_NAME
+            record.write_bytes(b"sealed")
+            self.assertEqual(HARNESS.retained_recovery_artifacts(data), [marker, record])
 
     def test_checkpoint_wait_is_bounded_by_the_ten_second_loss_window(self) -> None:
         harness = object.__new__(HARNESS.Goal02Harness)
