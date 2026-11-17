@@ -208,201 +208,6 @@ fn partial_accept_records_the_final_split_once() {
     );
 }
 
-/// A persistent Apply control also exercises a second invocation after the
-/// production panel removes its completed proposal's controls.
-#[component]
-fn RevisionDecisionActions() -> impl IntoElement {
-    let state = mt_app::state::AppState::new();
-    state.open_file(
-        std::env::var_os("MARKTURBO_OPEN")
-            .expect("document path")
-            .into(),
-    );
-    let review = state.clone();
-    let send_review = state.clone();
-    let revision = state.clone();
-    let send_revision = state.clone();
-    let approve = state.clone();
-    let apply = state.clone();
-    let review_view = state.review_view;
-    let revision_status = state.revision_status;
-    let hunks = state.revision_hunks;
-    let tabs = state.tabs;
-    view()
-        .flex_col()
-        .child(text("Review").on_press(move || review.start_review()))
-        .child(text("Send Review").on_press(move || send_review.send_review()))
-        .child(text("Prepare Revision").on_press(move || revision.start_revision()))
-        .child(text("Send Revision").on_press(move || send_revision.send_revision()))
-        .child(text("Approve first hunk").on_press(move || approve.toggle_revision_hunk(0)))
-        .child(text("Apply").on_press(move || apply.apply_revision()))
-        .child(text(move || {
-            review_view
-                .get()
-                .map(|view| view.status)
-                .unwrap_or_default()
-        }))
-        .child(text(move || revision_status.get().unwrap_or_default()))
-        .child(text(move || format!("Hunks: {}", hunks.get().len())))
-        .child(text(move || {
-            tabs.get()
-                .first()
-                .map(|tab| tab.text.get())
-                .unwrap_or_default()
-        }))
-        // The buffer escaped, so a selector compares every byte (a text
-        // selector ignores the spaces around a text).
-        .child(text(move || {
-            format!(
-                "Bytes: {:?}",
-                tabs.get()
-                    .first()
-                    .map(|tab| tab.text.get().to_string())
-                    .unwrap_or_default()
-            )
-        }))
-        .child(text(move || {
-            format!(
-                "Dirty: {}",
-                tabs.get().first().is_some_and(|tab| tab.dirty.get())
-            )
-        }))
-}
-
-#[test]
-fn all_rejected_apply_records_one_decision_and_finalizes() {
-    let _guard = TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let review_output = serde_json::json!({
-        "schema_version": "review-v1",
-        "scope": {"kind": "document"},
-        "understood_intent": {
-            "stated_goal": "keep the document intent",
-            "relevant_context": [],
-            "constraints": [],
-            "non_goals": [],
-            "expected_deliverable": "a reviewed document",
-            "success_evidence": [],
-            "inferred_assumptions": [],
-            "unresolved_decisions": []
-        },
-        "findings": [],
-        "clarification_questions": []
-    })
-    .to_string();
-    let revision_output = serde_json::json!({
-        "schema_version": "revision-v1",
-        "groups": [{
-            "rationale": "Revise the first line.",
-            "edits": [{
-                "range": {"start": 0, "end": 5},
-                "expected_source": "First",
-                "replacement": "Revised first"
-            }]
-        }, {
-            "rationale": "Revise the second line.",
-            "edits": [{
-                "range": {"start": 6, "end": 12},
-                "expected_source": "Second",
-                "replacement": "Revised second"
-            }]
-        }],
-        "question_coverage": []
-    })
-    .to_string();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
-    std::thread::spawn(move || {
-        for _ in 0..3 {
-            let (mut stream, _) = listener.accept().expect("provider request");
-            let body = read_http_body(&mut stream);
-            let request: serde_json::Value = serde_json::from_slice(&body).expect("request JSON");
-            if request["stream"].as_bool().unwrap_or(false) {
-                write_sse(&mut stream, &revision_output);
-            } else {
-                write_review_json(&mut stream, &review_output);
-            }
-        }
-    });
-    let directory = tempfile::tempdir().expect("document dir");
-    let config = tempfile::tempdir().expect("config dir");
-    let document = directory.path().join("plan.md");
-    std::fs::write(&document, "First\nSecond\n").expect("write document");
-    let endpoint = mt_core::model::EndpointIdentity::parse(
-        mt_core::model::Provider::OpenAiChat,
-        Some(&base_url),
-    )
-    .expect("endpoint");
-    let identity = endpoint.credential_target();
-    std::fs::write(config.path().join("settings.toml"), format!(
-        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
-    )).expect("write settings");
-    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
-    unsafe {
-        std::env::set_var("MARKTURBO_OPEN", &document);
-        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
-        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
-        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
-    }
-    let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionDecisionActions>()))
-        .expect("start revision actions");
-    app.wait_for("text:First\nSecond\n")
-        .expect("document loaded");
-    app.press("text:Review").expect("prepare Review");
-    app.press("text:Send Review").expect("send Review");
-    app.wait_for_within("text:Review ready", Duration::from_secs(20))
-        .expect("Review ready");
-    app.press("text:Prepare Revision")
-        .expect("prepare Revision");
-    app.press("text:Send Revision").expect("send Revision");
-    app.wait_for("text:Hunks: 2").expect("two rejected hunks");
-    app.press("text:Apply").expect("finalize all rejected");
-    app.wait_for("text:No changes approved.")
-        .expect("rejection status");
-    app.wait_for("text:Hunks: 0").expect("proposal finalized");
-    // Rejecting every hunk leaves the buffer byte for byte as reviewed, and
-    // clean.
-    assert!(
-        app.shows(r#"Bytes: "First\nSecond\n""#) && app.shows("Dirty: false"),
-        "the buffer is the reviewed source, clean: {:?}",
-        app.screen().texts()
-    );
-    assert_eq!(revision_usage_totals(), (1, 0, 2, 0));
-    let store = config.path().join("data/usage.json");
-    let finalized = std::fs::read(&store).expect("finalized usage aggregate");
-    app.press("text:Apply")
-        .expect("repeat Apply after finalization");
-    app.wait_for("text:Run Review first to prepare a Revision.")
-        .expect("no live proposal");
-    assert_eq!(std::fs::read(&store).unwrap(), finalized);
-    assert_eq!(revision_usage_totals(), (1, 0, 2, 0));
-    assert_eq!(
-        std::fs::read_to_string(&document).unwrap(),
-        "First\nSecond\n"
-    );
-
-    app.press("text:Prepare Revision")
-        .expect("prepare a fresh proposal");
-    app.press("text:Send Revision")
-        .expect("send the fresh Revision");
-    app.wait_for("text:Hunks: 2").expect("fresh proposal hunks");
-    app.press("text:Approve first hunk")
-        .expect("approve one fresh hunk");
-    app.press("text:Apply").expect("apply fresh final split");
-    app.wait_for("text:Approved changes applied to the buffer.")
-        .expect("fresh apply");
-    app.wait_for("text:Revised first\nSecond\n")
-        .expect("only fresh approval applied");
-    assert_eq!(revision_usage_totals(), (2, 1, 3, 1));
-    let finalized = std::fs::read(&store).unwrap();
-    app.press("text:Apply")
-        .expect("repeat Apply after successful finalization");
-    app.wait_for("text:Run Review first to prepare a Revision.")
-        .expect("fresh proposal finalized");
-    assert_eq!(std::fs::read(&store).unwrap(), finalized);
-}
-
 /// The revision field over a document the loopback provider reviews, with
 /// the buffer on screen: the field's own keys decide, and the text node shows
 /// what each decision wrote.
@@ -457,6 +262,17 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
                     .unwrap_or_default()
             )
         }))
+        // The buffer escaped, so a selector compares every byte (a text
+        // selector ignores the spaces around a text).
+        .child(text(move || {
+            format!(
+                "Bytes: {:?}",
+                tabs.get()
+                    .first()
+                    .map(|tab| tab.text.get().to_string())
+                    .unwrap_or_default()
+            )
+        }))
         .child(text(move || {
             format!(
                 "Dirty: {}",
@@ -472,10 +288,15 @@ fn RevisionFieldOverBuffer() -> impl IntoElement {
         )))
 }
 
-/// A Review with no findings and a Revision of two changes that both change
-/// length: `Original` (8 bytes) becomes `Revised` (7), `Unchanged` (9)
-/// becomes `Changed` (7).
-fn two_change_outputs() -> (String, String) {
+/// A Review with no findings and a Revision of two changes to `source` that
+/// both change length: `Original` (8 bytes) becomes `Revised` (7),
+/// `Unchanged` (9) becomes `Changed` (7). Each range is where the word first
+/// appears in `source`.
+fn two_change_outputs(source: &str) -> (String, String) {
+    let range = |word: &str| {
+        let start = source.find(word).expect("the word is in the source");
+        serde_json::json!({"start": start, "end": start + word.len()})
+    };
     let review = serde_json::json!({
         "schema_version": "review-v1",
         "scope": {"kind": "document"},
@@ -497,14 +318,14 @@ fn two_change_outputs() -> (String, String) {
         "groups": [{
             "rationale": "Use the reviewed title.",
             "edits": [{
-                "range": {"start": 0, "end": 8},
+                "range": range("Original"),
                 "expected_source": "Original",
                 "replacement": "Revised"
             }]
         }, {
             "rationale": "Change the second line.",
             "edits": [{
-                "range": {"start": 9, "end": 18},
+                "range": range("Unchanged"),
                 "expected_source": "Unchanged",
                 "replacement": "Changed"
             }]
@@ -517,7 +338,8 @@ fn two_change_outputs() -> (String, String) {
 /// Serve `review` and `revision` on a loopback provider, write `source` and
 /// the settings that point at it, and start `RevisionFieldOverBuffer` up to
 /// the moment the hunks arrive. The temporary directories live as long as
-/// the returned guards.
+/// the returned guards. The buffer holds `source` with `\n` line ends, and
+/// the Revision's ranges are in the buffer's text.
 fn start_field_over_buffer(
     source: &str,
 ) -> (
@@ -526,7 +348,8 @@ fn start_field_over_buffer(
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let (review_output, revision_output) = two_change_outputs();
+    let buffer = source.replace("\r\n", "\n");
+    let (review_output, revision_output) = two_change_outputs(&buffer);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
     std::thread::spawn(move || {
@@ -566,7 +389,7 @@ fn start_field_over_buffer(
     }
     let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionFieldOverBuffer>()))
         .expect("start the field over the buffer");
-    app.wait_for(&format!("text:Buffer: {source}"))
+    app.wait_for(&format!("text:Buffer: {buffer}"))
         .expect("document loaded");
     app.press("text:Review").expect("prepare Review");
     app.press("text:Send Review").expect("send Review");
@@ -673,6 +496,66 @@ fn decisions_write_at_once_and_undo_restores_the_exact_text() {
         (1, 1, 1, 1),
         "one decision record: one accepted, one not, one applied"
     );
+}
+
+/// `R` on every hunk in the field and then `Done` leaves the buffer and the
+/// disk byte for byte as reviewed — CRLF line ends on disk, CJK and emoji
+/// included — with the tab clean, and records one decision of two
+/// rejections. A second `Ctrl+Enter` records nothing more.
+#[test]
+fn rejecting_every_hunk_then_done_keeps_the_exact_bytes() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original 标题 🎉\r\nUnchanged 第二行 😀\r\n";
+    let (mut app, document, _directory, config) = start_field_over_buffer(source);
+    // The editor breaks lines at `\r\n` and holds `\n`; saving restores the
+    // file's line ends, which nothing here does.
+    let bytes = format!("Bytes: {:?}", source.replace("\r\n", "\n"));
+    assert!(
+        app.shows(&bytes),
+        "the buffer before any decision: {:?}",
+        app.screen().texts()
+    );
+
+    app.press_key("r").expect("reject the first hunk");
+    app.wait_for("text:1 of 2 decided").expect("one decided");
+    app.wait_for("text:Use the reviewed title. · Rejected")
+        .expect("the second hunk is docked");
+    app.press_key("r").expect("reject the second hunk");
+    app.wait_for("text:2 of 2 decided").expect("both decided");
+    assert!(
+        app.shows(&bytes),
+        "a rejection writes nothing: {:?}",
+        app.screen().texts()
+    );
+
+    app.press_key("ctrl+enter").expect("Done");
+    app.wait_for("text:No changes approved.")
+        .expect("Done with nothing approved");
+    assert!(
+        app.shows(&bytes) && app.shows("Dirty: false"),
+        "the buffer is the reviewed source, clean: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        std::fs::read(&document).unwrap(),
+        source.as_bytes(),
+        "the disk is the reviewed source"
+    );
+    assert_eq!(
+        revision_usage_totals(),
+        (1, 0, 2, 0),
+        "one decision record: two rejected, nothing applied"
+    );
+
+    let store = config.path().join("data/usage.json");
+    let finalized = std::fs::read(&store).expect("finalized usage aggregate");
+    app.press_key("ctrl+enter").expect("Ctrl+Enter again");
+    app.wait(Duration::from_millis(300)).expect("settle");
+    assert_eq!(std::fs::read(&store).unwrap(), finalized);
+    assert!(app.shows(&bytes) && app.shows("Dirty: false"));
+    assert_eq!(std::fs::read(&document).unwrap(), source.as_bytes());
 }
 
 /// The user edits between decisions: an edit inside an accepted change
@@ -848,7 +731,8 @@ fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
     let _guard = TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (review_output, revision_output) = two_change_outputs();
+    let source = "Original\nUnchanged\n";
+    let (review_output, revision_output) = two_change_outputs(source);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
     let (release, released) = std::sync::mpsc::channel::<()>();
@@ -875,7 +759,6 @@ fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
     let config = tempfile::tempdir().expect("config dir");
     let document = directory.path().join("plan.md");
     let other = directory.path().join("other.md");
-    let source = "Original\nUnchanged\n";
     // The other document starts with the reviewed one's text: a placement
     // that diffs the reviewed text against it would find the first hunk's
     // bytes there.

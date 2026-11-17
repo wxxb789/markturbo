@@ -3267,18 +3267,6 @@ impl AppState {
             })));
     }
 
-    /// `Done` for a caller that keeps no decisions of its own: every hunk
-    /// not accepted counts as not applied.
-    pub fn apply_revision(&self) {
-        let not_applied = self
-            .revision_hunks
-            .get()
-            .iter()
-            .filter(|hunk| !hunk.accepted.get())
-            .count();
-        self.finish_revision(not_applied);
-    }
-
     /// Whether the live proposal belongs to a tab other than the one on
     /// screen: its hunks are placed in that tab's text, so nothing can be
     /// decided into this one. An edit to the proposal's own tab does not
