@@ -187,6 +187,8 @@ FOREGROUND_TIMEOUT_SECONDS = 3.0
 # The longest a step nested inside an outer wait (one editor copy inside an
 # exact-bytes wait) may take, and never past the outer wait's deadline.
 INNER_WAIT_SECONDS = 2.0
+# How often a wait for a file's exact bytes hashes it.
+FILE_POLL_SECONDS = 0.1
 
 
 class GUITHREADINFO(ctypes.Structure):
@@ -407,10 +409,57 @@ def fingerprint_text(value: str) -> Fingerprint:
     return fingerprint_bytes(value.encode("utf-8"))
 
 
+GENERIC_READ = 0x80000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def open_shared_for_read(path: Path) -> Any:
+    """A binary reader of `path` that never blocks the app's own writes.
+
+    Python's `open` withholds FILE_SHARE_DELETE, so while the harness reads a
+    document the app's atomic save (`ReplaceFileW`, which renames over the
+    path) fails with a sharing violation. This handle grants read, write and
+    delete sharing; elsewhere than Windows `open` already shares them."""
+    if sys.platform != "win32":
+        return path.open("rb")
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wt.HANDLE
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    kernel32.CloseHandle.restype = wt.BOOL
+    handle = kernel32.CreateFileW(
+        str(path),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle is None or handle == INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        raise OSError(None, ctypes.FormatError(error).strip(), str(path), error)
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(descriptor, "rb")
+
+
 def sha256_file(path: Path) -> Fingerprint:
     digest = hashlib.sha256()
     byte_count = 0
-    with path.open("rb") as handle:
+    with open_shared_for_read(path) as handle:
         while chunk := handle.read(1024 * 1024):
             byte_count += len(chunk)
             digest.update(chunk)
@@ -2396,6 +2445,8 @@ class NativeHarness:
             raise failure
 
     def wait_file(self, path: Path, expected: Fingerprint, code: str) -> Fingerprint:
+        """Wait for `path` to hold `expected`, hashing it every 100 ms: each
+        read is a window in which the app's own save competes for the file."""
         last: Fingerprint | None = None
 
         def matches() -> Fingerprint | None:
@@ -2408,7 +2459,14 @@ class NativeHarness:
             return last if last == expected else None
 
         try:
-            return wait_until(matches, self.ui_timeout, code)
+            return wait_until(
+                matches,
+                self.ui_timeout,
+                code,
+                interval=FILE_POLL_SECONDS,
+                clock=self.clock,
+                sleep=self.sleep,
+            )
         except HarnessFailure as error:
             if error.code != code:
                 raise

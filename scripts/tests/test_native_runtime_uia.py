@@ -643,6 +643,30 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                         ("DESTINATION_TIMEOUT", relation),
                     )
 
+    def test_a_file_wait_hashes_the_file_every_100_ms(self) -> None:
+        harness = native_harness(FreshRootFactory([FakeRoot()]), timeout=1.0)
+        now = [0.0]
+        sleeps: list[float] = []
+        hashes: list[int] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        harness.clock = lambda: now[0]
+        harness.sleep = sleep
+        expected = runtime.fingerprint_bytes(b"saved")
+
+        def sha256_file(_path: Path) -> runtime.Fingerprint:
+            hashes.append(1)
+            return expected if len(hashes) == 3 else runtime.fingerprint_bytes(b"old")
+
+        with mock.patch.object(runtime, "sha256_file", sha256_file):
+            self.assertEqual(harness.wait_file(Path("document.md"), expected, "SAVE_TIMEOUT"), expected)
+
+        self.assertEqual(sleeps, [0.1, 0.1])
+        self.assertEqual(len(hashes), 3)
+
     def test_hold_control_waits_for_a_gliding_control_to_settle(self) -> None:
         rectangles = [
             mock.Mock(left=0, right=164, top=0, bottom=36),
