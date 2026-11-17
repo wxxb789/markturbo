@@ -57,6 +57,72 @@ class ToolingCliTests(unittest.TestCase):
                 )
             )
 
+    def test_accept_all_writes_one_evidence_file_per_goal_and_stops_after_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/mt.py",
+                    "accept",
+                    "all",
+                    "--exe",
+                    str(root / "missing.exe"),
+                    "--expect-exe-sha256",
+                    "0" * 64,
+                    "--evidence-dir",
+                    str(root),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertLess(result.stdout.index("== goal-03"), result.stdout.index("== goal-07"))
+            self.assertIn("overall: FAIL", result.stderr)
+            reasons = {}
+            for goal in cli.ACCEPT_ALL_ORDER:
+                value = json.loads((root / f"{goal}-native-acceptance.json").read_text("utf-8"))
+                self.assertEqual(value["schema"], f"markturbo.{goal}-native-acceptance")
+                self.assertEqual(value["executable"]["expected_sha256"], "0" * 64)
+                self.assertEqual(value["status"], "FAIL")
+                reasons[goal] = {case["reason_code"] for case in value["cases"]}
+
+        self.assertEqual(cli.ACCEPT_ALL_ORDER, ("goal-03", "goal-02", "goal-06", "goal-07"))
+        self.assertEqual(reasons["goal-03"], {"EXECUTABLE_MISSING"})
+        for goal in ("goal-02", "goal-06", "goal-07"):
+            self.assertEqual(reasons[goal], {"SKIPPED_AFTER_FAILURE"})
+
+    def test_accept_all_runs_each_goal_once_in_order_with_the_shared_options(self) -> None:
+        with mock.patch(
+            "scripts.markturbo_tools.native.runtime.main_native_acceptance_suite", return_value=2
+        ) as suite:
+            result = cli.main(
+                [
+                    "accept",
+                    "all",
+                    "--expect-exe-sha256",
+                    "A" * 64,
+                    "--evidence-dir",
+                    "receipts",
+                    "--ui-timeout",
+                    "20",
+                    "--keep-going",
+                ]
+            )
+
+        self.assertEqual(result, 2)
+        (runs,), options = suite.call_args
+        self.assertEqual(options, {"keep_going": True})
+        self.assertEqual([name for name, _args, _plan in runs], list(cli.ACCEPT_ALL_ORDER))
+        for name, args, plan in runs:
+            self.assertEqual(args.expect_exe_sha256, "a" * 64)
+            self.assertEqual(args.ui_timeout, 20.0)
+            self.assertEqual(args.evidence, Path("receipts") / f"{name}-native-acceptance.json")
+            self.assertTrue(plan.required_case_ids)
+
     def test_check_failure_returns_one_and_reports_the_error(self) -> None:
         stderr = StringIO()
         with (

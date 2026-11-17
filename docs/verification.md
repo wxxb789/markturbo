@@ -35,7 +35,7 @@ wiring, while `mt-core` tests proposal validation and consent semantics.
 | Workspace | `mt.py check ci` | fast + fmt/clippy + workspace tests, including headless app tests | settled product change; Ubuntu per PR |
 | Native-harness unit tests | `mt.py check native` | native acceptance tooling only; no desktop or executable | native harness change |
 | Release | `mt.py check full` | release profile + build + privacy scan | release candidate |
-| Native acceptance | `mt.py accept <goal> -- ...` | active Windows desktop, final executable hash | milestone |
+| Native acceptance | `mt.py accept all ...` (one goal: `mt.py accept <goal> -- ...` for diagnosis) | active Windows desktop, final executable hash | milestone |
 
 `check native` is not acceptance. Native acceptance remains a separate,
 hash-bound milestone action and may be BLOCKED by the desktop/session.
@@ -167,8 +167,9 @@ How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
   modes go through it.
 - The editor's accessible element is the `Markdown source` IME input; its UIA
   Value is not the document. The harness reads the document with Ctrl+A, Ctrl+C
-  and restores the user's clipboard. Selection and Review use the editor's own
-  keys (Ctrl+A, Ctrl+Enter).
+  into a cleared clipboard; the run saves the user's text clipboard once and
+  restores it once at its end. Selection and Review use the editor's own keys
+  (Ctrl+A, Ctrl+Enter).
 - UIA Invoke is one tap. The consent card's `consent-send` sends only after a
   held press, so the harnesses hold the real pointer past the control's 1.2 s
   threshold; an Invoke is never consent.
@@ -213,7 +214,7 @@ What the ported cases expect, matching the merged UI:
   after an accepted executable change.
 
 All four harnesses write one evidence schema (`native/evidence.py`,
-`schema_version` 3) to `target/native-acceptance/goal-NN-native-acceptance-v3.json`
+`schema_version` 3) to `target/native-acceptance/goal-NN-native-acceptance.json`
 by default; `revision_evaluation.py` binds only that version. Every earlier
 file, including the GPUI-era records under `docs/evidence/`, is rejected.
 
@@ -224,6 +225,57 @@ Revision write, Save As replacing a confirmed existing destination, the marked
 stale recent row, and the workspace home replacing the welcome. Whether the
 packaged app passes them is unknown until the first live run on an active,
 unlocked Windows 11 desktop.
+
+## Running native acceptance
+
+One command runs every goal on one executable:
+
+```sh
+uv run --locked --project scripts scripts/mt.py accept all \
+    --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+    --expect-exe-sha256 <sha256> --evidence-dir target/native-acceptance \
+    [--keep-going] [--ui-timeout 15]
+```
+
+It runs goal-03, goal-02, goal-06 and goal-07 in that order in one process. The
+executable is hashed and the environment checked once, the executable copied
+once, and the user's clipboard saved once; every goal still gets its own
+isolated temp root and writes its own `goal-0N-native-acceptance.json` with the
+same hash binding. Exit status: `0` PASS (every goal passed), `1` FAIL (any
+goal failed, or the clipboard could not be restored), `2` BLOCKED (the
+environment stopped the run and nothing failed). FAIL outranks BLOCKED. A goal
+BLOCKED stops the later goals, and a goal FAIL does too unless `--keep-going`;
+a goal whose cleanup failed (its processes or workdir may remain) stops them
+even with `--keep-going`. A stopped goal still writes its evidence, every case
+marked `SKIPPED_AFTER_BLOCKED`, `SKIPPED_AFTER_FAILURE` or
+`SKIPPED_AFTER_CLEANUP_FAILURE`. With `--keep-going` a case
+FAIL also lets the goal's later cases run; the first failure is the reported
+code and the goal stays FAIL. BLOCKED and a cleanup failure always stop.
+`mt.py accept goal-0N -- ...` (with `--case` or `--keep-going`) remains for
+diagnosing one goal; a single-case run is never acceptance.
+
+Before the run, on the Windows 11 x64 desktop that will run it:
+
+- Use the console session, or an RDP window that stays in the foreground and
+  is never minimised. A disconnected or locked session reports
+  `SESSION_NOT_ACTIVE` or an `INPUT_DESKTOP_*` code instead of
+  `FOREGROUND_PERMISSION_DENIED`.
+- Turn off clipboard history (Win+V), RDP clipboard redirection,
+  notifications and Focus Assist's banners; they take the clipboard or the
+  foreground. The harness asks Windows to keep the display and system awake
+  for the run and releases the request at its end.
+- Leave the clipboard empty or holding plain text: a clipboard with other
+  formats blocks as `CLIPBOARD_CONTAINS_NON_TEXT`. A clipboard held by another
+  program past the ~3 s retry window blocks as `CLIPBOARD_UNAVAILABLE`, with
+  the attempt count and whether a window held it. Do not use the clipboard
+  during the run; a harness killed mid-run cannot restore it.
+
+Timing rules the runtime enforces: the foreground has one ~3 s timeout; a
+wait nested inside another (the copy inside an exact-bytes editor wait) is
+bounded by the outer deadline and at most 2 s; an editor-text duration ends
+when the matching copy was requested, not after the harness's clipboard
+retries. Goal thresholds (the 10 000 ms recovery checkpoint, the consent hold,
+the 15 s default UI timeout, exact bytes) are unchanged.
 
 Goal 09's release-build screenshot matrix is produced by:
 

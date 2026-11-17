@@ -433,11 +433,14 @@ class ClipboardOpenRetryTests(unittest.TestCase):
     def test_a_briefly_held_clipboard_opens_on_a_retry(self) -> None:
         attempts = iter([False, False, True])
         _, clock, sleep = self.fake_clock()
-        self.assertTrue(
-            runtime.open_clipboard_with_retry(lambda: next(attempts), clock=clock, sleep=sleep)
+        self.assertEqual(
+            runtime.open_clipboard_with_retry(
+                lambda: next(attempts), lambda: True, clock=clock, sleep=sleep
+            ),
+            3,
         )
 
-    def test_a_clipboard_held_past_the_deadline_is_unavailable(self) -> None:
+    def test_a_clipboard_held_past_the_deadline_blocks_with_content_free_diagnostics(self) -> None:
         now, clock, sleep = self.fake_clock()
         calls = []
 
@@ -445,6 +448,43 @@ class ClipboardOpenRetryTests(unittest.TestCase):
             calls.append(now[0])
             return False
 
-        self.assertFalse(runtime.open_clipboard_with_retry(held, 0.1, clock=clock, sleep=sleep))
-        self.assertGreater(len(calls), 1)
-        self.assertGreaterEqual(now[0], 0.1)
+        with self.assertRaises(runtime.HarnessBlocked) as raised:
+            runtime.open_clipboard_with_retry(held, lambda: True, clock=clock, sleep=sleep)
+
+        self.assertEqual(raised.exception.code, "CLIPBOARD_UNAVAILABLE")
+        self.assertEqual(
+            raised.exception.diagnostics,
+            {"clipboard_open_attempts": len(calls), "clipboard_owner_window_present": True},
+        )
+        # The whole ~3 s window is retried, not a single attempt.
+        self.assertEqual(runtime.CLIPBOARD_OPEN_TIMEOUT_SECONDS, 3.0)
+        self.assertGreaterEqual(now[0], runtime.CLIPBOARD_OPEN_TIMEOUT_SECONDS)
+        self.assertGreater(len(calls), 100)
+
+
+class ExecutionStateTests(unittest.TestCase):
+    def test_the_run_keeps_the_display_on_and_releases_it(self) -> None:
+        calls: list[int] = []
+        win32 = object.__new__(runtime.Win32)
+        win32.kernel32 = SimpleNamespace(
+            SetThreadExecutionState=lambda flags: calls.append(flags) or runtime.ES_CONTINUOUS
+        )
+
+        win32.keep_display_awake()
+        win32.allow_display_sleep()
+
+        self.assertEqual(
+            calls,
+            [
+                runtime.ES_CONTINUOUS | runtime.ES_DISPLAY_REQUIRED | runtime.ES_SYSTEM_REQUIRED,
+                runtime.ES_CONTINUOUS,
+            ],
+        )
+
+    def test_a_refused_execution_state_blocks(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        win32.kernel32 = SimpleNamespace(SetThreadExecutionState=lambda _flags: 0)
+
+        with self.assertRaises(runtime.HarnessBlocked) as raised:
+            win32.keep_display_awake()
+        self.assertEqual(raised.exception.code, "EXECUTION_STATE_REQUEST_FAILED")
