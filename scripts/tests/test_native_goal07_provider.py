@@ -44,11 +44,11 @@ class LoopbackProviderTests(unittest.TestCase):
     def test_server_is_loopback_deterministic_and_content_free(self) -> None:
         with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
             server.grant_review_consent()
-            server.begin_consent_click(0)
+            server.dispatch_consent_click(0, lambda: None)
             for operation in ("review", "revision"):
                 if operation == "revision":
                     server.grant_revision_consent()
-                    server.begin_consent_click(1)
+                    server.dispatch_consent_click(1, lambda: None)
                 payload = loopback_request(operation)
                 request = urllib.request.Request(
                     server.base_url + "responses",
@@ -99,7 +99,7 @@ class LoopbackProviderTests(unittest.TestCase):
             self.assertTrue(server.requests[1]["revision"])
             self.assertFalse(server.requests[0]["stream"])
             self.assertTrue(server.requests[1]["stream"])
-            self.assertEqual(server.request_count_snapshot(), 2)
+            self.assertEqual(server.request_snapshot()["request_count"], 2)
             self.assertEqual(server.contract_evidence()["provider_request_count"], 2)
             self.assertTrue(
                 all(record["request_after_consent_click"] for record in server.requests)
@@ -125,7 +125,7 @@ class LoopbackProviderTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
                     server.grant_review_consent()
-                    server.begin_consent_click(0)
+                    server.dispatch_consent_click(0, lambda: None)
                     if operation == "revision":
                         review = urllib.request.Request(
                             server.base_url + "responses",
@@ -135,7 +135,7 @@ class LoopbackProviderTests(unittest.TestCase):
                         with urllib.request.urlopen(review) as response:
                             response.read()
                         server.grant_revision_consent()
-                        server.begin_consent_click(1)
+                        server.dispatch_consent_click(1, lambda: None)
                     payload = loopback_request(operation)
                     payload["stream"] = not payload["stream"]
                     request = urllib.request.Request(
@@ -154,7 +154,7 @@ class LoopbackProviderTests(unittest.TestCase):
             server.grant_review_consent()
             payload = loopback_request("review")
             arrival = server._next_event_sequence()
-            server.begin_consent_click(0)
+            server.dispatch_consent_click(0, lambda: None)
             record, failure = server._validate_request(
                 "/v1/responses", payload, request_arrival_sequence=arrival
             )
@@ -189,7 +189,7 @@ class LoopbackProviderTests(unittest.TestCase):
     def test_server_rejects_wrong_fixture_binding_and_missing_answer(self) -> None:
         with PROVIDER.LoopbackRevisionServer(HARNESS.EDITOR_SOURCE_TEXT) as server:
             server.grant_review_consent()
-            server.begin_consent_click(0)
+            server.dispatch_consent_click(0, lambda: None)
             review = urllib.request.Request(
                 server.base_url + "responses",
                 data=json.dumps(loopback_request("review")).encode("utf-8"),
@@ -198,7 +198,7 @@ class LoopbackProviderTests(unittest.TestCase):
             with urllib.request.urlopen(review) as response:
                 response.read()
             server.grant_revision_consent()
-            server.begin_consent_click(1)
+            server.dispatch_consent_click(1, lambda: None)
             invalid = loopback_request("revision")
             invalid["input"] = invalid["input"].replace(
                 hashlib.sha256(HARNESS.EDITOR_SOURCE_BYTES).hexdigest(), "0" * 64

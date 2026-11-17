@@ -1,6 +1,19 @@
-"""Goal 02 native harness tests without launching a UI."""
+"""The shared native runtime's UIA, focus and input paths, against fakes."""
 
-from ._native_goal02_support import *
+from __future__ import annotations
+
+import contextlib
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from scripts.markturbo_tools.native import goal02 as HARNESS
+from scripts.markturbo_tools.native import runtime
+
+from ._native_support import HASH
+
+SAME_AS_RAW = object()
 
 
 class FakeControl:
@@ -225,7 +238,7 @@ class FreshRootFactory:
 
 
 def native_harness(factory: FreshRootFactory, timeout: float = 0.1) -> object:
-    harness = object.__new__(NATIVE_HARNESS)
+    harness = object.__new__(HARNESS.Goal02Harness)
     harness.uia_element_info_class = factory.element_info
     harness.uia_wrapper_class = factory.wrapper
     harness.iuia_class = lambda: factory.uia
@@ -240,7 +253,7 @@ def running_app(hwnd: int = 73, exited: bool = False) -> object:
 
 
 def editor_control() -> FakeControl:
-    return FakeControl("", "Edit", name=EDITOR_NAME)
+    return FakeControl("", "Edit", name=runtime.EDITOR_NAME)
 
 
 class FakeEditorWin32:
@@ -260,7 +273,7 @@ class FakeEditorWin32:
 
     def send_shortcut(self, hwnd: int, key: int) -> None:
         self.shortcuts.append((hwnd, key))
-        if key == VK_C:
+        if key == runtime.VK_C:
             # nsh-base 0.5.1 copies an empty selection line-wise, so an empty
             # document copies as its one empty line (`editor/commands.rs` `copy`).
             copied = self.copies.pop(0) if self.copies else (self.document or "\n")
@@ -273,7 +286,7 @@ class FakeEditorWin32:
 
     def send_key(self, hwnd: int, key: int) -> None:
         self.keys.append((hwnd, key))
-        if key == VK_BACK:
+        if key == runtime.VK_BACK:
             self.document = ""
 
 
@@ -290,47 +303,47 @@ def editor_harness(
 
 class SessionIntegrityAndOutcomeTests(unittest.TestCase):
     def test_requires_same_session_and_integrity(self) -> None:
-        parent = SECURITY_CONTEXT(3, 0x2000, "medium")
+        parent = runtime.SecurityContext(3, 0x2000, "medium")
 
         self.assertIsNone(
-            SECURITY_CONTEXT_FAILURE(parent, SECURITY_CONTEXT(3, 0x2000, "medium"))
+            runtime.security_context_failure(parent, runtime.SecurityContext(3, 0x2000, "medium"))
         )
         self.assertEqual(
-            SECURITY_CONTEXT_FAILURE(parent, SECURITY_CONTEXT(4, 0x2000, "medium")),
+            runtime.security_context_failure(parent, runtime.SecurityContext(4, 0x2000, "medium")),
             "PROCESS_SESSION_MISMATCH",
         )
         self.assertEqual(
-            SECURITY_CONTEXT_FAILURE(parent, SECURITY_CONTEXT(3, 0x3000, "high")),
+            runtime.security_context_failure(parent, runtime.SecurityContext(3, 0x3000, "high")),
             "PROCESS_INTEGRITY_MISMATCH",
         )
 
     def test_parses_blocked_outcome_without_accepting_free_form_text(self) -> None:
         self.assertEqual(
-            PARSE_OUTCOME_LINE("BLOCKED: INPUT_DESKTOP_LOCKED"),
+            runtime.parse_outcome_line("BLOCKED: INPUT_DESKTOP_LOCKED"),
             ("BLOCKED", "INPUT_DESKTOP_LOCKED"),
         )
         with self.assertRaisesRegex(ValueError, "invalid harness outcome"):
-            PARSE_OUTCOME_LINE("BLOCKED: secret document contents")
+            runtime.parse_outcome_line("BLOCKED: secret document contents")
 
     def test_product_timeout_is_fail_not_blocked(self) -> None:
-        with self.assertRaises(HARNESS_FAILURE) as raised:
-            WAIT_UNTIL(lambda: False, 0.001, "PRODUCT_TIMEOUT", interval=0.0)
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            runtime.wait_until(lambda: False, 0.001, "PRODUCT_TIMEOUT", interval=0.0)
 
         self.assertEqual(raised.exception.code, "PRODUCT_TIMEOUT")
-        self.assertNotIsInstance(raised.exception, HARNESS_BLOCKED)
+        self.assertNotIsInstance(raised.exception, runtime.HarnessBlocked)
 
     def test_preflight_failure_and_prerequisite_block_have_distinct_exit_codes(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         exe = Path(temporary.name) / "markturbo.exe"
         exe.write_bytes(b"candidate")
-        args = PARSE_ARGS(["--exe", str(exe), "--expect-exe-sha256", HASH])
+        args = HARNESS.parse_args(["--exe", str(exe), "--expect-exe-sha256", HASH])
 
         def fail(*_args: object) -> object:
-            raise HARNESS_FAILURE("WINDOWS_11_REQUIRED")
+            raise runtime.HarnessFailure("WINDOWS_11_REQUIRED")
 
         def block(*_args: object) -> object:
-            raise HARNESS_BLOCKED("INPUT_DESKTOP_LOCKED")
+            raise runtime.HarnessBlocked("INPUT_DESKTOP_LOCKED")
 
         with mock.patch.dict(HARNESS.__dict__, {"preflight": fail}):
             fail_code, fail_evidence, fail_reason = runtime.run_native_acceptance(
@@ -344,8 +357,8 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
         self.assertEqual((fail_code, fail_evidence["status"]), (1, "FAIL"))
         self.assertEqual((block_code, block_evidence["status"]), (2, "BLOCKED"))
         self.assertEqual(fail_reason, "WINDOWS_11_REQUIRED")
-        VALIDATE_EVIDENCE(fail_evidence)
-        VALIDATE_EVIDENCE(block_evidence)
+        HARNESS.validate_evidence(fail_evidence)
+        HARNESS.validate_evidence(block_evidence)
 
     def test_foreground_failure_exposes_only_content_free_diagnostics(self) -> None:
         class FakeUser32:
@@ -365,7 +378,7 @@ class SessionIntegrityAndOutcomeTests(unittest.TestCase):
         win32.user32 = FakeUser32()
         win32.send_inputs = lambda _inputs: None
 
-        with self.assertRaises(HARNESS_BLOCKED) as raised:
+        with self.assertRaises(runtime.HarnessBlocked) as raised:
             win32.require_foreground(123, timeout=0.0)
 
         self.assertEqual(raised.exception.code, "FOREGROUND_PERMISSION_DENIED")
@@ -480,14 +493,14 @@ class NativeFocusTests(unittest.TestCase):
         self.assertEqual(win32.foreground_focus(73), 0)
         os.foreground = 73
         os.GetGUIThreadInfo = lambda *_args: False
-        with self.assertRaisesRegex(HARNESS_FAILURE, "NATIVE_FOCUS_QUERY_FAILED"):
+        with self.assertRaisesRegex(runtime.HarnessFailure, "NATIVE_FOCUS_QUERY_FAILED"):
             win32.foreground_focus(73)
 
 
 class SelectorAndOrchestrationTests(unittest.TestCase):
     def test_selectors_match_the_nsh_production_source(self) -> None:
-        self.assertEqual(TAB_CLOSE_AUTOMATION_ID, "rail-close")
-        self.assertEqual(EDITOR_NAME, "Markdown source")
+        self.assertEqual(HARNESS.TAB_CLOSE_AUTOMATION_ID, "rail-close")
+        self.assertEqual(runtime.EDITOR_NAME, "Markdown source")
         self.assertEqual(
             runtime.GUARD_BUTTON_NAMES,
             {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"},
@@ -496,25 +509,6 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             runtime.GUARD_BUTTON_AUTOMATION_IDS,
             {"Save": "guard-save", "Discard": "guard-dont-save", "Cancel": "guard-cancel"},
         )
-        self.assertIsNone(HARNESS.source_contract_failure())
-
-    def test_source_contract_rejects_a_comment_only_selector(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
-                target = root / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(HARNESS.REPO / relative, target)
-            rail = root / "crates/mt-app/src/ui/rail.rs"
-            source = rail.read_text(encoding="utf-8")
-            rail.write_text(
-                source.replace('.test_id("rail-close")', '.test_id("x") // "rail-close"'),
-                encoding="utf-8",
-            )
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertEqual(
-                    HARNESS.source_contract_failure(), "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
-                )
 
     def test_source_layout_waits_for_the_editor_without_the_menu(self) -> None:
         anchor = FakeControl(runtime.MENU_BUTTON_AUTOMATION_ID, "Button")
@@ -576,18 +570,17 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(buttons["Discard"].click_count, 1)
         self.assertEqual(buttons["Save"].click_count, 0)
         self.assertEqual(title_save.click_count, 0)
-        self.assertIn(("descendants", ("automation-id", "guard-dont-save")), root.find_calls)
 
     def test_guard_card_requires_its_heading_and_a_running_process(self) -> None:
         root, _buttons, _title_save = self.guard_root()
         root.controls = [control for control in root.controls if control.control_type != "Text"]
         missing = native_harness(FreshRootFactory([root]), timeout=0.001)
-        with self.assertRaises(HARNESS_FAILURE) as timeout:
+        with self.assertRaises(runtime.HarnessFailure) as timeout:
             missing.lifecycle_dialog(running_app())
         self.assertEqual(timeout.exception.code, "GUARD_CARD_UIA_TIMEOUT")
 
         exited = native_harness(FreshRootFactory([self.guard_root()[0]]))
-        with self.assertRaises(HARNESS_FAILURE) as closed:
+        with self.assertRaises(runtime.HarnessFailure) as closed:
             exited.lifecycle_dialog(running_app(exited=True))
         self.assertEqual(closed.exception.code, "PROCESS_EXITED_BEFORE_GUARD")
 
@@ -595,7 +588,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         root, _buttons, _title_save = self.guard_root()
         root.controls.append(FakeControl("guard-cancel", "Button", name="Cancel"))
         harness = native_harness(FreshRootFactory([root]))
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.lifecycle_dialog(running_app())
         self.assertEqual(raised.exception.code, "GUARD_BUTTON_UIA_CONTRACT_MISMATCH")
 
@@ -613,14 +606,14 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
     def test_find_control_refreshes_root_after_a_stale_lookup(self) -> None:
         stale = FakeRoot()
-        current_control = FakeControl(TAB_CLOSE_AUTOMATION_ID, "Edit")
+        current_control = FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")
         current = FakeRoot([current_control])
         factory = FreshRootFactory([stale, current])
         harness = native_harness(factory)
 
         control = harness.find_control(
             running_app(),
-            TAB_CLOSE_AUTOMATION_ID,
+            HARNESS.TAB_CLOSE_AUTOMATION_ID,
             "Edit",
             "SOURCE_EDITOR_UIA_TIMEOUT",
             "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -629,28 +622,16 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertIs(control, factory.wrappers[0])
         self.assertGreaterEqual(factory.calls, 2)
         self.assertEqual(factory.handles, [73] * factory.calls)
-        self.assertEqual(
-            stale.find_calls + current.find_calls,
-            [
-                ("descendants", ("automation-id", TAB_CLOSE_AUTOMATION_ID)),
-                ("descendants", ("automation-id", TAB_CLOSE_AUTOMATION_ID)),
-            ],
-        )
-        self.assertEqual(
-            factory.uia.conditions,
-            [("automation-id", TAB_CLOSE_AUTOMATION_ID)] * factory.calls,
-        )
-        self.assertEqual(current.arrays[0].get_calls, [0])
         self.assertIs(factory.wrappers[0].element_info.element, current_control)
 
     def test_find_control_uses_target_specific_timeout_without_label_fallback(self) -> None:
         root = FakeRoot([FakeControl("other-id", "Edit")])
         harness = native_harness(FreshRootFactory([root]), timeout=0.001)
 
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.find_control(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "SOURCE_EDITOR_UIA_TIMEOUT",
                 "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -659,18 +640,18 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "SOURCE_EDITOR_UIA_TIMEOUT")
         self.assertEqual(
             root.find_calls[0],
-            ("descendants", ("automation-id", TAB_CLOSE_AUTOMATION_ID)),
+            ("descendants", ("automation-id", HARNESS.TAB_CLOSE_AUTOMATION_ID)),
         )
 
     def test_find_control_fails_immediately_on_id_or_type_mismatch(self) -> None:
-        mismatched = FakeRoot([FakeControl(TAB_CLOSE_AUTOMATION_ID, "Button")])
+        mismatched = FakeRoot([FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Button")])
         factory = FreshRootFactory([mismatched])
         harness = native_harness(factory)
 
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.find_control(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "SOURCE_EDITOR_UIA_TIMEOUT",
                 "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -684,19 +665,19 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         stale = FakeRoot(
             [
                 FakeControl(
-                    TAB_CLOSE_AUTOMATION_ID,
+                    HARNESS.TAB_CLOSE_AUTOMATION_ID,
                     "Edit",
                     property_error=RuntimeError(secret),
                 )
             ]
         )
-        current_control = FakeControl(TAB_CLOSE_AUTOMATION_ID, "Edit")
+        current_control = FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")
         factory = FreshRootFactory([stale, FakeRoot([current_control])])
         harness = native_harness(factory)
 
         control = harness.find_control(
             running_app(),
-            TAB_CLOSE_AUTOMATION_ID,
+            HARNESS.TAB_CLOSE_AUTOMATION_ID,
             "Edit",
             "SOURCE_EDITOR_UIA_TIMEOUT",
             "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -710,19 +691,19 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         stale = FakeRoot(
             [
                 FakeControl(
-                    TAB_CLOSE_AUTOMATION_ID,
+                    HARNESS.TAB_CLOSE_AUTOMATION_ID,
                     "Edit",
                     wrapper_automation_id=None,
                 )
             ]
         )
-        fresh_control = FakeControl(TAB_CLOSE_AUTOMATION_ID, "Edit")
+        fresh_control = FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")
         factory = FreshRootFactory([stale, FakeRoot([fresh_control])])
         harness = native_harness(factory)
 
         control = harness.find_control(
             running_app(),
-            TAB_CLOSE_AUTOMATION_ID,
+            HARNESS.TAB_CLOSE_AUTOMATION_ID,
             "Edit",
             "SOURCE_EDITOR_UIA_TIMEOUT",
             "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -733,9 +714,9 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertIs(factory.wrappers[-1].element_info.element, fresh_control)
 
     def test_find_control_retries_hidden_and_disabled_controls_until_ready(self) -> None:
-        hidden = FakeRoot([FakeControl(TAB_CLOSE_AUTOMATION_ID, "Edit", visible=False)])
-        disabled = FakeRoot([FakeControl(TAB_CLOSE_AUTOMATION_ID, "Edit", enabled=False)])
-        ready_control = FakeControl(TAB_CLOSE_AUTOMATION_ID, "Edit")
+        hidden = FakeRoot([FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit", visible=False)])
+        disabled = FakeRoot([FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit", enabled=False)])
+        ready_control = FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")
         ready = FakeRoot([ready_control])
         factory = FreshRootFactory([hidden, disabled, ready])
         harness = native_harness(factory)
@@ -751,7 +732,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         ):
             control = harness.find_control(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "SOURCE_EDITOR_UIA_TIMEOUT",
                 "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -765,13 +746,13 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         secret = "UNIQUE-DOCUMENT-CONTENT"
         roots = (
             FakeRoot(find_error=RuntimeError(secret)),
-            FakeRoot([FakeControl(TAB_CLOSE_AUTOMATION_ID, "Edit")], get_error=RuntimeError(secret)),
+            FakeRoot([FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")], get_error=RuntimeError(secret)),
         )
         for root in roots:
-            with self.subTest(root=root), self.assertRaises(HARNESS_FAILURE) as raised:
+            with self.subTest(root=root), self.assertRaises(runtime.HarnessFailure) as raised:
                 native_harness(FreshRootFactory([root]), timeout=0.001).find_control(
                     running_app(),
-                    TAB_CLOSE_AUTOMATION_ID,
+                    HARNESS.TAB_CLOSE_AUTOMATION_ID,
                     "Edit",
                     "SOURCE_EDITOR_UIA_TIMEOUT",
                     "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -786,10 +767,10 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             FreshRootFactory([FakeRoot(find_error=RuntimeError(secret))])
         )
 
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.control_absent(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED",
                 "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH",
@@ -804,7 +785,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         root = FakeRoot(
             [
                 FakeControl(
-                    TAB_CLOSE_AUTOMATION_ID,
+                    HARNESS.TAB_CLOSE_AUTOMATION_ID,
                     "Edit",
                     property_error=RuntimeError(secret),
                 )
@@ -812,10 +793,10 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         )
         harness = native_harness(FreshRootFactory([root]))
 
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.control_absent(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED",
                 "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH",
@@ -829,7 +810,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         root = FakeRoot(
             [
                 FakeControl(
-                    TAB_CLOSE_AUTOMATION_ID,
+                    HARNESS.TAB_CLOSE_AUTOMATION_ID,
                     "Edit",
                     wrapper_control_type=None,
                 )
@@ -837,10 +818,10 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         )
         harness = native_harness(FreshRootFactory([root]))
 
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.control_absent(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED",
                 "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH",
@@ -856,25 +837,21 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertTrue(
             harness.control_absent(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED",
                 "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH",
             )
         )
-        self.assertEqual(
-            root.find_calls,
-            [("descendants", ("automation-id", TAB_CLOSE_AUTOMATION_ID))],
-        )
 
     def test_control_absent_fails_on_a_same_id_wrong_type(self) -> None:
-        root = FakeRoot([FakeControl(TAB_CLOSE_AUTOMATION_ID, "Button")])
+        root = FakeRoot([FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Button")])
         harness = native_harness(FreshRootFactory([root]))
 
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.control_absent(
                 running_app(),
-                TAB_CLOSE_AUTOMATION_ID,
+                HARNESS.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "DISCARD_EDITOR_ABSENCE_UIA_QUERY_FAILED",
                 "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH",
@@ -898,9 +875,9 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                 harness, editor = editor_harness(win32)
 
                 self.assertEqual(
-                    harness.read_editor_fingerprint(running_app()), FINGERPRINT_TEXT(copied)
+                    harness.read_editor_fingerprint(running_app()), runtime.fingerprint_text(copied)
                 )
-                self.assertEqual(win32.shortcuts, [(73, VK_A), (73, VK_C)])
+                self.assertEqual(win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_C)])
                 self.assertEqual(win32.clipboard, "user clipboard")
                 self.assertEqual(editor.focus_count, 1)
                 self.assertEqual(editor.value_pattern_count, 0)
@@ -918,24 +895,24 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         harness, _editor = editor_harness(win32, timeout=1.0)
 
         actual, _ = harness.wait_editor_fingerprint(
-            running_app(), FINGERPRINT_TEXT("after"), 1.0
+            running_app(), runtime.fingerprint_text("after"), 1.0
         )
 
-        self.assertEqual(actual, FINGERPRINT_TEXT("after"))
-        self.assertEqual(win32.shortcuts.count((73, VK_C)), 2)
+        self.assertEqual(actual, runtime.fingerprint_text("after"))
+        self.assertEqual(win32.shortcuts.count((73, runtime.VK_C)), 2)
         self.assertEqual(win32.clipboard, "user clipboard")
 
     def test_editor_timeouts_distinguish_wrong_and_uncopyable_text(self) -> None:
         wrong, _editor = editor_harness(FakeEditorWin32("wrong"), timeout=0.001)
-        with self.assertRaises(HARNESS_FAILURE) as wrong_timeout:
-            wrong.wait_editor_fingerprint(running_app(), FINGERPRINT_TEXT("expected"), 0.001)
+        with self.assertRaises(runtime.HarnessFailure) as wrong_timeout:
+            wrong.wait_editor_fingerprint(running_app(), runtime.fingerprint_text("expected"), 0.001)
         self.assertEqual(wrong_timeout.exception.code, "EDITOR_EXACT_BYTES_TIMEOUT")
 
         silent = FakeEditorWin32("UNIQUE-DOCUMENT-CONTENT", copies=[None] * 1000)
         uncopyable, _editor = editor_harness(silent, timeout=0.001)
-        with self.assertRaises(HARNESS_FAILURE) as unreadable:
+        with self.assertRaises(runtime.HarnessFailure) as unreadable:
             uncopyable.wait_editor_fingerprint(
-                running_app(), FINGERPRINT_TEXT("expected"), 0.001
+                running_app(), runtime.fingerprint_text("expected"), 0.001
             )
         self.assertEqual(unreadable.exception.code, "EDITOR_TEXT_TIMEOUT")
         self.assertEqual(unreadable.exception.detail, "HarnessFailure")
@@ -946,8 +923,8 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         win32 = FakeEditorWin32("before")
         harness, editor = editor_harness(win32)
 
-        self.assertEqual(harness.replace_editor(running_app(), value), FINGERPRINT_TEXT(value))
-        self.assertEqual(win32.shortcuts, [(73, VK_A), (73, VK_A), (73, VK_C)])
+        self.assertEqual(harness.replace_editor(running_app(), value), runtime.fingerprint_text(value))
+        self.assertEqual(win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_A), (73, runtime.VK_C)])
         self.assertEqual(win32.unicode_writes, [(73, value)])
         self.assertEqual(editor.click_count, 0)
 
@@ -955,20 +932,20 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         win32 = FakeEditorWin32("before")
         harness, _editor = editor_harness(win32)
 
-        self.assertEqual(harness.replace_editor(running_app(), ""), FINGERPRINT_TEXT(""))
+        self.assertEqual(harness.replace_editor(running_app(), ""), runtime.fingerprint_text(""))
         self.assertEqual(win32.document, "")
-        self.assertEqual(win32.keys, [(73, VK_BACK)])
+        self.assertEqual(win32.keys, [(73, runtime.VK_BACK)])
         self.assertEqual(win32.unicode_writes, [])
 
     def test_click_control_never_retries_a_failed_input(self) -> None:
         control = FakeControl(
-            TAB_CLOSE_AUTOMATION_ID,
+            HARNESS.TAB_CLOSE_AUTOMATION_ID,
             "Button",
             click_error=RuntimeError("UNIQUE-DOCUMENT-CONTENT"),
         )
-        harness = object.__new__(NATIVE_HARNESS)
+        harness = object.__new__(HARNESS.Goal02Harness)
 
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.click_control(
                 FakeUIAWrapper(FakeElementInfo(control)), "EDITOR_POINTER_FOCUS_FAILED"
             )
@@ -1168,7 +1145,7 @@ class SystemAlertTests(unittest.TestCase):
         win32 = AlertWin32()
         with (
             mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            self.assertRaises(HARNESS_FAILURE) as raised,
+            self.assertRaises(runtime.HarnessFailure) as raised,
         ):
             self.harness(win32).confirm_system_alert(running_app(), lambda: False, "EARLY")
         self.assertEqual(raised.exception.code, "EARLY")
@@ -1178,7 +1155,7 @@ class SystemAlertTests(unittest.TestCase):
         win32 = AlertWin32(focus=99)
         with (
             mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            self.assertRaises(HARNESS_FAILURE) as raised,
+            self.assertRaises(runtime.HarnessFailure) as raised,
         ):
             self.harness(win32).confirm_system_alert(running_app(), lambda: True, "EARLY")
         self.assertEqual(raised.exception.code, "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT")
@@ -1239,7 +1216,7 @@ class SystemAlertTests(unittest.TestCase):
         harness, app = self.conflict_scenario(
             overwrite_on_keep_mine=True, overwrite_on_enter=False
         )
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.scenario_external_conflict()
         self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
         self.assertNotIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
@@ -1248,52 +1225,79 @@ class SystemAlertTests(unittest.TestCase):
         harness, _app = self.conflict_scenario(
             overwrite_on_keep_mine=False, overwrite_on_enter=False
         )
-        with self.assertRaises(HARNESS_FAILURE) as raised:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.scenario_external_conflict()
         self.assertEqual(raised.exception.code, "EXPLICIT_OVERWRITE_SAVE_TIMEOUT")
 
-    def test_alert_source_contract_requires_the_confirmation_first_and_no_default(self) -> None:
-        cases = {
-            'alert_dialog().destructive("overwrite", "Overwrite").cancel("cancel", "Cancel")': True,
-            'alert_dialog().cancel("cancel", "Cancel").destructive("overwrite", "Overwrite")': False,
-            'alert_dialog().destructive("overwrite", "Overwrite").action("keep", "Keep")': False,
-            'alert_dialog().destructive("other", "Overwrite").cancel("cancel", "Cancel")': False,
-            '/* alert_dialog().destructive("overwrite", "Overwrite") */': False,
-        }
-        for body, expected in cases.items():
-            with self.subTest(body=body), tempfile.TemporaryDirectory() as temporary:
-                path = Path(temporary) / "state.rs"
-                path.write_text(
-                    f"impl S {{\n    pub fn overwrite_active(&self) {{\n        {body};\n    }}\n}}\n",
-                    encoding="utf-8",
-                )
-                self.assertEqual(
-                    HARNESS.alert_enter_confirms(path, "fn overwrite_active(", "overwrite"),
-                    expected,
-                )
-        self.assertTrue(
-            HARNESS.alert_enter_confirms(
-                HARNESS.REPO / "crates/mt-app/src/state.rs", "fn overwrite_active(", "overwrite"
-            )
+
+class SourceEditorTests(unittest.TestCase):
+    def test_paste_editor_pastes_and_restores_the_text_clipboard(self) -> None:
+        events = []
+
+        class FakeWin32:
+            def send_shortcut(self, hwnd, key):
+                events.append(("shortcut", hwnd, key))
+
+        class FakeHarness:
+            ui_timeout = 1.0
+            win32 = FakeWin32()
+
+            def read_text_clipboard(self):
+                events.append(("read",))
+                return "previous text"
+
+            def write_text_clipboard(self, value):
+                events.append(("write", value))
+
+            def focus_editor(self, app):
+                events.append(("focus", app.hwnd))
+
+            def wait_editor_fingerprint(self, app, expected, timeout):
+                events.append(("wait", timeout))
+                return expected, 0.0
+
+        app = type("App", (), {"hwnd": 42})()
+        result = runtime.NativeHarness.paste_editor(FakeHarness(), app, "emoji \U0001f680")
+
+        self.assertEqual(result, runtime.fingerprint_text("emoji \U0001f680"))
+        self.assertEqual(
+            events,
+            [
+                ("read",),
+                ("write", "emoji \U0001f680"),
+                ("focus", 42),
+                ("shortcut", 42, runtime.VK_A),
+                ("shortcut", 42, runtime.VK_V),
+                ("write", "previous text"),
+                ("wait", 1.0),
+            ],
         )
 
-    def test_source_contract_fails_when_enter_would_cancel_the_overwrite_alert(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
-                target = root / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(HARNESS.REPO / relative, target)
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertIsNone(HARNESS.source_contract_failure())
-            state = root / "crates/mt-app/src/state.rs"
-            source = state.read_text(encoding="utf-8")
-            confirm = '.destructive("overwrite", "Overwrite")'
-            self.assertEqual(source.count(confirm), 1)
-            state.write_text(
-                source.replace(confirm, '.action("keep", "Keep")' + confirm), encoding="utf-8"
-            )
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertEqual(
-                    HARNESS.source_contract_failure(), "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
-                )
+    def test_source_editor_focus_reads_uia_without_refocusing(self) -> None:
+        class FakeControl:
+            def has_keyboard_focus(self):
+                return True
+
+        class FakeHarness:
+            def control_by_name(self, hwnd, name, control_type, mismatch_code):
+                self.lookup = (hwnd, name, control_type, mismatch_code)
+                return FakeControl()
+
+        harness = FakeHarness()
+        app = type("App", (), {"hwnd": 42})()
+
+        self.assertTrue(runtime.NativeHarness.source_editor_has_focus(harness, app))
+        self.assertEqual(
+            harness.lookup, (42, runtime.EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH")
+        )
+
+        class BrokenHarness:
+            def control_by_name(self, *_args):
+                raise RuntimeError("UNIQUE-DOCUMENT-CONTENT")
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            runtime.NativeHarness.source_editor_has_focus(BrokenHarness(), app)
+        self.assertEqual(
+            (raised.exception.code, raised.exception.detail),
+            ("SOURCE_EDITOR_FOCUS_QUERY_FAILED", "RuntimeError"),
+        )

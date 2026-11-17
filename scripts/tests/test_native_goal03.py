@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import copy
 import hashlib
-import io
 import json
 import shutil
 import tempfile
@@ -18,33 +14,25 @@ from unittest import mock
 from scripts.markturbo_tools.native import goal03 as HARNESS
 from scripts.markturbo_tools.native import runtime
 
+from ._native_support import HASH, case_observations, fingerprint, passed_evidence
+
 BUILD_LAUNCH_SPEC = runtime.build_launch_spec
-CASE_CLI = HARNESS.CASE_CLI
 CASE_NEW_PASTE = HARNESS.CASE_NEW_PASTE
 CASE_RECENTS = HARNESS.CASE_RECENTS
 CASE_SAMPLE = HARNESS.CASE_SAMPLE
 CASE_SAVE_CANCEL_OVERWRITE = HARNESS.CASE_SAVE_CANCEL_OVERWRITE
 CASE_SAVE_CREATE = HARNESS.CASE_SAVE_CREATE
-CASE_WELCOME = HARNESS.CASE_WELCOME
-COMPLETE_EVIDENCE = HARNESS.complete_evidence
 DOCUMENT_SENTINEL = HARNESS.DOCUMENT_SENTINEL
 HARNESS_FAILURE = runtime.HarnessFailure
 HAS_UNICODE_CLIPBOARD_TEXT = runtime.has_unicode_clipboard_text
-NEW_EVIDENCE = HARNESS.new_evidence
-NORMALIZE_EXPECTED_HASH = runtime.normalize_expected_hash
-PARSE_ARGS = HARNESS.parse_args
 RECENT_SETTINGS_DOCUMENT = HARNESS.recent_settings_document
 REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
-SCAN_CASE_ARTIFACTS = HARNESS.scan_case_artifacts
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
-VALIDATE_FINGERPRINT = runtime.validate_fingerprint
 GOAL_03_HARNESS = HARNESS.Goal03Harness
 
-HASH = "a" * 64
 
-
-def fingerprint(value: bytes) -> dict[str, int | str]:
-    return {"byte_count": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+def complete(evidence: dict, status: str) -> None:
+    runtime.complete_evidence(evidence, status, REQUIRED_CASE_IDS)
 
 
 def sample_observation() -> dict[str, int | str | dict[str, int | str]]:
@@ -59,66 +47,15 @@ def sample_observation() -> dict[str, int | str | dict[str, int | str]]:
     }
 
 
-def runtime_scan() -> dict[str, int | bool]:
-    return {
-        "files_scanned": 3,
-        "app_logs_scanned": 1,
-        "config_files_scanned": 1,
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-    }
-
-
-def process_context() -> dict[str, int | str]:
-    return {"session_id": 1, "integrity_rid": 0x2000, "integrity": "medium"}
-
-
-def valid_evidence() -> dict:
-    evidence = NEW_EVIDENCE(HASH)
-    evidence["executable"].update(
-        {
-            "sha256": HASH,
-            "byte_count": 1234,
-            "hash_verified": True,
-            "copied_sha256": HASH,
-            "copy_hash_verified": True,
-            "format": "PE32+",
-            "machine": "x86_64",
-            "machine_code": 0x8664,
-            "optional_magic": 0x20B,
-        }
-    )
-    evidence["environment"] = {
-        "platform": "Windows 11",
-        "windows_major": 10,
-        "windows_build": 22631,
-        "architecture": "x86_64",
-        "native_machine_code": 0x8664,
-        "python_pointer_bits": 64,
-        "wts_state": "WTSActive",
-        "input_desktop": "Default",
-        "thread_desktop": "Default",
-        "harness_process": process_context(),
-    }
+def observations(case_id: str) -> dict:
     original = fingerprint(b"original")
     saved = fingerprint(b"saved")
-    observations = {
-        CASE_WELCOME: {
-            "welcome_visible": True,
-            "entry_points_visible": True,
-            "welcome_restart_visible": True,
-        },
+    specific = {
         CASE_NEW_PASTE: {
-            "new_buffer_created": True,
-            "paste_buffer_created": True,
             "new_unicode_editor": fingerprint("new \u4e2d\u6587 \U0001f680".encode()),
             "paste_unicode_editor": fingerprint("paste \u65e5\u672c\u8a9e \U0001f9ea".encode()),
         },
-        CASE_SAVE_CREATE: {
-            "save_as_created": True,
-            "saved_destination": saved,
-            "reopened_editor": saved,
-        },
+        CASE_SAVE_CREATE: {"saved_destination": saved, "reopened_editor": saved},
         CASE_SAVE_CANCEL_OVERWRITE: {
             "editor_before_cancellation": saved,
             "editor_after_save_as_cancel": saved,
@@ -128,41 +65,15 @@ def valid_evidence() -> dict:
             "save_as_cancel_destination_before": original,
             "save_as_cancel_destination_after": original,
             "saved_destination": saved,
-            "save_as_cancelled": True,
-            "save_as_cancel_focus_preserved": True,
-            "overwrite_cancelled": True,
-            "overwrite_cancel_focus_preserved": True,
-            "overwrite_confirmed": True,
         },
-        CASE_SAMPLE: {
-            "sample_workspace_opened": True,
-            "workspace_home_visible": True,
-            **sample_observation(),
-        },
-        CASE_RECENTS: {
-            "recent_restart_visible": True,
-            "recent_count": 10,
-            "recent_visible_count": 5,
-            "stale_recent_disabled": True,
-            "stale_recent_press_ignored": True,
-        },
-        CASE_CLI: {
-            "direct_file_bypassed_welcome": True,
-            "direct_directory_bypassed_welcome": True,
-        },
-    }
-    for case in evidence["cases"]:
-        case["status"] = "PASS"
-        case["duration_ms"] = 1.0
-        case["observations"] = {
-            **observations[case["id"]],
-            "flow": HARNESS.CASE_FLOWS[case["id"]],
-            "process_context": process_context(),
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan(),
-        }
-    COMPLETE_EVIDENCE(evidence, "PASS")
-    return evidence
+        CASE_SAMPLE: sample_observation(),
+        CASE_RECENTS: {"recent_count": 10, "recent_visible_count": 5},
+    }.get(case_id, {})
+    return case_observations(HARNESS.CASE_FLOWS[case_id], **specific)
+
+
+def valid_evidence() -> dict:
+    return passed_evidence(HARNESS.new_evidence(HASH), observations, complete)
 
 
 class EvidenceSchemaTests(unittest.TestCase):
@@ -191,49 +102,9 @@ class EvidenceSchemaTests(unittest.TestCase):
                 duration_ms=None,
                 observations={},
             )
-        COMPLETE_EVIDENCE(evidence, "FAIL")
+        complete(evidence, "FAIL")
 
         VALIDATE_EVIDENCE(evidence)
-
-    def test_rejects_missing_case_or_duplicate_case(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"].pop()
-        COMPLETE_EVIDENCE(evidence, "FAIL")
-        with self.assertRaisesRegex(ValueError, "required case set is incomplete"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][-1] = copy.deepcopy(evidence["cases"][0])
-        COMPLETE_EVIDENCE(evidence, "FAIL")
-        with self.assertRaisesRegex(ValueError, "required case set is incomplete"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_requires_matching_original_and_copied_hashes(self) -> None:
-        evidence = valid_evidence()
-        evidence["executable"]["copied_sha256"] = "b" * 64
-        with self.assertRaisesRegex(ValueError, "copied executable hash"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["executable"]["hash_verified"] = False
-        with self.assertRaisesRegex(ValueError, "verified executable hashes"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_rejects_boolean_counts_and_reuses_native_runtime_fingerprint_validation(self) -> None:
-        self.assertIs(VALIDATE_FINGERPRINT, runtime.validate_fingerprint)
-
-        with self.assertRaisesRegex(ValueError, "invalid fingerprint byte count"):
-            VALIDATE_FINGERPRINT({"byte_count": True, "sha256": HASH})
-
-        evidence = valid_evidence()
-        evidence["executable"]["byte_count"] = True
-        with self.assertRaisesRegex(ValueError, "nonempty executable"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["runtime_scan"]["files_scanned"] = True
-        with self.assertRaisesRegex(ValueError, "invalid files_scanned"):
-            VALIDATE_EVIDENCE(evidence)
 
     def test_pass_requires_exact_save_and_recent_evidence(self) -> None:
         evidence = valid_evidence()
@@ -249,16 +120,6 @@ class EvidenceSchemaTests(unittest.TestCase):
             VALIDATE_EVIDENCE(evidence)
 
         evidence = valid_evidence()
-        evidence["cases"][3]["observations"]["save_as_cancel_focus_preserved"] = False
-        with self.assertRaisesRegex(ValueError, "requires true save_as_cancel_focus_preserved"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][3]["observations"]["overwrite_cancel_focus_preserved"] = False
-        with self.assertRaisesRegex(ValueError, "requires true overwrite_cancel_focus_preserved"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
         evidence["cases"][5]["observations"]["recent_count"] = 11
         with self.assertRaisesRegex(ValueError, "exactly ten"):
             VALIDATE_EVIDENCE(evidence)
@@ -269,11 +130,6 @@ class EvidenceSchemaTests(unittest.TestCase):
                 evidence["cases"][5]["observations"]["recent_visible_count"] = visible
                 with self.assertRaisesRegex(ValueError, "between one and ten"):
                     VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["welcome_restart_visible"] = False
-        with self.assertRaisesRegex(ValueError, "requires true welcome_restart_visible"):
-            VALIDATE_EVIDENCE(evidence)
 
     def test_pass_requires_the_complete_materialized_sample_inventory(self) -> None:
         evidence = valid_evidence()
@@ -290,33 +146,6 @@ class EvidenceSchemaTests(unittest.TestCase):
         evidence["cases"][4]["observations"]["sample_version"] = "b" * 24
         with self.assertRaisesRegex(ValueError, "sample version does not match"):
             VALIDATE_EVIDENCE(evidence)
-
-    def test_rejects_text_and_unknown_observations(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][1]["observations"]["raw_text"] = DOCUMENT_SENTINEL
-        with self.assertRaisesRegex(ValueError, "unknown observation field"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["flow"] = "secret document text"
-        with self.assertRaisesRegex(ValueError, "free-form observation strings"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_rejects_untrusted_failure_and_reason_fields(self) -> None:
-        evidence = valid_evidence()
-        failed = evidence["cases"][0]
-        failed.update(status="FAIL", reason_code="secret text", failure_type="RuntimeError")
-        COMPLETE_EVIDENCE(evidence, "FAIL")
-        with self.assertRaisesRegex(ValueError, "invalid case reason code"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence()
-        failed = evidence["cases"][0]
-        failed.update(status="FAIL", reason_code="UI_TIMEOUT", failure_type="SecretFailure")
-        COMPLETE_EVIDENCE(evidence, "FAIL")
-        with self.assertRaisesRegex(ValueError, "invalid case failure type"):
-            VALIDATE_EVIDENCE(evidence)
-
 
 class ParserAndIsolationTests(unittest.TestCase):
     def test_recent_settings_seed_is_valid_input_without_document_content(self) -> None:
@@ -364,68 +193,6 @@ class ParserAndIsolationTests(unittest.TestCase):
                 HARNESS.materialized_sample_inventory(data)
             self.assertEqual(raised.exception.code, "SAMPLE_MATERIALIZATION_INCOMPLETE")
 
-    def test_editor_replacement_uses_and_restores_the_text_clipboard(self) -> None:
-        events = []
-
-        class FakeWin32:
-            def send_shortcut(self, hwnd, key):
-                events.append(("shortcut", hwnd, key))
-
-        class FakeHarness:
-            ui_timeout = 1.0
-            win32 = FakeWin32()
-
-            def read_text_clipboard(self):
-                events.append(("read",))
-                return "previous text"
-
-            def write_text_clipboard(self, value):
-                events.append(("write", value))
-
-            def focus_editor(self, app):
-                events.append(("focus", app.hwnd))
-
-            def wait_editor_fingerprint(self, app, expected, timeout):
-                events.append(("wait", timeout))
-                return expected, 0.0
-
-        app = type("App", (), {"hwnd": 42})()
-        result = GOAL_03_HARNESS.replace_editor(FakeHarness(), app, "emoji \U0001f680")
-
-        self.assertEqual(result, runtime.fingerprint_text("emoji \U0001f680"))
-        self.assertEqual(events[0], ("read",))
-        self.assertEqual(events[1], ("write", "emoji \U0001f680"))
-        self.assertIn(("shortcut", 42, runtime.VK_A), events)
-        self.assertIn(("shortcut", 42, HARNESS.VK_V), events)
-        self.assertLess(events.index(("focus", 42)), events.index(("shortcut", 42, runtime.VK_A)))
-        self.assertLess(
-            events.index(("write", "previous text")), events.index(("wait", 1.0))
-        )
-
-    def test_source_editor_focus_check_reads_uia_without_refocusing(self) -> None:
-        events = []
-
-        class FakeControl:
-            def has_keyboard_focus(self):
-                events.append(("read_focus",))
-                return True
-
-        class FakeHarness:
-            def control_by_name(self, hwnd, name, control_type, mismatch_code):
-                events.append(("lookup", hwnd, name, control_type, mismatch_code))
-                return FakeControl()
-
-        app = type("App", (), {"hwnd": 42})()
-        focused = GOAL_03_HARNESS.source_editor_has_focus(FakeHarness(), app)
-
-        self.assertTrue(focused)
-        self.assertEqual(
-            events[0],
-            ("lookup", 42, runtime.EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"),
-        )
-        self.assertEqual(events[-1], ("read_focus",))
-        self.assertNotIn("click", [event[0] for event in events])
-
     def test_welcome_actions_are_found_by_their_own_automation_ids(self) -> None:
         # The nsh welcome's actions are Buttons that carry their test ids, so
         # an anonymous by-name lookup would never see them.
@@ -471,29 +238,6 @@ class ParserAndIsolationTests(unittest.TestCase):
         self.assertEqual(events[1], ("foreground", 42, 3.0))
         self.assertEqual(events[2], ("inputs", 6))
 
-    def test_parser_requires_hash_and_positive_timeout(self) -> None:
-        args = PARSE_ARGS(["--expect-exe-sha256", HASH.upper(), "--ui-timeout", "1.5"])
-        self.assertEqual(args.expect_exe_sha256, HASH)
-        self.assertEqual(args.ui_timeout, 1.5)
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            PARSE_ARGS(["--expect-exe-sha256", HASH, "--ui-timeout", "0"])
-        with self.assertRaises(argparse.ArgumentTypeError):
-            NORMALIZE_EXPECTED_HASH("not-a-hash")
-
-    def test_parser_exposes_debug_case_and_workdir_retention(self) -> None:
-        case = REQUIRED_CASE_IDS[0]
-        args = PARSE_ARGS(
-            [
-                "--expect-exe-sha256",
-                HASH,
-                "--case",
-                case,
-                "--keep-workdir-on-failure",
-            ]
-        )
-        self.assertEqual(args.case, case)
-        self.assertTrue(args.keep_workdir_on_failure)
-
     def test_native_run_plan_wires_each_required_case_to_its_scenario_in_order(self) -> None:
         harness = object.__new__(GOAL_03_HARNESS)
         plan = HARNESS.native_run_plan()
@@ -537,64 +281,6 @@ class ParserAndIsolationTests(unittest.TestCase):
     def test_rejects_relative_isolation_paths(self) -> None:
         with self.assertRaisesRegex(ValueError, "launch paths must be absolute"):
             BUILD_LAUNCH_SPEC(Path("markturbo.exe"), None, Path("data"), Path("config"), Path("workspace"), Path("stderr.log"))
-
-
-class SourceContractFixtureTests(unittest.TestCase):
-    """The welcome, Save As and guard selectors the harness drives must live in
-    production nsh source; tests and comments cannot supply them."""
-
-    REPO = Path(__file__).resolve().parents[2]
-
-    def copy_repository(self, root: Path) -> None:
-        for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
-            target = root / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(self.REPO / relative, target)
-
-    def failure_after(self, relative: str, edit) -> str | None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            self.copy_repository(root)
-            target = root / relative
-            target.write_text(edit(target.read_text(encoding="utf-8")), encoding="utf-8")
-            with mock.patch.object(HARNESS, "REPO", root):
-                return HARNESS.source_contract_failure()
-
-    def test_real_repository_satisfies_source_contract(self) -> None:
-        self.assertIsNone(HARNESS.source_contract_failure())
-
-    def test_each_missing_production_marker_fails_closed(self) -> None:
-        for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
-            for marker in markers:
-                with self.subTest(file=relative, marker=marker):
-                    self.assertEqual(
-                        self.failure_after(relative, lambda text: text.replace(marker, "")),
-                        "FIRST_USE_SOURCE_CONTRACT_MISSING",
-                    )
-
-    def test_comment_or_test_module_cannot_replace_a_production_marker(self) -> None:
-        relative = "crates/mt-app/src/ui/welcome.rs"
-        marker = '"welcome-open-folder"'
-        commented = self.failure_after(
-            relative, lambda text: text.replace(marker, '"x"') + f"\n// {marker}\n"
-        )
-        test_only = self.failure_after(
-            relative,
-            lambda text: text.replace(marker, '"x"')
-            + f"\n#[cfg(test)]\nmod decoy {{ const ID: &str = {marker}; }}\n",
-        )
-        self.assertEqual(commented, "FIRST_USE_SOURCE_CONTRACT_MISSING")
-        self.assertEqual(test_only, "FIRST_USE_SOURCE_CONTRACT_MISSING")
-
-    def test_missing_source_file_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            self.copy_repository(root)
-            (root / "crates/mt-app/src/ui/welcome.rs").unlink()
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertEqual(
-                    HARNESS.source_contract_failure(), "FIRST_USE_SOURCE_CONTRACT_MISSING"
-                )
 
 
 class RecentControlBehaviorTests(unittest.TestCase):
@@ -754,7 +440,6 @@ class StaleRecentScenarioTests(unittest.TestCase):
         harness.hold_control.assert_called_once_with(
             mock.ANY, stale, HARNESS.STALE_RECENT_PRESS_SECONDS, "STALE_RECENT_PRESS_FAILED"
         )
-        self.assertTrue(observations["stale_recent_press_ignored"])
         self.assertEqual(observations["recent_visible_count"], 3)
 
     def test_an_enabled_or_unmarked_stale_row_fails(self) -> None:
@@ -770,26 +455,6 @@ class StaleRecentScenarioTests(unittest.TestCase):
 
 
 class RuntimeArtifactPrivacyTests(unittest.TestCase):
-    def test_artifact_read_errors_keep_the_goal_runtime_scan_code(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "data" / "logs").mkdir(parents=True)
-            (root / "config").mkdir()
-            (root / "data" / "logs" / "markturbo.log").write_bytes(b"startup")
-            (root / "config" / "settings.toml").write_bytes(b"settings")
-            with (
-                mock.patch.object(
-                    HARNESS,
-                    "artifact_contains",
-                    side_effect=PermissionError("document content"),
-                ),
-                self.assertRaises(HARNESS_FAILURE) as raised,
-            ):
-                SCAN_CASE_ARTIFACTS(root)
-
-        self.assertEqual(raised.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
-        self.assertEqual(raised.exception.detail, "PermissionError")
-
     def test_runtime_scan_rejects_document_text_in_data_or_config_but_not_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -797,34 +462,17 @@ class RuntimeArtifactPrivacyTests(unittest.TestCase):
             (root / "config").mkdir()
             (root / "workspace").mkdir()
             (root / "data" / "logs" / "markturbo.log").write_text("startup", encoding="utf-8")
-            (root / "config" / "settings.toml").write_text(
-                "show_welcome_on_startup = true", encoding="utf-8"
-            )
+            (root / "stderr.log").write_text("", encoding="utf-8")
             (root / "workspace" / "saved.md").write_text(DOCUMENT_SENTINEL, encoding="utf-8")
-            scan = SCAN_CASE_ARTIFACTS(root)
-            self.assertTrue(scan["utf8_sentinel_absent"])
+            HARNESS.scan_case_artifacts(root)
 
-            (root / "data" / "leak.log").write_text(DOCUMENT_SENTINEL, encoding="utf-8")
-            with self.assertRaises(HARNESS_FAILURE) as raised:
-                SCAN_CASE_ARTIFACTS(root)
-            self.assertEqual(raised.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
-
-    def test_runtime_scan_streams_webview_profile_and_detects_boundary_leaks(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            profile = root / "data" / "webview2" / "Default" / "Cache"
-            profile.mkdir(parents=True)
-            (root / "data" / "logs").mkdir()
-            (root / "data" / "logs" / "markturbo.log").write_bytes(b"startup")
-            split = 1024 * 1024 - 3
-            (profile / "cache.bin").write_bytes(
-                b"x" * split + DOCUMENT_SENTINEL.encode("utf-8")
-            )
-
-            with self.assertRaises(HARNESS_FAILURE) as raised:
-                SCAN_CASE_ARTIFACTS(root)
-
-            self.assertEqual(raised.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
+            for leak in ("data/leak.log", "config/settings.toml"):
+                with self.subTest(leak=leak):
+                    (root / leak).write_text(DOCUMENT_SENTINEL, encoding="utf-8")
+                    with self.assertRaises(HARNESS_FAILURE) as raised:
+                        HARNESS.scan_case_artifacts(root)
+                    self.assertEqual(raised.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
+                    (root / leak).unlink()
 
 
 if __name__ == "__main__":

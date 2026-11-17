@@ -46,15 +46,15 @@ TOOLING_TESTS = (
 # Native harness unit tests describe a Windows automation path that does not run
 # on PRs. Run them only when changing the harness, not for every product change.
 NATIVE_TOOLING_TESTS = (
-    "scripts.tests.test_native_goal02_evidence",
-    "scripts.tests.test_native_goal02_uia",
-    "scripts.tests.test_native_goal02_runtime",
-    "scripts.tests.test_native_goal02_execution",
+    "scripts.tests.test_native_evidence",
+    "scripts.tests.test_native_runtime_execution",
+    "scripts.tests.test_native_runtime_process",
+    "scripts.tests.test_native_runtime_uia",
+    "scripts.tests.test_native_goal02",
     "scripts.tests.test_native_goal03",
     "scripts.tests.test_native_goal06",
     "scripts.tests.test_native_goal07",
     "scripts.tests.test_native_goal07_provider",
-    "scripts.tests.test_native_source_contract",
 )
 
 

@@ -16,22 +16,16 @@ canonical recovery record the next launch offers to Restore.
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from .source_contract import alert_enter_confirms, production_markers_present
+from . import evidence
+from .evidence import leak_codes, validate_exact_fingerprint
 from .runtime import (
-    IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
-    PE32_PLUS_MAGIC,
-    REASON_CODE_RE,
-    SAFE_FAILURE_TYPES,
-    SHA256_RE,
     VK_MENU,
     VK_W,
     CONFLICT_HEADING,
@@ -39,31 +33,21 @@ from .runtime import (
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
     RunningApp,
-    complete_evidence as complete_evidence_envelope,
     finite_nonnegative,
     fingerprint_bytes,
     key_input,
     load_pywinauto,
     main_native_acceptance,
-    normalize_expected_hash,
     preflight,
     require_true,
     safe_exception_name,
     sha256_file,
-    utc_now,
-    validate_environment,
     validate_fingerprint,
-    validate_process_context,
     wait_until,
     write_durable,
 )
 
-REPO = Path(__file__).resolve().parents[3]
-DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
-DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-02-native-acceptance-v1.json"
-
 SCHEMA = "markturbo.goal-02-native-acceptance"
-SCHEMA_VERSION = 1
 CASE_POINTER_CANCEL = "pointer-dirty-tab-close-cancel"
 CASE_KEYBOARD_DISCARD = "sendinput-ctrl-w-discard"
 CASE_WINDOW_SAVE = "wm-close-save-exact-bytes"
@@ -82,6 +66,7 @@ CASE_FLOWS = {
         "Ctrl+W -> guard Don't save -> restart without recovery offer"
     ),
 }
+REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
 CHECKPOINT_SIGNAL = "content-free canonical recovery record"
 STARTUP_SIGNAL = "document ready without recovery offer"
 SAFE_OBSERVATION_STRINGS = (
@@ -89,157 +74,92 @@ SAFE_OBSERVATION_STRINGS = (
     | {"TerminateProcess", CHECKPOINT_SIGNAL, STARTUP_SIGNAL}
     | INTEGRITY_NAMES
 )
-ALLOWED_OBSERVATION_KEYS = {
-    "alt_f4_cancel_kept_window",
-    "app_logs_scanned",
-    "byte_count",
-    "checkpoint_record_seen",
-    "checkpoint_signal",
-    "canonical_record_count",
-    "canonical_records",
-    "canonical_recovery_records_scanned",
-    "cancel_kept_tab",
-    "dirty_editor",
-    "discard_restart_absent_ms",
-    "discard_closed_tab",
-    "discarded_recovery_absent",
-    "discarded_editor",
-    "edit_to_signal_ms",
-    "edited_text",
-    "editor",
-    "editor_after_alt_f4_cancel",
-    "editor_after_conflict",
-    "external_source",
-    "explicit_overwrite_used",
-    "files_scanned",
-    "foreground_verified",
-    "foreground_diagnostics",
-    "foreground_hwnd",
-    "flow",
-    "integrity",
-    "integrity_rid",
-    "loaded_source",
-    "live_recovery_scan",
-    "live_runtime_scan",
-    "process_context",
-    "process_contexts",
-    "recovery_offer_seen",
-    "recovery_restored_exact",
-    "recovery_artifacts_scanned",
-    "recovery_leases_scanned",
-    "refcell_absent",
-    "restart_editor",
-    "restart_count",
-    "restored_editor",
-    "restore_ms",
-    "runtime_scan",
-    "same_length",
-    "same_mtime_ns",
-    "save_refused_with_conflict",
-    "saved_after_explicit_overwrite",
-    "saved_source",
-    "session_id",
-    "requested_hwnd",
-    "show_window_return",
-    "bring_to_top_return",
-    "set_foreground_return",
-    "foreground_attempts",
-    "sha256",
-    "source_after_alt_f4_cancel",
-    "source_after_cancel_save",
-    "source_after_discard",
-    "source_after_recovery_discard",
-    "source_after_refused_save",
-    "source_before",
-    "termination",
-    "panic_absent",
-    "utf16le_sentinel_absent",
-    "utf8_sentinel_absent",
-    "startup_signal",
-    "startup_observed_before_restart_editor",
-    "window_exited",
-}
-REQUIRED_CASE_IDS = (
-    CASE_POINTER_CANCEL,
-    CASE_KEYBOARD_DISCARD,
-    CASE_WINDOW_SAVE,
-    CASE_EXTERNAL_CONFLICT,
-    CASE_RECOVERY,
-)
-REQUIRED_OBSERVATION_KEYS = {
-    CASE_POINTER_CANCEL: {
+FINGERPRINT_OBSERVATION_KEYS = frozenset(
+    {
         "editor",
         "source_before",
         "source_after_cancel_save",
-        "cancel_kept_tab",
-        "flow",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_KEYBOARD_DISCARD: {
         "discarded_editor",
-        "source_before",
         "source_after_discard",
-        "discard_closed_tab",
-        "flow",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_WINDOW_SAVE: {
-        "editor",
-        "alt_f4_cancel_kept_window",
         "editor_after_alt_f4_cancel",
         "source_after_alt_f4_cancel",
         "saved_source",
-        "flow",
-        "window_exited",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_EXTERNAL_CONFLICT: {
         "loaded_source",
         "external_source",
         "dirty_editor",
         "source_after_refused_save",
         "editor_after_conflict",
         "saved_after_explicit_overwrite",
-        "same_length",
-        "same_mtime_ns",
-        "save_refused_with_conflict",
-        "explicit_overwrite_used",
-        "flow",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_RECOVERY: {
         "edited_text",
-        "checkpoint_record_seen",
-        "checkpoint_signal",
-        "live_recovery_scan",
-        "live_runtime_scan",
-        "edit_to_signal_ms",
-        "recovery_offer_seen",
         "restored_editor",
-        "recovery_restored_exact",
-        "restore_ms",
-        "discard_restart_absent_ms",
         "source_after_recovery_discard",
         "restart_editor",
-        "discarded_recovery_absent",
-        "termination",
-        "restart_count",
-        "startup_signal",
-        "startup_observed_before_restart_editor",
-        "flow",
-        "process_contexts",
-        "foreground_verified",
-        "runtime_scan",
-    },
+    }
+)
+REQUIRED_OBSERVATIONS = {
+    CASE_POINTER_CANCEL: frozenset(
+        {"editor", "source_before", "source_after_cancel_save", "cancel_kept_tab"}
+    ),
+    CASE_KEYBOARD_DISCARD: frozenset(
+        {"discarded_editor", "source_before", "source_after_discard", "discard_closed_tab"}
+    ),
+    CASE_WINDOW_SAVE: frozenset(
+        {
+            "editor",
+            "alt_f4_cancel_kept_window",
+            "editor_after_alt_f4_cancel",
+            "source_after_alt_f4_cancel",
+            "saved_source",
+            "window_exited",
+        }
+    ),
+    CASE_EXTERNAL_CONFLICT: frozenset(
+        {
+            "loaded_source",
+            "external_source",
+            "dirty_editor",
+            "source_after_refused_save",
+            "editor_after_conflict",
+            "saved_after_explicit_overwrite",
+            "same_length",
+            "same_mtime_ns",
+            "save_refused_with_conflict",
+            "explicit_overwrite_used",
+        }
+    ),
+    CASE_RECOVERY: frozenset(
+        {
+            "edited_text",
+            "checkpoint_record_seen",
+            "checkpoint_signal",
+            "live_recovery_scan",
+            "live_runtime_scan",
+            "edit_to_signal_ms",
+            "recovery_offer_seen",
+            "restored_editor",
+            "recovery_restored_exact",
+            "restore_ms",
+            "discard_restart_absent_ms",
+            "source_after_recovery_discard",
+            "restart_editor",
+            "discarded_recovery_absent",
+            "termination",
+            "restart_count",
+            "startup_signal",
+            "startup_observed_before_restart_editor",
+            "process_contexts",
+        }
+    ),
 }
+RECOVERY_SCAN_KEYS = frozenset(
+    {
+        "recovery_artifacts_scanned",
+        "canonical_recovery_records_scanned",
+        "recovery_leases_scanned",
+    }
+)
+RECOVERY_LEASE_NAME = ".markturbo-recovery.lock"
+PANIC_RE = re.compile(rb"\bpanic(?:ked)?\b")
 
 # The rail's per-tab close control (`ui/rail.rs`): a Button with its own test
 # id, clipped until the pointer widens the rail over a file row.
@@ -252,36 +172,6 @@ TAB_CLOSE_AUTOMATION_ID = "rail-close"
 KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
 RESTORE_AUTOMATION_ID = "recovery-restore-0"
 RESTORE_NAME = "Restore"
-UI_SOURCE_REQUIREMENTS = {
-    "crates/mt-app/src/ui/rail.rs": (
-        '"rail-file-row"',
-        '"rail-close"',
-        'on_key("mod+w"',
-    ),
-    "crates/mt-app/src/ui/notices.rs": (
-        '"Close without saving?"',
-        '"Save"',
-        '"Don\'t save"',
-        '"Cancel"',
-        '"Changed on disk"',
-        '"Keep mine"',
-        '"Restore"',
-        '"guard-save"',
-        '"guard-dont-save"',
-        '"guard-cancel"',
-        '"conflict-keep-mine"',
-        '"recovery-restore-{index}"',
-    ),
-    "crates/mt-app/src/ui/titlebar.rs": (
-        '"title-settings"',
-        '"title-menu-save"',
-        '"title-menu-edit"',
-        '"title-dirty"',
-    ),
-    "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
-    "crates/mt-app/src/state.rs": ('.destructive("overwrite", "Overwrite")',),
-}
-
 VK_F4 = 0x73
 DOCUMENT_SENTINEL = "MTG02-NATIVE-SENTINEL-\u4fdd\u5b58-\U0001f680"
 CANONICAL_RECOVERY_RECORD_RE = re.compile(r"^[0-9a-f]{64}\.mtrecovery$")
@@ -294,249 +184,38 @@ WINDOW_EDIT = f"{DOCUMENT_SENTINEL}:window"
 CONFLICT_EDIT = f"{DOCUMENT_SENTINEL}:conflict"
 RECOVERY_EDIT = f"{DOCUMENT_SENTINEL}:recovery"
 
-def new_evidence(expected_hash: str) -> dict[str, Any]:
-    return {
-        "schema": SCHEMA,
-        "schema_version": SCHEMA_VERSION,
-        "status": "BLOCKED",
-        "started_at_utc": utc_now(),
-        "completed_at_utc": None,
-        "executable": {
-            "expected_sha256": expected_hash,
-            "sha256": None,
-            "byte_count": None,
-            "hash_verified": False,
-            "copied_sha256": None,
-            "copy_hash_verified": False,
-            "format": None,
-            "machine": None,
-        },
-        "environment": {},
-        "cases": [
-            {
-                "id": case_id,
-                "status": "NOT_RUN",
-                "duration_ms": None,
-                "reason_code": None,
-                "failure_type": None,
-                "observations": {},
-            }
-            for case_id in REQUIRED_CASE_IDS
-        ],
-        "summary": {
-            "required_case_count": len(REQUIRED_CASE_IDS),
-            "passed_case_count": 0,
-            "blocked_case_count": 0,
-            "failed_case_count": 0,
-            "not_run_case_count": len(REQUIRED_CASE_IDS),
-        },
-    }
-
-
-def complete_evidence(evidence: dict[str, Any], status: str) -> None:
-    complete_evidence_envelope(evidence, status, REQUIRED_CASE_IDS)
-
-
-def validate_evidence(evidence: dict[str, Any]) -> None:
-    if evidence.get("schema") != SCHEMA or evidence.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("unsupported evidence schema")
-    if evidence.get("status") not in {"PASS", "FAIL", "BLOCKED"}:
-        raise ValueError("invalid evidence status")
-
-    executable = evidence.get("executable")
-    if not isinstance(executable, dict):
-        raise ValueError("missing executable evidence")
-    expected_hash = executable.get("expected_sha256")
-    actual_hash = executable.get("sha256")
-    if not isinstance(expected_hash, str) or not SHA256_RE.fullmatch(expected_hash):
-        raise ValueError("invalid expected executable SHA-256")
-    if actual_hash is not None and (
-        not isinstance(actual_hash, str) or not SHA256_RE.fullmatch(actual_hash)
-    ):
-        raise ValueError("invalid executable SHA-256")
-    if executable.get("hash_verified") is True and actual_hash != expected_hash:
-        raise ValueError("verified executable hash does not match expected hash")
-    if evidence["status"] == "PASS" and executable.get("hash_verified") is not True:
-        raise ValueError("PASS requires a verified executable hash")
-    copied_hash = executable.get("copied_sha256")
-    if copied_hash is not None and (
-        not isinstance(copied_hash, str) or not SHA256_RE.fullmatch(copied_hash)
-    ):
-        raise ValueError("invalid copied executable SHA-256")
-    if executable.get("copy_hash_verified") is True and copied_hash != expected_hash:
-        raise ValueError("verified copied executable hash does not match expected hash")
-    if evidence["status"] == "PASS" and executable.get("copy_hash_verified") is not True:
-        raise ValueError("PASS requires a verified copied executable hash")
-    byte_count = executable.get("byte_count")
-    if byte_count is not None and (
-        not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0
-    ):
-        raise ValueError("invalid executable byte count")
-    if evidence["status"] == "PASS" and (not isinstance(byte_count, int) or byte_count <= 0):
-        raise ValueError("PASS requires a nonempty executable")
-    if evidence["status"] == "PASS" and (
-        executable.get("format") != "PE32+"
-        or executable.get("machine") != "x86_64"
-        or executable.get("machine_code") != IMAGE_FILE_MACHINE_AMD64
-        or executable.get("optional_magic") != PE32_PLUS_MAGIC
-    ):
-        raise ValueError("PASS requires an AMD64 PE32+ executable")
-
-    environment = evidence.get("environment")
-    if not isinstance(environment, dict):
-        raise ValueError("invalid environment evidence")
-    parent_context = environment.get("harness_process")
-    if evidence["status"] == "PASS":
-        validate_environment(environment)
-        validate_process_context(parent_context)
-
-    cases = evidence.get("cases")
-    if not isinstance(cases, list):
-        raise ValueError("missing case evidence")
-    ids = [case.get("id") for case in cases if isinstance(case, dict)]
-    duplicates = sorted({case_id for case_id in ids if ids.count(case_id) > 1})
-    if duplicates:
-        raise ValueError("duplicate required case ids")
-    missing = sorted(set(REQUIRED_CASE_IDS) - set(ids))
-    extra = sorted(set(ids) - set(REQUIRED_CASE_IDS))
-    if missing or extra or len(cases) != len(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    for case in cases:
-        if case.get("status") not in {"PASS", "FAIL", "BLOCKED", "NOT_RUN"}:
-            raise ValueError("invalid case status")
-        reason_code = case.get("reason_code")
-        if reason_code is not None and (
-            not isinstance(reason_code, str) or not REASON_CODE_RE.fullmatch(reason_code)
-        ):
-            raise ValueError("invalid case reason code")
-        failure_type = case.get("failure_type")
-        if failure_type is not None and (
-            not isinstance(failure_type, str) or failure_type not in SAFE_FAILURE_TYPES
-        ):
-            raise ValueError("invalid case failure type")
-        if case["status"] != "FAIL" and failure_type is not None:
-            raise ValueError("only failed cases may contain a failure type")
-        observations = case.get("observations")
-        if not isinstance(observations, dict):
-            raise ValueError("invalid case observations")
-        if case["status"] == "PASS" and not REQUIRED_OBSERVATION_KEYS[case["id"]].issubset(
-            observations
-        ):
-            raise ValueError("passed case evidence is incomplete")
-        validate_observations(observations)
-        duration_ms = case.get("duration_ms")
-        if case["status"] == "NOT_RUN":
-            if duration_ms is not None:
-                raise ValueError("NOT_RUN case cannot have a duration")
-        elif not finite_nonnegative(duration_ms):
-            raise ValueError("completed case duration must be nonnegative")
-        if case["status"] == "PASS":
-            validate_passed_case(case["id"], observations, parent_context)
-    if evidence["status"] == "PASS" and any(case["status"] != "PASS" for case in cases):
-        raise ValueError("PASS requires every required case to pass")
-
-    summary = evidence.get("summary")
-    if not isinstance(summary, dict) or summary.get("required_case_count") != len(
-        REQUIRED_CASE_IDS
-    ):
-        raise ValueError("invalid evidence summary")
-    expected_counts = {
-        "passed_case_count": sum(case["status"] == "PASS" for case in cases),
-        "blocked_case_count": sum(case["status"] == "BLOCKED" for case in cases),
-        "failed_case_count": sum(case["status"] == "FAIL" for case in cases),
-        "not_run_case_count": sum(case["status"] == "NOT_RUN" for case in cases),
-    }
-    if any(summary.get(key) != value for key, value in expected_counts.items()):
-        raise ValueError("case summary does not match case evidence")
-
-
-def validate_observations(value: Any, key: str | None = None) -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key not in ALLOWED_OBSERVATION_KEYS:
-                raise ValueError("unknown observation field")
-            if key == "sha256" and (
-                not isinstance(nested, str) or not SHA256_RE.fullmatch(nested)
-            ):
-                raise ValueError("invalid observation SHA-256")
-            validate_observations(nested, key)
-    elif isinstance(value, list):
-        for nested in value:
-            validate_observations(nested, key)
-    elif isinstance(value, str):
-        if key == "sha256":
-            return
-        if value not in SAFE_OBSERVATION_STRINGS:
-            raise ValueError("free-form observation strings are forbidden")
-    elif value is not None and not isinstance(value, (bool, int, float)):
-        raise ValueError("invalid observation value")
-
-
 def validate_runtime_scan(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("missing runtime scan evidence")
-    if not isinstance(value.get("files_scanned"), int) or value["files_scanned"] <= 0:
-        raise ValueError("runtime scan must cover at least one file")
-    if not isinstance(value.get("app_logs_scanned"), int) or value["app_logs_scanned"] <= 0:
-        raise ValueError("runtime scan must cover an application log")
+    evidence.validate_runtime_scan(value, require_config=False, extra_counts=RECOVERY_SCAN_KEYS)
     if (
-        not isinstance(value.get("recovery_artifacts_scanned"), int)
-        or value["recovery_artifacts_scanned"] < 0
+        value["canonical_recovery_records_scanned"] + value["recovery_leases_scanned"]
+        > value["recovery_artifacts_scanned"]
     ):
-        raise ValueError("invalid recovery artifact scan count")
-    for key in ("canonical_recovery_records_scanned", "recovery_leases_scanned"):
-        if not isinstance(value.get(key), int) or value[key] < 0:
-            raise ValueError(f"invalid {key}")
-    if value["canonical_recovery_records_scanned"] + value["recovery_leases_scanned"] > value[
-        "recovery_artifacts_scanned"
-    ]:
         raise ValueError("runtime scan recovery artifact counts are inconsistent")
     if value["files_scanned"] < (
-        value["app_logs_scanned"] + value["recovery_artifacts_scanned"] + 1
+        value["app_logs_scanned"]
+        + value["config_files_scanned"]
+        + value["recovery_artifacts_scanned"]
+        + 1
     ):
         raise ValueError("runtime scan file count is incomplete")
-    require_true(
-        value,
-        "utf8_sentinel_absent",
-        "utf16le_sentinel_absent",
-        "panic_absent",
-        "refcell_absent",
-    )
 
 
 def validate_live_recovery_scan(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("missing live recovery scan evidence")
-    count = value.get("canonical_record_count")
-    records = value.get("canonical_records")
-    if not isinstance(count, int) or count <= 0:
+    evidence.require_exact_keys(
+        value, frozenset({"canonical_record_count", "canonical_records"}), "live recovery scan"
+    )
+    count = value["canonical_record_count"]
+    records = value["canonical_records"]
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
         raise ValueError("live recovery scan requires a canonical record")
     if not isinstance(records, list) or len(records) != count:
         raise ValueError("live recovery record count does not match fingerprints")
     for record in records:
-        fingerprint = validate_fingerprint(record)
-        if fingerprint["byte_count"] <= 0:
+        if validate_exact_fingerprint(record)["byte_count"] <= 0:
             raise ValueError("canonical recovery record must be nonempty")
-    require_true(value, "utf8_sentinel_absent", "utf16le_sentinel_absent")
 
 
-def validate_passed_case(
-    case_id: str, observations: dict[str, Any], parent_context: Any
-) -> None:
-    parent = validate_process_context(parent_context)
-    contexts = observations.get("process_contexts")
-    if contexts is None:
-        contexts = [observations.get("process_context")]
-    if not isinstance(contexts, list) or not contexts:
-        raise ValueError("passed case requires process context")
-    for context in contexts:
-        if validate_process_context(context) != parent:
-            raise ValueError("case process context differs from harness context")
-    if observations.get("flow") != CASE_FLOWS[case_id]:
-        raise ValueError("case flow mechanics do not match the required scenario")
-    require_true(observations, "foreground_verified")
-    validate_runtime_scan(observations.get("runtime_scan"))
-
+def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     if case_id == CASE_POINTER_CANCEL:
         editor = validate_fingerprint(observations.get("editor"))
         saved = validate_fingerprint(observations.get("source_after_cancel_save"))
@@ -602,10 +281,8 @@ def validate_passed_case(
             raise ValueError("recovery startup signal is not the absent offer")
         if observations.get("termination") != "TerminateProcess":
             raise ValueError("recovery interruption did not use TerminateProcess")
-        if observations.get("restart_count") != 2 or len(contexts) != 3:
+        if observations.get("restart_count") != 2 or len(observations["process_contexts"]) != 3:
             raise ValueError("recovery scenario requires two restarts")
-        validate_live_recovery_scan(observations.get("live_recovery_scan"))
-        validate_runtime_scan(observations.get("live_runtime_scan"))
         if observations["live_runtime_scan"]["canonical_recovery_records_scanned"] < observations[
             "live_recovery_scan"
         ]["canonical_record_count"]:
@@ -625,29 +302,29 @@ def validate_passed_case(
             raise ValueError("discarded recovery was present after restart")
 
 
-def build_cli_command(exe: Path, expected_hash: str, evidence: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "scripts.markturbo_tools.native.goal02",
-        "--exe",
-        str(exe),
-        "--expect-exe-sha256",
-        expected_hash,
-        "--evidence",
-        str(evidence),
-    ]
+CONTRACT = evidence.EvidenceContract(
+    schema=SCHEMA,
+    case_flows=CASE_FLOWS,
+    observation_keys=frozenset().union(*REQUIRED_OBSERVATIONS.values()),
+    fingerprint_keys=FINGERPRINT_OBSERVATION_KEYS,
+    required_observations=REQUIRED_OBSERVATIONS,
+    validate_runtime_scan=validate_runtime_scan,
+    validate_passed_case=validate_passed_case,
+    private_sentinels=(DOCUMENT_SENTINEL,),
+    safe_strings=SAFE_OBSERVATION_STRINGS,
+    structured={
+        "live_recovery_scan": validate_live_recovery_scan,
+        "live_runtime_scan": validate_runtime_scan,
+    },
+)
 
 
-def source_contract_failure() -> str | None:
-    """The nsh selectors this harness drives must exist in production source."""
-    if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
-        return "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
-    if not alert_enter_confirms(
-        REPO / "crates/mt-app/src/state.rs", "fn overwrite_active(", "overwrite"
-    ):
-        return "LIFECYCLE_UI_SOURCE_CONTRACT_MISSING"
-    return None
+def new_evidence(expected_hash: str) -> dict[str, Any]:
+    return evidence.new_evidence(CONTRACT, expected_hash)
+
+
+def validate_evidence(value: dict[str, Any]) -> None:
+    evidence.validate_evidence(value, CONTRACT)
 
 
 def canonical_recovery_records(data_root: Path) -> list[Path]:
@@ -683,64 +360,41 @@ def scan_live_recovery_records(data_root: Path) -> dict[str, Any]:
         if utf16 in value:
             raise HarnessFailure("UTF16LE_DOCUMENT_SENTINEL_LEAKED")
         fingerprints.append(fingerprint_bytes(value).evidence())
-    return {
-        "canonical_record_count": len(records),
-        "canonical_records": fingerprints,
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-    }
-
-
-def runtime_artifact_paths(data_root: Path, stderr_path: Path) -> list[Path]:
-    paths = [stderr_path]
-    for root in (data_root / "logs", data_root / "recovery"):
-        paths.extend(path for path in root.rglob("*") if path.is_file())
-    return sorted(set(path.resolve() for path in paths))
+    return {"canonical_record_count": len(records), "canonical_records": fingerprints}
 
 
 def scan_runtime_artifacts(data_root: Path, stderr_path: Path) -> dict[str, Any]:
-    utf8 = DOCUMENT_SENTINEL.encode("utf-8")
-    utf16 = DOCUMENT_SENTINEL.encode("utf-16-le")
-    paths = runtime_artifact_paths(data_root, stderr_path)
-    app_logs = [path for path in paths if path.parent == (data_root / "logs").resolve()]
-    recovery_root = (data_root / "recovery").resolve()
-    recovery_artifacts = [path for path in paths if recovery_root in path.parents]
-    canonical_records = [
-        path
-        for path in recovery_artifacts
-        if CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)
-    ]
-    recovery_leases = [
-        path for path in recovery_artifacts if path.name == ".markturbo-recovery.lock"
-    ]
-    if not app_logs:
-        raise HarnessFailure("APP_LOG_MISSING")
-    for path in paths:
+    """The shared private-content scan, plus panics and recovery artifacts.
+
+    Logs, recovery artifacts and stderr must hold no panic; the recovery
+    directory's canonical records and lease are counted.
+    """
+    scan = evidence.scan_case_artifacts(
+        data_root.parent, leak_codes("DOCUMENT_SENTINEL", DOCUMENT_SENTINEL)
+    )
+    try:
+        logs = [path for path in (data_root / "logs").rglob("*") if path.is_file()]
+        recovery = [path for path in (data_root / "recovery").rglob("*") if path.is_file()]
+    except OSError as error:
+        raise HarnessFailure("RUNTIME_ARTIFACT_ENUM_FAILED", safe_exception_name(error)) from None
+    for path in (*logs, *recovery, stderr_path):
         try:
-            value = path.read_bytes()
+            lowered = path.read_bytes().lower()
         except OSError as error:
             raise HarnessFailure(
                 "RUNTIME_ARTIFACT_SCAN_FAILED", safe_exception_name(error)
             ) from None
-        lowered = value.lower()
-        if utf8 in value:
-            raise HarnessFailure("UTF8_DOCUMENT_SENTINEL_LEAKED")
-        if utf16 in value:
-            raise HarnessFailure("UTF16LE_DOCUMENT_SENTINEL_LEAKED")
         if b"refcell already borrowed" in lowered:
             raise HarnessFailure("REFCELL_BORROW_PANIC_LOGGED")
-        if re.search(rb"\bpanic(?:ked)?\b", lowered):
+        if PANIC_RE.search(lowered):
             raise HarnessFailure("PANIC_LOGGED")
     return {
-        "files_scanned": len(paths),
-        "app_logs_scanned": len(app_logs),
-        "recovery_artifacts_scanned": len(recovery_artifacts),
-        "canonical_recovery_records_scanned": len(canonical_records),
-        "recovery_leases_scanned": len(recovery_leases),
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-        "panic_absent": True,
-        "refcell_absent": True,
+        **scan,
+        "recovery_artifacts_scanned": len(recovery),
+        "canonical_recovery_records_scanned": sum(
+            bool(CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)) for path in recovery
+        ),
+        "recovery_leases_scanned": sum(path.name == RECOVERY_LEASE_NAME for path in recovery),
     }
 
 
@@ -942,7 +596,7 @@ class Goal02Harness(BaseNativeHarness):
             )
             self.click_control(keep_mine, "CONFLICT_KEEP_MINE_CLICK_FAILED")
             # Keep mine opens the Overwrite alert, which UIA cannot see; Enter
-            # answers it with Overwrite (`alert_enter_confirms`).
+            # answers it with Overwrite, proven by the written file.
             self.confirm_system_alert(
                 app,
                 lambda: sha256_file(document) == external,
@@ -1065,7 +719,6 @@ def native_run_plan() -> NativeRunPlan:
         workdir_prefix="markturbo-goal-02-native-",
         new_evidence=new_evidence,
         validate_evidence=validate_evidence,
-        source_contract=source_contract_failure,
         preflight=preflight,
         ui_types_loader=load_pywinauto,
         harness_factory=Goal02Harness,
@@ -1080,45 +733,8 @@ def native_run_plan() -> NativeRunPlan:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
-        "--exe",
-        type=Path,
-        default=DEFAULT_EXE,
-        help="release executable to copy and test (default: target/release/markturbo.exe)",
-    )
-    parser.add_argument(
-        "--case",
-        choices=REQUIRED_CASE_IDS,
-        help="run one case for debugging; it never produces acceptance PASS",
-    )
-    parser.add_argument(
-        "--keep-workdir-on-failure",
-        action="store_true",
-        help="preserve the isolated data, config, logs, and stderr directory after a non-PASS run",
-    )
-    parser.add_argument(
-        "--expect-exe-sha256",
-        type=normalize_expected_hash,
-        required=True,
-        help="required SHA-256 binding for the release executable",
-    )
-    parser.add_argument(
-        "--evidence",
-        type=Path,
-        default=DEFAULT_EVIDENCE,
-        help="JSON run receipt path (default: target/native-acceptance)",
-    )
-    parser.add_argument(
-        "--ui-timeout",
-        type=float,
-        default=15.0,
-        help="seconds allowed for ordinary UI state transitions (default: 15)",
-    )
-    args = parser.parse_args(argv)
-    if not math.isfinite(args.ui_timeout) or args.ui_timeout <= 0:
-        parser.error("--ui-timeout must be greater than zero")
-    return args
+    parser = evidence.build_parser(__doc__.splitlines()[0], "goal-02", REQUIRED_CASE_IDS)
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -28,152 +28,50 @@ consent is always a pointer hold. Trust scripts' Run scripts confirmation is
 an nsh system alert outside the UIA tree, answered with Enter (`runtime.py`
 `confirm_system_alert`).
 
-Evidence `schema_version` 2 matches this nsh flow. Version 1 files are
-historical records of the retired GPUI harness: `validate_historical_evidence`
-checks their envelope, and no current validator or Goal 07 evaluation accepts
-them as acceptance.
+Evidence follows the shared native schema (`evidence.py`).
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import math
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
+from . import evidence
 from . import goal07_provider as provider_fixtures
-from .goal03 import Goal03Harness as ClipboardNativeHarness
-from .source_contract import (
-    alert_enter_confirms,
-    production_markers_present,
-    production_source,
-    rust_source_views,
-)
+from .evidence import credential_target, leak_codes
 from .runtime import (
-    IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
-    PE32_PLUS_MAGIC,
-    REASON_CODE_RE,
-    SAFE_FAILURE_TYPES,
-    SHA256_RE,
-    CONFLICT_HEADING,
     MENU_EDIT_AUTOMATION_ID,
     MENU_WEB_AUTOMATION_ID,
     VK_A,
     VK_RETURN,
+    CONFLICT_HEADING,
     Fingerprint,
     HarnessBlocked,
     HarnessFailure,
+    NativeHarness,
     NativeRunPlan,
     complete_evidence as complete_evidence_envelope,
-    finite_nonnegative,
     fingerprint_bytes,
     fingerprint_text,
     load_pywinauto,
     main_native_acceptance,
-    normalize_expected_hash,
     preflight,
     require_true,
     safe_exception_name,
     sha256_file,
-    utc_now,
-    validate_environment as validate_runtime_environment,
     validate_fingerprint,
-    validate_process_context,
     wait_until,
     write_durable,
-    artifact_contains,
 )
 
 
-REPO = Path(__file__).resolve().parents[3]
-DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
-DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-07-native-acceptance-v2.json"
 SCHEMA = "markturbo.goal-07-native-acceptance"
-# 2: the nsh flow (decisions write at once, Undo, Copy, part-changed hunks).
-SCHEMA_VERSION = 2
-# Retained GPUI-era files (one Apply on Done, stale proposal): historical only.
-HISTORICAL_SCHEMA_VERSION = 1
 MAX_EDIT_OUTPUT_BYTES = 4 * 1024 * 1024
-
-EVIDENCE_KEYS = frozenset(
-    {
-        "schema",
-        "schema_version",
-        "status",
-        "started_at_utc",
-        "completed_at_utc",
-        "transport",
-        "executable",
-        "environment",
-        "cases",
-        "summary",
-    }
-)
 TRANSPORT_KEYS = frozenset({"mode", "provider", "deterministic", "request_count"})
-EXECUTABLE_KEYS = frozenset(
-    {
-        "expected_sha256",
-        "sha256",
-        "byte_count",
-        "hash_verified",
-        "copied_sha256",
-        "copy_hash_verified",
-        "format",
-        "machine",
-        "machine_code",
-        "optional_magic",
-    }
-)
-ENVIRONMENT_KEYS = frozenset(
-    {
-        "platform",
-        "windows_major",
-        "windows_minor",
-        "windows_build",
-        "architecture",
-        "native_machine_code",
-        "python_pointer_bits",
-        "wts_state",
-        "active_console_session_id",
-        "harness_is_console_session",
-        "input_desktop",
-        "thread_desktop",
-        "harness_process",
-    }
-)
-PROCESS_CONTEXT_KEYS = frozenset({"session_id", "integrity_rid", "integrity"})
-CASE_KEYS = frozenset(
-    {"id", "status", "duration_ms", "reason_code", "failure_type", "observations"}
-)
-SUMMARY_KEYS = frozenset(
-    {
-        "required_case_count",
-        "passed_case_count",
-        "blocked_case_count",
-        "failed_case_count",
-        "not_run_case_count",
-    }
-)
-RUNTIME_SCAN_KEYS = frozenset(
-    {
-        "files_scanned",
-        "app_logs_scanned",
-        "config_files_scanned",
-        "utf8_sentinel_absent",
-        "utf16le_sentinel_absent",
-        "ephemeral_credential_utf8_absent",
-        "ephemeral_credential_utf16le_absent",
-        "answer_sentinel_utf8_absent",
-        "answer_sentinel_utf16le_absent",
-        "raw_response_sentinel_utf8_absent",
-        "raw_response_sentinel_utf16le_absent",
-    }
-)
 
 # `ui/review.rs`: the structured result's first line, the answer input, and
 # the Buttons, each carrying its own AutomationId (`prims` actions).
@@ -204,60 +102,6 @@ REVISION_NOTHING_APPROVED = "No changes approved."
 TRUST_SCRIPTS_AUTOMATION_ID = "web-trust"
 TRUSTED_BANNER = "Trusted: scripts may run"
 RESTRICTED_BANNER = "Restricted: scripts disabled"
-UI_SOURCE_REQUIREMENTS = {
-    "crates/mt-app/src/ui/titlebar.rs": (
-        '"mod+enter"',
-        '"title-settings"',
-        '"title-menu-save"',
-        '"title-menu-edit"',
-        '"title-menu-web"',
-        '"title-menu-quit"',
-        '"title-dirty"',
-    ),
-    "crates/mt-app/src/ui/review.rs": (
-        '"review-answer-input"',
-        '"review-answer-submit"',
-        '"review-prepare"',
-        '"Answer"',
-        '"Prepare revision"',
-        '"Understood:"',
-    ),
-    "crates/mt-app/src/ui/consent.rs": ('"consent-send"', ".long_press_delay(HOLD_MS)"),
-    "crates/mt-app/src/ui/revision.rs": (
-        '"revision-accept"',
-        '"revision-reject"',
-        '"revision-undo"',
-        '"revision-done"',
-        '"revision-copy"',
-        '"revision-proposal-after"',
-        '"Accept"',
-        '"Reject"',
-        '"Accepted"',
-        '"Rejected"',
-        '"Undo"',
-        '"Done"',
-        '"Copy"',
-        '"Proposed text"',
-        '"Can\'t apply \u2014 this part changed"',
-        '"{n} of {m} decided"',
-    ),
-    "crates/mt-app/src/ui/notices.rs": (
-        '"Changed on disk"',
-        '"Close without saving?"',
-        '"Don\'t save"',
-    ),
-    "crates/mt-app/src/i18n.rs": (
-        '"Trust scripts"',
-        '"Trusted: scripts may run"',
-        '"Restricted: scripts disabled"',
-    ),
-    "crates/mt-app/src/ui/preview.rs": ('"web-trust"',),
-    "crates/mt-app/src/state.rs": (
-        '.destructive("trust", "Run scripts")',
-        '"No changes approved."',
-    ),
-    "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
-}
 
 CASE_REJECT_ALL = "reject_all_byte_identity"
 CASE_SELECTIVE_UNDO = "selective_apply_one_undo"
@@ -265,14 +109,6 @@ CASE_ACCEPT_ALL_PREVIEW = "accept_all_preview"
 CASE_STALE = "stale_proposal_blocks_apply"
 CASE_SAVE_CONFLICT = "safe_save_conflict"
 CASE_TRUST_REVOKE = "trusted_executable_apply_revokes_trust"
-REQUIRED_CASE_IDS = (
-    CASE_REJECT_ALL,
-    CASE_SELECTIVE_UNDO,
-    CASE_ACCEPT_ALL_PREVIEW,
-    CASE_STALE,
-    CASE_SAVE_CONFLICT,
-    CASE_TRUST_REVOKE,
-)
 CASE_FLOWS = {
     CASE_REJECT_ALL: "Review -> Revision -> Reject every hunk -> Done -> exact editor and source identity",
     CASE_SELECTIVE_UNDO: (
@@ -292,6 +128,7 @@ CASE_FLOWS = {
     ),
     CASE_TRUST_REVOKE: "trusted HTML -> Accept executable change -> Done -> Restricted trust",
 }
+REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
 SOURCE_TEXT = (
@@ -324,148 +161,135 @@ HTML_EDITOR_SOURCE_BYTES = HTML_EDITOR_SOURCE_TEXT.encode("utf-8")
 STALE_EDIT_TEXT = "---\ntitle: locally edited\nowner: TBD\n---\n"
 EXTERNAL_SOURCE_BYTES = b"external writer won\r\n"
 
-SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES | {
-    "keyless_loopback",
-    "openai-responses",
-    "Trusted",
-    "Restricted",
+SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
+FINGERPRINT_OBSERVATION_KEYS = frozenset(
+    {
+        "editor_after",
+        "editor_after_apply",
+        "editor_after_activation_attempt",
+        "editor_after_edit",
+        "editor_after_accept_all",
+        "editor_after_undo",
+        "editor_before",
+        "editor_before_apply",
+        "executable_expected",
+        "external_source_after",
+        "external_source_before",
+        "accept_all_expected",
+        "editor_after_done",
+        "preview_fingerprint",
+        "proposal_expected",
+        "selective_expected",
+        "source_after",
+        "source_before",
+        "copy_editor_after",
+        "copy_editor_before",
+        "copy_preview_fingerprint",
+        "copy_source_after",
+        "copy_source_before",
+    }
+)
+PROVIDER_OBSERVATION_KEYS = frozenset(
+    {
+        "provider_request_count",
+        "provider_review_count",
+        "provider_revision_count",
+        "provider_paths_exact",
+        "provider_no_request_before_consent_click",
+        "provider_review_before_revision",
+        "provider_review_source_sha256_match",
+        "provider_revision_source_sha256_match",
+        "provider_revision_snapshot_match",
+        "provider_revision_answer_sentinel_present",
+    }
+)
+REQUIRED_OBSERVATIONS = {
+    CASE_REJECT_ALL: frozenset(
+        {
+            "proposal_received",
+            "reviewed_source_match",
+            "editor_before",
+            "editor_after",
+            "source_before",
+            "source_after",
+            "reject_all_byte_identity",
+            "dirty_before",
+            "dirty_after",
+            "reject_all_dirty_unchanged",
+        }
+    ),
+    CASE_SELECTIVE_UNDO: frozenset(
+        {
+            "editor_before",
+            "selective_expected",
+            "editor_after_apply",
+            "editor_after_undo",
+            "editor_after_done",
+            "source_before",
+            "source_after",
+            "selective_matches_expected",
+            "one_undo_transaction",
+        }
+    ),
+    CASE_ACCEPT_ALL_PREVIEW: frozenset(
+        {
+            "editor_before_apply",
+            "editor_after_accept_all",
+            "accept_all_expected",
+            "editor_after_done",
+            "accept_all_matches_expected",
+            "copy_preview_fingerprint",
+            "copy_preview_exact",
+            "copy_editor_before",
+            "copy_editor_after",
+            "copy_editor_unchanged",
+            "copy_dirty_before",
+            "copy_dirty_after",
+            "copy_dirty_unchanged",
+            "copy_source_before",
+            "copy_source_after",
+            "copy_source_unchanged",
+        }
+    ),
+    CASE_STALE: frozenset(
+        {
+            "editor_before",
+            "editor_after_edit",
+            "source_before",
+            "source_after",
+            "stale_no_mutation",
+            "editor_after_activation_attempt",
+            "editor_after_done",
+        }
+    ),
+    CASE_SAVE_CONFLICT: frozenset(
+        {
+            "editor_after_apply",
+            "external_source_before",
+            "external_source_after",
+            "conflict_visible_before_save",
+            "safe_save_no_overwrite",
+        }
+    ),
+    CASE_TRUST_REVOKE: frozenset(
+        {
+            "editor_before_apply",
+            "editor_after_apply",
+            "executable_change",
+            "executable_expected",
+            "executable_matches_expected",
+            "preview_fingerprint",
+            "proposal_expected",
+            "preview_matches_expected",
+            "preview_contains_executable_text",
+        }
+    ),
 }
-ALLOWED_OBSERVATION_KEYS = {
-    "accept_all_expected",
-    "accept_all_matches_expected",
-    "copy_dirty_after",
-    "copy_dirty_before",
-    "copy_dirty_unchanged",
-    "copy_source_after",
-    "copy_source_before",
-    "copy_source_unchanged",
-    "copy_editor_after",
-    "copy_editor_before",
-    "copy_editor_unchanged",
-    "copy_preview_fingerprint",
-    "copy_preview_exact",
-    "accept_withheld",
-    "dirty_after",
-    "dirty_before",
-    "reject_all_dirty_unchanged",
-    "apply_activation_attempted",
-    "apply_disabled_source_contract",
-    "editor_after",
-    "editor_after_accept_all",
-    "editor_after_apply",
-    "editor_after_done",
-    "editor_after_edit",
-    "editor_before",
-    "editor_before_apply",
-    "external_source_after",
-    "external_source_before",
-    "flow",
-    "foreground_verified",
-    "loopback_provider",
-    "one_undo_transaction",
-    "preview_fingerprint",
-    "proposal_expected",
-    "proposal_received",
-    "reviewed_source_match",
-    "provider_request_count",
-    "provider_review_count",
-    "provider_revision_count",
-    "provider_paths_exact",
-    "provider_no_request_before_consent_click",
-    "provider_review_before_revision",
-    "provider_review_source_sha256_match",
-    "provider_revision_source_sha256_match",
-    "provider_revision_snapshot_match",
-    "provider_revision_answer_sentinel_present",
-    "process_context",
-    "reject_all_byte_identity",
-    "runtime_scan",
-    "safe_save_conflict_visible",
-    "safe_save_no_overwrite",
-    "save_command_sent",
-    "conflict_visible_before_save",
-    "selective_expected",
-    "selective_matches_expected",
-    "server_deterministic",
-    "server_loopback",
-    "source_after",
-    "source_before",
-    "stale_no_mutation",
-    "stale_proposal_received",
-    "part_changed_visible",
-    "trust_before",
-    "restricted_after_apply",
-    "executable_change",
-    "undo_count",
-    "utf16le_sentinel_absent",
-    "utf8_sentinel_absent",
-    "files_scanned",
-    "app_logs_scanned",
-    "config_files_scanned",
-    "ephemeral_credential_utf8_absent",
-    "ephemeral_credential_utf16le_absent",
-    "byte_count",
-    "sha256",
-    "session_id",
-    "integrity_rid",
-    "integrity",
-    "editor_after_undo",
-    "editor_after_activation_attempt",
-    "preview_inert_source_contract",
-    "trust_revocation_order_source_contract",
-    "executable_expected",
-    "executable_matches_expected",
-    "preview_matches_expected",
-    "preview_contains_executable_text",
-    "answer_sentinel_utf8_absent",
-    "answer_sentinel_utf16le_absent",
-    "raw_response_sentinel_utf8_absent",
-    "raw_response_sentinel_utf16le_absent",
-    "requested_hwnd",
-    "foreground_hwnd",
-    "show_window_return",
-    "bring_to_top_return",
-    "set_foreground_return",
-    "foreground_attempts",
+# Every case also records the loopback provider's request contract.
+REQUIRED_OBSERVATIONS = {
+    case_id: keys | PROVIDER_OBSERVATION_KEYS for case_id, keys in REQUIRED_OBSERVATIONS.items()
 }
-
-
-def endpoint_environment_key_identity(endpoint: str) -> str:
-    """Mirror EndpointIdentity::credential_target without exposing a secret."""
-    parsed = urlsplit(endpoint)
-    scheme = parsed.scheme.casefold()
-    host = parsed.hostname
-    if (
-        scheme not in {"http", "https"}
-        or not host
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("loopback endpoint identity requires an HTTP(S) host")
-    try:
-        port = parsed.port or (80 if scheme == "http" else 443)
-    except ValueError as error:
-        raise ValueError("loopback endpoint identity has an invalid port") from error
-    path = parsed.path or "/"
-    if not path.endswith("/"):
-        path += "/"
-    digest = hashlib.sha256()
-    for component in (
-        "io.github.wxxb789.markturbo",
-        "openai-responses",
-        scheme,
-        host.casefold(),
-        str(port),
-        path,
-    ):
-        digest.update(component.encode("utf-8"))
-        digest.update(b"\0")
-    return (
-        "io.github.wxxb789.markturbo:model-credential:v2|wire=openai-responses"
-        f"|host={host.casefold()}|identity-sha256={digest.hexdigest()}"
-    )
+OBSERVATION_KEYS = frozenset().union(*REQUIRED_OBSERVATIONS.values())
 
 
 def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
@@ -557,48 +381,6 @@ def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
     return bytes(output)
 
 
-def new_evidence(expected_hash: str) -> dict[str, Any]:
-    evidence = {
-        "schema": SCHEMA,
-        "schema_version": SCHEMA_VERSION,
-        "status": "BLOCKED",
-        "started_at_utc": utc_now(),
-        "completed_at_utc": None,
-        "transport": {
-            "mode": "keyless_loopback",
-            "provider": "openai-responses",
-            "deterministic": True,
-            "request_count": 0,
-        },
-        "executable": {
-            "expected_sha256": expected_hash,
-            "sha256": None,
-            "byte_count": None,
-            "hash_verified": False,
-            "copied_sha256": None,
-            "copy_hash_verified": False,
-            "format": None,
-            "machine": None,
-            "machine_code": None,
-            "optional_magic": None,
-        },
-        "environment": {},
-        "cases": [
-            {
-                "id": case_id,
-                "status": "NOT_RUN",
-                "duration_ms": None,
-                "reason_code": None,
-                "failure_type": None,
-                "observations": {},
-            }
-            for case_id in REQUIRED_CASE_IDS
-        ],
-        "summary": {},
-    }
-    return evidence
-
-
 def finalize_evidence(evidence: dict[str, Any]) -> None:
     request_count = 0
     for case in evidence.get("cases", ()):
@@ -622,268 +404,43 @@ def complete_evidence(evidence: dict[str, Any], status: str) -> None:
     complete_evidence_envelope(evidence, status, REQUIRED_CASE_IDS)
 
 
-PRIVATE_SENTINELS = (
-    DOCUMENT_SENTINEL,
-    provider_fixtures.ANSWER_SENTINEL,
-    provider_fixtures.RAW_RESPONSE_SENTINEL,
-)
-PRIVATE_KEYS = frozenset({"request_body", "credential", "api_key", "api-key"})
-
-FINGERPRINT_KEYS = frozenset({"byte_count", "sha256"})
-FINGERPRINT_OBSERVATION_KEYS = frozenset(
-    {
-        "editor_after",
-        "editor_after_apply",
-        "editor_after_activation_attempt",
-        "editor_after_edit",
-        "editor_after_accept_all",
-        "editor_after_undo",
-        "editor_before",
-        "editor_before_apply",
-        "executable_expected",
-        "external_source_after",
-        "external_source_before",
-        "accept_all_expected",
-        "editor_after_done",
-        "preview_fingerprint",
-        "proposal_expected",
-        "selective_expected",
-        "source_after",
-        "source_before",
-        "copy_editor_after",
-        "copy_editor_before",
-        "copy_preview_fingerprint",
-        "copy_source_after",
-        "copy_source_before",
-    }
-)
-STRUCTURED_OBSERVATION_KEYS = FINGERPRINT_OBSERVATION_KEYS | {
-    "process_context",
-    "runtime_scan",
-}
-
-
-def reject_private_content(value: Any) -> None:
-    """Reject content-bearing or credential-shaped values at every nesting level."""
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if not isinstance(key, str) or key.casefold() in PRIVATE_KEYS:
-                raise ValueError("evidence contains private content")
-            folded_key = key.casefold()
-            if any(sentinel.casefold() in folded_key for sentinel in PRIVATE_SENTINELS):
-                raise ValueError("free-form observation strings are forbidden")
-            reject_private_content(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            reject_private_content(nested)
-    elif isinstance(value, str):
-        folded_value = value.casefold()
-        if any(sentinel.casefold() in folded_value for sentinel in PRIVATE_SENTINELS):
-            raise ValueError("free-form observation strings are forbidden")
-
-
-def require_exact_keys(value: Any, expected: frozenset[str], label: str) -> None:
-    if not isinstance(value, dict) or set(value) != expected:
-        raise ValueError(f"invalid {label} keys")
-
-
-def validate_observations(value: Any, key: str | None = None) -> None:
-    if isinstance(value, dict):
-        if key == "process_context":
-            require_exact_keys(value, PROCESS_CONTEXT_KEYS, "process context")
-            validate_process_context(value)
-            return
-        if key == "runtime_scan":
-            validate_runtime_scan(value)
-            return
-        if key in FINGERPRINT_OBSERVATION_KEYS:
-            require_exact_keys(value, FINGERPRINT_KEYS, f"{key} fingerprint")
-            validate_fingerprint(value)
-            return
-        for nested_key, nested in value.items():
-            if not isinstance(nested_key, str):
-                raise ValueError("unknown observation field")
-            if nested_key.casefold() in PRIVATE_KEYS:
-                raise ValueError("evidence contains private content")
-            if nested_key not in ALLOWED_OBSERVATION_KEYS:
-                raise ValueError("unknown observation field")
-            if isinstance(nested, dict) and nested_key not in STRUCTURED_OBSERVATION_KEYS:
-                raise ValueError("invalid nested observation structure")
-            if nested_key == "sha256" and (
-                not isinstance(nested, str) or not SHA256_RE.fullmatch(nested)
-            ):
-                raise ValueError("invalid observation SHA-256")
-            validate_observations(nested, nested_key)
-    elif isinstance(value, list):
-        for nested in value:
-            validate_observations(nested, key)
-    elif isinstance(value, str):
-        if key != "sha256" and value not in SAFE_STRINGS:
-            raise ValueError("free-form observation strings are forbidden")
-    elif value is not None and not isinstance(value, (bool, int, float)):
-        raise ValueError("invalid observation value")
+def validate_transport(evidence: dict[str, Any]) -> None:
+    transport = evidence["transport"]
+    if (
+        not isinstance(transport, dict)
+        or set(transport) != TRANSPORT_KEYS
+        or transport.get("mode") != "keyless_loopback"
+        or transport.get("provider") != "openai-responses"
+        or transport.get("deterministic") is not True
+        or not isinstance(transport.get("request_count"), int)
+        or isinstance(transport.get("request_count"), bool)
+        or transport["request_count"] < 0
+    ):
+        raise ValueError("invalid loopback transport evidence")
+    cases = evidence.get("cases")
+    if isinstance(cases, list):
+        observed_request_count = 0
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            observations = case.get("observations")
+            if not isinstance(observations, dict) or "provider_request_count" not in observations:
+                continue
+            count = observations["provider_request_count"]
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise ValueError("invalid provider request count")
+            observed_request_count += count
+        if transport["request_count"] != observed_request_count:
+            raise ValueError("top-level transport request count is not synchronized")
 
 
 def validate_runtime_scan(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("missing runtime scan evidence")
-    require_exact_keys(value, RUNTIME_SCAN_KEYS, "runtime scan")
-    for key in ("files_scanned", "app_logs_scanned", "config_files_scanned"):
-        if not isinstance(value.get(key), int) or isinstance(value[key], bool) or value[key] < 0:
-            raise ValueError(f"invalid {key}")
-    if (
-        value["files_scanned"] <= 0
-        or value["app_logs_scanned"] <= 0
-        or value["config_files_scanned"] <= 0
-    ):
-        raise ValueError("runtime scan must cover an application log")
-    if (
-        value["app_logs_scanned"] > value["files_scanned"]
-        or value["config_files_scanned"] > value["files_scanned"]
-        or value["app_logs_scanned"] + value["config_files_scanned"]
-        > value["files_scanned"]
-    ):
-        raise ValueError("runtime scan counts are inconsistent")
-    if value["files_scanned"] < value["app_logs_scanned"] + value["config_files_scanned"] + 1:
-        raise ValueError("runtime scan file count is incomplete")
-    require_true(value, "utf8_sentinel_absent", "utf16le_sentinel_absent")
-    require_true(
-        value,
-        "ephemeral_credential_utf8_absent",
-        "ephemeral_credential_utf16le_absent",
-        "answer_sentinel_utf8_absent",
-        "answer_sentinel_utf16le_absent",
-        "raw_response_sentinel_utf8_absent",
-        "raw_response_sentinel_utf16le_absent",
-    )
+    evidence.validate_runtime_scan(value, require_config=True)
 
 
-def validate_environment(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError("invalid environment evidence")
-    require_exact_keys(value, ENVIRONMENT_KEYS, "environment")
-    require_exact_keys(value["harness_process"], PROCESS_CONTEXT_KEYS, "process context")
-    validate_runtime_environment(value)
-    return validate_process_context(value.get("harness_process"))
-
-
-def required_observations(case_id: str) -> set[str]:
-    common = {
-        "flow",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-        "loopback_provider",
-        "server_loopback",
-        "server_deterministic",
-        "provider_request_count",
-        "provider_review_count",
-        "provider_revision_count",
-        "provider_paths_exact",
-        "provider_no_request_before_consent_click",
-        "provider_review_before_revision",
-        "provider_review_source_sha256_match",
-        "provider_revision_source_sha256_match",
-        "provider_revision_snapshot_match",
-        "provider_revision_answer_sentinel_present",
-    }
-    specifics = {
-        CASE_REJECT_ALL: {
-            "proposal_received",
-            "reviewed_source_match",
-            "editor_before",
-            "editor_after",
-            "source_before",
-            "source_after",
-            "reject_all_byte_identity",
-            "dirty_before",
-            "dirty_after",
-            "reject_all_dirty_unchanged",
-        },
-        CASE_SELECTIVE_UNDO: {
-            "editor_before",
-            "selective_expected",
-            "editor_after_apply",
-            "editor_after_undo",
-            "editor_after_done",
-            "source_before",
-            "source_after",
-            "selective_matches_expected",
-            "one_undo_transaction",
-            "undo_count",
-        },
-        CASE_ACCEPT_ALL_PREVIEW: {
-            "editor_before_apply",
-            "editor_after_accept_all",
-            "accept_all_expected",
-            "editor_after_done",
-            "accept_all_matches_expected",
-            "copy_preview_fingerprint",
-            "copy_preview_exact",
-            "copy_editor_before",
-            "copy_editor_after",
-            "copy_editor_unchanged",
-            "copy_dirty_before",
-            "copy_dirty_after",
-            "copy_dirty_unchanged",
-            "copy_source_before",
-            "copy_source_after",
-            "copy_source_unchanged",
-        },
-        CASE_STALE: {
-            "editor_before",
-            "editor_after_edit",
-            "source_before",
-            "source_after",
-            "stale_proposal_received",
-            "part_changed_visible",
-            "accept_withheld",
-            "apply_activation_attempted",
-            "apply_disabled_source_contract",
-            "stale_no_mutation",
-            "editor_after_activation_attempt",
-            "editor_after_done",
-        },
-        CASE_SAVE_CONFLICT: {
-            "editor_after_apply",
-            "external_source_before",
-            "external_source_after",
-            "save_command_sent",
-            "conflict_visible_before_save",
-            "safe_save_conflict_visible",
-            "safe_save_no_overwrite",
-        },
-        CASE_TRUST_REVOKE: {
-            "trust_before",
-            "editor_before_apply",
-            "editor_after_apply",
-            "restricted_after_apply",
-            "executable_change",
-            "executable_expected",
-            "executable_matches_expected",
-            "trust_revocation_order_source_contract",
-            "preview_inert_source_contract",
-            "preview_fingerprint",
-            "proposal_expected",
-            "preview_matches_expected",
-            "preview_contains_executable_text",
-        },
-    }
-    return common | specifics[case_id]
-
-
-def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dict[str, Any]) -> None:
-    if observations.get("flow") != CASE_FLOWS[case_id]:
-        raise ValueError("case flow mechanics do not match the required scenario")
-    require_exact_keys(observations.get("process_context"), PROCESS_CONTEXT_KEYS, "process context")
-    if validate_process_context(observations.get("process_context")) != parent:
-        raise ValueError("case process context differs from harness context")
+def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     require_true(
         observations,
-        "foreground_verified",
-        "loopback_provider",
-        "server_loopback",
-        "server_deterministic",
         "provider_paths_exact",
         "provider_no_request_before_consent_click",
         "provider_review_before_revision",
@@ -892,7 +449,6 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         "provider_revision_snapshot_match",
         "provider_revision_answer_sentinel_present",
     )
-    validate_runtime_scan(observations.get("runtime_scan"))
     if (
         not isinstance(observations.get("provider_request_count"), int)
         or observations["provider_request_count"] != 2
@@ -927,11 +483,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         done = validate_fingerprint(observations["editor_after_done"])
         source_before = validate_fingerprint(observations["source_before"])
         source_after = validate_fingerprint(observations["source_after"])
-        require_true(
-            observations,
-            "selective_matches_expected",
-            "one_undo_transaction",
-        )
+        require_true(observations, "selective_matches_expected", "one_undo_transaction")
         if (
             applied != selected
             or undone != before
@@ -939,8 +491,6 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
             or source_before != source_after
         ):
             raise ValueError("selective Accept or one undo did not preserve exact bytes")
-        if observations.get("undo_count") != 1:
-            raise ValueError("selective Apply must be restored by exactly one undo")
     elif case_id == CASE_ACCEPT_ALL_PREVIEW:
         before = validate_fingerprint(observations["editor_before_apply"])
         after = validate_fingerprint(observations["editor_after_accept_all"])
@@ -951,9 +501,9 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         copy_after = validate_fingerprint(observations["copy_editor_after"])
         copy_source_before = validate_fingerprint(observations["copy_source_before"])
         copy_source_after = validate_fingerprint(observations["copy_source_after"])
-        require_true(observations, "accept_all_matches_expected")
         require_true(
             observations,
+            "accept_all_matches_expected",
             "copy_preview_exact",
             "copy_editor_unchanged",
             "copy_dirty_unchanged",
@@ -978,15 +528,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         after_done = validate_fingerprint(observations["editor_after_done"])
         source_before = validate_fingerprint(observations["source_before"])
         source_after = validate_fingerprint(observations["source_after"])
-        require_true(
-            observations,
-            "stale_proposal_received",
-            "part_changed_visible",
-            "accept_withheld",
-            "apply_activation_attempted",
-            "apply_disabled_source_contract",
-            "stale_no_mutation",
-        )
+        require_true(observations, "stale_no_mutation")
         if (
             before == edited
             or edited != after_observation
@@ -997,12 +539,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
     elif case_id == CASE_SAVE_CONFLICT:
         before = validate_fingerprint(observations["external_source_before"])
         after = validate_fingerprint(observations["external_source_after"])
-        require_true(
-            observations,
-            "save_command_sent",
-            "safe_save_conflict_visible",
-            "safe_save_no_overwrite",
-        )
+        require_true(observations, "safe_save_no_overwrite")
         if before != after:
             raise ValueError("safe-save conflict overwrote the external source")
         validate_fingerprint(observations["editor_after_apply"])
@@ -1014,12 +551,8 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         proposal = validate_fingerprint(observations["proposal_expected"])
         require_true(
             observations,
-            "trust_before",
-            "restricted_after_apply",
             "executable_change",
             "executable_matches_expected",
-            "trust_revocation_order_source_contract",
-            "preview_inert_source_contract",
             "preview_matches_expected",
             "preview_contains_executable_text",
         )
@@ -1027,363 +560,67 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
             raise ValueError("trusted executable Apply did not produce the expected restricted change")
 
 
-
-def validate_evidence(evidence: dict[str, Any]) -> None:
-    if not isinstance(evidence, dict):
-        raise ValueError("invalid top-level evidence")
-    require_exact_keys(evidence, EVIDENCE_KEYS, "top-level evidence")
-    if evidence.get("schema") != SCHEMA or evidence.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("unsupported evidence schema")
-    if evidence.get("status") not in {"PASS", "FAIL", "BLOCKED"}:
-        raise ValueError("invalid evidence status")
-    transport = evidence.get("transport")
-    if (
-        not isinstance(transport, dict)
-        or set(transport) != TRANSPORT_KEYS
-        or transport.get("mode") != "keyless_loopback"
-        or transport.get("provider") != "openai-responses"
-        or transport.get("deterministic") is not True
-        or not isinstance(transport.get("request_count"), int)
-        or isinstance(transport.get("request_count"), bool)
-        or transport["request_count"] < 0
-    ):
-        raise ValueError("invalid loopback transport evidence")
-    reject_private_content(evidence)
-    cases_for_transport = evidence.get("cases")
-    if isinstance(cases_for_transport, list):
-        observed_request_count = 0
-        for case in cases_for_transport:
-            if not isinstance(case, dict):
-                continue
-            observations = case.get("observations")
-            if not isinstance(observations, dict) or "provider_request_count" not in observations:
-                continue
-            count = observations["provider_request_count"]
-            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-                raise ValueError("invalid provider request count")
-            observed_request_count += count
-        if transport["request_count"] != observed_request_count:
-            raise ValueError("top-level transport request count is not synchronized")
-
-    executable = evidence.get("executable")
-    if not isinstance(executable, dict):
-        raise ValueError("missing executable evidence")
-    require_exact_keys(executable, EXECUTABLE_KEYS, "executable")
-    expected = executable.get("expected_sha256")
-    if not isinstance(expected, str) or not SHA256_RE.fullmatch(expected):
-        raise ValueError("invalid expected executable SHA-256")
-    for key in ("sha256", "copied_sha256"):
-        value = executable.get(key)
-        if value is not None and (
-            not isinstance(value, str) or not SHA256_RE.fullmatch(value)
-        ):
-            raise ValueError(f"invalid executable {key}")
-    if executable.get("hash_verified") is True and executable.get("sha256") != expected:
-        raise ValueError("verified executable hash does not match expected hash")
-    if executable.get("copy_hash_verified") is True and executable.get("copied_sha256") != expected:
-        raise ValueError("verified copied executable hash does not match expected hash")
-    if evidence["status"] == "PASS":
-        if not executable.get("hash_verified") or not executable.get("copy_hash_verified"):
-            raise ValueError("PASS requires verified executable hashes")
-        if executable.get("format") != "PE32+" or executable.get("machine") != "x86_64":
-            raise ValueError("PASS requires an AMD64 PE32+ executable")
-        if (
-            executable.get("machine_code") != IMAGE_FILE_MACHINE_AMD64
-            or executable.get("optional_magic") != PE32_PLUS_MAGIC
-        ):
-            raise ValueError("PASS requires an AMD64 PE32+ executable")
-        if (
-            not isinstance(executable.get("byte_count"), int)
-            or isinstance(executable["byte_count"], bool)
-            or executable["byte_count"] <= 0
-        ):
-            raise ValueError("PASS requires a nonempty executable")
-
-    cases = evidence.get("cases")
-    if not isinstance(cases, list) or len(cases) != len(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    ids = [case.get("id") for case in cases if isinstance(case, dict)]
-    if len(set(ids)) != len(ids) or set(ids) != set(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    parent = None
-    if evidence["status"] == "PASS" or any(
-        case.get("status") == "PASS" for case in cases if isinstance(case, dict)
-    ):
-        parent = validate_environment(evidence.get("environment"))
-    for case in cases:
-        require_exact_keys(case, CASE_KEYS, "case")
-        status = case.get("status")
-        if status not in {"PASS", "FAIL", "BLOCKED", "NOT_RUN"}:
-            raise ValueError("invalid case status")
-        reason = case.get("reason_code")
-        if reason is not None and (
-            not isinstance(reason, str) or not REASON_CODE_RE.fullmatch(reason)
-        ):
-            raise ValueError("invalid case reason code")
-        failure_type = case.get("failure_type")
-        if failure_type is not None and (
-            not isinstance(failure_type, str) or failure_type not in SAFE_FAILURE_TYPES
-        ):
-            raise ValueError("invalid case failure type")
-        if status != "FAIL" and failure_type is not None:
-            raise ValueError("only failed cases may contain a failure type")
-        duration = case.get("duration_ms")
-        if status == "NOT_RUN":
-            if duration is not None:
-                raise ValueError("NOT_RUN case cannot have a duration")
-        elif not finite_nonnegative(duration):
-            raise ValueError("completed case duration must be nonnegative")
-        observations = case.get("observations")
-        if not isinstance(observations, dict):
-            raise ValueError("invalid case observations")
-        validate_observations(observations)
-        if status == "PASS":
-            if not required_observations(case["id"]).issubset(observations):
-                raise ValueError("passed case evidence is incomplete")
-            if parent is None:
-                raise ValueError("passed case requires validated environment evidence")
-            validate_passed_case(case["id"], observations, parent)
-    if evidence["status"] == "PASS" and any(case["status"] != "PASS" for case in cases):
-        raise ValueError("PASS requires every required case to pass")
-    summary = evidence.get("summary")
-    if not isinstance(summary, dict):
-        raise ValueError("invalid case summary")
-    require_exact_keys(summary, SUMMARY_KEYS, "case summary")
-    expected_summary = {
-        "required_case_count": len(REQUIRED_CASE_IDS),
-        "passed_case_count": sum(case["status"] == "PASS" for case in cases),
-        "blocked_case_count": sum(case["status"] == "BLOCKED" for case in cases),
-        "failed_case_count": sum(case["status"] == "FAIL" for case in cases),
-        "not_run_case_count": sum(case["status"] == "NOT_RUN" for case in cases),
-    }
-    if evidence.get("summary") != expected_summary:
-        raise ValueError("case summary does not match case evidence")
-    if evidence.get("environment") != {}:
-        require_exact_keys(evidence.get("environment"), ENVIRONMENT_KEYS, "environment")
+CONTRACT = evidence.EvidenceContract(
+    schema=SCHEMA,
+    case_flows=CASE_FLOWS,
+    observation_keys=OBSERVATION_KEYS,
+    fingerprint_keys=FINGERPRINT_OBSERVATION_KEYS,
+    required_observations=REQUIRED_OBSERVATIONS,
+    validate_runtime_scan=validate_runtime_scan,
+    validate_passed_case=validate_passed_case,
+    private_sentinels=(
+        DOCUMENT_SENTINEL,
+        provider_fixtures.ANSWER_SENTINEL,
+        provider_fixtures.RAW_RESPONSE_SENTINEL,
+    ),
+    safe_strings=SAFE_STRINGS,
+    extra_keys=frozenset({"transport"}),
+    validate_extra=validate_transport,
+)
 
 
-def validate_historical_evidence(evidence: dict[str, Any]) -> None:
-    """Validate a retained `schema_version` 1 file as a historical record.
-
-    Version 1 came from the retired GPUI harness, whose observation keys and
-    flows describe a different UI (one Apply on Done, a stale proposal), so
-    only the envelope is checked: schema, the required case set, statuses,
-    reason codes, the summary and the absence of private content. It never
-    makes such a file acceptance for the current UI; `validate_evidence`
-    rejects it.
-    """
-    if not isinstance(evidence, dict):
-        raise ValueError("invalid top-level evidence")
-    require_exact_keys(evidence, EVIDENCE_KEYS, "top-level evidence")
-    if (
-        evidence.get("schema") != SCHEMA
-        or type(evidence.get("schema_version")) is not int
-        or evidence.get("schema_version") != HISTORICAL_SCHEMA_VERSION
-    ):
-        raise ValueError("not a historical goal-07 evidence record")
-    if evidence.get("status") not in {"PASS", "FAIL", "BLOCKED"}:
-        raise ValueError("invalid evidence status")
-    reject_private_content(evidence)
-    cases = evidence.get("cases")
-    if not isinstance(cases, list) or len(cases) != len(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    for case in cases:
-        require_exact_keys(case, CASE_KEYS, "case")
-        if case.get("status") not in {"PASS", "FAIL", "BLOCKED", "NOT_RUN"}:
-            raise ValueError("invalid case status")
-        reason = case.get("reason_code")
-        if reason is not None and (
-            not isinstance(reason, str) or not REASON_CODE_RE.fullmatch(reason)
-        ):
-            raise ValueError("invalid case reason code")
-    ids = [case["id"] for case in cases]
-    if len(set(ids)) != len(ids) or set(ids) != set(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    if evidence["status"] == "PASS" and any(case["status"] != "PASS" for case in cases):
-        raise ValueError("PASS requires every required case to pass")
-    expected_summary = {
-        "required_case_count": len(REQUIRED_CASE_IDS),
-        "passed_case_count": sum(case["status"] == "PASS" for case in cases),
-        "blocked_case_count": sum(case["status"] == "BLOCKED" for case in cases),
-        "failed_case_count": sum(case["status"] == "FAIL" for case in cases),
-        "not_run_case_count": sum(case["status"] == "NOT_RUN" for case in cases),
-    }
-    if evidence.get("summary") != expected_summary:
-        raise ValueError("case summary does not match case evidence")
-
-
-def _rust_function_body(source: str | None, signature: str) -> str | None:
-    if source is None:
-        return None
-    views = rust_source_views(source)
-    if views is None:
-        return None
-    code_only, _ = views
-
-    start = code_only.find(signature)
-    if start < 0:
-        return None
-    opening = code_only.find("{", start + len(signature))
-    if opening < 0:
-        return None
-
-    depth = 0
-    for index in range(opening, len(code_only)):
-        if code_only[index] == "{":
-            depth += 1
-        elif code_only[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return code_only[opening + 1 : index]
-    return None
-
-
-def trust_apply_source_contract_ok() -> bool:
-    """Every Revision write revokes the tab's script trust before the text
-    replaces the buffer: `set_revision_change_applied` (which Accept and Undo
-    both call) writes only through `write_model_text`, which revokes trust
-    first; Done (`finish_revision`) writes no text, so no trusted page
-    renders revised text."""
-    state = production_source(REPO / "crates" / "mt-app" / "src" / "state.rs")
-    decide = _rust_function_body(state, "pub fn set_revision_change_applied(")
-    write = _rust_function_body(state, "fn write_model_text(")
-    done = _rust_function_body(state, "pub fn finish_revision(")
-    if decide is None or write is None or done is None:
-        return False
-    revoke = write.find("web_trusted.set(false)")
-    replace = write.find("text.set(")
-    return (
-        0 <= revoke < replace
-        and "write_model_text(" in decide
-        and "text.set(" not in decide
-        and "text.set(" not in done
+def new_evidence(expected_hash: str) -> dict[str, Any]:
+    return evidence.new_evidence(
+        CONTRACT,
+        expected_hash,
+        transport={
+            "mode": "keyless_loopback",
+            "provider": "openai-responses",
+            "deterministic": True,
+            "request_count": 0,
+        },
     )
 
 
-def preview_inert_source_contract_ok() -> bool:
-    """The Revision field shows proposals as text, never through a WebView."""
-    revision = production_source(REPO / "crates" / "mt-app" / "src" / "ui" / "revision.rs")
-    if revision is None:
-        return False
-    views = rust_source_views(revision)
-    if views is None:
-        return False
-    _, comment_free = views
-    forbidden = ("web_view", "WebView", "web_view_html", "java_script_enabled")
-    return f'"{REVISION_PROPOSAL_AFTER_AUTOMATION_ID}"' in comment_free and not any(
-        marker in comment_free for marker in forbidden
-    )
-
-
-def part_changed_apply_source_contract_ok() -> bool:
-    """A hunk whose part the user edited cannot be accepted: the docked hunk
-    withholds its Accept button, the A key refuses it (`ui/revision.rs`), and
-    the state's ledger refuses the write as `PartChanged` (`state.rs`)."""
-    revision = production_source(REPO / "crates" / "mt-app" / "src" / "ui" / "revision.rs")
-    state = production_source(REPO / "crates" / "mt-app" / "src" / "state.rs")
-    docked = _rust_function_body(revision, "fn docked_proposal(")
-    decide = _rust_function_body(revision, "fn decide(")
-    cannot_apply = _rust_function_body(revision, "fn cannot_apply(")
-    write = _rust_function_body(state, "pub fn set_revision_change_applied(")
-    if docked is None or decide is None or cannot_apply is None or write is None:
-        return False
-    return (
-        "cannot_apply(&state, hunk)" in docked
-        and "cannot_apply(state, &hunks[index])" in decide
-        and "revision_hunk_part_changed(" in cannot_apply
-        and "LedgerRefusal::PartChanged" in write
-    )
-
-
-def source_contract_failure() -> str | None:
-    if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
-        return "REVISION_SOURCE_CONTRACT_MISSING"
-    if not alert_enter_confirms(
-        REPO / "crates/mt-app/src/state.rs", "fn request_web_trust(", "trust"
-    ):
-        return "REVISION_SOURCE_CONTRACT_MISSING"
-    return None
+def validate_evidence(value: dict[str, Any]) -> None:
+    evidence.validate_evidence(value, CONTRACT)
 
 
 def scan_case_artifacts(case_root: Path, ephemeral_credential: str) -> dict[str, Any]:
-    try:
-        roots = (case_root / "data", case_root / "config")
-        paths = [path for root in roots for path in root.rglob("*") if path.is_file()]
-        stderr = case_root / "stderr.log"
-        if stderr.exists():
-            paths.append(stderr)
-        paths = sorted(set(paths))
-    except OSError as error:
-        raise HarnessFailure("RUNTIME_ARTIFACT_ENUM_FAILED", safe_exception_name(error)) from None
-    if not paths:
-        raise HarnessFailure("RUNTIME_ARTIFACTS_MISSING")
-    logs_root = case_root / "data" / "logs"
-    app_logs = [path for path in paths if logs_root in path.parents]
-    if not app_logs:
-        raise HarnessFailure("APP_LOG_MISSING")
-    config_root = case_root / "config"
-    config_files = [path for path in paths if config_root in path.parents]
-    patterns = (
-        DOCUMENT_SENTINEL.encode("utf-8"),
-        DOCUMENT_SENTINEL.encode("utf-16-le"),
-        ephemeral_credential.encode("utf-8"),
-        ephemeral_credential.encode("utf-16-le"),
-        provider_fixtures.ANSWER_SENTINEL.encode("utf-8"),
-        provider_fixtures.ANSWER_SENTINEL.encode("utf-16-le"),
-        provider_fixtures.RAW_RESPONSE_SENTINEL.encode("utf-8"),
-        provider_fixtures.RAW_RESPONSE_SENTINEL.encode("utf-16-le"),
+    return evidence.scan_case_artifacts(
+        case_root,
+        {
+            **leak_codes("DOCUMENT_SENTINEL", DOCUMENT_SENTINEL),
+            **leak_codes("EPHEMERAL_CREDENTIAL", ephemeral_credential),
+            **leak_codes("ANSWER_SENTINEL", provider_fixtures.ANSWER_SENTINEL),
+            **leak_codes("RAW_RESPONSE_SENTINEL", provider_fixtures.RAW_RESPONSE_SENTINEL),
+        },
+        require_config=True,
     )
-    for path in paths:
-        try:
-            leaked = artifact_contains(path, patterns)
-        except OSError as error:
-            raise HarnessFailure("RUNTIME_ARTIFACT_SCAN_FAILED", safe_exception_name(error)) from None
-        if leaked == patterns[0]:
-            raise HarnessFailure("UTF8_DOCUMENT_SENTINEL_LEAKED")
-        if leaked == patterns[1]:
-            raise HarnessFailure("UTF16LE_DOCUMENT_SENTINEL_LEAKED")
-        if leaked == patterns[2]:
-            raise HarnessFailure("UTF8_EPHEMERAL_CREDENTIAL_LEAKED")
-        if leaked == patterns[3]:
-            raise HarnessFailure("UTF16LE_EPHEMERAL_CREDENTIAL_LEAKED")
-        if leaked == patterns[4]:
-            raise HarnessFailure("UTF8_ANSWER_SENTINEL_LEAKED")
-        if leaked == patterns[5]:
-            raise HarnessFailure("UTF16LE_ANSWER_SENTINEL_LEAKED")
-        if leaked == patterns[6]:
-            raise HarnessFailure("UTF8_RAW_RESPONSE_SENTINEL_LEAKED")
-        if leaked == patterns[7]:
-            raise HarnessFailure("UTF16LE_RAW_RESPONSE_SENTINEL_LEAKED")
-    if not config_files:
-        raise HarnessFailure("CONFIG_FILE_MISSING")
-    if len(paths) < len(app_logs) + len(config_files) + 1:
-        raise HarnessFailure("RUNTIME_FILE_COUNT_INCOMPLETE")
-    return {
-        "files_scanned": len(paths),
-        "app_logs_scanned": len(app_logs),
-        "config_files_scanned": len(config_files),
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-        "ephemeral_credential_utf8_absent": True,
-        "ephemeral_credential_utf16le_absent": True,
-        "answer_sentinel_utf8_absent": True,
-        "answer_sentinel_utf16le_absent": True,
-        "raw_response_sentinel_utf8_absent": True,
-        "raw_response_sentinel_utf16le_absent": True,
-    }
 
 
 def review_settings_document(endpoint: str) -> bytes:
+    identity = credential_target(endpoint, "openai-responses")
     return (
         "show-welcome-on-startup = false\n"
         'model-provider = "openai-responses"\n'
         'model-name = "goal07-loopback-model"\n'
         f"model-base-url = {json.dumps(endpoint)}\n"
-        f"model-environment-key-identity = {json.dumps(endpoint_environment_key_identity(endpoint))}\n"
+        f"model-environment-key-identity = {json.dumps(identity)}\n"
     ).encode("utf-8")
 
 
-class Goal07Harness(ClipboardNativeHarness):
+class Goal07Harness(NativeHarness):
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
         self._credential = f"markturbo-goal07-{uuid.uuid4().hex}"
@@ -1394,7 +631,7 @@ class Goal07Harness(ClipboardNativeHarness):
     def profile(
         self, case_id: str, endpoint: str, *, html: bool = False
     ) -> tuple[Path, Path, Path, Path, Path, Path]:
-        target = endpoint_environment_key_identity(endpoint)
+        target = credential_target(endpoint, "openai-responses")
         if self.win32.persistent_credential_target_exists(target):
             raise HarnessBlocked("PERSISTENT_CREDENTIAL_PRESENT")
         data_root, config_root, workspace_root, stderr_path = self.case_roots(case_id)
@@ -1588,13 +825,7 @@ class Goal07Harness(ClipboardNativeHarness):
     def _common_observations(
         self, provider: provider_fixtures.LoopbackRevisionServer
     ) -> dict[str, Any]:
-        contract = provider.contract_evidence()
-        return {
-            "loopback_provider": True,
-            "server_loopback": True,
-            "server_deterministic": True,
-            **contract,
-        }
+        return provider.contract_evidence()
 
     def _finalize_observations(
         self,
@@ -1698,7 +929,6 @@ class Goal07Harness(ClipboardNativeHarness):
                     editor_after_apply == expected and editor_after_done == expected
                 ),
                 "one_undo_transaction": editor_after_undo == editor_before,
-                "undo_count": 1,
             }
             return self._finalize_observations(provider, case_root, app, observations)
         finally:
@@ -1796,7 +1026,7 @@ class Goal07Harness(ClipboardNativeHarness):
             editor_before = self.editor_fingerprint(app)
             source_before = sha256_file(source)
             # One paste over the whole text touches every hunk's part.
-            self.replace_editor(app, STALE_EDIT_TEXT)
+            self.paste_editor(app, STALE_EDIT_TEXT)
             editor_after_edit = self.editor_fingerprint(app)
             self.wait_name(
                 app, REVISION_PART_CHANGED_TEXT, "Text", "REVISION_PART_CHANGED_UIA_TIMEOUT"
@@ -1839,11 +1069,6 @@ class Goal07Harness(ClipboardNativeHarness):
                 "editor_after_edit": editor_after_edit.evidence(),
                 "source_before": source_before.evidence(),
                 "source_after": source_after.evidence(),
-                "stale_proposal_received": True,
-                "part_changed_visible": True,
-                "accept_withheld": True,
-                "apply_activation_attempted": True,
-                "apply_disabled_source_contract": part_changed_apply_source_contract_ok(),
                 "editor_after_activation_attempt": editor_after_activation_attempt.evidence(),
                 "editor_after_done": editor_after_done.evidence(),
                 "stale_no_mutation": (
@@ -1888,9 +1113,7 @@ class Goal07Harness(ClipboardNativeHarness):
                 "editor_after_apply": editor_after_apply.evidence(),
                 "external_source_before": external_source_before.evidence(),
                 "external_source_after": external_source_after.evidence(),
-                "save_command_sent": True,
                 "conflict_visible_before_save": conflict_visible_before_save,
-                "safe_save_conflict_visible": True,
                 "safe_save_no_overwrite": external_source_before == external_source_after,
             }
             return self._finalize_observations(provider, case_root, app, observations)
@@ -1913,14 +1136,13 @@ class Goal07Harness(ClipboardNativeHarness):
             self.menu_command(app, MENU_WEB_AUTOMATION_ID)
             self._press(app, TRUST_SCRIPTS_AUTOMATION_ID, "TRUST_BUTTON")
             # The Run scripts alert is outside the UIA tree; Enter answers it
-            # with Run scripts (`alert_enter_confirms`).
+            # with Run scripts, proven by the Trusted banner.
             self.confirm_system_alert(
                 app,
                 lambda: not self.name_present(app, TRUSTED_BANNER, "Text"),
                 "TRUST_ENABLED_BEFORE_CONFIRMATION",
             )
             self.wait_name(app, TRUSTED_BANNER, "Text", "TRUST_ENABLE_STATE_TIMEOUT")
-            trust_before = True
             # Leaving the Web pane must hand keyboard ownership back to the
             # main window before the Review shortcut is sent.
             self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
@@ -1958,15 +1180,11 @@ class Goal07Harness(ClipboardNativeHarness):
                 "flow": CASE_FLOWS[CASE_TRUST_REVOKE],
                 "process_context": app.security_context.evidence(),
                 "foreground_verified": self._require_foreground(app),
-                "trust_before": trust_before,
                 "editor_before_apply": editor_before_apply.evidence(),
                 "editor_after_apply": editor_after_apply.evidence(),
                 "executable_expected": expected.evidence(),
                 "executable_matches_expected": editor_after_apply == expected,
-                "restricted_after_apply": True,
                 "executable_change": editor_before_apply != editor_after_apply,
-                "trust_revocation_order_source_contract": trust_apply_source_contract_ok(),
-                "preview_inert_source_contract": preview_inert_source_contract_ok(),
                 "preview_fingerprint": preview.evidence(),
                 "proposal_expected": proposal.evidence(),
                 "preview_matches_expected": preview == proposal,
@@ -1996,7 +1214,9 @@ class Goal07Harness(ClipboardNativeHarness):
             CASE_TRUST_REVOKE: self.scenario_trust_revoke,
         }[case_id]()
         try:
-            validate_passed_case(case_id, observations, self.parent_context.evidence())
+            evidence.validate_case(
+                CONTRACT, case_id, observations, self.parent_context.evidence()
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise HarnessFailure("CASE_CONTRACT_FAILED", safe_exception_name(error)) from None
         return observations
@@ -2008,7 +1228,6 @@ def native_run_plan() -> NativeRunPlan:
         workdir_prefix="markturbo-goal-07-native-",
         new_evidence=new_evidence,
         validate_evidence=validate_evidence,
-        source_contract=source_contract_failure,
         finalize_evidence=finalize_evidence,
         preflight=preflight,
         ui_types_loader=load_pywinauto,
@@ -2021,25 +1240,8 @@ def native_run_plan() -> NativeRunPlan:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
-    parser.add_argument("--expect-exe-sha256", type=normalize_expected_hash, required=True)
-    parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE)
-    parser.add_argument("--ui-timeout", type=float, default=15.0)
-    parser.add_argument(
-        "--case",
-        choices=REQUIRED_CASE_IDS,
-        help="run one case for debugging; it never produces acceptance PASS",
-    )
-    parser.add_argument(
-        "--keep-workdir-on-failure",
-        action="store_true",
-        help="preserve isolated roots after a non-PASS run",
-    )
-    args = parser.parse_args(argv)
-    if not math.isfinite(args.ui_timeout) or args.ui_timeout <= 0:
-        parser.error("--ui-timeout must be greater than zero")
-    return args
+    parser = evidence.build_parser(__doc__.splitlines()[0], "goal-07", REQUIRED_CASE_IDS)
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:

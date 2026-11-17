@@ -183,12 +183,11 @@ How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
   `.action` when it has one. The harnesses therefore check that the press alone changed
   nothing, then send Enter from the main window's keyboard focus, and prove the
   decision by its effect: the file holds the edited bytes, or the Trusted
-  banner appears. The source check requires each alert to list the confirming
-  destructive button first and have no regular `.action`. Test-id'd, in-window
-  confirmation cards would let a harness select the button directly.
+  banner appears, so an Enter that cancels fails the case. Test-id'd,
+  in-window confirmation cards would let a harness select the button directly.
 
-Each harness checks that the selectors it uses still exist in production Rust
-source (test modules and comments do not count) before launching.
+The harnesses do not scan Rust source; a renamed selector fails the live run
+with that control's UIA timeout or contract-mismatch code.
 
 What the ported cases expect, matching the merged UI:
 
@@ -210,23 +209,13 @@ What the ported cases expect, matching the merged UI:
   changing the editor, dirty mark or file; the docked hunk's proposed lines are
   read from the `revision-proposal-after` group named `Proposed text`; an edit
   over a hunk's part shows `Can't apply — this part changed`, withholds Accept
-  (button and A key) and Done writes nothing; trust is revoked before every
-  Revision write (source check on `set_revision_change_applied`), and the Web
-  pane shows Restricted after an accepted executable change.
+  (button and A key) and Done writes nothing; the Web pane shows Restricted
+  after an accepted executable change.
 
-Goal 07 evidence is `schema_version` 2, the nsh flow above; the harness
-writes `target/native-acceptance/goal-07-native-acceptance-v2.json` by
-default, and `revision_evaluation.py` binds only version 2. The four retained
-version 1 files under `docs/evidence/` (`goal-07-final-ablation-f1ec266c.json`,
-`goal-07-final-ablation-f1ec266c-r2.json`,
-`goal-07-post-ablation-trust-f1ec266c.json` and
-`goal-07-native-acceptance-v1.json`) are historical GPUI-era records:
-`goal07.validate_historical_evidence` checks their envelope (schema, case set,
-statuses, summary, no private content), the current validator rejects them,
-and the revision evaluation refuses them as acceptance. Goals 02, 03 and 06
-keep `schema_version` 1; their retained GPUI-era files are not re-validated
-against the ported harnesses (the goal 02 and goal 06 PASS files no longer
-validate).
+All four harnesses write one evidence schema (`native/evidence.py`,
+`schema_version` 3) to `target/native-acceptance/goal-NN-native-acceptance-v3.json`
+by default; `revision_evaluation.py` binds only that version. Every earlier
+file, including the GPUI-era records under `docs/evidence/`, is rejected.
 
 The former known gaps are fixed in the merged UI and are now expected by the
 cases above: the selection Review command, the Revision Copy and the labelled

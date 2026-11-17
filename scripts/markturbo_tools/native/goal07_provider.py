@@ -243,17 +243,6 @@ class LoopbackRevisionServer:
         with self._lock:
             self._revision_consent = True
 
-    def begin_consent_click(self, expected_request_count: int) -> None:
-        """Record the click-dispatch linearization point before UIA Invoke."""
-        operation = {
-            0: "read_only_review",
-            1: "revision",
-        }.get(expected_request_count)
-        if operation is None:
-            raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
-        with self._lock:
-            self._begin_consent_click_locked(operation, expected_request_count)
-
     def _begin_consent_click_locked(self, operation: str, expected_request_count: int) -> None:
         if self._invalid_request or len(self.requests) != expected_request_count:
             raise HarnessFailure("CONSENT_REQUEST_SEQUENCE_INVALID")
@@ -277,11 +266,6 @@ class LoopbackRevisionServer:
         with self._lock:
             self._begin_consent_click_locked(operation, expected_request_count)
             click()
-
-    def request_count_snapshot(self) -> int:
-        """Return only the accepted request count, without exposing request data."""
-        with self._lock:
-            return len(self.requests)
 
     def _next_event_sequence(self) -> int:
         with self._lock:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import copy
 import hashlib
 import tempfile
 import tomllib
@@ -11,106 +10,51 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.markturbo_tools.native import evidence as shared_evidence
 from scripts.markturbo_tools.native import goal06 as HARNESS
 from scripts.markturbo_tools.native import runtime
-from scripts.markturbo_tools.native import source_contract
 
+from ._native_support import HASH, case_observations, fingerprint, passed_evidence
 
 CASE_DOCUMENT = HARNESS.CASE_DOCUMENT
 CASE_SELECTION = HARNESS.CASE_SELECTION
-COMPLETE_EVIDENCE = HARNESS.complete_evidence
 NEW_EVIDENCE = HARNESS.new_evidence
 PARSE_ARGS = HARNESS.parse_args
 REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
 REVIEW_SETTINGS_DOCUMENT = HARNESS.review_settings_document
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
-
-HASH = "a" * 64
-
-
-def fingerprint(value: bytes) -> dict[str, int | str]:
-    return {"byte_count": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+CONFIGURED_IDENTITY = shared_evidence.credential_target(
+    HARNESS.CONFIGURED_PROVIDER_ENDPOINT, "openai-responses"
+)
 
 
-def process_context() -> dict[str, int | str]:
-    return {"session_id": 1, "integrity_rid": 0x2000, "integrity": "medium"}
-
-
-def runtime_scan(configured_provider: bool = False) -> dict[str, int | bool]:
-    scan = {
-        "files_scanned": 3,
-        "app_logs_scanned": 1,
-        "config_files_scanned": 1,
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-    }
-    if configured_provider:
-        scan.update(
-            ephemeral_credential_utf8_absent=True,
-            ephemeral_credential_utf16le_absent=True,
-        )
-    return scan
+def complete(evidence: dict, status: str) -> None:
+    runtime.complete_evidence(evidence, status, REQUIRED_CASE_IDS)
 
 
 def valid_evidence(configured_provider: bool = False) -> dict:
-    evidence = NEW_EVIDENCE(HASH, configured_provider)
-    evidence["executable"].update(
-        {
-            "sha256": HASH,
-            "byte_count": 1234,
-            "hash_verified": True,
-            "copied_sha256": HASH,
-            "copy_hash_verified": True,
-            "format": "PE32+",
-            "machine": "x86_64",
-            "machine_code": 0x8664,
-            "optional_magic": 0x20B,
-        }
-    )
-    evidence["environment"] = {
-        "platform": "Windows 11",
-        "windows_major": 10,
-        "windows_build": 22631,
-        "architecture": "x86_64",
-        "native_machine_code": 0x8664,
-        "python_pointer_bits": 64,
-        "wts_state": "WTSActive",
-        "input_desktop": "Default",
-        "thread_desktop": "Default",
-        "harness_process": process_context(),
-    }
+    flows = HARNESS.CONFIGURED_PROVIDER_CASE_FLOWS if configured_provider else HARNESS.CASE_FLOWS
     original = fingerprint(b"review source")
-    for case in evidence["cases"]:
-        case["status"] = "PASS"
-        case["duration_ms"] = 1.0
-        case["observations"] = {
-            "editor_before": original,
-            "editor_after": original,
-            "source_before": original,
-            "source_after": original,
-            "no_dirty_interlock": True,
-            "flow": (
-                HARNESS.CONFIGURED_PROVIDER_CASE_FLOWS[case["id"]]
-                if configured_provider
-                else HARNESS.CASE_FLOWS[case["id"]]
-            ),
-            "process_context": process_context(),
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan(configured_provider),
-        }
-        if configured_provider:
-            case["observations"].update(
-                review_consent_approved=True,
-                structured_success=True,
-            )
-        else:
-            case["observations"]["missing_credential_diagnostic"] = True
-        if case["id"] == CASE_SELECTION:
-            case["observations"]["selection_shortcut"] = True
-        else:
-            case["observations"]["document_shortcut"] = True
-    COMPLETE_EVIDENCE(evidence, "PASS")
-    return evidence
+
+    def observations(case_id: str) -> dict:
+        mode = (
+            {"review_consent_approved": True, "structured_success": True}
+            if configured_provider
+            else {"missing_credential_diagnostic": True}
+        )
+        return case_observations(
+            flows[case_id],
+            editor_before=original,
+            editor_after=original,
+            source_before=original,
+            source_after=original,
+            no_dirty_interlock=True,
+            document_shortcut=case_id == CASE_DOCUMENT,
+            selection_shortcut=case_id == CASE_SELECTION,
+            **mode,
+        )
+
+    return passed_evidence(NEW_EVIDENCE(HASH, configured_provider), observations, complete)
 
 
 class EvidenceSchemaTests(unittest.TestCase):
@@ -142,13 +86,14 @@ class EvidenceSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "review_consent_approved"):
             VALIDATE_EVIDENCE(evidence)
 
-    def test_configured_provider_success_requires_content_free_credential_scan(self) -> None:
+    def test_mode_selects_its_own_flows_and_observations(self) -> None:
         evidence = valid_evidence(configured_provider=True)
-        evidence["cases"][0]["observations"]["runtime_scan"].pop(
-            "ephemeral_credential_utf8_absent"
-        )
+        evidence["mode"] = HARNESS.MISSING_CREDENTIAL_MODE
+        with self.assertRaisesRegex(ValueError, "unknown observation field"):
+            VALIDATE_EVIDENCE(evidence)
 
-        with self.assertRaisesRegex(ValueError, "ephemeral_credential_utf8_absent"):
+        evidence["mode"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "invalid native Review mode"):
             VALIDATE_EVIDENCE(evidence)
 
     def test_pass_requires_identical_editor_and_file_fingerprints(self) -> None:
@@ -197,7 +142,7 @@ class EvidenceSchemaTests(unittest.TestCase):
             reason_code="SKIPPED_AFTER_BLOCKED",
             duration_ms=0.0,
         )
-        COMPLETE_EVIDENCE(evidence, "BLOCKED")
+        complete(evidence, "BLOCKED")
 
         VALIDATE_EVIDENCE(evidence)
 
@@ -215,7 +160,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("api-key", document.decode("utf-8").casefold())
 
     def test_configured_provider_profile_uses_only_fixed_loopback_identity(self) -> None:
-        identity = HARNESS.configured_provider_environment_key_identity()
+        identity = CONFIGURED_IDENTITY
         document = REVIEW_SETTINGS_DOCUMENT(HARNESS.CONFIGURED_PROVIDER_ENDPOINT, identity)
 
         settings = tomllib.loads(document.decode("utf-8"))
@@ -284,27 +229,6 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(runtime.HarnessFailure, "UTF8_EPHEMERAL_CREDENTIAL_LEAKED"):
                 HARNESS.scan_case_artifacts(case_root, "process-only")
 
-    def test_artifact_read_errors_keep_the_goal_runtime_scan_code(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            case_root = Path(temporary)
-            logs = case_root / "data" / "logs"
-            logs.mkdir(parents=True)
-            (case_root / "config").mkdir()
-            (logs / "markturbo.log").write_bytes(b"startup")
-            with (
-                mock.patch.object(
-                    HARNESS,
-                    "artifact_contains",
-                    side_effect=PermissionError("document content"),
-                ),
-                self.assertRaises(runtime.HarnessFailure) as raised,
-            ):
-                HARNESS.scan_case_artifacts(case_root, "process-only")
-
-        self.assertEqual(raised.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
-        self.assertEqual(raised.exception.detail, "PermissionError")
-
-
 class PersistentCredentialPreflightTests(unittest.TestCase):
     def test_configured_mode_blocks_before_launch_when_its_target_has_a_persistent_credential(self) -> None:
         calls: list[str] = []
@@ -320,7 +244,7 @@ class PersistentCredentialPreflightTests(unittest.TestCase):
                 HARNESS.goal06_preflight(True)(Path("C:/release/markturbo.exe"), HASH, evidence)
 
         preflight.assert_called_once_with(Path("C:/release/markturbo.exe"), HASH, evidence)
-        self.assertEqual(calls, [HARNESS.configured_provider_environment_key_identity()])
+        self.assertEqual(calls, [CONFIGURED_IDENTITY])
 
     def test_default_mode_does_not_query_persistent_credentials(self) -> None:
         win32 = mock.Mock()
@@ -336,7 +260,7 @@ class PersistentCredentialPreflightTests(unittest.TestCase):
         win32.persistent_credential_target_exists.assert_not_called()
 
     def test_persistent_credential_block_does_not_expose_credential_content(self) -> None:
-        target = HARNESS.configured_provider_environment_key_identity()
+        target = CONFIGURED_IDENTITY
         secret = b"UNIQUE-CREDENTIAL-BLOB"
         target_buffer = ctypes.create_unicode_buffer(target)
         blob = (ctypes.c_ubyte * len(secret)).from_buffer_copy(secret)
@@ -520,99 +444,3 @@ class HarnessContractTests(unittest.TestCase):
                         harness.close_app(app)
 
                 self.assertEqual(events, [("close", 42), ("wait", 1.0)])
-
-    def test_production_source_removes_test_imports_without_losing_later_code(self) -> None:
-        source_text = (
-            "pub fn before_test_import() {}\n"
-            "#[cfg(test)]\nuse crate::test_support::TestDependency;\n"
-            "pub fn after_test_import() {}\n"
-            "\n#[cfg(test)]\nmod tests {\n    fn test_only() {}\n}\n"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "workspace.rs"
-            source.write_text(source_text, encoding="utf-8")
-
-            production = source_contract.production_source(source)
-
-        self.assertIsNotNone(production)
-        self.assertNotIn("use crate::test_support::TestDependency;", production)
-        self.assertIn("before_test_import", production)
-        self.assertIn("after_test_import", production)
-        self.assertNotIn("mod tests", production)
-
-
-class SourceContractTests(unittest.TestCase):
-    """The review shortcut, diagnostic, result and consent selectors must live
-    in production nsh source; tests and comments cannot supply them."""
-
-    REPO = Path(__file__).resolve().parents[2]
-    TEST_SCOPES = (
-        "\n#[cfg(test)]\nmod tests {\n    // test-only contract decoy\n}\n",
-        "\n#[cfg(test)] mod checks {\nfn decoy() {\n// test-only contract decoy\n}\n}\n",
-        "\n# [ cfg (\n test \n) ]\npub(crate) mod checks\n{\n"
-        "fn decoy() {\n// test-only contract decoy\n}\n}\n",
-        "\n#[cfg(test)] fn decoy() {\n// test-only contract decoy\n}\n",
-        "\n#[cfg(all(test, windows))] fn decoy() {\n// test-only contract decoy\n}\n",
-        "\nmod helpers {\n#[cfg(test)] mod checks {\n"
-        "fn decoy() {\n// test-only contract decoy\n}\n}\n}\n",
-    )
-
-    def failure_after(self, relative: str, edit) -> str | None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for name in HARNESS.UI_SOURCE_REQUIREMENTS:
-                target = root / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes((self.REPO / name).read_bytes())
-            target = root / relative
-            target.write_text(edit(target.read_text(encoding="utf-8")), encoding="utf-8")
-            with mock.patch.object(HARNESS, "REPO", root):
-                return HARNESS.source_contract_failure()
-
-    def test_real_repository_satisfies_source_contract(self) -> None:
-        self.assertIsNone(HARNESS.source_contract_failure())
-
-    def test_unsafe_projection_returns_source_contract_failure(self) -> None:
-        for relative in HARNESS.UI_SOURCE_REQUIREMENTS:
-            with self.subTest(file=relative):
-                self.assertEqual(
-                    self.failure_after(relative, lambda text: text + "\n#[cfg(test)] mod checks {\n"),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )
-
-    def test_each_missing_production_marker_returns_source_contract_failure(self) -> None:
-        for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
-            for marker in markers:
-                with self.subTest(file=relative, marker=marker):
-                    self.assertEqual(
-                        self.failure_after(relative, lambda text: text.replace(marker, "")),
-                        "REVIEW_SOURCE_CONTRACT_MISSING",
-                    )
-
-    def test_cfg_test_decoys_do_not_supply_missing_production_contracts(self) -> None:
-        # Each file's parse is exercised once per test scope; the marker
-        # check itself is shared by every marker.
-        for relative, markers in HARNESS.UI_SOURCE_REQUIREMENTS.items():
-            for marker in markers[:1]:
-                for scope in self.TEST_SCOPES:
-                    decoy = scope.replace(
-                        "// test-only contract decoy", f"let _ = {marker};"
-                    )
-                    with self.subTest(file=relative, marker=marker, scope=scope):
-                        self.assertEqual(
-                            self.failure_after(
-                                relative,
-                                lambda text: decoy + text.replace(marker, ""),
-                            ),
-                            "REVIEW_SOURCE_CONTRACT_MISSING",
-                        )
-
-    def test_comment_decoys_do_not_preserve_a_removed_selector(self) -> None:
-        relative = "crates/mt-app/src/ui/review.rs"
-        marker = '"No model set up"'
-        for decoy in (f"// {marker}\n", f"/* {marker} */\n", f"/// {marker}\nfn f() {{}}\n"):
-            with self.subTest(decoy=decoy):
-                self.assertEqual(
-                    self.failure_after(relative, lambda text: text.replace(marker, '""') + decoy),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )

@@ -24,60 +24,40 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import re
 import tomllib
 from pathlib import Path
 from typing import Any
 
-from .source_contract import production_markers_present
+from . import evidence
+from .evidence import leak_codes
 from .runtime import (
-    IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
-    PE32_PLUS_MAGIC,
-    REASON_CODE_RE,
-    SAFE_FAILURE_TYPES,
-    SHA256_RE,
-    EDITOR_NAME,
     MENU_SAVE_AS_AUTOMATION_ID,
     VK_A,
     VK_CONTROL,
     VK_RETURN,
     VK_S,
-    VK_V,
     VK_W,
     Fingerprint,
     HarnessBlocked,
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
-    artifact_contains,
-    complete_evidence as complete_evidence_envelope,
-    finite_nonnegative,
     fingerprint_text,
     key_input,
     load_pywinauto,
     main_native_acceptance,
-    normalize_expected_hash,
     preflight,
-    require_true,
     safe_exception_name,
     sha256_file,
-    utc_now,
     validate_fingerprint,
-    validate_environment as validate_runtime_environment,
-    validate_process_context,
     wait_until,
     write_durable,
 )
 
 
-REPO = Path(__file__).resolve().parents[3]
-DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
-DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-03-native-acceptance-v1.json"
-
 SCHEMA = "markturbo.goal-03-native-acceptance"
-SCHEMA_VERSION = 1
 VK_SHIFT = 0x10
 VK_ESCAPE = 0x1B
 
@@ -90,32 +70,6 @@ WELCOME_RECENT_AUTOMATION_ID = "welcome-recent"
 # disabled and named `File <name> — Missing` (`ui/welcome.rs` `recents`).
 STALE_RECENT_NAME = "File {name} \u2014 Missing"
 WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
-UI_SOURCE_REQUIREMENTS = {
-    "crates/mt-app/src/ui/welcome.rs": (
-        '"welcome-open-folder"',
-        '"welcome-new-file"',
-        '"welcome-paste"',
-        '"welcome-open-sample"',
-        '"New file"',
-        '"Paste"',
-        '"Open sample"',
-        '"welcome-recent"',
-        '"{kind} {} \\u{2014} {}"',
-        '"Missing"',
-        ".disabled(missing)",
-        '"workspace-home-file"',
-    ),
-    "crates/mt-app/src/ui/titlebar.rs": (
-        '"title-menu-save-as"',
-        'on_key("shift+mod+s"',
-    ),
-    "crates/mt-app/src/ui/rail.rs": ('on_key("mod+w"',),
-    "crates/mt-app/src/ui/notices.rs": ('"Close without saving?"', '"Don\'t save"'),
-    "crates/mt-app/src/ui/document.rs": ('"Markdown source"',),
-    "crates/mt-app/src/i18n.rs": ('Key::File => "File"',),
-    "crates/mt-app/src/state.rs": ("pick_save_path(",),
-}
-
 CASE_WELCOME = "welcome_no_argument"
 CASE_NEW_PASTE = "new_and_paste_unicode"
 CASE_SAVE_CREATE = "save_as_create_and_reopen"
@@ -123,15 +77,6 @@ CASE_SAVE_CANCEL_OVERWRITE = "save_as_cancel_and_overwrite"
 CASE_SAMPLE = "bundled_sample"
 CASE_RECENTS = "recent_bound_restart_stale"
 CASE_CLI = "explicit_cli_targets"
-REQUIRED_CASE_IDS = (
-    CASE_WELCOME,
-    CASE_NEW_PASTE,
-    CASE_SAVE_CREATE,
-    CASE_SAVE_CANCEL_OVERWRITE,
-    CASE_SAMPLE,
-    CASE_RECENTS,
-    CASE_CLI,
-)
 CASE_FLOWS = {
     CASE_WELCOME: "no-argument welcome -> four entry points -> restart welcome",
     CASE_NEW_PASTE: "welcome New file and Paste -> editable Unicode buffers",
@@ -145,6 +90,7 @@ CASE_FLOWS = {
     ),
     CASE_CLI: "explicit file and directory arguments bypass welcome",
 }
+REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
 
 DOCUMENT_SENTINEL = "MTG03-NATIVE-SENTINEL-\u4fdd\u5b58-\U0001f680"
 NEW_TEXT = f"# {DOCUMENT_SENTINEL}: New\n\n\u4e2d\u6587 and emoji \U0001f680\n"
@@ -156,64 +102,44 @@ CANCELLED_DESTINATION = b"goal-03 cancelled destination\n"
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
 SAMPLE_VERSION_RE = re.compile(r"^[0-9a-f]{24}$")
-ALLOWED_OBSERVATION_KEYS = {
-    "app_logs_scanned",
-    "byte_count",
-    "config_files_scanned",
-    "direct_directory_bypassed_welcome",
-    "direct_file_bypassed_welcome",
-    "editor_after_overwrite_cancel",
-    "editor_after_save_as_cancel",
-    "editor_before_cancellation",
-    "entry_points_visible",
-    "files_scanned",
-    "flow",
-    "foreground_attempts",
-    "foreground_diagnostics",
-    "foreground_hwnd",
-    "foreground_verified",
-    "integrity",
-    "integrity_rid",
-    "new_buffer_created",
-    "new_unicode_editor",
-    "overwrite_cancelled",
-    "overwrite_confirmed",
-    "paste_buffer_created",
-    "paste_unicode_editor",
-    "process_context",
-    "process_contexts",
-    "recent_count",
-    "recent_restart_visible",
-    "recent_visible_count",
-    "requested_hwnd",
-    "reopened_editor",
-    "runtime_scan",
-    "sample_workspace_opened",
-    "workspace_home_visible",
-    "sample_content",
-    "sample_file_count",
-    "sample_manifest",
-    "sample_version",
-    "save_as_cancelled",
-    "save_as_cancel_destination_after",
-    "save_as_cancel_destination_before",
-    "save_as_cancel_focus_preserved",
-    "save_as_created",
-    "saved_destination",
-    "session_id",
-    "set_foreground_return",
-    "show_window_return",
-    "bring_to_top_return",
-    "sha256",
-    "source_after_cancel",
-    "source_before",
-    "stale_recent_disabled",
-    "stale_recent_press_ignored",
-    "overwrite_cancel_focus_preserved",
-    "utf16le_sentinel_absent",
-    "utf8_sentinel_absent",
-    "welcome_restart_visible",
-    "welcome_visible",
+FINGERPRINT_OBSERVATION_KEYS = frozenset(
+    {
+        "editor_after_overwrite_cancel",
+        "editor_after_save_as_cancel",
+        "editor_before_cancellation",
+        "new_unicode_editor",
+        "paste_unicode_editor",
+        "reopened_editor",
+        "sample_content",
+        "sample_manifest",
+        "save_as_cancel_destination_after",
+        "save_as_cancel_destination_before",
+        "saved_destination",
+        "source_after_cancel",
+        "source_before",
+    }
+)
+REQUIRED_OBSERVATIONS = {
+    CASE_WELCOME: frozenset(),
+    CASE_NEW_PASTE: frozenset({"new_unicode_editor", "paste_unicode_editor"}),
+    CASE_SAVE_CREATE: frozenset({"saved_destination", "reopened_editor"}),
+    CASE_SAVE_CANCEL_OVERWRITE: frozenset(
+        {
+            "editor_before_cancellation",
+            "editor_after_save_as_cancel",
+            "editor_after_overwrite_cancel",
+            "source_before",
+            "source_after_cancel",
+            "save_as_cancel_destination_before",
+            "save_as_cancel_destination_after",
+            "saved_destination",
+        }
+    ),
+    CASE_SAMPLE: frozenset(
+        {"sample_file_count", "sample_manifest", "sample_content", "sample_version"}
+    ),
+    CASE_RECENTS: frozenset({"recent_count", "recent_visible_count"}),
+    CASE_CLI: frozenset(),
 }
 
 
@@ -236,156 +162,17 @@ def recent_settings_document(documents: list[Path]) -> bytes:
     return "\n".join(lines).encode("utf-8")
 
 
-def new_evidence(expected_hash: str) -> dict[str, Any]:
-    return {
-        "schema": SCHEMA,
-        "schema_version": SCHEMA_VERSION,
-        "status": "BLOCKED",
-        "started_at_utc": utc_now(),
-        "completed_at_utc": None,
-        "executable": {
-            "expected_sha256": expected_hash,
-            "sha256": None,
-            "byte_count": None,
-            "hash_verified": False,
-            "copied_sha256": None,
-            "copy_hash_verified": False,
-            "format": None,
-            "machine": None,
-        },
-        "environment": {},
-        "cases": [
-            {
-                "id": case_id,
-                "status": "NOT_RUN",
-                "duration_ms": None,
-                "reason_code": None,
-                "failure_type": None,
-                "observations": {},
-            }
-            for case_id in REQUIRED_CASE_IDS
-        ],
-        "summary": {},
-    }
-
-
-def complete_evidence(evidence: dict[str, Any], status: str) -> None:
-    complete_evidence_envelope(evidence, status, REQUIRED_CASE_IDS)
-
-
-def validate_observations(value: Any, key: str | None = None) -> None:
-    if isinstance(value, dict):
-        for nested_key, nested in value.items():
-            if nested_key not in ALLOWED_OBSERVATION_KEYS:
-                raise ValueError("unknown observation field")
-            if nested_key == "sha256" and (
-                not isinstance(nested, str) or not SHA256_RE.fullmatch(nested)
-            ):
-                raise ValueError("invalid observation SHA-256")
-            validate_observations(nested, nested_key)
-    elif isinstance(value, list):
-        for nested in value:
-            validate_observations(nested, key)
-    elif isinstance(value, str):
-        if key == "sample_version" and SAMPLE_VERSION_RE.fullmatch(value):
-            return
-        if key != "sha256" and value not in SAFE_STRINGS:
-            raise ValueError("free-form observation strings are forbidden")
-    elif value is not None and not isinstance(value, (bool, int, float)):
-        raise ValueError("invalid observation value")
-
-
 def validate_runtime_scan(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("missing runtime scan evidence")
-    for key in ("files_scanned", "app_logs_scanned", "config_files_scanned"):
-        if (
-            not isinstance(value.get(key), int)
-            or isinstance(value[key], bool)
-            or value[key] < 0
-        ):
-            raise ValueError(f"invalid {key}")
-    if value["files_scanned"] <= 0 or value["app_logs_scanned"] <= 0:
-        raise ValueError("runtime scan must cover an application log")
-    require_true(value, "utf8_sentinel_absent", "utf16le_sentinel_absent")
+    evidence.validate_runtime_scan(value, require_config=False)
 
 
-def validate_environment(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError("invalid environment evidence")
-    validate_runtime_environment(value)
-    return validate_process_context(value.get("harness_process"))
-
-
-def required_observations(case_id: str) -> set[str]:
-    common = {"flow", "process_context", "foreground_verified", "runtime_scan"}
-    specifics = {
-        CASE_WELCOME: {
-            "welcome_visible",
-            "entry_points_visible",
-            "welcome_restart_visible",
-        },
-        CASE_NEW_PASTE: {
-            "new_buffer_created",
-            "paste_buffer_created",
-            "new_unicode_editor",
-            "paste_unicode_editor",
-        },
-        CASE_SAVE_CREATE: {"save_as_created", "saved_destination", "reopened_editor"},
-        CASE_SAVE_CANCEL_OVERWRITE: {
-            "editor_before_cancellation",
-            "editor_after_save_as_cancel",
-            "editor_after_overwrite_cancel",
-            "source_before",
-            "source_after_cancel",
-            "save_as_cancel_destination_before",
-            "save_as_cancel_destination_after",
-            "saved_destination",
-            "save_as_cancelled",
-            "save_as_cancel_focus_preserved",
-            "overwrite_cancelled",
-            "overwrite_cancel_focus_preserved",
-            "overwrite_confirmed",
-        },
-        CASE_SAMPLE: {
-            "sample_workspace_opened",
-            "workspace_home_visible",
-            "sample_file_count",
-            "sample_manifest",
-            "sample_content",
-            "sample_version",
-        },
-        CASE_RECENTS: {
-            "recent_restart_visible",
-            "recent_count",
-            "recent_visible_count",
-            "stale_recent_disabled",
-            "stale_recent_press_ignored",
-        },
-        CASE_CLI: {"direct_file_bypassed_welcome", "direct_directory_bypassed_welcome"},
-    }
-    return common | specifics[case_id]
-
-
-def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dict[str, Any]) -> None:
-    if observations.get("flow") != CASE_FLOWS[case_id]:
-        raise ValueError("case flow mechanics do not match the required scenario")
-    if validate_process_context(observations.get("process_context")) != parent:
-        raise ValueError("case process context differs from harness context")
-    require_true(observations, "foreground_verified")
-    validate_runtime_scan(observations.get("runtime_scan"))
-    if case_id == CASE_WELCOME:
-        require_true(
-            observations, "welcome_visible", "entry_points_visible", "welcome_restart_visible"
-        )
-    elif case_id == CASE_NEW_PASTE:
-        require_true(observations, "new_buffer_created", "paste_buffer_created")
+def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
+    if case_id == CASE_NEW_PASTE:
         validate_fingerprint(observations.get("new_unicode_editor"))
         validate_fingerprint(observations.get("paste_unicode_editor"))
     elif case_id == CASE_SAVE_CREATE:
         saved = validate_fingerprint(observations.get("saved_destination"))
         reopened = validate_fingerprint(observations.get("reopened_editor"))
-        require_true(observations, "save_as_created")
         if saved != reopened:
             raise ValueError("direct reopen did not preserve exact Save As text")
     elif case_id == CASE_SAVE_CANCEL_OVERWRITE:
@@ -405,14 +192,6 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
             observations.get("save_as_cancel_destination_after")
         )
         saved = validate_fingerprint(observations.get("saved_destination"))
-        require_true(
-            observations,
-            "save_as_cancelled",
-            "save_as_cancel_focus_preserved",
-            "overwrite_cancelled",
-            "overwrite_cancel_focus_preserved",
-            "overwrite_confirmed",
-        )
         if save_as_cancel_before != save_as_cancel_after:
             raise ValueError("Save As picker cancellation changed the named destination")
         if before != after_cancel:
@@ -424,7 +203,6 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         if saved != editor_before or saved == before:
             raise ValueError("confirmed overwrite did not replace the destination")
     elif case_id == CASE_SAMPLE:
-        require_true(observations, "sample_workspace_opened", "workspace_home_visible")
         file_count = observations.get("sample_file_count")
         if not isinstance(file_count, int) or isinstance(file_count, bool) or file_count <= 0:
             raise ValueError("sample file inventory must be nonempty")
@@ -438,118 +216,33 @@ def validate_passed_case(case_id: str, observations: dict[str, Any], parent: dic
         if content["sha256"][:24] != version:
             raise ValueError("sample version does not match the materialized content")
     elif case_id == CASE_RECENTS:
-        require_true(
-            observations,
-            "recent_restart_visible",
-            "stale_recent_disabled",
-            "stale_recent_press_ignored",
-        )
         if observations.get("recent_count") != 10:
             raise ValueError("recent target bound was not exactly ten")
         visible = observations.get("recent_visible_count")
         if not isinstance(visible, int) or isinstance(visible, bool) or not 1 <= visible <= 10:
             raise ValueError("recent rows must show between one and ten targets")
-    elif case_id == CASE_CLI:
-        require_true(observations, "direct_file_bypassed_welcome", "direct_directory_bypassed_welcome")
 
 
-def validate_evidence(evidence: dict[str, Any]) -> None:
-    if evidence.get("schema") != SCHEMA or evidence.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("unsupported evidence schema")
-    if evidence.get("status") not in {"PASS", "FAIL", "BLOCKED"}:
-        raise ValueError("invalid evidence status")
-    executable = evidence.get("executable")
-    if not isinstance(executable, dict):
-        raise ValueError("missing executable evidence")
-    expected = executable.get("expected_sha256")
-    if not isinstance(expected, str) or not SHA256_RE.fullmatch(expected):
-        raise ValueError("invalid expected executable SHA-256")
-    actual = executable.get("sha256")
-    if actual is not None and (not isinstance(actual, str) or not SHA256_RE.fullmatch(actual)):
-        raise ValueError("invalid executable SHA-256")
-    copied = executable.get("copied_sha256")
-    if copied is not None and (not isinstance(copied, str) or not SHA256_RE.fullmatch(copied)):
-        raise ValueError("invalid copied executable SHA-256")
-    if executable.get("hash_verified") is True and actual != expected:
-        raise ValueError("verified executable hash does not match expected hash")
-    if executable.get("copy_hash_verified") is True and copied != expected:
-        raise ValueError("verified copied executable hash does not match expected hash")
-    if evidence["status"] == "PASS":
-        if not executable.get("hash_verified") or not executable.get("copy_hash_verified"):
-            raise ValueError("PASS requires verified executable hashes")
-        if executable.get("format") != "PE32+" or executable.get("machine") != "x86_64":
-            raise ValueError("PASS requires an AMD64 PE32+ executable")
-        if executable.get("machine_code") != IMAGE_FILE_MACHINE_AMD64 or executable.get("optional_magic") != PE32_PLUS_MAGIC:
-            raise ValueError("PASS requires an AMD64 PE32+ executable")
-        if (
-            not isinstance(executable.get("byte_count"), int)
-            or isinstance(executable["byte_count"], bool)
-            or executable["byte_count"] <= 0
-        ):
-            raise ValueError("PASS requires a nonempty executable")
-    parent = None
-
-    cases = evidence.get("cases")
-    if not isinstance(cases, list) or len(cases) != len(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    ids = [case.get("id") for case in cases if isinstance(case, dict)]
-    if len(set(ids)) != len(ids) or set(ids) != set(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    if evidence["status"] == "PASS" or any(
-        isinstance(case, dict) and case.get("status") == "PASS" for case in cases
-    ):
-        parent = validate_environment(evidence.get("environment"))
-    for case in cases:
-        status = case.get("status")
-        if status not in {"PASS", "FAIL", "BLOCKED", "NOT_RUN"}:
-            raise ValueError("invalid case status")
-        reason = case.get("reason_code")
-        if reason is not None and (
-            not isinstance(reason, str) or not REASON_CODE_RE.fullmatch(reason)
-        ):
-            raise ValueError("invalid case reason code")
-        failure_type = case.get("failure_type")
-        if failure_type is not None and (
-            not isinstance(failure_type, str) or failure_type not in SAFE_FAILURE_TYPES
-        ):
-            raise ValueError("invalid case failure type")
-        if status != "FAIL" and failure_type is not None:
-            raise ValueError("only failed cases may contain a failure type")
-        duration = case.get("duration_ms")
-        if status == "NOT_RUN":
-            if duration is not None:
-                raise ValueError("NOT_RUN case cannot have a duration")
-        elif not finite_nonnegative(duration):
-            raise ValueError("completed case duration must be nonnegative")
-        observations = case.get("observations")
-        if not isinstance(observations, dict):
-            raise ValueError("invalid case observations")
-        validate_observations(observations)
-        if status == "PASS":
-            if not required_observations(case["id"]).issubset(observations):
-                raise ValueError("passed case evidence is incomplete")
-            if parent is None:
-                raise ValueError("passed case requires validated environment evidence")
-            validate_passed_case(case["id"], observations, parent)
-    if evidence["status"] == "PASS" and any(case["status"] != "PASS" for case in cases):
-        raise ValueError("PASS requires every required case to pass")
-    summary = evidence.get("summary")
-    expected_summary = {
-        "required_case_count": len(REQUIRED_CASE_IDS),
-        "passed_case_count": sum(case["status"] == "PASS" for case in cases),
-        "blocked_case_count": sum(case["status"] == "BLOCKED" for case in cases),
-        "failed_case_count": sum(case["status"] == "FAIL" for case in cases),
-        "not_run_case_count": sum(case["status"] == "NOT_RUN" for case in cases),
-    }
-    if summary != expected_summary:
-        raise ValueError("case summary does not match case evidence")
+CONTRACT = evidence.EvidenceContract(
+    schema=SCHEMA,
+    case_flows=CASE_FLOWS,
+    observation_keys=frozenset().union(*REQUIRED_OBSERVATIONS.values()),
+    fingerprint_keys=FINGERPRINT_OBSERVATION_KEYS,
+    required_observations=REQUIRED_OBSERVATIONS,
+    validate_runtime_scan=validate_runtime_scan,
+    validate_passed_case=validate_passed_case,
+    private_sentinels=(DOCUMENT_SENTINEL,),
+    safe_strings=SAFE_STRINGS,
+    string_patterns={"sample_version": SAMPLE_VERSION_RE},
+)
 
 
-def source_contract_failure() -> str | None:
-    """The nsh selectors this harness drives must exist in production source."""
-    if not production_markers_present(REPO, UI_SOURCE_REQUIREMENTS):
-        return "FIRST_USE_SOURCE_CONTRACT_MISSING"
-    return None
+def new_evidence(expected_hash: str) -> dict[str, Any]:
+    return evidence.new_evidence(CONTRACT, expected_hash)
+
+
+def validate_evidence(value: dict[str, Any]) -> None:
+    evidence.validate_evidence(value, CONTRACT)
 
 
 def persisted_recent_count(config_root: Path) -> int:
@@ -618,45 +311,7 @@ def materialized_sample_inventory(data_root: Path) -> dict[str, Any]:
 
 
 def scan_case_artifacts(case_root: Path) -> dict[str, Any]:
-    try:
-        roots = (case_root / "data", case_root / "config")
-        paths = [
-            path
-            for root in roots
-            for path in root.rglob("*")
-            if path.is_file()
-        ]
-        stderr = case_root / "stderr.log"
-        if stderr.exists():
-            paths.append(stderr)
-        paths = sorted(set(paths))
-    except OSError as error:
-        raise HarnessFailure("RUNTIME_ARTIFACT_ENUM_FAILED", safe_exception_name(error)) from None
-    if not paths:
-        raise HarnessFailure("RUNTIME_ARTIFACTS_MISSING")
-    utf8 = DOCUMENT_SENTINEL.encode("utf-8")
-    utf16 = DOCUMENT_SENTINEL.encode("utf-16-le")
-    logs_root = case_root / "data" / "logs"
-    app_logs = [path for path in paths if logs_root in path.parents]
-    if not app_logs:
-        raise HarnessFailure("APP_LOG_MISSING")
-    for path in paths:
-        try:
-            leaked = artifact_contains(path, (utf8, utf16))
-        except OSError as error:
-            raise HarnessFailure("RUNTIME_ARTIFACT_SCAN_FAILED", safe_exception_name(error)) from None
-        if leaked == utf8:
-            raise HarnessFailure("UTF8_DOCUMENT_SENTINEL_LEAKED")
-        if leaked == utf16:
-            raise HarnessFailure("UTF16LE_DOCUMENT_SENTINEL_LEAKED")
-    config_root = case_root / "config"
-    return {
-        "files_scanned": len(paths),
-        "app_logs_scanned": len(app_logs),
-        "config_files_scanned": sum(config_root in path.parents for path in paths),
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-    }
+    return evidence.scan_case_artifacts(case_root, leak_codes("DOCUMENT_SENTINEL", DOCUMENT_SENTINEL))
 
 
 class Goal03Harness(BaseNativeHarness):
@@ -703,40 +358,6 @@ class Goal03Harness(BaseNativeHarness):
 
     def source_editor_ready(self, app: Any) -> None:
         self.activate_source_layout(app)
-
-    def source_editor_has_focus(self, app: Any) -> bool:
-        try:
-            editor = self.control_by_name(
-                app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
-            )
-            return editor is not None and bool(editor.has_keyboard_focus())
-        except HarnessFailure:
-            raise
-        except Exception as error:
-            raise HarnessFailure(
-                "SOURCE_EDITOR_FOCUS_QUERY_FAILED", safe_exception_name(error)
-            ) from None
-
-    def require_source_editor_focus(self, app: Any, failure_code: str) -> None:
-        wait_until(
-            lambda: self.source_editor_has_focus(app),
-            self.ui_timeout,
-            failure_code,
-            interval=0.025,
-        )
-
-    def replace_editor(self, app: Any, value: str) -> Fingerprint:
-        clipboard_before = self.read_text_clipboard()
-        try:
-            self.write_text_clipboard(value)
-            self.focus_editor(app)
-            self.win32.send_shortcut(app.hwnd, VK_A)
-            self.win32.send_shortcut(app.hwnd, VK_V)
-        finally:
-            self.write_text_clipboard(clipboard_before)
-        expected = fingerprint_text(value)
-        actual, _ = self.wait_editor_fingerprint(app, expected, self.ui_timeout)
-        return actual
 
     def discard_memory_document(self, app: Any) -> None:
         self.focus_editor(app)
@@ -951,9 +572,6 @@ class Goal03Harness(BaseNativeHarness):
             finally:
                 self.reap(second)
             observations = {
-                "welcome_visible": True,
-                "entry_points_visible": True,
-                "welcome_restart_visible": True,
                 "flow": CASE_FLOWS[CASE_WELCOME],
                 "process_context": first.security_context.evidence(),
                 "foreground_verified": True,
@@ -970,7 +588,7 @@ class Goal03Harness(BaseNativeHarness):
             self.click_control(self.welcome_action(new, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.wait_welcome_absent(new)
             self.source_editor_ready(new)
-            new_text = self.replace_editor(new, NEW_TEXT)
+            new_text = self.paste_editor(new, NEW_TEXT)
             self.discard_memory_document(new)
             paste = self.launch_app(None, data, config, workspace, stderr)
             try:
@@ -995,8 +613,6 @@ class Goal03Harness(BaseNativeHarness):
             finally:
                 self.reap(paste)
             observations = {
-                "new_buffer_created": True,
-                "paste_buffer_created": True,
                 "new_unicode_editor": new_text.evidence(),
                 "paste_unicode_editor": paste_text.evidence(),
                 "flow": CASE_FLOWS[CASE_NEW_PASTE],
@@ -1015,7 +631,7 @@ class Goal03Harness(BaseNativeHarness):
         try:
             self.click_control(self.welcome_action(first, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(first)
-            editor = self.replace_editor(first, SAVE_TEXT)
+            editor = self.paste_editor(first, SAVE_TEXT)
             self.request_save_as(first)
             self.select_save_path(first, destination)
             saved = self.wait_file(destination, editor, "SAVE_AS_CREATE_TIMEOUT")
@@ -1031,7 +647,6 @@ class Goal03Harness(BaseNativeHarness):
             finally:
                 self.reap(reopened)
             observations = {
-                "save_as_created": True,
                 "saved_destination": saved.evidence(),
                 "reopened_editor": exact.evidence(),
                 "flow": CASE_FLOWS[CASE_SAVE_CREATE],
@@ -1055,7 +670,7 @@ class Goal03Harness(BaseNativeHarness):
         try:
             self.click_control(self.welcome_action(app, WELCOME_NEW_AUTOMATION_ID), "WELCOME_NEW_CLICK_FAILED")
             self.source_editor_ready(app)
-            editor = self.replace_editor(app, OVERWRITE_TEXT)
+            editor = self.paste_editor(app, OVERWRITE_TEXT)
             self.focus_editor(app)
             self.request_save_as_shortcut(app)
             self.cancel_save_picker(app, cancelled_destination)
@@ -1084,11 +699,6 @@ class Goal03Harness(BaseNativeHarness):
                 "save_as_cancel_destination_before": cancelled_before.evidence(),
                 "save_as_cancel_destination_after": cancelled_after.evidence(),
                 "saved_destination": saved.evidence(),
-                "save_as_cancelled": True,
-                "save_as_cancel_focus_preserved": True,
-                "overwrite_cancelled": True,
-                "overwrite_cancel_focus_preserved": True,
-                "overwrite_confirmed": True,
                 "flow": CASE_FLOWS[CASE_SAVE_CANCEL_OVERWRITE],
                 "process_context": app.security_context.evidence(),
                 "foreground_verified": True,
@@ -1108,8 +718,6 @@ class Goal03Harness(BaseNativeHarness):
             materialized = materialized_sample_inventory(data)
             self.close_app(app)
             observations = {
-                "sample_workspace_opened": True,
-                "workspace_home_visible": True,
                 **materialized,
                 "flow": CASE_FLOWS[CASE_SAMPLE],
                 "process_context": app.security_context.evidence(),
@@ -1181,11 +789,8 @@ class Goal03Harness(BaseNativeHarness):
                 raise HarnessFailure("STALE_RECENT_OPENED_DOCUMENT")
             self.close_app(restarted)
             observations = {
-                "recent_restart_visible": True,
                 "recent_count": recent_count,
                 "recent_visible_count": len(controls),
-                "stale_recent_disabled": True,
-                "stale_recent_press_ignored": True,
                 "flow": CASE_FLOWS[CASE_RECENTS],
                 "process_context": first_context.evidence(),
                 "foreground_verified": True,
@@ -1216,8 +821,6 @@ class Goal03Harness(BaseNativeHarness):
             finally:
                 self.reap(directory_app)
             observations = {
-                "direct_file_bypassed_welcome": True,
-                "direct_directory_bypassed_welcome": True,
                 "flow": CASE_FLOWS[CASE_CLI],
                 "process_context": file_app.security_context.evidence(),
                 "foreground_verified": True,
@@ -1234,7 +837,6 @@ def native_run_plan() -> NativeRunPlan:
         workdir_prefix="markturbo-goal-03-native-",
         new_evidence=new_evidence,
         validate_evidence=validate_evidence,
-        source_contract=source_contract_failure,
         preflight=preflight,
         ui_types_loader=load_pywinauto,
         harness_factory=Goal03Harness,
@@ -1251,25 +853,8 @@ def native_run_plan() -> NativeRunPlan:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
-    parser.add_argument("--expect-exe-sha256", type=normalize_expected_hash, required=True)
-    parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE)
-    parser.add_argument("--ui-timeout", type=float, default=15.0)
-    parser.add_argument(
-        "--case",
-        choices=REQUIRED_CASE_IDS,
-        help="run one case for debugging; it never produces acceptance PASS",
-    )
-    parser.add_argument(
-        "--keep-workdir-on-failure",
-        action="store_true",
-        help="preserve the isolated data, config, logs, and stderr directory after a non-PASS run",
-    )
-    args = parser.parse_args(argv)
-    if not math.isfinite(args.ui_timeout) or args.ui_timeout <= 0:
-        parser.error("--ui-timeout must be greater than zero")
-    return args
+    parser = evidence.build_parser(__doc__.splitlines()[0], "goal-03", REQUIRED_CASE_IDS)
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -91,8 +91,8 @@ INTEGRITY_NAMES = {
 #   (src/access.rs:373-384). While one shows, every key goes to it
 #   (src/system.rs:2022-2040); Enter presses its focused button, which starts on
 #   the last Default-styled button, else the first (src/system.rs:1461-1476,
-#   1674). `confirm_system_alert` answers with Enter, and
-#   `source_contract.alert_enter_confirms` pins the button order it relies on.
+#   1674). `confirm_system_alert` answers with Enter; each caller proves the
+#   confirmed effect, so a cancelling Enter fails its wait.
 SYSTEM_ALERT_SETTLE_SECONDS = 0.5
 EDITOR_NAME = "Markdown source"
 MENU_BUTTON_AUTOMATION_ID = "title-settings"
@@ -305,7 +305,6 @@ class NativeRunPlan:
     ui_types_loader: Callable[[], tuple[Any, ...]]
     harness_factory: Callable[..., "NativeHarness"]
     scenarios: Callable[["NativeHarness"], tuple[Callable[[], dict[str, Any]], ...]]
-    source_contract: Callable[[], str | None] | None = None
     finalize_evidence: Callable[[dict[str, Any]], None] | None = None
 
 
@@ -2140,6 +2139,41 @@ class NativeHarness:
             raise HarnessFailure("EDITOR_TEXT_TIMEOUT", last_failure_type or "") from None
         return actual, (time.perf_counter() - started) * 1000
 
+    def source_editor_has_focus(self, app: RunningApp) -> bool:
+        try:
+            editor = self.control_by_name(
+                app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
+            )
+            return editor is not None and bool(editor.has_keyboard_focus())
+        except HarnessFailure:
+            raise
+        except Exception as error:
+            raise HarnessFailure(
+                "SOURCE_EDITOR_FOCUS_QUERY_FAILED", safe_exception_name(error)
+            ) from None
+
+    def require_source_editor_focus(self, app: RunningApp, failure_code: str) -> None:
+        wait_until(
+            lambda: self.source_editor_has_focus(app),
+            self.ui_timeout,
+            failure_code,
+            interval=0.025,
+        )
+
+    def paste_editor(self, app: RunningApp, value: str) -> Fingerprint:
+        """Replace the document with one OS paste (Ctrl+A, Ctrl+V), unlike
+        `replace_editor`'s typed input, and restore the user's clipboard."""
+        clipboard_before = self.read_text_clipboard()
+        try:
+            self.write_text_clipboard(value)
+            self.focus_editor(app)
+            self.win32.send_shortcut(app.hwnd, VK_A)
+            self.win32.send_shortcut(app.hwnd, VK_V)
+        finally:
+            self.write_text_clipboard(clipboard_before)
+        actual, _ = self.wait_editor_fingerprint(app, fingerprint_text(value), self.ui_timeout)
+        return actual
+
 
 def _completion_status(returncode: int) -> str:
     return {0: "PASS", 1: "FAIL", 2: "BLOCKED"}[returncode]
@@ -2197,9 +2231,7 @@ def run_native_acceptance(
     evidence = plan.new_evidence(args.expect_exe_sha256)
     args.debug_workdir = None
 
-    # A missing executable is the first, unambiguous acceptance failure. A
-    # source contract checks the working tree, not the candidate executable,
-    # so it must not decide what an absent executable reports.
+    # A missing executable is the first, unambiguous acceptance failure.
     if not args.exe.is_file():
         return _complete_early(
             evidence,
@@ -2209,27 +2241,6 @@ def run_native_acceptance(
             blocked=False,
             finalize_evidence=plan.finalize_evidence,
         )
-
-    if plan.source_contract is not None:
-        try:
-            if code := plan.source_contract():
-                return _complete_early(
-                    evidence,
-                    plan.required_case_ids,
-                    1,
-                    code,
-                    blocked=False,
-                    finalize_evidence=plan.finalize_evidence,
-                )
-        except Exception as error:
-            return _complete_early(
-                evidence,
-                plan.required_case_ids,
-                1,
-                f"PREFLIGHT_{safe_exception_name(error).upper()}",
-                blocked=False,
-                finalize_evidence=plan.finalize_evidence,
-            )
 
     try:
         exe = args.exe.resolve(strict=False)

@@ -50,6 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .evidence import credential_target
 from .runtime import HarnessBlocked, HarnessFailure, Win32, safe_exception_name, sha256_file
 
 SCHEMA = "markturbo.goal-09-visual-matrix"
@@ -600,21 +601,7 @@ class ReviewServer:
 
 
 def credential_identity(port: int) -> str:
-    identity = hashlib.sha256()
-    for component in (
-        "io.github.wxxb789.markturbo",
-        "openai-chat",
-        "http",
-        "127.0.0.1",
-        str(port),
-        "/v1/",
-    ):
-        identity.update(component.encode("ascii"))
-        identity.update(b"\0")
-    return (
-        "io.github.wxxb789.markturbo:model-credential:v2"
-        f"|wire=openai-chat|host=127.0.0.1|identity-sha256={identity.hexdigest()}"
-    )
+    return credential_target(f"http://127.0.0.1:{port}/v1/", "openai-chat")
 
 
 class AppWindow:

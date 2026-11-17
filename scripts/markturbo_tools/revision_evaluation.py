@@ -24,6 +24,8 @@ from pathlib import Path
 from types import MappingProxyType
 
 from . import evaluation
+from .native import evidence as native_evidence
+from .native import goal07 as native_goal07
 
 
 REPO = evaluation.REPO
@@ -33,21 +35,9 @@ REGISTRY_SCHEMA = "markturbo-goal-07-eligibility-v2"
 EVIDENCE_SCHEMA = "markturbo-goal-07-revision-evaluation-v2"
 MACHINE_RECEIPT_SCHEMA = "markturbo-goal-07-machine-receipt-v2"
 LOCAL_DIFF_RUNNER_SCHEMA = "markturbo-local-diff-receipt-v2"
-NATIVE_ACCEPTANCE_SCHEMA = "markturbo.goal-07-native-acceptance"
-# The nsh harness writes version 2 (`native/goal07.py` `SCHEMA_VERSION`). The
-# retained version 1 files describe the retired GPUI UI and never bind here.
-NATIVE_ACCEPTANCE_SCHEMA_VERSION = 2
-NATIVE_ACCEPTANCE_HISTORICAL_SCHEMA_VERSION = 1
-NATIVE_REQUIRED_CASE_IDS = frozenset(
-    {
-        "reject_all_byte_identity",
-        "selective_apply_one_undo",
-        "accept_all_preview",
-        "stale_proposal_blocks_apply",
-        "safe_save_conflict",
-        "trusted_executable_apply_revokes_trust",
-    }
-)
+NATIVE_ACCEPTANCE_SCHEMA = native_goal07.SCHEMA
+NATIVE_ACCEPTANCE_SCHEMA_VERSION = native_evidence.SCHEMA_VERSION
+NATIVE_REQUIRED_CASE_IDS = frozenset(native_goal07.REQUIRED_CASE_IDS)
 REVISION_CONTRACT = (
     "docs/goals/archive/07-apply-only-approved-revisions.md#revision-evaluation-standard"
 )
@@ -1419,84 +1409,27 @@ def load_native_acceptance(
         raise RevisionEvaluationError("native acceptance raw digest does not match its external anchor")
     _reject_forbidden_content(value, field="native acceptance evidence")
     payload = _mapping(value, field="native acceptance evidence")
-    if not isinstance(payload.get("schema"), str) or payload.get("schema") != NATIVE_ACCEPTANCE_SCHEMA:
-        raise RevisionEvaluationError("native acceptance evidence schema is invalid")
     version = payload.get("schema_version")
-    if type(version) is int and version == NATIVE_ACCEPTANCE_HISTORICAL_SCHEMA_VERSION:
-        raise RevisionEvaluationError(
-            "native acceptance evidence is a historical GPUI-era record (schema_version 1), "
-            "not acceptance for the current UI"
-        )
-    if type(version) is not int or version != NATIVE_ACCEPTANCE_SCHEMA_VERSION:
-        raise RevisionEvaluationError("native acceptance evidence schema is invalid")
-    if not isinstance(payload.get("status"), str) or payload.get("status") != "PASS":
-        raise RevisionEvaluationError("native acceptance evidence must have PASS status")
-    executable = _mapping(payload.get("executable"), field="native acceptance executable")
-    expected = _safe_sha256(executable.get("expected_sha256"), field="native executable.expected_sha256")
-    actual = _safe_sha256(executable.get("sha256"), field="native executable.sha256")
-    copied = _safe_sha256(executable.get("copied_sha256"), field="native executable.copied_sha256")
-    for name in ("hash_verified", "copy_hash_verified"):
-        if name in executable and not isinstance(executable[name], bool):
-            raise RevisionEvaluationError(f"native executable.{name} must be a boolean")
-    if "byte_count" in executable:
-        _safe_count(executable["byte_count"], field="native executable.byte_count")
-    if "transport" in payload:
-        transport = _mapping(payload["transport"], field="native transport")
-        if "request_count" in transport:
-            _safe_count(transport["request_count"], field="native transport.request_count")
-    if "summary" in payload:
-        summary = _mapping(payload["summary"], field="native summary")
-        for name in (
-            "required_case_count",
-            "passed_case_count",
-            "blocked_case_count",
-            "failed_case_count",
-            "not_run_case_count",
-        ):
-            if name in summary:
-                _safe_count(summary[name], field=f"native summary.{name}")
-    if expected != approved_native_executable_sha256 or actual != expected or copied != expected:
-        raise RevisionEvaluationError("native executable digest does not match its external anchor")
-    cases = payload.get("cases")
-    if not isinstance(cases, list):
-        raise RevisionEvaluationError("native acceptance evidence does not prove PASS for every case")
-    case_ids: list[str] = []
-    for case in cases:
-        if not isinstance(case, Mapping) or not isinstance(case.get("id"), str):
-            raise RevisionEvaluationError("native acceptance evidence contains an invalid case identifier")
-        if case.get("status") != "PASS":
-            raise RevisionEvaluationError("native acceptance evidence does not prove PASS for every case")
-        if "duration_ms" in case and case["duration_ms"] is not None and isinstance(case["duration_ms"], bool):
-            raise RevisionEvaluationError("native case duration_ms must not be a boolean")
-        observations = case.get("observations")
-        if isinstance(observations, Mapping):
-            for required_flag in (
-                "foreground_verified",
-                "loopback_provider",
-                "server_loopback",
-                "server_deterministic",
-                "provider_paths_exact",
-                "provider_requests_after_consent",
-                "provider_review_before_revision",
-                "provider_review_source_sha256_match",
-                "provider_revision_source_sha256_match",
-                "provider_revision_snapshot_match",
-                "provider_revision_answer_sentinel_present",
-            ):
-                if required_flag in observations and observations[required_flag] is not True:
-                    raise RevisionEvaluationError("native acceptance evidence failed full harness validation")
-        case_ids.append(case["id"])
     if (
-        len(cases) != len(NATIVE_REQUIRED_CASE_IDS)
-        or len(set(case_ids)) != len(case_ids)
-        or set(case_ids) != NATIVE_REQUIRED_CASE_IDS
+        payload.get("schema") != NATIVE_ACCEPTANCE_SCHEMA
+        or type(version) is not int
+        or version != NATIVE_ACCEPTANCE_SCHEMA_VERSION
     ):
-        raise RevisionEvaluationError("native acceptance evidence does not prove PASS for every case")
+        raise RevisionEvaluationError("native acceptance evidence schema is invalid")
+    if payload.get("status") != "PASS":
+        raise RevisionEvaluationError("native acceptance evidence must have PASS status")
     try:
-        from .native import goal07 as native_goal07
         native_goal07.validate_evidence(dict(payload))
     except (KeyError, TypeError, ValueError, RecursionError) as error:
         raise RevisionEvaluationError("native acceptance evidence failed full harness validation") from error
+    executable = payload["executable"]
+    actual = executable["sha256"]
+    if (
+        executable["expected_sha256"] != approved_native_executable_sha256
+        or actual != approved_native_executable_sha256
+        or executable["copied_sha256"] != approved_native_executable_sha256
+    ):
+        raise RevisionEvaluationError("native executable digest does not match its external anchor")
     acceptance = NativeAcceptance(raw_sha256=raw_sha256, executable_sha256=actual)
     object.__setattr__(
         acceptance,
@@ -1505,8 +1438,6 @@ def load_native_acceptance(
     )
     return acceptance
 
-
-load_native_pass_evidence = load_native_acceptance
 
 
 def load_owner_inputs(

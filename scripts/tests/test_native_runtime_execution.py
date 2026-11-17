@@ -1,7 +1,21 @@
-"""Goal 02 native harness tests without launching a UI."""
+"""The shared native acceptance lifecycle, run through goal 02 with fake harnesses."""
 
-from ._native_goal02_support import *
-from scripts.markturbo_tools.native import goal03, goal06, goal07
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from scripts.markturbo_tools.native import evidence, goal03, goal06, goal07, runtime
+from scripts.markturbo_tools.native import goal02 as HARNESS
+
+from ._native_support import HASH
 
 
 class PrivacyAndCliTests(unittest.TestCase):
@@ -27,26 +41,10 @@ class PrivacyAndCliTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 runtime.remove_tree_with_retry(Path("temporary-native-root"), timeout=0.0)
 
-    def test_document_text_never_appears_in_serialized_observation(self) -> None:
-        secret = "UNIQUE-SECRET-\u4fdd\u5b58-\U0001f680"
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["editor"] = FINGERPRINT_TEXT(
-            secret
-        ).evidence()
-        serialized = json.dumps(evidence, ensure_ascii=False)
-
-        self.assertNotIn(secret, serialized)
-        self.assertNotIn("UNIQUE-SECRET", serialized)
-        self.assertIn(hashlib.sha256(secret.encode("utf-8")).hexdigest(), serialized)
-
-        evidence["cases"][0]["observations"]["raw_text"] = secret
-        with self.assertRaisesRegex(ValueError, "unknown observation field"):
-            VALIDATE_EVIDENCE(evidence)
-
     def test_exception_sanitizer_never_returns_exception_text(self) -> None:
         secret = "UNIQUE-DOCUMENT-CONTENT"
 
-        result = SAFE_EXCEPTION_NAME(RuntimeError(secret))
+        result = runtime.safe_exception_name(RuntimeError(secret))
 
         self.assertEqual(result, "RuntimeError")
         self.assertNotIn(secret, result)
@@ -55,13 +53,13 @@ class PrivacyAndCliTests(unittest.TestCase):
         for name in ("PermissionError", "TypeError", "COMError"):
             with self.subTest(name=name):
                 self.assertEqual(
-                    SAFE_FAILURE_TYPE(HARNESS_FAILURE("RUNTIME_ARTIFACT_SCAN_FAILED", name)),
+                    runtime.safe_failure_type(runtime.HarnessFailure("RUNTIME_ARTIFACT_SCAN_FAILED", name)),
                     name,
                 )
         for detail in ("UNIQUE_SECRET", "secret text", "secret-text"):
             with self.subTest(detail=detail):
                 self.assertEqual(
-                    SAFE_FAILURE_TYPE(HARNESS_FAILURE("RUNTIME_ARTIFACT_SCAN_FAILED", detail)),
+                    runtime.safe_failure_type(runtime.HarnessFailure("RUNTIME_ARTIFACT_SCAN_FAILED", detail)),
                     "HarnessFailure",
                 )
 
@@ -75,7 +73,7 @@ class PrivacyAndCliTests(unittest.TestCase):
             workspace = root / "workspace"
             stderr = root / "stderr.log"
             with mock.patch("subprocess.Popen") as popen:
-                spec = BUILD_LAUNCH_SPEC(
+                spec = runtime.build_launch_spec(
                     exe,
                     target,
                     data,
@@ -98,26 +96,11 @@ class PrivacyAndCliTests(unittest.TestCase):
             self.assertNotIn("OPENAI_API_KEY", spec.env)
             self.assertNotIn("ANTHROPIC_API_KEY", spec.env)
 
-    def test_constructs_cli_without_starting_process(self) -> None:
-        exe = Path("C:/release/markturbo.exe")
-        evidence = Path("C:/evidence/goal-02.json")
-        with mock.patch("subprocess.Popen") as popen:
-            command = BUILD_CLI_COMMAND(exe, HASH, evidence)
-            args = PARSE_ARGS(command[3:])
-
-        popen.assert_not_called()
-        self.assertEqual(command[1:3], ["-m", "scripts.markturbo_tools.native.goal02"])
-        self.assertEqual(args.exe, exe)
-        self.assertEqual(args.expect_exe_sha256, HASH)
-        self.assertEqual(args.evidence, evidence)
-        self.assertEqual(NORMALIZE_EXPECTED_HASH(HASH.upper()), HASH)
-
     def test_default_failure_receipts_preserve_retained_evidence(self) -> None:
         for module in (HARNESS, goal03, goal06, goal07):
             with self.subTest(goal=module.SCHEMA), tempfile.TemporaryDirectory() as temporary:
                 args = module.parse_args(["--expect-exe-sha256", HASH])
-                relative = Path("target") / "native-acceptance" / f"{module.SCHEMA.removeprefix('markturbo.')}-v{module.SCHEMA_VERSION}.json"
-                self.assertEqual(args.evidence, module.REPO / relative)
+                relative = args.evidence.relative_to(evidence.REPO)
                 root = Path(temporary)
                 retained = root / "docs" / "evidence" / relative.name
                 retained.parent.mkdir(parents=True)
@@ -126,7 +109,7 @@ class PrivacyAndCliTests(unittest.TestCase):
                 output = root / relative
                 stderr = io.StringIO()
                 with (
-                    mock.patch.object(module, "DEFAULT_EVIDENCE", output),
+                    mock.patch.object(evidence, "REPO", root),
                     contextlib.redirect_stderr(stderr),
                 ):
                     returncode = module.main(
@@ -146,8 +129,8 @@ class PrivacyAndCliTests(unittest.TestCase):
                 )
 
     def test_parser_exposes_debug_case_and_workdir_retention(self) -> None:
-        case = REQUIRED_CASE_IDS[0]
-        args = PARSE_ARGS(
+        case = HARNESS.REQUIRED_CASE_IDS[0]
+        args = HARNESS.parse_args(
             [
                 "--expect-exe-sha256",
                 HASH,
@@ -179,14 +162,14 @@ class PrivacyAndCliTests(unittest.TestCase):
             exe = Path(temporary) / "markturbo.exe"
             exe.write_bytes(b"test executable")
             expected = hashlib.sha256(exe.read_bytes()).hexdigest()
-            args = PARSE_ARGS(
+            args = HARNESS.parse_args(
                 [
                     "--exe",
                     str(exe),
                     "--expect-exe-sha256",
                     expected,
                     "--case",
-                    REQUIRED_CASE_IDS[0],
+                    HARNESS.REQUIRED_CASE_IDS[0],
                 ]
             )
             with mock.patch.dict(
@@ -234,19 +217,19 @@ class PrivacyAndCliTests(unittest.TestCase):
             }
 
             with mock.patch.dict(HARNESS.__dict__, patch_run):
-                success_args = PARSE_ARGS(["--exe", str(exe), "--expect-exe-sha256", expected])
+                success_args = HARNESS.parse_args(["--exe", str(exe), "--expect-exe-sha256", expected])
                 success_code, _, _ = runtime.run_native_acceptance(
                     success_args, HARNESS.native_run_plan()
                 )
 
-                partial_args = PARSE_ARGS(
+                partial_args = HARNESS.parse_args(
                     [
                         "--exe",
                         str(exe),
                         "--expect-exe-sha256",
                         expected,
                         "--case",
-                        REQUIRED_CASE_IDS[0],
+                        HARNESS.REQUIRED_CASE_IDS[0],
                         "--keep-workdir-on-failure",
                     ]
                 )
@@ -265,13 +248,13 @@ class PrivacyAndCliTests(unittest.TestCase):
 
         class FailingHarness(FakeHarness):
             def scenario_pointer_cancel(self):
-                raise HARNESS_FAILURE("TEST_CASE_FAILURE")
+                raise runtime.HarnessFailure("TEST_CASE_FAILURE")
 
         with tempfile.TemporaryDirectory() as temporary:
             exe = Path(temporary) / "markturbo.exe"
             exe.write_bytes(b"test executable")
             expected = hashlib.sha256(exe.read_bytes()).hexdigest()
-            args = PARSE_ARGS(
+            args = HARNESS.parse_args(
                 [
                     "--exe",
                     str(exe),
@@ -302,7 +285,7 @@ class PrivacyAndCliTests(unittest.TestCase):
             exe = Path(temporary) / "markturbo.exe"
             exe.write_bytes(b"test executable")
             expected = hashlib.sha256(exe.read_bytes()).hexdigest()
-            args = PARSE_ARGS(
+            args = HARNESS.parse_args(
                 [
                     "--exe",
                     str(exe),

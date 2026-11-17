@@ -16,6 +16,7 @@ from unittest import mock
 
 from scripts.markturbo_tools import evaluation
 from scripts.markturbo_tools import revision_evaluation as revision
+from scripts.markturbo_tools.native import evidence as native_evidence
 from scripts.markturbo_tools.native import goal07 as native_goal07
 
 
@@ -210,21 +211,10 @@ class Goal07Fixtures:
             "files_scanned": 3,
             "app_logs_scanned": 1,
             "config_files_scanned": 1,
-            "utf8_sentinel_absent": True,
-            "utf16le_sentinel_absent": True,
-            "ephemeral_credential_utf8_absent": True,
-            "ephemeral_credential_utf16le_absent": True,
-            "answer_sentinel_utf8_absent": True,
-            "answer_sentinel_utf16le_absent": True,
-            "raw_response_sentinel_utf8_absent": True,
-            "raw_response_sentinel_utf16le_absent": True,
         }
         common = {
             "process_context": parent,
             "foreground_verified": True,
-            "loopback_provider": True,
-            "server_loopback": True,
-            "server_deterministic": True,
             "provider_request_count": 2,
             "provider_review_count": 1,
             "provider_revision_count": 1,
@@ -267,7 +257,6 @@ class Goal07Fixtures:
                         "source_after": fingerprint,
                         "selective_matches_expected": True,
                         "one_undo_transaction": True,
-                        "undo_count": 1,
                     }
                 )
             elif case_id == native_goal07.CASE_ACCEPT_ALL_PREVIEW:
@@ -300,11 +289,6 @@ class Goal07Fixtures:
                         "editor_after_done": changed_fingerprint,
                         "source_before": fingerprint,
                         "source_after": fingerprint,
-                        "stale_proposal_received": True,
-                        "part_changed_visible": True,
-                        "accept_withheld": True,
-                        "apply_activation_attempted": True,
-                        "apply_disabled_source_contract": True,
                         "stale_no_mutation": True,
                     }
                 )
@@ -314,9 +298,7 @@ class Goal07Fixtures:
                         "editor_after_apply": changed_fingerprint,
                         "external_source_before": fingerprint,
                         "external_source_after": fingerprint,
-                        "save_command_sent": True,
                         "conflict_visible_before_save": True,
-                        "safe_save_conflict_visible": True,
                         "safe_save_no_overwrite": True,
                     }
                 )
@@ -325,13 +307,9 @@ class Goal07Fixtures:
                     {
                         "editor_before_apply": fingerprint,
                         "editor_after_apply": changed_fingerprint,
-                        "restricted_after_apply": True,
                         "executable_change": True,
                         "executable_expected": changed_fingerprint,
                         "executable_matches_expected": True,
-                        "trust_before": True,
-                        "trust_revocation_order_source_contract": True,
-                        "preview_inert_source_contract": True,
                         "preview_fingerprint": changed_fingerprint,
                         "proposal_expected": changed_fingerprint,
                         "preview_matches_expected": True,
@@ -341,7 +319,7 @@ class Goal07Fixtures:
             observations[case_id] = item
         return {
             "schema": revision.NATIVE_ACCEPTANCE_SCHEMA,
-            "schema_version": native_goal07.SCHEMA_VERSION,
+            "schema_version": revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION,
             "status": "PASS",
             "started_at_utc": "2026-09-18T00:00:00Z",
             "completed_at_utc": "2026-09-18T00:00:01Z",
@@ -360,8 +338,8 @@ class Goal07Fixtures:
                 "copy_hash_verified": True,
                 "format": "PE32+",
                 "machine": "x86_64",
-                "machine_code": native_goal07.IMAGE_FILE_MACHINE_AMD64,
-                "optional_magic": native_goal07.PE32_PLUS_MAGIC,
+                "machine_code": 0x8664,
+                "optional_magic": 0x20B,
             },
             "environment": {
                 "platform": "Windows 11",
@@ -369,7 +347,7 @@ class Goal07Fixtures:
                 "windows_minor": 0,
                 "windows_build": 22621,
                 "architecture": "x86_64",
-                "native_machine_code": native_goal07.IMAGE_FILE_MACHINE_AMD64,
+                "native_machine_code": 0x8664,
                 "python_pointer_bits": 64,
                 "wts_state": "WTSActive",
                 "active_console_session_id": 1,
@@ -734,7 +712,7 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
                 anchor = hashlib.sha256(path.read_bytes()).hexdigest()
                 with self.assertRaisesRegex(
                     revision.RevisionEvaluationError,
-                    "does not prove PASS for every case",
+                    "full harness validation",
                 ):
                     revision.load_native_acceptance(
                         path,
@@ -1068,24 +1046,20 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
         )
         self.assertFalse(evidence["evaluation"]["all_cases_satisfied"])
 
-    def test_native_schema_version_follows_the_harness_and_refuses_historical_files(self) -> None:
-        self.assertEqual(revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION, native_goal07.SCHEMA_VERSION)
-        self.assertEqual(
-            revision.NATIVE_ACCEPTANCE_HISTORICAL_SCHEMA_VERSION,
-            native_goal07.HISTORICAL_SCHEMA_VERSION,
-        )
-        # The retained PASS of the retired GPUI harness is historical, never acceptance.
-        retained = revision.REPO / "docs" / "evidence" / "goal-07-final-ablation-f1ec266c-r2.json"
-        value = json.loads(retained.read_text(encoding="utf-8"))
-        self.assertEqual((value["schema_version"], value["status"]), (1, "PASS"))
-        path = Path(self.temp.name) / "native-historical.json"
-        shutil.copyfile(retained, path)
-        with self.assertRaisesRegex(revision.RevisionEvaluationError, "historical GPUI-era record"):
-            revision.load_native_acceptance(
-                path,
-                approved_native_evidence_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-                approved_native_executable_sha256=value["executable"]["expected_sha256"],
-            )
+    def test_native_schema_follows_the_harness_and_refuses_earlier_versions(self) -> None:
+        self.assertEqual(revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION, native_evidence.SCHEMA_VERSION)
+        self.assertEqual(revision.NATIVE_REQUIRED_CASE_IDS, frozenset(native_goal07.REQUIRED_CASE_IDS))
+        for version in (1, 2):
+            with self.subTest(version=version):
+                value = {**self.fixtures.native_value, "schema_version": version}
+                path = Path(self.temp.name) / f"native-v{version}.json"
+                path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(revision.RevisionEvaluationError, "schema is invalid"):
+                    revision.load_native_acceptance(
+                        path,
+                        approved_native_evidence_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                        approved_native_executable_sha256=self.fixtures.native_executable_anchor,
+                    )
 
     def test_native_schema_version_and_unhashable_case_id_fail_closed(self) -> None:
         wrong_type = {**self.fixtures.native_value, "schema_version": True}
@@ -1113,7 +1087,7 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
         unhashable["cases"][0]["id"] = ["not-an-id"]
         path = Path(self.temp.name) / "native-unhashable-id.json"
         path.write_text(json.dumps(unhashable, sort_keys=True) + "\n", encoding="utf-8")
-        with self.assertRaisesRegex(revision.RevisionEvaluationError, "invalid case identifier"):
+        with self.assertRaisesRegex(revision.RevisionEvaluationError, "full harness validation"):
             revision.load_native_acceptance(
                 path,
                 approved_native_evidence_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),

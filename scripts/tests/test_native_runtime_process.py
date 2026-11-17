@@ -1,10 +1,18 @@
-"""Goal 02 native harness tests without launching a UI."""
+"""The shared native runtime's platform, process and artifact boundaries, against fakes."""
 
-from ._native_goal02_support import *
+from __future__ import annotations
 
 import sys
-import time
+import tempfile
+import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+
+from scripts.markturbo_tools.native import runtime
+
+from ._native_support import HASH, minimal_pe
 
 
 class OwnedKernel:
@@ -160,199 +168,77 @@ class ArtifactContainsTests(unittest.TestCase):
             )
 
 
-class RuntimeEvidenceTests(unittest.TestCase):
-    def test_checkpoint_signal_is_only_a_canonical_recovery_record(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary) / "data"
-            self.assertEqual(HARNESS.canonical_recovery_records(data), [])
-            recovery = data / "recovery"
-            recovery.mkdir(parents=True)
-            (recovery / "junk.mtrecovery").write_bytes(b"ignored")
-            (recovery / (("b" * 64) + ".tmp")).write_bytes(b"partial")
-            (recovery / (("c" * 64) + ".mtrecovery")).mkdir()
-            self.assertEqual(HARNESS.canonical_recovery_records(data), [])
-
-            canonical = recovery / (("a" * 64) + ".mtrecovery")
-            canonical.write_bytes(b"sealed")
-            self.assertEqual(HARNESS.canonical_recovery_records(data), [canonical])
-
-    def test_checkpoint_wait_is_bounded_by_the_ten_second_loss_window(self) -> None:
-        harness = object.__new__(HARNESS.Goal02Harness)
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary) / "data"
-            (data / "recovery").mkdir(parents=True)
-            (data / "recovery" / (("a" * 64) + ".mtrecovery")).write_bytes(b"sealed")
-            started = time.perf_counter()
-            self.assertLessEqual(harness.wait_checkpoint_record(data, started), 10_000)
-
-            with self.assertRaises(HARNESS_FAILURE) as late:
-                harness.wait_checkpoint_record(data, started - 10.5)
-            self.assertEqual(late.exception.code, "RECOVERY_RECORD_EXCEEDED_10_SECONDS")
-
-            empty = Path(temporary) / "empty"
-            with self.assertRaises(HARNESS_FAILURE) as missing:
-                harness.wait_checkpoint_record(empty, time.perf_counter() - 9.95)
-            self.assertEqual(missing.exception.code, "RECOVERY_RECORD_EXCEEDED_10_SECONDS")
-
-    def test_live_recovery_scan_requires_canonical_encrypted_record(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary) / "data"
-            recovery = data / "recovery"
-            recovery.mkdir(parents=True)
-            (recovery / "junk.mtrecovery").write_bytes(b"ignored")
-            with self.assertRaises(HARNESS_FAILURE) as missing:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(missing.exception.code, "CANONICAL_RECOVERY_RECORD_MISSING")
-
-            canonical = recovery / (("a" * 64) + ".mtrecovery")
-            canonical.write_bytes(b"")
-            with self.assertRaises(HARNESS_FAILURE) as empty:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(empty.exception.code, "CANONICAL_RECOVERY_RECORD_EMPTY")
-
-            canonical.write_bytes(b"encrypted-record")
-            result = LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(result["canonical_record_count"], 1)
-            self.assertEqual(len(result["canonical_records"]), 1)
-
-            canonical.write_bytes(DOCUMENT_SENTINEL.encode("utf-8"))
-            with self.assertRaises(HARNESS_FAILURE) as leaked:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(leaked.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
-
-    def test_runtime_scan_covers_stderr_app_logs_and_recovery_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-            (recovery / (("a" * 64) + ".mtrecovery")).write_bytes(b"ciphertext")
-            (recovery / ".markturbo-recovery.lock").write_bytes(b"lease")
-
-            result = RUNTIME_ARTIFACT_SCAN(data, stderr)
-
-            self.assertEqual(result["files_scanned"], 4)
-            self.assertEqual(result["app_logs_scanned"], 1)
-            self.assertEqual(result["recovery_artifacts_scanned"], 2)
-            self.assertEqual(result["canonical_recovery_records_scanned"], 1)
-            self.assertEqual(result["recovery_leases_scanned"], 1)
-
-    def test_runtime_scan_counts_records_and_leases_separately(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-
-            (recovery / ".markturbo-recovery.lock").write_bytes(b"lease")
-            lease_only = RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(lease_only["canonical_recovery_records_scanned"], 0)
-            self.assertEqual(lease_only["recovery_leases_scanned"], 1)
-
-            (recovery / ".markturbo-recovery.lock").unlink()
-            (recovery / (("a" * 64) + ".mtrecovery")).write_bytes(b"ciphertext")
-            record_only = RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(record_only["canonical_recovery_records_scanned"], 1)
-            self.assertEqual(record_only["recovery_leases_scanned"], 0)
-
-    def test_recovery_scans_fail_closed_on_permission_error(self) -> None:
-        secret = "UNIQUE-DOCUMENT-CONTENT"
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-            record = recovery / (("a" * 64) + ".mtrecovery")
-            record.write_bytes(b"ciphertext")
-            original_read_bytes = Path.read_bytes
-
-            def denied(path: Path) -> bytes:
-                if path == record:
-                    raise PermissionError(secret)
-                return original_read_bytes(path)
-
-            with mock.patch.object(Path, "read_bytes", new=denied):
-                with self.assertRaises(HARNESS_FAILURE) as live:
-                    LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(live.exception.code, "LIVE_RECOVERY_RECORD_SCAN_FAILED")
-            self.assertEqual(live.exception.detail, "PermissionError")
-
-            with mock.patch.object(Path, "read_bytes", new=denied):
-                with self.assertRaises(HARNESS_FAILURE) as runtime:
-                    RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(runtime.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
-            self.assertEqual(runtime.exception.detail, "PermissionError")
-            self.assertNotIn(secret, runtime.exception.detail)
-
-    def test_runtime_scan_rejects_utf8_utf16_panic_and_refcell(self) -> None:
-        payloads = (
-            (DOCUMENT_SENTINEL.encode("utf-8"), "UTF8_DOCUMENT_SENTINEL_LEAKED"),
-            (DOCUMENT_SENTINEL.encode("utf-16-le"), "UTF16LE_DOCUMENT_SENTINEL_LEAKED"),
-            (b"thread panicked at source", "PANIC_LOGGED"),
-            (b"RefCell already borrowed", "REFCELL_BORROW_PANIC_LOGGED"),
-        )
-        for payload, code in payloads:
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                data = root / "data"
-                logs = data / "logs"
-                logs.mkdir(parents=True)
-                stderr = root / "stderr.log"
-                stderr.write_bytes(b"")
-                (logs / "markturbo-1.log").write_bytes(payload)
-
-                with self.assertRaises(HARNESS_FAILURE) as raised:
-                    RUNTIME_ARTIFACT_SCAN(data, stderr)
-                self.assertEqual(raised.exception.code, code)
-
-    def test_runtime_scan_requires_app_log_and_scans_recovery_payload(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            with self.assertRaises(HARNESS_FAILURE) as missing:
-                RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(missing.exception.code, "APP_LOG_MISSING")
-
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            (logs / "markturbo-1.log").write_bytes(b"startup ok")
-            (recovery / "record.mtrecovery").write_bytes(
-                DOCUMENT_SENTINEL.encode("utf-16-le")
-            )
-            with self.assertRaises(HARNESS_FAILURE) as leaked:
-                RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(leaked.exception.code, "UTF16LE_DOCUMENT_SENTINEL_LEAKED")
-
+class HarnessCleanupTests(unittest.TestCase):
     def test_cleanup_failure_still_cleans_other_owned_jobs(self) -> None:
         bad = mock.Mock()
-        bad.cleanup.side_effect = HARNESS_FAILURE("PROCESS_JOB_QUIESCENCE_TIMEOUT")
+        bad.cleanup.side_effect = runtime.HarnessFailure("PROCESS_JOB_QUIESCENCE_TIMEOUT")
         other = mock.Mock()
-        harness = object.__new__(NATIVE_HARNESS)
+        harness = object.__new__(runtime.NativeHarness)
         harness.processes = [bad, other]
 
-        with self.assertRaisesRegex(HARNESS_FAILURE, "PROCESS_JOB_QUIESCENCE_TIMEOUT"):
+        with self.assertRaisesRegex(runtime.HarnessFailure, "PROCESS_JOB_QUIESCENCE_TIMEOUT"):
             harness.cleanup()
 
         other.cleanup.assert_called_once_with()
+
+
+class PlatformAndExecutableTests(unittest.TestCase):
+    def test_accepts_windows_11_x64_only(self) -> None:
+        self.assertIsNone(runtime.platform_preflight_failure("Windows", 10, 22631, "AMD64", 64))
+        self.assertEqual(
+            runtime.platform_preflight_failure("Windows", 10, 19045, "AMD64", 64),
+            "WINDOWS_11_REQUIRED",
+        )
+        self.assertEqual(
+            runtime.platform_preflight_failure("Linux", 6, 0, "x86_64", 64),
+            "WINDOWS_REQUIRED",
+        )
+        self.assertEqual(
+            runtime.platform_preflight_failure("Windows", 10, 22631, "ARM64", 64),
+            "WINDOWS_X64_REQUIRED",
+        )
+
+    def test_parses_amd64_pe32_plus(self) -> None:
+        result = runtime.inspect_pe_bytes(minimal_pe())
+
+        self.assertEqual(result["machine"], "x86_64")
+        self.assertEqual(result["format"], "PE32+")
+
+    def test_records_content_free_pe_section_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "test.exe"
+            path.write_bytes(minimal_pe())
+
+            self.assertEqual(
+                runtime.inspect_pe_sections(path),
+                [
+                    {
+                        "name": ".text",
+                        "virtual_size": 123,
+                        "raw_size": 512,
+                        "characteristics": 0x60000020,
+                    }
+                ],
+            )
+
+    def test_rejects_non_x64_pe(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not AMD64 PE32"):
+            runtime.inspect_pe_bytes(minimal_pe(machine=0x14C, magic=0x10B))
+
+    def test_hash_comparison_fails_closed(self) -> None:
+        self.assertIsNone(runtime.executable_hash_failure(HASH, HASH))
+        self.assertEqual(
+            runtime.executable_hash_failure("b" * 64, HASH), "EXECUTABLE_HASH_MISMATCH"
+        )
+        self.assertEqual(runtime.executable_hash_failure("short", HASH), "EXECUTABLE_HASH_INVALID")
+
+    def test_maps_windows_launch_error_codes_without_exception_text(self) -> None:
+        self.assertEqual(
+            runtime.launch_failure_code(OSError(2147942402, "The system cannot find the file specified.")),
+            "PROCESS_LAUNCH_FILE_NOT_FOUND",
+        )
+        self.assertEqual(runtime.launch_failure_code(OSError(5, "access denied")), "PROCESS_LAUNCH_ACCESS_DENIED")
+        self.assertEqual(runtime.launch_failure_code(OSError(999, "secret")), "PROCESS_LAUNCH_FAILED")
 
 
 class OwnedProcessTests(unittest.TestCase):
