@@ -8,6 +8,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from scripts.markturbo_tools.native import evidence as shared_evidence
@@ -350,21 +351,32 @@ class FakeApp:
         *,
         shown_at_start: bool = False,
         close_works: bool = True,
+        close_exposed: bool = True,
         menu_works: bool = True,
+        breaks: tuple[str, str] | None = None,
     ) -> None:
         self.card = shown_at_start
         self.close_works = close_works
+        self.close_exposed = close_exposed
         self.menu_works = menu_works
+        # (phase, what): after `phase`'s Review, change the "editor" or the
+        # "source", or make the editor's re-read time out ("read").
+        self.breaks = breaks
         self.phase = "start"
         self.events: list[tuple[str, object]] = []
 
 
 class FakeWin32:
-    def __init__(self, app: FakeApp, owns_keyboard: bool = True) -> None:
+    def __init__(self, app: FakeApp, owns_keyboard: bool = True, focus_lag: int = 0) -> None:
         self.app = app
         self.owns_keyboard = owns_keyboard
+        # Samples that miss the focus before activation hands it over.
+        self.focus_lag = focus_lag
 
     def foreground_focus(self, hwnd: int) -> int:
+        if self.focus_lag:
+            self.focus_lag -= 1
+            return 0
         return hwnd if self.owns_keyboard else 0
 
     def send_shortcut(self, hwnd: int, key: int) -> None:
@@ -374,7 +386,7 @@ class FakeWin32:
             self.app.phase = "shortcut"
 
 
-def fake_harness(app: FakeApp, source: Path, **win32: bool) -> HARNESS.Goal06Harness:
+def fake_harness(app: FakeApp, source: Path, **win32: Any) -> HARNESS.Goal06Harness:
     """A real `Goal06Harness` whose UI Automation reads the fake app."""
     harness = object.__new__(HARNESS.Goal06Harness)
     harness.ui_timeout = 0.2
@@ -385,7 +397,7 @@ def fake_harness(app: FakeApp, source: Path, **win32: bool) -> HARNESS.Goal06Har
 
     def find_control(_app, automation_id, control_type, timeout_code, _mismatch):
         app.events.append(("find", automation_id))
-        if automation_id == HARNESS.REVIEW_CLOSE_AUTOMATION_ID and app.card:
+        if automation_id == HARNESS.REVIEW_CLOSE_AUTOMATION_ID and app.card and app.close_exposed:
             return close_button
         raise runtime.HarnessFailure(timeout_code)
 
@@ -402,7 +414,16 @@ def fake_harness(app: FakeApp, source: Path, **win32: bool) -> HARNESS.Goal06Har
 
     harness.activate_source_layout = lambda _app: app.events.append(("layout", None))
     harness.focus_editor = lambda _app: app.events.append(("focus", None))
-    harness.editor_fingerprint = lambda _app: document
+    def editor_fingerprint(_app):
+        if app.breaks == (app.phase, "read"):
+            raise runtime.HarnessFailure("EDITOR_TEXT_TIMEOUT")
+        if app.breaks == (app.phase, "editor"):
+            return runtime.fingerprint_text(HARNESS.DOCUMENT_TEXT + "x")
+        if app.breaks == (app.phase, "source"):
+            source.write_text(HARNESS.DOCUMENT_TEXT + "x", encoding="utf-8", newline="")
+        return document
+
+    harness.editor_fingerprint = editor_fingerprint
     harness.name_present = lambda _app, name, _type: (
         name == HARNESS.NOT_SET_UP_MESSAGE and app.card
     )
@@ -417,13 +438,13 @@ def fake_harness(app: FakeApp, source: Path, **win32: bool) -> HARNESS.Goal06Har
 
 
 class NotSetUpSessionTests(unittest.TestCase):
-    def run_session(self, app: FakeApp, **win32: bool) -> dict:
+    def run_session(self, app: FakeApp, **win32: Any) -> dict:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "review.md"
             harness = fake_harness(app, source, **win32)
             return harness.not_set_up_session(app, source)
 
-    def assert_fails(self, code: str, app: FakeApp, **win32: bool) -> None:
+    def assert_fails(self, code: str, app: FakeApp, **win32: Any) -> None:
         with self.assertRaises(runtime.HarnessFailure) as raised:
             self.run_session(app, **win32)
         self.assertEqual(raised.exception.code, code)
@@ -469,45 +490,94 @@ class NotSetUpSessionTests(unittest.TestCase):
     def test_a_menu_row_that_shows_nothing_fails_its_own_phase(self) -> None:
         self.assert_fails("MENU_DIAGNOSTIC_UIA_TIMEOUT", FakeApp(menu_works=False))
 
+    def test_every_failure_names_the_phase_it_happened_in(self) -> None:
+        # The same helper failure, or the same change, in two phases of the
+        # one session must yield two different, locatable codes.
+        for code, app in (
+            ("SHORTCUT_REVIEW_CHANGED_EDITOR", FakeApp(breaks=("shortcut", "editor"))),
+            ("SHORTCUT_REVIEW_CHANGED_SOURCE", FakeApp(breaks=("shortcut", "source"))),
+            ("SHORTCUT_EDITOR_TEXT_TIMEOUT", FakeApp(breaks=("shortcut", "read"))),
+            ("MENU_REVIEW_CHANGED_EDITOR", FakeApp(breaks=("menu", "editor"))),
+            ("MENU_REVIEW_CHANGED_SOURCE", FakeApp(breaks=("menu", "source"))),
+            ("MENU_EDITOR_TEXT_TIMEOUT", FakeApp(breaks=("menu", "read"))),
+            ("CLOSE_REVIEW_UIA_TIMEOUT", FakeApp(close_exposed=False)),
+        ):
+            with self.subTest(code=code):
+                self.assert_fails(code, app)
+
+    def test_the_shortcut_waits_for_activation_to_hand_over_the_keyboard(self) -> None:
+        observations = self.run_session(FakeApp(), focus_lag=2)
+
+        self.assertIs(observations["foreground_verified"], True)
 
 
 class CleanCloseTests(unittest.TestCase):
     """The document's clean state, measured by how a close request ends."""
 
     @staticmethod
-    def harness(exits_with: int | None, guard: bool) -> HARNESS.Goal06Harness:
-        events: list[str] = []
+    def harness(
+        exits_with: int | None,
+        guard: bool,
+        *,
+        exit_after_polls: int = 0,
+        window_destroyed: bool = False,
+        query_fails: bool = False,
+    ) -> HARNESS.Goal06Harness:
+        """`exit_after_polls` keeps the process alive for that many polls after
+        the close; meanwhile its window may already be destroyed, or a UIA
+        query against it may fail (nsh's DestroyWindow precedes the exit)."""
 
         class Process:
             def __init__(self) -> None:
                 self.closed = False
+                self.polls = 0
 
             def poll(self) -> int | None:
-                return exits_with if self.closed else None
+                if not self.closed:
+                    return None
+                self.polls += 1
+                return exits_with if self.polls > exit_after_polls else None
 
             def wait(self, timeout: float) -> int:
                 return exits_with
 
         process = Process()
 
+        class User32:
+            @staticmethod
+            def IsWindow(hwnd: int) -> bool:
+                return not (window_destroyed and process.closed)
+
         class Win32:
+            user32 = User32()
+
             def post_close(self, hwnd: int) -> None:
-                events.append("close")
                 process.closed = True
+
+        def name_present(_app, name, _type):
+            if query_fails and process.closed:
+                raise runtime.HarnessFailure("UIA_NAME_QUERY_FAILED")
+            return guard and process.closed and name == runtime.GUARD_HEADING
 
         harness = object.__new__(HARNESS.Goal06Harness)
         harness.ui_timeout = 0.2
         harness.win32 = Win32()
-        harness.name_present = lambda _app, name, _type: (
-            guard and process.closed and name == runtime.GUARD_HEADING
-        )
+        harness.name_present = name_present
         harness.app = type("App", (), {"hwnd": 42, "process": process})()
         return harness
 
     def test_a_clean_document_closes_without_the_guard(self) -> None:
-        harness = self.harness(exits_with=0, guard=False)
+        for window_destroyed, query_fails in ((False, False), (True, False), (False, True)):
+            with self.subTest(window_destroyed=window_destroyed, query_fails=query_fails):
+                harness = self.harness(
+                    exits_with=0,
+                    guard=False,
+                    exit_after_polls=3,
+                    window_destroyed=window_destroyed,
+                    query_fails=query_fails,
+                )
 
-        self.assertTrue(runtime.finite_nonnegative(harness.close_clean(harness.app)))
+                self.assertTrue(runtime.finite_nonnegative(harness.close_clean(harness.app)))
 
     def test_a_dirty_document_fails_on_the_guard_it_raises(self) -> None:
         for exits_with, guard, code in (
@@ -520,6 +590,14 @@ class CleanCloseTests(unittest.TestCase):
                 with self.assertRaises(runtime.HarnessFailure) as raised:
                     harness.close_clean(harness.app)
                 self.assertEqual(raised.exception.code, code)
+
+    def test_queries_that_keep_failing_never_pass_as_a_clean_close(self) -> None:
+        harness = self.harness(exits_with=None, guard=False, query_fails=True)
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.close_clean(harness.app)
+
+        self.assertEqual(raised.exception.code, "PROCESS_EXIT_TIMEOUT")
 
 
 class ConfiguredReviewTests(unittest.TestCase):
@@ -604,6 +682,35 @@ class ConfiguredReviewTests(unittest.TestCase):
 
                 self.assertIs(harness.request_review(app, case_id), True)
                 self.assertEqual(app.events, expected)
+
+    def test_each_review_request_needs_the_keyboard_on_the_app_window(self) -> None:
+        for case_id, code in (
+            (CASE_DOCUMENT, "REVIEW_SHORTCUT_NATIVE_FOCUS_LOST"),
+            (CASE_SELECTION, "REVIEW_SELECT_ALL_NATIVE_FOCUS_LOST"),
+        ):
+            with self.subTest(case=case_id), tempfile.TemporaryDirectory() as temporary:
+                app = FakeApp()
+                harness = fake_harness(app, Path(temporary) / "review.md", owns_keyboard=False)
+
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    harness.request_review(app, case_id)
+
+                self.assertEqual(raised.exception.code, code)
+                self.assertNotIn("shortcut", [event[0] for event in app.events])
+
+    def test_a_review_that_changes_the_editor_or_file_fails_its_case(self) -> None:
+        for what, code in (("editor", "REVIEW_CHANGED_EDITOR"), ("source", "REVIEW_CHANGED_SOURCE")):
+            with self.subTest(what=what), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "review.md"
+                app = FakeApp(breaks=("result", what))
+                harness = fake_harness(app, source)
+                before = {"editor_before": DOCUMENT_PRINT, "source_before": DOCUMENT_PRINT}
+                app.phase = "result"
+
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    harness.read_only_phase(app, source, before, None)
+
+                self.assertEqual(raised.exception.code, code)
 
 
 class PlanAndArgumentTests(unittest.TestCase):

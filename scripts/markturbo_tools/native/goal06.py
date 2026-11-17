@@ -6,7 +6,8 @@ document content can leave; the harness never queries Credential Manager.
 Ctrl+Enter from the focused editor must show the explicit local diagnostic
 (`No model set up`); the card's Close (`review-close`) must take it away; and
 the title menu's Review row (`title-menu-review-selection`) must bring it back.
-Each phase has its own observation keys and failure codes.
+Each phase has its own observation keys, and every failure inside a phase,
+including one a shared helper raises, carries the phase's code prefix.
 
 The opt-in configured-provider mode sends only the fixed test document to an
 already-running loopback provider using a fresh process-only credential, in
@@ -25,6 +26,8 @@ import argparse
 import json
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -257,6 +260,22 @@ def _elapsed_ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 3)
 
 
+@contextmanager
+def _phase(prefix: str) -> Iterator[None]:
+    """Give every failure in one phase of a merged session the phase's prefix,
+    so a shared helper's code (e.g. `EDITOR_TEXT_TIMEOUT`) stays locatable."""
+    try:
+        yield
+    except HarnessFailure as error:
+        if error.code.startswith(f"{prefix}_"):
+            raise
+        raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
+
+
+def _window_exists(win32: Any, hwnd: int) -> bool:
+    return bool(win32.user32.IsWindow(hwnd))
+
+
 class Goal06Harness(BaseNativeHarness):
     def __init__(self, *args: Any, configured_provider: bool = False) -> None:
         super().__init__(*args)
@@ -290,11 +309,14 @@ class Goal06Harness(BaseNativeHarness):
 
     def send_from_editor(self, app: Any, key: int, code: str) -> bool:
         """Ctrl+`key` from the focused editor. Returns the measured fact that
-        the app's main window owned the keyboard as the key went out."""
+        the app's main window owned the keyboard as the key went out; the
+        activation that hands it over is awaited, not sampled once."""
         self.focus_editor(app)
-        owned = self.win32.foreground_focus(app.hwnd) == app.hwnd
-        if not owned:
-            raise HarnessFailure(f"{code}_NATIVE_FOCUS_LOST")
+        owned = wait_until(
+            lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
+            self.ui_timeout,
+            f"{code}_NATIVE_FOCUS_LOST",
+        )
         self.win32.send_shortcut(app.hwnd, key)
         return owned
 
@@ -328,16 +350,15 @@ class Goal06Harness(BaseNativeHarness):
     def read_only_phase(
         self, app: Any, source: Path, before: dict[str, Any], phase: str | None
     ) -> dict[str, Any]:
-        """Measure the editor and the file after one Review phase; each change
-        fails with the phase's own code."""
+        """Measure the editor and the file after one Review phase (`phase`
+        names its observation keys; `_phase` prefixes its failure codes)."""
         prefix = f"{phase}_" if phase else ""
-        code = f"{phase.upper()}_REVIEW" if phase else "REVIEW"
         editor = self.editor_fingerprint(app)
         file = sha256_file(source)
         if editor.evidence() != before["editor_before"]:
-            raise HarnessFailure(f"{code}_CHANGED_EDITOR")
+            raise HarnessFailure("REVIEW_CHANGED_EDITOR")
         if file.evidence() != before["source_before"]:
-            raise HarnessFailure(f"{code}_CHANGED_SOURCE")
+            raise HarnessFailure("REVIEW_CHANGED_SOURCE")
         return {
             f"{prefix}editor_after": editor.evidence(),
             f"{prefix}source_after": file.evidence(),
@@ -345,17 +366,18 @@ class Goal06Harness(BaseNativeHarness):
 
     def close_clean(self, app: Any) -> float:
         """Request the window's close and measure until the process ends.
-        A dirty document raises the in-app guard instead (`request_quit`)."""
+        A dirty document raises the in-app guard instead (`request_quit`).
+        nsh destroys a clean window before its process exits, so a gone
+        window, or a query that fails while it goes, is still closing: only a
+        guard actually found fails the close; the exit wait decides the rest."""
 
         def settled() -> str | None:
-            if app.process.poll() is not None:
-                return "exited"
+            if app.process.poll() is not None or not _window_exists(self.win32, app.hwnd):
+                return "closing"
             try:
                 return "guard" if self.name_present(app, GUARD_HEADING, "Text") else None
             except HarnessFailure:
-                if app.process.poll() is not None:
-                    return "exited"
-                raise
+                return None
 
         started = time.perf_counter()
         self.win32.post_close(app.hwnd)
@@ -413,21 +435,26 @@ class Goal06Harness(BaseNativeHarness):
         observations = self.initial_state(app, source)
         # Shortcut phase: the card must be absent first, so its appearance
         # is this key's effect.
-        observations["shortcut_diagnostic_before"] = self.not_set_up_shown(app)
-        if observations["shortcut_diagnostic_before"]:
-            raise HarnessFailure("SHORTCUT_DIAGNOSTIC_PRESENT_BEFORE_REVIEW")
-        observations["foreground_verified"] = self.send_from_editor(app, VK_RETURN, "SHORTCUT")
-        observations["shortcut_diagnostic_ms"] = self.wait_not_set_up(
-            app, "SHORTCUT_DIAGNOSTIC_UIA_TIMEOUT"
-        )
-        observations.update(self.read_only_phase(app, source, observations, "shortcut"))
+        with _phase("SHORTCUT"):
+            observations["shortcut_diagnostic_before"] = self.not_set_up_shown(app)
+            if observations["shortcut_diagnostic_before"]:
+                raise HarnessFailure("SHORTCUT_DIAGNOSTIC_PRESENT_BEFORE_REVIEW")
+            observations["foreground_verified"] = self.send_from_editor(
+                app, VK_RETURN, "SHORTCUT"
+            )
+            observations["shortcut_diagnostic_ms"] = self.wait_not_set_up(
+                app, "SHORTCUT_DIAGNOSTIC_UIA_TIMEOUT"
+            )
+            observations.update(self.read_only_phase(app, source, observations, "shortcut"))
         # Close phase, then the menu phase on an empty field.
-        observations["close_diagnostic_gone_ms"] = self.close_not_set_up(app)
-        started = time.perf_counter()
-        self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
-        self.wait_name(app, NOT_SET_UP_MESSAGE, "Text", "MENU_DIAGNOSTIC_UIA_TIMEOUT")
-        observations["menu_diagnostic_ms"] = _elapsed_ms(started)
-        observations.update(self.read_only_phase(app, source, observations, "menu"))
+        with _phase("CLOSE"):
+            observations["close_diagnostic_gone_ms"] = self.close_not_set_up(app)
+        with _phase("MENU"):
+            started = time.perf_counter()
+            self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
+            self.wait_name(app, NOT_SET_UP_MESSAGE, "Text", "MENU_DIAGNOSTIC_UIA_TIMEOUT")
+            observations["menu_diagnostic_ms"] = _elapsed_ms(started)
+            observations.update(self.read_only_phase(app, source, observations, "menu"))
         return observations
 
     def configured_session(self, app: Any, source: Path, case_id: str) -> dict[str, Any]:
