@@ -48,7 +48,7 @@ carried forward in [TODO](TODO.md).
 
 ```sh
 uv run --locked --project scripts scripts/mt.py visual -- \
-    --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+    --exe target/release/markturbo.exe \
     --out target/native-acceptance/goal-09
 ```
 
@@ -60,10 +60,10 @@ bound to the revision and executable hash below - re-running the command does
 not update it or its review sheets, and nothing points `--out` at retained
 evidence.
 
-The packaged executable comes from the same revision:
+The release executable comes from the same revision:
 
 ```sh
-cd crates/mt-app && nsh package --target windows --out .nsh/out
+cargo build --release --locked -p mt-app --bin markturbo
 ```
 
 Each cell launches the packaged app on an isolated profile, drives the real

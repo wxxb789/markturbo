@@ -183,7 +183,13 @@ uv run --locked --project scripts scripts/mt.py release verify --manifest dist/r
 
 `release versions` requires `Cargo.toml`, `crates/mt-app/nsh.json` and the
 release tag to name one version. `release package` runs
-`nsh package --target windows`, fails when the executable does not embed every
+`cargo build --release --locked -p mt-app --bin markturbo`, so the shipped
+executable uses the root `Cargo.lock`, the vendored `ratex-parser` patch and
+the root release profile; it does not use `nsh package`, whose generated runner
+is a separate Cargo workspace that bypasses all three. It stages the binary as
+`MarkTurbo.exe`, writes the application icon into it as icon group resource 1
+(which nsh loads for the window and taskbar) before signing and reads it back,
+fails when the executable does not carry the workspace version or embed every
 required KaTeX face or bundled sample entry, stages the project license and
 third-party notices, compiles `installer/markturbo.iss` with Inno Setup, and
 writes the SHA-256 sidecar and `release.json`. Signing reads
@@ -204,14 +210,9 @@ does not trust that certificate by default, so the result is labeled
 `self-signed`, is never accepted as a stable publication signature, and
 `--require-signature` rejects it.
 
-The packaging commands require the `nsh` CLI and Inno Setup 6 (`ISCC.exe`);
-the release workflow installs the pinned Inno Setup version and the nsh CLI
-release matching the pinned crates (currently `v0.5.1`, the version the
-packaging runtime comes from) before running them. It fails fast when the
-installed CLI and the pinned `nsh-core` disagree, because `nsh package`
-compiles the app against the CLI's runtime: installing the latest CLI broke the
-`v0.1.4-alpha.3` tag when nsh 0.5.1 no longer provided an API the pinned
-`nsh-core` 0.4.0 callers use.
+The packaging commands run on Windows and require Cargo and Inno Setup 6
+(`ISCC.exe`), not the `nsh` CLI; the release workflow installs the pinned Inno
+Setup version before running them.
 
 `check full` does not build the installer. The release workflow runs it first,
 then packages that same revision, and creates a draft release. The draft gate

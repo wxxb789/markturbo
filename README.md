@@ -232,11 +232,12 @@ The binary is `markturbo`. Its entry point embeds `crates/mt-app/theme.json` as
 nsh tokens and registers the embedded Martian fonts on the root. A path argument
 opens that folder, or opens a file with its parent folder.
 
-`nsh package --target windows|macos|linux`, run from `crates/mt-app`, builds a
-standalone app; name, id, version, theme, and icon come from `nsh.json`. The
-nsh CLI version must equal the `nsh-core` pin (0.5.1). The release workflow
-checks this; local `scripts/mt.py release package` does not. See
-[docs/platforms.md](docs/platforms.md) for per-platform toolchains.
+Release builds ship this same binary: `scripts/mt.py release package` runs
+`cargo build --release --locked -p mt-app --bin markturbo`, embeds the icon and
+wraps it in the Windows installer. `nsh package` is not used for releases: its
+generated runner is a separate Cargo workspace that bypasses the root lock,
+`[patch]` and release profile. See [docs/platforms.md](docs/platforms.md) for
+per-platform toolchains.
 
 The release gate:
 
@@ -391,7 +392,7 @@ Environment variables the app reads:
 | `MARKTURBO_TRANSLATE_MODEL` | Legacy model-id fallback |
 | `MARKTURBO_CONFIG_DIR` | Directory for `settings.toml`; blank means unset |
 | `MARKTURBO_DATA_DIR` | Absolute runtime data root; a non-empty invalid value disables runtime data rather than falling back |
-| `MARKTURBO_OPEN` | Folder or file to open at start; set from the first command-line argument |
+| `MARKTURBO_OPEN` | Folder or file to open at start when no command-line argument names one |
 | `MT_MATH_FONT_DIR` | KaTeX font directory override; incomplete or missing directories fall back to the embedded fonts |
 | `CODEX_HOME` | Codex home for Effective Agent Context, else `~/.codex` |
 | `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug` |

@@ -149,8 +149,8 @@ The goal-02/03/06/07 harnesses (`scripts/markturbo_tools/native/`) are ported
 to the nsh UI and synchronized with the merged Afterglow behavior below. They
 have not yet run live against an nsh build: no nsh acceptance evidence exists,
 and that absence stays pending, not a pass. Their unit tests run in
-`check native`, not the fast gate. Pass the packaged app with
-`--exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe`.
+`check native`, not the fast gate. Pass the release binary with
+`--exe target/release/markturbo.exe`.
 
 How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
 
@@ -293,7 +293,7 @@ One command runs every goal on one executable:
 
 ```sh
 uv run --locked --project scripts scripts/mt.py accept all \
-    --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+    --exe target/release/markturbo.exe \
     --expect-exe-sha256 <sha256> --evidence-dir target/native-acceptance \
     [--keep-going] [--ui-timeout 15]
 ```
@@ -354,7 +354,7 @@ Goal 09's release-build screenshot matrix is produced by:
 
 ```sh
 uv run --locked --project scripts scripts/mt.py visual -- \
-    --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+    --exe target/release/markturbo.exe \
     --out target/native-acceptance/goal-09
 ```
 

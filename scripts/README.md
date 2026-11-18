@@ -97,8 +97,9 @@ launch); goal-03 `first_use_lifecycle` (three launches). The per-phase contents 
 [verification](../docs/verification.md#native-harness-status).
 
 `release` owns the Windows installer contract. `versions` requires Cargo,
-`crates/mt-app/nsh.json` and the release tag to agree; `package` runs
-`nsh package --target windows`, verifies embedded fonts and sample entries,
+`crates/mt-app/nsh.json` and the release tag to agree; `package` builds
+`cargo build --release --locked -p mt-app --bin markturbo`, embeds the
+application icon (resource 1), verifies embedded fonts and sample entries,
 stages the license and third-party notices, and compiles
 `installer/markturbo.iss` with Inno Setup; `verify` rechecks the checksum,
 manifest inventory and signing policy. Stable releases require Authenticode
@@ -211,7 +212,7 @@ if ($LASTEXITCODE -ne 0) { throw "machine receipt generation failed" }
 $machineSha = (Get-FileHash $machineReceipt -Algorithm SHA256).Hash.ToLowerInvariant()
 $registrySha = (uv run --project scripts python -c "import json,sys; from pathlib import Path; from scripts.markturbo_tools.revision_evaluation import canonical_registry_digest; print(canonical_registry_digest(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))))" $registry).Trim()
 $nativeEvidenceSha = (Get-FileHash $nativeEvidence -Algorithm SHA256).Hash.ToLowerInvariant()
-$nativeExecutableSha = (Get-FileHash "crates\mt-app\.nsh\out\MarkTurbo\MarkTurbo.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+$nativeExecutableSha = (Get-FileHash "target\release\markturbo.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
 
 uv run --project scripts scripts/mt.py revision-evaluation record `
   --owner-input-dir $ownerDir `
@@ -321,17 +322,17 @@ Forward an underlying script's options after `--`. For example:
 ```sh
 uv run --project scripts scripts/mt.py probe -- startup --rounds 10
 uv run --project scripts scripts/mt.py accept goal-03 -- \
-  --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+  --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
   --evidence target/native-acceptance/goal-03-native-acceptance.json
 
 uv run --project scripts scripts/mt.py accept goal-06 -- \
-  --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+  --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
   --evidence target/native-acceptance/goal-06-native-acceptance.json
 
 uv run --project scripts scripts/mt.py accept goal-07 -- \
-  --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+  --exe target/release/markturbo.exe \
   --expect-exe-sha256 <sha256> \
   --evidence target/native-acceptance/goal-07-native-acceptance.json
 ```
@@ -343,11 +344,13 @@ when the underlying module is invoked directly.
 ## Native evidence
 
 Native acceptance requires Windows 11 x64, an active unlocked interactive
-desktop, `pywinauto`, and a current packaged `MarkTurbo.exe`. Package first:
+desktop, `pywinauto`, and a current release `markturbo.exe`, the binary
+`release package` wraps (it adds the icon resource and any signature to its
+staged copy, so the installed file hashes differently). Build it first:
 
 ```sh
-cd crates/mt-app && nsh package --target windows --out .nsh/out && cd ../..
-sha256sum crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe
+cargo build --release --locked -p mt-app --bin markturbo
+sha256sum target/release/markturbo.exe
 ```
 
 Use the measured hash in the `accept` command. `PASS` is possible only when all

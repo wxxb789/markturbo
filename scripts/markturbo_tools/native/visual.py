@@ -13,7 +13,7 @@ Run from the repository root, on an active Windows 11 x64 desktop, with a
 packaged `MarkTurbo.exe` built from the same source revision::
 
     uv run --locked --project scripts scripts/mt.py visual \\
-        --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \\
+        --exe target/release/markturbo.exe \\
         --out target/native-acceptance/goal-09
 
 `--out` names a scratch directory: the capture rewrites the cells it writes and

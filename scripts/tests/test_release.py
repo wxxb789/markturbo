@@ -4,34 +4,25 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.markturbo_tools import release
+from scripts.markturbo_tools import checks, release
 
 
-def fake_app_tree(root: Path, *, version: str = "1.2.3") -> Path:
-    """Create the minimum nsh package layout the release checks expect."""
+def fake_binary(root: Path, *, version: str = "1.2.3") -> Path:
+    """Create a stand-in for Cargo's `markturbo.exe` carrying its version."""
 
-    app = root / "app"
-    (app / "nsh").mkdir(parents=True)
-    (app / "nsh" / "app.json").write_text(
-        json.dumps(
-            {
-                "name": "MarkTurbo",
-                "id": "com.markturbo.app",
-                "version": version,
-                "appearance": "system",
-            }
-        ),
-        encoding="utf-8",
-    )
-    binary = app / "MarkTurbo.exe"
-    binary.write_bytes(b"MZ" + b"\0" * 1022)
-    return app
+    binary = root / "target" / "release" / "markturbo.exe"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"MZ" + b"\0" * 1022 + version.encode("utf-8"))
+    return binary
 
 
 def fake_payload(root: Path, *, version: str = "1.2.3") -> tuple[Path, Path, Path]:
@@ -49,8 +40,7 @@ def fake_payload(root: Path, *, version: str = "1.2.3") -> tuple[Path, Path, Pat
     excluded = fonts / "KaTeX_Caligraphic-Bold.ttf"
     excluded.write_bytes(b"XTRA" + bytes(reversed(range(60))))
 
-    app = fake_app_tree(root, version=version)
-    binary = app / "MarkTurbo.exe"
+    binary = fake_binary(root, version=version)
     payload = b"".join(
         [
             binary.read_bytes(),
@@ -60,7 +50,7 @@ def fake_payload(root: Path, *, version: str = "1.2.3") -> tuple[Path, Path, Pat
         ]
     )
     binary.write_bytes(payload)
-    return app, sample, fonts
+    return binary, sample, fonts
 
 
 def release_version(version: str = "1.2.3") -> release.ReleaseVersion:
@@ -93,7 +83,6 @@ def write_manifest(
         if payload is not None
         else [
             {"path": "MarkTurbo.exe", "bytes": 16},
-            {"path": "nsh/app.json", "bytes": 16},
             {"path": "LICENSE", "bytes": 16},
             {"path": "THIRD-PARTY-NOTICES.md", "bytes": 16},
         ],
@@ -168,109 +157,216 @@ class ReleaseVersionTests(unittest.TestCase):
 
 
 class PayloadTests(unittest.TestCase):
-    def test_staging_copies_every_packaged_file_and_reports_it(self) -> None:
+    def test_staging_ships_the_cargo_binary_under_the_installed_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            app, _, _ = fake_payload(root)
-            destination = root / "staged"
-
-            files = release.stage_payload(app, destination, notices={})
-
-            self.assertEqual(
-                [path.as_posix() for path in files],
-                ["MarkTurbo.exe", "nsh/app.json"],
-            )
-            self.assertEqual(
-                release.payload_inventory(destination),
-                [
-                    {"path": "MarkTurbo.exe", "bytes": (destination / "MarkTurbo.exe").stat().st_size},
-                    {"path": "nsh/app.json", "bytes": (destination / "nsh" / "app.json").stat().st_size},
-                ],
-            )
-
-    def test_staging_copies_shipped_notices(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            app = fake_app_tree(root)
+            binary, _, _ = fake_payload(root)
             license_file = root / "license.txt"
             license_file.write_text("license\n", encoding="utf-8")
             notice_file = root / "notices.txt"
             notice_file.write_text("notices\n", encoding="utf-8")
+            destination = root / "staged"
 
             files = release.stage_payload(
-                app,
-                root / "staged",
+                binary,
+                destination,
                 notices={"LICENSE": license_file, "NOTICE.txt": notice_file},
             )
 
             self.assertEqual(
                 [path.as_posix() for path in files],
-                ["LICENSE", "MarkTurbo.exe", "NOTICE.txt", "nsh/app.json"],
+                ["LICENSE", "MarkTurbo.exe", "NOTICE.txt"],
+            )
+            self.assertEqual(
+                (destination / "MarkTurbo.exe").read_bytes(), binary.read_bytes()
+            )
+            self.assertIn(
+                {"path": "MarkTurbo.exe", "bytes": binary.stat().st_size},
+                release.payload_inventory(destination),
             )
 
-    def test_staging_rejects_a_package_without_the_runner_metadata(self) -> None:
+    def test_staging_rejects_a_missing_binary_or_notice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            app = fake_app_tree(Path(temporary))
-            (app / "nsh" / "app.json").unlink()
-
-            with self.assertRaisesRegex(release.ReleaseError, "nsh/app.json"):
-                release.stage_payload(app, Path(temporary) / "staged")
+            root = Path(temporary)
+            with self.assertRaisesRegex(release.ReleaseError, "executable is missing"):
+                release.stage_payload(root / "missing.exe", root / "staged", notices={})
+            binary = fake_binary(root)
+            with self.assertRaisesRegex(release.ReleaseError, "notice is missing"):
+                release.stage_payload(
+                    binary, root / "staged", notices={"LICENSE": root / "missing"}
+                )
 
     def test_binary_check_requires_every_font_and_sample_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            app, sample, fonts = fake_payload(root)
+            binary, sample, fonts = fake_payload(root)
 
-            release.verify_binary(
-                app / "MarkTurbo.exe",
-                release_version(),
-                sample=sample,
-                fonts=fonts,
-            )
+            release.verify_binary(binary, release_version(), sample=sample, fonts=fonts)
 
     def test_binary_check_names_the_missing_font(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            app, sample, fonts = fake_payload(root)
+            binary, sample, fonts = fake_payload(root)
             (fonts / "KaTeX_AMS-Regular.ttf").write_bytes(b"FONT" + bytes(range(60)))
 
             with self.assertRaisesRegex(release.ReleaseError, "KaTeX_AMS-Regular.ttf"):
-                release.verify_binary(
-                    app / "MarkTurbo.exe",
-                    release_version(),
-                    sample=sample,
-                    fonts=fonts,
-                )
+                release.verify_binary(binary, release_version(), sample=sample, fonts=fonts)
 
     def test_binary_check_names_the_missing_sample_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            app, sample, fonts = fake_payload(root)
+            binary, sample, fonts = fake_payload(root)
             (sample / "extra.md").write_text("extra\n", encoding="utf-8")
 
             with self.assertRaisesRegex(release.ReleaseError, "sample/extra.md"):
-                release.verify_binary(
-                    app / "MarkTurbo.exe",
-                    release_version(),
-                    sample=sample,
-                    fonts=fonts,
-                )
+                release.verify_binary(binary, release_version(), sample=sample, fonts=fonts)
 
-    def test_binary_check_rejects_a_version_disagreement_in_the_runner_metadata(self) -> None:
+    def test_binary_check_rejects_a_binary_built_from_another_version(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            app, sample, fonts = fake_payload(root)
-            metadata = json.loads((app / "nsh" / "app.json").read_text(encoding="utf-8"))
-            metadata["version"] = "9.9.9"
-            (app / "nsh" / "app.json").write_text(json.dumps(metadata), encoding="utf-8")
+            binary, sample, fonts = fake_payload(root, version="9.9.9")
 
-            with self.assertRaisesRegex(release.ReleaseError, "does not match"):
-                release.verify_binary(
-                    app / "MarkTurbo.exe",
-                    release_version(),
-                    sample=sample,
-                    fonts=fonts,
-                )
+            with self.assertRaisesRegex(release.ReleaseError, "not built from version 1.2.3"):
+                release.verify_binary(binary, release_version(), sample=sample, fonts=fonts)
+
+
+class BuildTests(unittest.TestCase):
+    def test_release_builds_the_workspace_binary_with_the_locked_root_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = fake_binary(Path(temporary))
+            artifact = json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "target": {"name": "markturbo", "kind": ["bin"]},
+                    "executable": str(binary),
+                }
+            )
+            with (
+                mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+                mock.patch.object(checks, "run", return_value=artifact + "\n") as run,
+            ):
+                self.assertEqual(release.build_app_binary(), binary)
+
+            command = list(run.call_args.args[0])
+            self.assertEqual(
+                command[:8],
+                ["cargo", "build", "--release", "--locked", "-p", "mt-app", "--bin", "markturbo"],
+            )
+            self.assertNotIn("--manifest-path", command)
+            self.assertEqual(run.call_args.kwargs.get("cwd", checks.ROOT), release.ROOT)
+
+    def test_a_failed_build_is_a_release_error(self) -> None:
+        with (
+            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+            mock.patch.object(checks, "run", side_effect=checks.CheckFailure("cargo failed")),
+            self.assertRaisesRegex(release.ReleaseError, "cargo failed"),
+        ):
+            release.build_app_binary()
+
+
+class IconResourceTests(unittest.TestCase):
+    def test_icon_group_replaces_each_file_offset_with_a_resource_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ico = release.render_icon(Path(temporary) / "app.ico").read_bytes()
+
+        group, images = release.icon_group_resources(ico)
+
+        reserved, kind, count = struct.unpack_from("<HHH", ico)
+        self.assertEqual(group[:6], struct.pack("<HHH", reserved, kind, count))
+        self.assertEqual(len(group), 6 + 14 * count)
+        self.assertEqual([image_id for image_id, _ in images], list(range(1, count + 1)))
+        for index, (image_id, image) in enumerate(images):
+            entry = struct.unpack_from("<BBBBHHII", ico, 6 + 16 * index)
+            group_entry = struct.unpack_from("<BBBBHHIH", group, 6 + 14 * index)
+            self.assertEqual(group_entry[:7], entry[:7])
+            self.assertEqual(group_entry[7], image_id)
+            self.assertEqual(image, ico[entry[7] : entry[7] + entry[6]])
+
+    def test_malformed_icons_are_rejected(self) -> None:
+        header = struct.pack("<HHH", 0, 1, 1)
+        for data in (b"", b"PNG", header, header + struct.pack("<BBBBHHII", 16, 16, 0, 0, 1, 32, 64, 22)):
+            with self.subTest(data=data):
+                with self.assertRaises(release.ReleaseError):
+                    release.icon_group_resources(data)
+
+    @unittest.skipUnless(sys.platform == "win32", "PE resources are edited through Win32")
+    def test_embedded_icon_group_one_round_trips_through_win32(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "MarkTurbo.exe"
+            shutil.copyfile(sys.executable, executable)
+            icon = release.render_icon(root / "app.ico")
+            with self.assertRaises(release.ReleaseError):
+                release.verify_icon(executable, icon)
+
+            release.embed_icon(executable, icon)
+            release.verify_icon(executable, icon)
+
+            # The same lookup nsh-platform-windows makes for its window class.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+            kernel32.LoadLibraryExW.restype = wintypes.HMODULE
+            kernel32.FreeLibrary.argtypes = [wintypes.HMODULE]
+            user32.LoadIconW.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
+            user32.LoadIconW.restype = wintypes.HICON
+            module = kernel32.LoadLibraryExW(str(executable), None, 0x20)
+            self.assertTrue(module)
+            try:
+                self.assertTrue(user32.LoadIconW(module, release.ICON_GROUP_ID))
+            finally:
+                kernel32.FreeLibrary(module)
+
+
+class PackageReleaseTests(unittest.TestCase):
+    def test_package_embeds_the_icon_before_signing_and_ships_no_nsh_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = fake_binary(root)
+            output = root / "dist"
+            events: list[tuple[str, str]] = []
+
+            def record(name: str):  # type: ignore[no-untyped-def]
+                return lambda path, *_args, **_kwargs: events.append((name, Path(path).name))
+
+            def compile_installer(payload: Path, out: Path, version, *, icon: Path) -> Path:  # type: ignore[no-untyped-def]
+                events.append(("compile", sorted(path.name for path in payload.rglob("*"))))
+                artifact = out / version.artifact
+                artifact.write_bytes(b"installer")
+                return artifact
+
+            with (
+                mock.patch.object(release, "_signing_credentials", return_value=("a.pfx", "pw")),
+                mock.patch.object(release, "build_app_binary", return_value=binary),
+                mock.patch.object(release, "embed_icon", side_effect=record("embed_icon")),
+                mock.patch.object(release, "verify_icon", side_effect=record("verify_icon")),
+                mock.patch.object(release, "verify_binary", side_effect=record("verify_binary")),
+                mock.patch.object(release.privacy, "scan"),
+                mock.patch.object(release, "sign_file", side_effect=record("sign")),
+                mock.patch.object(release, "verify_authenticode"),
+                mock.patch.object(release, "compile_installer", side_effect=compile_installer),
+            ):
+                document = release.package_release(output)
+
+            self.assertEqual(
+                events,
+                [
+                    ("embed_icon", "MarkTurbo.exe"),
+                    ("verify_icon", "MarkTurbo.exe"),
+                    ("verify_binary", "MarkTurbo.exe"),
+                    ("sign", "MarkTurbo.exe"),
+                    ("compile", ["LICENSE", "MarkTurbo.exe", "THIRD-PARTY-NOTICES.md"]),
+                    ("sign", document["artifact"]),
+                ],
+            )
+            self.assertEqual(
+                [entry["path"] for entry in document["payload"]],
+                ["LICENSE", "MarkTurbo.exe", "THIRD-PARTY-NOTICES.md"],
+            )
+            self.assertEqual(document["signing"], "authenticode")
 
 
 class PEHeaderTests(unittest.TestCase):
@@ -429,7 +525,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                 payload=[{"path": "MarkTurbo.exe", "bytes": 12}],
             )
 
-            with self.assertRaisesRegex(release.ReleaseError, "nsh/app.json"):
+            with self.assertRaisesRegex(release.ReleaseError, "LICENSE"):
                 release.verify_artifact(manifest)
 
     def test_manifest_version_must_match_the_checkout_under_test(self) -> None:
