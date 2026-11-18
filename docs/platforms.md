@@ -130,9 +130,8 @@ The stable platform identifier is `io.github.wxxb789.markturbo`.
 - macOS has a checked-in `.icns` and `Info.plist.in` template, but the current
   raw-executable build does not apply either or produce a `.app` bundle.
 
-All platform icon forms are derived from
-`crates/mt-app/icon.png`; run
-`uv run --project scripts scripts/mt.py icons` after replacing that 1024 px master.
+The release icon is rendered from the 1024 px master `crates/mt-app/icon.png`
+by `scripts/mt.py release package`, which embeds it in `MarkTurbo.exe`.
 
 **gpui-wry** (the WebView) states in its own README:
 

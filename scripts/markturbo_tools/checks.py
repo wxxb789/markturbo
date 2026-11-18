@@ -35,7 +35,6 @@ TOOLING_TESTS = (
     "scripts.tests.test_cli",
     "scripts.tests.test_evaluation",
     "scripts.tests.test_revision_evaluation",
-    "scripts.tests.test_icons",
     "scripts.tests.test_perf_fixtures",
     "scripts.tests.test_recovery_capacity",
     "scripts.tests.test_probe",

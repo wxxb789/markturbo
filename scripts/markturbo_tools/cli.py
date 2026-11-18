@@ -13,7 +13,6 @@ from . import checks
 
 ROOT = Path(__file__).resolve().parents[2]
 UTILITY_COMMANDS = {
-    "icons": "scripts.markturbo_tools.icons",
     "fixtures": "scripts.markturbo_tools.perf_fixtures",
     "probe": "scripts.markturbo_tools.probe",
     "capacity": "scripts.markturbo_tools.recovery_capacity",

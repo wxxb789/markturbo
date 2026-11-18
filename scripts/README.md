@@ -60,7 +60,6 @@ without a desktop; they do not replace native acceptance.
 ## Commands
 
 ```sh
-uv run --project scripts scripts/mt.py icons
 uv run --project scripts scripts/mt.py fixtures
 uv run --project scripts scripts/mt.py probe -- memory
 uv run --project scripts scripts/mt.py capacity
