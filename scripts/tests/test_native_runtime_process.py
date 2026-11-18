@@ -1,9 +1,20 @@
-"""Goal 02 native harness tests without launching a UI."""
+"""The shared native runtime's platform, process and artifact boundaries, against fakes."""
 
-from ._native_goal02_support import *
+from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes as wt
 import sys
+import tempfile
+import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+
+from scripts.markturbo_tools.native import runtime
+
+from ._native_support import HASH, minimal_pe
 
 
 class OwnedKernel:
@@ -159,204 +170,133 @@ class ArtifactContainsTests(unittest.TestCase):
             )
 
 
-class RuntimeEvidenceTests(unittest.TestCase):
-    def test_log_marker_wait_reads_only_bytes_appended_after_the_offset(self) -> None:
-        marker = b"DEBUG recovery checkpoint written\n"
+def replace_file(destination: Path, replacement: Path, backup: Path) -> None:
+    """The app's atomic save: mt-core `commit.rs` `replace_file`."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReplaceFileW.argtypes = [
+        wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, wt.LPVOID, wt.LPVOID,
+    ]
+    kernel32.ReplaceFileW.restype = wt.BOOL
+    replace_file_write_through = 0x00000001
+    if not kernel32.ReplaceFileW(
+        str(destination), str(replacement), str(backup), replace_file_write_through, None, None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+@unittest.skipUnless(sys.platform == "win32", "the app's save uses ReplaceFileW")
+class SharedFileReadTests(unittest.TestCase):
+    def test_the_apps_replace_succeeds_while_the_harness_hashes_the_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "markturbo.log"
-            path.write_bytes(marker)
+            path = Path(temporary) / "document.md"
+            path.write_bytes(b"old bytes")
+            replacement = Path(temporary) / "document.md.tmp"
+            replacement.write_bytes(b"new bytes")
+            backup = Path(temporary) / "document.md.bak"
+            real_sha256 = runtime.hashlib.sha256
+            replaced: list[bool] = []
 
-            def append_then_match(predicate, timeout, code, interval):
-                self.assertEqual((timeout, code, interval), (1.0, "TIMEOUT", 0.025))
-                self.assertFalse(predicate())
-                with path.open("ab") as handle:
-                    handle.write(b"DEBUG recovery checkpoint ")
-                self.assertFalse(predicate())
-                with path.open("ab") as handle:
-                    handle.write(b"written\n")
-                self.assertTrue(predicate())
+            def sha256_replacing_mid_read():
+                digest = real_sha256()
+                update = digest.update
 
-            with mock.patch.object(HARNESS, "wait_until", side_effect=append_then_match):
-                HARNESS.wait_for_log_marker(
-                    path,
-                    len(marker),
-                    CHECKPOINT_SUCCESS_PRESENT,
-                    1.0,
-                    "TIMEOUT",
-                )
+                class Digest:
+                    def update(self, chunk: bytes) -> None:
+                        # The app's save lands while the harness holds the file open.
+                        if not replaced:
+                            replace_file(path, replacement, backup)
+                            replaced.append(True)
+                        update(chunk)
 
-    def test_checkpoint_log_parser_requires_written_marker_after_offset(self) -> None:
-        marker = b"DEBUG recovery checkpoint written\n"
-        self.assertTrue(CHECKPOINT_SUCCESS_PRESENT(marker))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(b"recovery checkpoint failed; durable=false\n"))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(b"recovery checkpoint written but failed\n"))
-        self.assertFalse(CHECKPOINT_SUCCESS_PRESENT(marker + b"other\n", len(marker)))
+                    def hexdigest(self) -> str:
+                        return digest.hexdigest()
 
-    def test_startup_log_parser_requires_finished_marker_after_offset(self) -> None:
-        marker = b"DEBUG recovery startup finished\n"
-        self.assertTrue(RECOVERY_STARTUP_FINISHED_PRESENT(marker))
-        self.assertFalse(RECOVERY_STARTUP_FINISHED_PRESENT(b"recovery startup began\n"))
-        self.assertFalse(RECOVERY_STARTUP_FINISHED_PRESENT(marker + b"other\n", len(marker)))
+                return Digest()
 
-    def test_live_recovery_scan_requires_canonical_encrypted_record(self) -> None:
+            with mock.patch.object(runtime.hashlib, "sha256", sha256_replacing_mid_read):
+                read = runtime.sha256_file(path)
+
+            self.assertEqual(replaced, [True])
+            self.assertEqual(read, runtime.fingerprint_bytes(b"old bytes"))
+            self.assertEqual(path.read_bytes(), b"new bytes")
+
+    def test_a_missing_file_is_an_os_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary) / "data"
-            recovery = data / "recovery"
-            recovery.mkdir(parents=True)
-            (recovery / "junk.mtrecovery").write_bytes(b"ignored")
-            with self.assertRaises(HARNESS_FAILURE) as missing:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(missing.exception.code, "CANONICAL_RECOVERY_RECORD_MISSING")
+            with self.assertRaises(FileNotFoundError):
+                runtime.sha256_file(Path(temporary) / "missing.md")
 
-            canonical = recovery / (("a" * 64) + ".mtrecovery")
-            canonical.write_bytes(b"")
-            with self.assertRaises(HARNESS_FAILURE) as empty:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(empty.exception.code, "CANONICAL_RECOVERY_RECORD_EMPTY")
 
-            canonical.write_bytes(b"encrypted-record")
-            result = LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(result["canonical_record_count"], 1)
-            self.assertEqual(len(result["canonical_records"]), 1)
-
-            canonical.write_bytes(DOCUMENT_SENTINEL.encode("utf-8"))
-            with self.assertRaises(HARNESS_FAILURE) as leaked:
-                LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(leaked.exception.code, "UTF8_DOCUMENT_SENTINEL_LEAKED")
-
-    def test_runtime_scan_covers_stderr_app_logs_and_recovery_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-            (recovery / (("a" * 64) + ".mtrecovery")).write_bytes(b"ciphertext")
-            (recovery / ".markturbo-recovery.lock").write_bytes(b"lease")
-
-            result = RUNTIME_ARTIFACT_SCAN(data, stderr)
-
-            self.assertEqual(result["files_scanned"], 4)
-            self.assertEqual(result["app_logs_scanned"], 1)
-            self.assertEqual(result["recovery_artifacts_scanned"], 2)
-            self.assertEqual(result["canonical_recovery_records_scanned"], 1)
-            self.assertEqual(result["recovery_leases_scanned"], 1)
-
-    def test_runtime_scan_counts_records_and_leases_separately(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-
-            (recovery / ".markturbo-recovery.lock").write_bytes(b"lease")
-            lease_only = RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(lease_only["canonical_recovery_records_scanned"], 0)
-            self.assertEqual(lease_only["recovery_leases_scanned"], 1)
-
-            (recovery / ".markturbo-recovery.lock").unlink()
-            (recovery / (("a" * 64) + ".mtrecovery")).write_bytes(b"ciphertext")
-            record_only = RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(record_only["canonical_recovery_records_scanned"], 1)
-            self.assertEqual(record_only["recovery_leases_scanned"], 0)
-
-    def test_recovery_scans_fail_closed_on_permission_error(self) -> None:
-        secret = "UNIQUE-DOCUMENT-CONTENT"
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            (logs / "markturbo-1.log").write_bytes(b"startup ok\n")
-            record = recovery / (("a" * 64) + ".mtrecovery")
-            record.write_bytes(b"ciphertext")
-            original_read_bytes = Path.read_bytes
-
-            def denied(path: Path) -> bytes:
-                if path == record:
-                    raise PermissionError(secret)
-                return original_read_bytes(path)
-
-            with mock.patch.object(Path, "read_bytes", new=denied):
-                with self.assertRaises(HARNESS_FAILURE) as live:
-                    LIVE_RECOVERY_SCAN(data)
-            self.assertEqual(live.exception.code, "LIVE_RECOVERY_RECORD_SCAN_FAILED")
-            self.assertEqual(live.exception.detail, "PermissionError")
-
-            with mock.patch.object(Path, "read_bytes", new=denied):
-                with self.assertRaises(HARNESS_FAILURE) as runtime:
-                    RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(runtime.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
-            self.assertEqual(runtime.exception.detail, "PermissionError")
-            self.assertNotIn(secret, runtime.exception.detail)
-
-    def test_runtime_scan_rejects_utf8_utf16_panic_and_refcell(self) -> None:
-        payloads = (
-            (DOCUMENT_SENTINEL.encode("utf-8"), "UTF8_DOCUMENT_SENTINEL_LEAKED"),
-            (DOCUMENT_SENTINEL.encode("utf-16-le"), "UTF16LE_DOCUMENT_SENTINEL_LEAKED"),
-            (b"thread panicked at source", "PANIC_LOGGED"),
-            (b"RefCell already borrowed", "REFCELL_BORROW_PANIC_LOGGED"),
-        )
-        for payload, code in payloads:
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                data = root / "data"
-                logs = data / "logs"
-                logs.mkdir(parents=True)
-                stderr = root / "stderr.log"
-                stderr.write_bytes(b"")
-                (logs / "markturbo-1.log").write_bytes(payload)
-
-                with self.assertRaises(HARNESS_FAILURE) as raised:
-                    RUNTIME_ARTIFACT_SCAN(data, stderr)
-                self.assertEqual(raised.exception.code, code)
-
-    def test_runtime_scan_requires_app_log_and_scans_recovery_payload(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            data = root / "data"
-            stderr = root / "stderr.log"
-            stderr.write_bytes(b"")
-            with self.assertRaises(HARNESS_FAILURE) as missing:
-                RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(missing.exception.code, "APP_LOG_MISSING")
-
-            logs = data / "logs"
-            recovery = data / "recovery"
-            logs.mkdir(parents=True)
-            recovery.mkdir()
-            (logs / "markturbo-1.log").write_bytes(b"startup ok")
-            (recovery / "record.mtrecovery").write_bytes(
-                DOCUMENT_SENTINEL.encode("utf-16-le")
-            )
-            with self.assertRaises(HARNESS_FAILURE) as leaked:
-                RUNTIME_ARTIFACT_SCAN(data, stderr)
-            self.assertEqual(leaked.exception.code, "UTF16LE_DOCUMENT_SENTINEL_LEAKED")
-
+class HarnessCleanupTests(unittest.TestCase):
     def test_cleanup_failure_still_cleans_other_owned_jobs(self) -> None:
         bad = mock.Mock()
-        bad.cleanup.side_effect = HARNESS_FAILURE("PROCESS_JOB_QUIESCENCE_TIMEOUT")
+        bad.cleanup.side_effect = runtime.HarnessFailure("PROCESS_JOB_QUIESCENCE_TIMEOUT")
         other = mock.Mock()
-        harness = object.__new__(NATIVE_HARNESS)
+        harness = object.__new__(runtime.NativeHarness)
         harness.processes = [bad, other]
 
-        with self.assertRaisesRegex(HARNESS_FAILURE, "PROCESS_JOB_QUIESCENCE_TIMEOUT"):
+        with self.assertRaisesRegex(runtime.HarnessFailure, "PROCESS_JOB_QUIESCENCE_TIMEOUT"):
             harness.cleanup()
 
         other.cleanup.assert_called_once_with()
+
+
+class PlatformAndExecutableTests(unittest.TestCase):
+    def test_accepts_windows_11_x64_only(self) -> None:
+        self.assertIsNone(runtime.platform_preflight_failure("Windows", 10, 22631, "AMD64", 64))
+        self.assertEqual(
+            runtime.platform_preflight_failure("Windows", 10, 19045, "AMD64", 64),
+            "WINDOWS_11_REQUIRED",
+        )
+        self.assertEqual(
+            runtime.platform_preflight_failure("Linux", 6, 0, "x86_64", 64),
+            "WINDOWS_REQUIRED",
+        )
+        self.assertEqual(
+            runtime.platform_preflight_failure("Windows", 10, 22631, "ARM64", 64),
+            "WINDOWS_X64_REQUIRED",
+        )
+
+    def test_parses_amd64_pe32_plus(self) -> None:
+        result = runtime.inspect_pe_bytes(minimal_pe())
+
+        self.assertEqual(result["machine"], "x86_64")
+        self.assertEqual(result["format"], "PE32+")
+
+    def test_records_content_free_pe_section_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "test.exe"
+            path.write_bytes(minimal_pe())
+
+            self.assertEqual(
+                runtime.inspect_pe_sections(path),
+                [
+                    {
+                        "name": ".text",
+                        "virtual_size": 123,
+                        "raw_size": 512,
+                        "characteristics": 0x60000020,
+                    }
+                ],
+            )
+
+    def test_rejects_non_x64_pe(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not AMD64 PE32"):
+            runtime.inspect_pe_bytes(minimal_pe(machine=0x14C, magic=0x10B))
+
+    def test_hash_comparison_fails_closed(self) -> None:
+        self.assertIsNone(runtime.executable_hash_failure(HASH, HASH))
+        self.assertEqual(
+            runtime.executable_hash_failure("b" * 64, HASH), "EXECUTABLE_HASH_MISMATCH"
+        )
+        self.assertEqual(runtime.executable_hash_failure("short", HASH), "EXECUTABLE_HASH_INVALID")
+
+    def test_maps_windows_launch_error_codes_without_exception_text(self) -> None:
+        self.assertEqual(
+            runtime.launch_failure_code(OSError(2147942402, "The system cannot find the file specified.")),
+            "PROCESS_LAUNCH_FILE_NOT_FOUND",
+        )
+        self.assertEqual(runtime.launch_failure_code(OSError(5, "access denied")), "PROCESS_LAUNCH_ACCESS_DENIED")
+        self.assertEqual(runtime.launch_failure_code(OSError(999, "secret")), "PROCESS_LAUNCH_FAILED")
 
 
 class OwnedProcessTests(unittest.TestCase):
@@ -538,3 +478,71 @@ class OwnedProcessTests(unittest.TestCase):
                     win32.create_suspended_process(spec)
                 expected = [mock.call(81)] if duplicate_failure else [mock.call(81), mock.call(82)]
                 self.assertEqual(api.CloseHandle.call_args_list, expected)
+
+
+class ClipboardOpenRetryTests(unittest.TestCase):
+    """Another process holding the clipboard for a moment is contention, not an
+    unavailable clipboard: the open is retried until a deadline."""
+
+    def fake_clock(self) -> tuple[list[float], Any, Any]:
+        now = [0.0]
+        return now, (lambda: now[0]), (lambda seconds: now.__setitem__(0, now[0] + seconds))
+
+    def test_a_briefly_held_clipboard_opens_on_a_retry(self) -> None:
+        attempts = iter([False, False, True])
+        _, clock, sleep = self.fake_clock()
+        self.assertEqual(
+            runtime.open_clipboard_with_retry(
+                lambda: next(attempts), lambda: True, clock=clock, sleep=sleep
+            ),
+            3,
+        )
+
+    def test_a_clipboard_held_past_the_deadline_blocks_with_content_free_diagnostics(self) -> None:
+        now, clock, sleep = self.fake_clock()
+        calls = []
+
+        def held() -> bool:
+            calls.append(now[0])
+            return False
+
+        with self.assertRaises(runtime.HarnessBlocked) as raised:
+            runtime.open_clipboard_with_retry(held, lambda: True, clock=clock, sleep=sleep)
+
+        self.assertEqual(raised.exception.code, "CLIPBOARD_UNAVAILABLE")
+        self.assertEqual(
+            raised.exception.diagnostics,
+            {"clipboard_open_attempts": len(calls), "clipboard_owner_window_present": True},
+        )
+        # The whole ~3 s window is retried, not a single attempt.
+        self.assertEqual(runtime.CLIPBOARD_OPEN_TIMEOUT_SECONDS, 3.0)
+        self.assertGreaterEqual(now[0], runtime.CLIPBOARD_OPEN_TIMEOUT_SECONDS)
+        self.assertGreater(len(calls), 100)
+
+
+class ExecutionStateTests(unittest.TestCase):
+    def test_the_run_keeps_the_display_on_and_releases_it(self) -> None:
+        calls: list[int] = []
+        win32 = object.__new__(runtime.Win32)
+        win32.kernel32 = SimpleNamespace(
+            SetThreadExecutionState=lambda flags: calls.append(flags) or runtime.ES_CONTINUOUS
+        )
+
+        win32.keep_display_awake()
+        win32.allow_display_sleep()
+
+        self.assertEqual(
+            calls,
+            [
+                runtime.ES_CONTINUOUS | runtime.ES_DISPLAY_REQUIRED | runtime.ES_SYSTEM_REQUIRED,
+                runtime.ES_CONTINUOUS,
+            ],
+        )
+
+    def test_a_refused_execution_state_blocks(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        win32.kernel32 = SimpleNamespace(SetThreadExecutionState=lambda _flags: 0)
+
+        with self.assertRaises(runtime.HarnessBlocked) as raised:
+            win32.keep_display_awake()
+        self.assertEqual(raised.exception.code, "EXECUTION_STATE_REQUEST_FAILED")

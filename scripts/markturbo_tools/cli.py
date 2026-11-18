@@ -28,6 +28,9 @@ ACCEPTANCE_GOALS = {
     "goal-06": "scripts.markturbo_tools.native.goal06",
     "goal-07": "scripts.markturbo_tools.native.goal07",
 }
+# `accept all` runs the cheapest, most stable goals first, so a late BLOCKED
+# result discards as little evidence as possible.
+ACCEPT_ALL_ORDER = ("goal-06", "goal-02", "goal-07", "goal-03")
 NATIVE_EXIT_CODES = frozenset({0, 1, 2})
 
 
@@ -47,8 +50,11 @@ def parser() -> argparse.ArgumentParser:
         delegated = subcommands.add_parser(command, help=f"Run {command} tooling.")
         delegated.add_argument("args", nargs=argparse.REMAINDER)
 
-    accept = subcommands.add_parser("accept", help="Run a Windows native acceptance harness.")
-    accept.add_argument("goal", choices=tuple(ACCEPTANCE_GOALS))
+    accept = subcommands.add_parser(
+        "accept",
+        help="Run a Windows native acceptance harness, or every goal in one session with 'all'.",
+    )
+    accept.add_argument("goal", choices=(*ACCEPTANCE_GOALS, "all"))
     accept.add_argument("args", nargs=argparse.REMAINDER)
     return result
 
@@ -72,6 +78,54 @@ def native_exit_code(returncode: int) -> int:
     return 1
 
 
+def accept_all(args: Sequence[str]) -> int:
+    """Run every native acceptance goal in one process and one shared session."""
+    from .native import evidence, goal02, goal03, goal06, goal07, runtime
+
+    modules = {"goal-02": goal02, "goal-03": goal03, "goal-06": goal06, "goal-07": goal07}
+    accept = argparse.ArgumentParser(
+        prog="mt.py accept all",
+        description=(
+            "Run goals " + ", ".join(ACCEPT_ALL_ORDER) + " in that order: one preflight, "
+            "one executable hash and copy, one clipboard save; one evidence file per goal."
+        ),
+    )
+    accept.add_argument("--exe", type=Path, default=evidence.DEFAULT_EXE)
+    accept.add_argument(
+        "--expect-exe-sha256", type=runtime.normalize_expected_hash, required=True
+    )
+    accept.add_argument(
+        "--evidence-dir",
+        type=Path,
+        default=ROOT / "target" / "native-acceptance",
+        help="directory for goal-0N-native-acceptance.json (default: target/native-acceptance)",
+    )
+    accept.add_argument("--ui-timeout", type=evidence.ui_timeout_seconds, default=15.0)
+    accept.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="after a case or goal FAIL, still run the later ones (BLOCKED stops)",
+    )
+    options = accept.parse_args(forwarded(args))
+    runs = []
+    for goal in ACCEPT_ALL_ORDER:
+        module = modules[goal]
+        goal_args = module.parse_args(
+            [
+                "--exe",
+                str(options.exe),
+                "--expect-exe-sha256",
+                options.expect_exe_sha256,
+                "--evidence",
+                str(options.evidence_dir / f"{goal}-native-acceptance.json"),
+                "--ui-timeout",
+                repr(options.ui_timeout),
+            ]
+        )
+        runs.append((goal, goal_args, module.native_run_plan()))
+    return runtime.main_native_acceptance_suite(runs, keep_going=options.keep_going)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if len(raw_argv) == 2 and raw_argv[0] in UTILITY_COMMANDS and raw_argv[1] in {"-h", "--help"}:
@@ -85,5 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
     if namespace.command == "accept":
+        if namespace.goal == "all":
+            return native_exit_code(accept_all(namespace.args))
         return native_exit_code(run_module(ACCEPTANCE_GOALS[namespace.goal], namespace.args))
     return run_module(UTILITY_COMMANDS[namespace.command], namespace.args)

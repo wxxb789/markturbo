@@ -12,11 +12,13 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 from scripts.markturbo_tools import evaluation
 from scripts.markturbo_tools import revision_evaluation as revision
+from scripts.markturbo_tools.native import evidence as native_evidence
 from scripts.markturbo_tools.native import goal07 as native_goal07
+
+from .test_native_goal07 import passing_observations as native_goal07_observations
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -204,143 +206,14 @@ class Goal07Fixtures:
     def _native_value(self) -> dict[str, Any]:
         executable = digest("markturbo.exe")
         parent = {"session_id": 1, "integrity_rid": 1000, "integrity": "medium"}
-        fingerprint = {"byte_count": 1, "sha256": digest("native-before")}
-        changed_fingerprint = {"byte_count": 2, "sha256": digest("native-after")}
-        runtime_scan = {
-            "files_scanned": 3,
-            "app_logs_scanned": 1,
-            "config_files_scanned": 1,
-            "utf8_sentinel_absent": True,
-            "utf16le_sentinel_absent": True,
-            "ephemeral_credential_utf8_absent": True,
-            "ephemeral_credential_utf16le_absent": True,
-            "answer_sentinel_utf8_absent": True,
-            "answer_sentinel_utf16le_absent": True,
-            "raw_response_sentinel_utf8_absent": True,
-            "raw_response_sentinel_utf16le_absent": True,
+        # The native harness's own passing session, under this parent context.
+        observations = {
+            case_id: {**native_goal07_observations(case_id), "process_context": parent}
+            for case_id in native_goal07.REQUIRED_CASE_IDS
         }
-        common = {
-            "process_context": parent,
-            "foreground_verified": True,
-            "loopback_provider": True,
-            "server_loopback": True,
-            "server_deterministic": True,
-            "provider_request_count": 2,
-            "provider_review_count": 1,
-            "provider_revision_count": 1,
-            "provider_paths_exact": True,
-            "provider_no_request_before_consent_click": True,
-            "provider_review_before_revision": True,
-            "provider_review_source_sha256_match": True,
-            "provider_revision_source_sha256_match": True,
-            "provider_revision_snapshot_match": True,
-            "provider_revision_answer_sentinel_present": True,
-            "runtime_scan": runtime_scan,
-        }
-        observations: dict[str, dict[str, Any]] = {}
-        for case_id in native_goal07.REQUIRED_CASE_IDS:
-            item = {"flow": native_goal07.CASE_FLOWS[case_id], **common}
-            if case_id == native_goal07.CASE_REJECT_ALL:
-                item.update(
-                    {
-                        "proposal_received": True,
-                        "reviewed_source_match": True,
-                        "editor_before": fingerprint,
-                        "editor_after": fingerprint,
-                        "source_before": fingerprint,
-                        "source_after": fingerprint,
-                        "reject_all_byte_identity": True,
-                        "dirty_before": False,
-                        "dirty_after": False,
-                        "reject_all_dirty_unchanged": True,
-                    }
-                )
-            elif case_id == native_goal07.CASE_SELECTIVE_UNDO:
-                item.update(
-                    {
-                        "editor_before": fingerprint,
-                        "selective_preview": changed_fingerprint,
-                        "editor_after_apply": changed_fingerprint,
-                        "editor_after_undo": fingerprint,
-                        "source_before": fingerprint,
-                        "source_after": fingerprint,
-                        "selective_matches_editor": True,
-                        "selective_matches_expected": True,
-                        "one_undo_transaction": True,
-                        "undo_count": 1,
-                    }
-                )
-            elif case_id == native_goal07.CASE_ACCEPT_ALL_PREVIEW:
-                item.update(
-                    {
-                        "editor_before_apply": fingerprint,
-                        "editor_after_preview": fingerprint,
-                        "preview_fingerprint": changed_fingerprint,
-                        "final_preview": changed_fingerprint,
-                        "accept_all_matches_expected": True,
-                        "copy_preview_fingerprint": changed_fingerprint,
-                        "copy_preview_exact": True,
-                        "copy_editor_before": fingerprint,
-                        "copy_editor_after": fingerprint,
-                        "copy_editor_unchanged": True,
-                        "copy_dirty_before": False,
-                        "copy_dirty_after": False,
-                        "copy_dirty_unchanged": True,
-                        "copy_source_before": fingerprint,
-                        "copy_source_after": fingerprint,
-                        "copy_source_unchanged": True,
-                    }
-                )
-            elif case_id == native_goal07.CASE_STALE:
-                item.update(
-                    {
-                        "editor_before": fingerprint,
-                        "editor_after_edit": changed_fingerprint,
-                        "editor_after_activation_attempt": changed_fingerprint,
-                        "source_before": fingerprint,
-                        "source_after": fingerprint,
-                        "stale_proposal_received": True,
-                        "stale_visible": True,
-                        "apply_activation_attempted": True,
-                        "apply_disabled_source_contract": True,
-                        "stale_no_mutation": True,
-                        "apply_control_observed": True,
-                        "apply_accessibility_reported_enabled": True,
-                    }
-                )
-            elif case_id == native_goal07.CASE_SAVE_CONFLICT:
-                item.update(
-                    {
-                        "editor_after_apply": changed_fingerprint,
-                        "external_source_before": fingerprint,
-                        "external_source_after": fingerprint,
-                        "save_shortcut_sent": True,
-                        "conflict_visible_before_save": True,
-                        "safe_save_conflict_visible": True,
-                        "safe_save_no_overwrite": True,
-                    }
-                )
-            else:
-                item.update(
-                    {
-                        "editor_before_apply": fingerprint,
-                        "editor_after_apply": changed_fingerprint,
-                        "restricted_after_apply": True,
-                        "executable_change": True,
-                        "executable_expected": changed_fingerprint,
-                        "executable_matches_expected": True,
-                        "trust_before": True,
-                        "trust_revocation_order_source_contract": True,
-                        "preview_inert_source_contract": True,
-                        "preview_fingerprint": changed_fingerprint,
-                        "preview_matches_expected": True,
-                        "preview_contains_executable_text": True,
-                    }
-                )
-            observations[case_id] = item
         return {
             "schema": revision.NATIVE_ACCEPTANCE_SCHEMA,
-            "schema_version": 1,
+            "schema_version": revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION,
             "status": "PASS",
             "started_at_utc": "2026-09-18T00:00:00Z",
             "completed_at_utc": "2026-09-18T00:00:01Z",
@@ -348,7 +221,7 @@ class Goal07Fixtures:
                 "mode": "keyless_loopback",
                 "provider": "openai-responses",
                 "deterministic": True,
-                "request_count": 12,
+                "request_count": native_goal07.EXPECTED_REQUEST_COUNT,
             },
             "executable": {
                 "expected_sha256": executable,
@@ -359,8 +232,8 @@ class Goal07Fixtures:
                 "copy_hash_verified": True,
                 "format": "PE32+",
                 "machine": "x86_64",
-                "machine_code": native_goal07.IMAGE_FILE_MACHINE_AMD64,
-                "optional_magic": native_goal07.PE32_PLUS_MAGIC,
+                "machine_code": 0x8664,
+                "optional_magic": 0x20B,
             },
             "environment": {
                 "platform": "Windows 11",
@@ -368,7 +241,7 @@ class Goal07Fixtures:
                 "windows_minor": 0,
                 "windows_build": 22621,
                 "architecture": "x86_64",
-                "native_machine_code": native_goal07.IMAGE_FILE_MACHINE_AMD64,
+                "native_machine_code": 0x8664,
                 "python_pointer_bits": 64,
                 "wts_state": "WTSActive",
                 "active_console_session_id": 1,
@@ -394,6 +267,10 @@ class Goal07Fixtures:
                 "blocked_case_count": 0,
                 "failed_case_count": 0,
                 "not_run_case_count": 0,
+            },
+            "metrics": {
+                "phase_timings": [{"phase": "DECISIONS", "ms": 1.0}],
+                "counters": dict.fromkeys(native_evidence.METRIC_COUNTERS, 0),
             },
         }
 
@@ -733,7 +610,7 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
                 anchor = hashlib.sha256(path.read_bytes()).hexdigest()
                 with self.assertRaisesRegex(
                     revision.RevisionEvaluationError,
-                    "does not prove PASS for every case",
+                    "full harness validation",
                 ):
                     revision.load_native_acceptance(
                         path,
@@ -1067,6 +944,21 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
         )
         self.assertFalse(evidence["evaluation"]["all_cases_satisfied"])
 
+    def test_native_schema_follows_the_harness_and_refuses_earlier_versions(self) -> None:
+        self.assertEqual(revision.NATIVE_ACCEPTANCE_SCHEMA_VERSION, native_evidence.SCHEMA_VERSION)
+        self.assertEqual(revision.NATIVE_REQUIRED_CASE_IDS, frozenset(native_goal07.REQUIRED_CASE_IDS))
+        for version in (1, 2, 3):
+            with self.subTest(version=version):
+                value = {**self.fixtures.native_value, "schema_version": version}
+                path = Path(self.temp.name) / f"native-v{version}.json"
+                path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(revision.RevisionEvaluationError, "schema is invalid"):
+                    revision.load_native_acceptance(
+                        path,
+                        approved_native_evidence_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                        approved_native_executable_sha256=self.fixtures.native_executable_anchor,
+                    )
+
     def test_native_schema_version_and_unhashable_case_id_fail_closed(self) -> None:
         wrong_type = {**self.fixtures.native_value, "schema_version": True}
         path = Path(self.temp.name) / "native-bool-version.json"
@@ -1079,7 +971,7 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
             )
 
         invalid_semantics = json.loads(json.dumps(self.fixtures.native_value))
-        invalid_semantics["cases"][0]["observations"]["foreground_verified"] = False
+        invalid_semantics["cases"][0]["observations"]["flow"] = "not the required flow"
         path = Path(self.temp.name) / "native-invalid-semantics.json"
         path.write_text(json.dumps(invalid_semantics, sort_keys=True) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(revision.RevisionEvaluationError, "full harness validation"):
@@ -1093,7 +985,7 @@ class RevisionEvaluationV2Tests(unittest.TestCase):
         unhashable["cases"][0]["id"] = ["not-an-id"]
         path = Path(self.temp.name) / "native-unhashable-id.json"
         path.write_text(json.dumps(unhashable, sort_keys=True) + "\n", encoding="utf-8")
-        with self.assertRaisesRegex(revision.RevisionEvaluationError, "invalid case identifier"):
+        with self.assertRaisesRegex(revision.RevisionEvaluationError, "full harness validation"):
             revision.load_native_acceptance(
                 path,
                 approved_native_evidence_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),

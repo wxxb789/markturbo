@@ -12,12 +12,12 @@ from .runtime import HarnessFailure
 
 ANSWER_SENTINEL = "MTG07-NATIVE-ANSWER-SENTINEL"
 RAW_RESPONSE_SENTINEL = "MTG07-NATIVE-RAW-RESPONSE-SENTINEL"
-ANSWER_TEXT = f"Use the new title for the revised plan. {ANSWER_SENTINEL}"
+ANSWER_TEXT = f"Set the new script value and name the team as owner. {ANSWER_SENTINEL}"
 
-QUESTION_0 = "Which title should the revised plan use?"
+QUESTION_0 = "Which value should the page script set?"
 QUESTION_1 = "Should the owner field remain explicit?"
 QUESTION_2 = "Which rollout detail is intentionally left open?"
-QUESTION_IMPACT_0 = "A title choice changes the artifact's audience and identity."
+QUESTION_IMPACT_0 = "A script value changes what the page does when it runs."
 QUESTION_IMPACT_1 = "An owner choice changes accountability for the first step."
 QUESTION_IMPACT_2 = "A rollout choice changes the success evidence."
 
@@ -54,34 +54,26 @@ def _source_edit(source: str, old: str, new: str) -> dict[str, Any]:
 
 
 def fixture_edits(source: str) -> list[dict[str, Any]]:
-    if "window.goal07" in source:
-        return [_source_edit(source, 'goal07 = "old"', 'goal07 = "new"')]
+    """The proposal's two hunks, in document order: h1 the executable script
+    value, h2 the owner line."""
     return [
-        _source_edit(source, "title: old", "title: new"),
+        _source_edit(source, 'goal07 = "old"', 'goal07 = "new"'),
         _source_edit(source, "owner: TBD", "owner: team"),
     ]
 
 
 def revision_response(source: str) -> str:
-    groups = (
-        [
-            {
-                "rationale": "The executable fixture changes only the requested script value.",
-                "edits": [_source_edit(source, 'goal07 = "old"', 'goal07 = "new"')],
-            }
-        ]
-        if "window.goal07" in source
-        else [
-            {
-                "rationale": "The answered title decision changes only the title line.",
-                "edits": [_source_edit(source, "title: old", "title: new")],
-            },
-            {
-                "rationale": "The answered owner decision changes only the owner line.",
-                "edits": [_source_edit(source, "owner: TBD", "owner: team")],
-            },
-        ]
-    )
+    script, owner = fixture_edits(source)
+    groups = [
+        {
+            "rationale": "The answered decision changes only the script value.",
+            "edits": [script],
+        },
+        {
+            "rationale": "The answered owner decision changes only the owner line.",
+            "edits": [owner],
+        },
+    ]
     coverage = [
         {
             "question_index": 0,
@@ -140,13 +132,19 @@ class _LoopbackHttpServer(http.server.ThreadingHTTPServer):
 
 
 class LoopbackRevisionServer:
-    """A deterministic OpenAI Responses-compatible loopback provider."""
+    """A deterministic OpenAI Responses-compatible loopback provider.
 
-    def __init__(self, source: str) -> None:
-        self.source = source
-        self._source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    One server serves a whole app session: each `begin_chain` starts one
+    Review -> Revision chain against its own source, with its own consent
+    gates. A refused request fails every later check of the server.
+    """
+
+    def __init__(self) -> None:
+        self.source: str | None = None
+        self._source_sha256: str | None = None
         self._source_snapshot = {"revision": 0, "source_generation": 0}
         self.requests: list[dict[str, Any]] = []
+        self._request_count = 0
         self._server: _LoopbackHttpServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
@@ -159,6 +157,22 @@ class LoopbackRevisionServer:
         }
         self._invalid_request = False
         self._failure_code: str | None = None
+
+    def begin_chain(self, source: str) -> None:
+        """Start the next Review -> Revision chain, bound to `source`."""
+        with self._lock:
+            self.source = source
+            self._source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            self.requests = []
+            self._review_consent = False
+            self._revision_consent = False
+            self._consent_click_sequence = {"read_only_review": None, "revision": None}
+
+    @property
+    def request_count(self) -> int:
+        """Every accepted request of every chain this server served."""
+        with self._lock:
+            return self._request_count
 
     @staticmethod
     def _nested_values(value: Any, key: str) -> list[Any]:
@@ -243,17 +257,6 @@ class LoopbackRevisionServer:
         with self._lock:
             self._revision_consent = True
 
-    def begin_consent_click(self, expected_request_count: int) -> None:
-        """Record the click-dispatch linearization point before UIA Invoke."""
-        operation = {
-            0: "read_only_review",
-            1: "revision",
-        }.get(expected_request_count)
-        if operation is None:
-            raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
-        with self._lock:
-            self._begin_consent_click_locked(operation, expected_request_count)
-
     def _begin_consent_click_locked(self, operation: str, expected_request_count: int) -> None:
         if self._invalid_request or len(self.requests) != expected_request_count:
             raise HarnessFailure("CONSENT_REQUEST_SEQUENCE_INVALID")
@@ -277,11 +280,6 @@ class LoopbackRevisionServer:
         with self._lock:
             self._begin_consent_click_locked(operation, expected_request_count)
             click()
-
-    def request_count_snapshot(self) -> int:
-        """Return only the accepted request count, without exposing request data."""
-        with self._lock:
-            return len(self.requests)
 
     def _next_event_sequence(self) -> int:
         with self._lock:
@@ -317,6 +315,8 @@ class LoopbackRevisionServer:
     ) -> tuple[dict[str, Any], str] | tuple[None, str]:
         if request_arrival_sequence is None:
             request_arrival_sequence = self._next_event_sequence()
+        if self.source is None:
+            return None, "LOOPBACK_CHAIN_NOT_STARTED"
         if path != "/v1/responses":
             return None, "LOOPBACK_PATH_MISMATCH"
         if not isinstance(parsed, dict):
@@ -379,11 +379,9 @@ class LoopbackRevisionServer:
                         )
                     )
                 ),
-                "path_exact": True,
                 "stream": stream,
                 "review": operation == "read_only_review",
                 "revision": operation == "revision",
-                "consent_gate_open": True,
                 "source_sha256_match": source_hash_match,
                 "source_snapshot_match": source_snapshot_match,
                 "answer_sentinel_present": answer_sentinel_present,
@@ -393,7 +391,9 @@ class LoopbackRevisionServer:
             }
             return record, operation
 
-    def contract_evidence(self) -> dict[str, Any]:
+    def verify_chain(self) -> None:
+        """Fail unless the current chain is exactly one Review, then one
+        Revision, each after its consent click, and no request was refused."""
         with self._lock:
             records = tuple(self.requests)
             review_records = tuple(record for record in records if record["review"])
@@ -410,29 +410,6 @@ class LoopbackRevisionServer:
                 for record in records
             ):
                 raise HarnessFailure("LOOPBACK_REQUEST_BEFORE_CONSENT_CLICK")
-            return {
-                "provider_request_count": len(records),
-                "provider_review_count": len(review_records),
-                "provider_revision_count": len(revision_records),
-                "provider_paths_exact": all(record["path_exact"] for record in records),
-                "provider_no_request_before_consent_click": all(
-                    record["request_after_consent_click"] for record in records
-                ),
-                "provider_review_before_revision": records[0]["review"]
-                and records[1]["revision"],
-                "provider_review_source_sha256_match": review_records[0][
-                    "source_sha256_match"
-                ],
-                "provider_revision_source_sha256_match": revision_records[0][
-                    "source_sha256_match"
-                ],
-                "provider_revision_snapshot_match": revision_records[0][
-                    "source_snapshot_match"
-                ],
-                "provider_revision_answer_sentinel_present": revision_records[0][
-                    "answer_sentinel_present"
-                ],
-            }
 
     def start(self) -> "LoopbackRevisionServer":
         owner = self
@@ -476,6 +453,7 @@ class LoopbackRevisionServer:
                         return
                     with owner._lock:
                         owner.requests.append(record)
+                        owner._request_count += 1
                     response = (
                         revision_response(owner.source)
                         if operation == "revision"

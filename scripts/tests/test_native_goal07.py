@@ -3,429 +3,123 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from unittest import mock
 
+from scripts.markturbo_tools.native import evidence as shared_evidence
 from scripts.markturbo_tools.native import goal07 as HARNESS
 from scripts.markturbo_tools.native import goal07_provider as PROVIDER
 from scripts.markturbo_tools.native import runtime
-from .test_native_goal02_runtime import OwnedKernel, launch_owned, owned_harness
+
+from ._native_support import (
+    HASH,
+    case_observations,
+    fingerprint,
+    passed_evidence,
+    process_context,
+)
+from .test_native_runtime_process import OwnedKernel, launch_owned, owned_harness
+
+CASE = HARNESS.CASE_REVISION_SESSION
+EDITS = PROVIDER.fixture_edits(HARNESS.EDITOR_SOURCE_TEXT)
+REVIEWED = runtime.fingerprint_bytes(HARNESS.EDITOR_SOURCE_BYTES)
+ONE_ACCEPTED = runtime.fingerprint_bytes(HARNESS.apply_edits(HARNESS.EDITOR_SOURCE_BYTES, EDITS[:1]))
+ALL_ACCEPTED = runtime.fingerprint_bytes(HARNESS.apply_edits(HARNESS.EDITOR_SOURCE_BYTES, EDITS))
+DISK = runtime.fingerprint_bytes(HARNESS.SOURCE_BYTES)
+STALE = runtime.fingerprint_text(HARNESS.STALE_EDIT)
+PROPOSAL_AFTER = 'goal07 = "new"'
 
 
-HASH = "a" * 64
+def credential_target(endpoint: str) -> str:
+    return shared_evidence.credential_target(endpoint, "openai-responses")
 
 
-def fingerprint(value: bytes) -> dict[str, int | str]:
-    return {"byte_count": len(value), "sha256": hashlib.sha256(value).hexdigest()}
-
-
-def process_context() -> dict[str, int | str]:
-    return {"session_id": 7, "integrity_rid": 0x2000, "integrity": "medium"}
-
-
-def runtime_scan() -> dict[str, int | bool]:
-    return {
-        "files_scanned": 3,
-        "app_logs_scanned": 1,
-        "config_files_scanned": 1,
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-        "ephemeral_credential_utf8_absent": True,
-        "ephemeral_credential_utf16le_absent": True,
-        "answer_sentinel_utf8_absent": True,
-        "answer_sentinel_utf16le_absent": True,
-        "raw_response_sentinel_utf8_absent": True,
-        "raw_response_sentinel_utf16le_absent": True,
-    }
-
-
-def environment() -> dict[str, int | str]:
-    return {
-        "platform": "Windows 11",
-        "windows_major": 10,
-        "windows_minor": 0,
-        "windows_build": 22631,
-        "architecture": "x86_64",
-        "native_machine_code": 0x8664,
-        "python_pointer_bits": 64,
-        "wts_state": "WTSActive",
-        "active_console_session_id": 7,
-        "harness_is_console_session": True,
-        "input_desktop": "Default",
-        "thread_desktop": "Default",
-        "harness_process": process_context(),
-    }
-
-
-def common(case_id: str) -> dict:
-    editor_same = fingerprint(HARNESS.EDITOR_SOURCE_BYTES)
-    disk_same = fingerprint(HARNESS.SOURCE_BYTES)
-    observations = {
-        "flow": HARNESS.CASE_FLOWS[case_id],
-        "process_context": process_context(),
-        "foreground_verified": True,
-        "loopback_provider": True,
-        "server_loopback": True,
-        "server_deterministic": True,
-        "provider_request_count": 2,
-        "provider_review_count": 1,
-        "provider_revision_count": 1,
-        "provider_paths_exact": True,
-        "provider_no_request_before_consent_click": True,
-        "provider_review_before_revision": True,
-        "provider_review_source_sha256_match": True,
-        "provider_revision_source_sha256_match": True,
-        "provider_revision_snapshot_match": True,
-        "provider_revision_answer_sentinel_present": True,
-        "runtime_scan": runtime_scan(),
-    }
-    if case_id == HARNESS.CASE_REJECT_ALL:
-        observations.update(
-            proposal_received=True,
-            reviewed_source_match=True,
-            editor_before=editor_same,
-            editor_after=editor_same,
-            source_before=disk_same,
-            source_after=disk_same,
-            reject_all_byte_identity=True,
-            dirty_before=False,
-            dirty_after=False,
-            reject_all_dirty_unchanged=True,
-        )
-    elif case_id == HARNESS.CASE_SELECTIVE_UNDO:
-        selected = fingerprint(
-            HARNESS.apply_edits(
-                HARNESS.EDITOR_SOURCE_BYTES,
-                PROVIDER.fixture_edits(HARNESS.EDITOR_SOURCE_TEXT)[:1],
-            )
-        )
-        observations.update(
-            editor_before=editor_same,
-            selective_preview=selected,
-            editor_after_apply=selected,
-            editor_after_undo=editor_same,
-            source_before=disk_same,
-            source_after=disk_same,
-            selective_matches_editor=True,
-            selective_matches_expected=True,
-            one_undo_transaction=True,
-            undo_count=1,
-        )
-    elif case_id == HARNESS.CASE_ACCEPT_ALL_PREVIEW:
-        final = fingerprint(
-            HARNESS.apply_edits(
-                HARNESS.EDITOR_SOURCE_BYTES,
-                PROVIDER.fixture_edits(HARNESS.EDITOR_SOURCE_TEXT),
-            )
-        )
-        observations.update(
-            editor_before_apply=editor_same,
-            editor_after_preview=editor_same,
-            preview_fingerprint=final,
-            final_preview=final,
-            accept_all_matches_expected=True,
-            copy_preview_fingerprint=final,
-            copy_preview_exact=True,
-            copy_editor_before=editor_same,
-            copy_editor_after=editor_same,
-            copy_editor_unchanged=True,
-            copy_dirty_before=False,
-            copy_dirty_after=False,
-            copy_dirty_unchanged=True,
-            copy_source_before=disk_same,
-            copy_source_after=disk_same,
-            copy_source_unchanged=True,
-        )
-    elif case_id == HARNESS.CASE_STALE:
-        edited = fingerprint(HARNESS.STALE_EDIT_TEXT.encode("utf-8"))
-        observations.update(
-            editor_before=editor_same,
-            editor_after_edit=edited,
-            source_before=disk_same,
-            source_after=disk_same,
-            stale_proposal_received=True,
-            stale_visible=True,
-            apply_activation_attempted=True,
-            apply_disabled_source_contract=True,
-            stale_no_mutation=True,
-            apply_control_observed=True,
-            apply_accessibility_reported_enabled=True,
-            editor_after_activation_attempt=edited,
-        )
-    elif case_id == HARNESS.CASE_SAVE_CONFLICT:
-        external = fingerprint(HARNESS.EXTERNAL_SOURCE_BYTES)
-        observations.update(
-            editor_after_apply=fingerprint(
-                HARNESS.apply_edits(
-                    HARNESS.EDITOR_SOURCE_BYTES,
-                    PROVIDER.fixture_edits(HARNESS.EDITOR_SOURCE_TEXT),
-                )
-            ),
-            external_source_before=external,
-            external_source_after=external,
-            save_shortcut_sent=True,
-            conflict_visible_before_save=False,
-            safe_save_conflict_visible=True,
-            safe_save_no_overwrite=True,
-        )
-    elif case_id == HARNESS.CASE_TRUST_REVOKE:
-        observations.update(
-            trust_before=True,
-            editor_before_apply=fingerprint(HARNESS.HTML_EDITOR_SOURCE_BYTES),
-            editor_after_apply=fingerprint(
-                HARNESS.apply_edits(
-                    HARNESS.HTML_EDITOR_SOURCE_BYTES,
-                    PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
-                )
-            ),
-            executable_expected=fingerprint(
-                HARNESS.apply_edits(
-                    HARNESS.HTML_EDITOR_SOURCE_BYTES,
-                    PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
-                )
-            ),
-            executable_matches_expected=True,
-            restricted_after_apply=True,
-            executable_change=True,
-            trust_revocation_order_source_contract=True,
-            preview_inert_source_contract=True,
-            preview_fingerprint=fingerprint(
-                HARNESS.apply_edits(
-                    HARNESS.HTML_EDITOR_SOURCE_BYTES,
-                    PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
-                )
-            ),
-            preview_matches_expected=True,
-            preview_contains_executable_text=True,
-        )
-    return observations
+def passing_observations(case_id: str = CASE) -> dict[str, Any]:
+    """A passed session's observations: every phase's measurements as expected."""
+    return case_observations(
+        HARNESS.CASE_FLOWS[case_id],
+        **HARNESS.expected_fingerprints(),
+        provider_request_count=HARNESS.EXPECTED_REQUEST_COUNT,
+    )
 
 
 def valid_evidence() -> dict:
-    evidence = HARNESS.new_evidence(HASH)
-    evidence["transport"]["request_count"] = len(HARNESS.REQUIRED_CASE_IDS) * 2
-    evidence["executable"].update(
-        {
-            "sha256": HASH,
-            "byte_count": 1234,
-            "hash_verified": True,
-            "copied_sha256": HASH,
-            "copy_hash_verified": True,
-            "format": "PE32+",
-            "machine": "x86_64",
-            "machine_code": 0x8664,
-            "optional_magic": 0x20B,
-        }
-    )
-    evidence["environment"] = environment()
-    for case in evidence["cases"]:
-        case.update(status="PASS", duration_ms=1.0, observations=common(case["id"]))
-    HARNESS.complete_evidence(evidence, "PASS")
-    return evidence
+    return passed_evidence(HARNESS.new_evidence(HASH), passing_observations, HARNESS.complete_evidence)
 
 
-def _trust_contract_comment_decoy() -> str:
-    return """\
-        /* Historical implementation excerpt; this code is intentionally inert.
-        let revoke_trust = self.trust == Trust::Trusted
-            && matches!(self.document.doc_type(),
-                DocType::Html | DocType::Mdx)
-            && current_text != final_text;
-        if revoke_trust {
-            self.trust = Trust::Restricted;
-            self.preview.trust_changed(Trust::Restricted);
-        }
-        self.replace_text(final_text, window, cx);
-        */
-"""
+def bare_harness(**attributes: Any) -> HARNESS.Goal07Harness:
+    harness = object.__new__(HARNESS.Goal07Harness)
+    harness.ui_timeout = 1.0
+    for name, value in attributes.items():
+        setattr(harness, name, value)
+    return harness
 
 
-def _write_goal07_source_fixture(
-    root: Path,
-    *,
-    trust_body: str | None = None,
-    active_preview: bool = False,
-    test_only_trust_markers: bool = False,
-    test_only_preview_markers: bool = False,
-) -> None:
-    """Write the small Rust-source surface consumed by Goal07's checkers."""
-    views = root / "crates" / "mt-app" / "src" / "views"
-    workspace = views / "workspace.rs"
-    review = views / "workspace" / "review.rs"
-    document = views / "document.rs"
-    preview = views / "document" / "preview.rs"
-    for path in (workspace, review, document, preview):
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-    workspace_symbols = (
-        ("REVIEW_RUN_ACCESSIBILITY_ID", HARNESS.REVIEW_RUN_ACCESSIBILITY_ID),
-        ("REVIEW_RESULT_ACCESSIBILITY_ID", HARNESS.REVIEW_RESULT_ACCESSIBILITY_ID),
-        ("REVISION_RUN_ACCESSIBILITY_ID", HARNESS.REVISION_RUN_ACCESSIBILITY_ID),
-        ("REVISION_STALE_ACCESSIBILITY_ID", HARNESS.REVISION_STALE_ACCESSIBILITY_ID),
-        (
-            "REVISION_ACCEPT_ALL_ACCESSIBILITY_ID",
-            HARNESS.REVISION_ACCEPT_ALL_ACCESSIBILITY_ID,
-        ),
-        (
-            "REVISION_REJECT_ALL_ACCESSIBILITY_ID",
-            HARNESS.REVISION_REJECT_ALL_ACCESSIBILITY_ID,
-        ),
-        ("REVISION_APPLY_ACCESSIBILITY_ID", HARNESS.REVISION_APPLY_ACCESSIBILITY_ID),
-        ("REVISION_COPY_ACCESSIBILITY_ID", HARNESS.REVISION_COPY_ACCESSIBILITY_ID),
-        (
-            "REVISION_RESULT_DISMISS_ACCESSIBILITY_ID",
-            HARNESS.REVISION_RESULT_DISMISS_ACCESSIBILITY_ID,
-        ),
-        (
-            "REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID",
-            HARNESS.REVISION_DISCARD_ANSWERS_ACCESSIBILITY_ID,
-        ),
-    )
-    workspace.write_text(
-        "\n".join(
-            f'const {symbol}: &str = "{value}";'
-            for symbol, value in workspace_symbols
-        )
-        + "\nDocumentEvent::Conflict\n",
-        encoding="utf-8",
-    )
-
-    if trust_body is None:
-        trust_body = """\
-        let revoke_trust = self.trust == Trust::Trusted
-            && matches!(self.document.doc_type(),
-                DocType::Html | DocType::Mdx)
-            && current_text != final_text;
-        if revoke_trust {
-            self.trust = Trust::Restricted;
-            self.preview.trust_changed(Trust::Restricted);
-        }
-        self.replace_text(final_text, window, cx);
-"""
-    document_source = f'''\
-Button::new("trust");
-accessibility_id(DOCUMENT_TRUST_ACCESSIBILITY_ID);
-const TRUST_ID: &str = "{HARNESS.TRUST_AUTOMATION_ID}";
-accessibility_id(CONFLICT_OVERWRITE_ACCESSIBILITY_ID);
-const CONFLICT_OVERWRITE_ID: &str = "{HARNESS.CONFLICT_OVERWRITE_ACCESSIBILITY_ID}";
-pub fn apply_approved_revision() {{
-{trust_body}}}
-'''
-    if test_only_trust_markers:
-        document_source += f'''\
-#[cfg(test)]
-mod tests {{
-    const TRUST_MARKER_DECOY: &str = {json.dumps(_trust_contract_comment_decoy())};
-}}
-'''
-    document.write_text(document_source, encoding="utf-8")
-
-    preview_region = f'''\
-.id("revision-preview")
-.role(gpui::Role::Group)
-.accessibility_id("{HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID}")
-.id("revision-preview-source")
-.role(gpui::Role::Label)
-.aria_value(preview.clone())
-.accessibility_id("{HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}")
-'''
-    if active_preview:
-        preview_region += ".child(WebSurface::new(preview.clone()))\n"
-    preview_region += ".child(preview)\n.into_any_element()\n"
-
-    review_symbols = tuple(symbol for symbol, _value in workspace_symbols)
-    review_accessibility = "\n".join(
-        f"accessibility_id({symbol});" for symbol in review_symbols
-    )
-    review_values = "\n".join(
-        f'const REVIEW_UIA_VALUE_{index}: &str = "{value}";'
-        for index, value in enumerate(
-            (
-                HARNESS.REVISION_RESULT_ACCESSIBILITY_ID,
-                HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID,
-                HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID,
-                HARNESS.REVISION_QUESTION_PREFIX,
-                HARNESS.REVISION_CHANGE_PREFIX,
-            )
-        )
-    )
-    review_source = f'''\
-{review_accessibility}
-{review_values}
-'''
-    if not test_only_preview_markers:
-        review_source += preview_region
-    else:
-        review_source += (
-            "// Preview IDs are also used by test fixtures: "
-            f"{HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID} "
-            f"{HARNESS.REVISION_PREVIEW_SOURCE_ACCESSIBILITY_ID}\n"
-        )
-    review_source += f'''\
-.id("revision-stale")
-accessibility_id(REVISION_STALE_ACCESSIBILITY_ID)
-.role(gpui::Role::Label)
-.aria_label(i18n::t(i18n::Key::RevisionStaleInspection, cx))
-.into_any_element()
-Button::new("revision-apply")
-accessibility_id(REVISION_APPLY_ACCESSIBILITY_ID)
-.disabled(revision_stale)
-this.apply_revision(window, cx)
-Button::new("revision-save")
-'''
-    if test_only_preview_markers:
-        review_source += f'''\
-#[cfg(test)]
-mod tests {{
-    fn preview_marker_decoy() {{
-{preview_region}    }}
-}}
-'''
-    review.write_text(review_source, encoding="utf-8")
-
-    (views / "document").mkdir(parents=True, exist_ok=True)
-    preview.write_text(
-        """\
-pub(super) fn trust_changed() {
-    self.rebuild_web(document, source_path, trust, cx);
-}
-fn rebuild_web() {
-    self.web_revision = self.web_revision.wrapping_add(1);
-    self.web_html = Some(match trust {
-        Trust::Restricted => web::build_html_raw(document, trust),
-        _ => web::build_html_themed(document, trust),
-    });
-}
-""",
-        encoding="utf-8",
-    )
+def wait_once(check: Callable[[], Any], _timeout: float, code: str, **_kwargs: Any) -> Any:
+    value = check()
+    if not value:
+        raise runtime.HarnessFailure(code)
+    return value
 
 
 class EvidenceTests(unittest.TestCase):
-    def test_complete_pass_is_hash_bound_and_requires_all_cases(self) -> None:
+    def test_complete_pass_is_hash_bound_and_counts_the_one_chain(self) -> None:
         evidence = valid_evidence()
         HARNESS.validate_evidence(evidence)
+        self.assertEqual(HARNESS.REQUIRED_CASE_IDS, (CASE,))
         self.assertEqual(evidence["status"], "PASS")
+        self.assertEqual(evidence["transport"]["request_count"], 2)
+        self.assertEqual(evidence["summary"]["passed_case_count"], 1)
+
+    def test_every_fingerprint_has_one_exact_expected_value(self) -> None:
+        expected = HARNESS.expected_fingerprints()
+        self.assertEqual(set(expected), HARNESS.FINGERPRINT_OBSERVATION_KEYS)
+        # The steps are distinguishable: an Accept that wrote nothing, a
+        # Reject that wrote, or a Done that saved cannot pass for the
+        # expected bytes.
+        self.assertEqual(len(EDITS), 2)
+        self.assertNotEqual(ONE_ACCEPTED, REVIEWED)
+        self.assertNotEqual(ALL_ACCEPTED, ONE_ACCEPTED)
+        self.assertNotEqual(DISK, REVIEWED)
+        self.assertEqual(expected["decisions_editor_one_accepted"], ONE_ACCEPTED.evidence())
+        # Copy exports the approved result: h1 in, h2 left open by Undo.
+        self.assertEqual(expected["decisions_clipboard_copied"], ONE_ACCEPTED.evidence())
+        self.assertEqual(expected["decisions_editor_stale"], STALE.evidence())
+        # The field shows the docked h1's replacement as the model sent it (the
+        # edit's span, not its whole line): RevisionHunkView.after.
         self.assertEqual(
-            evidence["summary"]["passed_case_count"], len(HARNESS.REQUIRED_CASE_IDS)
+            expected["decisions_proposal_after"], fingerprint(PROPOSAL_AFTER.encode("utf-8"))
         )
 
-    def test_reject_all_requires_exact_byte_identity(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["editor_after"] = fingerprint(b"changed")
-        with self.assertRaisesRegex(ValueError, "reject-all changed"):
-            HARNESS.validate_evidence(evidence)
+    def test_the_accepted_hunk_is_the_executable_one_after_the_multibyte_line(self) -> None:
+        script, owner = EDITS
+        self.assertEqual(script["replacement"], PROPOSAL_AFTER)
+        multibyte_line_end = HARNESS.EDITOR_SOURCE_BYTES.index("🚀".encode("utf-8"))
+        self.assertGreater(script["range"]["start"], multibyte_line_end)
+        self.assertLess(script["range"]["end"], owner["range"]["start"])
+        accepted = HARNESS.apply_edits(HARNESS.SOURCE_BYTES, PROVIDER.fixture_edits(HARNESS.SOURCE_TEXT)[:1])
+        self.assertIn(b'<script>window.goal07 = "new";</script>\r\n<p>owner: TBD</p>', accepted)
+        self.assertIn("<p>trusted 文档 🚀</p>\r\n".encode("utf-8"), accepted)
 
-    def test_selective_case_requires_one_undo(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][1]["observations"]["undo_count"] = 2
-        with self.assertRaisesRegex(ValueError, "exactly one undo"):
-            HARNESS.validate_evidence(evidence)
+    def test_each_fingerprint_must_hold_its_expected_bytes(self) -> None:
+        for key in sorted(HARNESS.FINGERPRINT_OBSERVATION_KEYS):
+            with self.subTest(key=key):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"][key] = fingerprint(b"other bytes")
+                with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected bytes"):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_the_session_needs_exactly_one_review_and_one_revision(self) -> None:
+        for count in (1, 4):
+            with self.subTest(count=count):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"]["provider_request_count"] = count
+                evidence["transport"]["request_count"] = count
+                with self.assertRaisesRegex(ValueError, "one Review and one Revision"):
+                    HARNESS.validate_evidence(evidence)
 
     def test_transport_count_must_match_case_observations(self) -> None:
         evidence = valid_evidence()
@@ -433,55 +127,14 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transport request count"):
             HARNESS.validate_evidence(evidence)
 
-    def test_copy_and_stale_proofs_are_required(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][2]["observations"]["copy_preview_exact"] = False
-        with self.assertRaisesRegex(ValueError, "requires true copy_preview_exact"):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][3]["observations"]["apply_activation_attempted"] = False
-        with self.assertRaisesRegex(ValueError, "requires true apply_activation_attempted"):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][3]["observations"]["apply_disabled_source_contract"] = False
-        with self.assertRaisesRegex(ValueError, "requires true apply_disabled_source_contract"):
-            HARNESS.validate_evidence(evidence)
-
-    def test_trust_proof_requires_runtime_and_source_contracts(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][5]["observations"]["restricted_after_apply"] = False
-        with self.assertRaisesRegex(ValueError, "requires true restricted_after_apply"):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][5]["observations"]["executable_matches_expected"] = False
-        with self.assertRaisesRegex(ValueError, "requires true executable_matches_expected"):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][5]["observations"]["trust_revocation_order_source_contract"] = False
-        with self.assertRaisesRegex(
-            ValueError, "requires true trust_revocation_order_source_contract"
-        ):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][5]["observations"]["preview_inert_source_contract"] = False
-        with self.assertRaisesRegex(ValueError, "requires true preview_inert_source_contract"):
-            HARNESS.validate_evidence(evidence)
-
-    def test_pass_rejects_hash_mismatch_and_private_content(self) -> None:
-        evidence = valid_evidence()
-        evidence["executable"]["copied_sha256"] = "b" * 64
-        with self.assertRaisesRegex(ValueError, "verified copied executable hash"):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["flow"] = HARNESS.DOCUMENT_SENTINEL
-        with self.assertRaisesRegex(ValueError, "free-form observation strings"):
-            HARNESS.validate_evidence(evidence)
+    def test_every_phase_observation_is_required(self) -> None:
+        for phase in HARNESS.PHASES:
+            key = next(key for key in sorted(HARNESS.OBSERVATION_KEYS) if key.startswith(phase))
+            with self.subTest(key=key):
+                evidence = valid_evidence()
+                del evidence["cases"][0]["observations"][key]
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    HARNESS.validate_evidence(evidence)
 
     def test_blocked_evidence_is_valid_without_windows_environment(self) -> None:
         evidence = HARNESS.new_evidence(HASH)
@@ -491,32 +144,11 @@ class EvidenceTests(unittest.TestCase):
             duration_ms=0.0,
             observations={},
         )
-        for case in evidence["cases"][1:]:
-            case.update(
-                status="BLOCKED",
-                reason_code="SKIPPED_AFTER_BLOCKED",
-                duration_ms=0.0,
-            )
         HARNESS.complete_evidence(evidence, "BLOCKED")
         HARNESS.validate_evidence(evidence)
-        self.assertEqual(
-            evidence["summary"]["blocked_case_count"], len(HARNESS.REQUIRED_CASE_IDS)
-        )
+        self.assertEqual(evidence["summary"]["blocked_case_count"], 1)
 
-    def test_evidence_objects_have_exact_keys_and_private_content_is_recursive(self) -> None:
-        for location in ("top-level", "executable", "environment", "case"):
-            evidence = valid_evidence()
-            if location == "top-level":
-                evidence["unexpected"] = True
-            elif location == "executable":
-                evidence["executable"]["unexpected"] = True
-            elif location == "environment":
-                evidence["environment"]["unexpected"] = True
-            else:
-                evidence["cases"][0]["unexpected"] = True
-            with self.subTest(location=location), self.assertRaisesRegex(ValueError, "keys"):
-                HARNESS.validate_evidence(evidence)
-
+    def test_document_answer_and_raw_response_sentinels_are_private(self) -> None:
         for sentinel in (
             HARNESS.DOCUMENT_SENTINEL,
             PROVIDER.ANSWER_SENTINEL,
@@ -529,41 +161,16 @@ class EvidenceTests(unittest.TestCase):
             ):
                 HARNESS.validate_evidence(evidence)
 
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["process_context"] = {
-            "request_body": True,
-        }
-        with self.assertRaisesRegex(ValueError, "private content"):
-            HARNESS.validate_evidence(evidence)
-
-        for key in ("process_context", "runtime_scan", "editor_before"):
-            evidence = valid_evidence()
-            evidence["cases"][0]["observations"][key]["unexpected"] = True
-            with self.subTest(nested_key=key), self.assertRaisesRegex(ValueError, "keys"):
-                HARNESS.validate_evidence(evidence)
-
-    def test_runtime_scan_requires_positive_and_consistent_config_counts(self) -> None:
+    def test_runtime_scan_must_cover_the_review_settings(self) -> None:
         evidence = valid_evidence()
         evidence["cases"][0]["observations"]["runtime_scan"]["config_files_scanned"] = 0
-        with self.assertRaisesRegex(ValueError, "application log"):
+        with self.assertRaisesRegex(ValueError, "configuration file"):
             HARNESS.validate_evidence(evidence)
 
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["runtime_scan"].update(
-            files_scanned=1,
-            app_logs_scanned=1,
-            config_files_scanned=1,
-        )
-        with self.assertRaisesRegex(ValueError, "counts are inconsistent"):
-            HARNESS.validate_evidence(evidence)
-
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["runtime_scan"].update(
-            files_scanned=2,
-            app_logs_scanned=1,
-            config_files_scanned=1,
-        )
-        with self.assertRaisesRegex(ValueError, "file count is incomplete"):
+    def test_evidence_does_not_allow_request_body_or_credentials(self) -> None:
+        evidence = HARNESS.new_evidence(HASH)
+        evidence["transport"]["request_body"] = "forbidden"
+        with self.assertRaisesRegex(ValueError, "private content"):
             HARNESS.validate_evidence(evidence)
 
 
@@ -571,14 +178,13 @@ class EvidenceFinalizationTests(unittest.TestCase):
     def run_native_cases(
         self,
         root: Path,
-        scenarios: tuple[object, ...],
+        scenario: Callable[[], dict],
         *,
         case: str | None = None,
         preflight: object | None = None,
     ) -> tuple[int, dict, str]:
         executable = root / "markturbo.exe"
         executable.write_bytes(b"native evidence finalization fixture")
-        expected_hash = runtime.sha256_file(executable).sha256
         goal07_plan = HARNESS.native_run_plan()
 
         class FakeHarness:
@@ -593,46 +199,28 @@ class EvidenceFinalizationTests(unittest.TestCase):
             preflight=preflight or (lambda *_args: (object(), object())),
             ui_types_loader=lambda: (),
             harness_factory=lambda *_args: FakeHarness(),
-            scenarios=lambda _harness: scenarios,
+            scenarios=lambda _harness: (scenario,),
             finalize_evidence=goal07_plan.finalize_evidence,
         )
-        args = type("Args", (), {})()
-        args.exe = executable
-        args.expect_exe_sha256 = expected_hash
-        args.ui_timeout = 1.0
-        args.case = case
-        args.keep_workdir_on_failure = False
+        args = argparse.Namespace(
+            exe=executable,
+            expect_exe_sha256=runtime.sha256_file(executable).sha256,
+            ui_timeout=1.0,
+            case=case,
+            keep_workdir_on_failure=False,
+        )
         return runtime.run_native_acceptance(args, plan)
 
     def test_interleaved_evidence_instances_keep_transport_counts_separate(self) -> None:
         first = HARNESS.new_evidence(HASH)
         second = HARNESS.new_evidence(HASH)
-        first["cases"][0]["observations"]["provider_request_count"] = 2
-        second["cases"][2]["observations"]["provider_request_count"] = 4
+        first["cases"][0]["observations"]["provider_request_count"] = 6
+        second["cases"][0]["observations"]["provider_request_count"] = 4
 
         HARNESS.complete_evidence(first, "FAIL")
         HARNESS.complete_evidence(second, "BLOCKED")
-        self.assertEqual(first["transport"]["request_count"], 2)
+        self.assertEqual(first["transport"]["request_count"], 6)
         self.assertEqual(second["transport"]["request_count"], 4)
-
-        first["cases"][1]["observations"]["provider_request_count"] = 1
-        HARNESS.complete_evidence(first, "FAIL")
-        self.assertEqual(first["transport"]["request_count"], 3)
-        self.assertEqual(second["transport"]["request_count"], 4)
-
-    def test_standalone_scenario_does_not_mutate_other_evidence_instances(self) -> None:
-        first = HARNESS.new_evidence(HASH)
-        second = HARNESS.new_evidence(HASH)
-        observations = common(HARNESS.CASE_REJECT_ALL)
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.parent_context = runtime.SecurityContext(7, 0x2000, "medium")
-        harness.scenario_reject_all = lambda: observations
-
-        result = harness.scenario(HARNESS.CASE_REJECT_ALL)
-
-        self.assertIs(result, observations)
-        self.assertEqual(first["transport"]["request_count"], 0)
-        self.assertEqual(second["transport"]["request_count"], 0)
 
     def test_request_count_rejects_boolean_case_observations(self) -> None:
         evidence = valid_evidence()
@@ -643,60 +231,40 @@ class EvidenceFinalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid provider request count"):
             HARNESS.complete_evidence(evidence, "PASS")
 
-    def test_failed_privacy_scan_counts_only_previously_persisted_cases(self) -> None:
+    def test_failed_privacy_scan_fails_the_session_without_its_observations(self) -> None:
         def failed_scan() -> dict:
             with tempfile.TemporaryDirectory() as temporary:
                 case_root = Path(temporary)
                 logs = case_root / "data" / "logs"
                 logs.mkdir(parents=True)
                 (case_root / "config").mkdir()
-                (logs / "markturbo.log").write_bytes(
-                    HARNESS.DOCUMENT_SENTINEL.encode("utf-8")
-                )
+                (logs / "markturbo.log").write_bytes(HARNESS.DOCUMENT_SENTINEL.encode("utf-8"))
                 return HARNESS.scan_case_artifacts(case_root, "synthetic-key")
 
-        scenarios = (
-            lambda: {"provider_request_count": 2},
-            failed_scan,
-            *(lambda: {} for _ in range(len(HARNESS.REQUIRED_CASE_IDS) - 2)),
-        )
         with tempfile.TemporaryDirectory() as temporary:
-            returncode, evidence, reason = self.run_native_cases(
-                Path(temporary), scenarios
-            )
+            returncode, evidence, reason = self.run_native_cases(Path(temporary), failed_scan)
 
         self.assertEqual((returncode, evidence["status"], reason), (1, "FAIL", "UTF8_DOCUMENT_SENTINEL_LEAKED"))
-        self.assertEqual(evidence["cases"][0]["status"], "PASS")
-        self.assertEqual(evidence["cases"][1]["status"], "FAIL")
-        self.assertEqual(evidence["cases"][1]["observations"], {})
-        self.assertEqual(evidence["transport"]["request_count"], 2)
+        self.assertEqual(evidence["cases"][0]["observations"], {})
+        self.assertEqual(evidence["transport"]["request_count"], 0)
 
-    def test_partial_case_counts_only_the_selected_observation(self) -> None:
-        scenarios = tuple(
-            (lambda: {"provider_request_count": 2})
-            for _ in HARNESS.REQUIRED_CASE_IDS
-        )
+    def test_selected_case_run_is_partial(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             returncode, evidence, reason = self.run_native_cases(
-                Path(temporary), scenarios, case=HARNESS.CASE_STALE
+                Path(temporary), lambda: {"provider_request_count": 2}, case=CASE
             )
 
         self.assertEqual((returncode, evidence["status"], reason), (1, "FAIL", "PARTIAL_CASE_RUN"))
         self.assertEqual(evidence["transport"]["request_count"], 2)
-        for item in evidence["cases"]:
-            expected = "PASS" if item["id"] == HARNESS.CASE_STALE else "NOT_RUN"
-            self.assertEqual(item["status"], expected)
-            if expected == "NOT_RUN":
-                self.assertEqual(item["observations"], {})
+        self.assertEqual(evidence["cases"][0]["status"], "PASS")
 
     def test_early_blocked_plan_keeps_request_count_zero(self) -> None:
         def blocked(*_args: object) -> tuple[object, object]:
             raise runtime.HarnessBlocked("WTS_SESSION_NOT_ACTIVE")
 
-        scenarios = tuple(lambda: {} for _ in HARNESS.REQUIRED_CASE_IDS)
         with tempfile.TemporaryDirectory() as temporary:
             returncode, evidence, reason = self.run_native_cases(
-                Path(temporary), scenarios, preflight=blocked
+                Path(temporary), lambda: {}, preflight=blocked
             )
 
         self.assertEqual((returncode, evidence["status"], reason), (2, "BLOCKED", "WTS_SESSION_NOT_ACTIVE"))
@@ -713,26 +281,12 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
             (root / "data" / "logs" / "app.log").write_bytes(
                 b"x" * split + HARNESS.DOCUMENT_SENTINEL.encode("utf-8")
             )
-            with self.assertRaisesRegex(
-                runtime.HarnessFailure, "UTF8_DOCUMENT_SENTINEL_LEAKED"
-            ):
+            with self.assertRaisesRegex(runtime.HarnessFailure, "UTF8_DOCUMENT_SENTINEL_LEAKED"):
                 HARNESS.scan_case_artifacts(root, "synthetic-key")
 
-    def test_runtime_scan_rejects_credential_leak_without_recording_value(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "data" / "logs").mkdir(parents=True)
-            (root / "config").mkdir()
-            (root / "data" / "logs" / "app.log").write_text(
-                "synthetic-key", encoding="utf-8"
-            )
-            with self.assertRaisesRegex(
-                runtime.HarnessFailure, "UTF8_EPHEMERAL_CREDENTIAL_LEAKED"
-            ):
-                HARNESS.scan_case_artifacts(root, "synthetic-key")
-
-    def test_runtime_scan_rejects_answer_and_raw_response_sentinels(self) -> None:
-        for sentinel, code in (
+    def test_runtime_scan_rejects_private_values_without_recording_them(self) -> None:
+        for value, code in (
+            ("synthetic-key", "UTF8_EPHEMERAL_CREDENTIAL_LEAKED"),
             (PROVIDER.ANSWER_SENTINEL, "UTF8_ANSWER_SENTINEL_LEAKED"),
             (PROVIDER.RAW_RESPONSE_SENTINEL, "UTF8_RAW_RESPONSE_SENTINEL_LEAKED"),
         ):
@@ -740,36 +294,9 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "data" / "logs").mkdir(parents=True)
                 (root / "config").mkdir()
-                (root / "data" / "logs" / "app.log").write_text(
-                    sentinel, encoding="utf-8"
-                )
+                (root / "data" / "logs" / "app.log").write_text(value, encoding="utf-8")
                 with self.assertRaisesRegex(runtime.HarnessFailure, code):
                     HARNESS.scan_case_artifacts(root, "synthetic-key")
-
-    def test_evidence_does_not_allow_request_body_or_credentials(self) -> None:
-        evidence = HARNESS.new_evidence(HASH)
-        evidence["transport"]["request_body"] = "forbidden"
-        with self.assertRaisesRegex(ValueError, "invalid loopback transport"):
-            HARNESS.validate_evidence(evidence)
-
-    def test_artifact_read_errors_keep_the_goal_runtime_scan_code(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "data" / "logs").mkdir(parents=True)
-            (root / "config").mkdir()
-            (root / "data" / "logs" / "markturbo.log").write_bytes(b"startup")
-            with (
-                mock.patch.object(
-                    HARNESS,
-                    "artifact_contains",
-                    side_effect=PermissionError("document content"),
-                ),
-                self.assertRaises(runtime.HarnessFailure) as raised,
-            ):
-                HARNESS.scan_case_artifacts(root, "synthetic-key")
-
-        self.assertEqual(raised.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
-        self.assertEqual(raised.exception.detail, "PermissionError")
 
     def test_privacy_scan_waits_for_owned_descendants_even_after_parent_exit(self) -> None:
         for parent_exited in (False, True):
@@ -783,8 +310,7 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                 (logs / "app.log").write_bytes(b"content-free log")
                 (case_root / "config" / "settings.toml").write_bytes(b"keyless")
                 (case_root / "stderr.log").write_bytes(b"")
-                provider = mock.Mock()
-                provider.contract_evidence.return_value = {"provider_request_count": 2}
+                provider = mock.Mock(request_count=2)
                 real_scan = HARNESS.scan_case_artifacts
 
                 def scan(*args):
@@ -796,6 +322,8 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                 with mock.patch.object(HARNESS, "scan_case_artifacts", side_effect=scan):
                     result = harness._finalize_observations(provider, case_root, app, {})
                 self.assertEqual(kernel.events[-2:], ["completion-4", "scan"])
+                provider.verify_chain.assert_called_once_with()
+                self.assertEqual(result["provider_request_count"], 2)
                 self.assertEqual(result["runtime_scan"]["files_scanned"], 3)
                 self.assertCountEqual(kernel.closed, kernel.opened)
 
@@ -807,7 +335,7 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
             app = launch_owned(harness)
             kernel.parent_exited = True
             provider = mock.Mock()
-            observations = {}
+            observations: dict = {}
             with (
                 mock.patch.object(runtime.ctypes, "get_last_error", return_value=258, create=True),
                 mock.patch.object(HARNESS, "scan_case_artifacts") as scan,
@@ -815,7 +343,7 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
             ):
                 harness._finalize_observations(provider, Path(directory), app, observations)
             scan.assert_not_called()
-            provider.contract_evidence.assert_not_called()
+            provider.verify_chain.assert_not_called()
             self.assertEqual(observations, {})
             self.assertCountEqual(kernel.closed, kernel.opened)
 
@@ -847,7 +375,7 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                     preflight=lambda *_args: (None, None),
                     ui_types_loader=lambda: (),
                     harness_factory=factory,
-                    scenarios=lambda _harness: (scenario,) * len(HARNESS.REQUIRED_CASE_IDS),
+                    scenarios=lambda _harness: (scenario,),
                     finalize_evidence=base.finalize_evidence,
                 )
                 args = argparse.Namespace(
@@ -884,452 +412,528 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                         # The fake owns no OS processes; remove the deliberately retained fixture.
                         real_remove(args.debug_workdir)
 
-class SourceContractFixtureTests(unittest.TestCase):
-    def source_failure(
+
+class SessionTests(unittest.TestCase):
+    """The single launch: its profile, its phases in order and their failures."""
+
+    def test_profile_writes_only_the_trusted_document_and_never_touches_credential_manager(
         self,
-        *,
-        trust_body: str | None = None,
-        active_preview: bool = False,
-        test_only_trust_markers: bool = False,
-        test_only_preview_markers: bool = False,
-    ) -> str | None:
+    ) -> None:
+        win32 = mock.Mock()
+        harness = bare_harness(win32=win32)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _write_goal07_source_fixture(
-                root,
-                trust_body=trust_body,
-                active_preview=active_preview,
-                test_only_trust_markers=test_only_trust_markers,
-                test_only_preview_markers=test_only_preview_markers,
+            harness.root = Path(directory)
+            case_root, data, config, workspace, stderr = harness.profile(
+                "http://127.0.0.1:43123/v1/"
             )
-            with mock.patch.object(HARNESS, "REPO", root):
-                return HARNESS.source_contract_failure()
-
-    def test_safe_source_fixture_passes_all_goal07_source_checkers(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _write_goal07_source_fixture(root)
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertIsNone(HARNESS.source_contract_failure())
-                self.assertTrue(HARNESS.trust_apply_source_contract_ok())
-                self.assertTrue(HARNESS.preview_inert_source_contract_ok())
-
-    @unittest.skipUnless(
-        (Path(__file__).resolve().parents[2] / "crates/mt-app/src/views/workspace.rs").exists(),
-        "legacy GPUI source contract removed during the nsh migration; nsh native acceptance is pending",
-    )
-    def test_real_repository_satisfies_source_contract(self) -> None:
-        self.assertIsNone(HARNESS.source_contract_failure())
-
-    def test_alternate_test_modules_cannot_supply_any_source_surface(self) -> None:
-        cases = (
-            ("workspace.rs", "REVISION_UIA_CONTRACT_MISSING"),
-            ("workspace/review.rs", "REVISION_SOURCE_CONTRACT_MISSING"),
-            ("document.rs", "REVISION_BOUNDARY_CONTRACT_MISSING"),
-            ("document/preview.rs", "REVISION_TRUST_SOURCE_CONTRACT_MISSING"),
-        )
-        for relative, expected in cases:
-            with self.subTest(source=relative), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _write_goal07_source_fixture(root)
-                source = root / "crates" / "mt-app" / "src" / "views" / relative
-                original = source.read_text(encoding="utf-8")
-                source.write_text(
-                    "#[cfg(test)] mod checks {\n"
-                    + original
-                    + "\n}\nfn production_after_tests() {}\n",
-                    encoding="utf-8",
-                )
-                with mock.patch.object(HARNESS, "REPO", root):
-                    self.assertEqual(HARNESS.source_contract_failure(), expected)
-
-    def test_test_imports_and_modules_do_not_hide_later_production(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _write_goal07_source_fixture(root)
-            views = root / "crates" / "mt-app" / "src" / "views"
-            for relative in (
-                "workspace.rs", "workspace/review.rs",
-                "document.rs", "document/preview.rs",
-            ):
-                source = views / relative
-                original = source.read_text(encoding="utf-8")
-                source.write_text(
-                    "#[cfg(test)] use crate::fixtures::TestOnly;\n"
-                    "#[cfg(test)]\nmod tests { fn decoy() {} }\n"
-                    + original,
-                    encoding="utf-8",
-                )
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertIsNone(HARNESS.source_contract_failure())
-
-    def test_unsafe_projection_returns_existing_source_contract_codes(self) -> None:
-        cases = (
-            ("workspace.rs", "REVISION_UIA_CONTRACT_MISSING"),
-            ("workspace/review.rs", "REVISION_UIA_CONTRACT_MISSING"),
-            ("document.rs", "REVISION_BOUNDARY_CONTRACT_MISSING"),
-            ("document/preview.rs", "REVISION_TRUST_SOURCE_CONTRACT_MISSING"),
-        )
-        for relative, expected in cases:
-            with self.subTest(source=relative), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                _write_goal07_source_fixture(root)
-                source = root / "crates" / "mt-app" / "src" / "views" / relative
-                original = source.read_text(encoding="utf-8")
-                source.write_text(
-                    original + "\n#[cfg(test)] mod checks {\n",
-                    encoding="utf-8",
-                )
-                with mock.patch.object(HARNESS, "REPO", root):
-                    self.assertEqual(HARNESS.source_contract_failure(), expected)
-
-    def test_source_contract_rejects_replace_before_trust_revocation(self) -> None:
-        wrong_order = """\
-        self.replace_text(final_text, window, cx);
-        let revoke_trust = self.trust == Trust::Trusted
-            && matches!(self.document.doc_type(),
-                DocType::Html | DocType::Mdx)
-            && current_text != final_text;
-        if revoke_trust {
-            self.trust = Trust::Restricted;
-            self.preview.trust_changed(Trust::Restricted);
-        }
-"""
-        self.assertEqual(
-            self.source_failure(trust_body=wrong_order),
-            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
-        )
-
-    def test_source_contract_rejects_active_revision_preview(self) -> None:
-        self.assertEqual(
-            self.source_failure(active_preview=True),
-            "REVISION_PREVIEW_INERT_CONTRACT_MISSING",
-        )
-
-    def test_source_contract_ignores_trust_markers_only_in_test_module(self) -> None:
-        self.assertEqual(
-            self.source_failure(
-                trust_body="",
-                test_only_trust_markers=True,
-            ),
-            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
-        )
-
-    def test_source_contract_ignores_preview_markers_only_in_test_module(self) -> None:
-        self.assertEqual(
-            self.source_failure(test_only_preview_markers=True),
-            "REVISION_PREVIEW_INERT_CONTRACT_MISSING",
-        )
-
-    def test_source_contract_rejects_review_values_only_in_comments(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            _write_goal07_source_fixture(root)
-            review = root / "crates" / "mt-app" / "src" / "views" / "workspace" / "review.rs"
-            source = review.read_text(encoding="utf-8")
-            value = HARNESS.REVISION_RESULT_ACCESSIBILITY_ID
-            source = source.replace(
-                f'const REVIEW_UIA_VALUE_0: &str = "{value}";',
-                f'// Removed result ID: {value}',
-                1,
+            self.assertEqual(case_root, data.parent)
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in workspace.iterdir()},
+                {HARNESS.TRUST_FILE: HARNESS.SOURCE_BYTES},
             )
-            review.write_text(source, encoding="utf-8")
+            self.assertEqual(
+                (config / "settings.toml").read_bytes(),
+                HARNESS.review_settings_document("http://127.0.0.1:43123/v1/"),
+            )
+            self.assertEqual(stderr.name, "stderr.log")
+        self.assertEqual(win32.mock_calls, [])
 
-            with mock.patch.object(HARNESS, "REPO", root):
-                self.assertEqual(
-                    HARNESS.source_contract_failure(),
-                    "REVISION_UIA_CONTRACT_MISSING",
-                )
-
-    def test_source_contract_rejects_comment_only_trust_markers(self) -> None:
-        comment_decoy = f"\n{_trust_contract_comment_decoy()}\n"
-        self.assertEqual(
-            self.source_failure(trust_body=comment_decoy),
-            "REVISION_TRUST_SOURCE_CONTRACT_MISSING",
+    def session_harness(self) -> tuple[HARNESS.Goal07Harness, mock.Mock, mock.Mock, mock.Mock]:
+        order = mock.Mock()
+        app, provider = mock.Mock(hwnd=73), mock.Mock()
+        app.security_context.evidence.return_value = process_context()
+        app.process.poll.return_value = None
+        provider.start.return_value = provider
+        provider.base_url = "http://127.0.0.1:43123/v1/"
+        workspace = Path("workspace")
+        harness = bare_harness(
+            profile=mock.Mock(return_value=(Path("case"), Path("data"), Path("config"), workspace, Path("stderr"))),
+            launch_app=order.launch_app,
+            phase_trust=order.phase_trust,
+            phase_decisions=order.phase_decisions,
+            quit_via_menu=order.quit_via_menu,
+            click_lifecycle_decision=order.click_lifecycle_decision,
+            wait_process_exit=order.wait_process_exit,
+            reap=order.reap,
+            _finalize_observations=lambda _provider, _root, _app, observations: observations,
         )
+        order.launch_app.return_value = app
+        order.phase_trust.return_value = {"trust_disk_before": DISK.evidence()}
+        order.phase_decisions.return_value = {"decisions_editor_stale": STALE.evidence()}
+        return harness, order, app, provider
 
+    def test_one_launch_on_the_document_runs_both_phases_then_quits_through_the_guard(self) -> None:
+        harness, order, app, provider = self.session_harness()
+        with mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider):
+            observations = harness.scenario_revision_session()
 
-class SourceAndCliTests(unittest.TestCase):
-    def test_review_after_web_handoff_sends_keys_without_explicit_refocus(self) -> None:
-        for preserve in (False, True):
-            with self.subTest(preserve_focus=preserve):
-                harness = object.__new__(HARNESS.Goal07Harness)
-                harness.focus_editor = mock.Mock()
-                harness._require_foreground = mock.Mock()
-                harness.win32 = mock.Mock()
-                harness._click_id = mock.Mock()
-                harness._approve_consent = mock.Mock()
-                harness.find_control = mock.Mock()
-                app, provider = mock.Mock(), mock.Mock()
-                app.hwnd = 73
-                harness.win32.foreground_focus.return_value = app.hwnd
+        source = Path("workspace") / HARNESS.TRUST_FILE
+        self.assertEqual(
+            # The app is the launch's return value: its own calls are not steps.
+            [call for call in order.mock_calls if not call[0].startswith("launch_app()")],
+            [
+                mock.call.launch_app(
+                    source, Path("data"), Path("config"), Path("workspace"), Path("stderr"),
+                ),
+                mock.call.phase_trust(app, provider, source),
+                mock.call.phase_decisions(app, provider, source),
+                mock.call.quit_via_menu(app),
+                mock.call.click_lifecycle_decision(app, "Discard"),
+                mock.call.wait_process_exit(app),
+                mock.call.reap(app),
+            ],
+        )
+        self.assertEqual(observations["trust_disk_before"], DISK.evidence())
+        self.assertEqual(observations["decisions_editor_stale"], STALE.evidence())
+        self.assertEqual(observations["flow"], HARNESS.CASE_FLOWS[CASE])
+        provider.close.assert_called_once_with()
 
-                harness.run_review(app, provider, preserve_focus=preserve)
+    def test_a_phase_failure_names_its_phase_and_stops_the_session(self) -> None:
+        harness, order, app, provider = self.session_harness()
+        order.phase_trust.side_effect = runtime.HarnessFailure("SCRIPTS_TRUSTED_TIMEOUT")
+        with (
+            mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^TRUST_SCRIPTS_TRUSTED_TIMEOUT$"),
+        ):
+            harness.scenario_revision_session()
+        order.phase_decisions.assert_not_called()
+        order.quit_via_menu.assert_not_called()
+        order.reap.assert_called_once_with(app)
+        provider.close.assert_called_once_with()
 
-                self.assertEqual(harness.focus_editor.call_count, 0 if preserve else 1)
-                self.assertEqual(harness._require_foreground.call_count, 0 if preserve else 1)
-                if preserve:
-                    harness.win32.foreground_focus.assert_called_once_with(app.hwnd)
-                keys = harness.win32.send_inputs.call_args.args[0]
-                self.assertEqual([item.ki.wVk for item in keys], [
-                    HARNESS.VK_CONTROL, HARNESS.VK_SHIFT, HARNESS.VK_R,
-                    HARNESS.VK_R, HARNESS.VK_SHIFT, HARNESS.VK_CONTROL,
-                ])
-                harness._approve_consent.assert_called_once_with(
-                    app, "REVIEW_CONSENT_CLICK_FAILED", provider=provider,
-                    expected_request_count=0, open_gate=provider.grant_review_consent,
-                )
-
-    def test_preserved_focus_never_sends_keys_to_a_different_native_owner(self) -> None:
-        for focused in (0, 74):
-            with self.subTest(focused=focused):
-                harness = object.__new__(HARNESS.Goal07Harness)
-                harness.win32 = mock.Mock()
-                harness.win32.foreground_focus.return_value = focused
-                harness.focus_editor = mock.Mock()
-                harness._require_foreground = mock.Mock()
-
-                with self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_LOST"):
-                    harness.run_review(mock.Mock(hwnd=73), mock.Mock(), preserve_focus=True)
-
-                harness.win32.send_inputs.assert_not_called()
-                harness.focus_editor.assert_not_called()
-                harness._require_foreground.assert_not_called()
-
-    def test_trust_scenario_requires_handoff_before_review_or_editor_helpers(self) -> None:
-        for broken in (False, True):
-            with self.subTest(broken=broken):
-                harness = object.__new__(HARNESS.Goal07Harness)
-                harness.ui_timeout = 1.0
-                app, provider = mock.Mock(), mock.Mock()
-                app.security_context.evidence.return_value = process_context()
-                app.process.poll.return_value = None
-                provider.start.return_value = provider
-                harness.profile = mock.Mock(return_value=(Path("unused"),) * 6)
-                harness.launch_app = mock.Mock(return_value=app)
-                harness.find_control = mock.Mock()
-                harness.click_control = mock.Mock()
-                harness._trust_label = mock.Mock(side_effect=["Trusted", "Restricted"])
-                harness.activate_source_layout = mock.Mock(side_effect=AssertionError("premature Source"))
-                harness.activate_source_from_focused_web = mock.Mock()
-                harness.run_review = mock.Mock()
-                harness.request_revision = mock.Mock()
-                harness._click_id = mock.Mock()
-                harness._require_foreground = mock.Mock(return_value=True)
-                final_text = HARNESS.apply_edits(
-                    HARNESS.HTML_EDITOR_SOURCE_BYTES,
-                    PROVIDER.fixture_edits(HARNESS.HTML_EDITOR_SOURCE_TEXT),
-                ).decode("utf-8")
-                harness._preview_source_text = mock.Mock(return_value=final_text)
-                harness.editor_fingerprint = mock.Mock(side_effect=[
-                    runtime.fingerprint_bytes(HARNESS.HTML_EDITOR_SOURCE_BYTES),
-                    runtime.fingerprint_text(final_text),
-                ])
-                harness.win32 = mock.Mock()
-                harness.click_lifecycle_decision = mock.Mock()
-                harness.wait_process_exit = mock.Mock(
-                    side_effect=lambda _app: setattr(app.process.poll, "return_value", 0)
-                )
-                harness.reap = mock.Mock()
-                harness._finalize_observations = lambda _provider, _root, _app, obs: obs
-                order = mock.Mock()
-                for name in ("activate_source_from_focused_web", "run_review", "editor_fingerprint"):
-                    order.attach_mock(getattr(harness, name), name)
-                if broken:
-                    harness.activate_source_from_focused_web.side_effect = runtime.HarnessFailure(
-                        "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"
-                    )
-                with (
-                    mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
-                    mock.patch.object(HARNESS, "wait_until", side_effect=lambda check, *_a, **_k: check()),
-                    mock.patch.object(HARNESS, "trust_apply_source_contract_ok", return_value=True),
-                    mock.patch.object(HARNESS, "preview_inert_source_contract_ok", return_value=True),
-                ):
-                    if broken:
-                        with self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"):
-                            harness.scenario_trust_revoke()
-                        harness.run_review.assert_not_called()
-                        harness.editor_fingerprint.assert_not_called()
-                        harness.reap.assert_called_once_with(app)
-                    else:
-                        observations = harness.scenario_trust_revoke()
-                        self.assertTrue(observations["trust_before"])
-                        self.assertEqual(order.mock_calls[:2], [
-                            mock.call.activate_source_from_focused_web(app),
-                            mock.call.run_review(app, provider, preserve_focus=True),
-                        ])
-                        harness.request_revision.assert_called_once_with(app, provider=provider)
-                        harness.click_lifecycle_decision.assert_called_once_with(app, "Discard")
-                harness.activate_source_layout.assert_not_called()
-                provider.close.assert_called_once_with()
+    def test_an_unexpected_measurement_fails_with_its_phase_key(self) -> None:
+        for key, value, code in (
+            ("trust_disk_before", REVIEWED, "TRUST_DISK_BEFORE_UNEXPECTED"),
+            ("decisions_editor_one_accepted", ALL_ACCEPTED, "DECISIONS_EDITOR_ONE_ACCEPTED_UNEXPECTED"),
+            ("decisions_clipboard_copied", ALL_ACCEPTED, "DECISIONS_CLIPBOARD_COPIED_UNEXPECTED"),
+            ("decisions_disk_after", ONE_ACCEPTED, "DECISIONS_DISK_AFTER_UNEXPECTED"),
+        ):
+            with self.subTest(code=code):
+                observed: dict[str, Any] = {}
+                with self.assertRaisesRegex(runtime.HarnessFailure, f"^{code}$"):
+                    with HARNESS.phase(key.partition("_")[0].upper()):
+                        HARNESS.record(observed, key, value)
+                self.assertEqual(observed, {})
+        observed = {}
+        HARNESS.record(observed, "decisions_editor_one_accepted", ONE_ACCEPTED)
+        self.assertEqual(observed, {"decisions_editor_one_accepted": ONE_ACCEPTED.evidence()})
 
     def test_scenario_contract_failure_is_raised_before_shared_pass_status(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        observations = common(HARNESS.CASE_REJECT_ALL)
-        observations["reject_all_byte_identity"] = False
-        harness.parent_context = mock.Mock()
-        harness.parent_context.evidence.return_value = observations["process_context"]
-        harness.scenario_reject_all = lambda: observations
-        evidence = HARNESS.new_evidence(HASH)
-
+        observations = passing_observations()
+        observations["decisions_clipboard_copied"] = ALL_ACCEPTED.evidence()
+        harness = bare_harness(parent_context=mock.Mock(), scenario_revision_session=lambda: observations)
+        harness.parent_context.evidence.return_value = process_context()
         with self.assertRaisesRegex(runtime.HarnessFailure, "CASE_CONTRACT_FAILED"):
-            harness.scenario(HARNESS.CASE_REJECT_ALL)
+            harness.scenario(CASE)
 
-        self.assertEqual(evidence["transport"]["request_count"], 0)
-        HARNESS.complete_evidence(evidence, "BLOCKED")
-        HARNESS.validate_evidence(evidence)
 
-    def test_preview_source_accepts_name_only_text_but_not_the_static_label(self) -> None:
-        class NoValuePattern(Exception):
-            pass
+class PhaseTests(unittest.TestCase):
+    """Each phase's UI steps, in order, against fakes."""
 
-        class Control:
-            def __init__(self, name: str) -> None:
-                self.element_info = mock.Mock()
-                self.element_info.name = name
-
-            @property
-            def iface_value(self) -> object:
-                raise NoValuePattern
-
-            def children(self) -> list[object]:
-                return []
-
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.no_pattern_error_class = NoValuePattern
-        harness.find_control = lambda *_args, **_kwargs: Control("approved\npreview")
-
-        self.assertEqual(harness._preview_source_text(mock.Mock()), "approved\npreview")
-
-        harness.find_control = lambda *_args, **_kwargs: Control(
-            "Final approved Revision source"
-        )
-        with self.assertRaisesRegex(
-            HARNESS.HarnessFailure, "REVISION_PREVIEW_SOURCE_TEXT_CONTRACT_MISMATCH"
+    def trust_harness(self, focus_returns: bool) -> tuple[HARNESS.Goal07Harness, mock.Mock, mock.Mock]:
+        order = mock.Mock()
+        app = mock.Mock(hwnd=73)
+        harness = bare_harness(win32=mock.Mock())
+        for name in (
+            "menu_command", "_press", "confirm_system_alert", "wait_name", "editor_control",
         ):
-            harness._preview_source_text(mock.Mock())
+            setattr(harness, name, getattr(order, name))
+        harness.name_present = mock.Mock(return_value=False)
+        harness.win32.foreground_focus.return_value = app.hwnd if focus_returns else 0
+        return harness, order, app
 
-    def test_answer_input_uses_the_focused_unicode_keyboard_path(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
+    def test_trust_phase_trusts_scripts_then_hands_the_keyboard_back(self) -> None:
+        harness, order, app = self.trust_harness(focus_returns=True)
+        with (
+            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+        ):
+            observed = harness.phase_trust(app, order.provider, Path("trusted.html"))
+
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
+                mock.call._press(app, HARNESS.TRUST_SCRIPTS_AUTOMATION_ID, "WEB_TRUST"),
+                mock.call.confirm_system_alert(
+                    app, mock.ANY, "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION", confirmed=mock.ANY
+                ),
+                mock.call.wait_name(app, HARNESS.TRUSTED_BANNER, "Text", "SCRIPTS_TRUSTED_TIMEOUT"),
+                mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
+                mock.call.editor_control(app),
+            ],
+        )
+        self.assertEqual(observed, {"trust_disk_before": DISK.evidence()})
+        # The Run scripts alert is outside UIA: Enter answers it only while
+        # trust is still off, then the banner proves it.
+        still_undecided = order.confirm_system_alert.call_args.args[1]
+        self.assertTrue(still_undecided())
+        harness.name_present.return_value = True
+        self.assertFalse(still_undecided())
+        harness.name_present.assert_called_with(app, HARNESS.TRUSTED_BANNER, "Text")
+
+    def test_trust_phase_fails_while_the_web_view_keeps_the_keyboard(self) -> None:
+        harness, order, app = self.trust_harness(focus_returns=False)
+        with (
+            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"),
+        ):
+            harness.phase_trust(app, order.provider, Path("trusted.html"))
+
+    def decisions_harness(self, accept_offered: bool = False) -> tuple[HARNESS.Goal07Harness, mock.Mock]:
+        order = mock.Mock()
+        harness = bare_harness()
+        for name in (
+            "review_and_revise", "_named_texts", "editor_fingerprint", "decide_hunks",
+            "undo_decision", "copy_approved", "replace_editor", "wait_name", "control_absent",
+            "done", "menu_command",
+        ):
+            setattr(harness, name, getattr(order, name))
+        order.review_and_revise.return_value = len(EDITS)
+        order._named_texts.return_value = PROPOSAL_AFTER
+        order.editor_fingerprint.side_effect = [REVIEWED, ONE_ACCEPTED]
+        order.copy_approved.return_value = HARNESS.apply_edits(
+            HARNESS.EDITOR_SOURCE_BYTES, EDITS[:1]
+        ).decode("utf-8")
+        order.replace_editor.return_value = STALE
+        order.control_absent.return_value = not accept_offered
+        return harness, order
+
+    def test_decisions_phase_walks_accept_reject_undo_copy_stale_done_restricted(self) -> None:
+        harness, order = self.decisions_harness()
+        app, provider = mock.Mock(hwnd=73), order.provider
+        with mock.patch.object(HARNESS, "sha256_file", return_value=DISK):
+            observed = harness.phase_decisions(app, provider, Path("trusted.html"))
+
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call.review_and_revise(app, provider),
+                mock.call._named_texts(
+                    app, HARNESS.REVISION_PROPOSAL_AFTER_AUTOMATION_ID,
+                    HARNESS.REVISION_PROPOSAL_AFTER_NAME, "REVISION_PROPOSAL_AFTER",
+                ),
+                mock.call.editor_fingerprint(app),
+                mock.call.decide_hunks(app, [True], 2),
+                mock.call.editor_fingerprint(app),
+                mock.call.decide_hunks(app, [False], 2, decided=1),
+                mock.call.undo_decision(app, 1, 2),
+                mock.call.copy_approved(app),
+                mock.call.replace_editor(app, HARNESS.STALE_EDIT),
+                mock.call.wait_name(
+                    app, HARNESS.REVISION_PART_CHANGED_TEXT, "Text",
+                    "REVISION_PART_CHANGED_UIA_TIMEOUT",
+                ),
+                mock.call.control_absent(
+                    app, HARNESS.REVISION_ACCEPT_AUTOMATION_ID, "Button",
+                    "REVISION_ACCEPT_UIA_QUERY_FAILED", "REVISION_ACCEPT_UIA_CONTRACT_MISMATCH",
+                ),
+                mock.call.done(app, HARNESS.REVISION_APPLIED),
+                mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
+                mock.call.wait_name(
+                    app, HARNESS.RESTRICTED_BANNER, "Text", "SCRIPTS_RESTRICTED_TIMEOUT"
+                ),
+                mock.call.provider.verify_chain(),
+            ],
+        )
+        shared_evidence.validate_case(
+            HARNESS.CONTRACT,
+            CASE,
+            {**passing_observations(), **observed},
+            process_context(),
+        )
+        self.assertEqual(
+            {key for key in HARNESS.OBSERVATION_KEYS if key.startswith("decisions_")},
+            set(observed),
+        )
+
+    def test_a_wrong_measurement_stops_the_phase_before_its_next_step(self) -> None:
+        # Accept wrote nothing: the read fails at once, before Reject could
+        # time out first.
+        harness, order = self.decisions_harness()
+        order.editor_fingerprint.side_effect = [REVIEWED, REVIEWED]
+        with (
+            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^EDITOR_ONE_ACCEPTED_UNEXPECTED$"),
+        ):
+            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path("trusted.html"))
+        self.assertEqual(order.decide_hunks.call_count, 1)
+        order.copy_approved.assert_not_called()
+
+    def test_decisions_phase_fails_when_the_changed_part_still_offers_accept(self) -> None:
+        harness, order = self.decisions_harness(accept_offered=True)
+        with (
+            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^REVISION_OFFERS_ACCEPT$"),
+        ):
+            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path("trusted.html"))
+        order.done.assert_not_called()
+
+
+class StepTests(unittest.TestCase):
+    """The UI steps the phases share."""
+
+    def test_review_sends_its_shortcut_to_the_handed_back_keyboard_without_a_refocus(self) -> None:
+        harness = bare_harness(
+            focus_editor=mock.Mock(),
+            win32=mock.Mock(),
+            _approve_consent=mock.Mock(),
+            wait_name=mock.Mock(),
+        )
+        app, provider = mock.Mock(hwnd=73), mock.Mock()
+        harness.win32.foreground_focus.return_value = app.hwnd
+
+        harness.run_review(app, provider)
+
+        harness.focus_editor.assert_not_called()
+        harness.win32.send_shortcut.assert_called_once_with(73, runtime.VK_RETURN)
+        harness._approve_consent.assert_called_once_with(
+            app, "REVIEW_CONSENT_HOLD_FAILED", provider=provider,
+            expected_request_count=0, open_gate=provider.grant_review_consent,
+        )
+        harness.wait_name.assert_called_once_with(
+            app, HARNESS.REVIEW_RESULT_MARKER, "Text", "REVIEW_RESULT_UIA_TIMEOUT", 60.0
+        )
+
+    def test_review_never_sends_keys_to_a_different_native_owner(self) -> None:
+        for focused in (0, 74):
+            with self.subTest(focused=focused):
+                harness = bare_harness(win32=mock.Mock(), focus_editor=mock.Mock())
+                harness.win32.foreground_focus.return_value = focused
+
+                with self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_LOST"):
+                    harness.run_review(mock.Mock(hwnd=73), mock.Mock())
+
+                harness.win32.send_shortcut.assert_not_called()
+                harness.win32.send_inputs.assert_not_called()
+                harness.focus_editor.assert_not_called()
+
+    def test_the_chain_is_bound_to_the_document_before_the_review(self) -> None:
+        order = mock.Mock()
+        harness = bare_harness(run_review=order.run_review, request_revision=order.request_revision)
+        app, provider = mock.Mock(), order.provider
+
+        hunks = harness.review_and_revise(app, provider)
+
+        self.assertEqual(hunks, 2)
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call.provider.begin_chain(HARNESS.EDITOR_SOURCE_TEXT),
+                mock.call.run_review(app, provider),
+                mock.call.request_revision(app, provider=provider, hunks=2),
+            ],
+        )
+
+    def test_revision_request_submits_answer_prepares_and_waits_for_hunks(self) -> None:
+        order = mock.Mock()
+        harness = bare_harness()
+        for name in ("_set_answer", "_press", "_approve_consent", "wait_name"):
+            setattr(harness, name, getattr(order, name))
+        app, provider = mock.Mock(), mock.Mock()
+
+        harness.request_revision(app, provider=provider, hunks=2)
+
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call._set_answer(app, PROVIDER.ANSWER_TEXT),
+                mock.call._press(app, HARNESS.PREPARE_REVISION_AUTOMATION_ID, "REVISION_PREPARE"),
+                mock.call._approve_consent(
+                    app,
+                    "REVISION_CONSENT_HOLD_FAILED",
+                    provider=provider,
+                    expected_request_count=1,
+                    open_gate=provider.grant_revision_consent,
+                ),
+                mock.call.wait_name(
+                    app, "0 of 2 decided", "Text", "REVISION_PROPOSAL_UIA_TIMEOUT", 60.0
+                ),
+            ],
+        )
+
+    def typing_harness(self, accepted_value: Callable[[str], str]) -> tuple[HARNESS.Goal07Harness, list]:
         events: list[tuple[str, object]] = []
+        value = mock.Mock(CurrentValue="")
 
         class Control:
-            def is_enabled(self) -> bool:
-                return True
+            iface_value = value
+
+            def set_focus(self) -> None:
+                events.append(("focus", None))
 
         control = Control()
-        app = mock.Mock(hwnd=41)
-        harness._click_id = lambda _app, automation_id: events.append(
-            ("answer-state", automation_id)
+        harness = bare_harness(win32=mock.Mock())
+        harness.ui_timeout = 0.05
+        harness.find_control = lambda _app, automation_id, *_args: (
+            events.append(("find", automation_id)) or control
         )
         harness.control_by_id = lambda *_args, **_kwargs: control
-        harness.win32 = mock.Mock()
-        harness.win32.send_unicode.side_effect = lambda hwnd, text: events.append(
-            ("send-unicode", (hwnd, text))
+
+        def type_text(hwnd: int, text: str) -> None:
+            events.append(("send-unicode", (hwnd, text)))
+            value.CurrentValue = accepted_value(text)
+
+        harness.win32.send_unicode.side_effect = type_text
+        harness._press = lambda _app, name, code: events.append(("press", (name, code)))
+        return harness, events
+
+    def test_answer_input_uses_the_focused_unicode_keyboard_path(self) -> None:
+        harness, events = self.typing_harness(lambda text: text)
+
+        harness._set_answer(mock.Mock(hwnd=41), "kept intent")
+
+        self.assertEqual(
+            events,
+            [
+                ("find", HARNESS.REVIEW_ANSWER_INPUT_AUTOMATION_ID),
+                ("focus", None),
+                ("send-unicode", (41, "kept intent")),
+                ("press", (HARNESS.REVIEW_ANSWER_AUTOMATION_ID, "REVIEW_ANSWER_SUBMIT")),
+            ],
         )
-        harness._text_control = lambda *_args, **_kwargs: "kept intent"
 
-        harness._set_answer(app, 0, "kept intent")
+    def test_answer_input_times_out_before_submitting_a_wrong_value(self) -> None:
+        harness, events = self.typing_harness(lambda _text: "other")
 
-        self.assertEqual(events[0][0], "answer-state")
-        self.assertEqual(events[1], ("send-unicode", (41, "kept intent")))
+        with self.assertRaisesRegex(runtime.HarnessFailure, "REVIEW_ANSWER_INPUT_TIMEOUT"):
+            harness._set_answer(mock.Mock(hwnd=41), "kept intent")
+        self.assertNotIn("press", [event for event, _ in events])
 
-    def test_bottom_bar_covered_revision_control_scrolls_from_visible_review_content(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        window_rect = mock.Mock(top=50, bottom=1031)
-        offscreen = mock.Mock(top=972, bottom=1000)
-        onscreen = mock.Mock(top=864, bottom=892)
-        control = mock.Mock()
-        control.rectangle.side_effect = [offscreen, onscreen]
-        anchor = mock.Mock()
-        anchor.rectangle.return_value = mock.Mock(top=100, bottom=120)
-        app = mock.Mock(hwnd=41)
-        app.window.rectangle.return_value = window_rect
-        harness.control_by_id = mock.Mock(
-            side_effect=lambda _hwnd, automation_id, *_args: (
-                control if automation_id == "target" else anchor
+    def test_decisions_wait_for_each_count_and_the_next_docked_hunk(self) -> None:
+        harness = bare_harness()
+        events: list[tuple[str, object]] = []
+        # The decided hunk stays docked with its word for one poll, then the
+        # next undecided hunk comes forward.
+        docked_word = iter([True, False])
+        harness._press = lambda _app, name, _code: events.append(("press", name))
+        harness.wait_name = lambda _app, name, *_args: events.append(("wait", name))
+
+        def name_present(_app, name, control_type):
+            self.assertIn(name, HARNESS.REVISION_DECISION_WORDS)
+            self.assertEqual(control_type, "Text")
+            present = next(docked_word, False) if name == "Accepted" else False
+            events.append(("docked", name)) if present else None
+            return present
+
+        harness.name_present = name_present
+
+        harness.decide_hunks(mock.Mock(), [True, False], 2)
+        harness.undo_decision(mock.Mock(), 1, 2)
+        harness.decide_hunks(mock.Mock(), [True], 2, decided=1)
+        harness.done(mock.Mock(), HARNESS.REVISION_APPLIED)
+
+        self.assertEqual(
+            events,
+            [
+                ("press", HARNESS.REVISION_ACCEPT_AUTOMATION_ID),
+                ("wait", "1 of 2 decided"),
+                ("docked", "Accepted"),
+                ("press", HARNESS.REVISION_REJECT_AUTOMATION_ID),
+                ("wait", "2 of 2 decided"),
+                ("press", HARNESS.REVISION_UNDO_AUTOMATION_ID),
+                ("wait", "1 of 2 decided"),
+                ("press", HARNESS.REVISION_ACCEPT_AUTOMATION_ID),
+                ("wait", "2 of 2 decided"),
+                ("press", HARNESS.REVISION_DONE_AUTOMATION_ID),
+                ("wait", HARNESS.REVISION_APPLIED),
+            ],
+        )
+
+    def test_copy_reads_the_os_clipboard_after_clearing_it(self) -> None:
+        order = mock.Mock()
+        harness = bare_harness()
+        for name in (
+            "read_text_clipboard", "write_text_clipboard", "find_control", "click_control",
+            "wait_clipboard_text",
+        ):
+            setattr(harness, name, getattr(order, name))
+        order.wait_clipboard_text.return_value = "approved"
+        app = mock.Mock()
+
+        self.assertEqual(harness.copy_approved(app), "approved")
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call.write_text_clipboard(None),
+                mock.call.find_control(
+                    app, HARNESS.REVISION_COPY_AUTOMATION_ID, "Button",
+                    "REVISION_COPY_UIA_TIMEOUT", "REVISION_COPY_UIA_CONTRACT_MISMATCH",
+                ),
+                mock.call.click_control(order.find_control.return_value, "REVISION_COPY_CLICK_FAILED"),
+                mock.call.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT"),
+            ],
+        )
+
+    def test_proposal_text_joins_only_the_exposed_group_text_lines(self) -> None:
+        def child(name: object, control_type: str = "Text") -> object:
+            item = mock.Mock()
+            item.element_info.name = name
+            item.element_info.control_type = control_type
+            return item
+
+        group = mock.Mock()
+        group.element_info.name = HARNESS.REVISION_PROPOSAL_AFTER_NAME
+        group.children.return_value = [
+            child("approved"), child("Accept", "Button"), child(None), child("preview"),
+        ]
+        harness = bare_harness(find_control=mock.Mock(return_value=group))
+
+        def texts() -> str:
+            return harness._named_texts(
+                mock.Mock(),
+                HARNESS.REVISION_PROPOSAL_AFTER_AUTOMATION_ID,
+                HARNESS.REVISION_PROPOSAL_AFTER_NAME,
+                "P",
             )
+
+        self.assertEqual(texts(), "approved\npreview")
+        self.assertEqual(harness.find_control.call_args.args[2], "Group")
+
+        group.children.return_value = [child("Accept", "Button")]
+        with self.assertRaisesRegex(runtime.HarnessFailure, "P_TEXT_UNAVAILABLE"):
+            texts()
+
+        group.children.return_value = [child("approved")]
+        group.element_info.name = "Something else"
+        with self.assertRaisesRegex(runtime.HarnessFailure, "P_UIA_CONTRACT_MISMATCH"):
+            texts()
+
+    def test_press_requires_foreground_first_and_finds_the_control_by_id(self) -> None:
+        events: list[str] = []
+        harness = bare_harness(win32=mock.Mock())
+        harness.win32.require_foreground.side_effect = lambda *_args: events.append("foreground")
+        harness.find_control = lambda _app, automation_id, control_type, *_args: (
+            events.append(f"find-{automation_id}-{control_type}") or object()
+        )
+        harness.click_control = lambda _control, failure: events.append(f"click-{failure}")
+
+        harness._press(mock.Mock(hwnd=41), HARNESS.REVISION_ACCEPT_AUTOMATION_ID, "REVISION_ACCEPT")
+
+        self.assertEqual(
+            events,
+            ["foreground", "find-revision-accept-Button", "click-REVISION_ACCEPT_CLICK_FAILED"],
         )
 
-        result = harness._scroll_revision_control_into_view(
-            app, "target", "Button", control
-        )
 
-        self.assertIs(result, control)
-        anchor.wheel_mouse_input.assert_called_once_with(wheel_dist=-3)
-
-    def test_stale_control_scrolls_up_until_accessible(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        stale = mock.Mock()
-        stale.rectangle.return_value = mock.Mock(top=120, bottom=140)
-        anchor = mock.Mock()
-        anchor.rectangle.return_value = mock.Mock(top=700, bottom=760)
-        app = mock.Mock(hwnd=41)
-        app.window.rectangle.return_value = mock.Mock(top=50, bottom=900)
-        stale_calls = 0
-
-        def control_by_id(_hwnd, automation_id, *_args, **_kwargs):
-            nonlocal stale_calls
-            if automation_id == HARNESS.REVISION_STALE_ACCESSIBILITY_ID:
-                stale_calls += 1
-                return stale if stale_calls > 1 else None
-            if automation_id == HARNESS.REVISION_PREVIEW_ACCESSIBILITY_ID:
-                return anchor
-            return None
-
-        harness.control_by_id = control_by_id
-
-        result = harness._find_stale_control(app)
-
-        self.assertIs(result, stale)
-        anchor.wheel_mouse_input.assert_called_once_with(wheel_dist=3)
-
-    def test_apply_state_scrolls_above_the_bottom_bar_before_querying(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        button = mock.Mock()
-        button.is_enabled.return_value = True
-        app = mock.Mock(hwnd=41)
-        harness.control_by_id = mock.Mock(return_value=button)
-        harness._scroll_revision_control_into_view = mock.Mock(return_value=button)
-
-        result, reported_enabled = harness._apply_button_state(app)
-
-        self.assertIs(result, button)
-        self.assertTrue(reported_enabled)
-        harness._scroll_revision_control_into_view.assert_called_once_with(
-            app,
-            HARNESS.REVISION_APPLY_ACCESSIBILITY_ID,
-            "Button",
-            button,
-        )
-
+class ConsentTests(unittest.TestCase):
     def test_consent_gate_rejects_any_pre_click_request_snapshot(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        harness.win32 = mock.Mock()
-        harness.win32.owned_task_dialogs.return_value = [99]
-        harness.control_by_id = lambda *_args, **_kwargs: object()
+        harness = bare_harness(win32=mock.Mock(), find_control=lambda *_args, **_kwargs: object())
         events: list[str] = []
 
         class FakeProvider:
             def request_snapshot(self) -> dict[str, int | bool]:
                 return {"request_count": 1, "invalid_request": False}
 
-            def dispatch_consent_click(
-                self, _count: int, click: Callable[[], None]
-            ) -> None:
+            def dispatch_consent_click(self, _count: int, click: Callable[[], None]) -> None:
                 events.append("marker")
                 click()
 
-        with self.assertRaisesRegex(
-            runtime.HarnessFailure, "REVIEW_REQUEST_BEFORE_CONSENT_CLICK"
-        ):
+        with self.assertRaisesRegex(runtime.HarnessFailure, "REVIEW_REQUEST_BEFORE_CONSENT_CLICK"):
             harness._approve_consent(
                 mock.Mock(process=mock.Mock(pid=7), hwnd=8),
-                "REVIEW_CONSENT_CLICK_FAILED",
+                "REVIEW_CONSENT_HOLD_FAILED",
                 provider=FakeProvider(),
                 expected_request_count=0,
                 open_gate=lambda: events.append("gate"),
@@ -1337,30 +941,22 @@ class SourceAndCliTests(unittest.TestCase):
         self.assertEqual(events, [])
 
     def test_consent_gate_records_rejected_request_before_click(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
+        harness = bare_harness()
         provider = mock.Mock()
-        provider.request_snapshot.return_value = {
-            "request_count": 0,
-            "invalid_request": True,
-        }
-        with self.assertRaisesRegex(
-            runtime.HarnessFailure, "REVISION_REQUEST_BEFORE_CONSENT_CLICK"
-        ):
+        provider.request_snapshot.return_value = {"request_count": 0, "invalid_request": True}
+        with self.assertRaisesRegex(runtime.HarnessFailure, "REVISION_REQUEST_BEFORE_CONSENT_CLICK"):
             harness._open_consent_gate(provider, 1, lambda: None)
 
     def test_consent_dispatch_requires_request_count_and_gate(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        harness.win32 = mock.Mock()
-        harness.win32.owned_task_dialogs.return_value = [99]
-        harness.control_by_id = lambda *_args, **_kwargs: object()
+        harness = bare_harness(
+            win32=mock.Mock(),
+            find_control=lambda *_args, **_kwargs: object(),
+            hold_control=mock.Mock(),
+        )
         provider = mock.Mock()
         app = mock.Mock(process=mock.Mock(pid=7), hwnd=8)
 
-        for expected_request_count, open_gate in (
-            (None, lambda: None),
-            (0, None),
-        ):
+        for expected_request_count, open_gate in ((None, lambda: None), (0, None)):
             with self.subTest(expected_request_count=expected_request_count), self.assertRaisesRegex(
                 runtime.HarnessFailure, "CONSENT_GATE_CONFIGURATION_INVALID"
             ):
@@ -1371,151 +967,109 @@ class SourceAndCliTests(unittest.TestCase):
                     expected_request_count=expected_request_count,
                     open_gate=open_gate,
                 )
+        provider.dispatch_consent_click.assert_not_called()
+        harness.hold_control.assert_not_called()
 
-    def test_consent_gate_opens_before_the_consent_button_click(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
+    def test_consent_gate_opens_before_the_consent_hold(self) -> None:
         events: list[str] = []
-        harness.win32 = mock.Mock()
-        harness.win32.owned_task_dialogs.return_value = [99]
-        harness.control_by_id = lambda *_args, **_kwargs: object()
-        harness.click_control = lambda _control, _failure: events.append("click")
+        send = object()
+        harness = bare_harness(
+            find_control=lambda _app, automation_id, *_args: (
+                send if automation_id == HARNESS.CONSENT_SEND_AUTOMATION_ID else None
+            ),
+            hold_control=lambda _app, control, seconds, failure: events.append(
+                f"hold-{control is send}-{seconds}-{failure}"
+            ),
+        )
 
         class FakeProvider:
-            def request_snapshot(self) -> dict[str, int | bool]:
-                return {"request_count": 0, "invalid_request": False}
+            requests = 0
 
-            def dispatch_consent_click(
-                self, count: int, click: Callable[[], None]
-            ) -> None:
+            def request_snapshot(self) -> dict[str, int | bool]:
+                events.append(f"snapshot-{self.requests}")
+                return {"request_count": self.requests, "invalid_request": False}
+
+            def dispatch_consent_click(self, count: int, click: Callable[[], None]) -> None:
                 events.append(f"marker-{count}")
                 click()
+                # The held send reaches the loopback after the hold.
+                self.requests += 1
 
         harness._approve_consent(
             mock.Mock(process=mock.Mock(pid=7), hwnd=8),
-            "REVIEW_CONSENT_CLICK_FAILED",
+            "REVIEW_CONSENT_HOLD_FAILED",
             provider=FakeProvider(),
             expected_request_count=0,
             open_gate=lambda: events.append("gate"),
         )
 
-        self.assertEqual(events, ["gate", "marker-0", "click"])
-
-    def test_app_owned_click_requires_foreground_first(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        events: list[str] = []
-        harness.win32 = mock.Mock()
-        harness.win32.require_foreground.side_effect = lambda *_args: events.append(
-            "foreground"
+        self.assertEqual(
+            events,
+            [
+                "snapshot-0",
+                "gate",
+                "marker-0",
+                f"hold-True-{HARNESS.CONSENT_HOLD_SECONDS}-REVIEW_CONSENT_HOLD_FAILED",
+                "snapshot-1",
+            ],
         )
-        harness.find_control = lambda *_args, **_kwargs: object()
-        harness._scroll_revision_control_into_view = (
-            lambda _app, _automation_id, _control_type, control: (
-                events.append("scroll") or control
+        self.assertEqual(HARNESS.CONSENT_HOLD_SECONDS, 1.8)
+
+    def test_a_hold_whose_request_never_arrives_fails_fast_with_its_operation(self) -> None:
+        # A real loopback that never receives the Review request.
+        harness = bare_harness(
+            find_control=lambda *_args: object(), hold_control=lambda *_args: None
+        )
+        with (
+            PROVIDER.LoopbackRevisionServer() as server,
+            mock.patch.object(HARNESS, "REQUEST_SENT_TIMEOUT_SECONDS", 0.2),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^REVIEW_REQUEST_NOT_SENT$"),
+        ):
+            server.begin_chain(HARNESS.EDITOR_SOURCE_TEXT)
+            harness._approve_consent(
+                mock.Mock(hwnd=8),
+                "REVIEW_CONSENT_HOLD_FAILED",
+                provider=server,
+                expected_request_count=0,
+                open_gate=server.grant_review_consent,
             )
-        )
-        harness.click_control = lambda _control, _failure: events.append("click")
 
-        harness._click_id(mock.Mock(hwnd=41), "markturbo-revision-accept-all")
+        # The Revision hold counts from the Review already received.
+        provider = mock.Mock()
+        provider.request_snapshot.return_value = {"request_count": 1, "invalid_request": False}
+        with (
+            mock.patch.object(HARNESS, "REQUEST_SENT_TIMEOUT_SECONDS", 0.2),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^REVISION_REQUEST_NOT_SENT$"),
+        ):
+            harness._wait_request_sent(provider, 1)
+        self.assertEqual(HARNESS.REQUEST_SENT_TIMEOUT_SECONDS, 5.0)
 
-        self.assertEqual(events, ["foreground", "scroll", "click"])
+    def test_a_refused_request_fails_with_the_loopback_code_not_as_unsent(self) -> None:
+        harness = bare_harness()
+        provider = mock.Mock()
+        provider.request_snapshot.return_value = {"request_count": 0, "invalid_request": True}
+        provider.verify_chain.side_effect = runtime.HarnessFailure("LOOPBACK_STREAM_MODE_MISMATCH")
+        with self.assertRaisesRegex(runtime.HarnessFailure, "^LOOPBACK_STREAM_MODE_MISMATCH$"):
+            harness._wait_request_sent(provider, 0)
 
-    def test_revision_run_waits_until_enabled_before_click(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.ui_timeout = 0.1
-        states = iter((False, True))
-        events: list[str] = []
 
-        class Control:
-            def is_enabled(self) -> bool:
-                events.append("enabled")
-                return next(states)
-
-        control = Control()
-        harness.win32 = mock.Mock()
-        harness.find_control = lambda *_args, **_kwargs: control
-        harness._scroll_revision_control_into_view = (
-            lambda _app, _automation_id, _control_type, candidate: candidate
-        )
-        harness.control_by_id = lambda *_args, **_kwargs: control
-        harness.click_control = lambda _control, _failure: events.append("click")
-
-        harness._click_id(mock.Mock(hwnd=41), HARNESS.REVISION_RUN_ACCESSIBILITY_ID)
-
-        self.assertEqual(events, ["enabled", "enabled", "click"])
-
+class ProfileAndFixtureTests(unittest.TestCase):
     def test_loopback_profile_is_keyless_and_uses_only_a_process_synthetic_key(self) -> None:
-        settings = HARNESS.review_settings_document("http://127.0.0.1:4141/v1/").decode(
-            "utf-8"
-        )
+        settings = HARNESS.review_settings_document("http://127.0.0.1:4141/v1/").decode("utf-8")
         self.assertIn('model-provider = "openai-responses"', settings)
         self.assertNotIn("api-key", settings.casefold())
         self.assertIn("model-environment-key-identity", settings)
-        self.assertIn(
-            HARNESS.endpoint_environment_key_identity("http://127.0.0.1:4141/v1/"),
-            settings,
-        )
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness._credential = "markturbo-goal07-loopback-key"
-        self.assertEqual(
-            harness.openai_api_key_for_child(), "markturbo-goal07-loopback-key"
-        )
+        self.assertIn(credential_target("http://127.0.0.1:4141/v1/"), settings)
+        harness = bare_harness(_credential="markturbo-goal07-loopback-key")
+        self.assertEqual(harness.openai_api_key_for_child(), "markturbo-goal07-loopback-key")
 
     def test_harness_credentials_are_fresh_uuid_values(self) -> None:
-        with mock.patch.object(HARNESS.ClipboardNativeHarness, "__init__", return_value=None):
+        with mock.patch.object(runtime.NativeHarness, "__init__", return_value=None):
             first = HARNESS.Goal07Harness()
             second = HARNESS.Goal07Harness()
         self.assertRegex(first.openai_api_key_for_child(), r"^markturbo-goal07-[0-9a-f]{32}$")
         self.assertRegex(second.openai_api_key_for_child(), r"^markturbo-goal07-[0-9a-f]{32}$")
         self.assertNotEqual(first.openai_api_key_for_child(), second.openai_api_key_for_child())
-
-    def test_profile_blocks_existing_persistent_credential_after_dynamic_endpoint(self) -> None:
-        harness = object.__new__(HARNESS.Goal07Harness)
-        harness.win32 = mock.Mock()
-        harness.win32.persistent_credential_target_exists.return_value = True
-        with tempfile.TemporaryDirectory() as directory:
-            harness.root = Path(directory)
-            with self.assertRaisesRegex(runtime.HarnessBlocked, "PERSISTENT_CREDENTIAL_PRESENT"):
-                harness.profile("synthetic", "http://127.0.0.1:43123/v1/")
-        harness.win32.persistent_credential_target_exists.assert_called_once_with(
-            HARNESS.endpoint_environment_key_identity("http://127.0.0.1:43123/v1/")
-        )
-
-    def test_dynamic_endpoint_identity_includes_port_and_path(self) -> None:
-        first = HARNESS.endpoint_environment_key_identity("http://127.0.0.1:4141/v1/")
-        second = HARNESS.endpoint_environment_key_identity("http://127.0.0.1:4141/other/")
-        third = HARNESS.endpoint_environment_key_identity("http://127.0.0.1:4142/v1/")
-        self.assertNotEqual(first, second)
-        self.assertNotEqual(first, third)
-        self.assertEqual(
-            first,
-            "io.github.wxxb789.markturbo:model-credential:v2|wire=openai-responses|"
-            "host=127.0.0.1|identity-sha256=76d1c8cb04c37287006720b64f66be02bb85723be756cc668cbc0acc13bb1eb4",
-        )
-
-    def test_question_and_change_ids_match_production_shape(self) -> None:
-        self.assertRegex(
-            HARNESS.revision_question_accessibility_id(0),
-            r"^markturbo-revision-question-[0-9a-f]{64}$",
-        )
-        self.assertEqual(
-            HARNESS.revision_change_accessibility_id(7, "accept"),
-            "markturbo-revision-change-7-accept",
-        )
-
-    def test_parser_requires_hash_and_positive_timeout(self) -> None:
-        args = HARNESS.parse_args(["--expect-exe-sha256", HASH, "--ui-timeout", "1.5"])
-        self.assertEqual(args.expect_exe_sha256, HASH)
-        self.assertEqual(args.ui_timeout, 1.5)
-        with self.assertRaises(argparse.ArgumentTypeError):
-            HARNESS.normalize_expected_hash("not-a-hash")
-
-    def test_single_case_is_not_a_full_acceptance_run(self) -> None:
-        args = HARNESS.parse_args(
-            ["--expect-exe-sha256", HASH, "--case", HARNESS.CASE_STALE]
-        )
-        self.assertEqual(args.case, HARNESS.CASE_STALE)
 
     def test_apply_edits_rejects_invalid_ranges_duplicate_offsets_and_oversized_output(self) -> None:
         invalid = [
@@ -1526,11 +1080,7 @@ class SourceAndCliTests(unittest.TestCase):
             with self.subTest(edit=edit), self.assertRaisesRegex(ValueError, "invalid native fixture edit"):
                 HARNESS.apply_edits(b"abc", [edit])
 
-        split_character = {
-            "range": {"start": 1, "end": 1},
-            "expected_source": "",
-            "replacement": "x",
-        }
+        split_character = {"range": {"start": 1, "end": 1}, "expected_source": "", "replacement": "x"}
         with self.assertRaisesRegex(ValueError, "invalid native fixture edit"):
             HARNESS.apply_edits("é".encode("utf-8"), [split_character])
 
@@ -1549,34 +1099,18 @@ class SourceAndCliTests(unittest.TestCase):
             HARNESS.apply_edits(b"abc", overlapping)
 
         with mock.patch.object(HARNESS, "MAX_EDIT_OUTPUT_BYTES", 3):
-            oversized = {
-                "range": {"start": 0, "end": 1},
-                "expected_source": "a",
-                "replacement": "xxxx",
-            }
+            oversized = {"range": {"start": 0, "end": 1}, "expected_source": "a", "replacement": "xxxx"}
             with self.assertRaisesRegex(ValueError, "invalid native fixture edit"):
                 HARNESS.apply_edits(b"abc", [oversized])
 
-        no_op = {
-            "range": {"start": 0, "end": 1},
-            "expected_source": "a",
-            "replacement": "a",
-        }
+        no_op = {"range": {"start": 0, "end": 1}, "expected_source": "a", "replacement": "a"}
         with self.assertRaisesRegex(ValueError, "invalid native fixture edit"):
             HARNESS.apply_edits(b"abc", [no_op])
 
         with mock.patch.object(HARNESS, "MAX_EDIT_OUTPUT_BYTES", 4):
             subset_only_oversized = [
-                {
-                    "range": {"start": 0, "end": 3},
-                    "expected_source": "abc",
-                    "replacement": "",
-                },
-                {
-                    "range": {"start": 4, "end": 4},
-                    "expected_source": "",
-                    "replacement": "xyz",
-                },
+                {"range": {"start": 0, "end": 3}, "expected_source": "abc", "replacement": ""},
+                {"range": {"start": 4, "end": 4}, "expected_source": "", "replacement": "xyz"},
             ]
             with self.assertRaisesRegex(ValueError, "invalid native fixture edit"):
                 HARNESS.apply_edits(b"abcd", subset_only_oversized)

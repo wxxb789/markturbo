@@ -12,8 +12,16 @@ fn start() -> Headless {
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
     app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
         .expect("wide viewport");
-    app.wait_for("text:Settings").expect("shell");
+    app.wait_for("id:shell").expect("shell");
     app
+}
+
+/// Opens the settings page from the title row's menu: the gear is the room's
+/// one icon, and the page lives behind it.
+fn open_settings(app: &mut Headless) {
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-settings").expect("open settings");
+    app.wait_for("id:settings-page").expect("settings page");
 }
 
 #[test]
@@ -31,7 +39,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     }
 
     let mut app = start();
-    app.press("text:Settings").expect("open settings");
+    open_settings(&mut app);
     app.wait_for("id:usage-counters").expect("usage section");
     app.wait_for("id:usage-summary").expect("readable summary");
     app.wait_for("id:usage-retention").expect("retention note");
@@ -44,21 +52,22 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         !store.exists(),
         "default-off startup and inspection wrote counts"
     );
-    app.press("text:On").expect("explicitly enable recording");
+    app.press("id:usage-on")
+        .expect("explicitly enable recording");
     app.wait_for("text:Usage-counter preference saved.")
         .expect("consent persisted");
     assert!(mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
-    app.press("text:Close").expect("close settings");
+    app.press("id:settings-close").expect("close settings");
     app.set_clipboard(Some("PRIVATE-PASTE-SENTINEL".to_owned()));
-    app.press("text:Paste").expect("paste an artifact");
+    // Paste is the welcome state's control: no document is open yet.
+    app.press("id:welcome-paste").expect("paste an artifact");
     support::wait_for_path(&mut app, &store, "count the paste", Duration::from_secs(5));
     drop(app);
 
     let mut app = start();
     assert!(mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
-    app.press("text:Settings").expect("settings after restart");
-    app.press("text:Inspect counts")
-        .expect("inspect daily counts");
+    open_settings(&mut app);
+    app.press("id:usage-inspect").expect("inspect daily counts");
     app.wait_for("id:usage-details").expect("daily details");
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
     let day = json["days"].as_object().unwrap().values().next().unwrap();
@@ -66,7 +75,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     assert_eq!(day["events"]["first_launch"], 1);
     app.on_pick_save_path(Some(export.clone()))
         .expect("choose export destination");
-    app.press("text:Export counts…").expect("deliberate export");
+    app.press("id:usage-export").expect("deliberate export");
     support::wait_for_path(
         &mut app,
         &export,
@@ -87,14 +96,15 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         assert!(!text.contains("chosen-summary"));
         assert!(!text.contains(&config.path().to_string_lossy().to_string()));
     }
-    app.press("text:Off").expect("disable recording");
+    app.press("id:usage-off").expect("disable recording");
     app.wait_for("text:Usage-counter preference saved.")
         .expect("disable saved");
     assert!(!mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
     let disabled_bytes = std::fs::read(&store).unwrap();
-    app.press("text:Close").expect("close settings");
+    app.press("id:settings-close").expect("close settings");
     app.set_clipboard(Some("ANOTHER-PRIVATE-PASTE".to_owned()));
-    app.press("text:Paste").expect("local paste while disabled");
+    app.press("id:welcome-paste")
+        .expect("local paste while disabled");
     app.wait_for("text:ANOTHER-PRIVATE-PASTE")
         .expect("paste completed");
     assert_eq!(std::fs::read(&store).unwrap(), disabled_bytes);
@@ -103,9 +113,8 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     let mut app = start();
     assert!(!mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
     assert_eq!(std::fs::read(&store).unwrap(), disabled_bytes);
-    app.press("text:Settings").expect("settings while disabled");
-    app.press("text:Clear counts")
-        .expect("clear local aggregate");
+    open_settings(&mut app);
+    app.press("id:usage-clear").expect("clear local aggregate");
     app.wait_for(
         "text:Local counts deleted. Recording preference and exported copies are unchanged.",
     )
@@ -116,7 +125,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         "text:0 retained UTC days · 0 Reviews completed · 0 revision decisions · 0 events",
     )
     .expect("summary reflects Clear");
-    app.press("text:简体中文")
+    app.press("id:settings-language-chinese")
         .expect("switch settings language");
     app.wait_for("text:本地使用计数")
         .expect("localized section");

@@ -35,7 +35,7 @@ wiring, while `mt-core` tests proposal validation and consent semantics.
 | Workspace | `mt.py check ci` | fast + fmt/clippy + workspace tests, including headless app tests | settled product change; Ubuntu per PR |
 | Native-harness unit tests | `mt.py check native` | native acceptance tooling only; no desktop or executable | native harness change |
 | Release | `mt.py check full` | release profile + build + privacy scan | release candidate |
-| Native acceptance | `mt.py accept <goal> -- ...` | active Windows desktop, final executable hash | milestone |
+| Native acceptance | `mt.py accept all ...` (one goal: `mt.py accept <goal> -- ...` for diagnosis) | active Windows desktop, final executable hash | milestone |
 
 `check native` is not acceptance. Native acceptance remains a separate,
 hash-bound milestone action and may be BLOCKED by the desktop/session.
@@ -145,12 +145,210 @@ Retained acceptance, ablation, and measurement evidence is indexed in
 
 ## Native harness status
 
-The nsh app has stable headless test IDs but not yet a complete native
-automation ID contract. The historical goal-03/06/07 harnesses target retired
-GPUI IDs and source files; their unit tests are in `check native`, not the fast
-gate. Rewriting the selectors and cases is a bounded follow-up before native
-acceptance can pass on nsh; the absence of that evidence is recorded as pending,
-not converted into a passing result.
+The goal-02/03/06/07 harnesses (`scripts/markturbo_tools/native/`) are ported
+to the nsh UI and synchronized with the merged Afterglow behavior below. They
+have not yet run live against an nsh build: no nsh acceptance evidence exists,
+and that absence stays pending, not a pass. Their unit tests run in
+`check native`, not the fast gate. Pass the packaged app with
+`--exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe`.
+
+How nsh 0.5.1 exposes views to UIA, and so how the harnesses select them:
+
+- A view's `test_id` is the UIA AutomationId, but only when the view is itself
+  an element: a Button (pressable), Edit (input), Text, or a labelled Group.
+  Unlabelled wrappers are flattened. The `prims` quiet/primary actions and
+  the guard card's buttons are the pressable view itself, so each is found by
+  its own AutomationId (`guard-save`, `welcome-new-file`, `revision-accept`,
+  ...). Rows that share an id (`welcome-recent`, `workspace-home-file`) are
+  enumerated by it and told apart by their Name.
+- Title-menu rows (`title-menu-*`) are reached by invoking `title-settings`
+  first, so a command can move between the title row and that menu without a
+  selector change. Save, Save As, Quit, Review selection and the Edit/Web
+  modes go through it.
+- The editor's accessible element is the `Markdown source` IME input; its UIA
+  Value is not the document. The harness reads the document with Ctrl+A, Ctrl+C
+  sent as one input batch, waits for the clipboard sequence number to advance
+  (resending Ctrl+C once after 300 ms), then reads the text. Another writer
+  can also advance the sequence, so before awaiting a text the harness
+  empties a clipboard that already holds it; otherwise a read never writes
+  the clipboard. The run saves the user's text clipboard once and
+  restores it once at its end. Selection and Review use the editor's own keys
+  (Ctrl+A, Ctrl+Enter).
+- UIA Invoke is one tap. The consent card's `consent-send` sends only after a
+  held press, so the harnesses hold the real pointer past the control's 1.2 s
+  threshold; an Invoke is never consent.
+- Ctrl+Enter depends on state: it starts Review from the title row, sends from
+  the consent card, and is Done on the Revision field. The harnesses send it
+  only in the state whose action they mean.
+- nsh system alerts (`alert_dialog()`) are not in the UIA tree: they are drawn
+  inside the window as hosted items, which have no accessibility hook. This
+  covers the Overwrite confirmation after Keep mine (goal 02) and the Run
+  scripts confirmation after Trust scripts (goal 07). While an alert shows it
+  takes every key. Enter presses its first button, or the last regular
+  `.action` when it has one. The harnesses therefore check that the press alone changed
+  nothing, then send Enter from the main window's keyboard focus, and prove the
+  decision by its effect: the file holds the edited bytes, or the Trusted
+  banner appears, so an Enter that cancels fails the case. Test-id'd,
+  in-window confirmation cards would let a harness select the button directly.
+
+The harnesses do not scan Rust source; a renamed selector fails the live run
+with that control's UIA timeout or contract-mismatch code.
+
+What each goal runs (`mt.py accept all` runs all four). Every phase of a
+merged session has its own observation-key prefix and failure-code prefix
+(`runtime.phase`), so a FAIL names the phase it happened in. A goal restarts
+the app only where the behaviour itself needs a restart.
+
+- Goal 06, default mode: one case `fresh_endpoint_not_set_up`, one launch.
+  Phase `SHORTCUT` (Ctrl+Enter shows `No model set up`); the source file's
+  hash is unchanged and a clean WM_CLOSE with no guard proves the document
+  stayed clean. Headless: its Close removing the card and the title menu's
+  `Review selection` row showing it again, with the document still clean
+  (`state.rs` `review_without_a_model_closes_and_the_menu_row_shows_it_again`).
+  `--configured-provider` (opt-in, `accept goal-06` only) runs
+  `configured_provider_session` against a real provider in one launch:
+  `DOCUMENT` (Ctrl+Enter, consent hold, result, Close) then `SELECTION`
+  (Select All, the menu row; the consent card shows the `Selection` scope);
+  each keeps the source file's hash. Localized findings, clarification
+  questions and the keyless Review variants are headless mt-core/mt-app tests.
+- Goal 02, one case `lifecycle-session`, two launches (the interruption is
+  the only restart). First launch: `EXTERNAL_MODIFICATION` (a same-length
+  rewrite with the loaded mtime is refused, then Keep mine and the Overwrite
+  alert write the exact bytes), `TAB_CLOSE` (the rail close raises the guard;
+  Cancel keeps the file; the following Save writes the exact edited bytes) and
+  `CHECKPOINT` (an encrypted canonical record within 10 000 ms, no sentinel
+  leak, then TerminateProcess). Relaunch on the workspace folder: `RESTORE`
+  (Restore brings back the exact checkpointed bytes), `KEYBOARD_CLOSE`
+  (Ctrl+W, Don't save closes the tab without writing and retires the record)
+  and `WINDOW_CLOSE` (the workspace home's row reopens the file; Alt+F4 and
+  WM_CLOSE raise the guard; Cancel keeps the file; Save writes the exact bytes
+  and the process exits 0; no recovery record survives). The editor is not
+  read after a refusal or a Cancel: the exact bytes of the next write prove
+  the buffer survived. Launch failures carry `FIRST_LAUNCH_` or
+  `RESTORE_LAUNCH_`. Headless: `tests/conflict.rs` (the refused save leaves
+  the edit in the editor and nothing is written before Overwrite),
+  `tests/tab_close_guard.rs` (Cancel keeps the dirty mark, which nsh 0.5.1's
+  UIA folds into the `title-file` Button), `tests/recovery_restore.rs` (a
+  discarded record is not offered on the next launch),
+  `tests/save_as_overwrite.rs` and `ui/revision.rs` `SaveConflictProbe`.
+- Goal 07, one case `revision_session`, one launch on `trusted.html` from
+  argv, one Review→Revision chain (two loopback provider requests) over a
+  two-hunk HTML fixture. `TRUST`: scripts are trusted first through the Run
+  scripts alert, then the Edit mode hands the keyboard back. `DECISIONS`:
+  Accept(h1), the executable script value after the CJK/emoji line, writes at
+  once across the multibyte offsets; Reject(h2) reads `2 of 2 decided`;
+  `Undo` (`revision-undo`) takes it back to `1 of 2 decided`; `Copy`
+  (`revision-copy`) puts exactly the approved text on the OS clipboard; an
+  edit over the whole document shows `Can't apply — this part changed` with
+  no Accept; `Done` leaves the file on disk unchanged; the Web pane is
+  Restricted, because the accepted write revoked the trust. `QUIT`: one
+  guard, Discard, the process exits. A consent hold whose request never reaches the loopback
+  fails at once (`REVIEW_REQUEST_NOT_SENT` / `REVISION_REQUEST_NOT_SENT`).
+  Headless: Reject and Undo restoring exact bytes after a write, reject-all
+  and every hunk accepted (`tests/revision_flow.rs`); an edit over every hunk
+  offering no Accept and Done writing nothing
+  (`an_edit_over_every_hunk_offers_no_accept_and_done_writes_nothing`); the
+  dirty mark, folded away by nsh 0.5.1's UIA (`tests/revision_flow.rs`); the
+  A, R and Ctrl+Z keys and A refused on a changed part (`ui/revision.rs`); a
+  safe save over a file changed on disk (`ui/revision.rs`); frontmatter,
+  fence and link anchoring (mt-core).
+- Goal 03, one case `first_use_lifecycle`, three launches (clean profile;
+  cold reopen through argv; restart onto the recent list). Phases: `WELCOME`
+  (the four entry points, New file among them, each one enabled Button, and
+  no recent row, in one UIA query on a clean profile), `PASTE`
+  (CF_UNICODETEXT with CJK and a surrogate-pair emoji), `OVERWRITE_NO` (the
+  native dialog's No, then the picker's Escape: the cancel proof; focus and
+  the destination unchanged), `OVERWRITE_YES` (Yes writes the pasted bytes,
+  then `title-file` names the new file), `SUBSEQUENT_SAVE` (a typed edit
+  saved to the new path), `SAVED_CLOSE` (one recent row), `SAMPLE`
+  (workspace home), `REOPEN` (argv: exact CJK/emoji text, no welcome, the
+  10-entry bound) and `RECENTS` (five rows; the stale one disabled and named
+  `File <name> — Missing`; a real press on it, then a real click on the saved
+  row, leaves exactly one open tab, the saved file). Headless: New file
+  saving through Save As (`tests/untitled_save.rs`); item 5, Save after Save
+  As writing only the new path (`tests/save_as_overwrite.rs`); item 7, an
+  untitled buffer going through the close decision and leaving no recent
+  entry (`tests/untitled_discard.rs`), with Ctrl+W, the guard and Don't save
+  proven natively by Goal 02's `KEYBOARD_CLOSE`; a directory argument
+  (`tests/welcome_leaves.rs`) and LRU eviction order
+  (`tests/welcome_recents.rs`, mt-core settings tests). Launch failures
+  carry `FIRST_LAUNCH_`, `REOPEN_LAUNCH_` or `RECENTS_LAUNCH_`.
+
+All four harnesses write one evidence schema (`native/evidence.py`,
+`schema_version` 4) to `target/native-acceptance/goal-NN-native-acceptance.json`
+by default; `revision_evaluation.py` binds only that version. Every earlier
+file, including the GPUI-era records under `docs/evidence/`, is rejected.
+
+The former known gaps are fixed in the merged UI and are now expected by the
+cases above: the selection Review command, the Revision Copy and the labelled
+proposal group, the WM_CLOSE/Alt+F4 guard, trust revocation before every
+Revision write, Save As replacing a confirmed existing destination, the marked
+stale recent row, and the workspace home replacing the welcome. Whether the
+packaged app passes them is unknown until the first live run on an active,
+unlocked Windows 11 desktop.
+
+## Running native acceptance
+
+One command runs every goal on one executable:
+
+```sh
+uv run --locked --project scripts scripts/mt.py accept all \
+    --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
+    --expect-exe-sha256 <sha256> --evidence-dir target/native-acceptance \
+    [--keep-going] [--ui-timeout 15]
+```
+
+It runs goal-06, goal-02, goal-07 and goal-03 in that order (cheapest and most
+stable first, so a late BLOCKED loses the least evidence) in one process. The
+executable is hashed and the environment checked once, the executable copied
+once, and the user's clipboard saved once; every goal still gets its own
+isolated temp root and writes its own `goal-0N-native-acceptance.json` with the
+same hash binding. Exit status: `0` PASS (every goal passed), `1` FAIL (any
+goal failed, or the clipboard could not be restored), `2` BLOCKED (the
+environment stopped the run and nothing failed). FAIL outranks BLOCKED. A goal
+BLOCKED stops the later goals, and a goal FAIL does too unless `--keep-going`;
+a goal whose cleanup failed (its processes or workdir may remain) stops them
+even with `--keep-going`. A stopped goal still writes its evidence, every case
+marked `SKIPPED_AFTER_BLOCKED`, `SKIPPED_AFTER_FAILURE` or
+`SKIPPED_AFTER_CLEANUP_FAILURE`. With `--keep-going` a case
+FAIL also lets the goal's later cases run; the first failure is the reported
+code and the goal stays FAIL. BLOCKED and a cleanup failure always stop.
+`mt.py accept goal-0N -- ...` (with `--case` or `--keep-going`) remains for
+diagnosing one goal; a single-case run is never acceptance.
+
+Before the run, on the Windows 11 x64 desktop that will run it:
+
+- Use the console session or an RDP window. A disconnected or locked session
+  reports `SESSION_NOT_ACTIVE` or an `INPUT_DESKTOP_*` code instead of
+  `FOREGROUND_PERMISSION_DENIED`. On the Remote Desktop client machine, set
+  the REG_DWORD value `RemoteDesktop_SuppressWhenMinimized` = 2 under
+  `HKCU\Software\Microsoft\Terminal Server Client` (and, for system-wide
+  use, `HKLM\SOFTWARE\Microsoft\Terminal Server Client` and
+  `HKLM\SOFTWARE\WOW6432Node\Microsoft\Terminal Server Client`). A
+  minimized mstsc client then keeps the remote session rendering and
+  accepting input. Without it the session has no foreground window
+  (foreground hwnd 0); the harness then prompts once on the console and waits
+  up to 30 s for the RDP window to be restored before it BLOCKs with
+  `FOREGROUND_PERMISSION_DENIED`. Another window holding the foreground
+  blocks at once.
+- Turn off clipboard history (Win+V), RDP clipboard redirection,
+  notifications and Focus Assist's banners; they take the clipboard or the
+  foreground. The harness asks Windows to keep the display and system awake
+  for the run and releases the request at its end.
+- Leave the clipboard empty or holding plain text: a clipboard with other
+  formats blocks as `CLIPBOARD_CONTAINS_NON_TEXT`. A clipboard held by another
+  program past the ~3 s retry window blocks as `CLIPBOARD_UNAVAILABLE`, with
+  the attempt count and whether a window held it. Do not use the clipboard
+  during the run; a harness killed mid-run cannot restore it.
+
+Timing rules the runtime enforces: the foreground has one ~3 s timeout; a
+wait nested inside another (the copy inside an exact-bytes editor wait) is
+bounded by the outer deadline and at most 2 s; an editor-text duration ends
+when the matching copy was requested, not after the harness's clipboard
+retries. Each goal's evidence `metrics` records every phase's wall time
+(`phase_timings`) and the content-free counters `editor_reads`,
+`copy_resends`, `foreground_recoveries` and `uia_queries`. Goal thresholds (the 10 000 ms recovery checkpoint, the consent hold,
+the 15 s default UI timeout, exact bytes) are unchanged.
 
 Goal 09's release-build screenshot matrix is produced by:
 

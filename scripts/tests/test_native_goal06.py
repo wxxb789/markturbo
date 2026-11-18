@@ -2,182 +2,143 @@
 
 from __future__ import annotations
 
-import ctypes
-import copy
 import hashlib
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
+from scripts.markturbo_tools.native import evidence as shared_evidence
 from scripts.markturbo_tools.native import goal06 as HARNESS
 from scripts.markturbo_tools.native import runtime
 
+from ._native_support import HASH, case_observations, fingerprint, passed_evidence
 
-CASE_DOCUMENT = HARNESS.CASE_DOCUMENT
-CASE_SELECTION = HARNESS.CASE_SELECTION
-COMPLETE_EVIDENCE = HARNESS.complete_evidence
+CASE_NOT_SET_UP = HARNESS.CASE_NOT_SET_UP
+CASE_CONFIGURED = HARNESS.CASE_CONFIGURED
 NEW_EVIDENCE = HARNESS.new_evidence
 PARSE_ARGS = HARNESS.parse_args
-REQUIRED_CASE_IDS = HARNESS.REQUIRED_CASE_IDS
 REVIEW_SETTINGS_DOCUMENT = HARNESS.review_settings_document
 VALIDATE_EVIDENCE = HARNESS.validate_evidence
-
-HASH = "a" * 64
-
-
-def fingerprint(value: bytes) -> dict[str, int | str]:
-    return {"byte_count": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+CONFIGURED_IDENTITY = shared_evidence.credential_target(
+    HARNESS.CONFIGURED_PROVIDER_ENDPOINT, "openai-responses"
+)
+DOCUMENT_PRINT = fingerprint(HARNESS.DOCUMENT_TEXT.encode("utf-8"))
 
 
-def process_context() -> dict[str, int | str]:
-    return {"session_id": 1, "integrity_rid": 0x2000, "integrity": "medium"}
+def mode_of(configured_provider: bool) -> str:
+    return HARNESS.CONFIGURED_PROVIDER_MODE if configured_provider else HARNESS.NOT_SET_UP_MODE
 
 
-def runtime_scan(configured_provider: bool = False) -> dict[str, int | bool]:
-    scan = {
-        "files_scanned": 3,
-        "app_logs_scanned": 1,
-        "config_files_scanned": 1,
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-    }
-    if configured_provider:
-        scan.update(
-            ephemeral_credential_utf8_absent=True,
-            ephemeral_credential_utf16le_absent=True,
-        )
-    return scan
+def complete(evidence: dict, status: str) -> None:
+    runtime.complete_evidence(evidence, status, HARNESS.CASE_IDS[evidence["mode"]])
 
 
 def valid_evidence(configured_provider: bool = False) -> dict:
-    evidence = NEW_EVIDENCE(HASH, configured_provider)
-    evidence["executable"].update(
-        {
-            "sha256": HASH,
-            "byte_count": 1234,
-            "hash_verified": True,
-            "copied_sha256": HASH,
-            "copy_hash_verified": True,
-            "format": "PE32+",
-            "machine": "x86_64",
-            "machine_code": 0x8664,
-            "optional_magic": 0x20B,
-        }
-    )
-    evidence["environment"] = {
-        "platform": "Windows 11",
-        "windows_major": 10,
-        "windows_build": 22631,
-        "architecture": "x86_64",
-        "native_machine_code": 0x8664,
-        "python_pointer_bits": 64,
-        "wts_state": "WTSActive",
-        "input_desktop": "Default",
-        "thread_desktop": "Default",
-        "harness_process": process_context(),
-    }
-    original = fingerprint(b"review source")
-    for case in evidence["cases"]:
-        case["status"] = "PASS"
-        case["duration_ms"] = 1.0
-        case["observations"] = {
-            "editor_before": original,
-            "editor_after": original,
-            "source_before": original,
-            "source_after": original,
-            "no_dirty_interlock": True,
-            "flow": (
-                HARNESS.CONFIGURED_PROVIDER_CASE_FLOWS[case["id"]]
-                if configured_provider
-                else HARNESS.CASE_FLOWS[case["id"]]
-            ),
-            "process_context": process_context(),
-            "foreground_verified": True,
-            "runtime_scan": runtime_scan(configured_provider),
-        }
+    flows = HARNESS.CASE_FLOWS[mode_of(configured_provider)]
+
+    def observations(case_id: str) -> dict:
         if configured_provider:
-            case["observations"].update(
-                review_consent_approved=True,
-                structured_success=True,
-            )
+            own = {
+                "document_consent_ms": 2100.5,
+                "document_result_ms": 900.0,
+                "document_source_after": DOCUMENT_PRINT,
+                "document_close_ms": 40.0,
+                "selection_consent_ms": 2200.0,
+                "selection_result_ms": 950.0,
+                "selection_source_after": DOCUMENT_PRINT,
+                "clean_close_ms": 300.0,
+            }
         else:
-            case["observations"]["missing_credential_diagnostic"] = True
-        if case["id"] == CASE_SELECTION:
-            case["observations"]["selection_shortcut"] = True
-        else:
-            case["observations"]["document_shortcut"] = True
-    COMPLETE_EVIDENCE(evidence, "PASS")
-    return evidence
+            own = {
+                "shortcut_diagnostic_ms": 120,
+                "shortcut_source_after": DOCUMENT_PRINT,
+                "clean_close_ms": 250.0,
+            }
+        return case_observations(flows[case_id], source_before=DOCUMENT_PRINT, **own)
+
+    return passed_evidence(NEW_EVIDENCE(HASH, configured_provider), observations, complete)
 
 
 class EvidenceSchemaTests(unittest.TestCase):
-    def test_accepts_complete_hash_bound_evidence(self) -> None:
+    def test_default_mode_is_one_hash_bound_not_set_up_case(self) -> None:
         evidence = valid_evidence()
 
         VALIDATE_EVIDENCE(evidence)
 
         self.assertEqual(evidence["status"], "PASS")
-        self.assertEqual([case["id"] for case in evidence["cases"]], list(REQUIRED_CASE_IDS))
+        self.assertEqual(HARNESS.REQUIRED_CASE_IDS, (CASE_NOT_SET_UP,))
+        self.assertEqual([case["id"] for case in evidence["cases"]], [CASE_NOT_SET_UP])
 
-    def test_accepts_complete_configured_provider_success_evidence(self) -> None:
+    def test_configured_mode_is_one_session_case(self) -> None:
         evidence = valid_evidence(configured_provider=True)
 
         VALIDATE_EVIDENCE(evidence)
 
-        self.assertEqual(evidence["mode"], HARNESS.CONFIGURED_PROVIDER_MODE)
+        self.assertEqual([case["id"] for case in evidence["cases"]], [CASE_CONFIGURED])
 
-    def test_configured_provider_success_requires_consent_and_structured_result(self) -> None:
+    def test_mode_selects_its_own_cases_and_observations(self) -> None:
         evidence = valid_evidence(configured_provider=True)
-        evidence["cases"][0]["observations"]["structured_success"] = False
-
-        with self.assertRaisesRegex(ValueError, "structured_success"):
-            VALIDATE_EVIDENCE(evidence)
-
-        evidence = valid_evidence(configured_provider=True)
-        evidence["cases"][1]["observations"]["review_consent_approved"] = False
-
-        with self.assertRaisesRegex(ValueError, "review_consent_approved"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_configured_provider_success_requires_content_free_credential_scan(self) -> None:
-        evidence = valid_evidence(configured_provider=True)
-        evidence["cases"][0]["observations"]["runtime_scan"].pop(
-            "ephemeral_credential_utf8_absent"
-        )
-
-        with self.assertRaisesRegex(ValueError, "ephemeral_credential_utf8_absent"):
-            VALIDATE_EVIDENCE(evidence)
-
-    def test_pass_requires_identical_editor_and_file_fingerprints(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["editor_after"] = fingerprint(b"changed")
-
-        with self.assertRaisesRegex(ValueError, "changed editor"):
+        evidence["mode"] = HARNESS.NOT_SET_UP_MODE
+        with self.assertRaises(ValueError):
             VALIDATE_EVIDENCE(evidence)
 
         evidence = valid_evidence()
-        evidence["cases"][1]["observations"]["source_after"] = fingerprint(b"changed")
-
-        with self.assertRaisesRegex(ValueError, "changed source"):
+        evidence["cases"][0]["observations"]["document_consent_ms"] = 1.0
+        with self.assertRaisesRegex(ValueError, "unknown observation field"):
             VALIDATE_EVIDENCE(evidence)
 
-    def test_pass_requires_each_shortcut_and_missing_credential_diagnostic(self) -> None:
-        evidence = valid_evidence()
-        evidence["cases"][0]["observations"]["document_shortcut"] = False
+        for mode in ("unknown", ["unhashable"]):
+            evidence["mode"] = mode
+            with self.assertRaisesRegex(ValueError, "invalid native Review mode"):
+                VALIDATE_EVIDENCE(evidence)
 
-        with self.assertRaisesRegex(ValueError, "document_shortcut"):
-            VALIDATE_EVIDENCE(evidence)
+    def test_each_phase_fails_on_its_own_change(self) -> None:
+        for configured, key, message in (
+            (False, "shortcut_source_after", r"changed source text \(shortcut_source_after\)"),
+            (False, "source_before", r"changed source text \(shortcut_source_after\)"),
+            (True, "document_source_after", r"changed source text \(document_source_after\)"),
+            (True, "selection_source_after", r"changed source text \(selection_source_after\)"),
+        ):
+            with self.subTest(key=key):
+                evidence = valid_evidence(configured)
+                evidence["cases"][0]["observations"][key] = fingerprint(b"changed")
+                with self.assertRaisesRegex(ValueError, message):
+                    VALIDATE_EVIDENCE(evidence)
 
-        evidence = valid_evidence()
-        evidence["cases"][1]["observations"]["missing_credential_diagnostic"] = False
+    def test_dropped_editor_and_card_keys_are_unknown(self) -> None:
+        # The editor is no longer read and Close/menu are proven headless.
+        for configured, key, value in (
+            (False, "editor_before", DOCUMENT_PRINT),
+            (False, "shortcut_editor_after", DOCUMENT_PRINT),
+            (False, "close_diagnostic_gone_ms", 40.0),
+            (False, "menu_diagnostic_ms", 80.0),
+            (True, "document_editor_after", DOCUMENT_PRINT),
+        ):
+            with self.subTest(key=key):
+                evidence = valid_evidence(configured)
+                evidence["cases"][0]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, "unknown observation field"):
+                    VALIDATE_EVIDENCE(evidence)
 
-        with self.assertRaisesRegex(ValueError, "missing_credential_diagnostic"):
-            VALIDATE_EVIDENCE(evidence)
+    def test_measured_durations_must_hold(self) -> None:
+        for configured, key, value, message in (
+            (True, "clean_close_ms", None, "measured clean_close_ms"),
+            (False, "shortcut_diagnostic_ms", -1.0, "measured shortcut_diagnostic_ms"),
+            (False, "clean_close_ms", True, "measured clean_close_ms"),
+            (True, "selection_result_ms", float("nan"), "measured selection_result_ms"),
+            (True, "document_close_ms", -1.0, "measured document_close_ms"),
+        ):
+            with self.subTest(key=key, value=value):
+                evidence = valid_evidence(configured)
+                evidence["cases"][0]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    VALIDATE_EVIDENCE(evidence)
 
     def test_blocked_foreground_diagnostics_are_retained_as_content_free_evidence(self) -> None:
-        evidence = NEW_EVIDENCE(HASH)
+        evidence = NEW_EVIDENCE(HASH, configured_provider=True)
         evidence["cases"][0].update(
             status="BLOCKED",
             reason_code="FOREGROUND_PERMISSION_DENIED",
@@ -191,12 +152,7 @@ class EvidenceSchemaTests(unittest.TestCase):
                 "foreground_attempts": 80,
             },
         )
-        evidence["cases"][1].update(
-            status="BLOCKED",
-            reason_code="SKIPPED_AFTER_BLOCKED",
-            duration_ms=0.0,
-        )
-        COMPLETE_EVIDENCE(evidence, "BLOCKED")
+        complete(evidence, "BLOCKED")
 
         VALIDATE_EVIDENCE(evidence)
 
@@ -214,7 +170,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("api-key", document.decode("utf-8").casefold())
 
     def test_configured_provider_profile_uses_only_fixed_loopback_identity(self) -> None:
-        identity = HARNESS.configured_provider_environment_key_identity()
+        identity = CONFIGURED_IDENTITY
         document = REVIEW_SETTINGS_DOCUMENT(HARNESS.CONFIGURED_PROVIDER_ENDPOINT, identity)
 
         settings = tomllib.loads(document.decode("utf-8"))
@@ -283,153 +239,437 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(runtime.HarnessFailure, "UTF8_EPHEMERAL_CREDENTIAL_LEAKED"):
                 HARNESS.scan_case_artifacts(case_root, "process-only")
 
-    def test_artifact_read_errors_keep_the_goal_runtime_scan_code(self) -> None:
+
+class PreflightTests(unittest.TestCase):
+    def test_no_mode_adds_a_credential_store_query_to_the_shared_preflight(self) -> None:
+        for configured in (False, True):
+            with self.subTest(configured=configured):
+                self.assertIs(HARNESS.native_run_plan(configured).preflight, HARNESS.preflight)
+        self.assertFalse(hasattr(runtime.Win32, "persistent_credential_target_exists"))
+
+
+class FakeApp:
+    """The few app facts the Review flow reads: the Review card and its
+    Close, with switches that break one step at a time."""
+
+    hwnd = 42
+
+    def __init__(
+        self,
+        *,
+        shown_at_start: bool = False,
+        close_works: bool = True,
+        breaks: str | None = None,
+    ) -> None:
+        self.card = shown_at_start
+        self.close_works = close_works
+        # The phase whose Review rewrites the source file.
+        self.breaks = breaks
+        self.source: Path | None = None
+        self.events: list[tuple[str, object]] = []
+
+    def reviewed(self, phase: str, card: bool = True) -> None:
+        self.card = card
+        if self.breaks == phase:
+            self.source.write_text(HARNESS.DOCUMENT_TEXT + "x", encoding="utf-8", newline="")
+
+
+class FakeWin32:
+    def __init__(self, app: FakeApp, owns_keyboard: bool = True, focus_lag: int = 0) -> None:
+        self.app = app
+        self.owns_keyboard = owns_keyboard
+        # Samples that miss the focus before activation hands it over.
+        self.focus_lag = focus_lag
+
+    def foreground_focus(self, hwnd: int) -> int:
+        if self.focus_lag:
+            self.focus_lag -= 1
+            return 0
+        return hwnd if self.owns_keyboard else 0
+
+    def send_shortcut(self, hwnd: int, key: int) -> None:
+        self.app.events.append(("shortcut", key))
+        if key == runtime.VK_RETURN:
+            self.app.reviewed("shortcut")
+
+
+def fake_harness(app: FakeApp, source: Path, **win32: Any) -> HARNESS.Goal06Harness:
+    """A real `Goal06Harness` whose UI Automation reads the fake app."""
+    harness = object.__new__(HARNESS.Goal06Harness)
+    harness.ui_timeout = 0.2
+    harness.configured_provider = False
+    harness.win32 = FakeWin32(app, **win32)
+    app.source = source
+    close_button = object()
+
+    def find_control(_app, automation_id, control_type, timeout_code, _mismatch):
+        app.events.append(("find", automation_id))
+        if automation_id == HARNESS.REVIEW_CLOSE_AUTOMATION_ID and app.card:
+            return close_button
+        raise runtime.HarnessFailure(timeout_code)
+
+    def invoke_control(control, _code):
+        app.events.append(("invoke", "close" if control is close_button else control))
+        if control is close_button and app.close_works:
+            app.card = False
+
+    def editor_fingerprint(_app):
+        raise AssertionError("the Review flow must not read the editor")
+
+    harness.activate_source_layout = lambda _app: app.events.append(("layout", None))
+    harness.focus_editor = lambda _app: app.events.append(("focus", None))
+    harness.editor_fingerprint = editor_fingerprint
+    harness.menu_command = lambda _app, automation_id: app.events.append(("menu", automation_id))
+    harness.name_present = lambda _app, name, _type: (
+        name in (HARNESS.NOT_SET_UP_MESSAGE, HARNESS.REVIEW_RESULT_MARKER) and app.card
+    )
+    harness.control_absent = lambda _app, automation_id, *_codes: not (
+        automation_id == HARNESS.REVIEW_CLOSE_AUTOMATION_ID and app.card
+    )
+    harness.find_control = find_control
+    harness.invoke_control = invoke_control
+    source.write_text(HARNESS.DOCUMENT_TEXT, encoding="utf-8", newline="")
+    return harness
+
+
+class NotSetUpSessionTests(unittest.TestCase):
+    def run_session(self, app: FakeApp, **win32: Any) -> dict:
         with tempfile.TemporaryDirectory() as temporary:
-            case_root = Path(temporary)
-            logs = case_root / "data" / "logs"
-            logs.mkdir(parents=True)
-            (case_root / "config").mkdir()
-            (logs / "markturbo.log").write_bytes(b"startup")
-            with (
-                mock.patch.object(
-                    HARNESS,
-                    "artifact_contains",
-                    side_effect=PermissionError("document content"),
-                ),
-                self.assertRaises(runtime.HarnessFailure) as raised,
-            ):
-                HARNESS.scan_case_artifacts(case_root, "process-only")
+            source = Path(temporary) / "review.md"
+            harness = fake_harness(app, source, **win32)
+            return harness.not_set_up_session(app, source)
 
-        self.assertEqual(raised.exception.code, "RUNTIME_ARTIFACT_SCAN_FAILED")
-        self.assertEqual(raised.exception.detail, "PermissionError")
+    def assert_fails(self, code: str, app: FakeApp, **win32: Any) -> None:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            self.run_session(app, **win32)
+        self.assertEqual(raised.exception.code, code)
 
+    def test_one_session_proves_the_shortcut_and_hashes_only_the_file(self) -> None:
+        app = FakeApp()
 
-class PersistentCredentialPreflightTests(unittest.TestCase):
-    def test_configured_mode_blocks_before_launch_when_its_target_has_a_persistent_credential(self) -> None:
-        calls: list[str] = []
-        win32 = mock.Mock()
-        win32.persistent_credential_target_exists.side_effect = (
-            lambda target: calls.append(target) or True
+        observations = self.run_session(app)
+
+        # Close and the menu row are headless-proven; the native session sends
+        # only the shortcut and never reads the editor (the fake would raise).
+        self.assertEqual(
+            [event for event in app.events if event[0] in {"shortcut", "invoke", "menu"}],
+            [("shortcut", runtime.VK_RETURN)],
         )
-        parent = object()
-        evidence: dict = {}
-
-        with mock.patch.object(HARNESS, "preflight", return_value=(win32, parent)) as preflight:
-            with self.assertRaisesRegex(runtime.HarnessBlocked, "PERSISTENT_CREDENTIAL_PRESENT"):
-                HARNESS.goal06_preflight(True)(Path("C:/release/markturbo.exe"), HASH, evidence)
-
-        preflight.assert_called_once_with(Path("C:/release/markturbo.exe"), HASH, evidence)
-        self.assertEqual(calls, [HARNESS.configured_provider_environment_key_identity()])
-
-    def test_default_mode_does_not_query_persistent_credentials(self) -> None:
-        win32 = mock.Mock()
-        parent = object()
-        evidence: dict = {}
-
-        with mock.patch.object(HARNESS, "preflight", return_value=(win32, parent)):
-            actual = HARNESS.goal06_preflight(False)(
-                Path("C:/release/markturbo.exe"), HASH, evidence
-            )
-
-        self.assertEqual(actual, (win32, parent))
-        win32.persistent_credential_target_exists.assert_not_called()
-
-    def test_persistent_credential_block_does_not_expose_credential_content(self) -> None:
-        target = HARNESS.configured_provider_environment_key_identity()
-        secret = b"UNIQUE-CREDENTIAL-BLOB"
-        target_buffer = ctypes.create_unicode_buffer(target)
-        blob = (ctypes.c_ubyte * len(secret)).from_buffer_copy(secret)
-        credential = runtime.CREDENTIALW()
-        credential.TargetName = ctypes.cast(target_buffer, runtime.wt.LPWSTR)
-        credential.CredentialBlobSize = len(secret)
-        credential.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte))
-        records = (ctypes.POINTER(runtime.CREDENTIALW) * 1)(ctypes.pointer(credential))
-        records_pointer = ctypes.cast(
-            records, ctypes.POINTER(ctypes.POINTER(runtime.CREDENTIALW))
+        self.assertEqual(observations["shortcut_source_after"], observations["source_before"])
+        # With the clean close the scenario adds, the session's own keys are
+        # exactly what a PASS case requires.
+        contract = HARNESS.CONTRACTS[HARNESS.NOT_SET_UP_MODE]
+        self.assertEqual(
+            set(observations) | {"clean_close_ms"},
+            set(contract.required_observations[CASE_NOT_SET_UP]),
         )
-        enumerated: list[str] = []
-        freed: list[object] = []
 
-        class FakeAdvapi32:
-            def CredEnumerateW(
-                self,
-                requested_target: str,
-                _flags: int,
-                count_pointer: object,
-                credentials_pointer: object,
-            ) -> bool:
-                enumerated.append(requested_target)
-                ctypes.cast(count_pointer, ctypes.POINTER(runtime.wt.DWORD)).contents.value = 1
-                output = ctypes.cast(
-                    credentials_pointer,
-                    ctypes.POINTER(
-                        ctypes.POINTER(ctypes.POINTER(runtime.CREDENTIALW))
-                    ),
+    def test_a_card_already_shown_cannot_stand_in_for_the_shortcut(self) -> None:
+        self.assert_fails("SHORTCUT_DIAGNOSTIC_PRESENT_BEFORE_REVIEW", FakeApp(shown_at_start=True))
+
+    def test_the_shortcut_needs_the_keyboard_on_the_app_window(self) -> None:
+        self.assert_fails("SHORTCUT_NATIVE_FOCUS_LOST", FakeApp(), owns_keyboard=False)
+
+    def test_a_changed_file_fails_the_shortcut_phase(self) -> None:
+        self.assert_fails("SHORTCUT_REVIEW_CHANGED_SOURCE", FakeApp(breaks="shortcut"))
+
+    def test_the_shortcut_waits_for_activation_to_hand_over_the_keyboard(self) -> None:
+        observations = self.run_session(FakeApp(), focus_lag=2)
+
+        self.assertIn("shortcut_diagnostic_ms", observations)
+
+
+class ConfiguredSessionTests(unittest.TestCase):
+    """One session: the document Review, its card closed, then the selection
+    Review; the provider round trip is stubbed at the consent hold."""
+
+    def run_session(self, app: FakeApp, *, result_shown: bool = True) -> dict:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "review.md"
+            harness = fake_harness(app, source)
+
+            def request_review(_app, selection):
+                app.events.append(("request", selection))
+
+            def approve_review_consent(_app, selection):
+                app.events.append(("consent", selection))
+                app.reviewed("selection" if selection else "document", result_shown)
+
+            def wait_name(_app, name, _type, timeout_code, *_timeout):
+                if not harness.name_present(app, name, _type):
+                    raise runtime.HarnessFailure(timeout_code)
+
+            harness.request_review = request_review
+            harness.approve_review_consent = approve_review_consent
+            harness.wait_name = wait_name
+            return harness.configured_session(app, source)
+
+    def assert_fails(self, code: str, app: FakeApp, **kwargs: Any) -> None:
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            self.run_session(app, **kwargs)
+        self.assertEqual(raised.exception.code, code)
+
+    def test_one_session_reviews_the_document_then_the_selection(self) -> None:
+        app = FakeApp()
+
+        observations = self.run_session(app)
+
+        self.assertEqual(
+            [event for event in app.events if event[0] in {"request", "consent", "invoke"}],
+            [
+                ("request", False),
+                ("consent", False),
+                ("invoke", "close"),
+                ("request", True),
+                ("consent", True),
+            ],
+        )
+        contract = HARNESS.CONTRACTS[HARNESS.CONFIGURED_PROVIDER_MODE]
+        self.assertEqual(
+            set(observations) | {"clean_close_ms"},
+            set(contract.required_observations[CASE_CONFIGURED]),
+        )
+
+    def test_every_failure_names_the_review_it_happened_in(self) -> None:
+        for code, app, kwargs in (
+            ("DOCUMENT_REVIEW_CHANGED_SOURCE", FakeApp(breaks="document"), {}),
+            ("SELECTION_REVIEW_CHANGED_SOURCE", FakeApp(breaks="selection"), {}),
+            ("DOCUMENT_REVIEW_RESULT_UIA_TIMEOUT", FakeApp(), {"result_shown": False}),
+            ("DOCUMENT_CLOSE_REVIEW_STILL_SHOWN", FakeApp(close_works=False), {}),
+        ):
+            with self.subTest(code=code):
+                self.assert_fails(code, app, **kwargs)
+
+    def test_a_document_card_that_does_not_close_cannot_stand_in_for_the_selection(self) -> None:
+        app = FakeApp(close_works=False)
+
+        self.assert_fails("DOCUMENT_CLOSE_REVIEW_STILL_SHOWN", app)
+        self.assertNotIn(("request", True), app.events)
+
+
+class CleanCloseTests(unittest.TestCase):
+    """The document's clean state, measured by how a close request ends."""
+
+    @staticmethod
+    def harness(
+        exits_with: int | None,
+        guard: bool,
+        *,
+        exit_after_polls: int = 0,
+        window_destroyed: bool = False,
+        query_fails: bool = False,
+    ) -> HARNESS.Goal06Harness:
+        """`exit_after_polls` keeps the process alive for that many polls after
+        the close; meanwhile its window may already be destroyed, or a UIA
+        query against it may fail (nsh's DestroyWindow precedes the exit)."""
+
+        class Process:
+            def __init__(self) -> None:
+                self.closed = False
+                self.polls = 0
+
+            def poll(self) -> int | None:
+                if not self.closed:
+                    return None
+                self.polls += 1
+                return exits_with if self.polls > exit_after_polls else None
+
+            def wait(self, timeout: float) -> int:
+                return exits_with
+
+        process = Process()
+
+        class User32:
+            @staticmethod
+            def IsWindow(hwnd: int) -> bool:
+                return not (window_destroyed and process.closed)
+
+        class Win32:
+            user32 = User32()
+
+            def post_close(self, hwnd: int) -> None:
+                process.closed = True
+
+        def name_present(_app, name, _type):
+            if query_fails and process.closed:
+                raise runtime.HarnessFailure("UIA_NAME_QUERY_FAILED")
+            return guard and process.closed and name == runtime.GUARD_HEADING
+
+        harness = object.__new__(HARNESS.Goal06Harness)
+        harness.ui_timeout = 0.2
+        harness.win32 = Win32()
+        harness.name_present = name_present
+        harness.app = type("App", (), {"hwnd": 42, "process": process})()
+        return harness
+
+    def test_a_clean_document_closes_without_the_guard(self) -> None:
+        for window_destroyed, query_fails in ((False, False), (True, False), (False, True)):
+            with self.subTest(window_destroyed=window_destroyed, query_fails=query_fails):
+                harness = self.harness(
+                    exits_with=0,
+                    guard=False,
+                    exit_after_polls=3,
+                    window_destroyed=window_destroyed,
+                    query_fails=query_fails,
                 )
-                output[0] = records_pointer
-                return True
 
-            def CredFree(self, credentials: object) -> None:
-                freed.append(credentials)
+                self.assertTrue(runtime.finite_nonnegative(harness.close_clean(harness.app)))
 
-        win32 = object.__new__(runtime.Win32)
-        win32.advapi32 = FakeAdvapi32()
-        evidence: dict = {}
+    def test_a_dirty_document_fails_on_the_guard_it_raises(self) -> None:
+        for exits_with, guard, code in (
+            (None, True, "REVIEW_LEFT_DOCUMENT_DIRTY"),
+            (None, False, "PROCESS_EXIT_TIMEOUT"),
+            (1, False, "PROCESS_EXIT_NONZERO"),
+        ):
+            with self.subTest(code=code):
+                harness = self.harness(exits_with=exits_with, guard=guard)
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    harness.close_clean(harness.app)
+                self.assertEqual(raised.exception.code, code)
 
-        with mock.patch.object(HARNESS, "preflight", return_value=(win32, object())):
-            with self.assertRaises(runtime.HarnessBlocked) as raised:
-                HARNESS.goal06_preflight(True)(
-                    Path("C:/release/markturbo.exe"), HASH, evidence
-                )
+    def test_queries_that_keep_failing_never_pass_as_a_clean_close(self) -> None:
+        harness = self.harness(exits_with=None, guard=False, query_fails=True)
 
-        self.assertEqual(raised.exception.code, "PERSISTENT_CREDENTIAL_PRESENT")
-        self.assertNotIn(secret.decode("utf-8"), str(raised.exception))
-        self.assertEqual(enumerated, [target])
-        self.assertEqual(len(freed), 1)
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.close_clean(harness.app)
+
+        self.assertEqual(raised.exception.code, "PROCESS_EXIT_TIMEOUT")
 
 
-class HarnessContractTests(unittest.TestCase):
-    def test_configured_mode_approves_the_send_task_dialog(self) -> None:
-        events: list[tuple[str, object]] = []
+class ConfiguredReviewTests(unittest.TestCase):
+    @staticmethod
+    def consent_harness(events: list[tuple[str, object]], *, scope_shown: bool = True):
         button = object()
-        app = type("App", (), {"process": type("Process", (), {"pid": 7})(), "hwnd": 42})()
-
-        class FakeWin32:
-            def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
-                events.append(("dialogs", (process_id, owner_hwnd)))
-                return [99]
 
         class FakeHarness:
-            win32 = FakeWin32()
             ui_timeout = 1.0
 
-            def control_by_id(self, *args: object) -> object:
-                events.append(("control", args))
+            def find_control(self, app, automation_id, control_type, timeout_code, mismatch_code):
+                events.append(("control", (automation_id, control_type, timeout_code)))
                 return button
 
-            def click_control(self, value: object, failure_code: str) -> None:
-                events.append(("click", (value, failure_code)))
+            def name_present(self, app, name, control_type):
+                events.append(("scope", (name, control_type)))
+                return scope_shown
 
-        HARNESS.Goal06Harness.approve_review_consent(FakeHarness(), app)
+            def hold_control(self, app, control, seconds, failure_code):
+                events.append(("hold", (control, seconds, failure_code)))
 
-        self.assertEqual(events[0], ("dialogs", (7, 42)))
-        self.assertEqual(events[-1], ("click", (button, "REVIEW_CONSENT_CLICK_FAILED")))
+            def click_control(self, *_args):
+                events.append(("click", None))
 
-    def test_cli_arguments_require_a_hash_and_accept_each_case(self) -> None:
-        for case_id in REQUIRED_CASE_IDS:
-            parsed = PARSE_ARGS(["--expect-exe-sha256", HASH, "--case", case_id])
-            self.assertEqual(parsed.case, case_id)
-            self.assertFalse(parsed.configured_provider)
+            def invoke_control(self, *_args):
+                events.append(("invoke", None))
 
-        configured = PARSE_ARGS(["--expect-exe-sha256", HASH, "--configured-provider"])
+        return FakeHarness(), button
+
+    def test_consent_is_approved_only_by_a_full_pointer_hold(self) -> None:
+        events: list[tuple[str, object]] = []
+        harness, button = self.consent_harness(events)
+        app = type("App", (), {"hwnd": 42})()
+
+        HARNESS.Goal06Harness.approve_review_consent(harness, app, False)
+
+        self.assertEqual(
+            events[0],
+            ("control", (HARNESS.CONSENT_SEND_AUTOMATION_ID, "Button", "REVIEW_CONSENT_UIA_TIMEOUT")),
+        )
+        self.assertEqual(
+            events[-1],
+            ("hold", (button, HARNESS.CONSENT_HOLD_SECONDS, "REVIEW_CONSENT_HOLD_FAILED")),
+        )
+        self.assertNotIn("click", [event[0] for event in events])
+        self.assertNotIn("invoke", [event[0] for event in events])
+        # The control's own hold threshold is 1.2s; the harness must exceed it.
+        self.assertGreater(HARNESS.CONSENT_HOLD_SECONDS, 1.2)
+
+    def test_selection_consent_measures_its_scope_before_holding(self) -> None:
+        events: list[tuple[str, object]] = []
+        harness, _button = self.consent_harness(events)
+        app = type("App", (), {"hwnd": 42})()
+
+        HARNESS.Goal06Harness.approve_review_consent(harness, app, True)
+        self.assertEqual(events[-1][0], "hold")
+
+        events.clear()
+        harness, _button = self.consent_harness(events, scope_shown=False)
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            HARNESS.Goal06Harness.approve_review_consent(harness, app, True)
+
+        self.assertEqual(raised.exception.code, "REVIEW_CONSENT_SELECTION_SCOPE_MISSING")
+        self.assertIn(("scope", (HARNESS.CONSENT_SELECTION_SCOPE, "Text")), events)
+        self.assertNotIn("hold", [event[0] for event in events])
+
+    def test_review_requests_use_the_editor_shortcut_or_the_menu_row(self) -> None:
+        for selection, expected in (
+            (False, [("focus", None), ("shortcut", runtime.VK_RETURN)]),
+            (
+                True,
+                [
+                    ("focus", None),
+                    ("shortcut", runtime.VK_A),
+                    ("menu", HARNESS.REVIEW_MENU_AUTOMATION_ID),
+                ],
+            ),
+        ):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as temporary:
+                app = FakeApp()
+                harness = fake_harness(app, Path(temporary) / "review.md")
+
+                harness.request_review(app, selection)
+                self.assertEqual(app.events, expected)
+
+    def test_each_review_request_needs_the_keyboard_on_the_app_window(self) -> None:
+        for selection, code in (
+            (False, "REVIEW_SHORTCUT_NATIVE_FOCUS_LOST"),
+            (True, "REVIEW_SELECT_ALL_NATIVE_FOCUS_LOST"),
+        ):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as temporary:
+                app = FakeApp()
+                harness = fake_harness(app, Path(temporary) / "review.md", owns_keyboard=False)
+
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    harness.request_review(app, selection)
+
+                self.assertEqual(raised.exception.code, code)
+                self.assertNotIn("shortcut", [event[0] for event in app.events])
+
+class PlanAndArgumentTests(unittest.TestCase):
+    def test_each_mode_runs_one_scenario_per_case(self) -> None:
+        for configured in (False, True):
+            with self.subTest(configured=configured):
+                plan = HARNESS.native_run_plan(configured)
+                harness = mock.Mock()
+                harness.scenario.side_effect = lambda case_id: case_id
+
+                ran = [scenario() for scenario in plan.scenarios(harness)]
+
+                self.assertEqual(tuple(ran), HARNESS.CASE_IDS[mode_of(configured)])
+                self.assertEqual(plan.required_case_ids, HARNESS.CASE_IDS[mode_of(configured)])
+
+    def test_cli_accepts_only_the_cases_of_the_selected_mode(self) -> None:
+        parsed = PARSE_ARGS(["--expect-exe-sha256", HASH, "--case", CASE_NOT_SET_UP])
+        self.assertEqual(parsed.case, CASE_NOT_SET_UP)
+        self.assertFalse(parsed.configured_provider)
+        configured = PARSE_ARGS(
+            ["--expect-exe-sha256", HASH, "--configured-provider", "--case", CASE_CONFIGURED]
+        )
         self.assertTrue(configured.configured_provider)
+
+        for argv in (
+            ["--case", CASE_CONFIGURED],
+            ["--configured-provider", "--case", CASE_NOT_SET_UP],
+        ):
+            with self.subTest(argv=argv), mock.patch("sys.stderr"):
+                with self.assertRaises(SystemExit):
+                    PARSE_ARGS(["--expect-exe-sha256", HASH, *argv])
 
     def test_close_app_posts_close_and_waits_for_clean_exit(self) -> None:
         for returncode in (0, 1):
             with self.subTest(returncode=returncode):
                 events: list[tuple[str, object]] = []
 
-                class FakeWin32:
+                class PostCloseWin32:
                     def post_close(self, hwnd: int) -> None:
                         events.append(("close", hwnd))
 
@@ -439,7 +679,7 @@ class HarnessContractTests(unittest.TestCase):
                         return returncode
 
                 harness = object.__new__(runtime.NativeHarness)
-                harness.win32 = FakeWin32()
+                harness.win32 = PostCloseWin32()
                 harness.ui_timeout = 1.0
                 app = type(
                     "App", (), {"hwnd": 42, "process": FakeProcess()}
@@ -455,241 +695,6 @@ class HarnessContractTests(unittest.TestCase):
 
                 self.assertEqual(events, [("close", 42), ("wait", 1.0)])
 
-    def test_production_source_removes_test_imports_without_losing_later_code(self) -> None:
-        source_text = (
-            "pub fn before_test_import() {}\n"
-            "#[cfg(test)]\nuse crate::test_support::TestDependency;\n"
-            "pub fn after_test_import() {}\n"
-            "\n#[cfg(test)]\nmod tests {\n    fn test_only() {}\n}\n"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "workspace.rs"
-            source.write_text(source_text, encoding="utf-8")
 
-            production = HARNESS.production_source(source)
-
-        self.assertIsNotNone(production)
-        self.assertNotIn("use crate::test_support::TestDependency;", production)
-        self.assertIn("before_test_import", production)
-        self.assertIn("after_test_import", production)
-        self.assertNotIn("mod tests", production)
-
-
-class SourceContractTests(unittest.TestCase):
-    WORKSPACE_SOURCE = (
-        'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n'
-        'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n'
-        'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n'
-        'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n'
-        'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n'
-    )
-    REVIEW_SOURCE = (
-        "fn review_controls(diagnostic: Diagnostic, cx: &Context) {\n"
-        "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n"
-        "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n"
-        "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n"
-        "    diagnostic_control.role(gpui_kit::Role::Label);\n"
-        "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n"
-        "    let _ = ReviewError::MissingCredential;\n"
-        "    let _ = i18n::Key::ReviewMissingCredential;\n"
-        "    let _ = PromptButton::ok(i18n::t(i18n::Key::SendToModel, cx));\n"
-        "    let _ = i18n::Key::ReviewReady;\n"
-        "}\n"
-    )
-    TEST_MODULE = "\n#[cfg(test)]\nmod tests {\n    // test-only contract decoy\n}\n"
-
-    @staticmethod
-    def source_contract_failure(workspace: str, review: str) -> str | None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            views = repo / "crates" / "mt-app" / "src" / "views"
-            review_dir = views / "workspace"
-            review_dir.mkdir(parents=True)
-            (views / "workspace.rs").write_text(workspace, encoding="utf-8")
-            (review_dir / "review.rs").write_text(review, encoding="utf-8")
-
-            with mock.patch.object(HARNESS, "REPO", repo):
-                return HARNESS.source_contract_failure()
-
-    def test_complete_temporary_workspace_and_review_sources_satisfy_contract(self) -> None:
-        self.assertIsNone(
-            self.source_contract_failure(self.WORKSPACE_SOURCE, self.REVIEW_SOURCE)
-        )
-
-    @unittest.skipUnless(
-        (Path(__file__).resolve().parents[2] / "crates/mt-app/src/views/workspace.rs").exists(),
-        "legacy GPUI source contract removed during the nsh migration; nsh native acceptance is pending",
-    )
-    def test_real_repository_satisfies_source_contract(self) -> None:
-        self.assertIsNone(HARNESS.source_contract_failure())
-
-    def test_unsafe_projection_returns_existing_source_contract_failure(self) -> None:
-        malformed = "\n#[cfg(test)] mod checks {\n"
-        for workspace, review in (
-            (self.WORKSPACE_SOURCE + malformed, self.REVIEW_SOURCE),
-            (self.WORKSPACE_SOURCE, self.REVIEW_SOURCE + malformed),
-        ):
-            with self.subTest(workspace=workspace, review=review):
-                self.assertEqual(
-                    self.source_contract_failure(workspace, review),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )
-
-    def test_each_missing_workspace_accessibility_id_returns_uia_contract_failure(
-        self,
-    ) -> None:
-        for contract in (
-            'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n',
-            'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n',
-            'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n',
-        ):
-            with self.subTest(contract=contract):
-                workspace = self.WORKSPACE_SOURCE.replace(contract, "", 1)
-                self.assertEqual(
-                    self.source_contract_failure(workspace, self.REVIEW_SOURCE),
-                    "REVIEW_UIA_CONTRACT_MISSING",
-                )
-
-    def test_each_missing_review_control_returns_source_contract_failure(self) -> None:
-        for contract in (
-            "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n",
-            "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n",
-            "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n",
-        ):
-            with self.subTest(contract=contract):
-                review = self.REVIEW_SOURCE.replace(contract, "", 1)
-                self.assertEqual(
-                    self.source_contract_failure(self.WORKSPACE_SOURCE, review),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )
-
-    def test_each_missing_review_shortcut_returns_source_contract_failure(self) -> None:
-        for contract in (
-            'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n',
-            'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n',
-        ):
-            with self.subTest(contract=contract):
-                workspace = self.WORKSPACE_SOURCE.replace(contract, "", 1)
-                self.assertEqual(
-                    self.source_contract_failure(workspace, self.REVIEW_SOURCE),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )
-
-    def test_missing_diagnostic_aria_value_returns_source_contract_failure(self) -> None:
-        review = self.REVIEW_SOURCE.replace(
-            "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
-            "",
-            1,
-        )
-
-        self.assertEqual(
-            self.source_contract_failure(self.WORKSPACE_SOURCE, review),
-            "REVIEW_SOURCE_CONTRACT_MISSING",
-        )
-
-    def test_cfg_test_decoys_do_not_supply_missing_production_contracts(self) -> None:
-        cases = (
-            (
-                "workspace run ID",
-                "workspace",
-                'const REVIEW_RUN_ACCESSIBILITY_ID: &str = "markturbo-review-run";\n',
-                "REVIEW_UIA_CONTRACT_MISSING",
-            ),
-            (
-                "workspace diagnostic ID",
-                "workspace",
-                'const REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID: &str = "markturbo-review-diagnostic";\n',
-                "REVIEW_UIA_CONTRACT_MISSING",
-            ),
-            (
-                "workspace result ID",
-                "workspace",
-                'const REVIEW_RESULT_ACCESSIBILITY_ID: &str = "markturbo-review-result";\n',
-                "REVIEW_UIA_CONTRACT_MISSING",
-            ),
-            (
-                "document shortcut",
-                "workspace",
-                'KeyBinding::new("ctrl-shift-r", ReviewDocument, None);\n',
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "selection shortcut",
-                "workspace",
-                'KeyBinding::new("ctrl-shift-alt-r", ReviewSelection, None);\n',
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "run control",
-                "review",
-                "    run.accessibility_id(REVIEW_RUN_ACCESSIBILITY_ID);\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "diagnostic control",
-                "review",
-                "    diagnostic_control.accessibility_id(REVIEW_DIAGNOSTIC_ACCESSIBILITY_ID);\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "result control",
-                "review",
-                "    result.accessibility_id(REVIEW_RESULT_ACCESSIBILITY_ID);\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-            (
-                "diagnostic aria value",
-                "review",
-                "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
-                "REVIEW_SOURCE_CONTRACT_MISSING",
-            ),
-        )
-
-        test_scopes = (
-            self.TEST_MODULE,
-            "\n#[cfg(test)] mod checks {\n"
-            "fn decoy() {\n// test-only contract decoy\n}\n}\n",
-            "\n# [ cfg (\n test \n) ]\npub(crate) mod checks\n{\n"
-            "fn decoy() {\n// test-only contract decoy\n}\n}\n",
-            "\n#[cfg(test)] fn decoy() {\n// test-only contract decoy\n}\n",
-            "\n#[cfg(all(test, windows))] fn decoy() {\n"
-            "// test-only contract decoy\n}\n",
-            "\nmod helpers {\n#[cfg(test)] mod checks {\n"
-            "fn decoy() {\n// test-only contract decoy\n}\n}\n}\n",
-        )
-        for name, source_file, contract, failure in cases:
-            for test_scope in test_scopes:
-                workspace, review = self.WORKSPACE_SOURCE, self.REVIEW_SOURCE
-                source = workspace if source_file == "workspace" else review
-                source = test_scope.replace(
-                    "// test-only contract decoy", contract.strip()
-                ) + source.replace(contract, "", 1)
-                if source_file == "workspace":
-                    workspace = source
-                else:
-                    review = source
-                with self.subTest(contract=name, test_scope=test_scope):
-                    self.assertEqual(
-                        self.source_contract_failure(workspace, review), failure
-                    )
-
-    def test_comment_or_string_decoys_do_not_preserve_removed_diagnostic_exposure(
-        self,
-    ) -> None:
-        decoys = (
-            "// .aria_value(diagnostic.diagnostic.message.as_str())\n",
-            'const REMOVED_DIAGNOSTIC_EXPOSURE: &str = '
-            '".aria_value(diagnostic.diagnostic.message.as_str())";\n',
-        )
-
-        for decoy in decoys:
-            with self.subTest(decoy=decoy):
-                review = self.REVIEW_SOURCE.replace(
-                    "    diagnostic_control.aria_value(diagnostic.diagnostic.message.as_str());\n",
-                    "",
-                    1,
-                ) + decoy
-                self.assertEqual(
-                    self.source_contract_failure(self.WORKSPACE_SOURCE, review),
-                    "REVIEW_SOURCE_CONTRACT_MISSING",
-                )
+if __name__ == "__main__":
+    unittest.main()

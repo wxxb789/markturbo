@@ -1,4 +1,7 @@
 //! A new untitled document can be authored and saved through Save As.
+//!
+//! Afterglow: the welcome's New file starts the draft and the title row's
+//! Save routes it through the Save As picker.
 
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
@@ -20,9 +23,9 @@ fn new_document_saves_with_save_as() {
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
     app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
         .expect("wide viewport");
-    app.wait_for("text:Start a Markdown document")
-        .expect("welcome");
-    app.press("text:New").expect("create untitled document");
+    app.wait_for("id:welcome").expect("welcome");
+    app.press("label:New file")
+        .expect("create untitled document");
     app.wait_for("label:Markdown source")
         .expect("untitled editor");
     app.type_text("label:Markdown source", "# Draft")
@@ -30,7 +33,12 @@ fn new_document_saves_with_save_as() {
 
     app.on_pick_save_path(Some(destination.clone()))
         .expect("register the save path");
-    app.press("text:Save").expect("Save As for untitled");
+    app.wait_for("id:title-settings")
+        .expect("the settings glyph");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save")
+        .expect("Save As for untitled");
     app.wait_for("text:notes.md").expect("saved tab title");
     assert_eq!(
         std::fs::read_to_string(&destination).expect("read saved file"),

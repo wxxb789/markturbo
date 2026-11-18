@@ -134,3 +134,10 @@
   difference in the shared commit path. The per-pull-request macOS job now runs
   only the arm64 build, and the nightly `--workspace` run owns macOS behavior, so
   nothing hides behind this gap.
+- [ ] **Dead-code candidate: multi-chain loopback provider** — Goal 07 now runs
+  one Review→Revision chain, but `LoopbackRevisionServer` in
+  `scripts/markturbo_tools/native/goal07_provider.py` still supports repeated
+  `begin_chain` cycles and keeps a cumulative `_request_count` beside the
+  per-chain `requests`, and `scripts/tests/test_native_goal07_provider.py`
+  still runs a three-chain test (`request_count == 6`). Revalidate that no
+  caller needs more than one chain, then drop the extra state and test.

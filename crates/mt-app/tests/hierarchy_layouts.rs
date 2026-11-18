@@ -1,5 +1,7 @@
 //! Uncommon layouts stay behind one inline disclosure.
 
+use std::time::Duration;
+
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
@@ -19,27 +21,92 @@ fn compatibility_layouts_are_progressively_disclosed() {
 
     let mut app =
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
-    app.set_viewport(nsh_core::Size::new(Points(720.0), Points(600.0)))
+    app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
         .expect("wide viewport");
 
     app.wait_for("label:Markdown source")
         .expect("source editor");
-    app.wait_for("text:Edit").expect("primary Edit mode");
-    app.wait_for("text:Preview").expect("primary Preview mode");
+    // The row holds no mode, even in a roomy window: the three modes are the
+    // glyph's menu's first pane commands.
+    for mode in ["id:title-edit", "id:title-preview", "id:title-split"] {
+        assert_eq!(
+            app.screen().count(mode).expect("selector"),
+            0,
+            "`{mode}` on the title row"
+        );
+    }
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    for mode in [
+        "id:title-menu-edit",
+        "id:title-menu-preview",
+        "id:title-menu-split",
+    ] {
+        app.wait_for(mode).expect("primary mode in the menu");
+    }
+    app.press("id:title-settings")
+        .expect("close the glyph's menu");
+    app.wait_for_gone("id:title-menu", Duration::from_secs(5))
+        .expect("the menu closes");
+    // The web compatibility pane waits behind the glyph's menu too.
     assert!(
-        !app.shows("Compatibility Preview"),
+        !app.shows("Web preview"),
         "advanced layout shown before disclosure"
     );
+    assert_eq!(
+        app.screen().count("id:title-menu-web").expect("selector"),
+        0,
+        "the compatibility layout is only in the menu"
+    );
 
-    app.press("text:More layouts")
-        .expect("open layout disclosure");
-    app.wait_for("text:Compatibility Preview")
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.wait_for("id:title-menu").expect("menu disclosed");
+    app.wait_for("id:title-menu-web")
         .expect("compatibility layout disclosed");
-    app.press("text:Fewer layouts")
-        .expect("close layout disclosure");
-    app.wait_for_gone(
-        "text:Compatibility Preview",
-        std::time::Duration::from_secs(5),
-    )
-    .expect("compatibility layout hidden again");
+    app.wait_for("text:Web preview").expect("its copy");
+
+    // Closing the disclosure hides the layout again: the menu carries it,
+    // and nothing stays on the row.
+    app.press("id:title-settings")
+        .expect("close the glyph's menu");
+    app.wait_for_gone("id:title-menu-web", Duration::from_secs(5))
+        .expect("the compatibility layout is hidden again");
+    assert!(!app.shows("Web preview"), "the disclosed layout stayed");
+
+    // Reopened, the disclosed layout works: Web shows the document as a page
+    // with its scripts restricted until the user trusts them.
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-web")
+        .expect("switch to the web pane");
+    app.wait_for("id:web-pane")
+        .expect("the web compatibility pane");
+    app.wait_for("text:Restricted: scripts disabled")
+        .expect("the trust level on the pane");
+    app.wait_for_gone("label:Markdown source", Duration::from_secs(5))
+        .expect("the web pane replaces the editor");
+
+    // The primary Edit mode comes back from the same menu.
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-edit")
+        .expect("switch back to Edit");
+    app.wait_for("label:Markdown source").expect("editor again");
+    app.wait_for_gone("id:web-pane", Duration::from_secs(5))
+        .expect("the web pane left");
+
+    // A narrow window keeps the modes in the menu: never a lost action.
+    app.set_viewport(nsh_core::Size::new(Points(900.0), Points(700.0)))
+        .expect("narrow viewport");
+    app.wait_for_gone("id:title-edit", Duration::from_secs(5))
+        .expect("no mode on the row");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.wait_for("id:title-menu-edit")
+        .expect("Edit in the menu");
+    app.wait_for("id:title-menu-preview")
+        .expect("Preview in the menu");
+    app.wait_for("id:title-menu-split")
+        .expect("Split in the menu");
 }

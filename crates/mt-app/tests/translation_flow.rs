@@ -65,14 +65,16 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         nsh_engine::Points(1280.0),
         nsh_engine::Points(800.0),
     ))
-    .expect("wide viewport for the toolbar");
+    .expect("wide viewport");
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
+    // Translation's consent is the state's one-shot dialog; it discloses the
+    // outbound request and authorizes nothing until it is answered.
     app.on_dialog(|_| DialogAnswer::Press("Send".to_owned()));
-    app.press("text:More layouts")
-        .expect("open the secondary actions");
-    app.press("text:Translate").expect("start translation");
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-translate")
+        .expect("start translation");
     app.wait_for_within(
         "text:Translated 1 segment(s) into zh.",
         Duration::from_secs(20),
@@ -84,7 +86,8 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         app.screen().texts()
     );
 
-    app.press("text:Save").expect("save translation");
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-save").expect("save translation");
     support::wait_for_file(
         &mut app,
         &document,
@@ -93,36 +96,49 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         Duration::from_secs(20),
     );
 
-    if app.shows("More layouts") {
-        app.press("text:More layouts")
-            .expect("open the secondary actions");
-    }
-    app.press("text:Translate")
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-translate")
         .expect("start another translation");
     app.wait_for("text:Waiting for model request approval…")
         .expect("second translation is pending");
-    app.press("text:other.md").expect("open another tab");
+    // Open another document and dirty it: the pending translation must land on
+    // the revision it was prepared from, not on whatever is active.
+    app.press_key("mod+p").expect("open the file palette");
+    app.wait_for("id:palette-input").expect("the palette input");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open another tab");
     app.wait_for("text:Other").expect("other document");
     app.type_text("label:Markdown source", "\nUnsaved edit.")
         .expect("dirty the other tab");
-    app.press("text:plan.md >> nth=0")
+    // Return by the row's own label, and prove the target is the active tab:
+    // the title row reads its file name and the editor holds its text, so a
+    // later landing can only be the revision the translation was prepared
+    // from.
+    app.press("label:plan.md")
         .expect("return to the translation target");
     app.wait_for("label:Markdown source")
         .expect("translation target editor");
-    app.answer_dialogs_myself();
-    app.press("text:Quit").expect("request quit");
-    support::wait_for_pending_dialog(
-        &mut app,
-        "Quit must await a decision",
-        Duration::from_secs(20),
-    );
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("the translation target is the active tab");
+    app.wait_for("id:source-editor >> text:/你好/")
+        .expect("the active editor holds the translation target's text");
+    // Quit: the in-app guard takes the decision, and it must await it.
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-quit").expect("request quit");
+    app.wait_for("text:Close without saving?")
+        .expect("Quit must await a decision");
 
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:你好，再见", Duration::from_secs(20))
         .expect("second translation applies while Quit is pending");
-    assert!(app.pending_dialog().is_some(), "Quit must still be pending");
-    app.answer_dialog(DialogAnswer::Press("Save all".to_owned()))
-        .expect("save all and quit");
+    assert!(
+        app.screen()
+            .matches("id:guard-card")
+            .expect("guard selector"),
+        "Quit must still be pending"
+    );
+    app.press("id:guard-save").expect("save all and quit");
 
     support::wait_for_file(
         &mut app,

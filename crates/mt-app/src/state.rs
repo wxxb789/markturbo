@@ -17,18 +17,24 @@ use std::{
 use mt_core::{
     Document,
     agent_artifacts::{
-        context::{CODEX_PROFILE_ID, ContextInput, ProjectTrust, ResolvedContext, resolve},
+        context::{
+            CODEX_PROFILE_ID, ContextInput, ProjectTrust, ResolvedContext, SelectedContext, resolve,
+        },
         instruction::{self, Instruction},
         package::{ReviewRequestBuildRequest, ReviewTarget, build_review_request},
         skill::{self, Discovery, Skill},
     },
     credentials::CredentialVault,
     document::io::{self, FileStamp, LoadedFile, Newline, SaveError, SourceIdentity},
-    model::{ConsentCapability, ConsentDecision},
+    model::{
+        ConsentCapability, ConsentDecision, ModelRequestDisclosure, OutboundScope,
+        OutboundScopeKind,
+    },
     recovery::{RecoveredRecord, RecoveryCheckpoint, RecoveryKey, RecoveryMetadata, RecoveryStore},
     review::{
-        ArtifactLens, ClarificationPriority, FindingKind, ReviewModelOutput, ReviewRequest,
-        ReviewResult, ReviewStatus, SourceSnapshot,
+        ArtifactLens, ByteRange, ClarificationPriority, FindingKind, ReviewModelOutput,
+        ReviewRequest, ReviewResult, ReviewScope, ReviewSource, ReviewStatus, SkillFilePayload,
+        SourceAnchor, SourceLocation, SourceSnapshot,
         provider::{
             PreparedDocumentReviewRequest, PreparedReview, PreparedRevisionRequest, ReviewError,
             ReviewLanguage, RevisionAnswer, RevisionAnswers, RevisionError,
@@ -46,10 +52,23 @@ use mt_core::{
         tree::{self, FileNode},
     },
 };
-use nsh_base::alert_dialog;
+use nsh_base::{
+    alert_dialog,
+    editor::{Editor, EditorApi},
+};
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
 
+mod revision_ledger;
+
+use revision_ledger::{LedgerRefusal, RevisionLedger};
+
 static FIRST_LAUNCH_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// The status line while a proposal waits for decisions.
+const REVISION_READY: &str =
+    "Revision ready. Each accepted change enters the buffer at once; nothing is saved.";
+/// The status line when there is no proposal to decide or finish.
+const REVISION_UNAVAILABLE: &str = "Run Review first to prepare a Revision.";
 
 /// Which panes a document shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,6 +113,9 @@ impl PartialEq for Tab {
     }
 }
 
+/// A mounted source editor's handle and the tab it edits.
+type SourceEditor = (u64, ComponentRef<Editor>);
+
 /// The shell's state.
 #[derive(Clone)]
 pub struct AppState {
@@ -111,6 +133,13 @@ pub struct AppState {
     pub settings_open: Signal<bool>,
     pub settings_credential: Signal<String>,
     pub settings_notice: Signal<SharedString>,
+    /// Bumped after a credential is stored or removed, so the settings page
+    /// re-reads the credential status: the vault has no signal of its own.
+    pub settings_credential_revision: Signal<u64>,
+    /// The last credential status and what it was computed for, so a render
+    /// that changes nothing about the endpoint does not read the secure store
+    /// again; the settings page is the only reader.
+    pub(crate) settings_credential_status: Signal<Option<(CredentialStatusKey, CredentialStatus)>>,
     pub usage_counts: Signal<UsageAggregate>,
     pub usage_inspection_open: Signal<bool>,
     pub recovery_records: Signal<Vec<RecoveredRecord>>,
@@ -123,23 +152,81 @@ pub struct AppState {
     pub harness_instructions: Signal<Vec<Instruction>>,
     pub review_open: Signal<bool>,
     pub review_consent: Signal<Option<SharedString>>,
+    /// The waiting Review consent's structured disclosure and manifest.
+    pub review_manifest: Signal<Option<OutboundConsent>>,
     pub review_view: Signal<Option<ReviewView>>,
     pub review_busy: Signal<bool>,
+    /// The source column's camera ([`DocumentFocus`]): the line a docked
+    /// surface wants levelled with it. Set it with
+    /// [`AppState::focus_document_line`].
+    pub document_focus: Signal<DocumentFocus>,
+    /// Why the last Review attempt could not be prepared, when it could not:
+    /// the field explains it and offers Settings. `None` normally.
+    pub review_unavailable: Signal<Option<ReviewUnavailable>>,
+    /// Which Review an in-flight request belongs to. Bumped when a review is
+    /// prepared and when one is withdrawn: a task whose generation is stale
+    /// writes nothing, so a cancelled (or replaced) run can never show its
+    /// result.
+    pub review_generation: Signal<u64>,
     pub translation_busy: Signal<bool>,
     pub revision_questions: Signal<Vec<RevisionQuestionView>>,
     pub revision_consent: Signal<Option<SharedString>>,
+    /// The waiting Revision consent's structured disclosure and manifest.
+    pub revision_manifest: Signal<Option<OutboundConsent>>,
     pub revision_hunks: Signal<Vec<RevisionHunkView>>,
     pub revision_status: Signal<Option<SharedString>>,
     pub revision_busy: Signal<bool>,
+    /// How many hunks the last `Done` discarded undecided (never written);
+    /// zero when there is nothing to report.
+    pub revision_not_applied: Signal<usize>,
+    /// The rail's preview slot (chrome lane): the tab a single press in the
+    /// rail's file list opened, which the next single press replaces, until a
+    /// double press pins it. `None` when nothing is slotted.
+    pub preview_slot: Signal<Option<u64>>,
+    /// The destructive close or quit guard (`ui::notices`): up while a
+    /// decision over dirty buffers is waiting.
+    pub guard: Signal<Option<GuardRequest>>,
+    /// The tab whose disk comparison (`ui::notices`) is open, if any.
+    pub conflict_compare: Signal<Option<u64>>,
+    /// Which difference the open comparison shows (`ui::notices`).
+    pub conflict_difference: Signal<usize>,
+    /// The file-on-disk text of each conflicted document (`ui::notices`),
+    /// keyed by its tab and read when the comparison opens. A tab's entry is
+    /// ignored while its `conflict` is false.
+    pub conflict_disks: Signal<Vec<(u64, String)>>,
     owner: Owner,
     vault: CredentialVault,
     usage: Rc<RefCell<UsageStore>>,
     pending_review: Rc<RefCell<Option<PreparedDocumentReviewRequest>>>,
     review_origin: Rc<RefCell<Option<ReviewOrigin>>>,
+    /// The non-empty source selection captured, as byte offsets into the
+    /// frozen text, when the waiting Review consent was prepared: the
+    /// `Selection` scope the card may switch to. `None` offers no selection.
+    review_selection: Rc<Cell<Option<(usize, usize)>>>,
+    /// The source editor `ui::document` mounted last, with the tab it edits.
+    /// Its selection is read live when a Review is prepared; once that
+    /// editor is unmounted (another pane or tab) its handle reaches nothing,
+    /// so a selection nobody sees is never reviewed.
+    source_editor: Rc<Cell<Option<SourceEditor>>>,
+    /// The tab a sent Review request belongs to, until its answer lands or
+    /// the request stops mattering (replaced or withdrawn). It outlives the
+    /// tab being on screen: switching tabs must not drop an answer nobody
+    /// has read yet.
+    review_in_flight: Rc<RefCell<Option<ReviewOrigin>>>,
     review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
+    /// Bumped whenever the revision context is replaced or reset: a Revision
+    /// answer sent under an older generation belongs to no live proposal and
+    /// is dropped unread.
+    revision_generation: Rc<Cell<u64>>,
+    /// Bumped by every context resolution and reset: only the latest
+    /// resolution lands, so a slower one for the document that was active
+    /// before cannot replace the chain of the one active now.
+    context_generation: Rc<Cell<u64>>,
     pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
-    revision_proposal: Rc<RefCell<Option<RevisionProposal>>>,
+    /// Where the live proposal's hunks sit in its tab's text: the one
+    /// authority that writes an accepted change, or takes one back.
+    revision_ledger: Rc<RefCell<Option<RevisionLedger>>>,
     recovery: Option<Rc<RecoveryStore>>,
     recovery_tracks: Rc<RefCell<HashMap<u64, RecoveryTrack>>>,
     quit_discarded: Rc<Cell<bool>>,
@@ -172,10 +259,153 @@ pub struct RevisionHunkView {
     pub accepted: Signal<bool>,
 }
 
+/// One destructive decision the guard is asking about (`ui::notices`).
+#[derive(Clone, PartialEq)]
+pub struct GuardRequest {
+    /// The tab being closed; `None` quits the window.
+    pub tab: Option<u64>,
+    /// Which control the keyboard is on (`ui::notices`): `0` Save, `1`
+    /// Don't save, `2` Cancel (the default).
+    pub choice: Signal<usize>,
+    /// A save is going on: the guard's controls wait for it.
+    pub busy: Signal<bool>,
+    /// Why the guard is still up (a save that could not finish).
+    pub notice: Signal<Option<SharedString>>,
+}
+
+/// The guard's controls, in the order its card draws them (`ui::notices`).
+pub const GUARD_SAVE_CHOICE: usize = 0;
+pub const GUARD_DISCARD_CHOICE: usize = 1;
+pub const GUARD_CANCEL_CHOICE: usize = 2;
+/// How many controls the guard has.
+pub const GUARD_CHOICES: usize = 3;
+/// Where one outbound item came from, for the consent card to name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboundOrigin {
+    /// The reviewed document itself.
+    Document,
+    /// The selected part of the reviewed document, alone.
+    Selection,
+    /// One named Effective Agent Context source.
+    NamedSource,
+    /// One Agent Skill package file, whose own reason travels with it.
+    PackageFile,
+    /// A file the package would normally include but does not send.
+    Omission,
+    /// A resolved Effective Agent Context source that is not in the scope.
+    ExcludedSource,
+    /// The Review a Revision request carries as context.
+    ReviewContext,
+    /// The clarification answers a Revision request carries.
+    Answers,
+}
+
+/// One item of a consent's outbound manifest: what leaves the device, why, and
+/// its own bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboundItem {
+    pub origin: OutboundOrigin,
+    /// The item's path, relative to the workspace root when it is inside it.
+    /// `None` for an item that is not a file (a request's framing).
+    pub path: Option<String>,
+    /// The package's own inclusion reason, when the item has one.
+    pub reason: Option<String>,
+    /// The item's own byte size.
+    pub bytes: u64,
+    /// Whether the raw content crosses the boundary. False for a package entry
+    /// that leaves as path, size and hash only.
+    pub content_leaves: bool,
+}
+
+/// What one waiting consent discloses: the structured disclosure the send will
+/// be bound to, plus the manifest the card's rows are built from.
+///
+/// Built where the request is bound and from the same objects that will
+/// authorize the send, so no number on the card is summarized or estimated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboundConsent {
+    pub disclosure: ModelRequestDisclosure,
+    /// What leaves and why, in display order.
+    pub items: Vec<OutboundItem>,
+    /// Normally in-scope items that do not leave, in display order.
+    pub stays: Vec<OutboundItem>,
+}
+
+/// The outbound scope a waiting Review consent can be rebound to: the spec's
+/// `Selection · Document · Document + context`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewScopeChoice {
+    /// Only the source selection captured when the Review was prepared.
+    Selection,
+    /// The whole document (or Agent Skill package).
+    Document,
+    /// The whole document with its selected Effective Agent Context sources.
+    DocumentWithContext,
+}
+
+/// The source editor's primary selection in the editor's own coordinates:
+/// a line from 0 and a column in UTF-16 code units, from where it started
+/// (`anchor`) to where the caret is (`head`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceSelection {
+    anchor: (u32, u32),
+    head: (u32, u32),
+}
+
+impl SourceSelection {
+    /// The selection as a byte range of `text`, ordered and clamped to the
+    /// text; `None` when it selects nothing.
+    fn byte_range(&self, text: &str) -> Option<(usize, usize)> {
+        let anchor = byte_offset(text, self.anchor);
+        let head = byte_offset(text, self.head);
+        let (start, end) = (anchor.min(head), anchor.max(head));
+        (start < end).then_some((start, end))
+    }
+}
+
+/// The byte offset of an editor position (line from 0, UTF-16 column) in
+/// `text`, clamped to the end of its line (before its line break) and to the
+/// end of the text.
+fn byte_offset(text: &str, (line, column): (u32, u32)) -> usize {
+    let mut start = 0;
+    for _ in 0..line {
+        match line_bounds(text, start).1 {
+            Some(next) => start = next,
+            None => return text.len(),
+        }
+    }
+    let line_text = &text[start..line_bounds(text, start).0];
+    let mut units = 0;
+    for (offset, character) in line_text.char_indices() {
+        if units >= column as usize {
+            return start + offset;
+        }
+        units += character.len_utf16();
+    }
+    start + line_text.len()
+}
+
+/// Where the line starting at byte `start` of `text` ends (before its break)
+/// and where the next line starts, if one does. Lines break as the source
+/// editor breaks them: at `\r\n`, `\n` or a lone `\r`.
+fn line_bounds(text: &str, start: usize) -> (usize, Option<usize>) {
+    match text[start..].find(['\r', '\n']) {
+        None => (text.len(), None),
+        Some(at) => {
+            let end = start + at;
+            let next = if text[end..].starts_with("\r\n") {
+                end + 2
+            } else {
+                end + 1
+            };
+            (end, Some(next))
+        }
+    }
+}
+
 /// Immutable inputs retained after a successful Review for a later Revision.
 struct RevisionContext {
     tab_id: u64,
-    snapshot: SourceSnapshot,
     request: ReviewRequest,
     output: ReviewModelOutput,
     language: ReviewLanguage,
@@ -196,12 +426,88 @@ pub struct ReviewView {
     pub sections: Vec<ReviewSection>,
     pub findings: Vec<String>,
     pub questions: Vec<String>,
+    /// Whether the source moved on after this result: the field says so, and
+    /// the column keeps only the afterimage.
+    pub stale: bool,
+    /// The findings with their anchors intact: the field writes their line
+    /// ranges and the column lights the anchored words.
+    pub findings_anchored: Vec<ReviewFindingView>,
+    /// The questions with priority and impact kept apart: the field orders
+    /// them and shows one at a time.
+    pub questions_detail: Vec<ReviewQuestionView>,
+    /// The tab this result belongs to; the column lights findings only in
+    /// that tab's text.
+    pub tab_id: Option<u64>,
+    /// Why the review failed, when it did: the field writes the plain
+    /// diagnostic line the spec asks for.
+    pub failure: Option<ReviewFailure>,
+    /// Whether the reviewed Agent Skill package omitted a normally in-scope
+    /// supporting file: the result is labelled partial, never complete.
+    pub partial: bool,
+}
+
+/// The column's camera: the document line a surface asked the source editor to
+/// level with its docked reading position (a review's racked finding, a
+/// revision's current hunk). The document lane's `ui::document` scrolls to it;
+/// nothing here changes the document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocumentFocus {
+    /// The tab the line belongs to; another tab's request is ignored.
+    pub tab: u64,
+    /// The line, from 0.
+    pub line: u32,
+    /// Bumped by every request, so asking again for the same line levels it
+    /// again.
+    pub request: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReviewSection {
     pub title: String,
     pub items: Vec<String>,
+}
+
+/// One grounded finding as the review field and the document's light need it.
+///
+/// `stated` decides where the light is: a stated finding makes the anchored
+/// glyphs themselves emit, an inferred one makes the air beside them. The
+/// location is the model's anchor as the core resolved it, so neither surface
+/// can invent a source position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewFindingView {
+    pub stated: bool,
+    pub text: String,
+    pub location: Option<SourceLocation>,
+}
+
+/// One clarification question with its priority and impact kept apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewQuestionView {
+    pub priority: ClarificationPriority,
+    pub question: String,
+    pub impact: Option<String>,
+}
+
+/// Why Review could not be prepared, so nothing left the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewUnavailable {
+    /// No model provider or credential is configured.
+    NotSetUp,
+    /// The document or its context cannot form a review request.
+    Unpreparable,
+}
+
+/// Why a sent Review produced no result, as the field's copy names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFailure {
+    /// The provider did not answer in time.
+    Timeout,
+    /// The answer could not be read as a review.
+    Malformed,
+    /// The wait was cancelled; nothing changed.
+    Cancelled,
+    /// Anything else, shown with the localized status and the detail.
+    Other,
 }
 
 /// One content-search row.
@@ -212,7 +518,31 @@ pub struct SearchHit {
 }
 
 impl AppState {
+    /// The state over the platform's secure store; in a test build, over
+    /// this process's in-memory store instead (the `test_vault` module).
     pub fn new() -> Self {
+        #[cfg(not(any(test, feature = "test-vault")))]
+        let vault = CredentialVault::production();
+        #[cfg(any(test, feature = "test-vault"))]
+        let vault = crate::test_vault::vault();
+        Self::build(vault)
+    }
+
+    /// The state with the credential vault given: a test passes its own
+    /// in-memory vault, so nothing it does can read, write or delete a
+    /// credential in the platform's secure store.
+    #[cfg(test)]
+    pub(crate) fn with_vault(vault: CredentialVault) -> Self {
+        Self::build(vault)
+    }
+
+    /// The constructor's body, with the one choice a test overrides made a
+    /// parameter.
+    fn build(vault: CredentialVault) -> Self {
+        #[cfg(test)]
+        {
+            crate::test_env::hermetic();
+        }
         let settings = SettingsData::load();
         set_color_scheme(match settings.theme {
             ThemePreference::System => nsh_core::platform::Appearance::System,
@@ -242,12 +572,9 @@ impl AppState {
                 Some(SharedString::from(format!("Recovery unavailable: {error}"))),
             ),
         };
-        let status = notice.clone().unwrap_or_else(|| {
-            SharedString::from(crate::i18n::t(
-                settings.language,
-                crate::i18n::Key::OpenFolderToBegin,
-            ))
-        });
+        // With nothing to report the status line starts empty: the welcome's
+        // own choices and its local-only line say how to begin, once.
+        let status = notice.clone().unwrap_or_default();
         let usage = UsageStore::open(settings.usage_metrics_enabled);
         let state = Self {
             owner: Owner::current(),
@@ -265,6 +592,8 @@ impl AppState {
             settings_open: signal(false),
             settings_credential: signal(String::new()),
             settings_notice: signal(SharedString::from("")),
+            settings_credential_revision: signal(0_u64),
+            settings_credential_status: signal(None),
             usage_counts: signal(UsageAggregate::default()),
             usage_inspection_open: signal(false),
             recovery_records: signal(records),
@@ -277,22 +606,38 @@ impl AppState {
             harness_instructions: signal(Vec::new()),
             review_open: signal(false),
             review_consent: signal(None),
+            review_manifest: signal(None),
             review_view: signal(None),
             review_busy: signal(false),
+            document_focus: signal(DocumentFocus::default()),
+            review_unavailable: signal(None),
             translation_busy: signal(false),
             revision_questions: signal(Vec::new()),
             revision_consent: signal(None),
+            revision_manifest: signal(None),
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
             revision_busy: signal(false),
-            vault: CredentialVault::production(),
+            revision_not_applied: signal(0),
+            preview_slot: signal(None),
+            vault,
+            review_generation: signal(0),
+            guard: signal(None),
+            conflict_compare: signal(None),
+            conflict_difference: signal(0),
+            conflict_disks: signal(Vec::new()),
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
+            review_selection: Rc::new(Cell::new(None)),
+            source_editor: Rc::new(Cell::new(None)),
+            review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
+            revision_generation: Rc::new(Cell::new(0)),
+            context_generation: Rc::new(Cell::new(0)),
             pending_revision: Rc::new(RefCell::new(None)),
-            revision_proposal: Rc::new(RefCell::new(None)),
+            revision_ledger: Rc::new(RefCell::new(None)),
             recovery,
             recovery_tracks: Rc::new(RefCell::new(HashMap::new())),
             quit_discarded: Rc::new(Cell::new(false)),
@@ -509,6 +854,114 @@ impl AppState {
         });
     }
 
+    /// Opens `path` in the rail's preview slot (chrome lane): the tab the
+    /// next single press replaces, unless a file it replaces was edited,
+    /// saved as a new document or pinned. A tab already showing `path` is
+    /// activated where it is, and stays whatever it was.
+    pub fn open_preview(&self, path: PathBuf) {
+        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.path == path) {
+            self.set_active(tab.id);
+            return;
+        }
+        if let Some(slot) = self.preview_slot.get() {
+            // A tab that still owns model work keeps its slot — a request out
+            // for it, the answer bound to it, the Revision it prepared — and
+            // so does one the user has changed. Both would be lost with it.
+            let replaceable = !self.holds_live_model_output(slot)
+                && self
+                    .tabs
+                    .get()
+                    .iter()
+                    .any(|tab| tab.id == slot && !tab.dirty.get() && !tab.untitled);
+            if replaceable {
+                self.close_tab_now(slot);
+            }
+        }
+        self.preview_slot.set(None);
+        let state = self.clone();
+        self.spawn_task(async move {
+            let loaded = match blocking(move || io::load(&path)).await {
+                Ok(Ok(loaded)) => loaded,
+                Ok(Err(error)) => {
+                    state
+                        .status
+                        .set(SharedString::from(format!("Open failed: {error}")));
+                    return;
+                }
+                Err(error) => {
+                    state
+                        .status
+                        .set(SharedString::from(format!("Open failed: {error}")));
+                    return;
+                }
+            };
+            let known: Vec<u64> = state.tabs.get().iter().map(|tab| tab.id).collect();
+            state.add_tab(loaded);
+            state.record_usage(UsageEvent::ArtifactOpened);
+            let opened = state
+                .tabs
+                .get()
+                .iter()
+                .map(|tab| tab.id)
+                .find(|id| !known.contains(id));
+            if let Some(id) = opened {
+                state.preview_slot.set(Some(id));
+            }
+        });
+    }
+
+    /// Pins the preview slot's tab (a double press): the next single press
+    /// opens beside it instead of replacing it.
+    pub fn pin_tab(&self, id: u64) {
+        self.preview_slot.update(|slot| {
+            if *slot == Some(id) {
+                *slot = None
+            }
+        });
+    }
+
+    /// Whether this tab holds live Review or Revision work: a request out for
+    /// it, the answer bound to it, or the Revision a Review prepared. The
+    /// work travels with the tab, not with what is on screen — switching tabs
+    /// does not move it, and replacing the tab would drop it.
+    pub fn holds_live_model_output(&self, id: u64) -> bool {
+        let owns = |origin: &Option<ReviewOrigin>| origin.is_some_and(|origin| origin.tab_id == id);
+        // The answer is the tab's while its result is the one on screen: a
+        // closed Review keeps its binding but holds nothing.
+        let shown = self
+            .review_view
+            .get()
+            .is_some_and(|view| view.tab_id == Some(id));
+        let binding = *self.review_binding.borrow();
+        let answer = shown
+            && binding.is_some_and(|binding| {
+                binding.tab_id == id
+                    // The same test `note_edit` uses to call a review stale:
+                    // the text has not moved on since the model read it.
+                    && self
+                        .tabs
+                        .get()
+                        .iter()
+                        .find(|tab| tab.id == id)
+                        .is_some_and(|tab| tab.revision.get() == binding.snapshot.revision)
+            });
+        let revision = self.revision_context.borrow();
+        let revision_work = match revision.as_ref() {
+            Some(context) => context.tab_id == id,
+            // Hunks and questions clear with the context; without one they
+            // are the tab on screen's (a Revision still coming back).
+            None => {
+                self.active.get() == Some(id)
+                    && (!self.revision_hunks.get().is_empty()
+                        || !self.revision_questions.get().is_empty())
+            }
+        };
+        owns(&self.review_origin.borrow())
+            || owns(&self.review_in_flight.borrow())
+            || answer
+            || revision_work
+    }
+
     /// Start an empty document that does not have a source file yet.
     pub fn new_document(&self) {
         self.add_untitled(String::new());
@@ -657,6 +1110,9 @@ impl AppState {
     }
 
     fn reset_context(&self) {
+        self.context_generation
+            .set(self.context_generation.get().wrapping_add(1));
+        self.context_busy.set(false);
         self.context_resolved.set(None);
         self.context_selected.set(Vec::new());
         self.context_error.set(None);
@@ -712,6 +1168,8 @@ impl AppState {
             project_root_markers: vec![".git".to_owned()],
             project_trust: ProjectTrust::Unspecified,
         };
+        let generation = self.context_generation.get().wrapping_add(1);
+        self.context_generation.set(generation);
         self.context_busy.set(true);
         self.context_error.set(None);
         let state = self.clone();
@@ -722,6 +1180,9 @@ impl AppState {
                 (resolve(&input, &skills), skills, instructions)
             })
             .await;
+            if state.context_generation.get() != generation {
+                return;
+            }
             state.context_busy.set(false);
             match scanned {
                 Ok((resolved, skills, instructions)) => {
@@ -775,9 +1236,24 @@ impl AppState {
         }
     }
 
+    /// Ask the source column to level `line` (from 0) of tab `tab_id` with
+    /// its docked reading position — the review's racked finding, a
+    /// revision's current hunk. The document lane's `ui::document` does the
+    /// scrolling, so the anchored lines and the field's docked explanation
+    /// sit level; the document itself is never touched.
+    pub fn focus_document_line(&self, tab_id: u64, line: u32) {
+        let request = self.document_focus.get().request.wrapping_add(1);
+        self.document_focus.set(DocumentFocus {
+            tab: tab_id,
+            line,
+            request,
+        });
+    }
+
     /// Remember that a tab was edited, so its next checkpoint waits for a
     /// short idle window instead of copying on every keystroke.
     pub fn note_edit(&self, id: u64) {
+        self.observe_revision_edit(id);
         let now = Instant::now();
         self.recovery_tracks
             .borrow_mut()
@@ -800,6 +1276,7 @@ impl AppState {
             view.status =
                 crate::i18n::t(self.settings.get().language, crate::i18n::Key::ReviewStale)
                     .to_owned();
+            view.stale = true;
             self.review_view.set(Some(view));
         }
     }
@@ -953,7 +1430,7 @@ impl AppState {
         }
         if record.source_conflicted {
             if let Some(tab) = self.active_tab() {
-                tab.conflict.set(true);
+                self.note_conflict(&tab);
             }
             self.status.set(SharedString::from(
                 "Recovered text differs from disk; reload, overwrite, or save as a new file.",
@@ -1070,39 +1547,206 @@ impl AppState {
             self.close_tab_now(id);
             return;
         }
-        let state = self.clone();
-        self.spawn_task(async move {
-            let answer = alert_dialog()
-                .title("Unsaved changes")
-                .description("Save this document before closing it?")
-                .action("save", "Save")
-                .destructive("discard", "Discard")
-                .cancel("cancel", "Cancel")
-                .show()
-                .await;
-            match answer {
-                Ok(answer) if answer.action.as_deref() == Some("save") => {
-                    state.set_active(id);
-                    state.save_active();
-                    if !state
+        // The in-app guard takes the decision (`ui::notices`): Save, Don't
+        // save or Cancel, with Cancel the default.
+        self.open_guard(Some(id));
+    }
+
+    /// Show the destructive close or quit guard for `tab` (`None` quits the
+    /// window).
+    fn open_guard(&self, tab: Option<u64>) {
+        // The guard outlives the control that asked for it (the card replaces
+        // the tab's own row), so its signals are the app's.
+        let (choice, busy, notice) = self
+            .owner
+            .run(|| (signal(GUARD_CANCEL_CHOICE), signal(false), signal(None)));
+        self.guard.set(Some(GuardRequest {
+            tab,
+            choice,
+            busy,
+            notice,
+        }));
+    }
+
+    /// Read `tab`'s file for the conflict comparison (`ui::notices`),
+    /// replacing any earlier text for it. The read is best-effort: a file
+    /// that cannot be read leaves the comparison empty and the other
+    /// decisions in place.
+    pub fn refresh_conflict_disk(&self, tab: &Tab) {
+        let disk = io::load(&tab.path).ok().map(|loaded| loaded.text);
+        let id = tab.id;
+        self.conflict_disks.update(|disks| {
+            disks.retain(|(entry, _)| *entry != id);
+            if let Some(disk) = disk {
+                disks.push((id, disk));
+            }
+        });
+    }
+
+    /// Note that `tab` differs from its file: its flag goes up and any disk
+    /// text from an earlier conflict is dropped, so the comparison can never
+    /// show — or mark lines against — a read that predates this conflict.
+    /// The text is read when the comparison is asked for
+    /// ([`Self::refresh_conflict_disk`]).
+    fn note_conflict(&self, tab: &Tab) {
+        tab.conflict.set(true);
+        let id = tab.id;
+        self.conflict_disks
+            .update(|disks| disks.retain(|(entry, _)| *entry != id));
+    }
+
+    /// Run `f` under the state's own owner: what it makes (a new tab's
+    /// signals, a new guard's) then belongs to the app, not to the element
+    /// whose handler asked. A handler in a row that the action itself
+    /// removes (a recovered record's Restore) would otherwise take the
+    /// document's signals down with its owner.
+    pub fn owned<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.owner.run(f)
+    }
+
+    /// The guard's selection: `delta` steps of [`GUARD_CHOICES`], wrapping.
+    pub fn guard_move(&self, delta: isize) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        let current = request.choice.get();
+        let next = (current as isize + delta).rem_euclid(GUARD_CHOICES as isize) as usize;
+        request.choice.set(next);
+    }
+
+    /// The guard's Enter: the selected control's decision.
+    pub fn guard_activate(&self) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        match request.choice.get() {
+            GUARD_DISCARD_CHOICE => self.guard_discard(),
+            GUARD_CANCEL_CHOICE => self.guard_cancel(),
+            _ => self.guard_save(),
+        }
+    }
+
+    /// The guard's Save: save every document it covers, then finish the
+    /// close. A save that cannot finish leaves the guard up with its notice.
+    pub fn guard_save(&self) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        if request.busy.get() {
+            return;
+        }
+        match request.tab {
+            Some(id) => {
+                self.set_active(id);
+                let untitled = self
+                    .tabs
+                    .get()
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .is_some_and(|tab| tab.untitled);
+                if untitled {
+                    // The picker is the next decision; nothing is discarded
+                    // when it is cancelled.
+                    self.guard.set(None);
+                    self.save_active();
+                    return;
+                }
+                let saved = self.save_tab(id);
+                if saved {
+                    self.guard.set(None);
+                    self.close_tab_now(id);
+                } else {
+                    request.notice.set(Some(SharedString::from(
+                        "Still open: the document could not be saved.",
+                    )));
+                }
+            }
+            None => {
+                let state = self.clone();
+                request.busy.set(true);
+                request.notice.set(None);
+                self.spawn_task(async move {
+                    // Translation can dirty another tab while a save waits,
+                    // and Cancel takes the guard away mid-flight.
+                    let dirty: Vec<u64> = state
                         .tabs
                         .get()
                         .iter()
-                        .find(|tab| tab.id == id)
-                        .is_some_and(|tab| tab.dirty.get())
-                    {
-                        state.close_tab_now(id);
+                        .filter(|tab| tab.dirty.get())
+                        .map(|tab| tab.id)
+                        .collect();
+                    for id in dirty {
+                        if state.guard.get().is_none() {
+                            return;
+                        }
+                        let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id).cloned()
+                        else {
+                            continue;
+                        };
+                        let saved = if tab.untitled {
+                            state.save_as_tab(tab).await
+                        } else {
+                            state.save_tab(id)
+                        };
+                        if !saved {
+                            if let Some(request) = state.guard.get() {
+                                request.busy.set(false);
+                                request.notice.set(Some(SharedString::from(
+                                    "Still open: a document could not be saved.",
+                                )));
+                            }
+                            state.status.set(SharedString::from(
+                                "Quit cancelled: a document could not be saved.",
+                            ));
+                            return;
+                        }
+                    }
+                    if state.guard.get().is_some() {
+                        state.guard.set(None);
+                        nsh_core::element::desktop::current_window().close();
+                    }
+                });
+            }
+        }
+    }
+
+    /// The guard's Don't save: close the covered documents, retiring their
+    /// recovery records.
+    pub fn guard_discard(&self) {
+        let Some(request) = self.guard.get() else {
+            return;
+        };
+        self.guard.set(None);
+        match request.tab {
+            Some(id) => self.close_tab_now(id),
+            None => {
+                self.quit_discarded.set(true);
+                // The same rule as Save, and the card lists the same
+                // documents: whatever is dirty when the decision is made.
+                let dirty: Vec<u64> = self
+                    .tabs
+                    .get()
+                    .iter()
+                    .filter(|tab| tab.dirty.get())
+                    .map(|tab| tab.id)
+                    .collect();
+                for id in dirty {
+                    if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
+                        self.retire_tab_recovery(tab);
                     }
                 }
-                Ok(answer) if answer.action.as_deref() == Some("discard") => {
-                    state.close_tab_now(id);
-                }
-                Ok(_) => {}
-                Err(error) => state
-                    .status
-                    .set(SharedString::from(format!("Close dialog failed: {error}"))),
+                nsh_core::element::desktop::current_window().close();
             }
-        });
+        }
+    }
+
+    /// The guard's Cancel: nothing changes and the guard goes.
+    pub fn guard_cancel(&self) {
+        if let Some(request) = self.guard.get() {
+            request.busy.set(false);
+            request.notice.set(None);
+            self.guard.set(None);
+        }
     }
 
     fn close_tab_now(&self, id: u64) {
@@ -1156,14 +1800,7 @@ impl AppState {
                     return;
                 }
             };
-            let text = loaded.text.clone();
-            *tab.loaded.borrow_mut() = loaded;
-            tab.text.set(SharedString::from(text));
-            tab.dirty.set(false);
-            tab.conflict.set(false);
-            tab.revision.update(|revision| *revision += 1);
-            state.retire_tab_recovery(&tab);
-            state.recovery_tracks.borrow_mut().remove(&tab.id);
+            state.adopt_disk_version(&tab, loaded);
             state.status.set(SharedString::from(format!(
                 "Reloaded {}",
                 tab.path.display()
@@ -1171,11 +1808,42 @@ impl AppState {
         });
     }
 
+    /// Replace the tab's buffer with the file as it is on disk, which the
+    /// tab now tracks. Trust was granted to the buffer it replaces: it is
+    /// revoked first, so the disk's text never runs scripts under it.
+    fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
+        let text = loaded.text.clone();
+        *tab.loaded.borrow_mut() = loaded;
+        tab.web_trusted.set(false);
+        tab.text.set(SharedString::from(text));
+        tab.dirty.set(false);
+        tab.conflict.set(false);
+        tab.revision.update(|revision| *revision += 1);
+        self.retire_tab_recovery(tab);
+        self.recovery_tracks.borrow_mut().remove(&tab.id);
+    }
+
+    /// Write model-produced text (a translation, a Revision decision) into
+    /// the tab as one unsaved edit. Trust was granted to the text before this
+    /// write: it is revoked first, so the new text never runs scripts under
+    /// it.
+    fn write_model_text(&self, tab: &Tab, text: String) {
+        tab.web_trusted.set(false);
+        tab.text.set(SharedString::from(text));
+        tab.dirty.set(true);
+        tab.revision.update(|revision| *revision += 1);
+        self.note_edit(tab.id);
+    }
+
     /// Overwrite a changed file only after an explicit destructive decision.
     pub fn overwrite_active(&self) {
         let Some(tab) = self.active_tab() else {
             return;
         };
+        // The confirmation is modal and owns Enter once it shows; it opens
+        // from a task, and until then an Enter must not reach the focused
+        // editor and change the text the decision is about.
+        self.blur_source_editor();
         let state = self.clone();
         self.spawn_task(async move {
             let answer = alert_dialog()
@@ -1214,8 +1882,10 @@ impl AppState {
         });
     }
 
-    /// Save the active buffer to a new path. An existing destination is never
-    /// replaced here; the user must choose a path that does not exist yet.
+    /// Save the active buffer to a new path. The native save dialog asks
+    /// before an existing file is chosen, so a picked existing destination is
+    /// replaced (atomically, as Save does) — unless another tab has it open,
+    /// which is refused so two tabs never edit one file.
     pub fn save_as_active(&self) {
         let Some(tab) = self.active_tab() else {
             return;
@@ -1238,23 +1908,43 @@ impl AppState {
         );
         match picked.await {
             Ok(Some(path)) => {
+                if !tab.untitled && path == tab.path {
+                    // Its own file: a plain Save, with its conflict check.
+                    return self.save_tab(tab.id);
+                }
+                if self
+                    .tabs
+                    .get()
+                    .iter()
+                    .any(|other| other.id != tab.id && other.path == path)
+                {
+                    self.status.set(SharedString::from(
+                        crate::i18n::save_as_path_already_open_message(
+                            self.settings.get().language,
+                            &path,
+                        ),
+                    ));
+                    return false;
+                }
                 let text = tab.text.get().to_string();
                 let (newline, had_bom) = {
                     let loaded = tab.loaded.borrow();
                     (loaded.newline, loaded.had_bom)
                 };
-                match io::save_as(&path, &text, newline, had_bom) {
+                let saved = match io::save_as(&path, &text, newline, had_bom) {
+                    // The native dialog already asked before this existing
+                    // file was chosen: replace the entry it showed.
+                    Err(SaveError::DestinationExists) => {
+                        io::overwrite_as(&path, &text, newline, had_bom)
+                    }
+                    saved => saved,
+                };
+                match saved {
                     Ok(loaded) => {
                         self.close_tab_now(tab.id);
                         self.add_tab(loaded);
                         self.record_usage(UsageEvent::ArtifactSaved);
                         true
-                    }
-                    Err(SaveError::DestinationExists) => {
-                        self.status.set(SharedString::from(
-                            "Save As refused: that file exists. Choose a new name.",
-                        ));
-                        false
                     }
                     Err(error) => {
                         self.status
@@ -1341,7 +2031,7 @@ impl AppState {
                 true
             }
             Err(SaveError::Conflict) => {
-                tab.conflict.set(true);
+                self.note_conflict(&tab);
                 self.status.set(SharedString::from(crate::i18n::t(
                     self.settings.get().language,
                     crate::i18n::Key::SaveConflictDetail,
@@ -1356,12 +2046,12 @@ impl AppState {
         }
     }
 
-    /// Ask before discarding every dirty buffer, then close the window. This
-    /// is the guarded close path available inside the app; the platform title
-    /// bar and Alt+F4 still have no cancellable close event in nsh 0.4, so the
-    /// periodic checkpoint remains the only recovery protection on that path.
-    /// A dirty buffer is checkpointed before the dialog as a best-effort extra
-    /// guard against a failed save or dialog.
+    /// Ask before discarding every dirty buffer, then close the window. Quit
+    /// and every user close of the window (its close button, Alt+F4: `app.rs`
+    /// turns `close_on_press` off and routes `on_close_press` here) take this
+    /// path; the in-app guard (`ui::notices`) takes the decision. A dirty
+    /// buffer is checkpointed before the guard as a best-effort extra guard
+    /// against a failed save.
     pub fn request_quit(&self) {
         let dirty: Vec<u64> = self
             .tabs
@@ -1371,65 +2061,12 @@ impl AppState {
             .map(|tab| tab.id)
             .collect();
         if dirty.is_empty() {
-            nsh_core::element::desktop::close_window();
+            nsh_core::element::desktop::current_window().close();
             return;
         }
         self.checkpoint_dirty_now();
-
-        let state = self.clone();
-        self.spawn_task(async move {
-            let answer = alert_dialog()
-                .title("Quit MarkTurbo?")
-                .description("Some documents have unsaved changes.")
-                .action("save", "Save all")
-                .destructive("discard", "Discard all")
-                .cancel("cancel", "Cancel")
-                .show()
-                .await;
-            // Translation can dirty another tab while the dialog is open.
-            let dirty: Vec<u64> = state
-                .tabs
-                .get()
-                .iter()
-                .filter(|tab| tab.dirty.get())
-                .map(|tab| tab.id)
-                .collect();
-            match answer {
-                Ok(answer) if answer.action.as_deref() == Some("save") => {
-                    for &id in &dirty {
-                        let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id).cloned()
-                        else {
-                            continue;
-                        };
-                        let saved = if tab.untitled {
-                            state.save_as_tab(tab).await
-                        } else {
-                            state.save_tab(id)
-                        };
-                        if !saved {
-                            state.status.set(SharedString::from(
-                                "Quit cancelled: a document could not be saved.",
-                            ));
-                            return;
-                        }
-                    }
-                    nsh_core::element::desktop::close_window();
-                }
-                Ok(answer) if answer.action.as_deref() == Some("discard") => {
-                    state.quit_discarded.set(true);
-                    for &id in &dirty {
-                        if let Some(tab) = state.tabs.get().iter().find(|tab| tab.id == id) {
-                            state.retire_tab_recovery(tab);
-                        }
-                    }
-                    nsh_core::element::desktop::close_window();
-                }
-                Ok(_) => {}
-                Err(error) => state
-                    .status
-                    .set(SharedString::from(format!("Quit dialog failed: {error}"))),
-            }
-        });
+        // The in-app guard takes the decision (`ui::notices`).
+        self.open_guard(None);
     }
 
     /// Translate the active document through the consent-bound provider path.
@@ -1542,10 +2179,7 @@ impl AppState {
                         ));
                         return;
                     }
-                    tab.text.set(SharedString::from(translated));
-                    tab.dirty.set(true);
-                    tab.revision.update(|revision| *revision += 1);
-                    state.note_edit(tab.id);
+                    state.write_model_text(&tab, translated);
                     state.status.set(SharedString::from(format!(
                         "Translated {segments} segment(s) into {target}."
                     )));
@@ -1571,6 +2205,65 @@ impl AppState {
     /// configured endpoint and credential, and show the exact disclosure.
     /// Nothing leaves the machine until [`send_review`](Self::send_review).
     pub fn start_review(&self) {
+        self.prepare_review(false);
+    }
+
+    /// Prepare one Review of exactly the active source editor's selection:
+    /// the request, the disclosure and the bytes are the selected text's
+    /// alone. Without a non-empty selection nothing is prepared.
+    pub fn start_review_selection(&self) {
+        self.prepare_review(true);
+    }
+
+    /// Record the source editor `ui::document` mounted for `tab`: the one
+    /// whose live selection `Review selection` reviews.
+    pub fn attach_source_editor(&self, tab: u64, editor: ComponentRef<Editor>) {
+        self.source_editor.set(Some((tab, editor)));
+    }
+
+    /// Take the keyboard focus from the mounted source editor, if it has it:
+    /// a card that floats over the room (consent, the close guard) owns
+    /// Enter, Escape and Tab, which the focused editor would otherwise take
+    /// first (its keys are the newest bindings while it is focused).
+    pub fn blur_source_editor(&self) {
+        if let Some(api) = self
+            .source_editor
+            .get()
+            .and_then(|(_, editor)| editor.api::<EditorApi>())
+        {
+            api.blur();
+        }
+    }
+
+    /// The non-empty primary selection the mounted source editor of `tab`
+    /// shows now, as byte offsets into `text`. No editor on screen for the
+    /// tab (another pane, another tab), or an editor that does not hold
+    /// `text`, selects nothing.
+    fn selection_in(&self, tab: &Tab, text: &str) -> Option<(usize, usize)> {
+        let (owner, editor) = self.source_editor.get()?;
+        let api = editor.api::<EditorApi>().filter(|_| owner == tab.id)?;
+        // The editor holds the text with its line breaks as `\n`.
+        if api.value() != text.replace("\r\n", "\n").replace('\r', "\n") {
+            return None;
+        }
+        let primary = api.selections().pop()?;
+        SourceSelection {
+            anchor: (primary.anchor.line, primary.anchor.column),
+            head: (primary.head.line, primary.head.column),
+        }
+        .byte_range(text)
+    }
+
+    /// [`start_review`](Self::start_review) for the whole document, or for
+    /// the selection with `selection`.
+    fn prepare_review(&self, selection: bool) {
+        // A review that is prepared replaces any review still in flight: its
+        // task writes nothing when it comes back, and the loading state it
+        // left is not this run's to show — the early returns below must not
+        // leave the field saying `Reviewing…`.
+        self.review_generation.update(|generation| *generation += 1);
+        self.review_busy.set(false);
+        self.review_in_flight.borrow_mut().take();
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -1580,9 +2273,12 @@ impl AppState {
         };
         self.context_open.set(false);
         self.review_view.set(None);
+        self.review_unavailable.set(None);
         self.review_consent.set(None);
+        self.review_manifest.set(None);
         *self.review_origin.borrow_mut() = None;
         *self.review_binding.borrow_mut() = None;
+        self.review_selection.set(None);
         self.reset_revision();
 
         let settings = self.settings.get();
@@ -1594,19 +2290,46 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
+                self.review_unavailable.set(Some(match error {
+                    ReviewError::UnsupportedConfiguredProvider
+                    | ReviewError::InvalidEndpoint { .. }
+                    | ReviewError::CredentialAccess { .. }
+                    | ReviewError::MissingCredential { .. }
+                    | ReviewError::NoAvailableCredential => ReviewUnavailable::NotSetUp,
+                    _ => ReviewUnavailable::Unpreparable,
+                }));
                 self.status
                     .set(SharedString::from(format!("Review unavailable: {error}")));
                 return;
             }
         };
+        let lens = ArtifactLens::infer_from_path(&tab.path);
+        if selection && lens == ArtifactLens::AgentSkill {
+            self.status.set(SharedString::from(
+                "An Agent Skill is reviewed as one package: use Review.",
+            ));
+            return;
+        }
         let text = tab.text.get().to_string();
+        let captured = self.selection_in(&tab, &text);
+        if selection && captured.is_none() {
+            self.status.set(SharedString::from(
+                "Select text in the source to review a selection.",
+            ));
+            return;
+        }
+        let range = captured.map(|(start, end)| start..end);
         let built = build_review_request(
             ReviewRequestBuildRequest::new(
-                ReviewTarget::Document,
-                ArtifactLens::infer_from_path(&tab.path),
+                if selection {
+                    ReviewTarget::Selection
+                } else {
+                    ReviewTarget::Document
+                },
+                lens,
                 Some(&tab.path),
                 &text,
-                None,
+                range.as_ref(),
                 SourceSnapshot::new(tab.revision.get(), 0),
                 tab.dirty.get(),
             )
@@ -1615,13 +2338,17 @@ impl AppState {
         let mut request = match built {
             Ok(built) => built.into_parts().0,
             Err(error) => {
+                self.review_unavailable
+                    .set(Some(ReviewUnavailable::Unpreparable));
                 self.status.set(SharedString::from(format!(
                     "Review request rejected: {error}"
                 )));
                 return;
             }
         };
-        if let Some(context) = self.context_resolved.get() {
+        // A selection leaves alone: Effective Agent Context belongs to the
+        // whole artifact.
+        if let Some(context) = self.context_resolved.get().filter(|_| !selection) {
             let selected = self.context_selected.get();
             if !selected.is_empty() && context.input.target == tab.path {
                 let selected = match context.select_sources(&selected) {
@@ -1644,6 +2371,7 @@ impl AppState {
                 };
             }
         }
+        let context_included = request.effective_agent_context.is_some();
         let bound = match prepared.bind_document_request(request, language) {
             Ok(bound) => bound,
             Err(error) => {
@@ -1655,11 +2383,400 @@ impl AppState {
         };
         let disclosure =
             crate::i18n::model_request_disclosure(settings.language, bound.disclosure());
+        let manifest = self.review_manifest_of(
+            &bound,
+            &tab.path,
+            self.excluded_sources(&tab.path, context_included),
+        );
+        // The selection is offered only where a selection can be bound: an
+        // Agent Skill package is reviewed whole.
+        let selectable = matches!(bound.request().source, ReviewSource::Document { .. });
         *self.pending_review.borrow_mut() = Some(bound);
         *self.review_origin.borrow_mut() = Some(origin);
+        self.review_selection.set(captured.filter(|_| selectable));
         self.review_consent
             .set(Some(SharedString::from(disclosure)));
+        self.review_manifest.set(Some(manifest));
         self.review_open.set(true);
+    }
+
+    /// Whether the waiting Review consent may be bound to the source
+    /// selection captured when it was prepared (the `Selection` scope).
+    pub fn review_consent_offers_selection(&self) -> bool {
+        self.review_selection.get().is_some() && self.review_consent_target().is_some()
+    }
+
+    /// Whether the waiting Review consent may also be bound with its selected
+    /// Effective Agent Context (the `Document + context` scope).
+    pub fn review_consent_offers_context(&self) -> bool {
+        self.review_consent_target()
+            .is_some_and(|target| self.context_candidate(&target).is_some())
+    }
+
+    /// The file the waiting Review consent was bound for, while its tab is
+    /// still open.
+    fn review_consent_target(&self) -> Option<PathBuf> {
+        let origin = self.review_origin.borrow().as_ref().copied()?;
+        self.tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == origin.tab_id)
+            .map(|tab| tab.path.clone())
+    }
+
+    /// The selected Effective Agent Context a binding for `target` may carry,
+    /// when one is resolved and selected for that exact file. `Err` is the
+    /// selection the request boundary rejects: the caller says so.
+    fn context_selection(&self, target: &Path) -> Result<Option<SelectedContext>, String> {
+        let Some(context) = self.context_resolved.get() else {
+            return Ok(None);
+        };
+        if context.input.target != target {
+            return Ok(None);
+        }
+        let selected = self.context_selected.get();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        context
+            .select_sources(&selected)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    /// [`Self::context_selection`] without the error: what the UI polls to
+    /// know whether the other scope is bindable at all.
+    fn context_candidate(&self, target: &Path) -> Option<SelectedContext> {
+        self.context_selection(target).ok().flatten()
+    }
+
+    /// The frozen Review behind the waiting consent, stripped back to its
+    /// pre-context form, with the file it was bound for and its language.
+    fn review_base(&self) -> Option<(PathBuf, ReviewRequest, ReviewLanguage)> {
+        let target = self.review_consent_target()?;
+        let (mut request, language) = {
+            let bound = self.pending_review.borrow();
+            let bound = bound.as_ref()?;
+            (bound.request().clone(), bound.language())
+        };
+        request.effective_agent_context = None;
+        Some((target, request, language))
+    }
+
+    /// Re-arm the waiting Review consent for another outbound scope: rebuild
+    /// the same frozen request over the captured selection, the whole
+    /// document, or the document with the selected Effective Agent Context,
+    /// and disclose the new scope. Nothing is authorized; the next send needs
+    /// a fresh hold.
+    pub fn set_review_consent_scope(&self, choice: ReviewScopeChoice) {
+        let Some((target, base, language)) = self.review_base() else {
+            return;
+        };
+        let scope = match choice {
+            ReviewScopeChoice::Selection => {
+                let Some((start, end)) = self.review_selection.get() else {
+                    return;
+                };
+                match ByteRange::new(start as u64, end as u64) {
+                    Ok(range) => ReviewScope::selection(range),
+                    Err(error) => {
+                        self.status.set(SharedString::from(format!(
+                            "Review request rejected: {error}"
+                        )));
+                        return;
+                    }
+                }
+            }
+            ReviewScopeChoice::Document | ReviewScopeChoice::DocumentWithContext => {
+                match base.scope {
+                    ReviewScope::Selection { .. } => ReviewScope::Document,
+                    whole => whole,
+                }
+            }
+        };
+        let mut request = match ReviewRequest::new(base.lens, scope, base.source, base.snapshot) {
+            Ok(request) => request,
+            Err(error) => {
+                self.status.set(SharedString::from(format!(
+                    "Review request rejected: {error}"
+                )));
+                return;
+            }
+        };
+        if choice == ReviewScopeChoice::DocumentWithContext {
+            let context = match self.context_selection(&target) {
+                Ok(Some(context)) => context,
+                Ok(None) => return,
+                Err(error) => {
+                    self.status.set(SharedString::from(format!(
+                        "Context selection rejected: {error}"
+                    )));
+                    return;
+                }
+            };
+            request = match request.with_effective_agent_context(context) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.status.set(SharedString::from(format!(
+                        "Context request rejected: {error}"
+                    )));
+                    return;
+                }
+            };
+        }
+        let settings = self.settings.get();
+        let prepared = match PreparedReview::from_settings(&settings, &self.vault) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.record_review_failure(&error);
+                self.status
+                    .set(SharedString::from(format!("Review unavailable: {error}")));
+                self.cancel_review();
+                return;
+            }
+        };
+        let context_included = request.effective_agent_context.is_some();
+        let bound = match prepared.bind_document_request(request, language) {
+            Ok(bound) => bound,
+            Err(error) => {
+                self.status.set(SharedString::from(format!(
+                    "Review request rejected: {error}"
+                )));
+                self.cancel_review();
+                return;
+            }
+        };
+        let disclosure =
+            crate::i18n::model_request_disclosure(settings.language, bound.disclosure());
+        let manifest = self.review_manifest_of(
+            &bound,
+            &target,
+            self.excluded_sources(&target, context_included),
+        );
+        *self.pending_review.borrow_mut() = Some(bound);
+        self.review_consent
+            .set(Some(SharedString::from(disclosure)));
+        self.review_manifest.set(Some(manifest));
+    }
+
+    /// The resolved Effective Agent Context sources that are not in the
+    /// scope: what stays behind, for the consent card's `Stays here`. With the
+    /// context left out of the binding, every resolved source stays, the
+    /// selected ones included.
+    fn excluded_sources(&self, target: &Path, context_included: bool) -> Vec<OutboundItem> {
+        let Some(context) = self.context_resolved.get() else {
+            return Vec::new();
+        };
+        if context.input.target != target {
+            return Vec::new();
+        }
+        let selected = self.context_selected.get();
+        context
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !context_included || !selected.contains(index))
+            .map(|(_, source)| OutboundItem {
+                origin: OutboundOrigin::ExcludedSource,
+                path: Some(self.display_path(&source.path)),
+                reason: None,
+                bytes: u64::try_from(source.included_bytes).unwrap_or(u64::MAX),
+                content_leaves: false,
+            })
+            .collect()
+    }
+
+    /// The manifest one bound Review discloses: the document and its named
+    /// sources, or every file of the Agent Skill package.
+    fn review_manifest_of(
+        &self,
+        bound: &PreparedDocumentReviewRequest,
+        path: &Path,
+        excluded: Vec<OutboundItem>,
+    ) -> OutboundConsent {
+        let disclosure = bound.disclosure().clone();
+        let (items, mut stays) = self.scope_items(bound.request(), disclosure.scope(), Some(path));
+        stays.extend(excluded);
+        OutboundConsent {
+            disclosure,
+            items,
+            stays,
+        }
+    }
+
+    /// What one bound scope discloses: the document and its named sources, or
+    /// every file of an Agent Skill package — plus the items that stay.
+    fn scope_items(
+        &self,
+        request: &ReviewRequest,
+        scope: &OutboundScope,
+        path: Option<&Path>,
+    ) -> (Vec<OutboundItem>, Vec<OutboundItem>) {
+        let mut items = Vec::new();
+        let mut stays = Vec::new();
+        if scope.kind() == OutboundScopeKind::AgentSkillPackage {
+            let inventory = scope
+                .agent_skill_inventory()
+                .expect("an Agent Skill scope owns an inventory");
+            let package = request.source.package();
+            for file in inventory.files() {
+                // A binary entry whose raw bytes were not explicitly selected
+                // leaves as path, size and hash only.
+                let content_leaves = package
+                    .and_then(|package| {
+                        package
+                            .files()
+                            .iter()
+                            .find(|entry| entry.path == file.normalized_relative_path())
+                    })
+                    .is_none_or(|entry| {
+                        matches!(
+                            entry.payload,
+                            SkillFilePayload::Utf8 { .. } | SkillFilePayload::RawBinary { .. }
+                        )
+                    });
+                items.push(OutboundItem {
+                    origin: OutboundOrigin::PackageFile,
+                    path: Some(file.normalized_relative_path().to_owned()),
+                    reason: Some(file.inclusion_reason().to_owned()),
+                    bytes: file.byte_size(),
+                    content_leaves,
+                });
+            }
+            if let Some(package) = package {
+                stays.extend(package.omissions().iter().map(|omission| OutboundItem {
+                    origin: OutboundOrigin::Omission,
+                    path: Some(omission.path.clone()),
+                    reason: Some(omission.reason.clone()),
+                    bytes: 0,
+                    content_leaves: false,
+                }));
+            }
+            // A package reviewed with Effective Agent Context leaves those
+            // sources too: they are named beside its files.
+            items.extend(self.context_items(request.effective_agent_context.as_ref()));
+        } else {
+            if let Some(path) = path {
+                items.push(OutboundItem {
+                    origin: if scope.kind() == OutboundScopeKind::Selection {
+                        OutboundOrigin::Selection
+                    } else {
+                        OutboundOrigin::Document
+                    },
+                    path: Some(self.display_path(path)),
+                    reason: None,
+                    bytes: scope.primary_content_byte_size(),
+                    content_leaves: true,
+                });
+            }
+            items.extend(self.context_items(request.effective_agent_context.as_ref()));
+        }
+        (items, stays)
+    }
+
+    /// The named Effective Agent Context sources of a binding, in order.
+    /// Aliases of one content are counted once, on the first occurrence that
+    /// carries it.
+    fn context_items(&self, context: Option<&SelectedContext>) -> Vec<OutboundItem> {
+        let Some(context) = context else {
+            return Vec::new();
+        };
+        let mut counted: Vec<usize> = Vec::new();
+        context
+            .sources()
+            .iter()
+            .map(|source| {
+                let occurrence = source.occurrence();
+                let first = occurrence.content_index.is_some_and(|index| {
+                    if counted.contains(&index) {
+                        false
+                    } else {
+                        counted.push(index);
+                        true
+                    }
+                });
+                OutboundItem {
+                    origin: OutboundOrigin::NamedSource,
+                    path: Some(self.display_path(&occurrence.path)),
+                    reason: None,
+                    bytes: if first {
+                        u64::try_from(occurrence.included_bytes).unwrap_or(u64::MAX)
+                    } else {
+                        0
+                    },
+                    content_leaves: true,
+                }
+            })
+            .collect()
+    }
+
+    /// The manifest one bound Revision discloses: the reviewed document, the
+    /// Review it builds on and the answers it carries.
+    fn revision_manifest_of(
+        &self,
+        bound: &PreparedRevisionRequest,
+        tab_id: u64,
+    ) -> OutboundConsent {
+        let disclosure = bound.disclosure().clone();
+        let path = self
+            .tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.path.clone());
+        // A Revision of an Agent Skill package resends the whole package; an
+        // ordinary one resends the document the Review covered.
+        let mut items = match disclosure.scope().kind() {
+            OutboundScopeKind::AgentSkillPackage => {
+                self.scope_items(bound.request(), disclosure.scope(), path.as_deref())
+                    .0
+            }
+            _ => vec![OutboundItem {
+                origin: OutboundOrigin::Document,
+                path: path.as_deref().map(|path| self.display_path(path)),
+                reason: None,
+                bytes: disclosure.scope().primary_content_byte_size(),
+                content_leaves: true,
+            }],
+        };
+        if let Some(details) = disclosure.revision_details() {
+            items.push(OutboundItem {
+                origin: OutboundOrigin::ReviewContext,
+                path: None,
+                reason: None,
+                bytes: details.review_context_bytes(),
+                content_leaves: true,
+            });
+            items.push(OutboundItem {
+                origin: OutboundOrigin::Answers,
+                path: None,
+                reason: None,
+                bytes: details.answers_bytes(),
+                content_leaves: true,
+            });
+        }
+        OutboundConsent {
+            disclosure,
+            items,
+            stays: Vec::new(),
+        }
+    }
+
+    /// A path as a manifest row shows it: relative to the workspace root when
+    /// it is inside it, shortened under the home directory, else itself.
+    fn display_path(&self, path: &Path) -> String {
+        let slash = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        if let Some(root) = self.root.get()
+            && let Ok(relative) = path.strip_prefix(&root)
+        {
+            return slash(relative);
+        }
+        if let Some(home) = dirs::home_dir()
+            && let Ok(relative) = path.strip_prefix(&home)
+        {
+            return format!("~/{}", slash(relative));
+        }
+        slash(path)
     }
 
     /// Send the prepared request. Consent is one-shot and bound to the
@@ -1673,6 +2790,10 @@ impl AppState {
         };
         let binding = origin;
         let revision_request = bound.request().clone();
+        let partial = revision_request
+            .source
+            .package()
+            .is_some_and(|package| package.is_partial());
         let revision_language = bound.language();
         let disclosure = bound.disclosure().clone();
         let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
@@ -1687,10 +2808,13 @@ impl AppState {
         };
 
         self.review_consent.set(None);
+        self.review_manifest.set(None);
         self.review_busy.set(true);
+        *self.review_in_flight.borrow_mut() = Some(origin);
         self.record_usage(UsageEvent::review_started(&revision_request));
         let started = Instant::now();
         let state = self.clone();
+        let generation = self.review_generation.get_untracked();
         let revision = self
             .tabs
             .get()
@@ -1700,7 +2824,14 @@ impl AppState {
             .unwrap_or_else(|| signal(0));
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
+            if state.review_generation.get_untracked() != generation {
+                // Withdrawn (or replaced) while the request was out: its
+                // answer is not this surface's to show, and it must not touch
+                // the view, the revision context or the busy flag.
+                return;
+            }
             state.review_busy.set(false);
+            *state.review_in_flight.borrow_mut() = None;
             let view = match result {
                 Ok(Ok(transport)) => {
                     state.record_usage(UsageEvent::ReviewCompleted(
@@ -1716,7 +2847,14 @@ impl AppState {
                         );
                     }
                     *state.review_binding.borrow_mut() = Some(binding);
-                    ReviewView::from_result(&transport.result, stale, state.settings.get().language)
+                    let mut view = ReviewView::from_result(
+                        &transport.result,
+                        stale,
+                        state.settings.get().language,
+                    );
+                    view.tab_id = Some(origin.tab_id);
+                    view.partial = partial;
+                    view
                 }
                 Ok(Err(error)) => {
                     state.record_review_failure(&error);
@@ -1756,24 +2894,33 @@ impl AppState {
             .collect();
         *self.revision_context.borrow_mut() = Some(RevisionContext {
             tab_id: origin.tab_id,
-            snapshot: origin.snapshot,
             request,
             output,
             language,
         });
-        *self.revision_proposal.borrow_mut() = None;
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
+        *self.pending_revision.borrow_mut() = None;
+        *self.revision_ledger.borrow_mut() = None;
+        self.revision_busy.set(false);
+        self.revision_not_applied.set(0);
         self.revision_questions.set(questions);
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_hunks.set(Vec::new());
         self.revision_status.set(None);
     }
 
     fn reset_revision(&self) {
         *self.revision_context.borrow_mut() = None;
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
         *self.pending_revision.borrow_mut() = None;
-        *self.revision_proposal.borrow_mut() = None;
+        *self.revision_ledger.borrow_mut() = None;
+        self.revision_not_applied.set(0);
         self.revision_questions.set(Vec::new());
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_hunks.set(Vec::new());
         self.revision_status.set(None);
         self.revision_busy.set(false);
@@ -1784,17 +2931,18 @@ impl AppState {
     pub fn start_revision(&self) {
         let context = self.revision_context.borrow().as_ref().map(|context| {
             (
+                context.tab_id,
                 context.request.clone(),
                 context.output.clone(),
                 context.language,
             )
         });
-        let Some((request, output, language)) = context else {
-            self.revision_status.set(Some(SharedString::from(
-                "Run Review first to prepare a Revision.",
-            )));
+        let Some((tab_id, request, output, language)) = context else {
+            self.revision_status
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
             return;
         };
+        self.revision_not_applied.set(0);
         let answers: Vec<RevisionAnswer> = self
             .revision_questions
             .get()
@@ -1841,12 +2989,15 @@ impl AppState {
         self.revision_consent.set(Some(SharedString::from(
             crate::i18n::model_request_disclosure(settings.language, bound.disclosure()),
         )));
+        let manifest = self.revision_manifest_of(&bound, tab_id);
+        self.revision_manifest.set(Some(manifest));
         *self.pending_revision.borrow_mut() = Some(bound);
     }
 
     pub fn cancel_revision(&self) {
         *self.pending_revision.borrow_mut() = None;
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_busy.set(false);
     }
 
@@ -1856,6 +3007,19 @@ impl AppState {
         let Some(bound) = self.pending_revision.borrow_mut().take() else {
             return;
         };
+        // The answer belongs to the document this Review read, and only for
+        // as long as this context lives.
+        let Some(tab_id) = self
+            .revision_context
+            .borrow()
+            .as_ref()
+            .map(|context| context.tab_id)
+        else {
+            self.revision_status
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            return;
+        };
+        let generation = self.revision_generation.get();
         let disclosure = bound.disclosure().clone();
         let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
         let authorization = match bound.authorize(&mut consent) {
@@ -1868,6 +3032,7 @@ impl AppState {
             }
         };
         self.revision_consent.set(None);
+        self.revision_manifest.set(None);
         self.revision_busy.set(true);
         for answer in bound.answers().as_slice() {
             if matches!(answer, RevisionAnswer::Answered(_)) {
@@ -1877,32 +3042,15 @@ impl AppState {
         let state = self.clone();
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
+            if state.revision_generation.get() != generation {
+                // Its Review was reset or replaced while the request was out
+                // (another tab's Review, Close): the answer is no live
+                // proposal's, and must not touch the field or the busy flag.
+                return;
+            }
             state.revision_busy.set(false);
             match result {
-                Ok(Ok(transport)) => {
-                    let proposal = transport.into_proposal();
-                    let mut accepted = HashMap::new();
-                    let hunks = proposal
-                        .hunks()
-                        .iter()
-                        .enumerate()
-                        .map(|(ordinal, hunk)| RevisionHunkView {
-                            ordinal,
-                            change_id: hunk.change_id().0,
-                            rationale: hunk.rationale().to_owned(),
-                            before: hunk.expected_source().to_owned(),
-                            after: hunk.replacement().to_owned(),
-                            accepted: *accepted
-                                .entry(hunk.change_id().0)
-                                .or_insert_with(|| signal(false)),
-                        })
-                        .collect();
-                    state.revision_hunks.set(hunks);
-                    *state.revision_proposal.borrow_mut() = Some(proposal);
-                    state.revision_status.set(Some(SharedString::from(
-                        "Revision ready. Approve individual changes, then apply.",
-                    )));
-                }
+                Ok(Ok(transport)) => state.present_revision_for(tab_id, transport.into_proposal()),
                 Ok(Err(error)) => {
                     if matches!(
                         error,
@@ -1926,83 +3074,212 @@ impl AppState {
         });
     }
 
-    pub fn toggle_revision_hunk(&self, index: usize) {
-        if let Some(hunk) = self.revision_hunks.get().get(index) {
-            hunk.accepted.update(|accepted| *accepted = !*accepted);
+    /// Present `proposal` over the tab on screen, as if a Review of it had
+    /// prepared the proposal: the unit tests' way in, with no provider.
+    #[cfg(test)]
+    pub(crate) fn present_revision(&self, proposal: RevisionProposal) {
+        if let Some(tab_id) = self.active.get() {
+            self.present_revision_for(tab_id, proposal);
         }
     }
 
-    /// Compose only explicitly approved changes and apply them to the buffer.
-    pub fn apply_revision(&self) {
-        let Some(proposal) = self.revision_proposal.borrow().clone() else {
-            self.revision_status.set(Some(SharedString::from(
-                "Run Review first to prepare a Revision.",
-            )));
-            return;
+    /// Show a validated proposal for per-change decisions: its hunks in the
+    /// field, and a ledger placing them in the text of `tab_id`, the tab the
+    /// Review read. Nothing is written until the user accepts a change.
+    fn present_revision_for(&self, tab_id: u64, proposal: RevisionProposal) {
+        let mut accepted = HashMap::new();
+        let hunks = proposal
+            .hunks()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, hunk)| RevisionHunkView {
+                ordinal,
+                change_id: hunk.change_id().0,
+                rationale: hunk.rationale().to_owned(),
+                before: hunk.expected_source().to_owned(),
+                after: hunk.replacement().to_owned(),
+                accepted: *accepted
+                    .entry(hunk.change_id().0)
+                    .or_insert_with(|| signal(false)),
+            })
+            .collect();
+        *self.revision_ledger.borrow_mut() = Some(RevisionLedger::new(tab_id, &proposal));
+        self.revision_not_applied.set(0);
+        self.revision_hunks.set(hunks);
+        self.revision_status
+            .set(Some(SharedString::from(REVISION_READY)));
+    }
+
+    /// Write one change into the buffer now, as one edit: `applied` puts its
+    /// replacement in place of the reviewed bytes, otherwise the reviewed
+    /// bytes go back exactly. Returns whether the buffer now reads as asked;
+    /// a refusal says why on the status line and changes nothing. Nothing is
+    /// saved — the tab is only dirty.
+    pub fn set_revision_change_applied(&self, change_id: u32, applied: bool) -> bool {
+        let change = ChangeId(change_id);
+        let mut slot = self.revision_ledger.borrow_mut();
+        let Some(ledger) = slot.as_mut() else {
+            drop(slot);
+            self.revision_status
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            return false;
         };
-        let Some((tab_id, snapshot)) = self
-            .revision_context
-            .borrow()
-            .as_ref()
-            .map(|context| (context.tab_id, context.snapshot))
-        else {
-            self.revision_status.set(Some(SharedString::from(
-                "Run Review first to prepare a Revision.",
-            )));
-            return;
-        };
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        let current_snapshot = SourceSnapshot::new(tab.revision.get(), 0);
-        if tab.id != tab_id || !snapshot.matches(current_snapshot) {
+        if ledger.applied(change) == applied {
+            return true;
+        }
+        let Some(tab) = self.active_tab().filter(|tab| tab.id == ledger.tab_id()) else {
+            drop(slot);
             self.record_usage(UsageEvent::StaleResultBlocked);
             self.revision_status.set(Some(SharedString::from(
-                "This Revision belongs to another document or source state. Run Review again before applying.",
+                "This Revision belongs to another document. Return to it to decide.",
             )));
-            return;
-        }
-        let mut decisions = HashMap::new();
-        for hunk in self.revision_hunks.get() {
-            decisions.insert(ChangeId(hunk.change_id), hunk.accepted.get());
-        }
-        let decisions: Vec<_> = decisions.into_iter().collect();
-        let text = match proposal.compose_against(&tab.text.get(), current_snapshot, &decisions) {
-            Ok(text) => text,
-            Err(error) => {
-                self.revision_status.set(Some(SharedString::from(format!(
-                    "Revision apply rejected: {error}"
-                ))));
-                return;
+            return false;
+        };
+        let written = match tab
+            .text
+            .with(|text| ledger.set_applied(change, applied, text))
+        {
+            Ok(written) => written,
+            Err(refusal) => {
+                drop(slot);
+                let message = match (refusal, applied) {
+                    (LedgerRefusal::UnknownChange, _) => "This change is not part of the Revision.",
+                    (LedgerRefusal::PartChanged, true) => {
+                        self.record_usage(UsageEvent::StaleResultBlocked);
+                        "Can't apply — this part changed."
+                    }
+                    (LedgerRefusal::PartChanged, false) => {
+                        "Can't undo — this part was edited after it was accepted."
+                    }
+                };
+                self.revision_status.set(Some(SharedString::from(message)));
+                return false;
             }
         };
-        let hunks = self.revision_hunks.get();
-        if text == tab.text.get().as_str() {
-            self.record_usage(UsageEvent::RevisionDecision {
-                accepted_hunks: 0,
-                rejected_hunks: hunks.len() as u64,
-            });
-            *self.revision_proposal.borrow_mut() = None;
-            self.revision_hunks.set(Vec::new());
+        // The ledger already follows the new text: `note_edit` below finds
+        // nothing left to observe.
+        drop(slot);
+        if let Some(hunk) = self
+            .revision_hunks
+            .get()
+            .iter()
+            .find(|hunk| hunk.change_id == change_id)
+        {
+            // Every hunk of one change shares this signal.
+            hunk.accepted.set(applied);
+        }
+        if let Some(text) = written {
+            self.write_model_text(&tab, text);
+        }
+        self.revision_status
+            .set(Some(SharedString::from(REVISION_READY)));
+        true
+    }
+
+    /// Flip the hunk's change between accepted (written) and not.
+    pub fn toggle_revision_hunk(&self, index: usize) {
+        if let Some(hunk) = self.revision_hunks.get().get(index) {
+            self.set_revision_change_applied(hunk.change_id, !hunk.accepted.get());
+        }
+    }
+
+    /// Whether the hunk at `index` no longer finds its own text where it
+    /// left it — an edit touched the part it covers — so it can neither be
+    /// accepted nor, once accepted, taken back. Reads the tab's text, so a
+    /// binding follows every edit.
+    pub fn revision_hunk_part_changed(&self, index: usize) -> bool {
+        let ledger = self.revision_ledger.borrow();
+        let Some(ledger) = ledger.as_ref() else {
+            return true;
+        };
+        let tab = self
+            .tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == ledger.tab_id())
+            .cloned();
+        tab.is_none_or(|tab| tab.text.with(|text| ledger.part_changed(index, text)))
+    }
+
+    /// Where the hunk at `index` sits in the text of tab `tab_id` now: the
+    /// bytes of its current side, as the ledger places them. `None` when no
+    /// proposal is live, when it belongs to another tab, or once an edit
+    /// touched the hunk. Reads the tab's text, so a binding follows every
+    /// edit.
+    pub fn revision_hunk_range(&self, tab_id: u64, index: usize) -> Option<std::ops::Range<usize>> {
+        let ledger = self.revision_ledger.borrow();
+        let ledger = ledger.as_ref().filter(|ledger| ledger.tab_id() == tab_id)?;
+        let tab = self
+            .tabs
+            .get()
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .cloned()?;
+        tab.text.with(|text| ledger.current_range(index, text))
+    }
+
+    /// The approved result of the live proposal: the text of the tab it
+    /// belongs to, as it stands — every accepted change is already in it,
+    /// nothing else of the proposal is. `None` when no proposal is live.
+    pub fn revision_approved_text(&self) -> Option<SharedString> {
+        let tab_id = self.revision_ledger.borrow().as_ref()?.tab_id();
+        self.tabs
+            .get_untracked()
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.text.get_untracked())
+    }
+
+    /// Follow an edit of tab `id` with the live proposal's ledger, so each
+    /// hunk the edit did not touch keeps its place.
+    fn observe_revision_edit(&self, id: u64) {
+        let mut slot = self.revision_ledger.borrow_mut();
+        let Some(ledger) = slot.as_mut().filter(|ledger| ledger.tab_id() == id) else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
+            tab.text.with(|text| ledger.observe(text));
+        }
+    }
+
+    /// `Done`: the decisions stand as written — every accepted change is
+    /// already in the buffer — and the `undecided` hunks are discarded,
+    /// never written; the outcome line counts them. Nothing is saved.
+    pub fn finish_revision(&self, undecided: usize) {
+        if self.revision_ledger.borrow_mut().take().is_none() {
             self.revision_status
-                .set(Some(SharedString::from("No changes approved.")));
+                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
             return;
         }
+        let hunks = self.revision_hunks.get();
         let accepted_hunks = hunks.iter().filter(|hunk| hunk.accepted.get()).count() as u64;
         self.record_usage(UsageEvent::RevisionDecision {
             accepted_hunks,
             rejected_hunks: hunks.len() as u64 - accepted_hunks,
         });
-        tab.text.set(SharedString::from(text));
-        tab.dirty.set(true);
-        tab.revision.update(|revision| *revision += 1);
-        self.note_edit(tab.id);
-        self.record_usage(UsageEvent::RevisionApplied);
-        *self.revision_proposal.borrow_mut() = None;
+        if accepted_hunks > 0 {
+            self.record_usage(UsageEvent::RevisionApplied);
+        }
         self.revision_hunks.set(Vec::new());
-        self.revision_status.set(Some(SharedString::from(
-            "Approved changes applied to the buffer.",
-        )));
+        self.revision_not_applied.set(undecided);
+        self.revision_status
+            .set(Some(SharedString::from(if accepted_hunks > 0 {
+                "Approved changes applied to the buffer."
+            } else {
+                "No changes approved."
+            })));
+    }
+
+    /// Whether the live proposal belongs to a tab other than the one on
+    /// screen: its hunks are placed in that tab's text, so nothing can be
+    /// decided into this one. An edit to the proposal's own tab does not
+    /// make the whole proposal stale — each hunk the edit touched says so on
+    /// its own ([`revision_hunk_part_changed`](Self::revision_hunk_part_changed)).
+    pub fn revision_is_stale(&self) -> bool {
+        let ledger = self.revision_ledger.borrow();
+        ledger
+            .as_ref()
+            .is_some_and(|ledger| self.active.get() != Some(ledger.tab_id()))
     }
 
     /// Withdraw the prepared request before it is sent.
@@ -2010,13 +3287,25 @@ impl AppState {
         self.pending_review.borrow_mut().take();
         self.review_origin.borrow_mut().take();
         self.review_consent.set(None);
+        self.review_manifest.set(None);
         self.review_busy.set(false);
+    }
+
+    /// Withdraw a review whose request is already in flight: the task's
+    /// generation becomes stale, so when the model answers it writes nothing
+    /// — no view, no revision context, no busy flag. What the user cancelled
+    /// stays cancelled.
+    pub fn cancel_review_in_flight(&self) {
+        self.review_generation.update(|generation| *generation += 1);
+        self.review_in_flight.borrow_mut().take();
+        self.cancel_review();
     }
 
     pub fn close_review(&self) {
         self.cancel_review();
         self.reset_revision();
         self.review_view.set(None);
+        self.review_unavailable.set(None);
         self.review_open.set(false);
     }
 
@@ -2082,6 +3371,97 @@ impl AppState {
             })
     }
 
+    /// How the configured endpoint's credential would resolve right now,
+    /// without reading or returning the secret. Mirrors the resolution a model
+    /// operation does: this process's session key first, then the secure store,
+    /// then the provider's environment variable for an endpoint allowed to use
+    /// it.
+    ///
+    /// The vault's only source-aware query is `resolve`, and resolving reads
+    /// the platform's secure store behind a global mutex; callers that draw a
+    /// status line should use [`Self::credential_status_cached`] instead.
+    pub fn credential_status(&self) -> CredentialStatus {
+        let settings = self.settings.get();
+        let Some(provider) = mt_core::model::Provider::from_key(settings.model_provider.trim())
+        else {
+            return CredentialStatus::Unconfigured;
+        };
+        let base = (!settings.model_base_url.trim().is_empty())
+            .then_some(settings.model_base_url.as_str());
+        let Ok(endpoint) = mt_core::model::EndpointIdentity::parse(provider, base) else {
+            return CredentialStatus::Unconfigured;
+        };
+        let target = endpoint.credential_target();
+        let environment_allowed = endpoint.is_vendor_default()
+            || settings.model_environment_key_identity == target.as_str();
+        let environment_value = environment_allowed
+            .then(|| std::env::var(provider.credential_environment_variable()).ok())
+            .flatten();
+        match self
+            .vault
+            .resolve(target.as_str(), environment_value, environment_allowed)
+        {
+            Ok(Some(resolved)) => match resolved.source() {
+                mt_core::credentials::CredentialSource::Session => CredentialStatus::Session,
+                mt_core::credentials::CredentialSource::Persistent => CredentialStatus::Stored,
+                mt_core::credentials::CredentialSource::Environment => {
+                    CredentialStatus::Environment
+                }
+            },
+            Ok(None) => CredentialStatus::Missing,
+            Err(_) => CredentialStatus::Unavailable,
+        }
+    }
+
+    /// [`credential_status`](Self::credential_status), computed again only when
+    /// the endpoint or the credential state changes: a status line must not
+    /// read the secure store once per binding, nor on every keystroke of a
+    /// field the status does not depend on.
+    ///
+    /// A store that could not be read is never remembered (the caller may be
+    /// looking at a moment of contention), and
+    /// [`forget_credential_status`](Self::forget_credential_status) drops the
+    /// memo for a caller that knows the store may have changed under it.
+    pub(crate) fn credential_status_cached(&self) -> CredentialStatus {
+        let settings = self.settings.get();
+        let key = CredentialStatusKey {
+            provider: settings.model_provider.clone(),
+            base_url: settings.model_base_url.clone(),
+            environment_identity: settings.model_environment_key_identity.clone(),
+            revision: self.settings_credential_revision.get(),
+        };
+        if let Some((cached, status)) = self.settings_credential_status.get()
+            && cached == key
+        {
+            return status;
+        }
+        let status = self.credential_status();
+        // A failure is a moment, not a state: retry it on the next read rather
+        // than pin it for the life of the process.
+        if status != CredentialStatus::Unavailable {
+            self.settings_credential_status.set(Some((key, status)));
+        }
+        status
+    }
+
+    /// Drop the memoised credential status, so the next read resolves the vault
+    /// again. The settings page calls this whenever it is built: the secure
+    /// store can change under it (another instance storing or removing a key),
+    /// and nothing in this process reports that.
+    pub(crate) fn forget_credential_status(&self) {
+        self.settings_credential_status.set(None);
+    }
+
+    /// Forget the configured endpoint's key: the secure-store entry and this
+    /// process's copy, if either exists.
+    pub fn remove_credential(&self) -> Result<(), String> {
+        let target = self.credential_target()?;
+        self.vault.delete(&target).map_err(|error| {
+            self.record_usage(UsageEvent::CredentialFailure);
+            error.to_string()
+        })
+    }
+
     fn credential_target(&self) -> Result<String, String> {
         let settings = self.settings.get();
         let provider = mt_core::model::Provider::from_key(settings.model_provider.trim())
@@ -2094,7 +3474,45 @@ impl AppState {
     }
 }
 
+/// The settings [`AppState::credential_status_cached`] depends on: the wire
+/// format, the base URL, the endpoint's environment authorization, and the
+/// credential revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CredentialStatusKey {
+    provider: String,
+    base_url: String,
+    environment_identity: String,
+    revision: u64,
+}
+
+/// How the configured endpoint's model credential resolves right now, as the
+/// settings page's status line says it. Never carries the key itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStatus {
+    /// No usable endpoint: no wire format chosen, or the base URL is invalid.
+    Unconfigured,
+    /// A wire format and endpoint are set, but no key is available.
+    Missing,
+    /// A key held for this process only.
+    Session,
+    /// A key in the platform's secure store (Windows Credential Manager).
+    Stored,
+    /// A key from the provider's environment variable.
+    Environment,
+    /// The secure store could not be read.
+    Unavailable,
+}
+
 impl ReviewView {
+    /// Whether `self` and `other` are the same result: the same understood
+    /// sections, findings and questions. The status text and the stale flag
+    /// change under one result without it becoming a new arrival.
+    pub fn same_result(&self, other: &Self) -> bool {
+        self.sections == other.sections
+            && self.findings_anchored == other.findings_anchored
+            && self.questions_detail == other.questions_detail
+    }
+
     fn from_result(result: &ReviewResult, stale: bool, language: Language) -> Self {
         let mut view = Self {
             status: if stale {
@@ -2116,6 +3534,7 @@ impl ReviewView {
                 .diagnostic
                 .as_ref()
                 .map(|diagnostic| diagnostic.message.as_str().to_owned()),
+            stale: stale || matches!(result.status, ReviewStatus::Stale),
             ..Self::default()
         };
         let Some(output) = &result.output else {
@@ -2135,6 +3554,21 @@ impl ReviewView {
                     }
                 };
                 format!("{kind}: {}", finding.text.as_str())
+            })
+            .collect();
+        view.findings_anchored = output
+            .findings
+            .iter()
+            .map(|finding| ReviewFindingView {
+                stated: matches!(
+                    finding.kind,
+                    FindingKind::Source | FindingKind::SourceStatement
+                ),
+                text: finding.text.as_str().to_owned(),
+                location: match &finding.anchor {
+                    SourceAnchor::Document { location } => Some(*location),
+                    _ => None,
+                },
             })
             .collect();
         view.questions = output
@@ -2165,6 +3599,18 @@ impl ReviewView {
                 }
             })
             .collect();
+        view.questions_detail = output
+            .clarification_questions
+            .iter()
+            .map(|question| ReviewQuestionView {
+                priority: question.priority,
+                question: question.question.as_str().to_owned(),
+                impact: question
+                    .impact
+                    .as_ref()
+                    .map(|impact| impact.as_str().to_owned()),
+            })
+            .collect();
         view
     }
 
@@ -2172,6 +3618,14 @@ impl ReviewView {
         Self {
             status: crate::i18n::t(language, crate::i18n::Key::ReviewFailed).to_owned(),
             diagnostic: Some(error.to_string()),
+            failure: Some(match error {
+                ReviewError::Timeout { .. } => ReviewFailure::Timeout,
+                ReviewError::MalformedResponse { .. }
+                | ReviewError::MissingResponseText { .. }
+                | ReviewError::ResponseTooLarge { .. } => ReviewFailure::Malformed,
+                ReviewError::Cancelled { .. } => ReviewFailure::Cancelled,
+                _ => ReviewFailure::Other,
+            }),
             ..Self::default()
         }
     }
@@ -2288,5 +3742,413 @@ fn recovered_loaded(record: &RecoveredRecord) -> LoadedFile {
             .unwrap_or(encoding_rs::UTF_8),
         decode_had_errors: metadata.decode_had_errors,
         source_identity: metadata.source_identity.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mt_core::{
+        credentials::{CredentialError, Secret, SecureCredentialStore},
+        review::{
+            ByteRange,
+            revision::{RevisionChange, RevisionEdit, RevisionLimits},
+        },
+    };
+
+    use super::*;
+
+    /// A credential store with nothing in it: the test never reaches the
+    /// platform's secure store.
+    struct NoStore;
+
+    impl SecureCredentialStore for NoStore {
+        fn is_supported(&self) -> bool {
+            false
+        }
+        fn read(&self, _: &str) -> Result<Option<Secret>, CredentialError> {
+            Ok(None)
+        }
+        fn write(&self, _: &str, _: &Secret) -> Result<(), CredentialError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
+
+    const SOURCE: &str = "compiles but no check\n";
+
+    /// What the probe saw: the text and trust after the accept and after
+    /// the undo, then every (text, trust) a text watcher observed.
+    type Outcome = ((String, bool), (String, bool), Vec<(String, bool)>);
+
+    static OUTCOME: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
+
+    /// Every (text, trust) a watcher of the tab's text observes, as the Web
+    /// pane does: the trust is read when the text changes, not watched.
+    fn watch_text_and_trust(tab: &Tab) -> Rc<RefCell<Vec<(String, bool)>>> {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let watch = seen.clone();
+        let (text, trusted) = (tab.text, tab.web_trusted);
+        effect(move || {
+            let text = text.get().to_string();
+            let trusted = untracked(|| trusted.get());
+            watch.borrow_mut().push((text, trusted));
+        });
+        seen
+    }
+
+    fn read(tab: &Tab) -> (String, bool) {
+        (tab.text.get().to_string(), tab.web_trusted.get())
+    }
+
+    /// Accepts, then undoes, one Revision change in a trusted document, as
+    /// the hunk card does.
+    #[component]
+    fn TrustProbe() -> impl IntoElement {
+        let (state, tab) = proposed();
+
+        // Whatever watches the text (the Web pane) must never see revised
+        // text under the trust granted to the text before it.
+        let seen = watch_text_and_trust(&tab);
+
+        tab.web_trusted.set(true);
+        assert!(state.set_revision_change_applied(0, true), "accept");
+        let accepted = read(&tab);
+        tab.web_trusted.set(true);
+        assert!(state.set_revision_change_applied(0, false), "undo");
+        let undone = read(&tab);
+        *OUTCOME.lock().expect("the outcome") = Some((accepted, undone, seen.borrow().clone()));
+        view()
+    }
+
+    /// A new document holding [`SOURCE`] with a one-change Revision on
+    /// screen, over an empty credential store.
+    fn proposed() -> (AppState, Tab) {
+        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the new document");
+        tab.text.set(SharedString::from(SOURCE));
+        let changes = [("Tighten.", "compiles but", "compiles, but")]
+            .iter()
+            .map(|&(reason, before, after)| {
+                let start = SOURCE.find(before).expect("in the source") as u64;
+                let range = ByteRange::new(start, start + before.len() as u64).expect("a range");
+                RevisionChange::new(reason, vec![RevisionEdit::new(range, before, after)])
+            })
+            .collect();
+        let proposal = RevisionProposal::validate(
+            SOURCE,
+            SourceSnapshot::new(0, 0),
+            changes,
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision(proposal);
+        (state, tab)
+    }
+
+    #[test]
+    fn every_revision_write_revokes_web_script_trust_first() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                TrustProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (accepted, undone, seen) = OUTCOME
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert_eq!(
+            accepted,
+            (
+                "compiles, but no check
+"
+                .to_owned(),
+                false
+            )
+        );
+        assert_eq!(undone, (SOURCE.to_owned(), false));
+        assert!(
+            seen.iter().skip(1).all(|(_, trusted)| !trusted),
+            "a watcher saw revised text under old trust: {seen:?}"
+        );
+    }
+
+    /// The status after a first and a second `Done` over one proposal.
+    static DONE_TWICE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+    #[component]
+    fn DoneTwiceProbe() -> impl IntoElement {
+        let (state, _tab) = proposed();
+        let status = || {
+            state
+                .revision_status
+                .get()
+                .map(|status| status.to_string())
+                .unwrap_or_default()
+        };
+        state.finish_revision(1);
+        let first = status();
+        state.finish_revision(1);
+        *DONE_TWICE.lock().expect("the outcome") = Some((first, status()));
+        view()
+    }
+
+    #[test]
+    fn a_second_done_without_a_proposal_decides_nothing() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                DoneTwiceProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (first, second) = DONE_TWICE
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert_eq!(first, "No changes approved.");
+        assert_eq!(second, REVISION_UNAVAILABLE);
+    }
+
+    const UNSET_SOURCE: &str = "# Plan\n\nKeep this text.\n";
+
+    /// The whole room over one clean document, on an endpoint no environment
+    /// key is allowed for and an empty credential store: no model is set up,
+    /// and nothing can reach the platform's secure store or the network.
+    /// Beside the room, the document's exact text and dirty flag.
+    fn not_set_up_room(language: Language) -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        state.settings.update(|settings| {
+            settings.language = language;
+            settings.model_provider = mt_core::model::Provider::OpenAiResponses.key().to_owned();
+            settings.model_base_url = "https://review.markturbo-test.invalid/v1/".to_owned();
+            settings.model_environment_key_identity = String::new();
+        });
+        state.new_document();
+        let tab = state.active_tab().expect("the new document");
+        tab.text.set(SharedString::from(UNSET_SOURCE));
+        let (source, dirty) = (tab.text, tab.dirty);
+        view()
+            .flex_1()
+            .w_full()
+            .h(relative(1.0))
+            .child(text(move || {
+                format!("Probe: {:?} dirty={}", source.get(), dirty.get())
+            }))
+            .child(crate::ui::shell(
+                state,
+                language,
+                crate::ui::tokens::Layout::Wide,
+            ))
+    }
+
+    #[component]
+    fn NotSetUpProbe() -> impl IntoElement {
+        not_set_up_room(Language::English)
+    }
+
+    #[component]
+    fn NotSetUpChineseProbe() -> impl IntoElement {
+        not_set_up_room(Language::Chinese)
+    }
+
+    /// `Ctrl+Enter` from the focused source editor with no model set up:
+    /// the field says so, with the way to Settings, and the document's text
+    /// and dirty flag are as they were. Returns the app with the diagnostic
+    /// on screen.
+    fn review_says_not_set_up<P: Component>(
+        headline: &str,
+        open_settings: &str,
+    ) -> nsh_testing::Headless
+    where
+        P::Props: Default,
+    {
+        let mut engine = nsh_engine::EngineConfig::new(nsh_engine::Root::of::<P>());
+        engine.environment.os = nsh_core::platform::Os::Windows;
+        engine.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = nsh_testing::Headless::start(engine).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(
+            nsh_engine::Points(1440.0),
+            nsh_engine::Points(900.0),
+        ))
+        .expect("viewport");
+        let probe = format!("Probe: {UNSET_SOURCE:?} dirty=false");
+        app.wait_for(&format!("text:{probe}"))
+            .expect("the clean document");
+        app.wait_for("label:Markdown source")
+            .expect("the source editor");
+        app.type_text("label:Markdown source", "")
+            .expect("focus the editor");
+        assert_eq!(
+            app.screen()
+                .count("id:review-unavailable")
+                .expect("the selector"),
+            0,
+            "nothing says so before Review is asked for"
+        );
+        app.press_key("ctrl+enter").expect("press Ctrl+Enter");
+        // Review prepares off the UI thread; under a loaded parallel suite
+        // that can outlast the default wait, as in the other Review tests.
+        app.wait_for_within("id:review-unavailable", std::time::Duration::from_secs(20))
+            .expect("Review says why it cannot run");
+        let screen = app.screen();
+        for (what, copy) in [("headline", headline), ("way forward", open_settings)] {
+            assert!(
+                screen
+                    .matches(&format!("id:review-unavailable >> text:{copy}"))
+                    .expect("the selector"),
+                "the {what} `{copy}`: {:?}",
+                screen.texts()
+            );
+        }
+        assert!(
+            app.shows(&probe),
+            "the text and dirty flag are unchanged: {:?}",
+            app.screen().texts()
+        );
+        app
+    }
+
+    #[test]
+    fn review_without_a_model_says_no_model_set_up() {
+        review_says_not_set_up::<NotSetUpProbe>("No model set up", "Open settings");
+    }
+
+    #[test]
+    fn review_without_a_model_says_so_in_chinese() {
+        review_says_not_set_up::<NotSetUpChineseProbe>("未配置模型", "打开设置");
+    }
+
+    /// With no model set up, the field's Close takes the diagnostic away,
+    /// and the title menu's Review row brings it back; neither touches the
+    /// document's text or dirty flag.
+    #[test]
+    fn review_without_a_model_closes_and_the_menu_row_shows_it_again() {
+        let mut app = review_says_not_set_up::<NotSetUpProbe>("No model set up", "Open settings");
+        let probe = format!("Probe: {UNSET_SOURCE:?} dirty=false");
+
+        app.press("id:review-close").expect("close the field");
+        app.wait_for_gone("id:review-unavailable", std::time::Duration::from_secs(5))
+            .expect("Close takes the diagnostic away");
+
+        app.press("id:title-settings").expect("open the title menu");
+        app.press("id:title-menu-review-selection")
+            .expect("the menu's Review row");
+        app.wait_for_within("id:review-unavailable", std::time::Duration::from_secs(20))
+            .expect("the menu row says why Review cannot run");
+        assert!(
+            app.shows(&probe),
+            "the text and dirty flag are unchanged: {:?}",
+            app.screen().texts()
+        );
+    }
+
+    static REPLACED: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
+
+    /// Lands a translation, then takes the disk version (the conflict's
+    /// `Use disk version`), each over a document whose scripts are trusted.
+    #[component]
+    fn ReplaceProbe() -> impl IntoElement {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("plan.md");
+        std::fs::write(
+            &path, "on disk
+",
+        )
+        .expect("the file on disk");
+        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the new document");
+        tab.text.set(SharedString::from(SOURCE));
+        let seen = watch_text_and_trust(&tab);
+
+        tab.web_trusted.set(true);
+        state.write_model_text(
+            &tab,
+            "translated
+"
+            .to_owned(),
+        );
+        let translated = read(&tab);
+        tab.web_trusted.set(true);
+        state.adopt_disk_version(&tab, io::load(&path).expect("load the file"));
+        let reloaded = read(&tab);
+        *REPLACED.lock().expect("the outcome") =
+            Some((translated, reloaded, seen.borrow().clone()));
+        view()
+    }
+
+    #[test]
+    fn a_translation_and_the_disk_version_revoke_web_script_trust_first() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ReplaceProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (translated, reloaded, seen) = REPLACED
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert_eq!(
+            translated,
+            (
+                "translated
+"
+                .to_owned(),
+                false
+            )
+        );
+        assert_eq!(
+            reloaded,
+            (
+                "on disk
+"
+                .to_owned(),
+                false
+            )
+        );
+        assert!(
+            seen.iter().skip(1).all(|(_, trusted)| !trusted),
+            "a watcher saw replaced text under old trust: {seen:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::SourceSelection;
+
+    fn range(text: &str, anchor: (u32, u32), head: (u32, u32)) -> Option<(usize, usize)> {
+        SourceSelection { anchor, head }.byte_range(text)
+    }
+
+    #[test]
+    fn editor_positions_map_to_the_text_bytes_they_select() {
+        let text = "ab\n\u{4e2d}\u{6587}\u{1f600}x\r\nz";
+        let line = text.find('\u{4e2d}').unwrap();
+        // UTF-16 columns: two CJK units and one surrogate pair before `x`.
+        let x = text.find('x').unwrap();
+        assert_eq!(range(text, (1, 0), (1, 4)), Some((line, x)));
+        assert_eq!(&text[line..x], "\u{4e2d}\u{6587}\u{1f600}");
+        // Selected backwards, the range is the same.
+        assert_eq!(range(text, (1, 4), (1, 0)), Some((line, x)));
+        // A column past the line stops before its `\r\n`.
+        assert_eq!(range(text, (1, 0), (1, 99)), Some((line, x + 1)));
+        // Across lines, and a line past the text clamps to its end.
+        assert_eq!(range(text, (0, 1), (9, 0)), Some((1, text.len())));
+        // A lone `\r` breaks a line, as it does in the editor.
+        assert_eq!(range("a\rbc\r\nd", (1, 0), (1, 2)), Some((2, 4)));
+        assert_eq!(range("a\rbc\r\nd", (2, 0), (2, 1)), Some((6, 7)));
+        // A caret selects nothing.
+        assert_eq!(range(text, (2, 1), (2, 1)), None);
+        assert_eq!(range("", (0, 0), (3, 3)), None);
     }
 }

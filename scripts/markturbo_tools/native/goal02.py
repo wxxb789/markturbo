@@ -4,623 +4,335 @@ The harness is intentionally fail-closed. It emits PASS only after every
 required case runs against the expected x64 release executable in an active,
 unlocked Windows 11 session. Document text is never written to stdout or JSON;
 observations contain only UTF-8 byte counts, SHA-256 digests, and timings.
+
+One case, two launches; only the interruption needs the restart. The first
+launch opens the document: a same-length external rewrite (mtime restored)
+must be refused by menu Save until Keep mine is confirmed; the rail's close
+control, revealed by a real pointer hover, must raise the in-window guard card
+(Save / Don't save / Cancel), whose Cancel keeps the text, then menu Save
+writes it; an edited buffer (CJK + emoji) must then leave a canonical recovery
+record within 10 000 ms before TerminateProcess interrupts it. The relaunch is
+given the workspace folder, so no document opens beside the recovered one: it
+offers the record to Restore; Ctrl+W's guard Don't save closes the restored tab
+without writing and retires the record; the workspace home's file row reopens
+the document, and Alt+F4 and the native window close (WM_CLOSE) must raise the
+guard, never close it unasked, and the guard's Save writes the exact bytes,
+retires the recovery record and exits 0.
+
+The unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
+which nsh 0.5.1's Windows UIA folds away, so the guard's Cancel keeping the
+mark is proven headless (`tests/tab_close_guard.rs`).
+
+Every phase has its own observation-key prefix and failure-code prefix
+(`PHASE_*`), and each launch its own failure-code prefix (`LAUNCH_*`), so a
+failed case names the step that failed.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
-import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from . import evidence
+from .evidence import leak_codes, validate_exact_fingerprint
 from .runtime import (
-    IMAGE_FILE_MACHINE_AMD64,
     INTEGRITY_NAMES,
-    PE32_PLUS_MAGIC,
-    REASON_CODE_RE,
-    SAFE_FAILURE_TYPES,
-    SHA256_RE,
-    VK_S,
+    VK_MENU,
     VK_W,
+    CONFLICT_HEADING,
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
-    complete_evidence as complete_evidence_envelope,
+    RunningApp,
+    elapsed_ms,
     finite_nonnegative,
     fingerprint_bytes,
+    key_input,
     load_pywinauto,
     main_native_acceptance,
-    normalize_expected_hash,
+    open_shared_for_read,
+    phase,
     preflight,
-    require_true,
     safe_exception_name,
     sha256_file,
-    utc_now,
-    validate_environment,
     validate_fingerprint,
-    validate_process_context,
     wait_until,
     write_durable,
 )
 
-REPO = Path(__file__).resolve().parents[3]
-DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
-DEFAULT_EVIDENCE = REPO / "target" / "native-acceptance" / "goal-02-native-acceptance-v1.json"
-
 SCHEMA = "markturbo.goal-02-native-acceptance"
-SCHEMA_VERSION = 1
-SAFE_OBSERVATION_STRINGS = {
-    "pointer tab-close -> Cancel -> SendInput Ctrl+S",
-    "SendInput Ctrl+W -> Discard",
-    "WM_CLOSE -> Save",
-    "watcher conflict -> explicit Overwrite",
-    "edit -> checkpoint log -> TerminateProcess -> restart -> Discard -> restart after startup log",
-    "TerminateProcess",
-    "content-free checkpoint success log",
-    "content-free recovery startup finished log",
-} | INTEGRITY_NAMES
-ALLOWED_OBSERVATION_KEYS = {
-    "app_logs_scanned",
-    "byte_count",
-    "checkpoint_log_seen",
-    "checkpoint_signal",
-    "canonical_record_count",
-    "canonical_records",
-    "canonical_recovery_records_scanned",
-    "cancel_kept_tab",
-    "dirty_editor",
-    "discard_restart_absent_ms",
-    "discard_closed_tab",
-    "discarded_recovery_absent",
-    "discarded_editor",
-    "edit_to_signal_ms",
-    "edited_text",
-    "editor",
-    "external_source",
-    "explicit_overwrite_used",
-    "files_scanned",
-    "foreground_verified",
-    "foreground_diagnostics",
-    "foreground_hwnd",
-    "flow",
-    "integrity",
-    "integrity_rid",
-    "loaded_source",
-    "live_recovery_scan",
-    "live_runtime_scan",
-    "process_context",
-    "process_contexts",
-    "recovery_restored_exact",
-    "recovery_artifacts_scanned",
-    "recovery_leases_scanned",
-    "refcell_absent",
-    "restart_editor",
-    "restart_count",
-    "restored_editor",
-    "restore_ms",
-    "runtime_scan",
-    "same_length",
-    "same_mtime_ns",
-    "saved_after_explicit_overwrite",
-    "saved_source",
-    "session_id",
-    "requested_hwnd",
-    "show_window_return",
-    "bring_to_top_return",
-    "set_foreground_return",
-    "foreground_attempts",
-    "sha256",
-    "source_after_cancel_save",
-    "source_after_discard",
-    "source_after_recovery_discard",
-    "source_before",
-    "termination",
-    "panic_absent",
-    "utf16le_sentinel_absent",
-    "utf8_sentinel_absent",
-    "startup_finished_log_seen",
-    "startup_signal",
-    "startup_observed_before_restart_editor",
-    "watcher_conflict_before_save",
-    "window_exited",
-}
-CASE_POINTER_CANCEL = "pointer-dirty-tab-close-cancel"
-CASE_KEYBOARD_DISCARD = "sendinput-ctrl-w-discard"
-CASE_WINDOW_SAVE = "wm-close-save-exact-bytes"
-CASE_EXTERNAL_CONFLICT = "same-length-mtime-external-conflict"
-CASE_RECOVERY = "cjk-emoji-interruption-recovery-retirement"
-REQUIRED_CASE_IDS = (
-    CASE_POINTER_CANCEL,
-    CASE_KEYBOARD_DISCARD,
-    CASE_WINDOW_SAVE,
-    CASE_EXTERNAL_CONFLICT,
-    CASE_RECOVERY,
-)
-REQUIRED_OBSERVATION_KEYS = {
-    CASE_POINTER_CANCEL: {
-        "editor",
-        "source_before",
-        "source_after_cancel_save",
-        "cancel_kept_tab",
-        "flow",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_KEYBOARD_DISCARD: {
-        "discarded_editor",
-        "source_before",
-        "source_after_discard",
-        "discard_closed_tab",
-        "flow",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_WINDOW_SAVE: {
-        "editor",
-        "saved_source",
-        "flow",
-        "window_exited",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_EXTERNAL_CONFLICT: {
-        "loaded_source",
-        "external_source",
-        "dirty_editor",
-        "saved_after_explicit_overwrite",
-        "same_length",
-        "same_mtime_ns",
-        "watcher_conflict_before_save",
-        "explicit_overwrite_used",
-        "flow",
-        "process_context",
-        "foreground_verified",
-        "runtime_scan",
-    },
-    CASE_RECOVERY: {
-        "edited_text",
-        "checkpoint_log_seen",
-        "checkpoint_signal",
-        "live_recovery_scan",
-        "live_runtime_scan",
-        "edit_to_signal_ms",
-        "restored_editor",
-        "recovery_restored_exact",
-        "restore_ms",
-        "discard_restart_absent_ms",
-        "source_after_recovery_discard",
-        "restart_editor",
-        "discarded_recovery_absent",
-        "termination",
-        "restart_count",
-        "startup_finished_log_seen",
-        "startup_signal",
-        "startup_observed_before_restart_editor",
-        "flow",
-        "process_contexts",
-        "foreground_verified",
-        "runtime_scan",
-    },
-}
-
-TAB_CLOSE_AUTOMATION_ID = "markturbo-document-tab-close"
-CONFLICT_OVERWRITE_AUTOMATION_ID = "markturbo-conflict-overwrite"
-
+CASE_LIFECYCLE_SESSION = "lifecycle-session"
 CASE_FLOWS = {
-    CASE_POINTER_CANCEL: "pointer tab-close -> Cancel -> SendInput Ctrl+S",
-    CASE_KEYBOARD_DISCARD: "SendInput Ctrl+W -> Discard",
-    CASE_WINDOW_SAVE: "WM_CLOSE -> Save",
-    CASE_EXTERNAL_CONFLICT: "watcher conflict -> explicit Overwrite",
-    CASE_RECOVERY: (
-        "edit -> checkpoint log -> TerminateProcess -> restart -> Discard -> "
-        "restart after startup log"
+    CASE_LIFECYCLE_SESSION: (
+        "same-length rewrite -> menu Save refused with conflict -> Keep mine -> "
+        "Overwrite; pointer rail close -> guard Cancel -> menu Save; "
+        "edit -> recovery record -> TerminateProcess -> relaunch on the workspace -> "
+        "Restore; SendInput Ctrl+W -> guard Don't save -> recovery record retired; "
+        "workspace home file -> SendInput Alt+F4 -> guard Cancel -> WM_CLOSE -> "
+        "guard Save -> exit"
     ),
 }
+REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
+SAFE_OBSERVATION_STRINGS = set(CASE_FLOWS.values()) | INTEGRITY_NAMES
 
+# Phase failure-code prefixes; each phase's observation keys start with the
+# same name in lower case.
+PHASE_EXTERNAL = "EXTERNAL_MODIFICATION"
+PHASE_TAB_CLOSE = "TAB_CLOSE"
+PHASE_WINDOW_CLOSE = "WINDOW_CLOSE"
+PHASE_CHECKPOINT = "CHECKPOINT"
+PHASE_RESTORE = "RESTORE"
+PHASE_KEYBOARD_CLOSE = "KEYBOARD_CLOSE"
+# Launch failure-code prefixes; a phase wrapping a launch keeps them.
+LAUNCH_FIRST = "FIRST_LAUNCH"
+LAUNCH_RESTORE = f"{PHASE_RESTORE}_LAUNCH"
+
+FINGERPRINT_OBSERVATION_KEYS = frozenset(
+    {
+        "external_modification_loaded_source",
+        "external_modification_rewritten_source",
+        "external_modification_dirty_editor",
+        "external_modification_source_after_refused_save",
+        "external_modification_overwritten_source",
+        "tab_close_editor",
+        "tab_close_source_after_cancel",
+        "tab_close_saved_source",
+        "window_close_editor",
+        "window_close_source_after_cancel",
+        "window_close_saved_source",
+        "checkpoint_editor",
+        "restore_editor",
+        "keyboard_close_source_before",
+        "keyboard_close_source_after",
+    }
+)
+REQUIRED_OBSERVATIONS = {
+    CASE_LIFECYCLE_SESSION: FINGERPRINT_OBSERVATION_KEYS
+    | {
+        "external_modification_conflict_ms",
+        "checkpoint_ms",
+        "checkpoint_live_records",
+        "checkpoint_runtime_scan",
+        "restore_ms",
+        "keyboard_close_ms",
+        "keyboard_close_retire_ms",
+        "process_contexts",
+    }
+}
+RECOVERY_SCAN_KEYS = frozenset(
+    {
+        "recovery_artifacts_scanned",
+        "canonical_recovery_records_scanned",
+        "recovery_leases_scanned",
+    }
+)
+RECOVERY_LEASE_NAME = ".markturbo-recovery.lock"
+# mt-core `recovery.rs` names its transaction, temporary and retirement
+# artifacts with this prefix; the lease (`.markturbo-recovery.lock`) has none.
+RECOVERY_ARTIFACT_PREFIX = ".markturbo-recovery-"
+PANIC_RE = re.compile(rb"\bpanic(?:ked)?\b")
+
+# The rail's per-tab close control (`ui/rail.rs`): a Button with its own test
+# id, clipped until the pointer widens the rail over a file row.
+RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
+TAB_CLOSE_AUTOMATION_ID = "rail-close"
+# The conflict and recovery actions (`ui/notices.rs`), each a Button with its
+# own id and its label as Name. The one recovered record is row 0. Keep mine's
+# confirmation is an nsh system alert outside the UIA tree, answered with
+# Enter (`runtime.py` `confirm_system_alert`).
+KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
+RESTORE_AUTOMATION_ID = "recovery-restore-0"
+# The workspace home's file rows (`ui/welcome.rs` `workspace_home`), shown
+# while a workspace is open and no document is; the workspace holds one file.
+WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
+VK_F4 = 0x73
 DOCUMENT_SENTINEL = "MTG02-NATIVE-SENTINEL-\u4fdd\u5b58-\U0001f680"
-RECOVERY_CHECKPOINT_LOG_RE = re.compile(
-    rb"(?mi)^.*\brecovery checkpoint written\s*$"
-)
-RECOVERY_STARTUP_FINISHED_LOG_RE = re.compile(
-    rb"(?mi)^.*\brecovery startup finished\s*$"
-)
 CANONICAL_RECOVERY_RECORD_RE = re.compile(r"^[0-9a-f]{64}\.mtrecovery$")
+RECOVERY_LOSS_WINDOW_MS = 10_000
 
 ORIGINAL_BYTES = b"native acceptance original"
 EXTERNAL_BYTES = b"native acceptance external"
-POINTER_EDIT = f"{DOCUMENT_SENTINEL}:pointer"
-KEYBOARD_EDIT = f"{DOCUMENT_SENTINEL}:keyboard"
-WINDOW_EDIT = f"{DOCUMENT_SENTINEL}:window"
 CONFLICT_EDIT = f"{DOCUMENT_SENTINEL}:conflict"
+POINTER_EDIT = f"{DOCUMENT_SENTINEL}:pointer"
+WINDOW_EDIT = f"{DOCUMENT_SENTINEL}:window"
 RECOVERY_EDIT = f"{DOCUMENT_SENTINEL}:recovery"
-
-def new_evidence(expected_hash: str) -> dict[str, Any]:
-    return {
-        "schema": SCHEMA,
-        "schema_version": SCHEMA_VERSION,
-        "status": "BLOCKED",
-        "started_at_utc": utc_now(),
-        "completed_at_utc": None,
-        "executable": {
-            "expected_sha256": expected_hash,
-            "sha256": None,
-            "byte_count": None,
-            "hash_verified": False,
-            "copied_sha256": None,
-            "copy_hash_verified": False,
-            "format": None,
-            "machine": None,
-        },
-        "environment": {},
-        "cases": [
-            {
-                "id": case_id,
-                "status": "NOT_RUN",
-                "duration_ms": None,
-                "reason_code": None,
-                "failure_type": None,
-                "observations": {},
-            }
-            for case_id in REQUIRED_CASE_IDS
-        ],
-        "summary": {
-            "required_case_count": len(REQUIRED_CASE_IDS),
-            "passed_case_count": 0,
-            "blocked_case_count": 0,
-            "failed_case_count": 0,
-            "not_run_case_count": len(REQUIRED_CASE_IDS),
-        },
-    }
-
-
-def complete_evidence(evidence: dict[str, Any], status: str) -> None:
-    complete_evidence_envelope(evidence, status, REQUIRED_CASE_IDS)
-
-
-def validate_evidence(evidence: dict[str, Any]) -> None:
-    if evidence.get("schema") != SCHEMA or evidence.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("unsupported evidence schema")
-    if evidence.get("status") not in {"PASS", "FAIL", "BLOCKED"}:
-        raise ValueError("invalid evidence status")
-
-    executable = evidence.get("executable")
-    if not isinstance(executable, dict):
-        raise ValueError("missing executable evidence")
-    expected_hash = executable.get("expected_sha256")
-    actual_hash = executable.get("sha256")
-    if not isinstance(expected_hash, str) or not SHA256_RE.fullmatch(expected_hash):
-        raise ValueError("invalid expected executable SHA-256")
-    if actual_hash is not None and (
-        not isinstance(actual_hash, str) or not SHA256_RE.fullmatch(actual_hash)
-    ):
-        raise ValueError("invalid executable SHA-256")
-    if executable.get("hash_verified") is True and actual_hash != expected_hash:
-        raise ValueError("verified executable hash does not match expected hash")
-    if evidence["status"] == "PASS" and executable.get("hash_verified") is not True:
-        raise ValueError("PASS requires a verified executable hash")
-    copied_hash = executable.get("copied_sha256")
-    if copied_hash is not None and (
-        not isinstance(copied_hash, str) or not SHA256_RE.fullmatch(copied_hash)
-    ):
-        raise ValueError("invalid copied executable SHA-256")
-    if executable.get("copy_hash_verified") is True and copied_hash != expected_hash:
-        raise ValueError("verified copied executable hash does not match expected hash")
-    if evidence["status"] == "PASS" and executable.get("copy_hash_verified") is not True:
-        raise ValueError("PASS requires a verified copied executable hash")
-    byte_count = executable.get("byte_count")
-    if byte_count is not None and (
-        not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0
-    ):
-        raise ValueError("invalid executable byte count")
-    if evidence["status"] == "PASS" and (not isinstance(byte_count, int) or byte_count <= 0):
-        raise ValueError("PASS requires a nonempty executable")
-    if evidence["status"] == "PASS" and (
-        executable.get("format") != "PE32+"
-        or executable.get("machine") != "x86_64"
-        or executable.get("machine_code") != IMAGE_FILE_MACHINE_AMD64
-        or executable.get("optional_magic") != PE32_PLUS_MAGIC
-    ):
-        raise ValueError("PASS requires an AMD64 PE32+ executable")
-
-    environment = evidence.get("environment")
-    if not isinstance(environment, dict):
-        raise ValueError("invalid environment evidence")
-    parent_context = environment.get("harness_process")
-    if evidence["status"] == "PASS":
-        validate_environment(environment)
-        validate_process_context(parent_context)
-
-    cases = evidence.get("cases")
-    if not isinstance(cases, list):
-        raise ValueError("missing case evidence")
-    ids = [case.get("id") for case in cases if isinstance(case, dict)]
-    duplicates = sorted({case_id for case_id in ids if ids.count(case_id) > 1})
-    if duplicates:
-        raise ValueError("duplicate required case ids")
-    missing = sorted(set(REQUIRED_CASE_IDS) - set(ids))
-    extra = sorted(set(ids) - set(REQUIRED_CASE_IDS))
-    if missing or extra or len(cases) != len(REQUIRED_CASE_IDS):
-        raise ValueError("required case set is incomplete")
-    for case in cases:
-        if case.get("status") not in {"PASS", "FAIL", "BLOCKED", "NOT_RUN"}:
-            raise ValueError("invalid case status")
-        reason_code = case.get("reason_code")
-        if reason_code is not None and (
-            not isinstance(reason_code, str) or not REASON_CODE_RE.fullmatch(reason_code)
-        ):
-            raise ValueError("invalid case reason code")
-        failure_type = case.get("failure_type")
-        if failure_type is not None and (
-            not isinstance(failure_type, str) or failure_type not in SAFE_FAILURE_TYPES
-        ):
-            raise ValueError("invalid case failure type")
-        if case["status"] != "FAIL" and failure_type is not None:
-            raise ValueError("only failed cases may contain a failure type")
-        observations = case.get("observations")
-        if not isinstance(observations, dict):
-            raise ValueError("invalid case observations")
-        if case["status"] == "PASS" and not REQUIRED_OBSERVATION_KEYS[case["id"]].issubset(
-            observations
-        ):
-            raise ValueError("passed case evidence is incomplete")
-        validate_observations(observations)
-        duration_ms = case.get("duration_ms")
-        if case["status"] == "NOT_RUN":
-            if duration_ms is not None:
-                raise ValueError("NOT_RUN case cannot have a duration")
-        elif not finite_nonnegative(duration_ms):
-            raise ValueError("completed case duration must be nonnegative")
-        if case["status"] == "PASS":
-            validate_passed_case(case["id"], observations, parent_context)
-    if evidence["status"] == "PASS" and any(case["status"] != "PASS" for case in cases):
-        raise ValueError("PASS requires every required case to pass")
-
-    summary = evidence.get("summary")
-    if not isinstance(summary, dict) or summary.get("required_case_count") != len(
-        REQUIRED_CASE_IDS
-    ):
-        raise ValueError("invalid evidence summary")
-    expected_counts = {
-        "passed_case_count": sum(case["status"] == "PASS" for case in cases),
-        "blocked_case_count": sum(case["status"] == "BLOCKED" for case in cases),
-        "failed_case_count": sum(case["status"] == "FAIL" for case in cases),
-        "not_run_case_count": sum(case["status"] == "NOT_RUN" for case in cases),
-    }
-    if any(summary.get(key) != value for key, value in expected_counts.items()):
-        raise ValueError("case summary does not match case evidence")
-
-
-def validate_observations(value: Any, key: str | None = None) -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key not in ALLOWED_OBSERVATION_KEYS:
-                raise ValueError("unknown observation field")
-            if key == "sha256" and (
-                not isinstance(nested, str) or not SHA256_RE.fullmatch(nested)
-            ):
-                raise ValueError("invalid observation SHA-256")
-            validate_observations(nested, key)
-    elif isinstance(value, list):
-        for nested in value:
-            validate_observations(nested, key)
-    elif isinstance(value, str):
-        if key == "sha256":
-            return
-        if value not in SAFE_OBSERVATION_STRINGS:
-            raise ValueError("free-form observation strings are forbidden")
-    elif value is not None and not isinstance(value, (bool, int, float)):
-        raise ValueError("invalid observation value")
 
 
 def validate_runtime_scan(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("missing runtime scan evidence")
-    if not isinstance(value.get("files_scanned"), int) or value["files_scanned"] <= 0:
-        raise ValueError("runtime scan must cover at least one file")
-    if not isinstance(value.get("app_logs_scanned"), int) or value["app_logs_scanned"] <= 0:
-        raise ValueError("runtime scan must cover an application log")
+    evidence.validate_runtime_scan(value, require_config=False, extra_counts=RECOVERY_SCAN_KEYS)
     if (
-        not isinstance(value.get("recovery_artifacts_scanned"), int)
-        or value["recovery_artifacts_scanned"] < 0
+        value["canonical_recovery_records_scanned"] + value["recovery_leases_scanned"]
+        > value["recovery_artifacts_scanned"]
     ):
-        raise ValueError("invalid recovery artifact scan count")
-    for key in ("canonical_recovery_records_scanned", "recovery_leases_scanned"):
-        if not isinstance(value.get(key), int) or value[key] < 0:
-            raise ValueError(f"invalid {key}")
-    if value["canonical_recovery_records_scanned"] + value["recovery_leases_scanned"] > value[
-        "recovery_artifacts_scanned"
-    ]:
         raise ValueError("runtime scan recovery artifact counts are inconsistent")
     if value["files_scanned"] < (
-        value["app_logs_scanned"] + value["recovery_artifacts_scanned"] + 1
+        value["app_logs_scanned"]
+        + value["config_files_scanned"]
+        + value["recovery_artifacts_scanned"]
+        + 1
     ):
         raise ValueError("runtime scan file count is incomplete")
-    require_true(
-        value,
-        "utf8_sentinel_absent",
-        "utf16le_sentinel_absent",
-        "panic_absent",
-        "refcell_absent",
-    )
 
 
 def validate_live_recovery_scan(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("missing live recovery scan evidence")
-    count = value.get("canonical_record_count")
-    records = value.get("canonical_records")
-    if not isinstance(count, int) or count <= 0:
+    evidence.require_exact_keys(
+        value, frozenset({"canonical_record_count", "canonical_records"}), "live recovery scan"
+    )
+    count = value["canonical_record_count"]
+    records = value["canonical_records"]
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
         raise ValueError("live recovery scan requires a canonical record")
     if not isinstance(records, list) or len(records) != count:
         raise ValueError("live recovery record count does not match fingerprints")
     for record in records:
-        fingerprint = validate_fingerprint(record)
-        if fingerprint["byte_count"] <= 0:
+        if validate_exact_fingerprint(record)["byte_count"] <= 0:
             raise ValueError("canonical recovery record must be nonempty")
-    require_true(value, "utf8_sentinel_absent", "utf16le_sentinel_absent")
 
 
-def validate_passed_case(
-    case_id: str, observations: dict[str, Any], parent_context: Any
-) -> None:
-    parent = validate_process_context(parent_context)
-    contexts = observations.get("process_contexts")
-    if contexts is None:
-        contexts = [observations.get("process_context")]
-    if not isinstance(contexts, list) or not contexts:
-        raise ValueError("passed case requires process context")
-    for context in contexts:
-        if validate_process_context(context) != parent:
-            raise ValueError("case process context differs from harness context")
-    if observations.get("flow") != CASE_FLOWS[case_id]:
-        raise ValueError("case flow mechanics do not match the required scenario")
-    require_true(observations, "foreground_verified")
-    validate_runtime_scan(observations.get("runtime_scan"))
+def _fingerprints(observations: dict[str, Any], prefix: str, *names: str) -> list[dict[str, Any]]:
+    return [validate_fingerprint(observations.get(f"{prefix}_{name}")) for name in names]
 
-    if case_id == CASE_POINTER_CANCEL:
-        editor = validate_fingerprint(observations.get("editor"))
-        saved = validate_fingerprint(observations.get("source_after_cancel_save"))
-        validate_fingerprint(observations.get("source_before"))
-        require_true(observations, "cancel_kept_tab")
-        if editor != saved:
-            raise ValueError("Cancel did not preserve exact editor bytes")
-    elif case_id == CASE_KEYBOARD_DISCARD:
-        before = validate_fingerprint(observations.get("source_before"))
-        after = validate_fingerprint(observations.get("source_after_discard"))
-        validate_fingerprint(observations.get("discarded_editor"))
-        require_true(observations, "discard_closed_tab")
-        if before != after:
-            raise ValueError("Discard changed source bytes")
-    elif case_id == CASE_WINDOW_SAVE:
-        editor = validate_fingerprint(observations.get("editor"))
-        saved = validate_fingerprint(observations.get("saved_source"))
-        require_true(observations, "window_exited")
-        if editor != saved:
-            raise ValueError("window Save did not preserve exact editor bytes")
-    elif case_id == CASE_EXTERNAL_CONFLICT:
-        loaded = validate_fingerprint(observations.get("loaded_source"))
-        external = validate_fingerprint(observations.get("external_source"))
-        dirty = validate_fingerprint(observations.get("dirty_editor"))
-        saved = validate_fingerprint(observations.get("saved_after_explicit_overwrite"))
-        require_true(
-            observations,
-            "same_length",
-            "same_mtime_ns",
-            "watcher_conflict_before_save",
-            "explicit_overwrite_used",
+
+def _require_timing(observations: dict[str, Any], key: str) -> float:
+    value = observations.get(key)
+    if not finite_nonnegative(value):
+        raise ValueError(f"{key} must be a nonnegative timing")
+    return value
+
+
+def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
+    loaded, rewritten, dirty, refused, overwritten = _fingerprints(
+        observations,
+        "external_modification",
+        "loaded_source",
+        "rewritten_source",
+        "dirty_editor",
+        "source_after_refused_save",
+        "overwritten_source",
+    )
+    if loaded["byte_count"] != rewritten["byte_count"] or loaded["sha256"] == rewritten["sha256"]:
+        raise ValueError("external rewrite evidence is not same-length and different")
+    _require_timing(observations, "external_modification_conflict_ms")
+    if refused != rewritten:
+        raise ValueError("refused Save changed the externally rewritten source")
+    if dirty != overwritten or rewritten == overwritten:
+        raise ValueError("explicit overwrite did not preserve exact dirty editor bytes")
+
+    editor, kept_source, saved = _fingerprints(
+        observations, "tab_close", "editor", "source_after_cancel", "saved_source"
+    )
+    if kept_source != overwritten or editor == kept_source:
+        raise ValueError("tab close Cancel changed the source")
+    if editor != saved:
+        raise ValueError("Cancel did not preserve exact editor bytes for Save")
+
+    (edited,) = _fingerprints(observations, "checkpoint", "editor")
+    signal_ms = _require_timing(observations, "checkpoint_ms")
+    if signal_ms > RECOVERY_LOSS_WINDOW_MS:
+        raise ValueError("recovery checkpoint exceeds 10000ms")
+    live_scan = observations["checkpoint_runtime_scan"]
+    if live_scan["canonical_recovery_records_scanned"] < observations[
+        "checkpoint_live_records"
+    ]["canonical_record_count"]:
+        raise ValueError("live runtime scan omitted canonical recovery records")
+    if live_scan["recovery_leases_scanned"] < 1:
+        raise ValueError("live runtime scan omitted recovery lease")
+
+    (restored,) = _fingerprints(observations, "restore", "editor")
+    _require_timing(observations, "restore_ms")
+    if restored != edited:
+        raise ValueError("recovery did not restore exact editor bytes")
+
+    before, after = _fingerprints(
+        observations, "keyboard_close", "source_before", "source_after"
+    )
+    _require_timing(observations, "keyboard_close_ms")
+    _require_timing(observations, "keyboard_close_retire_ms")
+    if before != saved or before != after or restored == before:
+        raise ValueError("keyboard close Don't save changed the source")
+
+    window, untouched, window_saved = _fingerprints(
+        observations,
+        "window_close",
+        "editor",
+        "source_after_cancel",
+        "saved_source",
+    )
+    if untouched != after or window == untouched:
+        raise ValueError("Alt+F4 Cancel changed the source")
+    if window != window_saved:
+        raise ValueError("window Save did not preserve exact editor bytes")
+    if observations["runtime_scan"]["canonical_recovery_records_scanned"] != 0:
+        raise ValueError("a saved or discarded document kept its recovery record")
+    if len(observations["process_contexts"]) != 2:
+        raise ValueError("the session requires one interrupted and one relaunched process")
+
+
+CONTRACT = evidence.EvidenceContract(
+    schema=SCHEMA,
+    case_flows=CASE_FLOWS,
+    observation_keys=frozenset().union(*REQUIRED_OBSERVATIONS.values()),
+    fingerprint_keys=FINGERPRINT_OBSERVATION_KEYS,
+    required_observations=REQUIRED_OBSERVATIONS,
+    validate_runtime_scan=validate_runtime_scan,
+    validate_passed_case=validate_passed_case,
+    private_sentinels=(DOCUMENT_SENTINEL,),
+    safe_strings=frozenset(SAFE_OBSERVATION_STRINGS),
+    structured={
+        "checkpoint_live_records": validate_live_recovery_scan,
+        "checkpoint_runtime_scan": validate_runtime_scan,
+    },
+)
+
+
+def new_evidence(expected_hash: str) -> dict[str, Any]:
+    return evidence.new_evidence(CONTRACT, expected_hash)
+
+
+def validate_evidence(value: dict[str, Any]) -> None:
+    evidence.validate_evidence(value, CONTRACT)
+
+
+def canonical_recovery_records(data_root: Path) -> list[Path]:
+    recovery_root = data_root / "recovery"
+    try:
+        return sorted(
+            path
+            for path in recovery_root.glob("*.mtrecovery")
+            if path.is_file() and CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)
         )
-        if loaded["byte_count"] != external["byte_count"] or loaded["sha256"] == external["sha256"]:
-            raise ValueError("external rewrite evidence is not same-length and different")
-        if dirty != saved or external == saved:
-            raise ValueError("explicit overwrite did not preserve exact dirty editor bytes")
-    elif case_id == CASE_RECOVERY:
-        edited = validate_fingerprint(observations.get("edited_text"))
-        restored = validate_fingerprint(observations.get("restored_editor"))
-        after_discard = validate_fingerprint(observations.get("source_after_recovery_discard"))
-        restarted = validate_fingerprint(observations.get("restart_editor"))
-        require_true(
-            observations,
-            "checkpoint_log_seen",
-            "recovery_restored_exact",
-            "discarded_recovery_absent",
-            "startup_finished_log_seen",
-            "startup_observed_before_restart_editor",
+    except OSError:
+        return []
+
+
+def retained_recovery_artifacts(data_root: Path) -> list[Path]:
+    """Recovery records and their transaction or retirement artifacts.
+
+    After a deliberate Don't save or Save none may remain: the next launch
+    offers only what these hold. The lease is the running app's and is not
+    counted.
+    """
+    try:
+        return sorted(
+            path
+            for path in (data_root / "recovery").iterdir()
+            if CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)
+            or path.name.startswith(RECOVERY_ARTIFACT_PREFIX)
         )
-        if observations.get("checkpoint_signal") != "content-free checkpoint success log":
-            raise ValueError("recovery checkpoint signal is not the required log")
-        if observations.get("startup_signal") != "content-free recovery startup finished log":
-            raise ValueError("recovery startup signal is not the required log")
-        if observations.get("termination") != "TerminateProcess":
-            raise ValueError("recovery interruption did not use TerminateProcess")
-        if observations.get("restart_count") != 2 or len(contexts) != 3:
-            raise ValueError("recovery scenario requires two restarts")
-        validate_live_recovery_scan(observations.get("live_recovery_scan"))
-        validate_runtime_scan(observations.get("live_runtime_scan"))
-        if observations["live_runtime_scan"]["canonical_recovery_records_scanned"] < observations[
-            "live_recovery_scan"
-        ]["canonical_record_count"]:
-            raise ValueError("live runtime scan omitted canonical recovery records")
-        if observations["live_runtime_scan"]["recovery_leases_scanned"] < 1:
-            raise ValueError("live runtime scan omitted recovery lease")
-        signal_ms = observations.get("edit_to_signal_ms")
-        if not finite_nonnegative(signal_ms) or signal_ms > 10_000:
-            raise ValueError("recovery success signal exceeds 10000ms")
-        for key in ("restore_ms", "discard_restart_absent_ms"):
-            value = observations.get(key)
-            if not finite_nonnegative(value):
-                raise ValueError("recovery timing must be nonnegative")
-        if edited != restored:
-            raise ValueError("recovery did not restore exact editor bytes")
-        if after_discard != restarted or restarted == edited:
-            raise ValueError("discarded recovery was present after restart")
-
-
-def build_cli_command(exe: Path, expected_hash: str, evidence: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "scripts.markturbo_tools.native.goal02",
-        "--exe",
-        str(exe),
-        "--expect-exe-sha256",
-        expected_hash,
-        "--evidence",
-        str(evidence),
-    ]
-
-
-def checkpoint_success_present(value: bytes, offset: int = 0) -> bool:
-    return RECOVERY_CHECKPOINT_LOG_RE.search(value[max(0, offset) :]) is not None
-
-
-def recovery_startup_finished_present(value: bytes, offset: int = 0) -> bool:
-    return RECOVERY_STARTUP_FINISHED_LOG_RE.search(value[max(0, offset) :]) is not None
-
-
-def wait_for_log_marker(
-    path: Path,
-    offset: int,
-    predicate: Callable[[bytes], bool],
-    timeout: float,
-    code: str,
-) -> None:
-    cursor = max(0, offset)
-    trailing_line = b""
-
-    def present() -> bool:
-        nonlocal cursor, trailing_line
-        try:
-            with path.open("rb") as handle:
-                handle.seek(cursor)
-                appended = handle.read()
-        except OSError:
-            return False
-        if not appended:
-            return False
-        cursor += len(appended)
-        observed = trailing_line + appended
-        if predicate(observed):
-            return True
-        trailing_line = observed.rsplit(b"\n", 1)[-1][-512:]
-        return False
-
-    wait_until(present, timeout, code, interval=0.025)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise HarnessFailure(
+            "RECOVERY_ARTIFACT_ENUM_FAILED", safe_exception_name(error)
+        ) from None
 
 
 def scan_live_recovery_records(data_root: Path) -> dict[str, Any]:
-    recovery_root = data_root / "recovery"
-    records = sorted(
-        path
-        for path in recovery_root.glob("*.mtrecovery")
-        if path.is_file() and CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)
-    )
+    records = canonical_recovery_records(data_root)
     if not records:
         raise HarnessFailure("CANONICAL_RECOVERY_RECORD_MISSING")
     utf8 = DOCUMENT_SENTINEL.encode("utf-8")
@@ -628,7 +340,8 @@ def scan_live_recovery_records(data_root: Path) -> dict[str, Any]:
     fingerprints = []
     for path in records:
         try:
-            value = path.read_bytes()
+            with open_shared_for_read(path) as handle:
+                value = handle.read()
         except OSError as error:
             raise HarnessFailure(
                 "LIVE_RECOVERY_RECORD_SCAN_FAILED", safe_exception_name(error)
@@ -640,324 +353,359 @@ def scan_live_recovery_records(data_root: Path) -> dict[str, Any]:
         if utf16 in value:
             raise HarnessFailure("UTF16LE_DOCUMENT_SENTINEL_LEAKED")
         fingerprints.append(fingerprint_bytes(value).evidence())
-    return {
-        "canonical_record_count": len(records),
-        "canonical_records": fingerprints,
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-    }
-
-
-def runtime_artifact_paths(data_root: Path, stderr_path: Path) -> list[Path]:
-    paths = [stderr_path]
-    for root in (data_root / "logs", data_root / "recovery"):
-        paths.extend(path for path in root.rglob("*") if path.is_file())
-    return sorted(set(path.resolve() for path in paths))
+    return {"canonical_record_count": len(records), "canonical_records": fingerprints}
 
 
 def scan_runtime_artifacts(data_root: Path, stderr_path: Path) -> dict[str, Any]:
-    utf8 = DOCUMENT_SENTINEL.encode("utf-8")
-    utf16 = DOCUMENT_SENTINEL.encode("utf-16-le")
-    paths = runtime_artifact_paths(data_root, stderr_path)
-    app_logs = [path for path in paths if path.parent == (data_root / "logs").resolve()]
-    recovery_root = (data_root / "recovery").resolve()
-    recovery_artifacts = [path for path in paths if recovery_root in path.parents]
-    canonical_records = [
-        path
-        for path in recovery_artifacts
-        if CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)
-    ]
-    recovery_leases = [
-        path for path in recovery_artifacts if path.name == ".markturbo-recovery.lock"
-    ]
-    if not app_logs:
-        raise HarnessFailure("APP_LOG_MISSING")
-    for path in paths:
+    """The shared private-content scan, plus panics and recovery artifacts.
+
+    Logs, recovery artifacts and stderr must hold no panic; the recovery
+    directory's canonical records and lease are counted.
+    """
+    scan = evidence.scan_case_artifacts(
+        data_root.parent, leak_codes("DOCUMENT_SENTINEL", DOCUMENT_SENTINEL)
+    )
+    try:
+        logs = [path for path in (data_root / "logs").rglob("*") if path.is_file()]
+        recovery = [path for path in (data_root / "recovery").rglob("*") if path.is_file()]
+    except OSError as error:
+        raise HarnessFailure("RUNTIME_ARTIFACT_ENUM_FAILED", safe_exception_name(error)) from None
+    for path in (*logs, *recovery, stderr_path):
         try:
-            value = path.read_bytes()
+            lowered = path.read_bytes().lower()
         except OSError as error:
             raise HarnessFailure(
                 "RUNTIME_ARTIFACT_SCAN_FAILED", safe_exception_name(error)
             ) from None
-        lowered = value.lower()
-        if utf8 in value:
-            raise HarnessFailure("UTF8_DOCUMENT_SENTINEL_LEAKED")
-        if utf16 in value:
-            raise HarnessFailure("UTF16LE_DOCUMENT_SENTINEL_LEAKED")
         if b"refcell already borrowed" in lowered:
             raise HarnessFailure("REFCELL_BORROW_PANIC_LOGGED")
-        if re.search(rb"\bpanic(?:ked)?\b", lowered):
+        if PANIC_RE.search(lowered):
             raise HarnessFailure("PANIC_LOGGED")
     return {
-        "files_scanned": len(paths),
-        "app_logs_scanned": len(app_logs),
-        "recovery_artifacts_scanned": len(recovery_artifacts),
-        "canonical_recovery_records_scanned": len(canonical_records),
-        "recovery_leases_scanned": len(recovery_leases),
-        "utf8_sentinel_absent": True,
-        "utf16le_sentinel_absent": True,
-        "panic_absent": True,
-        "refcell_absent": True,
+        **scan,
+        "recovery_artifacts_scanned": len(recovery),
+        "canonical_recovery_records_scanned": sum(
+            bool(CANONICAL_RECOVERY_RECORD_RE.fullmatch(path.name)) for path in recovery
+        ),
+        "recovery_leases_scanned": sum(path.name == RECOVERY_LEASE_NAME for path in recovery),
     }
 
 
 class Goal02Harness(BaseNativeHarness):
-    def wait_checkpoint_log(self, app: RunningApp, offset: int, started: float) -> float:
+    def wait_checkpoint_record(
+        self, data_root: Path, started: float, written_after_ns: int = 0
+    ) -> float:
+        """Wait for the dirty buffer's canonical record within the loss window.
+
+        The app writes its first checkpoint without waiting for typing to
+        pause, so a record may hold part of the edit. Only one written at or
+        after `written_after_ns` (wall clock, once the editor showed the
+        whole edit) can hold all of it.
+        """
         remaining = 10.0 - (time.perf_counter() - started)
         if remaining <= 0:
-            raise HarnessFailure("RECOVERY_SUCCESS_LOG_EXCEEDED_10_SECONDS")
+            raise HarnessFailure("RECOVERY_RECORD_EXCEEDED_10_SECONDS")
 
-        wait_for_log_marker(
-            app.app_log_path,
-            offset,
-            checkpoint_success_present,
+        def written() -> bool:
+            try:
+                return any(
+                    path.stat().st_mtime_ns >= written_after_ns
+                    for path in canonical_recovery_records(data_root)
+                )
+            except OSError:
+                return False
+
+        wait_until(
+            written,
             remaining,
-            "RECOVERY_SUCCESS_LOG_EXCEEDED_10_SECONDS",
+            "RECOVERY_RECORD_EXCEEDED_10_SECONDS",
+            interval=0.025,
         )
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        if elapsed_ms > 10_000:
-            raise HarnessFailure("RECOVERY_SUCCESS_LOG_EXCEEDED_10_SECONDS")
-        return elapsed_ms
+        elapsed = (time.perf_counter() - started) * 1000
+        if elapsed > RECOVERY_LOSS_WINDOW_MS:
+            raise HarnessFailure("RECOVERY_RECORD_EXCEEDED_10_SECONDS")
+        return elapsed
 
-    def wait_recovery_startup_finished(self, app: RunningApp, timeout: float) -> None:
-        wait_for_log_marker(
-            app.app_log_path,
-            0,
-            recovery_startup_finished_present,
-            timeout,
-            "RECOVERY_STARTUP_FINISHED_TIMEOUT",
+    def close_tab_by_pointer(self, app: RunningApp) -> None:
+        """Widen the rail under the pointer, then click the tab's close control."""
+        row = self.find_control(
+            app,
+            RAIL_FILE_ROW_AUTOMATION_ID,
+            "Button",
+            "RAIL_FILE_ROW_UIA_TIMEOUT",
+            "RAIL_FILE_ROW_UIA_CONTRACT_MISMATCH",
+        )
+        try:
+            rectangle = row.rectangle()
+        except Exception as error:
+            raise HarnessFailure("RAIL_FILE_ROW_UIA_QUERY_FAILED", safe_exception_name(error)) from None
+        self.win32.move_cursor(
+            (rectangle.left + rectangle.right) // 2, (rectangle.top + rectangle.bottom) // 2
+        )
+        close = self.find_control(
+            app,
+            TAB_CLOSE_AUTOMATION_ID,
+            "Button",
+            "RAIL_CLOSE_UIA_TIMEOUT",
+            "RAIL_CLOSE_UIA_CONTRACT_MISMATCH",
+        )
+        self.click_control(close, "RAIL_CLOSE_POINTER_CLICK_FAILED")
+
+    def send_alt_f4(self, app: RunningApp) -> None:
+        """Alt+F4 through SendInput to the foreground main window."""
+        self.win32.require_foreground(app.hwnd, self.ui_timeout)
+        self.win32.send_inputs(
+            [
+                key_input(VK_MENU, False),
+                key_input(VK_F4, False),
+                key_input(VK_F4, True),
+                key_input(VK_MENU, True),
+            ]
         )
 
-    def scenario_pointer_cancel(self) -> dict[str, Any]:
-        data, config, workspace, stderr = self.case_roots(CASE_POINTER_CANCEL)
-        document = (workspace / "pointer.md").resolve()
-        write_durable(document, ORIGINAL_BYTES)
-        source_before = sha256_file(document)
-        app = self.launch(document, data, config, workspace, stderr)
-        try:
-            editor = self.replace_editor(app, POINTER_EDIT)
-            close = self.find_control(
-                app,
-                TAB_CLOSE_AUTOMATION_ID,
-                "Button",
-                "TAB_CLOSE_UIA_TIMEOUT",
-                "TAB_CLOSE_UIA_CONTRACT_MISMATCH",
-            )
-            self.click_control(close, "TAB_CLOSE_POINTER_CLICK_FAILED")
-            self.click_lifecycle_decision(app, "Cancel")
-            if app.process.poll() is not None:
-                raise HarnessFailure("CANCEL_CLOSED_PROCESS")
-            if self.editor_fingerprint(app) != editor:
-                raise HarnessFailure("CANCEL_CHANGED_EDITOR_BYTES")
-            if sha256_file(document) != source_before:
-                raise HarnessFailure("CANCEL_CHANGED_SOURCE")
-            self.win32.send_shortcut(app.hwnd, VK_S)
-            saved = self.wait_file(document, editor, "CANCEL_FOLLOWUP_SAVE_TIMEOUT")
-            observations = {
-                "editor": editor.evidence(),
-                "source_before": source_before.evidence(),
-                "source_after_cancel_save": saved.evidence(),
-                "cancel_kept_tab": True,
-                "flow": CASE_FLOWS[CASE_POINTER_CANCEL],
-                "process_context": app.security_context.evidence(),
-                "foreground_verified": True,
-            }
-        finally:
-            self.reap(app)
-        observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
-        return observations
+    def require_running(self, app: RunningApp, code: str) -> None:
+        if app.process.poll() is not None:
+            raise HarnessFailure(code)
 
-    def scenario_keyboard_discard(self) -> dict[str, Any]:
-        data, config, workspace, stderr = self.case_roots(CASE_KEYBOARD_DISCARD)
-        document = (workspace / "keyboard.md").resolve()
-        write_durable(document, ORIGINAL_BYTES)
-        source_before = sha256_file(document)
-        app = self.launch(document, data, config, workspace, stderr)
-        try:
-            discarded = self.replace_editor(app, KEYBOARD_EDIT)
-            self.win32.send_shortcut(app.hwnd, VK_W)
-            self.click_lifecycle_decision(app, "Discard")
-            wait_until(
-                lambda: self.editor_absent_while_running(app),
-                self.ui_timeout,
-                "DISCARD_TAB_CLOSE_TIMEOUT",
-            )
-            source_after = sha256_file(document)
-            if source_after != source_before:
-                raise HarnessFailure("DISCARD_CHANGED_SOURCE")
-            self.win32.post_close(app.hwnd)
-            self.wait_process_exit(app)
-            observations = {
-                "discarded_editor": discarded.evidence(),
-                "source_before": source_before.evidence(),
-                "source_after_discard": source_after.evidence(),
-                "discard_closed_tab": True,
-                "flow": CASE_FLOWS[CASE_KEYBOARD_DISCARD],
-                "process_context": app.security_context.evidence(),
-                "foreground_verified": True,
-            }
-        finally:
-            self.reap(app)
-        observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
-        return observations
-
-    def scenario_window_save(self) -> dict[str, Any]:
-        data, config, workspace, stderr = self.case_roots(CASE_WINDOW_SAVE)
-        document = (workspace / "window.md").resolve()
-        write_durable(document, ORIGINAL_BYTES)
-        app = self.launch(document, data, config, workspace, stderr)
-        try:
-            editor = self.replace_editor(app, WINDOW_EDIT)
-            self.win32.post_close(app.hwnd)
-            self.click_lifecycle_decision(app, "Save")
-            self.wait_process_exit(app, max(self.ui_timeout, 20.0))
-            saved = sha256_file(document)
-            if saved != editor:
-                raise HarnessFailure("WINDOW_SAVE_BYTES_MISMATCH")
-            observations = {
-                "editor": editor.evidence(),
-                "saved_source": saved.evidence(),
-                "flow": CASE_FLOWS[CASE_WINDOW_SAVE],
-                "window_exited": True,
-                "process_context": app.security_context.evidence(),
-                "foreground_verified": True,
-            }
-        finally:
-            self.reap(app)
-        observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
-        return observations
-
-    def scenario_external_conflict(self) -> dict[str, Any]:
-        data, config, workspace, stderr = self.case_roots(CASE_EXTERNAL_CONFLICT)
-        document = (workspace / "conflict.md").resolve()
-        write_durable(document, ORIGINAL_BYTES)
+    def external_modification(self, app: RunningApp, document: Path) -> dict[str, Any]:
+        """A same-length rewrite with the loaded mtime is refused, then overwritten."""
         loaded = sha256_file(document)
-        app = self.launch(document, data, config, workspace, stderr)
-        try:
-            dirty = self.replace_editor(app, CONFLICT_EDIT)
-            before = document.stat()
-            if len(ORIGINAL_BYTES) != len(EXTERNAL_BYTES):
-                raise HarnessFailure("FIXTURE_LENGTH_MISMATCH")
-            write_durable(document, EXTERNAL_BYTES)
-            os.utime(document, ns=(before.st_atime_ns, before.st_mtime_ns))
-            after = document.stat()
-            if after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
-                raise HarnessFailure("EXACT_MTIME_RESTORE_UNAVAILABLE")
+        dirty = self.replace_editor(app, CONFLICT_EDIT)
+        before = document.stat()
+        if len(ORIGINAL_BYTES) != len(EXTERNAL_BYTES):
+            raise HarnessFailure("FIXTURE_LENGTH_MISMATCH")
+        write_durable(document, EXTERNAL_BYTES)
+        os.utime(document, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = document.stat()
+        if after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
+            raise HarnessFailure("EXACT_MTIME_RESTORE_UNAVAILABLE")
+        rewritten = sha256_file(document)
+        if rewritten != fingerprint_bytes(EXTERNAL_BYTES):
+            raise HarnessFailure("REWRITE_NOT_OBSERVED")
 
-            # The watcher must expose the conflict before any Save input.
-            overwrite = self.find_control(
-                app,
-                CONFLICT_OVERWRITE_AUTOMATION_ID,
-                "Button",
-                "CONFLICT_OVERWRITE_UIA_TIMEOUT",
-                "CONFLICT_OVERWRITE_UIA_CONTRACT_MISMATCH",
-                self.ui_timeout,
-            )
-            external = sha256_file(document)
-            if external != fingerprint_bytes(EXTERNAL_BYTES):
-                raise HarnessFailure("WATCHER_CONFLICT_CHANGED_EXTERNAL_SOURCE")
-            if self.editor_fingerprint(app) != dirty:
-                raise HarnessFailure("WATCHER_CONFLICT_CHANGED_EDITOR")
-            self.click_control(overwrite, "CONFLICT_OVERWRITE_CLICK_FAILED")
-            saved = self.wait_file(document, dirty, "EXPLICIT_OVERWRITE_SAVE_TIMEOUT")
-            self.win32.post_close(app.hwnd)
-            self.wait_process_exit(app)
-            observations = {
-                "loaded_source": loaded.evidence(),
-                "external_source": external.evidence(),
-                "dirty_editor": dirty.evidence(),
-                "saved_after_explicit_overwrite": saved.evidence(),
-                "same_length": True,
-                "same_mtime_ns": True,
-                "watcher_conflict_before_save": True,
-                "explicit_overwrite_used": True,
-                "flow": CASE_FLOWS[CASE_EXTERNAL_CONFLICT],
-                "process_context": app.security_context.evidence(),
-                "foreground_verified": True,
-            }
-        finally:
-            self.reap(app)
-        observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
-        return observations
+        # Save must detect the same-length rewrite and refuse to write.
+        save_started = time.perf_counter()
+        self.save_via_menu(app)
+        self.wait_name(app, CONFLICT_HEADING, "Text", "SAVE_CONFLICT_UIA_TIMEOUT")
+        conflict_ms = elapsed_ms(save_started)
+        refused = sha256_file(document)
+        if refused != rewritten:
+            raise HarnessFailure("SAVE_OVERWROTE_EXTERNAL_REWRITE")
+        # The overwrite below writes the exact dirty bytes, which proves the
+        # conflict kept the buffer; no editor read is needed here.
+        keep_mine = self.find_control(
+            app,
+            KEEP_MINE_AUTOMATION_ID,
+            "Button",
+            "KEEP_MINE_UIA_TIMEOUT",
+            "KEEP_MINE_UIA_CONTRACT_MISMATCH",
+        )
+        self.click_control(keep_mine, "KEEP_MINE_CLICK_FAILED")
+        # Keep mine opens the Overwrite alert, which UIA cannot see; Enter
+        # answers it with Overwrite, proven by the written file.
+        self.confirm_system_alert(
+            app,
+            lambda: sha256_file(document) == rewritten,
+            "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+            confirmed=lambda: sha256_file(document) == dirty,
+        )
+        overwritten = self.wait_file(document, dirty, "OVERWRITE_SAVE_TIMEOUT")
+        # The next phases start from a clean, conflict-free document.
+        wait_until(
+            lambda: not self.name_present(app, CONFLICT_HEADING, "Text"),
+            self.ui_timeout,
+            "CONFLICT_NOT_RESOLVED",
+        )
+        return {
+            "external_modification_loaded_source": loaded.evidence(),
+            "external_modification_rewritten_source": rewritten.evidence(),
+            "external_modification_dirty_editor": dirty.evidence(),
+            "external_modification_source_after_refused_save": refused.evidence(),
+            "external_modification_overwritten_source": overwritten.evidence(),
+            "external_modification_conflict_ms": conflict_ms,
+        }
 
-    def scenario_recovery(self) -> dict[str, Any]:
-        data, config, workspace, stderr = self.case_roots(CASE_RECOVERY)
-        document = (workspace / "recovery.md").resolve()
-        write_durable(document, ORIGINAL_BYTES)
+    def tab_close(self, app: RunningApp, document: Path) -> dict[str, Any]:
+        """The hover-revealed rail close raises the guard; Cancel keeps the text."""
+        editor = self.replace_editor(app, POINTER_EDIT)
         source = sha256_file(document)
+        self.close_tab_by_pointer(app)
+        self.click_lifecycle_decision(app, "Cancel")
+        self.require_running(app, "CANCEL_CLOSED_PROCESS")
+        kept_source = sha256_file(document)
+        if kept_source != source:
+            raise HarnessFailure("CANCEL_CHANGED_SOURCE")
+        self.save_via_menu(app)
+        saved = self.wait_file(document, editor, "FOLLOWUP_SAVE_TIMEOUT")
+        return {
+            "tab_close_editor": editor.evidence(),
+            "tab_close_source_after_cancel": kept_source.evidence(),
+            "tab_close_saved_source": saved.evidence(),
+        }
 
-        first = self.launch(document, data, config, workspace, stderr)
+    def reopen_from_workspace_home(self, app: RunningApp) -> None:
+        """Press the workspace home's file row; wait for the source editor.
+
+        The app adds the tab only after loading the file, and the next
+        `replace_editor` reads its own text back, so no readback is needed.
+        """
+        row = self.find_control(
+            app,
+            WORKSPACE_HOME_FILE_AUTOMATION_ID,
+            "Button",
+            "WORKSPACE_HOME_FILE_UIA_TIMEOUT",
+            "WORKSPACE_HOME_FILE_UIA_CONTRACT_MISMATCH",
+        )
+        self.invoke_control(row, "WORKSPACE_HOME_FILE_INVOKE_FAILED")
+        self.activate_source_layout(app)
+
+    def window_close(self, app: RunningApp, document: Path) -> dict[str, Any]:
+        """Alt+F4 and WM_CLOSE raise the guard; its Save writes and exits.
+
+        `wait_process_exit` fails with PROCESS_EXIT_NONZERO unless the code is 0.
+        """
+        self.reopen_from_workspace_home(app)
+        editor = self.replace_editor(app, WINDOW_EDIT)
+        source = sha256_file(document)
+        self.send_alt_f4(app)
+        self.click_lifecycle_decision(app, "Cancel")
+        self.require_running(app, "ALT_F4_CANCEL_CLOSED_PROCESS")
+        untouched = sha256_file(document)
+        if untouched != source:
+            raise HarnessFailure("ALT_F4_CANCEL_CHANGED_SOURCE")
+        # The platform close must raise the guard, not close the window.
+        self.win32.post_close(app.hwnd)
+        self.click_lifecycle_decision(app, "Save")
+        self.wait_process_exit(app, max(self.ui_timeout, 20.0))
+        saved = sha256_file(document)
+        if saved != editor:
+            raise HarnessFailure("SAVE_BYTES_MISMATCH")
+        return {
+            "window_close_editor": editor.evidence(),
+            "window_close_source_after_cancel": untouched.evidence(),
+            "window_close_saved_source": saved.evidence(),
+        }
+
+    def checkpoint(self, app: RunningApp, data: Path) -> tuple[dict[str, Any], Any]:
+        """An edited buffer leaves a canonical record within the loss window."""
+        # The earlier phases' saves retire their checkpoints off the UI
+        # thread; the edit starts from a store they have emptied.
+        wait_until(
+            lambda: not canonical_recovery_records(data),
+            self.ui_timeout,
+            "RECORD_BEFORE_EDIT",
+        )
+        input_started = time.perf_counter()
+        edited = self.replace_editor(app, RECOVERY_EDIT)
+        shown_ns = time.time_ns()
+        checkpoint_ms = round(self.wait_checkpoint_record(data, input_started, shown_ns), 3)
+        return {
+            "checkpoint_editor": edited.evidence(),
+            "checkpoint_ms": checkpoint_ms,
+            "checkpoint_live_records": scan_live_recovery_records(data),
+        }, edited
+
+    def restore(self, app: RunningApp, edited: Any) -> dict[str, Any]:
+        """The relaunch offers the record; Restore brings back the exact text."""
+        started = time.perf_counter()
+        restore = self.find_control(
+            app,
+            RESTORE_AUTOMATION_ID,
+            "Button",
+            "UIA_TIMEOUT",
+            "UIA_CONTRACT_MISMATCH",
+            max(self.ui_timeout, 20.0),
+        )
+        self.click_control(restore, "CLICK_FAILED")
+        self.activate_source_layout(app)
+        restored, _ = self.wait_editor_fingerprint(app, edited, max(self.ui_timeout, 20.0))
+        return {"restore_editor": restored.evidence(), "restore_ms": elapsed_ms(started)}
+
+    def keyboard_close(self, app: RunningApp, document: Path, data: Path) -> dict[str, Any]:
+        """Ctrl+W's guard Don't save closes the restored tab unwritten and
+        retires its recovery record."""
+        source = sha256_file(document)
+        started = time.perf_counter()
+        self.focus_editor(app)
+        self.win32.send_shortcut(app.hwnd, VK_W)
+        self.click_lifecycle_decision(app, "Discard")
+        discard_started = time.perf_counter()
+        wait_until(
+            lambda: self.editor_absent_while_running(app),
+            max(self.ui_timeout, 20.0),
+            "TAB_CLOSE_TIMEOUT",
+        )
+        close_ms = elapsed_ms(started)
+        wait_until(
+            lambda: not retained_recovery_artifacts(data),
+            self.ui_timeout,
+            "RECOVERY_RECORD_RETAINED",
+        )
+        retire_ms = elapsed_ms(discard_started)
+        after = sha256_file(document)
+        if after != source:
+            raise HarnessFailure("DISCARD_CHANGED_SOURCE")
+        return {
+            "keyboard_close_source_before": source.evidence(),
+            "keyboard_close_source_after": after.evidence(),
+            "keyboard_close_ms": close_ms,
+            "keyboard_close_retire_ms": retire_ms,
+        }
+
+    def scenario_lifecycle_session(self) -> dict[str, Any]:
+        """Two launches: the interruption alone needs the restart.
+
+        The conflict runs first so its stamp is the one the app loaded; each
+        later phase starts from the document the previous one saved, restored
+        or discarded, and window close ends the second process. The relaunch
+        gets the workspace folder, not the document: an argv document would
+        open as its own clean tab beside the restored one
+        (`AppState::add_tab_with` does not deduplicate paths), and closing the
+        restored tab would leave that tab's editor on screen.
+        """
+        data, config, workspace, stderr = self.case_roots(CASE_LIFECYCLE_SESSION)
+        document = (workspace / "guarded.md").resolve()
+        write_durable(document, ORIGINAL_BYTES)
+        first: RunningApp | None = None
+        second: RunningApp | None = None
         try:
-            wait_until(first.app_log_path.exists, self.ui_timeout, "APP_LOG_STARTUP_TIMEOUT")
-            log_offset = first.app_log_path.stat().st_size
-            input_started = time.perf_counter()
-            edited = self.replace_editor(first, RECOVERY_EDIT)
-            signal_ms = self.wait_checkpoint_log(first, log_offset, input_started)
-            live_recovery_scan = scan_live_recovery_records(data)
-            self.terminate(first)
-        finally:
-            self.reap(first)
-
-        live_runtime_scan = scan_runtime_artifacts(data, stderr)
-
-        second = self.launch(document, data, config, workspace, stderr)
-        try:
-            restored, restore_ms = self.wait_editor_fingerprint(
-                second, edited, max(self.ui_timeout, 20.0)
-            )
-            self.win32.send_shortcut(second.hwnd, VK_W)
-            self.click_lifecycle_decision(second, "Discard")
-            wait_until(
-                lambda: self.editor_absent_while_running(second),
-                max(self.ui_timeout, 20.0),
-                "RECOVERY_DISCARD_CLOSE_TIMEOUT",
-            )
-            if sha256_file(document) != source:
-                raise HarnessFailure("RECOVERY_DISCARD_CHANGED_SOURCE")
-            self.win32.post_close(second.hwnd)
-            self.wait_process_exit(second, max(self.ui_timeout, 20.0))
-        finally:
-            self.reap(second)
-
-        third = self.launch(document, data, config, workspace, stderr)
-        try:
-            restart_started = time.perf_counter()
-            self.wait_recovery_startup_finished(third, max(self.ui_timeout, 20.0))
-            restarted, _ = self.wait_editor_fingerprint(
-                third, source, max(self.ui_timeout, 20.0)
-            )
-            absent_ms = (time.perf_counter() - restart_started) * 1000
-            observations = {
-                "edited_text": edited.evidence(),
-                "checkpoint_log_seen": True,
-                "checkpoint_signal": "content-free checkpoint success log",
-                "live_runtime_scan": live_runtime_scan,
-                "live_recovery_scan": live_recovery_scan,
-                "edit_to_signal_ms": round(signal_ms, 3),
-                "restored_editor": restored.evidence(),
-                "recovery_restored_exact": restored == edited,
-                "restore_ms": round(restore_ms, 3),
-                "source_after_recovery_discard": sha256_file(document).evidence(),
-                "restart_editor": restarted.evidence(),
-                "discarded_recovery_absent": restarted == source,
-                "discard_restart_absent_ms": round(absent_ms, 3),
-                "termination": "TerminateProcess",
-                "restart_count": 2,
-                "startup_finished_log_seen": True,
-                "startup_signal": "content-free recovery startup finished log",
-                "startup_observed_before_restart_editor": True,
-                "flow": CASE_FLOWS[CASE_RECOVERY],
+            with phase(LAUNCH_FIRST):
+                first = self.launch(document, data, config, workspace, stderr)
+            with phase(PHASE_EXTERNAL):
+                observations = self.external_modification(first, document)
+            with phase(PHASE_TAB_CLOSE):
+                observations |= self.tab_close(first, document)
+            with phase(PHASE_CHECKPOINT):
+                checkpoint, edited = self.checkpoint(first, data)
+                observations |= checkpoint
+                self.terminate(first)
+                self.reap(first)
+                observations["checkpoint_runtime_scan"] = scan_runtime_artifacts(data, stderr)
+            with phase(PHASE_RESTORE):
+                with phase(LAUNCH_RESTORE):
+                    second = self.launch_app(workspace, data, config, workspace, stderr)
+                observations |= self.restore(second, edited)
+            with phase(PHASE_KEYBOARD_CLOSE):
+                observations |= self.keyboard_close(second, document, data)
+            with phase(PHASE_WINDOW_CLOSE):
+                observations |= self.window_close(second, document)
+            observations |= {
+                "flow": CASE_FLOWS[CASE_LIFECYCLE_SESSION],
                 "process_contexts": [
                     first.security_context.evidence(),
                     second.security_context.evidence(),
-                    third.security_context.evidence(),
                 ],
-                "foreground_verified": True,
             }
         finally:
-            self.reap(third)
+            for app in (first, second):
+                if app is not None:
+                    self.reap(app)
         observations["runtime_scan"] = scan_runtime_artifacts(data, stderr)
+        # Every Save and Don't save retired the record; none may outlive the exit.
+        if observations["runtime_scan"]["canonical_recovery_records_scanned"]:
+            raise HarnessFailure(f"{PHASE_WINDOW_CLOSE}_RECOVERY_RECORD_RETAINED_AFTER_SAVE")
         return observations
+
 
 def native_run_plan() -> NativeRunPlan:
     return NativeRunPlan(
@@ -968,56 +716,13 @@ def native_run_plan() -> NativeRunPlan:
         preflight=preflight,
         ui_types_loader=load_pywinauto,
         harness_factory=Goal02Harness,
-        scenarios=lambda harness: (
-            harness.scenario_pointer_cancel,
-            harness.scenario_keyboard_discard,
-            harness.scenario_window_save,
-            harness.scenario_external_conflict,
-            harness.scenario_recovery,
-        ),
+        scenarios=lambda harness: (harness.scenario_lifecycle_session,),
     )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
-        "--exe",
-        type=Path,
-        default=DEFAULT_EXE,
-        help="release executable to copy and test (default: target/release/markturbo.exe)",
-    )
-    parser.add_argument(
-        "--case",
-        choices=REQUIRED_CASE_IDS,
-        help="run one case for debugging; it never produces acceptance PASS",
-    )
-    parser.add_argument(
-        "--keep-workdir-on-failure",
-        action="store_true",
-        help="preserve the isolated data, config, logs, and stderr directory after a non-PASS run",
-    )
-    parser.add_argument(
-        "--expect-exe-sha256",
-        type=normalize_expected_hash,
-        required=True,
-        help="required SHA-256 binding for the release executable",
-    )
-    parser.add_argument(
-        "--evidence",
-        type=Path,
-        default=DEFAULT_EVIDENCE,
-        help="JSON run receipt path (default: target/native-acceptance)",
-    )
-    parser.add_argument(
-        "--ui-timeout",
-        type=float,
-        default=15.0,
-        help="seconds allowed for ordinary UI state transitions (default: 15)",
-    )
-    args = parser.parse_args(argv)
-    if not math.isfinite(args.ui_timeout) or args.ui_timeout <= 0:
-        parser.error("--ui-timeout must be greater than zero")
-    return args
+    parser = evidence.build_parser(__doc__.splitlines()[0], "goal-02", REQUIRED_CASE_IDS)
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:

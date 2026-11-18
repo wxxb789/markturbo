@@ -46,7 +46,7 @@ uv run --project scripts scripts/mt.py check fast --base <base-sha> --head <head
 The test list lives in `markturbo_tools/checks.py`. It is deliberately explicit:
 native UI acceptance cannot enter a test run through discovery. The runtime
 probe is Windows-only, but its geometry unit test and the other tooling tests
-validate portable input, source contracts, or fixture behavior without a desktop.
+validate portable input or fixture behavior without a desktop.
 
 A-B-B-A scheduling, arithmetic, and paired sample tests are in the explicit
 `test_probe` suite and run with `fast`, `ci`, and `full`. Actual Windows process
@@ -73,6 +73,7 @@ uv run --project scripts scripts/mt.py release versions --tag v<version>
 uv run --project scripts scripts/mt.py release package --out dist --no-sign
 uv run --project scripts scripts/mt.py release package --out dist --self-signed
 uv run --project scripts scripts/mt.py release verify --manifest dist/release.json
+uv run --project scripts scripts/mt.py accept all --help
 uv run --project scripts scripts/mt.py accept goal-02 -- --help
 uv run --project scripts scripts/mt.py accept goal-03 -- --help
 uv run --project scripts scripts/mt.py accept goal-06 -- --help
@@ -86,7 +87,14 @@ outputs. `fixtures` deterministically regenerates committed performance
 fixtures. `probe` measures a real Windows
 process. `capacity` measures the ignored Windows DPAPI capacity test in fresh
 Cargo processes. The `accept` commands drive real Windows UI workflows and
-write fail-closed, hash-bound evidence.
+write fail-closed, hash-bound evidence; `accept all` runs every goal in one
+process and session (see [verification](../docs/verification.md#running-native-acceptance)).
+Its cases, in run order: goal-06 `fresh_endpoint_not_set_up` (one launch;
+`accept goal-06 -- --configured-provider` instead runs
+`configured_provider_session`, one launch); goal-02 `lifecycle-session` (two
+launches; the crash restart is the only one); goal-07 `revision_session` (one
+launch); goal-03 `first_use_lifecycle` (three launches). The per-phase contents are in
+[verification](../docs/verification.md#native-harness-status).
 
 `release` owns the Windows installer contract. `versions` requires Cargo,
 `crates/mt-app/nsh.json` and the release tag to agree; `package` runs
@@ -99,9 +107,10 @@ not launch the app or prove clean-machine acceptance. `--self-signed` creates a
 throwaway test certificate and publishes its `.cer`; it is not trusted
 Authenticode and cannot satisfy stable publication.
 
-Goal 02/03/06/07 acceptance defaults write working receipts under the ignored
-`target/native-acceptance/` directory, including failed and single-case runs.
-Use `--evidence` to choose another output path. Review a completed receipt before
+Goal 02/03/06/07 acceptance defaults write working receipts
+(`goal-0N-native-acceptance.json`) under the ignored `target/native-acceptance/`
+directory, including failed and single-case runs. Use `--evidence` (one goal)
+or `--evidence-dir` (`accept all`) to choose another output location. Review a completed receipt before
 copying it into `docs/evidence/` under a distinct name for retention; do not use
 an existing historical receipt as a routine run destination.
 
@@ -124,7 +133,10 @@ The canonical `evaluation verify-manifest` command also verifies Goal 07's
 immutable corpus. `revision-evaluation scaffold` writes a fail-closed v2 record
 without inventing owner values. `revision-evaluation record` consumes an external
 eligibility registry, a v2 machine receipt, a separately hash-bound native
-Goal 07 `PASS` receipt, and one metadata-only owner JSON per artifact. The
+Goal 07 `PASS` receipt (`schema_version` 4, the shared native evidence schema;
+every earlier version, including the GPUI-era records under `docs/evidence/`,
+is refused), and one metadata-only owner JSON
+per artifact. The
 machine receipt schema is `markturbo-goal-07-machine-receipt-v2`. Per case,
 `editable_source_sha256` and `editable_source_byte_count` are the SHA-256 and
 UTF-8 byte count of `proposal.source()`; `source_binding_sha256` is
@@ -182,7 +194,7 @@ $decisionDir = "docs/evidence/goal-07\composition-decisions"
 $machineReceipt = "docs/evidence/goal-07\machine-receipt.json"
 $registry = "docs/evidence/goal-07\eligibility.json"
 $ownerDir = "docs/evidence/goal-07\owner-input"
-$nativeEvidence = "docs/evidence/goal-07\goal-07-native-acceptance-v1.json"
+$nativeEvidence = "target/native-acceptance/goal-07-native-acceptance.json"
 $evidence = "docs/evidence/goal-07\revision-evaluation.json"
 
 cargo build --release --locked -p mt-core --bin markturbo-goal07-evaluate
@@ -199,7 +211,7 @@ if ($LASTEXITCODE -ne 0) { throw "machine receipt generation failed" }
 $machineSha = (Get-FileHash $machineReceipt -Algorithm SHA256).Hash.ToLowerInvariant()
 $registrySha = (uv run --project scripts python -c "import json,sys; from pathlib import Path; from scripts.markturbo_tools.revision_evaluation import canonical_registry_digest; print(canonical_registry_digest(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))))" $registry).Trim()
 $nativeEvidenceSha = (Get-FileHash $nativeEvidence -Algorithm SHA256).Hash.ToLowerInvariant()
-$nativeExecutableSha = (Get-FileHash "target\release\markturbo.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+$nativeExecutableSha = (Get-FileHash "crates\mt-app\.nsh\out\MarkTurbo\MarkTurbo.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
 
 uv run --project scripts scripts/mt.py revision-evaluation record `
   --owner-input-dir $ownerDir `
@@ -309,19 +321,19 @@ Forward an underlying script's options after `--`. For example:
 ```sh
 uv run --project scripts scripts/mt.py probe -- startup --rounds 10
 uv run --project scripts scripts/mt.py accept goal-03 -- \
-  --exe target/release/markturbo.exe \
+  --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence docs/evidence/goal-03-native-acceptance-v1.json
+  --evidence target/native-acceptance/goal-03-native-acceptance.json
 
 uv run --project scripts scripts/mt.py accept goal-06 -- \
-  --exe target/release/markturbo.exe \
+  --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence docs/evidence/goal-06-native-acceptance-v1.json
+  --evidence target/native-acceptance/goal-06-native-acceptance.json
 
 uv run --project scripts scripts/mt.py accept goal-07 -- \
-  --exe target/release/markturbo.exe \
+  --exe crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe \
   --expect-exe-sha256 <sha256> \
-  --evidence docs/evidence/goal-07-native-acceptance-v1.json
+  --evidence target/native-acceptance/goal-07-native-acceptance.json
 ```
 
 Delegated commands run from the repository root. Therefore paths supplied to
@@ -331,11 +343,11 @@ when the underlying module is invoked directly.
 ## Native evidence
 
 Native acceptance requires Windows 11 x64, an active unlocked interactive
-desktop, `pywinauto`, and a current `target/release/markturbo.exe`. Build first:
+desktop, `pywinauto`, and a current packaged `MarkTurbo.exe`. Package first:
 
 ```sh
-cargo build --release --locked -p mt-app --bin markturbo
-sha256sum target/release/markturbo.exe
+cd crates/mt-app && nsh package --target windows --out .nsh/out && cd ../..
+sha256sum crates/mt-app/.nsh/out/MarkTurbo/MarkTurbo.exe
 ```
 
 Use the measured hash in the `accept` command. `PASS` is possible only when all
@@ -350,13 +362,12 @@ The native command exit status is part of that contract: `0` is `PASS`, `1` is
 `FAIL` by the CLI.
 
 `native/runtime.py` owns hash-bound case execution, shared UIA/process
-primitives and bounded privacy byte search. Each goal module retains its own
-cases, artifact scan policy and evidence validation; Goal 07's private
+primitives and bounded privacy byte search. `native/evidence.py` owns the one
+shared evidence schema, its validation and the case artifact scan; each goal
+module retains its own cases, allowed observations and passed-case checks; Goal 07's private
 `native/goal07_provider.py` owns its synthetic Responses loopback protocol.
 The Goal 07 transport count is derived per run from recorded case observations,
-not from module-global state. Goal 03 preflight checks both the Workspace shell
-and its Welcome production module; source checks are structural safeguards, not
-proof that the shipped executable exposed those controls.
+not from module-global state.
 
 ## Evidence data
 

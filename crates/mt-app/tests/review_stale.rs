@@ -71,19 +71,25 @@ fn editing_the_reviewed_document_marks_the_result_stale() {
     .expect("wide viewport");
     app.wait_for("label:Markdown source")
         .expect("source editor");
-    app.press("text:Review").expect("open Review");
-    app.wait_for("text:Send").expect("Review disclosure");
-    app.press("text:Send").expect("send Review");
-    app.wait_for_within("text:Review ready", Duration::from_secs(20))
+    // Review is the document's one next action in the title row.
+    app.press("id:title-review").expect("open Review");
+    // Nothing leaves the device before the consent card's hold completes.
+    app.wait_for("id:consent-card").expect("Review disclosure");
+    app.long_press("id:consent-send").expect("send Review");
+    // The result is up when the field offers its one next action, and the
+    // model's understood intent is on screen.
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("Review result");
+    app.wait_for("text:keep the document intent")
+        .expect("the model's stated goal");
 
     app.type_text("label:Markdown source", "\n\nLocal edit.")
         .expect("edit the reviewed document");
-    app.wait_for_within(
-        "text:This review describes an older source revision and is stale.",
-        Duration::from_secs(5),
-    )
-    .expect("Review result marked stale");
+    // The result's banner says the source moved on under it.
+    app.wait_for_within("id:review-stale", Duration::from_secs(5))
+        .expect("Review result marked stale");
+    app.wait_for("text:Stale — edited after review")
+        .expect("stale banner names the state");
 
     let store = config.path().join("data/usage.json");
     let stored = std::fs::read_to_string(&store).expect("usage aggregate");
