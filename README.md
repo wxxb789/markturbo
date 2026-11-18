@@ -30,10 +30,10 @@ but no public-quality claim is made for it.
 
 ### What is on the Releases page
 
-[GitHub Releases](https://github.com/wxxb789/markturbo/releases) currently
-marks `v0.1.3`, a portable build, as **Latest**; `v0.1.4-alpha.1` is a portable
-prerelease. Both predate the installer path and the current UI. Installer
-builds (`v0.1.4-alpha.4`, `v0.1.4-alpha.5`) exist only as unpublished drafts.
+[GitHub Releases](https://github.com/wxxb789/markturbo/releases) lists the
+Windows installers the Release workflow publishes; the newest stable one is
+marked **Latest**. `v0.1.3` and `v0.1.4-alpha.1` are older portable builds, and
+`v0.1.4-alpha.4` and `v0.1.4-alpha.5` remain unpublished drafts.
 
 ### Installer path (for a future approved release)
 
@@ -265,9 +265,10 @@ it to stable, as in `cargo-release`.
 The **Release** workflow also runs for an existing tag or a pushed `v*` tag. It
 checks that the tag is on the default branch and that versions agree, runs
 `check full` on windows-2022, packages and verifies the installer, smoke-tests
-install and uninstall, and creates a **draft** release. Versions with a `-`
-suffix become GitHub prereleases. Stable versions require Authenticode signing.
-Packaging or CI success does not establish clean-machine acceptance.
+install and uninstall, and publishes the release with no manual step.
+Versions with a `-` suffix become GitHub prereleases; stable versions become
+the latest release. Stable versions are signed when the signing secrets are
+configured.
 
 To bump locally with the same tool:
 

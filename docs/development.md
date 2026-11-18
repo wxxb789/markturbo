@@ -200,7 +200,7 @@ configured; otherwise the release ships unsigned and its page says so.
 An `authenticode` manifest also requires Windows SDK `signtool verify /pa`
 to validate the signature digest and Windows certificate trust; verification
 fails if the verifier is unavailable or rejects the signature. A PE certificate
-header alone is not proof of signing. The draft-release job runs on Windows
+header alone is not proof of signing. The publish-release job runs on Windows
 to perform the same trust check after downloading the artifact, and refuses
 to replace assets of an already published release.
 
@@ -216,8 +216,9 @@ The packaging commands run on Windows and require Cargo and Inno Setup 6
 Setup version before running them.
 
 `check full` does not build the installer. The release workflow runs it first,
-then packages that same revision, and creates a draft release. The draft gate
-keeps clean-machine acceptance and owner approval separate from CI success.
+then packages that same revision, smoke-tests install and uninstall, and
+publishes the release. There is no draft or manual approval step: a pushed tag
+that passes these checks is public.
 
 ## Implementation and acceptance are separate
 

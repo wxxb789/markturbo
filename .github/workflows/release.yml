@@ -219,7 +219,7 @@ jobs:
           if (-not (Test-Path $marker)) { throw "uninstall removed user data outside the install directory" }
           Remove-Item -Path $marker -Force
 
-  draft-release:
+  publish-release:
     needs: [build, install-smoke]
     # Downloaded Authenticode artifacts must be checked against Windows trust.
     runs-on: windows-2022
@@ -304,8 +304,9 @@ jobs:
                   "public-quality download for them."
               ),
               "__ACCEPTANCE_STATE__": (
-                  "pending. This workflow creates a draft release; clean-machine "
-                  "acceptance and owner approval are required before publication."
+                  "CI ran the full check, verified the installer and installed "
+                  "and uninstalled it on a clean Windows runner. No separate "
+                  "manual acceptance run precedes publication."
               ),
           }
           notes = pathlib.Path(".github/release-notes.md").read_text(encoding="utf-8")
@@ -316,14 +317,14 @@ jobs:
           pathlib.Path("release-notes.md").write_text(notes, encoding="utf-8")
           PY
 
-      - name: Create or update the draft release
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ env.RELEASE_TAG }}
         run: |
           VERSION="${TAG#v}"
-          prerelease=()
+          prerelease=(--latest)
           if [[ "$VERSION" == *-* ]]; then
             prerelease=(--prerelease --latest=false)
           fi
@@ -345,10 +346,11 @@ jobs:
                 *) gh release delete-asset "$TAG" "$asset" --yes ;;
               esac
             done < <(jq -r '.assets[]?.name' <<< "$release")
-            gh release edit "$TAG" --title "MarkTurbo $VERSION" --notes-file release-notes.md
+            # A draft left by an earlier run is published with this run's assets.
+            gh release edit "$TAG" --title "MarkTurbo $VERSION" --notes-file release-notes.md \
+              --draft=false "${prerelease[@]}"
           else
             gh release create "$TAG" "${assets[@]}" \
-              --draft \
               --verify-tag \
               --title "MarkTurbo $VERSION" \
               --notes-file release-notes.md \

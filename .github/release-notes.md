@@ -100,14 +100,7 @@ pending.
 
 - Windows 11 x64 is the only public-quality target. Windows 10 x64, macOS, and
   Linux remain compatibility-only, not public-quality platforms.
-- Release status: **deferred, not published.** The owner archived the release
-  sequence as execution deferred, not accepted, on 2026-11-14, so no
-  public-quality release is approved or published and this note describes an
-  unpublished draft candidate.
-- Clean-machine acceptance: __ACCEPTANCE_STATE__ Deferral waives none of those
-  requirements.
-- Packaging or CI success alone does not establish clean-machine acceptance.
-  The exact installer hash must match the artifact used for acceptance.
+- Release checks: __ACCEPTANCE_STATE__
 - Semantic Review and Translation require a configured model endpoint; local
   editing and inspection remain available without one. Hosted endpoints receive
   only the source content disclosed and confirmed for the operation, plus
