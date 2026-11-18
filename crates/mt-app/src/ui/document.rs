@@ -208,12 +208,15 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
 
     // `Ctrl+Enter` stays the app's from the editor: the editor binds its own
     // `mod+enter` (insert a line below) each time it takes the focus, and the
-    // keymap fires the newest binding. The editor binds its keys in the round
-    // that sets its focus and only queues its `Focus` event for the core, so
-    // the app's binding made when that event arrives is always the newer one.
-    // (Rebinding on the box's focus-in instead left the editor's binding the
-    // newer one in about one `cargo test -p mt-app --lib` run in four.)
+    // keymap fires the newest binding. nsh offers no binding priority, so the
+    // app binds again after the editor, on both signs of the focus arriving:
+    // the editor's own `Focus` event (queued after the round that bound its
+    // keys; alone it lost on the Windows host's first launch) and the box's
+    // focus-in (heard at the end of the focus round; alone it lost in about
+    // one headless `--lib` run in four). The later of the two wins.
     let focuses = signal(0u64);
+    let editor_box = element_ref();
+    editor_box.on_focus_in(move || focuses.update(|count| *count += 1));
     let keys_state = state.clone();
     effect(move || {
         focuses.get();
@@ -231,6 +234,7 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
             // around it does, and it is the editor's own box.
             view()
                 .test_id("source-editor")
+                .element_ref(&editor_box)
                 .flex_1()
                 .min_h(px(0.0))
                 .h(relative(1.0))

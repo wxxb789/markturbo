@@ -1840,6 +1840,10 @@ impl AppState {
         let Some(tab) = self.active_tab() else {
             return;
         };
+        // The confirmation is modal and owns Enter once it shows; it opens
+        // from a task, and until then an Enter must not reach the focused
+        // editor and change the text the decision is about.
+        self.blur_source_editor();
         let state = self.clone();
         self.spawn_task(async move {
             let answer = alert_dialog()
