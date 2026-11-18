@@ -215,9 +215,11 @@ The packaging commands run on Windows and require Cargo and Inno Setup 6
 (`ISCC.exe`), not the `nsh` CLI; the release workflow installs the pinned Inno
 Setup version before running them.
 
-`check full` does not build the installer. The release workflow runs it first,
-then packages that same revision, smoke-tests install and uninstall, and
-publishes the release. There is no draft or manual approval step: a pushed tag
+`check full` does not build the installer, and the release workflow does not
+run it: tests and Clippy gate the pull requests that reach the default branch.
+The release workflow runs `check fast` and the formatting check, then packages
+the tagged revision (building and privacy-scanning the release binary),
+smoke-tests install and uninstall, and publishes the release. There is no draft or manual approval step: a pushed tag
 that passes these checks is public.
 
 ## Implementation and acceptance are separate

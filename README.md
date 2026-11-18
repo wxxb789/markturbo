@@ -264,7 +264,8 @@ it to stable, as in `cargo-release`.
 
 The **Release** workflow also runs for an existing tag or a pushed `v*` tag. It
 checks that the tag is on the default branch and that versions agree, runs
-`check full` on windows-2022, packages and verifies the installer, smoke-tests
+`check fast` and the formatting check on windows-2022 (tests and Clippy gate
+pull requests instead), packages and verifies the installer, smoke-tests
 install and uninstall, and publishes the release with no manual step.
 Versions with a `-` suffix become GitHub prereleases; stable versions become
 the latest release. Stable versions are signed when the signing secrets are

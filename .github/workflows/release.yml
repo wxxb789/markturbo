@@ -116,13 +116,18 @@ jobs:
           shared-key: markturbo-windows
 
       - name: Install Rust components
-        run: rustup component add rustfmt clippy
+        run: rustup component add rustfmt
 
       - name: Install Inno Setup
         run: choco install innosetup --version=6.7.1 --no-progress -y --force
 
-      - name: Check
-        run: uv run --locked --project scripts scripts/mt.py check full
+      # Tests and Clippy gate the pull requests that reach the default branch;
+      # rebuilding the workspace tests under the release profile here took
+      # hours. Packaging below builds the release binary and privacy-scans it.
+      - name: Check tooling and formatting
+        run: |
+          uv run --locked --project scripts scripts/mt.py check fast
+          cargo fmt --all -- --check
 
       - name: Stage signing credentials
         if: env.SIGNING_PFX_BASE64 != '' && env.SIGNING_PFX_PASSWORD != ''
