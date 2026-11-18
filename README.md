@@ -57,10 +57,11 @@ Get-Content ".\MarkTurbo-Setup-$version.exe.sha256"
 sha256sum --check 'MarkTurbo-Setup-<version>.exe.sha256'
 ```
 
-Do not install if the hashes differ. Stable releases require Authenticode
-signing. A prerelease may be unsigned, and its release page must say so; never
-treat an unsigned prerelease as signed. A self-signed test prerelease is not trusted by Windows until its certificate is
-installed manually.
+Do not install if the hashes differ. A release is Authenticode-signed when a
+signing certificate is configured; otherwise it is unsigned and its release
+page says so, and Windows SmartScreen may warn before it runs. A self-signed
+test prerelease is not trusted by Windows until its certificate is installed
+manually.
 
 The installer is per-user and needs no administrator rights. It installs to
 `%LOCALAPPDATA%\Programs\MarkTurbo`, creates a Start menu shortcut, registers

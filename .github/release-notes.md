@@ -3,9 +3,8 @@
 Channel: **__CHANNEL__**.
 
 <!-- CI replaces this with the complete signing status. For an unsigned
-prerelease, it must explicitly warn that the installer is unsigned; it must
-never describe an unsigned artifact as signed. Stable publication requires
-Authenticode signing. -->
+build, it must explicitly warn that the installer is unsigned; it must never
+describe an unsigned artifact as signed. -->
 __SIGNING_STATE__
 
 ## Download
@@ -35,9 +34,9 @@ Or verify the `sha256sum`-format sidecar from the download directory:
 sha256sum --check '__ARTIFACT__.sha256'
 ```
 
-Do not install if the hashes differ. Read the signing status above: an explicitly
-unsigned prerelease is not a signed stable release, and a self-signed test build
-is not trusted by Windows by default.
+Do not install if the hashes differ. Read the signing status above: an unsigned
+installer carries no publisher identity, and a self-signed test build is not
+trusted by Windows by default.
 
 ## Install
 

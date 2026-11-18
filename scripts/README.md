@@ -102,8 +102,8 @@ launch); goal-03 `first_use_lifecycle` (three launches). The per-phase contents 
 application icon (resource 1), verifies embedded fonts and sample entries,
 stages the license and third-party notices, and compiles
 `installer/markturbo.iss` with Inno Setup; `verify` rechecks the checksum,
-manifest inventory and signing policy. Stable releases require Authenticode
-credentials; an unsigned prerelease is allowed and labeled. These commands do
+manifest inventory and signing policy. `--require-signature` demands
+Authenticode credentials; an unsigned build is allowed and labeled. These commands do
 not launch the app or prove clean-machine acceptance. `--self-signed` creates a
 throwaway test certificate and publishes its `.cer`; it is not trusted
 Authenticode and cannot satisfy stable publication.

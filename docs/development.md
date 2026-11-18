@@ -193,8 +193,9 @@ fails when the executable does not carry the workspace version or embed every
 required KaTeX face or bundled sample entry, stages the project license and
 third-party notices, compiles `installer/markturbo.iss` with Inno Setup, and
 writes the SHA-256 sidecar and `release.json`. Signing reads
-`MARKTURBO_SIGN_PFX` and `MARKTURBO_SIGN_PASSWORD`; stable releases require it,
-and an unsigned prerelease is allowed only when its release page says so.
+`MARKTURBO_SIGN_PFX` and `MARKTURBO_SIGN_PASSWORD`. The release workflow
+requires a signature for a stable tag only when the signing secrets are
+configured; otherwise the release ships unsigned and its page says so.
 `release verify` rechecks the checksum, manifest inventory and signing policy.
 An `authenticode` manifest also requires Windows SDK `signtool verify /pa`
 to validate the signature digest and Windows certificate trust; verification

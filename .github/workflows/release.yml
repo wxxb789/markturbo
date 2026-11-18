@@ -135,9 +135,11 @@ jobs:
           "MARKTURBO_SIGN_PFX=$certificate" >> $env:GITHUB_ENV
           "MARKTURBO_SIGN_PASSWORD=$env:SIGNING_PFX_PASSWORD" >> $env:GITHUB_ENV
 
-      - name: Require signing for stable releases
+      - name: Require signing for stable releases when a certificate is configured
         run: |
-          $require = -not $env:RELEASE_TAG.Contains("-")
+          # Without the signing secrets a stable release ships unsigned and its
+          # release page says so; with them, signing is mandatory.
+          $require = (-not $env:RELEASE_TAG.Contains("-")) -and ($env:SIGNING_PFX_BASE64 -ne "")
           "MARKTURBO_REQUIRE_SIGNATURE=$($require.ToString().ToLower())" >> $env:GITHUB_ENV
           $selfSigned = "$env:SELF_SIGNED_INPUT" -eq "true"
           "MARKTURBO_SELF_SIGNED=$($selfSigned.ToString().ToLower())" >> $env:GITHUB_ENV
@@ -248,7 +250,10 @@ jobs:
       - name: Verify the downloaded artifact
         run: |
           arguments=(release verify --manifest release/release.json)
-          if [[ "$RELEASE_TAG" != *-* ]]; then
+          # A signed artifact must verify as trusted; an unsigned one is
+          # labelled unsigned on the release page below.
+          signing="$("$(command -v python3 || command -v python)" -c 'import json,sys; print(json.load(open(sys.argv[1]))["signing"])' release/release.json)"
+          if [[ "$RELEASE_TAG" != *-* && "$signing" == authenticode ]]; then
             arguments+=(--require-signature)
           fi
           uv run --locked --project scripts scripts/mt.py "${arguments[@]}"
@@ -282,9 +287,9 @@ jobs:
               )
           else:
               signing = (
-                  "**Unsigned prerelease.** This installer is not "
-                  "Authenticode-signed. Treat it as a development prerelease, "
-                  "not a signed stable release."
+                  "**Unsigned.** This installer is not Authenticode-signed, so "
+                  "Windows SmartScreen may warn before it runs. Verify the "
+                  "checksum below before installing."
               )
           replacements = {
               "__VERSION__": version,
