@@ -24,7 +24,7 @@ pub fn App() -> impl IntoElement {
     // ignores a font it has already seen.
     ui::fonts::register();
     let state = AppState::new();
-    if let Some(path) = std::env::var_os("MARKTURBO_OPEN").map(PathBuf::from) {
+    if let Some(path) = startup_path() {
         log::debug!("startup: opening {}", path.display());
         if path.is_dir() {
             state.open_folder(path);
@@ -73,6 +73,22 @@ pub fn App() -> impl IntoElement {
                 }
             },
         ))
+}
+
+/// The file or folder to open at startup: the first command-line argument,
+/// else `MARKTURBO_OPEN`. Read here rather than in `main.rs` because nsh's
+/// own hosts (`nsh run`, `nsh package`, `nsh.json` `"root"`) mount `App`
+/// without running `main.rs`. Test binaries take only the variable: their
+/// arguments are test filters.
+fn startup_path() -> Option<PathBuf> {
+    let argument = if cfg!(any(test, feature = "test-vault")) {
+        None
+    } else {
+        std::env::args_os().nth(1)
+    };
+    argument
+        .or_else(|| std::env::var_os("MARKTURBO_OPEN"))
+        .map(PathBuf::from)
 }
 
 /// Routes every user close of the main window (its close button, Alt+F4, the
