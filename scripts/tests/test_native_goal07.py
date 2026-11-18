@@ -555,7 +555,9 @@ class PhaseTests(unittest.TestCase):
             [
                 mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
                 mock.call._press(app, HARNESS.TRUST_SCRIPTS_AUTOMATION_ID, "WEB_TRUST"),
-                mock.call.confirm_system_alert(app, mock.ANY, "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION"),
+                mock.call.confirm_system_alert(
+                    app, mock.ANY, "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION", confirmed=mock.ANY
+                ),
                 mock.call.wait_name(app, HARNESS.TRUSTED_BANNER, "Text", "SCRIPTS_TRUSTED_TIMEOUT"),
                 mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
                 mock.call.editor_control(app),

@@ -275,9 +275,13 @@ class FakeEditorWin32:
         self.keys: list[tuple[int, int]] = []
         self.unicode_writes: list[tuple[int, str]] = []
         self.foreground: list[int] = []
+        self.frames_waited: list[int] = []
 
     def require_foreground(self, hwnd: int, _timeout: float = 2.0) -> None:
         self.foreground.append(hwnd)
+
+    def wait_frames(self, frames: int = runtime.FOCUS_SETTLE_FRAMES) -> None:
+        self.frames_waited.append(frames)
 
     def send_shortcut(self, hwnd: int, key: int) -> None:
         self.shortcuts.append((hwnd, key))
@@ -1013,6 +1017,13 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                 self.assertEqual(editor.focus_count, 1)
                 self.assertEqual(editor.value_pattern_count, 0)
 
+    def test_a_focus_change_waits_for_the_keymap_frames_before_a_key(self) -> None:
+        # The editor binds its keys and the app rebinds Ctrl+Enter as the
+        # focus moves; both reach the window a frame later.
+        unfocused, _editor = editor_harness(FakeEditorWin32("text"), timeout=1.0)
+        unfocused.focus_editor(running_app())
+        self.assertEqual(unfocused.win32.frames_waited, [runtime.FOCUS_SETTLE_FRAMES])
+
     def test_one_editor_read_queries_ui_automation_once(self) -> None:
         win32 = FakeEditorWin32("text")
         root = FakeRoot([editor_control()])
@@ -1420,6 +1431,41 @@ class SystemAlertTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT")
         self.assertNotIn(("key", 73, runtime.VK_RETURN), win32.events)
 
+    def test_an_enter_sent_before_the_alert_showed_is_sent_again(self) -> None:
+        # The alert opens from a task: the first Enter can come before it.
+        answered = {"enters": 0}
+
+        def enter() -> None:
+            answered["enters"] += 1
+
+        win32 = AlertWin32(on_enter=enter)
+        harness = self.harness(win32)
+        harness.ui_timeout = 5.0
+        harness.source_editor_has_focus = lambda _app: False
+        with (
+            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
+            mock.patch.object(runtime, "SYSTEM_ALERT_ANSWER_SECONDS", 0.05),
+        ):
+            harness.confirm_system_alert(
+                running_app(), lambda: True, "EARLY", confirmed=lambda: answered["enters"] >= 2
+            )
+        self.assertEqual(answered["enters"], 2)
+
+    def test_no_second_enter_while_the_source_editor_has_the_keyboard(self) -> None:
+        # A lost Enter in the editor would edit the very text being decided.
+        win32 = AlertWin32()
+        harness = self.harness(win32)
+        harness.ui_timeout = 5.0
+        harness.source_editor_has_focus = lambda _app: True
+        with (
+            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
+            mock.patch.object(runtime, "SYSTEM_ALERT_ANSWER_SECONDS", 0.05),
+            self.assertRaises(runtime.HarnessFailure) as raised,
+        ):
+            harness.confirm_system_alert(running_app(), lambda: True, "EARLY", confirmed=lambda: False)
+        self.assertEqual(raised.exception.code, "SYSTEM_ALERT_EDITOR_FOCUSED")
+        self.assertEqual(win32.events.count(("key", 73, runtime.VK_RETURN)), 1)
+
     def conflict_scenario(self, *, overwrite_on_keep_mine: bool, overwrite_on_enter: bool):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1483,7 +1529,7 @@ class SystemAlertTests(unittest.TestCase):
         )
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.external_modification(app, document)
-        self.assertEqual(raised.exception.code, "OVERWRITE_SAVE_TIMEOUT")
+        self.assertEqual(raised.exception.code, "SYSTEM_ALERT_UNANSWERED")
 
 
 class SourceEditorTests(unittest.TestCase):

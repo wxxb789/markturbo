@@ -466,7 +466,7 @@ class ScenarioTests(unittest.TestCase):
         for options, code in (
             (dict(keep_mine_writes=True, enter_overwrites=False),
              "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
-            (dict(enter_overwrites=False), "EXTERNAL_MODIFICATION_OVERWRITE_SAVE_TIMEOUT"),
+            (dict(enter_overwrites=False), "EXTERNAL_MODIFICATION_SYSTEM_ALERT_UNANSWERED"),
         ):
             with self.subTest(code=code):
                 self.assert_fails(code, **options)

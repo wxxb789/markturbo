@@ -559,6 +559,9 @@ class Goal07Harness(NativeHarness):
         to, never after a refocus."""
         if self.win32.foreground_focus(app.hwnd) != app.hwnd:
             raise HarnessFailure("WEB_TO_SOURCE_NATIVE_FOCUS_LOST")
+        # The keyboard just came back to the editor: its key bindings and the
+        # app's Ctrl+Enter reach the window's keymap with a later frame.
+        self.win32.wait_frames()
         self.win32.send_shortcut(app.hwnd, VK_RETURN)
         self._approve_consent(
             app,
@@ -686,6 +689,7 @@ class Goal07Harness(NativeHarness):
             app,
             lambda: not self.name_present(app, TRUSTED_BANNER, "Text"),
             "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION",
+            confirmed=lambda: self.name_present(app, TRUSTED_BANNER, "Text"),
         )
         self.wait_name(app, TRUSTED_BANNER, "Text", "SCRIPTS_TRUSTED_TIMEOUT")
         # Leaving the Web pane must hand keyboard ownership back to the main

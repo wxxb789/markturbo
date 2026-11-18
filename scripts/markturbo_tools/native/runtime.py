@@ -108,6 +108,8 @@ INTEGRITY_NAMES = {
 #   1674). `confirm_system_alert` answers with Enter; each caller proves the
 #   confirmed effect, so a cancelling Enter fails its wait.
 SYSTEM_ALERT_SETTLE_SECONDS = 0.5
+# How long one Enter's effect is awaited before the alert is answered again.
+SYSTEM_ALERT_ANSWER_SECONDS = 1.0
 EDITOR_NAME = "Markdown source"
 MENU_BUTTON_AUTOMATION_ID = "title-settings"
 MENU_SAVE_AUTOMATION_ID = "title-menu-save"
@@ -183,6 +185,8 @@ ES_DISPLAY_REQUIRED = 0x00000002
 # The one wait for the OS to hand the main window the foreground. Longer waits
 # do not help: a refused activation stays refused until the session changes.
 FOREGROUND_TIMEOUT_SECONDS = 3.0
+# Frames a focus change takes to reach the window's keymap (`focus_editor`).
+FOCUS_SETTLE_FRAMES = 2
 # How long a run waits for the operator to give the session a foreground
 # window back (`Win32.require_foreground`), and what it asks them.
 FOREGROUND_RECOVERY_SECONDS = 30.0
@@ -1267,6 +1271,19 @@ class Win32:
     def send_shortcut(self, hwnd: int, key: int) -> None:
         self.send_shortcuts(hwnd, (key,))
 
+    def wait_frames(self, frames: int = FOCUS_SETTLE_FRAMES) -> None:
+        """Wait for `frames` display frames: nsh hands the key bindings of a
+        focus change to the window with the next frame's batch."""
+        for _ in range(frames):
+            try:
+                failed = ctypes.WinDLL("dwmapi").DwmFlush() != 0
+            except OSError:
+                failed = True
+            if failed:
+                # Composition is off (a locked or remote session): one
+                # frame's time, as nsh's own test agent waits.
+                time.sleep(1 / 60)
+
     def send_shortcuts(self, hwnd: int, keys: tuple[int, ...]) -> None:
         """Press each of `keys` in turn with Ctrl held, as one SendInput batch:
         no other input can land between them."""
@@ -2203,7 +2220,11 @@ class NativeHarness:
             raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
     def confirm_system_alert(
-        self, app: RunningApp, still_undecided: Callable[[], bool], early_code: str
+        self,
+        app: RunningApp,
+        still_undecided: Callable[[], bool],
+        early_code: str,
+        confirmed: Callable[[], bool] | None = None,
     ) -> None:
         """Answer the nsh system alert that the last press opened with Enter.
 
@@ -2215,17 +2236,37 @@ class NativeHarness:
         app's own views first, where it could at most open the alert again.
         Keys reach the alert only through the main window's own keyboard focus,
         not a WebView's.
+
+        With `confirmed` (the effect the alert's confirming button has), an
+        Enter sent before the alert showed is sent again until that effect
+        appears, within `ui_timeout`: the async task that opens the alert can
+        outlast the settle delay. A retry is only sent while the source editor
+        lacks the keyboard focus, where a lost Enter cannot edit the document.
         """
         time.sleep(SYSTEM_ALERT_SETTLE_SECONDS)
         if not still_undecided():
             raise HarnessFailure(early_code)
-        self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
-        wait_until(
-            lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
-            self.ui_timeout,
-            "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT",
-        )
-        self.win32.send_key(app.hwnd, VK_RETURN)
+        deadline = time.perf_counter() + self.ui_timeout
+        while True:
+            self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
+            wait_until(
+                lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
+                self.ui_timeout,
+                "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT",
+            )
+            self.win32.send_key(app.hwnd, VK_RETURN)
+            if confirmed is None:
+                return
+            try:
+                wait_until(confirmed, SYSTEM_ALERT_ANSWER_SECONDS, "SYSTEM_ALERT_UNANSWERED")
+                return
+            except HarnessFailure as error:
+                if error.code != "SYSTEM_ALERT_UNANSWERED":
+                    raise
+            if time.perf_counter() >= deadline:
+                raise HarnessFailure("SYSTEM_ALERT_UNANSWERED")
+            if self.source_editor_has_focus(app):
+                raise HarnessFailure("SYSTEM_ALERT_EDITOR_FOCUSED")
 
     def hold_control(
         self, app: RunningApp, control: Any, seconds: float, failure_code: str
@@ -2364,6 +2405,12 @@ class NativeHarness:
             except Exception as error:
                 raise HarnessFailure("EDITOR_FOCUS_FAILED", safe_exception_name(error)) from None
         self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
+        if not focused:
+            # The editor binds its own keys (Ctrl+Enter: a new line) as it
+            # takes the focus, and the app binds its Ctrl+Enter again after
+            # it; both reach the window's keymap with a later frame. A user
+            # never presses a key within those frames, so neither does this.
+            self.win32.wait_frames()
 
     def read_text_clipboard(self) -> str | None:
         return read_clipboard_text()

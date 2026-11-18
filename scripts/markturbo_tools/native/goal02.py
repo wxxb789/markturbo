@@ -507,6 +507,7 @@ class Goal02Harness(BaseNativeHarness):
             app,
             lambda: sha256_file(document) == rewritten,
             "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+            confirmed=lambda: sha256_file(document) == dirty,
         )
         overwritten = self.wait_file(document, dirty, "OVERWRITE_SAVE_TIMEOUT")
         # The next phases start from a clean, conflict-free document.
