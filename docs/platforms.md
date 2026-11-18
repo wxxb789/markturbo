@@ -15,13 +15,13 @@ names Windows 11 x64 as the only first public-quality platform.
 | WebAssembly | No | - | - | - | Out of scope |
 
 Windows 11 x64 is the only platform with a public release contract. The app is
-built and packaged by `nsh package --target windows|macos|linux` from
-`crates/mt-app`; the executable and `nsh/` assets form the distributable, and
-the release workflow packages the per-user Windows installer, checksum sidecar
-and `release.json` described under [Windows CD
-artifact](#windows-cd-artifact). Other platforms remain useful for compile and
-compatibility coverage until their own clean-machine acceptance runs. Release
-status is **deferred**: the owner archived the release sequence as execution
+built by `cargo build --release --locked -p mt-app --bin markturbo`; that
+executable is the distributable, and the release workflow packages the
+per-user Windows installer, checksum sidecar and `release.json` described under
+[Windows CD artifact](#windows-cd-artifact). Other platforms remain useful for
+compile and compatibility coverage until their own clean-machine acceptance
+runs. Release status is **deferred**: the owner archived the release sequence
+as execution
 deferred, not accepted, on 2026-11-14, so no public-quality release is approved
 or published and nothing on this page claims an approved artifact. A
 downloadable macOS `.app` with Developer ID signing and notarization remains
@@ -105,7 +105,7 @@ verifies; do not treat `codesign --verify` as a notarization check.
 > **Migration note:** everything below this line describes the retired GPUI
 > shell. The current app is an nsh Rust app in `crates/mt-app`; run it with
 > `nsh run crates/mt-app` (or `cargo run -p mt-app`) and package it with
-> `nsh package --target windows|macos|linux`. The GPUI runtime, Wry host and
+> `scripts/mt.py release package`. The GPUI runtime, Wry host and
 > per-platform GPUI dependency notes below are historical.
 
 ## Where the support comes from
@@ -200,10 +200,10 @@ system certificate *paths* and links nothing.
 
 The release workflow produces one per-user Inno Setup installer,
 `MarkTurbo-Setup-<version>.exe`, with a `sha256sum`-format sidecar and a
-`release.json` manifest. The installer places `MarkTurbo.exe` and its `nsh/`
-metadata under `%LOCALAPPDATA%\Programs\MarkTurbo`, creates a Start menu
-shortcut, registers Shell App Paths, and ships the project license and
-third-party notices. It does not include archives, docs, or auxiliary
+`release.json` manifest. The installer places `MarkTurbo.exe` under
+`%LOCALAPPDATA%\Programs\MarkTurbo`, creates a Start menu shortcut,
+registers Shell App Paths, and ships the project license and third-party
+notices. It does not include archives, docs, or auxiliary
 payloads. Windows 11 x64 is the only public-quality target; installation,
 signing, upgrade and uninstall policy belong to the archived
 [Goal 10](goals/archive/10-ship-primary-platform-release.md), retained as

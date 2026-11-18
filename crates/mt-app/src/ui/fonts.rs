@@ -28,8 +28,10 @@ struct Face {
     data: &'static [u8],
 }
 
-/// The four faces, with the family names `ui::tokens` refers to.
-const FACES: [Face; 4] = [
+/// The four faces, with the family names `ui::tokens` refers to. A `static`,
+/// not a `const`: a `const` is copied into each crate that uses it, which put
+/// a second copy of every face in the executable.
+static FACES: [Face; 4] = [
     Face {
         family: "Martian Grotesk",
         data: include_bytes!("../../fonts/martian/MartianGrotesk-StdLt.ttf"),
@@ -66,7 +68,7 @@ pub fn family_names() -> impl Iterator<Item = &'static str> {
 /// called from [`crate::app::App`].
 pub fn register() {
     stored(spawn(async {
-        for face in FACES {
+        for face in &FACES {
             match register_font(face.data).await {
                 Ok(family) if family == face.family => {
                     log::debug!("fonts: registered {family}");

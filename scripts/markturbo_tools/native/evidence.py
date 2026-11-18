@@ -50,7 +50,7 @@ from .runtime import (
 
 REPO = Path(__file__).resolve().parents[3]
 SCHEMA_VERSION = 4
-DEFAULT_EXE = REPO / "crates" / "mt-app" / ".nsh" / "out" / "MarkTurbo" / "MarkTurbo.exe"
+DEFAULT_EXE = REPO / "target" / "release" / "markturbo.exe"
 
 EVIDENCE_KEYS = frozenset(
     {
@@ -561,7 +561,7 @@ def build_parser(description: str, goal: str, case_ids: tuple[str, ...]) -> argp
         "--exe",
         type=Path,
         default=DEFAULT_EXE,
-        help="release executable to copy and test (default: the packaged MarkTurbo.exe)",
+        help="release executable to copy and test (default: target/release/markturbo.exe)",
     )
     parser.add_argument(
         "--expect-exe-sha256",

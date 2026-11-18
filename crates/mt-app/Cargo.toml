@@ -37,7 +37,10 @@ dirs.workspace = true
 rust-embed.workspace = true
 
 nsh-core = "0.5.1"
-nsh-base = "0.5.1"
+# Only the parts the app uses: the editor and the preview's code highlighting.
+# The defaults also compile plot, rich-editor and term, which the app never
+# shows but `nsh_base::registry()` links in.
+nsh-base = { version = "0.5.1", default-features = false, features = ["editor", "highlight"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `webview` links WebKitGTK 6.0; the Web pane is part of the product surface.

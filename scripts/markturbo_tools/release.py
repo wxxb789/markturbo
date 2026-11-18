@@ -2,9 +2,14 @@
 
 The release artifact is one Inno Setup installer plus a SHA-256 sidecar and a
 JSON manifest. This module owns the release contract: version agreement across
-`Cargo.toml`, `nsh.json` and the release tag; the staged payload inventory and
-its embedded font/sample markers; Authenticode signing policy; and artifact
-verification.
+`Cargo.toml`, `nsh.json` and the release tag; the workspace-built executable,
+its application icon resource and embedded font/sample markers; the staged
+payload inventory; Authenticode signing policy; and artifact verification.
+
+The shipped executable is the workspace's own `markturbo` binary, built with
+the root `Cargo.lock`, `[patch]` and `[profile.release]`. `nsh package` is not
+used: its generated runner is a separate Cargo workspace that bypasses all
+three.
 
 Local development builds an unsigned installer. Stable releases require a
 signing certificate through `MARKTURBO_SIGN_PFX` and
@@ -20,6 +25,7 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,7 +34,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import privacy
+from . import checks, privacy
 
 ROOT = Path(__file__).resolve().parents[2]
 APP_DIR = ROOT / "crates" / "mt-app"
@@ -46,13 +52,20 @@ NOTICES = {
 PRODUCT = "MarkTurbo"
 PLATFORM = "windows-x86_64"
 APP_ID = "com.markturbo.app"
-APP_PAYLOAD = ("MarkTurbo.exe", "nsh/app.json")
-REQUIRED_PAYLOAD = (*APP_PAYLOAD, *NOTICES)
+# The installer, its shortcuts and the App Paths registration name this file.
+APP_EXE = "MarkTurbo.exe"
+REQUIRED_PAYLOAD = (APP_EXE, *NOTICES)
 # `MathFonts` excludes this face; see crates/mt-core/src/rendering/mod.rs.
 EXCLUDED_FONTS = frozenset({"KaTeX_Caligraphic-Bold.ttf"})
 FONT_MARKER_BYTES = 64
 TIMESTAMP_URL = "http://timestamp.digicert.com"
 SIGN_TIMEOUT_SECONDS = 120
+# nsh-platform-windows loads the window and taskbar icon with
+# `LoadIconW(hinstance, MAKEINTRESOURCE(1))`.
+ICON_GROUP_ID = 1
+RT_ICON = 3
+RT_GROUP_ICON = 14
+LANG_NEUTRAL = 0
 
 _VERSION = re.compile(
     r"^(?P<numeric>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))"
@@ -223,7 +236,7 @@ def verify_binary(
     fonts: Path = FONT_DIR,
     excluded_fonts: frozenset[str] = EXCLUDED_FONTS,
 ) -> None:
-    """Fail when the executable lacks an embedded font or sample entry."""
+    """Fail when the executable lacks its version, an embedded font or sample entry."""
 
     try:
         data = binary.read_bytes()
@@ -231,46 +244,29 @@ def verify_binary(
         raise ReleaseError(f"could not read {binary}: {error}") from error
     if not data:
         raise ReleaseError(f"{binary} is empty")
+    # `env!("CARGO_PKG_VERSION")` places the workspace version in the image.
+    if version.version.encode("utf-8") not in data:
+        raise ReleaseError(f"{binary} was not built from version {version.version}")
     markers = _embedded_markers(sample, fonts, excluded_fonts)
     for name, marker in markers:
         if marker not in data:
             raise ReleaseError(f"{binary} does not embed {name}")
-    app_json = binary.parent / "nsh" / "app.json"
-    if not app_json.is_file():
-        raise ReleaseError(f"{app_json} is missing from the packaged payload")
-    try:
-        metadata = json.loads(app_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ReleaseError(f"could not read {app_json}: {error}") from error
-    if not isinstance(metadata, dict):
-        raise ReleaseError(f"{app_json} is not an object")
-    if metadata.get("version") != version.version:
-        raise ReleaseError(
-            f"{app_json} version {metadata.get('version')!r} does not match "
-            f"{version.version!r}"
-        )
-    if metadata.get("name") != PRODUCT:
-        raise ReleaseError(f"{app_json} does not name {PRODUCT}")
-    if metadata.get("id") != APP_ID:
-        raise ReleaseError(f"{app_json} does not carry {APP_ID}")
 
 
 def stage_payload(
-    source: Path,
+    binary: Path,
     destination: Path,
     *,
     notices: dict[str, Path] = NOTICES,
 ) -> list[Path]:
-    """Copy one packaged app directory and validate its required files."""
+    """Stage the built executable under its installed name, plus the notices."""
 
-    if not source.is_dir():
-        raise ReleaseError(f"packaged app directory is missing: {source}")
-    for relative in APP_PAYLOAD:
-        if not (source / relative).is_file():
-            raise ReleaseError(f"packaged app is missing {relative}")
+    if not binary.is_file():
+        raise ReleaseError(f"application executable is missing: {binary}")
     if destination.exists():
         shutil.rmtree(destination)
-    shutil.copytree(source, destination)
+    destination.mkdir(parents=True)
+    shutil.copyfile(binary, destination / APP_EXE)
     for relative, notice in notices.items():
         if not notice.is_file():
             raise ReleaseError(f"release notice is missing: {notice}")
@@ -285,41 +281,24 @@ def payload_inventory(payload: Path) -> list[dict[str, object]]:
     ]
 
 
-def nsh_executable() -> str:
-    executable = os.environ.get("NSH") or shutil.which("nsh")
-    if executable is None:
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            candidate = Path(local) / "nsh" / "bin" / ("nsh.exe" if os.name == "nt" else "nsh")
-            if candidate.is_file():
-                executable = str(candidate)
-    if executable is None:
-        raise ReleaseError("the nsh CLI was not found on PATH or under %LOCALAPPDATA%\\nsh")
-    return executable
+def build_app_binary() -> Path:
+    """Build the workspace `markturbo` binary with the root lock and profile.
 
+    This is `cargo build --release --locked -p mt-app --bin markturbo`, shared
+    with `check full` so both gate the same executable.
+    """
 
-def build_packaged_app(output: Path) -> Path:
-    """Ask nsh for the Windows app bundle that the installer ships."""
-
-    output.mkdir(parents=True, exist_ok=True)
-    _run(
-        [nsh_executable(), "package", "--target", "windows", "--out", str(output)],
-        cwd=APP_DIR,
-    )
-    name = nsh_metadata().get("name")
-    if not isinstance(name, str) or not name:
-        raise ReleaseError("crates/mt-app/nsh.json does not name the packaged app")
-    packaged = output / name
-    if not packaged.is_dir():
-        raise ReleaseError(f"nsh package did not produce {packaged}")
-    return packaged
+    try:
+        return checks.build_release_binary()
+    except checks.CheckFailure as error:
+        raise ReleaseError(str(error)) from None
 
 
 def render_icon(destination: Path) -> Path:
     try:
         from PIL import Image
     except ImportError as error:
-        raise ReleaseError("Pillow is required to render the installer icon") from error
+        raise ReleaseError("Pillow is required to render the application icon") from error
     if not APP_ICON.is_file():
         raise ReleaseError(f"application icon is missing: {APP_ICON}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -331,6 +310,117 @@ def render_icon(destination: Path) -> Path:
             sizes=[(size, size) for size in (16, 24, 32, 48, 64, 128, 256)],
         )
     return destination
+
+
+def icon_group_resources(ico: bytes) -> tuple[bytes, list[tuple[int, bytes]]]:
+    """Split an ICO file into an RT_GROUP_ICON directory and its RT_ICON images.
+
+    A GRPICONDIRENTRY is an ICONDIRENTRY whose trailing 32-bit file offset is
+    replaced by the 16-bit RT_ICON resource id; image ids start at 1.
+    """
+
+    if len(ico) < 6:
+        raise ReleaseError("application icon is not an ICO file")
+    reserved, kind, count = struct.unpack_from("<HHH", ico)
+    table_end = 6 + 16 * count
+    if reserved != 0 or kind != 1 or count == 0 or len(ico) < table_end:
+        raise ReleaseError("application icon is not an ICO file")
+    group = bytearray(struct.pack("<HHH", 0, 1, count))
+    images: list[tuple[int, bytes]] = []
+    for index in range(count):
+        *fields, size, offset = struct.unpack_from("<BBBBHHII", ico, 6 + 16 * index)
+        if size == 0 or offset < table_end or offset + size > len(ico):
+            raise ReleaseError(f"application icon entry {index} is out of bounds")
+        resource_id = index + 1
+        group += struct.pack("<BBBBHHIH", *fields, size, resource_id)
+        images.append((resource_id, ico[offset : offset + size]))
+    return bytes(group), images
+
+
+def _kernel32():  # type: ignore[no-untyped-def]
+    if os.name != "nt":
+        raise ReleaseError("Windows executable resources can only be edited on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    resource = ctypes.c_void_p  # an integer id passed as MAKEINTRESOURCE
+    for name, argtypes, restype in (
+        ("BeginUpdateResourceW", [wintypes.LPCWSTR, wintypes.BOOL], wintypes.HANDLE),
+        (
+            "UpdateResourceW",
+            [wintypes.HANDLE, resource, resource, wintypes.WORD, ctypes.c_char_p, wintypes.DWORD],
+            wintypes.BOOL,
+        ),
+        ("EndUpdateResourceW", [wintypes.HANDLE, wintypes.BOOL], wintypes.BOOL),
+        ("LoadLibraryExW", [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD], wintypes.HMODULE),
+        ("FreeLibrary", [wintypes.HMODULE], wintypes.BOOL),
+        ("FindResourceW", [wintypes.HMODULE, resource, resource], wintypes.HRSRC),
+        ("LoadResource", [wintypes.HMODULE, wintypes.HRSRC], wintypes.HGLOBAL),
+        ("LockResource", [wintypes.HGLOBAL], ctypes.c_void_p),
+        ("SizeofResource", [wintypes.HMODULE, wintypes.HRSRC], wintypes.DWORD),
+    ):
+        function = getattr(kernel32, name)
+        function.argtypes = argtypes
+        function.restype = restype
+    return ctypes, kernel32
+
+
+def _windows_error(ctypes_module, action: str) -> ReleaseError:  # type: ignore[no-untyped-def]
+    code = ctypes_module.get_last_error()
+    return ReleaseError(f"{action} failed: {ctypes_module.FormatError(code).strip()} ({code})")
+
+
+def embed_icon(executable: Path, ico: Path) -> None:
+    """Write the ICO into the executable as RT_ICON images plus RT_GROUP_ICON 1."""
+
+    group, images = icon_group_resources(ico.read_bytes())
+    ctypes_module, kernel32 = _kernel32()
+    handle = kernel32.BeginUpdateResourceW(str(executable), False)
+    if not handle:
+        raise _windows_error(ctypes_module, f"BeginUpdateResourceW({executable.name})")
+    resources = [(RT_ICON, image_id, image) for image_id, image in images]
+    resources.append((RT_GROUP_ICON, ICON_GROUP_ID, group))
+    try:
+        for kind, resource_id, data in resources:
+            if not kernel32.UpdateResourceW(
+                handle, kind, resource_id, LANG_NEUTRAL, data, len(data)
+            ):
+                raise _windows_error(ctypes_module, "UpdateResourceW")
+    except BaseException:
+        kernel32.EndUpdateResourceW(handle, True)
+        raise
+    if not kernel32.EndUpdateResourceW(handle, False):
+        raise _windows_error(ctypes_module, f"EndUpdateResourceW({executable.name})")
+
+
+def verify_icon(executable: Path, ico: Path) -> None:
+    """Fail unless the icon group `LoadIconW(hinstance, 1)` resolves is this ICO."""
+
+    group, images = icon_group_resources(ico.read_bytes())
+    ctypes_module, kernel32 = _kernel32()
+    as_data = 0x00000002 | 0x00000020  # LOAD_LIBRARY_AS_DATAFILE | AS_IMAGE_RESOURCE
+    module = kernel32.LoadLibraryExW(str(executable), None, as_data)
+    if not module:
+        raise _windows_error(ctypes_module, f"LoadLibraryExW({executable.name})")
+
+    def read(kind: int, resource_id: int) -> bytes:
+        found = kernel32.FindResourceW(module, resource_id, kind)
+        if not found:
+            raise ReleaseError(f"{executable.name} has no resource type {kind} id {resource_id}")
+        pointer = kernel32.LockResource(kernel32.LoadResource(module, found))
+        if not pointer:
+            raise _windows_error(ctypes_module, "LoadResource")
+        return ctypes_module.string_at(pointer, kernel32.SizeofResource(module, found))
+
+    try:
+        if read(RT_GROUP_ICON, ICON_GROUP_ID) != group:
+            raise ReleaseError(f"{executable.name} icon group {ICON_GROUP_ID} is not the app icon")
+        for image_id, image in images:
+            if read(RT_ICON, image_id) != image:
+                raise ReleaseError(f"{executable.name} icon image {image_id} is not the app icon")
+    finally:
+        kernel32.FreeLibrary(module)
 
 
 def inno_compiler() -> str:
@@ -698,7 +788,6 @@ def verify_artifact(
 def package_release(
     output: Path,
     *,
-    payload_source: Path | None = None,
     sign: bool = True,
     require_signature: bool = False,
     self_signed: bool = False,
@@ -728,13 +817,14 @@ def package_release(
             credentials, certificate_source, certificate_thumbprint = (
                 generate_self_signed_certificate(scratch)
             )
-        packaged = (
-            payload_source if payload_source is not None else build_packaged_app(scratch / "package")
-        )
         payload = scratch / "payload"
-        stage_payload(packaged, payload)
-        verify_binary(payload / "MarkTurbo.exe", version)
-        executable = payload / "MarkTurbo.exe"
+        stage_payload(build_app_binary(), payload)
+        executable = payload / APP_EXE
+        icon = render_icon(scratch / "MarkTurbo.ico")
+        # Resources must be final before signing: the signature covers them.
+        embed_icon(executable, icon)
+        verify_icon(executable, icon)
+        verify_binary(executable, version)
         try:
             privacy.scan(ROOT, executable)
         except privacy.PrivacyScanError as error:
@@ -742,7 +832,6 @@ def package_release(
         if credentials is not None:
             sign_file(executable, credentials)
             verify_authenticode(executable, allow_untrusted=self_signed)
-        icon = render_icon(scratch / "MarkTurbo.ico")
         artifact = compile_installer(payload, output, version, icon=icon)
         if credentials is not None:
             sign_file(artifact, credentials)
@@ -819,10 +908,8 @@ def versions_command(args: argparse.Namespace) -> int:
 
 
 def package_command(args: argparse.Namespace) -> int:
-    payload = Path(args.payload) if args.payload else None
     document = package_release(
         Path(args.out),
-        payload_source=payload,
         sign=args.sign,
         require_signature=args.require_signature,
         self_signed=args.self_signed,
@@ -843,10 +930,6 @@ def parser() -> argparse.ArgumentParser:
 
     package = subcommands.add_parser("package", help="Build the installer and manifest.")
     package.add_argument("--out", default="dist", help="output directory (default: dist)")
-    package.add_argument(
-        "--payload",
-        help="use an existing nsh package directory instead of running nsh package",
-    )
     package.add_argument(
         "--no-sign",
         dest="sign",

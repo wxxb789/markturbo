@@ -22,11 +22,6 @@ fn main() -> impl std::process::Termination {
         std::process::exit(2);
     }
     mt_app::logging::init();
-    if let Some(path) = std::env::args_os().nth(1) {
-        // SAFETY: this runs before the app starts and no other thread reads the
-        // environment concurrently.
-        unsafe { std::env::set_var("MARKTURBO_OPEN", path) };
-    }
     let tokens = mt_app::ui::tokens::theme();
     // The faces travel with the root, so the first frame is already measured
     // with them (the app registers them again at startup for hosts that build
