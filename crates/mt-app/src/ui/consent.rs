@@ -20,7 +20,7 @@
 //!   above it, and the request's own framing is disclosed below it as *not
 //!   counted*: nothing here measures the wire request, so nothing here prints
 //!   a figure for it;
-//! * Cancel has the default focus and equals the send's weight; Esc always
+//! * Cancel has the default focus and is a quiet action; Esc always
 //!   cancels; `Enter` and `Space` charge the hold only while the hold control
 //!   itself has the focus — anywhere else they activate the default (Cancel) —
 //!   and a held `Ctrl+Enter` charges the same hold wherever the focus is, so
@@ -29,6 +29,8 @@
 //! * a send needs a deliberate hold: a press-and-release, a keyboard tap, an
 //!   auto-repeat or a handler's second hand never authorize anything, and each
 //!   consent is single-use;
+//! * the `Ctrl+Enter` that opened the card never charges it, however long it
+//!   is held: the card arms only after the key was let go ([`key_hold`]);
 //! * a rebuilt body drops what went with the old controls: the focus flag and
 //!   any press or key charge in flight, whose release can never arrive;
 //! * a loopback HTTP endpoint keeps its filament and row underlines plain grey
@@ -94,9 +96,24 @@ const ROW_H: f32 = 22.0;
 /// What the card may take of the window, and the chrome around its rows.
 const CARD_MAX_FRACTION: f32 = 0.80;
 const CARD_CHROME_H: f32 = 320.0;
+/// The headline's size and line: a step above the body, so the question is
+/// read first.
+const HEADLINE_SIZE: f32 = 16.0;
+const HEADLINE_LINE: f32 = 24.0;
+/// The definition list's term column (`To`, `Transport`, `API`, `Proxy`,
+/// `Scope`).
+const TERM_W: f32 = 96.0;
+/// How long `Ctrl+Enter` must stay silent before the card takes it as a hold,
+/// when the card opened on that key: longer than the slowest first
+/// auto-repeat the platforms offer (Windows' keyboard delay tops out at about
+/// 1s), so the press that opened the card, however long it is held, never
+/// charges it.
+const ARM_SILENCE_MS: f32 = 1_100.0;
 /// A tap must never complete a hold: the watchdog a key tap charges for stays
 /// short of the charge a send needs.
 const _: () = assert!(KEY_ALIVE_MS < motion::FILAMENT_CHARGE_MS);
+/// A held key's first repeat must never arm the card it opened.
+const _: () = assert!(ARM_SILENCE_MS > KEY_ALIVE_MS);
 
 /// Whether a consent is waiting: the shell dims the room and shows the card.
 pub fn is_open(state: &AppState) -> bool {
@@ -156,7 +173,25 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
         .flex_col()
         .gap(px(tokens::SPACE_4))
         .p(px(tokens::SPACE_5))
-        .bg(move || tokens::palette().room)
+        // In dark mode the card's ground is lifted a hair off the room and a
+        // hairline draws its edge: the shadow alone does not show on graphite.
+        .bg(move || {
+            let palette = tokens::palette();
+            if palette.is_dark {
+                palette.column_ground
+            } else {
+                palette.room
+            }
+        })
+        .border(px(tokens::HAIRLINE))
+        .border_color(move || {
+            let palette = tokens::palette();
+            if palette.is_dark {
+                palette.hairline
+            } else {
+                Color::TRANSPARENT
+            }
+        })
         .shadow([shadow])
         .shadow_color(AdaptiveColor::new(
             Color::rgba(0, 0, 0, 36),
@@ -169,10 +204,10 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             } else {
                 S::HeadlineReview.text(language)
             })
-            .font_family(tokens::FONT_UI)
+            .font_family(tokens::FONT_MEDIUM)
             .font_weight(tokens::WEIGHT_MEDIUM)
-            .text_size(px(tokens::TYPE_UI))
-            .line_height(px(tokens::TYPE_UI_LINE))
+            .text_size(px(HEADLINE_SIZE))
+            .line_height(px(HEADLINE_LINE))
             .text_color(move || tokens::palette().ink),
         )
         .child(dynamic(move || {
@@ -242,11 +277,15 @@ fn disclosure_body(
         .test_id("consent-disclosure")
         .flex_col()
         .gap(px(tokens::SPACE_4))
-        .child(prims::rest(SharedString::from(destination(
-            language,
-            consent.disclosure.endpoint(),
-        ))))
-        .child(scope_row(scope_state, language, waiting))
+        .child(
+            // The destination and the scope: one two-column list, terms at
+            // resting ink, values in the source face.
+            view()
+                .flex_col()
+                .gap(px(tokens::SPACE_1))
+                .child(destination_list(language, consent.disclosure.endpoint()))
+                .child(scope_row(scope_state, language, waiting)),
+        )
         .child(
             // Every row is on the card: a long manifest scrolls in place, so
             // the scope, the total and the controls stay in view.
@@ -277,12 +316,43 @@ fn disclosure_body(
                 )
                 .child(framing_section(language, loopback)),
         )
-        .child(
+        .child(prims::rest(S::Boundary.text(language)))
+}
+
+/// The destination as a definition list: where (`To`), how (`Transport`), in
+/// what wire format (`API`) and through which proxy, in that order. Each
+/// value is its own text, so a long one wraps between its words.
+fn destination_list(language: Language, endpoint: &EndpointIdentity) -> impl IntoElement {
+    let mut list = view()
+        .test_id("consent-destination")
+        .flex_col()
+        .gap(px(tokens::SPACE_1));
+    for (term, value) in destination(language, endpoint) {
+        list = list.child(
             view()
-                .flex_col()
-                .child(prims::rest(S::BoundaryFraming.text(language)))
-                .child(prims::rest(S::BoundaryContent.text(language))),
-        )
+                .flex_row()
+                .items_start()
+                .child(term_view(term.text(language)))
+                .child(
+                    text(SharedString::from(value))
+                        .font_family(tokens::FONT_SOURCE)
+                        .text_size(px(tokens::TYPE_UI))
+                        .line_height(px(tokens::TYPE_UI_LINE))
+                        .text_color(move || tokens::palette().ink)
+                        .flex_1()
+                        .min_w(px(0.0)),
+                ),
+        );
+    }
+    list
+}
+
+/// A definition list's term, in its fixed column.
+fn term_view(term: &'static str) -> impl IntoElement {
+    view()
+        .w(px(TERM_W))
+        .flex_shrink_0()
+        .child(prims::rest(term))
 }
 
 /// The scope: the words the state can bind (`Selection`, `Document`,
@@ -357,9 +427,14 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
         .test_id("consent-scope")
         .flex_row()
         .items_center()
-        .gap(px(tokens::SPACE_3))
-        .child(prims::rest(S::Scope.text(language)))
-        .children(options)
+        .child(term_view(S::Scope.text(language)))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(tokens::SPACE_3))
+                .children(options),
+        )
 }
 
 /// The scope the disclosure carries, in full ink.
@@ -449,8 +524,9 @@ fn tone_of(loopback: bool) -> Tone {
 
 /// One manifest row: path, reason, bytes right-aligned, and the under-line —
 /// white-hot as outbound data, plain grey for a loopback endpoint, ambient for
-/// what stays. Only lit rows sit on the emitter plate: what stays behind is
-/// unlit and stays on the room.
+/// what stays. Only white-hot rows sit on the emitter plate: a loopback row
+/// makes no heat claim and what stays behind is unlit, so both stay on the
+/// room.
 fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
     let label = SharedString::from(row.label.clone());
     let reason = SharedString::from(row.reason.clone());
@@ -505,8 +581,8 @@ fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
             )
     };
     let content = match tone {
-        Tone::Leaving | Tone::Loopback => prims::emitter_plate(content()).into_element(),
-        Tone::Unlit => content().into_element(),
+        Tone::Leaving => prims::emitter_plate(content()).into_element(),
+        Tone::Loopback | Tone::Unlit => content().into_element(),
     };
     view()
         .test_id(test_id)
@@ -521,7 +597,8 @@ fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
         )
 }
 
-/// The two controls: Cancel (default focus, the send's weight) and the hold.
+/// The two controls, Cancel (default focus, quiet) and the hold, then the
+/// hold's key as `kbd` chips.
 fn buttons(
     state: AppState,
     is_revision: bool,
@@ -538,10 +615,20 @@ fn buttons(
         .child(send_button(hold, language, total))
         // The keyboard route that needs no focus anywhere: Cancel is where the
         // card asks for it, and this hold works without it.
-        .child(prims::rest(S::HoldCtrlEnter.text(language)))
+        .child(
+            view()
+                .test_id("consent-key-hint")
+                .flex_row()
+                .items_center()
+                .gap(px(tokens::SPACE_1))
+                .child(prims::rest(S::OrHold.text(language)))
+                .child(prims::kbd("Ctrl"))
+                .child(prims::rest("+"))
+                .child(prims::kbd("Enter")),
+        )
 }
 
-/// Cancel: default focus, the send's weight, and it authorizes nothing.
+/// Cancel: default focus, a quiet action, and it authorizes nothing.
 fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl IntoElement {
     let reference = element_ref();
     // Cancel takes the keyboard focus as soon as the card is up, so Enter and
@@ -549,23 +636,20 @@ fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl
     // button itself: nsh focuses an input or a view that takes presses, and
     // `prims::primary_action` takes no ref, so Cancel draws its own control.
     effect(move || reference.focus());
-    view()
-        .test_id("consent-cancel")
-        .w(px(tokens::CONSENT_BUTTON_W))
-        .h(px(tokens::CONSENT_BUTTON_H))
-        .child(cancel_action(
-            i18n::t(language, Key::Cancel),
-            move || cancel(&state, is_revision),
-            reference,
-        ))
+    view().test_id("consent-cancel").child(cancel_action(
+        i18n::t(language, Key::Cancel),
+        move || cancel(&state, is_revision),
+        reference,
+    ))
 }
 
-/// `prims::primary_action`'s chrome, as the Cancel control itself: the same
-/// hairline, ink and hover step as every other local action, filling the
-/// 164x36 box the send control fills. The control is one focusable view with
-/// the ref *on it*: a component's element is a boundary the platforms cannot
-/// focus, so `Enter` would otherwise land nowhere (`nsh_base`'s button keeps
-/// its own pressable view inside it, out of the ref's reach).
+/// `prims::quiet_action`'s look, as the Cancel control itself: resting ink
+/// that steps to full ink, underlined, on hover or keyboard focus (drawn by
+/// the text, which a style on the control would not reach). The control is
+/// one focusable view with the ref *on it*: a component's element is a
+/// boundary the platforms cannot focus, so `Enter` would otherwise land
+/// nowhere (`nsh_base`'s button keeps its own pressable view inside it, out
+/// of the ref's reach).
 fn cancel_action(
     label: &'static str,
     on_press: impl Fn() + 'static,
@@ -573,19 +657,13 @@ fn cancel_action(
 ) -> AnyElement {
     view()
         .test_id("consent-cancel-button")
-        .w_full()
-        .h_full()
         .flex_row()
         .items_center()
-        .justify_center()
+        .px(px(2.0))
+        .py(px(4.0))
         .bg(Color::TRANSPARENT)
         .cursor_pointer()
-        .border(px(tokens::HAIRLINE))
-        .border_color(move || tokens::palette().ink_faint)
-        .transition_colors()
-        .duration(motion::HOVER_MS)
-        .hover(|s| s.border_color(tokens::palette().ink))
-        .focus_visible(|s| s.border_color(tokens::palette().ink))
+        .group()
         .focusable(true)
         .role(AccessibilityRole::Button)
         .label(SharedString::from(label))
@@ -596,7 +674,12 @@ fn cancel_action(
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink),
+                .text_color(move || tokens::palette().ink_rest)
+                .underline_offset(px(4.0))
+                .transition_colors()
+                .duration(motion::HOVER_MS)
+                .group_hover(|s| s.text_color(tokens::palette().ink).underline())
+                .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
         )
         .into_element()
 }
@@ -761,11 +844,36 @@ fn open_hold() -> Rc<RefCell<Option<Hold>>> {
 /// whichever effect run bound it last (a focus-in rebinds it, a tab switch
 /// unmounts it), and the hold's timers must not go with that run, or a press
 /// would never be released and the next tap would find the charge full.
+///
+/// A card that opened on `Ctrl+Enter` is not armed: the key's presses only
+/// keep the key counted as down until [`ARM_SILENCE_MS`] pass without one —
+/// the key was let go — and the press after that is the first that charges.
 pub fn key_hold() {
+    let previous = last_key().replace(Some(nsh_core::time::now()));
     let hold = open_hold().borrow().clone();
     if let Some(hold) = hold {
+        if !hold.armed.get() {
+            if previous.is_some_and(|at| elapsed_ms(at) < ARM_SILENCE_MS) {
+                return;
+            }
+            hold.armed.set(true);
+        }
         hold.owner.run(|| hold.key_press());
     }
+}
+
+/// A `Ctrl+Enter` press with no card up ([`titlebar::bind_mod_enter`]): a
+/// card it opens starts unarmed.
+pub fn note_key_press() {
+    last_key().set(Some(nsh_core::time::now()));
+}
+
+/// When `Ctrl+Enter` last reached the app, on the engine's clock.
+#[derive(Default)]
+struct LastKey(Rc<Cell<Option<Instant>>>);
+
+fn last_key() -> Rc<Cell<Option<Instant>>> {
+    global::<LastKey>().with_untracked(|last| last.0.clone())
 }
 
 /// Cancel the waiting consent, whatever it is.
@@ -898,42 +1006,44 @@ fn reason_of(language: Language, item: &OutboundItem) -> String {
     }
 }
 
-/// The destination line: where, how, and in what wire format.
-fn destination(language: Language, endpoint: &EndpointIdentity) -> String {
-    let path = endpoint.api_base_path().trim_end_matches('/');
-    // Whether the endpoint is local or remote, and what the transport does
-    // with proxies: both are disclosures of their own, never implied.
+/// The destination, term by term: where (`To`), how (`Transport`), in what
+/// wire format (`API`), and what the transport does with proxies. Whether
+/// the endpoint is local or remote and the proxy are disclosures of their
+/// own, never implied.
+fn destination(language: Language, endpoint: &EndpointIdentity) -> [(S, String); 4] {
     let location = match endpoint.location() {
         EndpointLocation::Local => S::LocalModel.text(language),
         EndpointLocation::Remote => S::Remote.text(language),
+    };
+    let transport = if endpoint.transport().encryption() == TransportEncryption::Encrypted {
+        "HTTPS"
+    } else {
+        S::Unencrypted.text(language)
     };
     let proxy = match endpoint.transport().proxy() {
         ProxyDisclosure::MayUseConfiguredProxy => S::ProxySystem.text(language),
         ProxyDisclosure::Disabled => S::ProxyDisabled.text(language),
     };
-    let address = if endpoint.transport().encryption() == TransportEncryption::Encrypted {
-        format!(
-            "{} · {}:{} · HTTPS · {} {} · {}",
-            location,
-            endpoint.host(),
-            endpoint.effective_port(),
-            endpoint.provider().label(),
-            path,
-            proxy
-        )
-    } else {
-        format!(
-            "{} · {}:{} · {} · {} {} · {}",
-            location,
-            endpoint.host(),
-            endpoint.effective_port(),
-            S::Unencrypted.text(language),
-            endpoint.provider().label(),
-            path,
-            proxy
-        )
-    };
-    format!("{} {}", S::To.text(language), address)
+    [
+        (
+            S::To,
+            format!(
+                "{location} \u{00B7} {}:{}",
+                endpoint.host(),
+                endpoint.effective_port()
+            ),
+        ),
+        (S::Transport, transport.to_owned()),
+        (
+            S::Api,
+            format!(
+                "{} {}",
+                endpoint.provider().label(),
+                endpoint.api_base_path().trim_end_matches('/')
+            ),
+        ),
+        (S::Proxy, proxy.to_owned()),
+    ]
 }
 
 /// Bytes as the card writes them: `2,140 B`.
@@ -1065,6 +1175,11 @@ struct Hold {
     notice: Rc<RefCell<Option<Spawned<()>>>>,
     /// The send fired: this consent is spent.
     spent: Rc<Cell<bool>>,
+    /// `Ctrl+Enter` may charge: false while the press that opened the card
+    /// may still be down ([`key_hold`]). The pointer and a focused control's
+    /// `Enter`/`Space` never wait for it. A rebuilt body keeps it: a held key
+    /// is still held.
+    armed: Rc<Cell<bool>>,
     /// The card's owner: the hold's timers live under it, whoever presses.
     owner: Owner,
 }
@@ -1087,6 +1202,11 @@ impl Hold {
             steps: Rc::new(RefCell::new(Vec::new())),
             notice: Rc::new(RefCell::new(None)),
             spent: Rc::new(Cell::new(false)),
+            armed: Rc::new(Cell::new(
+                last_key()
+                    .get()
+                    .is_none_or(|at| elapsed_ms(at) >= ARM_SILENCE_MS),
+            )),
             owner: Owner::current(),
         }
     }
@@ -1376,6 +1496,9 @@ enum S {
     HeadlineReview,
     HeadlineRevision,
     To,
+    Transport,
+    Api,
+    Proxy,
     Unencrypted,
     LocalModel,
     Remote,
@@ -1390,8 +1513,7 @@ enum S {
     MetadataOnly,
     RequestFraming,
     FramingReason,
-    BoundaryFraming,
-    BoundaryContent,
+    Boundary,
     Total,
     DocumentName,
     SelectionName,
@@ -1416,7 +1538,7 @@ enum S {
     Sending,
     Sent,
     HoldToSend,
-    HoldCtrlEnter,
+    OrHold,
 }
 
 impl S {
@@ -1424,13 +1546,16 @@ impl S {
         match language {
             Language::English => match self {
                 S::HeadlineReview => "Send for review?",
-                S::HeadlineRevision => "Send the revision?",
+                S::HeadlineRevision => "Ask for a revision?",
                 S::To => "To",
+                S::Transport => "Transport",
+                S::Api => "API",
+                S::Proxy => "Proxy",
                 S::Unencrypted => "HTTP (not encrypted)",
                 S::LocalModel => "Local model",
                 S::Remote => "Remote",
                 S::ProxySystem => "may use the configured system proxy",
-                S::ProxyDisabled => "proxy disabled",
+                S::ProxyDisabled => "disabled",
                 S::Scope => "Scope",
                 S::ScopeSelection => "Selection",
                 S::ScopeDocument => "Document",
@@ -1440,8 +1565,7 @@ impl S {
                 S::MetadataOnly => "Path, size and hash only",
                 S::RequestFraming => "Request framing (not counted)",
                 S::FramingReason => "headers and JSON beyond the content above",
-                S::BoundaryFraming => "Request framing crosses this boundary.",
-                S::BoundaryContent => "The disclosed source content also crosses it.",
+                S::Boundary => "This content and the request framing leave this device.",
                 S::Total => "Content total",
                 S::DocumentName => "the document",
                 S::SelectionName => "the selection",
@@ -1466,17 +1590,20 @@ impl S {
                 S::Sending => "Sending",
                 S::Sent => "Sent",
                 S::HoldToSend => "Hold to send",
-                S::HoldCtrlEnter => "Hold Ctrl+Enter to send",
+                S::OrHold => "or hold",
             },
             Language::Chinese => match self {
                 S::HeadlineReview => "发送以进行审查？",
-                S::HeadlineRevision => "发送修订？",
+                S::HeadlineRevision => "请求修订？",
                 S::To => "发送至",
+                S::Transport => "传输",
+                S::Api => "API",
+                S::Proxy => "代理",
                 S::Unencrypted => "HTTP（未加密）",
                 S::LocalModel => "本地模型",
                 S::Remote => "远程",
                 S::ProxySystem => "可能使用已配置的系统代理",
-                S::ProxyDisabled => "已禁用代理",
+                S::ProxyDisabled => "已禁用",
                 S::Scope => "范围",
                 S::ScopeSelection => "选区",
                 S::ScopeDocument => "文档",
@@ -1486,8 +1613,7 @@ impl S {
                 S::MetadataOnly => "仅路径、大小与哈希",
                 S::RequestFraming => "请求封装（未计入合计）",
                 S::FramingReason => "上述内容之外的标头与 JSON",
-                S::BoundaryFraming => "请求封装会跨越此边界。",
-                S::BoundaryContent => "上述源内容也会跨越此边界发送。",
+                S::Boundary => "此内容与请求封装都会离开此设备。",
                 S::Total => "内容合计",
                 S::DocumentName => "文档",
                 S::SelectionName => "选区",
@@ -1512,7 +1638,7 @@ impl S {
                 S::Sending => "发送中",
                 S::Sent => "已发送",
                 S::HoldToSend => "按住发送",
-                S::HoldCtrlEnter => "按住 Ctrl+Enter 发送",
+                S::OrHold => "或按住",
             },
         }
     }
@@ -1685,13 +1811,17 @@ mod tests {
             Some("http://127.0.0.1:8080/custom/v1/"),
         )
         .expect("loopback endpoint");
-        let line = destination(Language::English, &endpoint);
-        assert!(
-            line.starts_with(
-                "To Local model · 127.0.0.1:8080 · HTTP (not encrypted) · \
-                 OpenAI Responses /custom/v1 · proxy disabled"
-            ),
-            "{line}"
+        let terms = destination(Language::English, &endpoint)
+            .map(|(term, value)| (term.text(Language::English), value));
+        assert_eq!(
+            terms,
+            [
+                ("To", "Local model · 127.0.0.1:8080".to_owned()),
+                ("Transport", "HTTP (not encrypted)".to_owned()),
+                ("API", "OpenAI Responses /custom/v1".to_owned()),
+                ("Proxy", "disabled".to_owned()),
+            ],
+            "every fact, in the order the line had them"
         );
     }
 
@@ -1699,13 +1829,10 @@ mod tests {
     fn a_remote_endpoint_discloses_the_location_and_the_proxy() {
         let endpoint =
             EndpointIdentity::parse(Provider::OpenAiResponses, None).expect("the default endpoint");
-        let line = destination(Language::English, &endpoint);
-        assert!(line.contains("Remote"), "{line}");
-        assert!(
-            line.contains("may use the configured system proxy"),
-            "{line}"
-        );
-        assert!(line.contains("HTTPS"), "{line}");
+        let [to, transport, _, proxy] = destination(Language::English, &endpoint);
+        assert!(to.1.starts_with("Remote · "), "{to:?}");
+        assert_eq!(transport.1, "HTTPS");
+        assert_eq!(proxy.1, "may use the configured system proxy");
     }
 
     /// A manifest of the shape the state builds: one document and one named
@@ -1854,12 +1981,13 @@ mod tests {
             "no figure is claimed for the wire request"
         );
         assert!(
-            app.shows("Hold Ctrl+Enter to send"),
+            app.wait_for("id:consent-key-hint >> text:Enter").is_ok(),
             "the focus-independent hold is on the card"
         );
         assert!(
-            app.wait_for("text:/To Remote .* may use the configured system proxy/")
-                .is_ok(),
+            app.wait_for("id:consent-destination >> text:/^Remote · /")
+                .is_ok()
+                && app.shows("may use the configured system proxy"),
             "the destination discloses the location and the proxy"
         );
         // The scope row: the current scope in ink, the other one switchable.
@@ -1907,6 +2035,10 @@ mod tests {
             .expect("viewport");
         app.wait_for("id:consent-scope-selection >> text:Selection")
             .expect("the scope in force, in words");
+        assert!(
+            app.shows("Ask for a revision?"),
+            "the revision card's question"
+        );
         let scope_ids: Vec<String> = app
             .screen()
             .layout_nodes()

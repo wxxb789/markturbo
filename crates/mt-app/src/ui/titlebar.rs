@@ -1,8 +1,8 @@
 //! Owner lane: chrome.
 //!
 //! The 32px opaque title row: the file's name at the left (aligned with the
-//! text column), `Review` and the settings glyph at the right, and the menu
-//! the glyph opens.
+//! text column), `Review` and `Settings` at the right, and the menu
+//! `Settings` opens.
 //!
 //! Contract: [`title_row`] fills the row and owns its height and its padding.
 //! The window runs with the system title bar hidden (`shell` sets it), so the
@@ -11,13 +11,15 @@
 //!
 //! `Review` is the row's one action: it is the document's one next step and it
 //! sits at full ink. Every other command — the pane modes, Context, Save and
-//! Save As among them — lives in the settings glyph's menu, which also carries
-//! Quit, and pressing the file's name opens Context (the spec's "'Context'
-//! expands the title row's file path"). The row holds nothing else, at any
-//! width.
+//! Save As among them — lives in the `Settings` menu, which also carries
+//! Quit, names the shortcuts its commands have and marks the pane on screen;
+//! pressing the file's name opens Context (the spec's "'Context' expands the
+//! title row's file path"). The row holds nothing else, at any width.
 
 use mt_core::settings::Language;
-use nsh_core::{Color, element::KeyOptions, keymap::When, prelude::*};
+use nsh_core::{
+    AccessibilityCurrent, AccessibilityState, Color, element::KeyOptions, keymap::When, prelude::*,
+};
 
 use crate::{
     i18n::{self, Key},
@@ -27,12 +29,15 @@ use crate::{
         motion::HOVER_MS,
         notices, prims, revision, shell,
         tokens::{
-            self, COLUMN_GAP, HAIRLINE, RAIL_W, SPACE_1, SPACE_2, SPACE_3, TITLE_ROW_H, TYPE_UI,
-            TYPE_UI_LINE,
+            self, COLUMN_GAP, HAIRLINE, RAIL_DOT, RAIL_W, SPACE_1, SPACE_2, SPACE_3, TITLE_ROW_H,
+            TYPE_UI, TYPE_UI_LINE,
         },
         welcome,
     },
 };
+
+/// The menu's width: every row and its shortcut stay on one line.
+const MENU_W: f32 = 240.0;
 
 /// The title row. `state` is the shell's handle on the app; `language` is the
 /// language the shell was re-keyed with.
@@ -50,6 +55,10 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     });
     let new_state = state.clone();
     on_key("mod+n", move |_: &str| new_state.new_document());
+    // Save; an untitled document goes to Save As. The source editor binds no
+    // `mod+s`, so the default `when` fires it from the editor too.
+    let save_state = state.clone();
+    on_key("mod+s", move |_: &str| save_state.save_active());
     let save_as_state = state.clone();
     on_key("shift+mod+s", move |_: &str| {
         if save_as_state.active.get().is_some() {
@@ -98,7 +107,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         .child(when(move || menu.get(), {
             move || menu_scrim(menu).into_element()
         }))
-        // No document, no name (the welcome): the row holds the glyph alone.
+        // No document, no name (the welcome): the row holds `Settings` alone.
         .child(when(
             {
                 let state = state.clone();
@@ -156,6 +165,9 @@ fn mod_enter(state: &AppState) {
         consent::key_hold();
         return;
     }
+    // A card this press opens must not read the same key's repeats as a
+    // hold: it arms only once the key was let go.
+    consent::note_key_press();
     if revision::done_applies(state) {
         revision::done(state);
         return;
@@ -191,7 +203,7 @@ fn file_name(state: AppState) -> impl IntoElement {
         .flex_row()
         .items_center()
         .gap(px(SPACE_2))
-        // The name gives way first: `Review` and the glyph keep their room at
+        // The name gives way first: `Review` and `Settings` keep their room at
         // any width, and a long name truncates instead of running under them.
         .flex_shrink(1.0)
         .min_w(px(0.0))
@@ -254,32 +266,40 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
     when(can_review, move || {
         let start = state.clone();
         let review = i18n::t(language, Key::Review);
-        row_action("title-review", review, review, move || start.start_review()).into_element()
+        row_action("title-review", review, true, move || start.start_review()).into_element()
     })
 }
 
-/// The glyph that opens the row's menu: the room's one icon.
+/// `Settings`, the word that opens the row's menu: quieter than `Review`,
+/// and it tells screen readers whether its menu is open.
 fn menu_anchor(state: AppState, language: Language, menu: Signal<bool>) -> impl IntoElement {
     let panel_state = state;
     view()
         .test_id("title-menu-anchor")
         .relative()
-        // The room's one icon; screen readers (and tests) name it 'Settings'.
-        .child(row_action(
-            "title-settings",
-            "\u{2699}",
-            i18n::t(language, Key::Settings),
-            move || {
-                menu.update(|open| *open = !*open);
-            },
-        ))
+        .child(
+            row_action(
+                "title-settings",
+                i18n::t(language, Key::Settings),
+                false,
+                move || {
+                    menu.update(|open| *open = !*open);
+                },
+            )
+            .accessibility_state(move || AccessibilityState {
+                expanded: Some(menu.get()),
+                has_popup: true,
+                ..AccessibilityState::default()
+            }),
+        )
         .child(when(move || menu.get(), {
             move || menu_panel(panel_state.clone(), language, menu).into_element()
         }))
 }
 
-/// The row's menu, under the glyph: the document's actions, Context, the
-/// settings page, and Quit.
+/// The row's menu, under `Settings`: the document's actions with their
+/// shortcuts, the panes with the one on screen marked, Context, the settings
+/// page, and Quit.
 fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl IntoElement {
     let document = {
         let state = state.clone();
@@ -290,7 +310,7 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
         .absolute()
         .top(px(TITLE_ROW_H))
         .right(px(0.0))
-        .w(px(200.0))
+        .w(px(MENU_W))
         .flex_col()
         .py(px(SPACE_2))
         .bg(move || tokens::palette().room)
@@ -307,6 +327,7 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
             menu_row(
                 "title-menu-open-folder",
                 s(S::OpenFolder, language),
+                Some(shortcut(false, "O")),
                 move || {
                     menu.set(false);
                     welcome::choose_folder(open_state.clone());
@@ -318,17 +339,27 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
         // opened from: the new document becomes the active tab.
         .child({
             let new_state = state.clone();
-            menu_row("title-menu-new-file", s(S::NewFile, language), move || {
-                menu.set(false);
-                new_state.new_document();
-            })
+            menu_row(
+                "title-menu-new-file",
+                s(S::NewFile, language),
+                Some(shortcut(false, "N")),
+                move || {
+                    menu.set(false);
+                    new_state.new_document();
+                },
+            )
         })
         .child({
             let paste_state = state.clone();
-            menu_row("title-menu-paste", s(S::PasteAsNew, language), move || {
-                menu.set(false);
-                paste_state.new_from_clipboard();
-            })
+            menu_row(
+                "title-menu-paste",
+                s(S::PasteAsNew, language),
+                None,
+                move || {
+                    menu.set(false);
+                    paste_state.new_from_clipboard();
+                },
+            )
         })
         .child(
             view()
@@ -341,90 +372,67 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
             let state = state.clone();
             move || {
                 // Every row closes the menu first, then does its one thing.
-                let row = |test_id: &'static str, label: &'static str, run: fn(&AppState)| {
+                let row = |test_id: &'static str,
+                           label: &'static str,
+                           hint: Option<SharedString>,
+                           run: fn(&AppState)| {
                     let state = state.clone();
-                    menu_row(test_id, label, move || {
+                    menu_row(test_id, label, hint, move || {
                         menu.set(false);
                         run(&state);
                     })
+                    .into_element()
+                };
+                // A pane's row: the pane on screen carries the mark.
+                let pane = |test_id: &'static str, label: &'static str, pane: Pane| {
+                    pane_row(&state, menu, test_id, label, pane)
                 };
                 view()
-                    .child(
-                        row("title-menu-save", i18n::t(language, Key::Save), |state| {
-                            state.save_active();
-                        })
-                        .into_element(),
-                    )
-                    .child(
-                        row("title-menu-save-as", s(S::SaveAs, language), |state| {
-                            state.save_as_active()
-                        })
-                        .into_element(),
-                    )
-                    .child(
-                        row(
-                            "title-menu-edit",
-                            i18n::t(language, Key::ModeSource),
-                            |state| {
-                                if let Some(tab) = state.active_tab() {
-                                    state.set_pane(tab.id, Pane::Source);
-                                }
-                            },
-                        )
-                        .into_element(),
-                    )
-                    .child(
-                        row(
-                            "title-menu-preview",
-                            i18n::t(language, Key::ModeNative),
-                            |state| {
-                                if let Some(tab) = state.active_tab() {
-                                    state.set_pane(tab.id, Pane::Preview);
-                                }
-                            },
-                        )
-                        .into_element(),
-                    )
-                    .child(
-                        row("title-menu-split", s(S::Split, language), |state| {
-                            if let Some(tab) = state.active_tab() {
-                                state.set_pane(tab.id, Pane::Split);
-                            }
-                        })
-                        .into_element(),
-                    )
-                    .child(
-                        row("title-menu-web", s(S::WebPreview, language), |state| {
-                            if let Some(tab) = state.active_tab() {
-                                state.set_pane(tab.id, Pane::Web);
-                            }
-                        })
-                        .into_element(),
-                    )
-                    .child(
-                        row("title-menu-split-web", s(S::SplitWeb, language), |state| {
-                            if let Some(tab) = state.active_tab() {
-                                state.set_pane(tab.id, Pane::SplitWeb);
-                            }
-                        })
-                        .into_element(),
-                    )
-                    .child(
-                        row(
-                            "title-menu-translate",
-                            i18n::t(language, Key::Translate),
-                            |state| state.translate_active(),
-                        )
-                        .into_element(),
-                    )
-                    .child(
-                        row(
-                            "title-menu-review-selection",
-                            s(S::ReviewSelection, language),
-                            |state| state.start_review_selection(),
-                        )
-                        .into_element(),
-                    )
+                    .child(row(
+                        "title-menu-save",
+                        i18n::t(language, Key::Save),
+                        Some(shortcut(false, "S")),
+                        |state| state.save_active(),
+                    ))
+                    .child(row(
+                        "title-menu-save-as",
+                        s(S::SaveAs, language),
+                        Some(shortcut(true, "S")),
+                        |state| state.save_as_active(),
+                    ))
+                    .child(pane(
+                        "title-menu-edit",
+                        i18n::t(language, Key::ModeSource),
+                        Pane::Source,
+                    ))
+                    .child(pane(
+                        "title-menu-preview",
+                        i18n::t(language, Key::ModeNative),
+                        Pane::Preview,
+                    ))
+                    .child(pane("title-menu-split", s(S::Split, language), Pane::Split))
+                    .child(pane(
+                        "title-menu-web",
+                        s(S::WebPreview, language),
+                        Pane::Web,
+                    ))
+                    .child(pane(
+                        "title-menu-split-web",
+                        s(S::SplitWeb, language),
+                        Pane::SplitWeb,
+                    ))
+                    .child(row(
+                        "title-menu-translate",
+                        i18n::t(language, Key::Translate),
+                        None,
+                        |state| state.translate_active(),
+                    ))
+                    .child(row(
+                        "title-menu-review-selection",
+                        s(S::ReviewSelection, language),
+                        None,
+                        |state| state.start_review_selection(),
+                    ))
                     .into_element()
             }
         }))
@@ -467,10 +475,66 @@ fn menu_item(
     run: fn(&AppState),
 ) -> impl IntoElement {
     let state = state.clone();
-    menu_row(test_id, label, move || {
+    menu_row(test_id, label, None, move || {
         menu.set(false);
         run(&state);
     })
+}
+
+/// A pane's row: it shows the active document in `pane`. The pane on screen
+/// carries the mark — the rail's dot, where a shortcut would be — and is the
+/// current item for screen readers.
+fn pane_row(
+    state: &AppState,
+    menu: Signal<bool>,
+    test_id: &'static str,
+    label: &'static str,
+    pane: Pane,
+) -> AnyElement {
+    let on_screen = {
+        let state = state.clone();
+        move || state.active_tab().is_some_and(|tab| tab.pane.get() == pane)
+    };
+    let current = on_screen.clone();
+    let state = state.clone();
+    menu_row(test_id, label, None, move || {
+        menu.set(false);
+        if let Some(tab) = state.active_tab() {
+            state.set_pane(tab.id, pane);
+        }
+    })
+    .accessibility_state(move || AccessibilityState {
+        current: current().then_some(AccessibilityCurrent::True),
+        ..AccessibilityState::default()
+    })
+    .child(when(on_screen, || {
+        view()
+            .w(px(RAIL_DOT))
+            .h(px(RAIL_DOT))
+            .rounded(px(RAIL_DOT / 2.0))
+            .flex_shrink_0()
+            .bg(move || tokens::palette().ink)
+            .into_element()
+    }))
+    .into_element()
+}
+
+/// A shortcut as the menu names it: `Ctrl+S`, `Ctrl+Shift+S`; `⌘S`, `⇧⌘S`
+/// where `mod` is Command.
+fn shortcut(shift: bool, key: &str) -> SharedString {
+    SharedString::from(match (apple_keys(), shift) {
+        (true, false) => format!("\u{2318}{key}"),
+        (true, true) => format!("\u{21E7}\u{2318}{key}"),
+        (false, false) => format!("Ctrl+{key}"),
+        (false, true) => format!("Ctrl+Shift+{key}"),
+    })
+}
+
+/// A caption's ink: quieter than a row's label and still text contrast —
+/// body ink's hue at .54 (dark) / .66 (light).
+fn caption_ink() -> Color {
+    let palette = tokens::palette();
+    palette.ink_at(if palette.is_dark { 0.54 } else { 0.66 })
 }
 
 /// The click-catcher under the menu: a press anywhere else closes it. It is
@@ -489,12 +553,16 @@ fn menu_scrim(menu: Signal<bool>) -> impl IntoElement {
         .on_press(move || menu.set(false))
 }
 
-/// One row of the menu: quiet ink, full ink on hover.
+/// One row of the menu, on one line: its label at quiet ink (full ink and
+/// underlined on hover or keyboard focus), then the shortcut it has, if any,
+/// right-aligned in caption ink. The label's text draws the hover itself: a
+/// style on the row would not reach it.
 fn menu_row(
     test_id: &'static str,
     label: &'static str,
+    hint: Option<SharedString>,
     on_press: impl Fn() + 'static,
-) -> impl Interactive + ParentElement {
+) -> View {
     view()
         .test_id(test_id)
         .w_full()
@@ -503,67 +571,105 @@ fn menu_row(
         .window_drag(false)
         .cursor_pointer()
         .bg(Color::TRANSPARENT)
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_3))
         .px(px(SPACE_3))
         .py(px(SPACE_2))
-        .transition_colors()
-        .duration(HOVER_MS)
-        .hover(|s| s.text_color(tokens::palette().ink).underline())
-        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+        .group()
         .on_press(on_press)
         .child(
             text(label)
                 .font_family(tokens::FONT_UI)
                 .text_size(px(TYPE_UI))
                 .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest),
+                .text_color(move || tokens::palette().ink_rest)
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .transition_colors()
+                .duration(HOVER_MS)
+                .group_hover(|s| s.text_color(tokens::palette().ink).underline())
+                .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
         )
+        .children(hint.map(|hint| {
+            text(hint)
+                .font_family(tokens::FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(caption_ink)
+                .flex_shrink_0()
+                .into_element()
+        }))
 }
 
-/// A title-row action at the app's one plain emphasis — body ink over a 34%
-/// underline (the prototype's `.act`) — the underline stepping to full ink on
-/// hover, and the designed ring when it has the keyboard focus. No heat: it
-/// is local work, lit by ambient ink.
+/// A title-row action, named as it reads. `strong` is `Review`, the app's one
+/// plain emphasis: the medium face at body ink over a 34% underline (the
+/// prototype's `.act`), the underline stepping to full ink on hover or
+/// keyboard focus. Otherwise (`Settings`) resting ink that steps to full ink,
+/// underlined, on hover or focus. No heat: it is local work, lit by ambient
+/// ink. The underline is the text's own: a decoration on the view around it
+/// would not reach the glyphs.
 fn row_action(
     test_id: &'static str,
-    label: impl Into<SharedString>,
-    accessible_label: &'static str,
+    label: &'static str,
+    strong: bool,
     on_press: impl Fn() + 'static,
-) -> impl Interactive + ParentElement {
-    let label: SharedString = label.into();
+) -> View {
+    let mut label_text = text(label)
+        .font_family(if strong {
+            tokens::FONT_MEDIUM
+        } else {
+            tokens::FONT_UI
+        })
+        .font_weight(if strong {
+            tokens::WEIGHT_MEDIUM
+        } else {
+            tokens::WEIGHT_UI
+        })
+        .text_size(px(TYPE_UI))
+        .line_height(px(TYPE_UI_LINE))
+        .text_color(move || {
+            if strong {
+                tokens::palette().ink
+            } else {
+                tokens::palette().ink_rest
+            }
+        })
+        .underline_offset(px(4.0))
+        .transition_colors()
+        .duration(HOVER_MS)
+        .group_hover(|s| {
+            s.text_color(tokens::palette().ink)
+                .underline()
+                .text_decoration_color(tokens::palette().ink)
+        })
+        .group_focus_visible(|s| {
+            s.text_color(tokens::palette().ink)
+                .underline()
+                .text_decoration_color(tokens::palette().ink)
+        });
+    if strong {
+        label_text = label_text
+            .underline()
+            .text_decoration_color(move || tokens::palette().ink_at(0.34));
+    }
     // A plain press target, not `nsh_base`'s button: the control itself
     // carries the test id, so a test presses `id:` and lands on the view that
     // hears the press.
     view()
         .test_id(test_id)
         .role(AccessibilityRole::Button)
-        .optional_label(Some(SharedString::from(accessible_label)))
+        .optional_label(Some(SharedString::from(label)))
         .window_drag(false)
         .cursor_pointer()
         .bg(Color::TRANSPARENT)
         .rounded(px(0.0))
         .px(px(SPACE_1))
         .py(px(SPACE_1))
-        .underline()
-        .underline_offset(px(4.0))
-        .text_decoration_color(move || tokens::palette().ink_at(0.34))
-        .transition_colors()
-        .duration(HOVER_MS)
-        .hover(|s| {
-            s.text_color(tokens::palette().ink)
-                .text_decoration_color(tokens::palette().ink)
-        })
-        .focus_visible(|s| {
-            s.text_color(tokens::palette().ink)
-                .text_decoration_color(tokens::palette().ink)
-        })
+        .group()
         .on_press(on_press)
-        .child(
-            text(label)
-                .font_family(tokens::FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink),
-        )
+        .child(label_text)
 }
 
 /// The title row's copy. New strings live here rather than in `i18n.rs` (a
