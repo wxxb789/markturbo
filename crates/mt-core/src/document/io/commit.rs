@@ -468,14 +468,6 @@ fn verify_skill_path_preconditions(
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const SKILL_LINKAT_NOFOLLOW_FLAGS: std::ffi::c_int = if cfg!(target_os = "macos") {
-    // Darwin <sys/fcntl.h>: AT_SYMLINK_NOFOLLOW_ANY.
-    0x0800
-} else {
-    0
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn cstring_skill_name(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt as _;
     std::ffi::CString::new(name.as_bytes())
@@ -657,16 +649,12 @@ fn link_skill_name_raw(
             flags: std::ffi::c_int,
         ) -> std::ffi::c_int;
     }
+    // No flags: without AT_SYMLINK_FOLLOW, linkat links a symlink itself rather
+    // than its target, and both names are single components of the pinned
+    // root, so there is no intermediate component to guard. Darwin's
+    // AT_SYMLINK_NOFOLLOW_ANY is not accepted by linkat on macOS 15.
     // SAFETY: caller supplies live dirfd and NUL-terminated single components.
-    unsafe {
-        linkat(
-            root_fd,
-            source,
-            root_fd,
-            target,
-            SKILL_LINKAT_NOFOLLOW_FLAGS,
-        )
-    }
+    unsafe { linkat(root_fd, source, root_fd, target, 0) }
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -754,8 +742,11 @@ fn exchange_skill_names(
     }
     let source = cstring_skill_name(source)?;
     let target = cstring_skill_name(target)?;
-    // Darwin <sys/stdio.h>: RENAME_SWAP | RENAME_NOFOLLOW_ANY.
-    const RENAME_SWAP_NOFOLLOW: c_uint = 0x2 | 0x10;
+    // Darwin <sys/stdio.h>: RENAME_SWAP. A rename never follows the names it
+    // moves, and both are single components of the pinned root, so
+    // RENAME_NOFOLLOW_ANY would guard nothing (and, like the linkat flag, it
+    // is a recent Darwin addition).
+    const RENAME_SWAP: c_uint = 0x2;
     // SAFETY: root_fd is pinned and both names are NUL-terminated components.
     let result = unsafe {
         renameatx_np(
@@ -763,7 +754,7 @@ fn exchange_skill_names(
             source.as_ptr(),
             root.directory().as_raw_fd(),
             target.as_ptr(),
-            RENAME_SWAP_NOFOLLOW,
+            RENAME_SWAP,
         )
     };
     if result < 0 {
