@@ -756,6 +756,10 @@ mod tests {
         .expect("a narrow window");
         app.wait_for("label:Markdown source")
             .expect("the source editor");
+        // A document opens in Source; the user picks Split.
+        app.press("id:title-settings")
+            .expect("open the glyph's menu");
+        app.press("id:title-menu-split").expect("choose Split");
         app.wait_for("id:preview-field").expect("the field renders");
         app.wait_for("text:Release plan")
             .expect("the document renders");

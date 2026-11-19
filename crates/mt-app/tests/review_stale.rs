@@ -88,8 +88,13 @@ fn editing_the_reviewed_document_marks_the_result_stale() {
     // The result's banner says the source moved on under it.
     app.wait_for_within("id:review-stale", Duration::from_secs(5))
         .expect("Review result marked stale");
-    app.wait_for("text:Stale — edited after review")
+    app.wait_for("text:Text changed since this review")
         .expect("stale banner names the state");
+    // Review again is the one next step: no Revision is prepared from a
+    // review of text that is gone.
+    app.wait_for_gone("id:review-prepare", Duration::from_secs(5))
+        .expect("a stale review offers no Prepare revision");
+    app.wait_for("id:review-again").expect("Review again stays");
 
     let store = config.path().join("data/usage.json");
     let stored = std::fs::read_to_string(&store).expect("usage aggregate");

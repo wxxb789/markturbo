@@ -27,7 +27,8 @@ fn switching_tabs_swaps_the_document_surface() {
     app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
         .expect("wide viewport");
 
-    app.wait_for("text:First heading").expect("first document");
+    app.wait_for("text:# First heading")
+        .expect("first document");
     app.wait_for("label:Markdown source")
         .expect("first source editor");
 
@@ -39,9 +40,9 @@ fn switching_tabs_swaps_the_document_surface() {
     app.type_text("id:palette-input", "second")
         .expect("filter to second.md");
     app.submit("id:palette-input").expect("open second.md");
-    app.wait_for("text:Second heading")
+    app.wait_for("text:# Second heading")
         .expect("second document replaces the first");
-    app.wait_for_gone("text:First heading", Duration::from_secs(5))
+    app.wait_for_gone("text:# First heading", Duration::from_secs(5))
         .expect("first document surface is gone");
     assert_eq!(
         app.screen().count("id:rail-file-row").expect("selector"),

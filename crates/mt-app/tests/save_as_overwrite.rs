@@ -87,7 +87,7 @@ fn save_as_replaces_a_confirmed_existing_destination() {
     app.type_text("id:palette-input", "second")
         .expect("filter to second.md");
     app.submit("id:palette-input").expect("open second.md");
-    app.wait_for("text:Second heading")
+    app.wait_for("text:# Second heading")
         .expect("second document");
     app.type_text("label:Markdown source", "Edited second. ")
         .expect("edit second");
