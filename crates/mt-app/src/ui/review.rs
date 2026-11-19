@@ -25,7 +25,7 @@ use mt_core::{
     review::{ArtifactLens, ClarificationPriority, provider::REVIEW_REQUEST_TIMEOUT},
     settings::Language,
 };
-use nsh_base::{button, input};
+use nsh_base::input;
 use nsh_core::{Color, EllipsizeMode, element::KeyOptions, keymap::When, prelude::*};
 
 use crate::{
@@ -789,21 +789,18 @@ fn questions(
                     let order = order.to_vec();
                     move || reopen_question(session, &order, index)
                 };
+                // The line is the button itself, as `prims::press_target` is: a
+                // pressable view around a named button reads as a second,
+                // unnamed button to UIA.
                 view()
                     .test_id("review-question-line")
+                    .role(AccessibilityRole::Button)
+                    .optional_label(Some(SharedString::from(text.clone())))
                     .w_full()
-                    .on_press(reopen.clone())
-                    .child(
-                        button()
-                            .accessibility_label(Some(SharedString::from(text.clone())))
-                            .w_full()
-                            .p(px(0.0))
-                            .bg(Color::TRANSPARENT)
-                            .cursor_pointer()
-                            .focus_visible(|style| style.text_color(tokens::palette().ink))
-                            .on_press(reopen)
-                            .child(row),
-                    )
+                    .cursor_pointer()
+                    .focus_visible(|style| style.text_color(tokens::palette().ink))
+                    .on_press(reopen)
+                    .child(row)
                     .into_element()
             })),
     );
@@ -1061,19 +1058,17 @@ fn step_control(
 ) -> AnyElement {
     let state = state.clone();
     let step = move || step_finding(&state, session, delta);
+    // The control is the button itself, as `prims::press_target` is: a
+    // pressable view around a named button reads as a second, unnamed button
+    // to UIA.
     view()
         .test_id(id)
-        .on_press(step.clone())
-        .child(
-            button()
-                .accessibility_label(Some(SharedString::from(s(label, language))))
-                .p(px(0.0))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .focus_visible(|style| style.text_color(tokens::palette().ink))
-                .on_press(step)
-                .child(prims::kbd(key)),
-        )
+        .role(AccessibilityRole::Button)
+        .optional_label(Some(SharedString::from(s(label, language))))
+        .cursor_pointer()
+        .focus_visible(|style| style.text_color(tokens::palette().ink))
+        .on_press(step)
+        .child(prims::kbd(key))
         .into_element()
 }
 
