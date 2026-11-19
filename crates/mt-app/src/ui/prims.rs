@@ -70,13 +70,14 @@ pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
         .text_color(move || tokens::palette().ink_rest)
 }
 
-/// Non-text ink: rules, dots, disabled states.
+/// Caption ink: the quietest text that must still be read (hints,
+/// disclosures, secondary lines), at 4.5:1 or better on every ground.
 pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
-        .text_color(move || tokens::palette().ink_faint)
+        .text_color(move || tokens::palette().ink_caption)
 }
 
 /// Source-mode ink: Martian Mono at 14/24, in the given colour.
@@ -146,7 +147,7 @@ pub fn primary_action(
         .px(px(tokens::SPACE_3))
         .py(px(tokens::SPACE_2))
         .border(px(HAIRLINE))
-        .border_color(move || tokens::palette().ink_faint)
+        .border_color(move || tokens::palette().ink_caption)
         .hover(|s| s.border_color(tokens::palette().ink))
         .focus_visible(|s| s.border_color(tokens::palette().ink))
         .on_press(on_press)
@@ -316,6 +317,28 @@ mod tests {
             .child(view().test_id("harness-presses").child(ink(move || {
                 SharedString::from(format!("{} presses", presses.get()))
             })))
+            .child(faint("A caption"))
+    }
+
+    /// A caption is text someone must read: it draws in caption ink, which
+    /// reads at 4.5:1 on the room, not in the non-text faint ink.
+    #[test]
+    fn a_caption_reads_at_4_5_to_1() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+        app.wait_for("text:A caption").expect("the caption");
+        let color = app
+            .screen()
+            .span_style("text:A caption")
+            .expect("the caption's style")
+            .color;
+        let palette = [&tokens::DARK, &tokens::LIGHT]
+            .into_iter()
+            .find(|p| p.ink_caption == color)
+            .unwrap_or_else(|| panic!("the caption is {color:?}, not caption ink"));
+        let room = nsh_core::Hsla::from(palette.room);
+        let ratio = room.blend(nsh_core::Hsla::from(color)).contrast_ratio(room);
+        assert!(ratio >= 4.5, "the caption is {ratio:.2}:1 on the room");
     }
 
     /// The node carrying `test_id` on the headless screen.
