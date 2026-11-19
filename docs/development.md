@@ -49,8 +49,11 @@ builds the release executable, verifies the Mach-O arm64 slice and runs
 release-profile app suite no longer run per PR: `.github/workflows/nightly.yml`
 (schedule plus manual dispatch) reruns the combined `check ci` on
 `ubuntu-24.04`, `cargo test --locked --profile ci --workspace` and
-`cargo test --release --locked -p mt-app` on `macos-15` and `windows-2022`, as a
-non-blocking safety net rather than a PR gate. It is also what saves the
+`cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
+release_suite` on `macos-15` and `windows-2022`, as a non-blocking safety net
+rather than a PR gate. `release_suite` links every `crates/mt-app/tests/*.rs`
+file into one binary, because under thin LTO each test binary re-optimizes the
+whole app at link time; plain `cargo test` never builds it. It is also what saves the
 rust-cache entries the PR jobs restore; PR jobs only restore. The PR workflow
 classifies the diff before it spends runner time, in two steps. When every
 changed path is under `docs/**` or is a Markdown file at the repository root,
