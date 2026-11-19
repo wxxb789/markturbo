@@ -127,7 +127,7 @@ fn partial_accept_records_the_final_split_once() {
     // Prepare revision is the result's one next action.
     app.press("label:Prepare revision")
         .expect("prepare revision");
-    app.wait_for("text:Send the revision?")
+    app.wait_for("text:Ask for a revision?")
         .expect("revision disclosure names the revision");
     app.long_press("id:consent-send").expect("send revision");
     // The hunks arrive with the reading position on the first group.

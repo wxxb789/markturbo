@@ -175,14 +175,7 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
         .p(px(tokens::SPACE_5))
         // In dark mode the card's ground is lifted a hair off the room and a
         // hairline draws its edge: the shadow alone does not show on graphite.
-        .bg(move || {
-            let palette = tokens::palette();
-            if palette.is_dark {
-                palette.column_ground
-            } else {
-                palette.room
-            }
-        })
+        .bg(move || tokens::palette().card_ground)
         .border(px(tokens::HAIRLINE))
         .border_color(move || {
             let palette = tokens::palette();
@@ -703,7 +696,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
         .items_center()
         .justify_center()
         .border(px(tokens::HAIRLINE))
-        .border_color(move || tokens::palette().ink_faint)
+        .border_color(move || tokens::palette().ink_caption)
         .focus_visible(|s| s.border_color(tokens::palette().ink))
         .cursor_pointer()
         .focusable(true)
@@ -1410,11 +1403,11 @@ impl Hold {
         } else {
             HoldLabel::Sent
         });
-        self.state.status.set(SharedString::from(format!(
+        self.state.notify(format!(
             "{} · {}",
             S::Sent.text(self.language),
             sent_bytes(self.language, self.total.get())
-        )));
+        ));
         if self.is_revision {
             self.state.send_revision();
         } else {

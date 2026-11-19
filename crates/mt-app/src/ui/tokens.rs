@@ -59,6 +59,9 @@ pub struct Palette {
     /// The text column's ground: the room itself in both appearances, so no
     /// sheet shows under the text.
     pub column_ground: Color,
+    /// A floating card's ground (the consent card): the room in light, lifted
+    /// a hair off it in dark, where a shadow alone does not show on graphite.
+    pub card_ground: Color,
     /// Body ink: your text, labels at full attention.
     pub ink: Color,
     /// Resting ink: quiet local actions, captions (steps to [`Palette::ink`]
@@ -124,6 +127,7 @@ pub struct Palette {
 pub const DARK: Palette = Palette {
     room: hex(0x101113),
     column_ground: hex(0x101113),
+    card_ground: hex(0x15161A),
     ink: hexa(0xD9DCE1, A_84),
     ink_rest: hexa(0xD9DCE1, A_56),
     ink_caption: hexa(0xD9DCE1, A_54),
@@ -157,6 +161,7 @@ pub const DARK: Palette = Palette {
 pub const LIGHT: Palette = Palette {
     room: hex(0xF2F0EB),
     column_ground: hex(0xF2F0EB),
+    card_ground: hex(0xF2F0EB),
     ink: hexa(0x23262B, A_88),
     ink_rest: hexa(0x23262B, A_70),
     ink_caption: hexa(0x23262B, A_66),

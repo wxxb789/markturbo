@@ -219,7 +219,7 @@ pub fn kbd(key: &'static str) -> impl IntoElement {
     view()
         .px(px(tokens::SPACE_1))
         .border(px(HAIRLINE))
-        .border_color(move || tokens::palette().ink_faint)
+        .border_color(move || tokens::palette().ink_caption)
         .bg(Color::TRANSPARENT)
         .child(
             text(key)

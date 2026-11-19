@@ -226,7 +226,7 @@ fn file_name(state: AppState) -> impl IntoElement {
             .font_family(tokens::FONT_UI)
             .text_size(px(TYPE_UI))
             .line_height(px(TYPE_UI_LINE))
-            .text_color(move || tokens::palette().ink_faint),
+            .text_color(move || tokens::palette().ink_caption),
         )
         .child(
             text(move || match name_state.active_tab() {
@@ -530,13 +530,6 @@ fn shortcut(shift: bool, key: &str) -> SharedString {
     })
 }
 
-/// A caption's ink: quieter than a row's label and still text contrast —
-/// body ink's hue at .54 (dark) / .66 (light).
-fn caption_ink() -> Color {
-    let palette = tokens::palette();
-    palette.ink_at(if palette.is_dark { 0.54 } else { 0.66 })
-}
-
 /// The click-catcher under the menu: a press anywhere else closes it. It is
 /// the row's first child, so what the row holds stays pressable above it.
 fn menu_scrim(menu: Signal<bool>) -> impl IntoElement {
@@ -597,7 +590,7 @@ fn menu_row(
                 .font_family(tokens::FONT_UI)
                 .text_size(px(TYPE_UI))
                 .line_height(px(TYPE_UI_LINE))
-                .text_color(caption_ink)
+                .text_color(|| tokens::palette().ink_caption)
                 .flex_shrink_0()
                 .into_element()
         }))

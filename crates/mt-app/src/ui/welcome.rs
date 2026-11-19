@@ -225,7 +225,7 @@ fn open_folder_action(
         .px(px(SPACE_3))
         .py(px(SPACE_2))
         .border(px(HAIRLINE))
-        .border_color(move || tokens::palette().ink_faint)
+        .border_color(move || tokens::palette().ink_caption)
         .transition_colors()
         .duration(HOVER_MS)
         .hover(|s| s.border_color(tokens::palette().ink))
@@ -316,7 +316,7 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                             .font_family(FONT_UI)
                             .text_size(px(TYPE_UI))
                             .line_height(px(TYPE_UI_LINE))
-                            .text_color(move || tokens::palette().ink_faint),
+                            .text_color(move || tokens::palette().ink_caption),
                     )
                     .child(
                         text(target.display_name.clone())
@@ -325,7 +325,7 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                             .line_height(px(TYPE_UI_LINE))
                             .text_color(move || {
                                 if missing {
-                                    tokens::palette().ink_faint
+                                    tokens::palette().ink_caption
                                 } else {
                                     tokens::palette().ink_rest
                                 }

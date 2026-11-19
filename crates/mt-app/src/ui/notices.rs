@@ -1109,7 +1109,7 @@ fn card_action(
                     if danger {
                         tokens::palette().hairline
                     } else {
-                        tokens::palette().ink_faint
+                        tokens::palette().ink_caption
                     }
                 })
                 .transition_colors()

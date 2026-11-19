@@ -378,7 +378,7 @@ fn base_url_note_view(state: AppState, language: Language) -> impl IntoElement {
         {
             tokens::palette().danger
         } else {
-            tokens::palette().ink_faint
+            tokens::palette().ink_caption
         }
     })
 }
