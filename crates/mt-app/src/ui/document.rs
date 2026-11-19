@@ -40,7 +40,7 @@ use nsh_base::{
     text_view::PartStyle,
 };
 use nsh_core::{
-    Color, PropertyValue, StyleKey,
+    Color, PropertyValue, StyleKey, StyleValue,
     element::{Style, StyleRefinement},
     prelude::*,
 };
@@ -190,14 +190,9 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                 // source's ink is the room's, at the body level.
                 .text_color(tokens::palette().ink),
         )));
-        // The gutter: 11px line numbers in non-text ink, shown only while a
-        // docked surface is reading the document (the prototype hides them
-        // while you edit).
-        styles.line_number = Some(PartStyle::from(Style::from(
-            StyleRefinement::default()
-                .text_size(px(11.0))
-                .text_color(tokens::palette().ink_faint),
-        )));
+        let reading = docked_surfaces(&numbers_state);
+        styles.gutter = Some(PartStyle::from(gutter_style(reading)));
+        styles.line_number = Some(PartStyle::from(line_number_style(reading)));
         styles
     };
 
@@ -235,6 +230,10 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
             view()
                 .test_id("source-editor")
                 .element_ref(&editor_box)
+                // The editor reaches back over the column's left gap: its
+                // gutter fills the gap and its text starts at the measure,
+                // where it would without a gutter.
+                .ml(px(-tokens::COLUMN_GAP))
                 .flex_1()
                 .min_h(px(0.0))
                 .h(relative(1.0))
@@ -261,7 +260,11 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                         // The measure is the window's, not a horizontal scroll: as the
                         // prototype wraps, so does the editor.
                         .soft_wrap(true)
-                        .line_numbers(move || docked_surfaces(&numbers_state))
+                        // Always on, so the gutter is always laid out: it
+                        // sits in the column's left gap ([`gutter_style`])
+                        // and only its numbers' opacity follows a reading
+                        // pass, so opening one never moves your text.
+                        .line_numbers(true)
                         .active_line(false)
                         .indent_guides(false)
                         // No fold markers: Afterglow's gutter shows the line numbers
@@ -491,6 +494,71 @@ fn line_tint(line: u32, end: u32, color: Color) -> EditorDecoration {
 /// from a typed refinement has none of.
 fn text_ink(color: Color) -> Style {
     Style::default().with(StyleKey::Color, PropertyValue::Color(Some(color)))
+}
+
+/// The line numbers' size: 11px, the active line's as every other's.
+const LINE_NUMBER_SIZE: f32 = 11.0;
+
+/// The room between a line number's right edge and your text's first glyph
+/// (the editor's content adds 4px of its own).
+const GUTTER_TO_TEXT: f32 = 6.0;
+
+/// A style of declarations, each written as its JS value; the editor replays
+/// a part's style through [`Style::decls`] where a row is in more than one
+/// part (the active line's number), which a typed refinement has none of.
+fn declared(values: &[(StyleKey, StyleValue<'_>)]) -> Style {
+    values.iter().fold(Style::default(), |style, (key, value)| {
+        let value = key
+            .parse_value(*value)
+            .unwrap_or_else(|_| panic!("`{}` does not take {value:?}", key.name()));
+        style.with(*key, value)
+    })
+}
+
+/// The gutter: exactly the column's left gap wide, its numbers set right
+/// against your text. Its width never changes — not with the line count, not
+/// with a finding's gutter tick, not with a reading pass — so the text never
+/// moves. While nobody reads the document it takes no presses: the numbers
+/// are invisible then, and a press there is not a line selection.
+fn gutter_style(reading: bool) -> Style {
+    declared(&[
+        (StyleKey::Width, StyleValue::Number(tokens::COLUMN_GAP)),
+        (StyleKey::PaddingLeft, StyleValue::Number(0.0)),
+        (StyleKey::PaddingRight, StyleValue::Number(GUTTER_TO_TEXT)),
+        (StyleKey::AlignItems, StyleValue::Str("flex-end")),
+        (
+            StyleKey::PointerEvents,
+            StyleValue::Str(if reading { "auto" } else { "none" }),
+        ),
+    ])
+}
+
+/// Every line number, the active line's included: 11px in non-text ink,
+/// shown only while a docked surface is reading the document (the prototype
+/// hides them while you edit), fading in and out over the extinguish.
+fn line_number_style(reading: bool) -> Style {
+    let fade = if motion::reduced_motion() {
+        motion::REDUCED_CROSSFADE_MS
+    } else {
+        motion::EXTINGUISH_MS
+    };
+    declared(&[
+        (StyleKey::FontSize, StyleValue::Number(LINE_NUMBER_SIZE)),
+        (
+            StyleKey::Opacity,
+            StyleValue::Number(if reading { 1.0 } else { 0.0 }),
+        ),
+        (StyleKey::TransitionProperty, StyleValue::Str("opacity")),
+        (StyleKey::TransitionDuration, StyleValue::Number(fade)),
+        (
+            StyleKey::TransitionTimingFunction,
+            StyleValue::Str("ease-in"),
+        ),
+    ])
+    .with(
+        StyleKey::Color,
+        PropertyValue::Color(Some(tokens::palette().ink_faint)),
+    )
 }
 
 #[cfg(test)]

@@ -1,9 +1,9 @@
 //! Owner lane: chrome.
 //!
-//! The welcome state: an empty room with a blinking caret at the column origin
-//! and four plain choices beneath it — Open folder, New file, Paste, Open
-//! sample — with the paths opened before under them, and one quiet line that
-//! says the local work stays local.
+//! The welcome state: an empty room with four plain choices at the column
+//! origin — Open folder, New file, Paste, Open sample — with the paths opened
+//! before under them, and one quiet line that says the local work stays local.
+//! It draws no caret: nothing here takes typing, so nothing pretends to.
 //!
 //! Contract: [`welcome`] is the column's content while no document is open;
 //! the shell gives it the column's measure and ground. Until a workspace is
@@ -20,12 +20,7 @@ use mt_core::{
     settings::{Language, RecentTarget, RecentTargetKind},
     workspace::tree,
 };
-use nsh_core::{
-    Color,
-    element::{Easing, Keyframe, KeyframeTiming},
-    file_dialog::OpenDialog,
-    prelude::*,
-};
+use nsh_core::{Color, file_dialog::OpenDialog, prelude::*};
 
 use crate::{
     app_paths,
@@ -71,7 +66,6 @@ fn start(state: AppState, language: Language) -> impl IntoElement {
         .w_full()
         .flex_col()
         .pt(px(SPACE_3))
-        .child(caret())
         .child(
             view()
                 .flex_col()
@@ -209,29 +203,6 @@ fn workspace_files(state: &AppState) -> Vec<Entry> {
         .filter(|entry| !entry.is_dir)
         .take(WORKSPACE_FILES)
         .collect()
-}
-
-/// The blinking caret at the column origin: 2px of ink, 1.06s steps.
-fn caret() -> impl IntoElement {
-    let opacity = animated_value(1.0);
-    let mut timing = KeyframeTiming::new(1060.0);
-    timing.easing = Easing::Linear;
-    // Blink until the caret is dropped: 1 → 0 → 1, steps, forever.
-    timing.iterations = None;
-    opacity.keyframes(
-        [
-            Keyframe::at(0.0, 1.0),
-            Keyframe::at(0.5, 0.0),
-            Keyframe::at(1.0, 1.0),
-        ],
-        timing,
-    );
-    view()
-        .test_id("welcome-caret")
-        .w(px(2.0))
-        .h(px(TYPE_UI_LINE))
-        .bg(move || tokens::palette().ink)
-        .bind_opacity(&opacity)
 }
 
 /// 'Open folder', the state's one next action: full ink, a hairline plate, and
