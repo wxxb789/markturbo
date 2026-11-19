@@ -506,7 +506,7 @@ fn spacer() -> impl IntoElement {
     view().flex_1().min_h(px(SPACE_2))
 }
 
-/// 'Stale — edited after review' with `Review again`.
+/// 'Text changed since this review' with `Review again`.
 fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
     let again = state.clone();
     // 'Review again' takes the focus when the result goes stale: it is the
@@ -1078,7 +1078,8 @@ fn step_control(
 }
 
 /// The legend, and the state's one next action once every question is
-/// answered or skipped.
+/// answered or skipped. A stale result offers no `Prepare revision`: the
+/// banner's `Review again` is its only next step.
 fn footer(
     state: AppState,
     language: Language,
@@ -1089,6 +1090,7 @@ fn footer(
     let order = priority_order(&review.questions_detail);
     let done =
         review.questions_detail.is_empty() || current_question(&session_now, &order).is_none();
+    let stale = review.stale;
     let prepare_state = state.clone();
     let prepare_session = session;
     let close_state = state.clone();
@@ -1146,7 +1148,9 @@ fn footer(
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .child(if done {
+                .child(if stale {
+                    view().into_element()
+                } else if done {
                     // The state's one next action takes the focus once, when
                     // every question is done.
                     let reference = element_ref();
@@ -1353,7 +1357,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::ReviewingWith => "Reviewing with {host}…",
             S::UsuallySeconds => "Usually 10–30 seconds. Esc cancels.",
             S::Cancelled => "Cancelled — nothing changed.",
-            S::Stale => "Stale — edited after review",
+            S::Stale => "Text changed since this review",
             S::NoModelSetUp => "No model set up",
             S::NoModelHint => "Add a provider and an API key in Settings, then run Review again.",
             S::OpenSettings => "Open settings",
@@ -1390,7 +1394,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::ReviewingWith => "正在审查 · {host}…",
             S::UsuallySeconds => "通常需要 10–30 秒。按 Esc 取消。",
             S::Cancelled => "已取消——没有任何更改。",
-            S::Stale => "已过期——审查后文档被编辑",
+            S::Stale => "审查后文本已更改",
             S::NoModelSetUp => "未配置模型",
             S::NoModelHint => "请在设置中添加服务商和 API 密钥，然后重新运行审查。",
             S::OpenSettings => "打开设置",

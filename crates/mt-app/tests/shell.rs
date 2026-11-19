@@ -35,11 +35,14 @@ fn opens_a_markdown_file() {
     app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
         .expect("wide viewport");
 
-    // The document opens into the source editor, with the native preview
-    // beside it in the field (the default Split pane), and Review is the
-    // document's own next action.
+    // The document opens into the source editor (the default Source pane);
+    // Split puts the native preview beside it in the field, and Review is
+    // the document's own next action.
     app.wait_for("label:Markdown source")
         .expect("source editor");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-split").expect("choose Split");
     app.wait_for("text:Release notes").expect("preview heading");
     app.wait_for("id:title-review")
         .expect("the document's Review action");

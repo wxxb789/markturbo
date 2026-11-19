@@ -81,7 +81,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     )
     .expect("translation status");
     assert!(
-        app.shows("你好"),
+        app.shows("# 你好"),
         "translation not shown: {:?}",
         app.screen().texts()
     );
@@ -108,7 +108,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.type_text("id:palette-input", "other")
         .expect("filter to other.md");
     app.press("id:palette-row").expect("open another tab");
-    app.wait_for("text:Other").expect("other document");
+    app.wait_for("text:# Other").expect("other document");
     app.type_text("label:Markdown source", "\nUnsaved edit.")
         .expect("dirty the other tab");
     // Return by the row's own label, and prove the target is the active tab:
@@ -130,7 +130,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("Quit must await a decision");
 
     release_response.send(()).expect("release translation");
-    app.wait_for_within("text:你好，再见", Duration::from_secs(20))
+    app.wait_for_within("text:# 你好，再见", Duration::from_secs(20))
         .expect("second translation applies while Quit is pending");
     assert!(
         app.screen()
