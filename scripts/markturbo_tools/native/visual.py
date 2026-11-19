@@ -3,16 +3,30 @@
 The matrix is eleven product states at the configured minimum, default and wide
 DIP viewports in the two effective color modes and both interface languages.
 Each cell launches the packaged app on an isolated profile under the system
-temporary directory, drives the real controls, refuses an obstructed or
-off-screen window, verifies the effective background against the shipped theme,
-and writes one PNG plus a content-free JSON receipt. The profile - settings,
-logs and recovery payloads - is deleted with the cell, so an output tree never
-carries the local paths it recorded.
+temporary directory and drives the Afterglow UI with the native acceptance
+harness's own UIA steps (`runtime.NativeHarness`): the title menu's
+`title-menu-*` rows, controls found by AutomationId, typed input, and a real
+pointer hold on `consent-send`. Every cell proves it
+reached its named state by the state's own controls before it captures; a cell
+that cannot fails with a reason code prefixed by its state (for example
+`ORDINARY_EDIT_DOCUMENT_NOT_OPEN`) and keeps a `failure.png` of what it reached.
+It then refuses an obstructed or off-screen window, verifies the effective
+background against the shipped theme, and writes one PNG plus a content-free
+JSON receipt.
+
+The profile - settings, logs, recovery payloads, the fixture workspace and an
+empty `CODEX_HOME`, so no instructions of the user reach Context or a request -
+is deleted with the cell, so an output tree never carries the local paths it
+recorded. The Review cells talk to a process-local OpenAI Responses loopback
+that refuses a request sent before the consent hold and returns a fixed review;
+the child gets one synthetic key in its environment only. A typed edit is
+proven by the UIA tree showing it (the editor's accessible readout or the
+preview), never through the clipboard, which the run leaves untouched.
 
 Run from the repository root, on an active Windows 11 x64 desktop, with a
 packaged `MarkTurbo.exe` built from the same source revision::
 
-    uv run --locked --project scripts scripts/mt.py visual \\
+    uv run --locked --project scripts scripts/mt.py visual -- \\
         --exe target/release/markturbo.exe \\
         --out target/native-acceptance/goal-09
 
@@ -26,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import ctypes
 import ctypes.wintypes as wt
 import datetime as dt
@@ -43,14 +58,35 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Sequence
+import uuid
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from .evidence import credential_target
-from .runtime import HarnessBlocked, HarnessFailure, Win32, safe_exception_name, sha256_file
+from .goal07 import (
+    CONSENT_HOLD_SECONDS,
+    CONSENT_SEND_AUTOMATION_ID,
+    REQUEST_SENT_TIMEOUT_SECONDS,
+    REVIEW_ANSWER_INPUT_AUTOMATION_ID,
+)
+from .runtime import (
+    MENU_EDIT_AUTOMATION_ID,
+    MENU_SAVE_AUTOMATION_ID,
+    MENU_WEB_AUTOMATION_ID,
+    HarnessBlocked,
+    HarnessFailure,
+    NativeHarness,
+    RunningApp,
+    Win32,
+    load_pywinauto,
+    phase,
+    safe_exception_name,
+    sha256_file,
+    wait_until,
+)
 
 SCHEMA = "markturbo.goal-09-visual-matrix"
 RECEIPT_SCHEMA = "markturbo.goal-09-visual-cell"
@@ -77,9 +113,15 @@ LANGUAGES = ("en-us", "zh-cn")
 REVIEW_STATES = frozenset(
     {"review-loading", "review-result-questions", "review-stale"}
 )
-WAIT = 20.0
-FRAME = 0.2
-CELL_TIMEOUT = 90.0
+# The states that launch on a clean profile with no document.
+EMPTY_STATES = frozenset({"clean-profile-welcome", "new-unsaved-document", "settings"})
+UI_TIMEOUT = 20.0
+# What a state may take to settle once it is proven: a card's glide, a model
+# item's ignition and stagger, the hover the pointer left behind.
+SETTLE_SECONDS = 1.2
+# How long a cell retries removing its profile before it ends the profile's
+# WebView2 browser (and again after).
+PROFILE_REMOVAL_SECONDS = 3.0
 DEBUG = False
 ACTIONABLE_ROLES = frozenset(
     {
@@ -98,12 +140,58 @@ ACTIONABLE_ROLES = frozenset(
     }
 )
 
+# The AutomationIds (the views' `test_id`s) that drive and prove each state.
+# They are language-independent, so one plan drives both interface languages.
+WELCOME_NEW_FILE_AUTOMATION_ID = "welcome-new-file"
+TITLE_FILE_AUTOMATION_ID = "title-file"
+TITLE_REVIEW_AUTOMATION_ID = "title-review"
+MENU_SPLIT_AUTOMATION_ID = "title-menu-split"
+MENU_CONTEXT_AUTOMATION_ID = "title-menu-context"
+MENU_SETTINGS_AUTOMATION_ID = "title-menu-settings"
+WEB_TRUST_AUTOMATION_ID = "web-trust"
+WEB_VIEW_AUTOMATION_ID = "web-view"
+CONTEXT_CLOSE_AUTOMATION_ID = "context-close"
+CONFLICT_KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
+# The page's primary action. (Its `settings-close` is off screen in UIA and
+# unpainted at rest, so it cannot prove the page.)
+SETTINGS_SAVE_AUTOMATION_ID = "settings-save"
+REVIEW_CANCEL_AUTOMATION_ID = "review-cancel"
+REVIEW_AGAIN_AUTOMATION_ID = "review-again"
+# `state.rs` names a new document's tab with `Key::Untitled`.
+UNTITLED = {"en-us": "Untitled", "zh-cn": "未命名"}
+# `i18n::effective_context_choice_label(language, false)`: a source's include
+# toggle. Its `context-include-<n>` id sits on a view UIA does not expose, so
+# the checkbox is found by its accessible label.
+CONTEXT_SOURCE_TOGGLE = {
+    "en-us": "Include context source (unchecked)",
+    "zh-cn": "包含 Context 来源（未选择）",
+}
+# Ctrl+End: the caret to the document's end, collapsing a Select All.
+VK_END = 0x23
+
+# Fixture text only: nothing a user wrote reaches a capture or a receipt.
+PLAN_NAME = "plan.md"
+PLAN_TEXT = (
+    "# Release plan\n\nDescribe the next release and list **one** risk.\n\n"
+    "- [ ] verify install\n- [ ] verify uninstall\n"
+)
+PLAN_HEADING = "Release plan"
+AGENTS_TEXT = "# Project instructions\n\nKeep answers concise.\n"
+NEW_DOCUMENT_TEXT = "# Launch notes"
+ORDINARY_EDIT_TEXT = "Ship after the install check passes."
+CONFLICT_EDIT_TEXT = "Hold the release until the rollback is rehearsed."
+STALE_EDIT_TEXT = "Name the release owner."
+EXTERNAL_TEXT = "# Release plan\n\nChanged by another editor.\n"
+
 # The model request is the only non-loopback-shaped operation in this matrix.
 # It reaches a process-local server that returns a fixed review; no credential
 # or document content is written to a receipt.
-REVIEW_ANSWER = (
-    "Which risk should the plan prioritize?"
+REVIEW_QUESTIONS = (
+    ("Which risk should the plan prioritize?", "high", "It changes the risk section."),
+    ("Who signs off on the release?", "medium", "It names the owner of the go decision."),
+    ("Is uninstall in scope for this release?", "low", "It decides the second check."),
 )
+REVIEW_FIRST_QUESTION = REVIEW_QUESTIONS[0][0]
 REVIEW_JSON = json.dumps(
     {
         "schema_version": "review-v1",
@@ -120,67 +208,24 @@ REVIEW_JSON = json.dumps(
         },
         "findings": [],
         "clarification_questions": [
-            {
-                "question": REVIEW_ANSWER,
-                "priority": "high",
-                "impact": "It changes the risk section.",
-            }
+            {"question": question, "priority": priority, "impact": impact}
+            for question, priority, impact in REVIEW_QUESTIONS
         ],
     },
     ensure_ascii=True,
     separators=(",", ":"),
 )
+REVIEW_PROVIDER = "openai-responses"
+REVIEW_MODEL = "goal09-review"
+# A held Review answers when its cell ends, or after this long.
+REVIEW_HOLD_SECONDS = 120.0
+REVIEW_ANSWER_TIMEOUT_SECONDS = 30.0
 
-LABELS = {
-    "en-us": {
-        "new": "New",
-        "edit": "Edit",
-        "preview": "Preview",
-        "more": "More layouts",
-        "web": "Compatibility Preview",
-        "context": "Agent Context",
-        "settings": "Settings",
-        "review": "Review",
-        "send": "Send",
-        "save": "Save",
-        "welcome": "Start a Markdown document",
-        "untitled": "Untitled",
-        "web_restricted": "Restricted: scripts disabled",
-        "reviewing": "Reviewing…",
-        "ready": "Review ready",
-        "stale": "This review describes an older source revision and is stale.",
-        "question": "Clarification questions",
-        "question_text": REVIEW_ANSWER,
-        "context_ready": "Effective Agent Context",
-        "conflict": "Save conflict",
-    },
-    "zh-cn": {
-        "new": "新建",
-        "edit": "编辑",
-        "preview": "预览",
-        "more": "更多布局",
-        "web": "兼容预览",
-        "context": "代理上下文",
-        "settings": "设置",
-        "review": "审查",
-        "send": "发送",
-        "save": "保存",
-        "welcome": "开始编写 Markdown 文档",
-        "untitled": "未命名",
-        "web_restricted": "受限：脚本已禁用",
-        "reviewing": "正在审查…",
-        "ready": "审查已就绪",
-        "stale": "此审查描述的是较旧的源版本，已过期。",
-        "question": "澄清问题",
-        "question_text": REVIEW_ANSWER,
-        "context_ready": "有效代理上下文",
-        "conflict": "保存冲突",
-    },
-}
-
+# `ui/tokens.rs` `LIGHT.room` / `DARK.room`: the window ground under the title
+# row, where the effective-mode sample is taken.
 THEME_BACKGROUNDS = {
-    "light": (255, 255, 255),
-    "dark": (13, 17, 23),
+    "light": (0xF2, 0xF0, 0xEB),
+    "dark": (0x10, 0x11, 0x13),
 }
 
 
@@ -290,7 +335,7 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def cdp_page_target(port: int, timeout: float = WAIT) -> str:
+def cdp_page_target(port: int, timeout: float = UI_TIMEOUT) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -322,6 +367,8 @@ def cdp_page_png(port: int) -> bytes:
         return base64.b64decode(encoded)
     finally:
         websocket.close()
+
+
 
 
 class VisualFailure(RuntimeError):
@@ -373,6 +420,11 @@ def matrix_cells(
         for viewport in viewports
         for mode in modes
     ]
+
+
+def state_code(state: str) -> str:
+    """The reason-code prefix of a state's own failures."""
+    return state.upper().replace("-", "_")
 
 
 def git(*args: str) -> str:
@@ -507,32 +559,24 @@ def capture_window(hwnd: int) -> Any:
         gdi32.DeleteDC(screen)
 
 
-def wait_until(
-    probe: Any, timeout: float, code: str, interval: float = 0.05
-) -> Any:
-    deadline = time.monotonic() + timeout
-    last: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            result = probe()
-        except Exception as error:  # noqa: BLE001 - UIA raises COM variants
-            last = error
-            result = None
-        if result:
-            return result
-        time.sleep(interval)
-    raise VisualFailure(code, safe_exception_name(last) if last else "")
-
-
 class ReviewServer:
-    """A loopback OpenAI-compatible endpoint for the three Review cells."""
+    """A loopback OpenAI Responses endpoint for the three Review cells.
+
+    It answers one read-only Review with `REVIEW_JSON`, and refuses (409) any
+    request that arrives before `allow` - the moment the harness starts the
+    consent hold - so a Review sent without consent fails its cell. With
+    `hold`, the answer waits until `close` (the loading cell captures while it
+    waits). Only counts and a reason code are kept; no request body is.
+    """
 
     def __init__(self, hold: bool) -> None:
         self.hold = hold
-        self.seen = threading.Event()
+        self.consented = threading.Event()
         self.release = threading.Event()
-        handler = self._handler()
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self._lock = threading.Lock()
+        self._request_count = 0
+        self._refusal: str | None = None
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(
             target=self.server.serve_forever, name="goal09-review", daemon=True
@@ -546,6 +590,19 @@ class ReviewServer:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}/v1/"
 
+    @property
+    def request_count(self) -> int:
+        with self._lock:
+            return self._request_count
+
+    @property
+    def refusal(self) -> str | None:
+        with self._lock:
+            return self._refusal
+
+    def allow(self) -> None:
+        self.consented.set()
+
     def start(self) -> None:
         self.thread.start()
 
@@ -554,6 +611,10 @@ class ReviewServer:
         self.server.shutdown()
         self.server.server_close()
 
+    def _refuse(self, code: str) -> None:
+        with self._lock:
+            self._refusal = self._refusal or code
+
     def _handler(self) -> type[BaseHTTPRequestHandler]:
         outer = self
 
@@ -561,190 +622,78 @@ class ReviewServer:
             def log_message(self, *_args: Any) -> None:
                 return
 
-            def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
-                length = int(self.headers.get("content-length", "0"))
-                self.rfile.read(length)
-                outer.seen.set()
-                if outer.hold and not outer.release.wait(WAIT):
-                    self.send_error(504)
-                    return
-                response = json.dumps(
-                    {
-                        "id": "chatcmpl-goal09",
-                        "object": "chat.completion",
-                        "model": "goal09-review",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {"role": "assistant", "content": REVIEW_JSON},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    },
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
+            def _reply(self, status: int, body: bytes = b"") -> None:
                 try:
-                    self.send_response(200)
+                    self.send_response(status)
                     self.send_header("content-type", "application/json")
-                    self.send_header("content-length", str(len(response)))
+                    self.send_header("content-length", str(len(body)))
                     self.send_header("connection", "close")
                     self.end_headers()
-                    self.wfile.write(response)
+                    self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
                     # The cell closed its app after the capture; the response
                     # has no reader, and that is not a matrix failure.
                     return
 
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
+                length = int(self.headers.get("content-length", "0"))
+                body = self.rfile.read(length)
+                if self.path != "/v1/responses":
+                    outer._refuse("REVIEW_REQUEST_PATH_MISMATCH")
+                    self._reply(404)
+                    return
+                if not outer.consented.is_set():
+                    outer._refuse("REVIEW_REQUEST_BEFORE_CONSENT")
+                    self._reply(409)
+                    return
+                if b"read_only_review" not in body:
+                    outer._refuse("REVIEW_REQUEST_NOT_READ_ONLY")
+                    self._reply(409)
+                    return
+                with outer._lock:
+                    outer._request_count += 1
+                if outer.hold:
+                    outer.release.wait(REVIEW_HOLD_SECONDS)
+                self._reply(200, review_response_body())
+
         return Handler
 
 
+def review_response_body() -> bytes:
+    """One completed Responses object carrying `REVIEW_JSON`."""
+    return json.dumps(
+        {
+            "id": "resp-goal09-review",
+            "object": "response",
+            "status": "completed",
+            "model": REVIEW_MODEL,
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg-goal09-review",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": REVIEW_JSON, "annotations": []}
+                    ],
+                }
+            ],
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def credential_identity(port: int) -> str:
-    return credential_target(f"http://127.0.0.1:{port}/v1/", "openai-chat")
+    return credential_target(f"http://127.0.0.1:{port}/v1/", REVIEW_PROVIDER)
 
 
 class AppWindow:
+    """The window geometry, accessibility and obstruction checks of a cell."""
+
     def __init__(self, win32: Win32, win: Any) -> None:
         self.win32 = win32
         self.win = win
         self.hwnd = int(win.handle)
-
-    def wait_text(self, text: str, timeout: float = WAIT) -> None:
-        def probe() -> bool:
-            try:
-                for control in self.win.descendants():
-                    try:
-                        if control.window_text() == text:
-                            return True
-                    except Exception:  # noqa: BLE001 - UIA element can go stale
-                        continue
-            except Exception:  # noqa: BLE001 - the tree can be rebuilding
-                return False
-            return False
-
-        try:
-            wait_until(probe, timeout, "STATE_MARKER_MISSING")
-        except VisualFailure:
-            if DEBUG:
-                print(
-                    "  texts=" + repr([c.window_text() for c in self.win.descendants()]),
-                    file=sys.stderr,
-                    flush=True,
-                )
-            raise
-
-    def wait_contains(self, text: str, timeout: float = WAIT) -> None:
-        def probe() -> bool:
-            for control in self.win.descendants():
-                try:
-                    if text in control.window_text():
-                        return True
-                except Exception:  # noqa: BLE001 - UIA element can go stale
-                    continue
-            return False
-
-        try:
-            wait_until(probe, timeout, "STATE_MARKER_MISSING")
-        except VisualFailure:
-            if DEBUG:
-                print(
-                    "  texts=" + repr([c.window_text() for c in self.win.descendants()]),
-                    file=sys.stderr,
-                    flush=True,
-                )
-            raise
-
-    def has_text(self, text: str) -> bool:
-        try:
-            for control in self.win.descendants():
-                try:
-                    if control.window_text() == text:
-                        return True
-                except Exception:  # noqa: BLE001 - UIA element can go stale
-                    continue
-        except Exception:  # noqa: BLE001 - the tree can be rebuilding
-            return False
-        return False
-
-    def scroll_until_text(self, text: str, timeout: float = WAIT) -> None:
-        deadline = time.monotonic() + timeout
-        user32 = self.win32.user32
-        left, top, right, bottom = self.client_rect()
-        x = right - max(120, (right - left) // 6)
-        y = (top + bottom) // 2
-        user32.SetCursorPos(x, y)
-        while time.monotonic() < deadline:
-            if self.has_text(text):
-                return
-            user32.mouse_event(0x0800, 0, 0, -120, 0)
-            time.sleep(0.2)
-        if not self.has_text(text):
-            raise VisualFailure("STATE_MARKER_MISSING")
-
-    def button(self, label: str) -> Any:
-        def probe() -> Any | None:
-            for control in self.win.descendants():
-                try:
-                    if (
-                        control.element_info.control_type == "Button"
-                        and control.window_text() == label
-                    ):
-                        return control
-                except Exception:  # noqa: BLE001 - UIA element can go stale
-                    continue
-            return None
-
-        return wait_until(probe, WAIT, "CONTROL_MISSING")
-
-    def click(self, label: str) -> None:
-        control = self.button(label)
-        try:
-            control.invoke()
-        except Exception:
-            try:
-                control.click_input()
-            except Exception as error:  # noqa: BLE001
-                raise VisualFailure(
-                    "CONTROL_CLICK_FAILED", safe_exception_name(error)
-                ) from None
-        time.sleep(FRAME)
-
-    def editor_text(self) -> str:
-        def probe() -> str | None:
-            for control in self.win.descendants():
-                try:
-                    if control.window_text() != "Markdown source":
-                        continue
-                    pattern = control.iface_value
-                    value = pattern.CurrentValue
-                    return value if isinstance(value, str) else None
-                except Exception:  # noqa: BLE001 - no ValuePattern yet
-                    continue
-            return None
-
-        value = wait_until(probe, WAIT, "EDITOR_MISSING")
-        return value
-
-    def set_editor_text(self, text: str) -> None:
-        editor = None
-        for control in self.win.descendants():
-            try:
-                if control.window_text() == "Markdown source":
-                    editor = control
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-        if editor is None:
-            raise VisualFailure("EDITOR_MISSING")
-        try:
-            editor.set_edit_text(text)
-        except Exception as error:  # noqa: BLE001
-            raise VisualFailure("EDITOR_UPDATE_FAILED", safe_exception_name(error)) from None
-        wait_until(
-            lambda: self.editor_text() == text,
-            WAIT,
-            "EDITOR_UPDATE_NOT_OBSERVED",
-        )
 
     def resize_client(self, width: int, height: int, work: tuple[int, int, int, int]) -> None:
         user32 = self.win32.user32
@@ -779,13 +728,8 @@ class AppWindow:
             time.sleep(0.35)
             user32.GetClientRect(self.hwnd, ctypes.byref(client))
             if DEBUG:
-                error = ctypes.get_last_error()
-                class_name = ctypes.create_unicode_buffer(128)
-                user32.GetClassNameW(self.hwnd, class_name, 128)
                 print(
-                    f"  resize {width}x{height}: hwnd={self.hwnd} class={class_name.value} "
-                    f"placed={placed} err={error} "
-                    f"outer={outer_width}x{outer_height} "
+                    f"  resize {width}x{height}: placed={placed} "
                     f"client={client.right}x{client.bottom}",
                     file=sys.stderr,
                     flush=True,
@@ -854,36 +798,33 @@ class AppWindow:
             "unnamed": unnamed,
         }
 
-    def webview_rect(
-        self, timeout: float = WAIT
-    ) -> tuple[int, int, int, int]:
-        deadline = time.monotonic() + timeout
-        while True:
-            left, top, right, bottom = self.client_rect()
+    def webview_rect(self, timeout: float = UI_TIMEOUT) -> tuple[int, int, int, int]:
+        """The compatibility WebView's client rectangle (`ui/preview.rs`
+        `web-view`), as the largest control carrying its AutomationId."""
+
+        def locate() -> tuple[int, int, int, int] | None:
+            left, top, _right, _bottom = self.client_rect()
             best: tuple[int, int, int, int] | None = None
             for control in self.win.descendants():
                 try:
-                    if not control.window_text().startswith("data:text/html"):
+                    if control.element_info.automation_id != WEB_VIEW_AUTOMATION_ID:
                         continue
                     rectangle = control.rectangle()
-                    candidate = (
-                        rectangle.left - left,
-                        rectangle.top - top,
-                        rectangle.right - left,
-                        rectangle.bottom - top,
-                    )
-                    if candidate[2] > candidate[0] and candidate[3] > candidate[1]:
-                        if best is None or (candidate[2] - candidate[0]) * (
-                            candidate[3] - candidate[1]
-                        ) > (best[2] - best[0]) * (best[3] - best[1]):
-                            best = candidate
                 except Exception:  # noqa: BLE001 - UIA element can go stale
                     continue
-            if best is not None:
-                return best
-            if time.monotonic() >= deadline:
-                raise VisualFailure("WEBVIEW_RECT_MISSING")
-            time.sleep(0.25)
+                candidate = (
+                    rectangle.left - left,
+                    rectangle.top - top,
+                    rectangle.right - left,
+                    rectangle.bottom - top,
+                )
+                if candidate[2] <= candidate[0] or candidate[3] <= candidate[1]:
+                    continue
+                if best is None or area(candidate) > area(best):
+                    best = candidate
+            return best
+
+        return wait_until(locate, timeout, "WEBVIEW_RECT_MISSING", interval=0.25)
 
     def client_rect(self) -> tuple[int, int, int, int]:
         client = wt.RECT()
@@ -900,6 +841,18 @@ class AppWindow:
             raise VisualFailure("WINDOW_RECT_MISSING")
         return outer.right - outer.left, outer.bottom - outer.top
 
+    def park_pointer(self) -> None:
+        """Move the pointer off every control, so no hover reaches a capture:
+        the bottom-right screen corner, or the window's own corner (its status
+        line's end) when the window covers the screen's."""
+        user32 = self.win32.user32
+        x = int(user32.GetSystemMetrics(0)) - 1
+        y = int(user32.GetSystemMetrics(1)) - 1
+        left, top, right, bottom = self.client_rect()
+        if left <= x < right and top <= y < bottom:
+            x, y = right - 2, bottom - 2
+        user32.SetCursorPos(x, y)
+
     def make_topmost(self) -> bool:
         user32 = self.win32.user32
         placed = bool(
@@ -909,7 +862,6 @@ class AppWindow:
             ctypes.windll.dwmapi.DwmFlush()
         except (AttributeError, OSError):
             pass
-        time.sleep(FRAME)
         return placed
 
     def obstruction(self) -> dict[str, Any]:
@@ -935,53 +887,252 @@ class AppWindow:
             "visible": bool(user32.IsWindowVisible(self.hwnd)),
         }
 
-    def close(self) -> None:
-        try:
-            self.win32.post_close(self.hwnd)
-            self.win.close()
-        except Exception:  # noqa: BLE001 - best effort
-            pass
+
+def area(rect: tuple[int, int, int, int]) -> int:
+    return (rect[2] - rect[0]) * (rect[3] - rect[1])
 
 
-def launch(
-    win32: Win32,
-    exe: Path,
-    environment: dict[str, str],
-    cwd: Path,
-) -> tuple[subprocess.Popen[bytes], AppWindow]:
-    from pywinauto import Application
+class VisualHarness(NativeHarness):
+    """The native acceptance harness's UIA steps, driving one cell to its state.
 
-    process = subprocess.Popen(
-        [str(exe)],
-        env=environment,
-        cwd=str(cwd),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        application = Application(backend="uia").connect(
-            process=process.pid, timeout=WAIT
+    `prepare` runs the state's plan inside `phase(<STATE>)`, so every failure
+    carries the state's prefix, and returns the AutomationIds that proved the
+    state (the receipt's content-free `state_markers`).
+    """
+
+    def __init__(self, *args: Any, credential: str | None = None) -> None:
+        super().__init__(*args)
+        self._credential = credential
+        # Pointer holds on `consent-send` a Review cell needed (0 elsewhere).
+        self.consent_holds = 0
+
+    def openai_api_key_for_child(self) -> str | None:
+        return self._credential
+
+    # -- generic steps -------------------------------------------------------
+
+    def require(
+        self, app: RunningApp, automation_id: str, code: str, control_type: str = "Button",
+        timeout: float | None = None,
+    ) -> Any:
+        """The one ready control with `automation_id`, else `code`."""
+        return self.find_control(
+            app, automation_id, control_type, code, f"{code}_UIA_CONTRACT_MISMATCH", timeout
         )
-        window = application.top_window()
-        window.wait("exists visible enabled ready", timeout=WAIT)
-    except Exception as error:  # noqa: BLE001 - pywinauto raises several types
-        process.terminate()
-        process.wait(timeout=5)
-        raise VisualFailure("WINDOW_CONNECT_FAILED", safe_exception_name(error)) from None
-    return process, AppWindow(win32, window)
+
+    def present(self, app: RunningApp, automation_id: str, control_type: str = "Button") -> bool:
+        return (
+            self.control_by_id(
+                app.hwnd, automation_id, control_type, "STATE_UIA_CONTRACT_MISMATCH"
+            )
+            is not None
+        )
+
+    def press(self, app: RunningApp, automation_id: str, code: str) -> None:
+        control = self.require(app, automation_id, f"{code}_MISSING")
+        self.invoke_control(control, f"{code}_INVOKE_FAILED")
+
+    def wait_text(
+        self, app: RunningApp, name: str, code: str, timeout: float | None = None
+    ) -> None:
+        self.wait_name(app, name, "Text", code, timeout)
+
+    def wait_title(self, app: RunningApp, title: str, code: str) -> None:
+        """The title row names the active tab `title` (`title-file`'s label)."""
+
+        def named() -> bool:
+            control = self.control_by_id(
+                app.hwnd, TITLE_FILE_AUTOMATION_ID, "Button", f"{code}_UIA_CONTRACT_MISMATCH"
+            )
+            return control is not None and control.element_info.name == title
+
+        wait_until(named, self.ui_timeout, code, interval=0.05)
+
+    def shows_text(self, app: RunningApp, text: str) -> bool:
+        """Whether a control's UIA name holds `text`: the editor's accessible
+        readout of its document, or the preview rendering it."""
+        for control in app.window.descendants():
+            try:
+                if text in (control.element_info.name or ""):
+                    return True
+            except Exception:  # noqa: BLE001 - UIA element can go stale
+                continue
+        return False
+
+    def type_at_end(self, app: RunningApp, text: str) -> None:
+        """Type `text` at the document's end, the way a user does, until the
+        document shows it. The clipboard is never touched."""
+        self.focus_editor(app)
+        # A layout switch just rebuilt the editor: its key bindings reach the
+        # window with a later frame, and Ctrl must be up before the text, or
+        # the caret stays put and the first character is lost.
+        self.win32.wait_frames()
+        self.win32.send_shortcut(app.hwnd, VK_END)
+        self.win32.wait_frames()
+        self.win32.send_unicode(app.hwnd, text)
+        wait_until(lambda: self.shows_text(app, text), self.ui_timeout, "TYPED_EDIT_MISSING")
+
+    def open_document(self, app: RunningApp) -> None:
+        """The fixture document is the active tab and its editor is ready."""
+        self.wait_title(app, PLAN_NAME, "DOCUMENT_NOT_OPEN")
+        self.editor_control(app)
+
+    def source_only(self, app: RunningApp) -> None:
+        """The Edit layout: the editor, and no native preview beside it."""
+        self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
+        self.editor_control(app)
+        wait_until(
+            lambda: not self.name_present(app, PLAN_HEADING, "Text"),
+            self.ui_timeout,
+            "PREVIEW_STILL_SHOWN",
+        )
+
+    # -- the eleven states ---------------------------------------------------
+
+    def prepare(
+        self, app: RunningApp, cell: Cell, plan: Path, server: ReviewServer | None
+    ) -> list[str]:
+        with phase(state_code(cell.state)):
+            return self._plans()[cell.state](app, cell, plan, server)
+
+    def _plans(self) -> dict[str, Callable[..., list[str]]]:
+        return {
+            "clean-profile-welcome": self.welcome,
+            "new-unsaved-document": self.new_unsaved_document,
+            "ordinary-edit": self.ordinary_edit,
+            "native-preview-or-split": self.split,
+            "web-compatibility-preview": self.web_preview,
+            "review-loading": self.review,
+            "review-result-questions": self.review,
+            "review-stale": self.review,
+            "effective-agent-context": self.context,
+            "external-change-conflict": self.conflict,
+            "settings": self.settings_page,
+        }
+
+    def welcome(self, app: RunningApp, *_: Any) -> list[str]:
+        self.require(app, WELCOME_NEW_FILE_AUTOMATION_ID, "WELCOME_MISSING")
+        if self.present(app, TITLE_FILE_AUTOMATION_ID):
+            raise HarnessFailure("DOCUMENT_OPEN")
+        return [WELCOME_NEW_FILE_AUTOMATION_ID]
+
+    def new_unsaved_document(self, app: RunningApp, cell: Cell, *_: Any) -> list[str]:
+        self.press(app, WELCOME_NEW_FILE_AUTOMATION_ID, "WELCOME_NEW_FILE")
+        self.wait_title(app, UNTITLED[cell.language], "UNTITLED_TAB_MISSING")
+        self.type_at_end(app, NEW_DOCUMENT_TEXT)
+        return [TITLE_FILE_AUTOMATION_ID, "editor"]
+
+    def ordinary_edit(self, app: RunningApp, *_: Any) -> list[str]:
+        self.open_document(app)
+        self.source_only(app)
+        self.type_at_end(app, ORDINARY_EDIT_TEXT)
+        return [TITLE_FILE_AUTOMATION_ID, MENU_EDIT_AUTOMATION_ID, "editor"]
+
+    def split(self, app: RunningApp, *_: Any) -> list[str]:
+        self.open_document(app)
+        self.menu_command(app, MENU_SPLIT_AUTOMATION_ID)
+        self.editor_control(app)
+        self.wait_text(app, PLAN_HEADING, "PREVIEW_MISSING")
+        return [TITLE_FILE_AUTOMATION_ID, MENU_SPLIT_AUTOMATION_ID, "editor", "preview"]
+
+    def web_preview(self, app: RunningApp, *_: Any) -> list[str]:
+        self.open_document(app)
+        self.menu_command(app, MENU_WEB_AUTOMATION_ID)
+        self.require(app, WEB_TRUST_AUTOMATION_ID, "WEB_RESTRICTED_MISSING")
+        return [TITLE_FILE_AUTOMATION_ID, MENU_WEB_AUTOMATION_ID, WEB_TRUST_AUTOMATION_ID]
+
+    def context(self, app: RunningApp, cell: Cell, *_: Any) -> list[str]:
+        self.open_document(app)
+        self.menu_command(app, MENU_CONTEXT_AUTOMATION_ID)
+        self.require(app, CONTEXT_CLOSE_AUTOMATION_ID, "CONTEXT_FIELD_MISSING")
+        # The workspace's AGENTS.md is the one source that applies.
+        self.wait_name(
+            app, CONTEXT_SOURCE_TOGGLE[cell.language], "CheckBox", "CONTEXT_SOURCE_MISSING"
+        )
+        return [
+            TITLE_FILE_AUTOMATION_ID,
+            MENU_CONTEXT_AUTOMATION_ID,
+            CONTEXT_CLOSE_AUTOMATION_ID,
+            "context-source-toggle",
+        ]
+
+    def conflict(self, app: RunningApp, _cell: Cell, plan: Path, _server: Any) -> list[str]:
+        self.open_document(app)
+        self.source_only(app)
+        self.type_at_end(app, CONFLICT_EDIT_TEXT)
+        plan.write_text(EXTERNAL_TEXT, encoding="utf-8", newline="\n")
+        self.menu_command(app, MENU_SAVE_AUTOMATION_ID)
+        self.require(app, CONFLICT_KEEP_MINE_AUTOMATION_ID, "CONFLICT_BANNER_MISSING")
+        if plan.read_text(encoding="utf-8") != EXTERNAL_TEXT:
+            raise HarnessFailure("SAVE_OVERWROTE_EXTERNAL_CHANGE")
+        return [TITLE_FILE_AUTOMATION_ID, MENU_SAVE_AUTOMATION_ID, CONFLICT_KEEP_MINE_AUTOMATION_ID]
+
+    def settings_page(self, app: RunningApp, *_: Any) -> list[str]:
+        self.menu_command(app, MENU_SETTINGS_AUTOMATION_ID)
+        self.require(app, SETTINGS_SAVE_AUTOMATION_ID, "SETTINGS_PAGE_MISSING")
+        return [MENU_SETTINGS_AUTOMATION_ID, SETTINGS_SAVE_AUTOMATION_ID]
+
+    def review(
+        self, app: RunningApp, cell: Cell, _plan: Path, server: ReviewServer | None
+    ) -> list[str]:
+        """`Review` -> the consent card -> a pointer hold on `consent-send`
+        (the only press that sends) -> the state."""
+        if server is None:
+            raise HarnessFailure("REVIEW_SERVER_MISSING")
+        self.open_document(app)
+        self.press(app, TITLE_REVIEW_AUTOMATION_ID, "TITLE_REVIEW")
+        send = self.require(app, CONSENT_SEND_AUTOMATION_ID, "CONSENT_CARD_MISSING")
+        if server.request_count or server.refusal:
+            raise HarnessFailure("REVIEW_REQUEST_BEFORE_CONSENT")
+        server.allow()
+        # A hold that lands as the card settles can go unseen (about one cell
+        # in twenty): while the card is still open and nothing was sent, hold
+        # once more. The receipt keeps the count, so a second hold is visible.
+        for attempt in (1, 2):
+            self.consent_holds = attempt
+            self.hold_control(app, send, CONSENT_HOLD_SECONDS, "CONSENT_HOLD")
+            try:
+                wait_until(
+                    lambda: server.request_count > 0 or server.refusal,
+                    REQUEST_SENT_TIMEOUT_SECONDS,
+                    "REVIEW_REQUEST_NOT_SENT",
+                )
+                break
+            except HarnessFailure as error:
+                if attempt == 2 or error.code != "REVIEW_REQUEST_NOT_SENT":
+                    raise
+                if not self.present(app, CONSENT_SEND_AUTOMATION_ID):
+                    raise
+        if server.refusal:
+            raise HarnessFailure(server.refusal)
+        markers = [TITLE_REVIEW_AUTOMATION_ID, CONSENT_SEND_AUTOMATION_ID]
+        if cell.state == "review-loading":
+            self.require(app, REVIEW_CANCEL_AUTOMATION_ID, "REVIEW_LOADING_MISSING")
+            return [*markers, REVIEW_CANCEL_AUTOMATION_ID]
+        self.wait_text(
+            app, REVIEW_FIRST_QUESTION, "REVIEW_RESULT_MISSING", REVIEW_ANSWER_TIMEOUT_SECONDS
+        )
+        self.require(app, REVIEW_ANSWER_INPUT_AUTOMATION_ID, "REVIEW_ANSWER_INPUT_MISSING", "Edit")
+        markers += ["review-question", REVIEW_ANSWER_INPUT_AUTOMATION_ID]
+        if cell.state == "review-result-questions":
+            return markers
+        self.type_at_end(app, STALE_EDIT_TEXT)
+        self.require(app, REVIEW_AGAIN_AUTOMATION_ID, "REVIEW_STALE_MISSING")
+        if not self.name_present(app, REVIEW_FIRST_QUESTION, "Text"):
+            raise HarnessFailure("REVIEW_STALE_RESULT_GONE")
+        return [*markers, REVIEW_AGAIN_AUTOMATION_ID]
 
 
 def write_settings(path: Path, mode: str, language: str, server: ReviewServer | None) -> None:
     lines = [
         f'theme = "{mode}"',
         f'language = "{language}"',
-        "show-welcome-on-startup = true",
     ]
     if server is not None:
         lines.extend(
             [
-                'model-provider = "openai-chat"',
-                'model-name = "goal09-review"',
+                f'model-provider = "{REVIEW_PROVIDER}"',
+                f'model-name = "{REVIEW_MODEL}"',
                 f'model-base-url = "{server.base_url}"',
                 f'model-environment-key-identity = "{credential_identity(server.port)}"',
             ]
@@ -991,88 +1142,27 @@ def write_settings(path: Path, mode: str, language: str, server: ReviewServer | 
 
 def fixture(workspace: Path) -> Path:
     workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "AGENTS.md").write_text(
-        "# Project instructions\n\nKeep answers concise.\n", encoding="utf-8"
-    )
-    plan = workspace / "plan.md"
-    plan.write_text(
-        "# Release plan\n\nDescribe the next release and list **one** risk.\n\n"
-        "- [ ] verify install\n- [ ] verify uninstall\n",
-        encoding="utf-8",
-    )
-    (workspace / "other.md").write_text("# Other\n", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text(AGENTS_TEXT, encoding="utf-8", newline="\n")
+    plan = workspace / PLAN_NAME
+    plan.write_text(PLAN_TEXT, encoding="utf-8", newline="\n")
+    (workspace / "other.md").write_text("# Other\n", encoding="utf-8", newline="\n")
     return plan
 
 
-def prepare_state(window: AppWindow, state: str, language: str, plan: Path) -> None:
-    labels = LABELS[language]
-    if state == "clean-profile-welcome":
-        window.wait_text(labels["welcome"])
-        return
-    if state == "new-unsaved-document":
-        window.wait_text(labels["welcome"])
-        window.click(labels["new"])
-        window.wait_contains(labels["untitled"])
-        return
-    if state == "settings":
-        window.click(labels["settings"])
-        window.wait_text(labels["settings"])
-        return
-    if state == "effective-agent-context":
-        window.click(labels["context"])
-        window.wait_text(labels["context_ready"])
-        return
-    if state == "ordinary-edit":
-        window.click(labels["edit"])
-        window.wait_text("Markdown source")
-        return
-    if state == "native-preview-or-split":
-        window.click(labels["preview"])
-        window.wait_text("Release plan")
-        return
-    if state == "web-compatibility-preview":
-        window.click(labels["more"])
-        window.click(labels["web"])
-        window.wait_text(labels["web_restricted"])
-        return
-    if state == "external-change-conflict":
-        window.click(labels["edit"])
-        window.set_editor_text(
-            "# Release plan\n\nLocal edit.\n\n- [ ] verify install\n"
-        )
-        plan.write_text("# External change\n", encoding="utf-8")
-        window.click(labels["save"])
-        window.wait_text(labels["conflict"])
-        return
-    if state in REVIEW_STATES:
-        if DEBUG:
-            print("  review: Review", file=sys.stderr, flush=True)
-        for _attempt in range(2):
-            window.click(labels["review"])
-            try:
-                window.wait_text(labels["send"], timeout=5.0)
-                break
-            except VisualFailure:
-                continue
-        else:
-            raise VisualFailure("REVIEW_CONSENT_MISSING")
-        if DEBUG:
-            print("  review: Send", file=sys.stderr, flush=True)
-        window.click(labels["send"])
-        if state == "review-loading":
-            window.wait_text(labels["reviewing"])
-            return
-        if DEBUG:
-            print("  review: ready", file=sys.stderr, flush=True)
-        window.wait_text(labels["ready"], timeout=30.0)
-        if state == "review-result-questions":
-            window.scroll_until_text(labels["question"])
-            window.wait_contains(labels["question_text"])
-            return
-        window.set_editor_text("# Release plan\n\nLocal edit.\n")
-        window.wait_text(labels["stale"], timeout=20.0)
-        return
-    raise VisualFailure("STATE_UNKNOWN")
+@contextlib.contextmanager
+def child_environment(overrides: dict[str, str]) -> Iterator[None]:
+    """`overrides` in this process's environment while a launch copies it
+    (`runtime.build_launch_spec`), then the previous values back."""
+    previous = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def composite_web(image: Any, page_png: bytes, rect: tuple[int, int, int, int]) -> Any:
@@ -1099,32 +1189,70 @@ def color_distance(left: tuple[int, int, int], right: tuple[int, int, int]) -> i
     return max(abs(a - b) for a, b in zip(left, right))
 
 
-def web_content_present(
-    image: Any, mode: str, rect: tuple[int, int, int, int]
-) -> bool:
-    """Whether the compatibility pane has more than its empty background.
+def web_content_present(image: Any, rect: tuple[int, int, int, int]) -> bool:
+    """Whether the compatibility pane has more than its empty page ground.
 
     The page is composited into the pane rectangle, so the check only looks
-    there. A page with text has many pixels away from the theme background; an
-    empty pane has almost none. Sampling every four pixels and requiring a
-    tenth of a percent keeps a short release plan above the floor at the wide
-    viewport, where the text occupies little of the pane, while an empty pane
-    stays well below it.
+    there, against the page's own ground at the pane's top-left corner. A page
+    with text has many pixels away from that ground; an empty pane has almost
+    none. Sampling every four pixels and requiring a tenth of a percent keeps
+    a short release plan above the floor at the wide viewport, where the text
+    occupies little of the pane, while an empty pane stays well below it.
     """
-    background = expected_background(mode)
     left = max(0, rect[0])
     top = max(0, rect[1])
     right = min(image.width, rect[2])
     bottom = min(image.height, rect[3])
+    if right <= left or bottom <= top:
+        return False
+    ground = image.getpixel((left, top))
     changed = 0
     total = 0
     for y in range(top, bottom, 4):
         for x in range(left, right, 4):
             total += 1
-            pixel = image.getpixel((x, y))
-            if color_distance(pixel, background) > 24:
+            if color_distance(image.getpixel((x, y)), ground) > 24:
                 changed += 1
-    return total > 0 and changed >= max(64, total // 1000)
+    return changed >= max(64, total // 1000)
+
+
+def stop_profile_browsers(profile: Path) -> None:
+    """End the WebView2 browser processes serving `profile`'s WebView2
+    folder. The browser escapes the launch's job object and outlives the app
+    by minutes, holding the profile's files."""
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" | "
+        "Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf("
+        "$env:MARKTURBO_GOAL09_PROFILE, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            env={**os.environ, "MARKTURBO_GOAL09_PROFILE": str(profile)},
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def remove_profile(profile: Path, timeout: float = PROFILE_REMOVAL_SECONDS) -> None:
+    """Delete a cell's profile; if a WebView2 browser still holds its files,
+    end that browser and try again."""
+
+    def removed() -> bool:
+        shutil.rmtree(profile, ignore_errors=True)
+        return not profile.exists()
+
+    for attempt in (1, 2):
+        try:
+            wait_until(removed, timeout, "PROFILE_NOT_REMOVED", interval=0.25)
+            return
+        except HarnessFailure:
+            if attempt == 1:
+                stop_profile_browsers(profile)
 
 
 def capture_cell(
@@ -1134,41 +1262,46 @@ def capture_cell(
     cell: Cell,
     source: SourceBinding,
     executable: dict[str, Any],
+    ui_types: tuple[Any, ...],
+    parent_context: Any,
 ) -> dict[str, Any]:
     started = utc_now()
     case_root = out / "cells" / cell.cell_id
     case_root.mkdir(parents=True, exist_ok=True)
-    workspace = case_root / "workspace"
-    workspace.mkdir(exist_ok=True)
-    profile = Path(tempfile.mkdtemp(prefix=f"markturbo-{cell.cell_id}-"))
-    config = profile / "config"
-    data = profile / "data"
-    for directory in (config, data):
+    for stale in ("capture.png", "failure.png"):
+        (case_root / stale).unlink(missing_ok=True)
+    profile = Path(tempfile.mkdtemp(prefix="markturbo-goal09-")).resolve()
+    config, data, workspace, codex_home, local_app_data = (
+        profile / name
+        for name in ("config", "data", "workspace", "codex-home", "local-app-data")
+    )
+    for directory in (config, data, workspace, codex_home, local_app_data):
         directory.mkdir(parents=True, exist_ok=True)
     plan = fixture(workspace)
     server = ReviewServer(hold=cell.state == "review-loading") if cell.state in REVIEW_STATES else None
     if server is not None:
         server.start()
     write_settings(config / "settings.toml", cell.mode, cell.language, server)
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "MARKTURBO_CONFIG_DIR": str(config),
-            "MARKTURBO_DATA_DIR": str(data),
-            "RUST_LOG": "error",
-        }
-    )
-    if cell.state not in {"clean-profile-welcome", "new-unsaved-document", "settings"}:
-        environment["MARKTURBO_OPEN"] = str(plan)
-    if server is not None:
-        environment["OPENAI_API_KEY"] = "goal09-loopback-test-key"
+    # nsh keeps its WebView2 profile under `%LOCALAPPDATA%\<app id>`. One per
+    # cell, so a cell never joins the previous cell's still-exiting browser
+    # (which ignores this cell's debugging port) nor the user's own profile.
+    overrides = {"CODEX_HOME": str(codex_home), "LOCALAPPDATA": str(local_app_data)}
     web_port = free_port() if cell.state == "web-compatibility-preview" else None
     if web_port is not None:
-        environment["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
+        overrides["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
             f"--remote-debugging-port={web_port} --remote-allow-origins=*"
         )
+    harness = VisualHarness(
+        exe,
+        profile,
+        UI_TIMEOUT,
+        win32,
+        *ui_types,
+        parent_context,
+        credential=f"markturbo-goal09-{uuid.uuid4().hex}" if server is not None else None,
+    )
 
-    process: subprocess.Popen[bytes] | None = None
+    app: RunningApp | None = None
     window: AppWindow | None = None
     receipt: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,
@@ -1180,12 +1313,29 @@ def capture_cell(
         "executable": executable,
     }
     try:
-        process, window = launch(win32, exe, environment, workspace)
+        with child_environment(overrides):
+            app = harness.launch_app(
+                None if cell.state in EMPTY_STATES else plan,
+                data,
+                config,
+                workspace,
+                profile / "stderr.log",
+            )
+        window = AppWindow(win32, app.window)
         focused = window.foreground()
         dpi = int(win32.user32.GetDpiForWindow(window.hwnd))
         width, height = physical_viewport(cell.viewport, dpi)
         window.resize_client(width, height, dpi_awareness()[2])
-        prepare_state(window, cell.state, cell.language, plan)
+        markers = harness.prepare(app, cell, plan, server)
+        # Kept on a later failure too: the state was reached, and the
+        # `failure.png` shows it.
+        receipt["state_markers"] = markers
+        receipt["consent_hold_count"] = None if server is None else harness.consent_holds
+        window.park_pointer()
+        time.sleep(SETTLE_SECONDS)
+        # The app can grow its client area by the caption height after the
+        # first resize (seen as 1162 for 1125 px); place it again.
+        window.resize_client(width, height, dpi_awareness()[2])
         topmost = window.make_topmost()
         accessibility = window.accessibility()
         receipt["accessibility"] = accessibility
@@ -1200,24 +1350,12 @@ def capture_cell(
         if image.size != (width, height):
             raise VisualFailure("CAPTURE_SIZE_MISMATCH")
         web_evidence = None
-        web_rect = (0, 0, image.width, image.height)
         if web_port is not None:
-            time.sleep(0.4)
             page = cdp_page_png(web_port)
             rect = window.webview_rect()
-            if DEBUG:
-                debug_page = Path(tempfile.gettempdir()) / f"{cell.cell_id}-page.png"
-                debug_raw = Path(tempfile.gettempdir()) / f"{cell.cell_id}-raw.png"
-                debug_page.write_bytes(page)
-                image.save(debug_raw)
-                print(
-                    f"  web page={len(page)} bytes rect={rect} raw={image.size} "
-                    f"files={debug_page} {debug_raw}",
-                    file=sys.stderr,
-                    flush=True,
-                )
             image = composite_web(image, page, rect)
-            web_rect = rect
+            if not web_content_present(image, rect):
+                raise VisualFailure("WEBVIEW_CONTENT_MISSING")
             web_evidence = {
                 "method": "WebView2 CDP Page.captureScreenshot",
                 "page_byte_count": len(page),
@@ -1229,10 +1367,6 @@ def capture_cell(
         distance = color_distance(observed, expected)
         if distance > 10:
             raise VisualFailure("CAPTURE_EFFECTIVE_MODE_MISMATCH")
-        if cell.state == "web-compatibility-preview" and not web_content_present(
-            image, cell.mode, web_rect
-        ):
-            raise VisualFailure("WEBVIEW_CONTENT_MISSING")
         destination = case_root / "capture.png"
         image.save(destination, format="PNG")
         fingerprint = sha256_file(destination)
@@ -1267,10 +1401,10 @@ def capture_cell(
                     "expected_rgb": list(expected),
                     "max_channel_distance": distance,
                 },
-                "state_markers": [cell.state],
+                "review_request_count": None if server is None else server.request_count,
             }
         )
-    except VisualFailure as error:
+    except (VisualFailure, HarnessFailure, HarnessBlocked) as error:
         receipt["reason_code"] = error.code
         if error.detail:
             receipt["failure_type"] = error.detail
@@ -1281,27 +1415,21 @@ def capture_cell(
                 capture_window(window.hwnd).save(case_root / "failure.png", format="PNG")
             except Exception:  # noqa: BLE001
                 pass
-    except (HarnessFailure, HarnessBlocked) as error:
-        receipt["reason_code"] = error.code
-        if error.detail:
-            receipt["failure_type"] = error.detail
     except Exception as error:  # noqa: BLE001 - a cell must not abort the matrix
         receipt["reason_code"] = "CAPTURE_FAILED"
         receipt["failure_type"] = safe_exception_name(error)
         if DEBUG:
             print(f"  {type(error).__name__}: {error}", file=sys.stderr, flush=True)
     finally:
-        if window is not None:
-            window.close()
-        if process is not None:
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            if app is not None:
+                harness.reap(app)
+            harness.cleanup()
+        except Exception:  # noqa: BLE001 - the job object still ends the app
+            pass
         if server is not None:
             server.close()
-        shutil.rmtree(profile, ignore_errors=True)
+        remove_profile(profile)
         receipt.setdefault("completed_at", utc_now())
         (case_root / "receipt.json").write_text(
             json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
@@ -1364,6 +1492,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     try:
         win32 = Win32()
+        parent_context = win32.security_context(os.getpid())
+        ui_types = load_pywinauto()
+    except HarnessBlocked as error:
+        print(f"error: {error.code}", file=sys.stderr)
+        return 2
     except Exception as error:  # noqa: BLE001
         print(f"error: Windows APIs unavailable: {safe_exception_name(error)}", file=sys.stderr)
         return 2
@@ -1375,16 +1508,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         "executable": executable,
         "cells": [],
     }
-    for index, cell in enumerate(cells, 1):
-        print(f"[{index}/{len(cells)}] {cell.cell_id}", flush=True)
-        receipt = capture_cell(win32, arguments.exe.resolve(), out, cell, source, executable)
-        summary["cells"].append(
-            {
-                "cell_id": cell.cell_id,
-                "status": receipt["status"],
-                "reason_code": receipt.get("reason_code"),
-            }
-        )
+    win32.keep_display_awake()
+    try:
+        for index, cell in enumerate(cells, 1):
+            print(f"[{index}/{len(cells)}] {cell.cell_id}", flush=True)
+            receipt = capture_cell(
+                win32,
+                arguments.exe.resolve(),
+                out,
+                cell,
+                source,
+                executable,
+                ui_types,
+                parent_context,
+            )
+            if receipt["status"] != "CAPTURED":
+                print(f"  {receipt.get('reason_code')}", flush=True)
+            summary["cells"].append(
+                {
+                    "cell_id": cell.cell_id,
+                    "status": receipt["status"],
+                    "reason_code": receipt.get("reason_code"),
+                }
+            )
+    finally:
+        win32.allow_display_sleep()
     captured = sum(item["status"] == "CAPTURED" for item in summary["cells"])
     summary["status"] = "PASS" if captured == len(cells) else "FAIL"
     summary["completed_at"] = utc_now()
