@@ -59,7 +59,8 @@ to a serif. Martian stays embedded; no font is added to the executable.
 - CI: the per-PR pipeline on the PR head (Linux tests, the macOS build,
   Windows release tests), plus a Nightly run on the PR head for the macOS
   tests.
-- Native: `mt.py visual -- --states settings,review-result-questions
+- Native: `mt.py visual -- --exe <release mt-app.exe>
+  --out .scratch/goal-12-visual --states settings,review-result-questions
   --languages en-us,zh-cn --viewports default` on the release build. Capture
   receipts stay under the git-ignored `.scratch/`.
 

@@ -355,8 +355,8 @@ impl Layout {
 // under those; they are fallbacks, never the first entry.
 
 // After Martian, each platform falls back to the faces it ships that sit
-// closest to it: a clean, geometric-leaning CJK sans first — so the CJK
-// punctuation and symbols Martian lacks (`―`, `…`) are drawn by the CJK face,
+// closest to it: a clean, geometric-leaning CJK sans first — so CJK
+// characters missing from Martian, such as `―`, are drawn by the CJK face,
 // as Chinese text sets them — then the platform's own neo-grotesk UI face for
 // what neither has, then the generic family. Displayed text takes a character
 // the first family lacks from the next family that has it. Windows text inputs
@@ -598,6 +598,7 @@ mod tests {
             assert_eq!(first, Some("Bahnschrift"), "{FONT_INPUT}");
         } else {
             assert_eq!(first, Some("Martian Grotesk Std Rg"), "{FONT_INPUT}");
+            assert_eq!(FONT_INPUT, FONT_UI);
         }
     }
 
