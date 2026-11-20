@@ -14,6 +14,12 @@
 //! its `web_dirty` deferral (never mutate a WebView from render) and its
 //! restricted-scripts banner.
 //!
+//! The preview body uses [`tokens::FONT_UI`], which leads with the Regular
+//! instance's legacy family so DirectWrite finds the registered face.
+//! The Windows ruler (60 `M`s at 14 px) measures 884 for both `FONT_UI` and
+//! the registered Regular face, 755 for a missing family, and 727 for
+//! DengXian; see `document::tests::the_ui_and_model_lists_resolve_to_martian`.
+//!
 //! The web pane never navigates from render: its [`WebDocument`] watches the
 //! document text, the trust level and the appearance, marks the page dirty and
 //! builds it from an effect, whose write the web view applies at the next
@@ -42,18 +48,6 @@ use crate::{
     },
     web,
 };
-
-/// The preview body's family: what the app's registered grotesk answers to.
-///
-/// `tokens::FONT_UI` names it by its typographic family (`Martian Grotesk`),
-/// which the Windows text engine does not find — it searches with DirectWrite's
-/// `FindFamilyName`, which matches the file's *legacy* family name (nameID 1:
-/// `Martian Grotesk Std Rg`, the Regular instance the 16/27 body wants).
-/// Measured in the editor's rows, 60 `M`s at 14pt: the registered face 884,
-/// the fallback 755, DengXian 727 — see
-/// `document::tests::the_editor_draws_the_registered_source_font`. The
-/// fallbacks follow the spec's list.
-const FONT_PREVIEW: &str = "Martian Grotesk Std Rg, DengXian, Microsoft YaHei UI, sans-serif";
 
 /// Whether the field is showing the preview or the web pane (Split, SplitWeb).
 pub fn is_open(state: &AppState) -> bool {
@@ -217,7 +211,7 @@ fn rendered(state: AppState, language: Language) -> impl IntoElement {
                                 .render_math(|math: &TextViewMath| {
                                     render_diagram("math", math.tex.as_ref())
                                 })
-                                .font_family(FONT_PREVIEW)
+                                .font_family(tokens::FONT_UI)
                                 .text_size(px(tokens::TYPE_PREVIEW))
                                 .line_height(px(tokens::TYPE_PREVIEW_LINE))
                                 .text_color(move || tokens::palette().ink)

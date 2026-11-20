@@ -358,8 +358,9 @@ impl Layout {
 // closest to it: a clean, geometric-leaning CJK sans first — so the CJK
 // punctuation and symbols Martian lacks (`―`, `…`) are drawn by the CJK face,
 // as Chinese text sets them — then the platform's own neo-grotesk UI face for
-// what neither has, then the generic family. Every text engine takes a
-// character the first family lacks from the next that has it.
+// what neither has, then the generic family. Displayed text uses the next
+// family that has a missing character. Windows text inputs resolve only the
+// first family from system fonts; see `FONT_INPUT`.
 //
 // * Windows: DengXian — geometric, low-contrast and open, the system's
 //   closest Simplified Chinese match to Martian — then Microsoft YaHei UI.
@@ -398,7 +399,7 @@ macro_rules! sans_fallback {
         "PingFang SC, Hiragino Sans GB, system-ui, sans-serif"
     };
 }
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "windows"))]
 macro_rules! light_fallback {
     () => {
         sans_fallback!()
@@ -417,12 +418,6 @@ macro_rules! sans_fallback {
     };
 }
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-macro_rules! light_fallback {
-    () => {
-        sans_fallback!()
-    };
-}
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 macro_rules! mono_fallback {
     () => {
         "Noto Sans Mono CJK SC, Noto Sans CJK SC, Adwaita Mono, DejaVu Sans Mono, monospace"
@@ -435,8 +430,7 @@ pub const FONT_UI: &str = concat!(
     sans_fallback!()
 );
 /// Martian Grotesk 300 (the `Std Lt` instance): the model's voice, the only
-/// large type in the app. Its fallbacks follow the light cut where the
-/// platform names one.
+/// large type in the app.
 pub const FONT_MODEL: &str = concat!(
     "Martian Grotesk Std Lt, Martian Grotesk, ",
     light_fallback!()
@@ -559,6 +553,37 @@ mod tests {
                 FONT_MODEL.contains("DengXian Light, DengXian"),
                 "{FONT_MODEL}"
             );
+        }
+    }
+
+    #[test]
+    fn the_font_roles_have_exact_ordered_fallbacks() {
+        #[cfg(target_os = "windows")]
+        let (sans, model, mono) = (
+            "DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Text, sans-serif",
+            "DengXian Light, DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Display, sans-serif",
+            "DengXian, Microsoft YaHei UI, Cascadia Mono, Consolas, monospace",
+        );
+        #[cfg(target_os = "macos")]
+        let (sans, model, mono) = (
+            "PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
+            "PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
+            "PingFang SC, Hiragino Sans GB, ui-monospace, Menlo, monospace",
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let (sans, model, mono) = (
+            "Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
+            "Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
+            "Noto Sans Mono CJK SC, Noto Sans CJK SC, Adwaita Mono, DejaVu Sans Mono, monospace",
+        );
+
+        for (role, list, expected) in [
+            ("FONT_UI", FONT_UI, sans),
+            ("FONT_MODEL", FONT_MODEL, model),
+            ("FONT_MEDIUM", FONT_MEDIUM, sans),
+            ("FONT_SOURCE", FONT_SOURCE, mono),
+        ] {
+            assert_eq!(list.splitn(3, ", ").nth(2), Some(expected), "{role}");
         }
     }
 
