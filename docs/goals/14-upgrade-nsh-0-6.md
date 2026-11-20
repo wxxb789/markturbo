@@ -54,6 +54,13 @@ work then targets the 0.6 animation and interaction APIs, not 0.5.1.
    If the desktop is unavailable, this clause stays pending and the PR records it. It is not
    waived.
 
+7. The on-disk data location is unchanged: settings, the recovery store and the companion font.
+   nsh 0.6.0 added an app-named data directory (#2232). Check whether any path that MarkTurbo or
+   nsh resolves for MarkTurbo moves. A unit test, or a recorded before/after resolution, should
+   show that the paths are the same.
+   - If a path would move, stop and report. Do not migrate, copy or drop user files without the
+     owner's decision.
+
 ## Failure control
 
 - Two versions of any nsh crate in `Cargo.lock`, or a manifest still on 0.5.x.
