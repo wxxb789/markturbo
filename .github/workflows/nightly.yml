@@ -85,8 +85,9 @@ jobs:
           - runner: windows-2022
             cache: windows
     runs-on: ${{ matrix.runner }}
-    # The release-profile suite alone measured 3082 s on macOS, so the 20-45
-    # minute pull-request bounds do not apply here; this only stops a hang.
+    # The release-profile suite still re-optimizes the app at link time, so
+    # the 20-45 minute pull-request bounds do not apply here; this only stops
+    # a hang.
     timeout-minutes: 240
     defaults:
       run:
@@ -109,5 +110,19 @@ jobs:
       - name: Test the workspace
         run: cargo test --locked --profile ci --workspace
 
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest
+
       - name: Test the app in the release profile
-        run: cargo test --release --locked -p mt-app
+        # The shipped codegen (thin LTO, one codegen unit) re-optimizes the
+        # whole app in every test binary it links, so this step links the
+        # unit tests and one `release_suite` binary holding every
+        # `tests/*.rs` file instead of one binary per file. On windows-2022
+        # (run 44453412872) building 38 binaries took 120m28s of the 122-minute
+        # step and the tests under two minutes; the build time grew with the
+        # binary count (60m24s for 21 in run 44077710691). nextest gives each
+        # test its own process, which those tests need, and runs them in
+        # parallel; mt-app has no doctests (`doctest = false`) and the main
+        # binary has no unit tests.
+        run: cargo nextest run --locked --cargo-profile release -p mt-app --lib --test release_suite

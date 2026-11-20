@@ -15,6 +15,13 @@ doctest = false
 name = "markturbo"
 path = "src/main.rs"
 
+# All of `tests/*.rs` as one binary, for the nightly release-profile run only
+# (see the file header). `test = false` keeps it out of plain `cargo test`.
+[[test]]
+name = "release_suite"
+path = "tests/release_suite.rs"
+test = false
+
 [features]
 default = ["model-transport"]
 # The public build keeps this default; disabling it is only the compile-time

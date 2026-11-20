@@ -117,7 +117,11 @@
   compilation and linking). Consolidating them behind one `tests/all.rs` with
   `autotests = false`, or adopting `cargo nextest` for cross-binary parallelism,
   would cut both costs. Treat it as its own small goal inside the upcoming UI
-  iteration, and keep `cargo test` as the local command either way.
+  iteration, and keep `cargo test` as the local command either way. The PR app
+  suites already use nextest, and the nightly release-profile run already links
+  the files once through `tests/release_suite.rs`; what remains is the
+  per-file binaries under `cargo test`, most of which set process environment
+  variables and so need their own process.
 - [ ] **Dead-code candidate: multi-chain loopback provider** — Goal 07 now runs
   one Review→Revision chain, but `LoopbackRevisionServer` in
   `scripts/markturbo_tools/native/goal07_provider.py` still supports repeated
