@@ -11,8 +11,10 @@ to a serif. Martian stays embedded; no font is added to the executable.
 1. `crates/mt-app/src/ui/tokens.rs` gives `FONT_UI`, `FONT_MODEL`,
    `FONT_MEDIUM` and `FONT_SOURCE` per-platform fallbacks after the two Martian
    names, CJK face first:
-   - Windows: DengXian → Microsoft YaHei UI → Bahnschrift → Segoe UI Variable;
-     code: Cascadia Mono → Consolas.
+   - Windows: DengXian → Microsoft YaHei UI → Bahnschrift → Segoe UI Variable
+     (as the optical-size families DirectWrite resolves: `Segoe UI Variable
+     Text`, and `Segoe UI Variable Display` for the model voice); code:
+     Cascadia Mono → Consolas.
    - macOS: PingFang SC → Hiragino Sans GB → `system-ui`; code: `ui-monospace`
      → Menlo.
    - Linux: Noto Sans CJK SC → Source Han Sans SC → WenQuanYi Micro Hei → Inter
