@@ -701,7 +701,7 @@ fn ink_bar(color: Color) -> impl IntoElement {
 /// The companion Chinese font: what it is and where it would come from, and
 /// the actions available in each state. Nothing is fetched until Download or
 /// Retry is pressed, after the disclosure names the host, size and licence.
-fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElement {
+pub(super) fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElement {
     let status = companion.status;
     let total = companion.size();
     let can_download = move || {
@@ -716,6 +716,7 @@ fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElemen
         companion.clone(),
         companion,
     );
+    let removable = remove.clone();
     section(
         s(S::ChineseFont, language),
         view()
@@ -737,7 +738,7 @@ fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElemen
                             | CompanionStatus::Downloading(_)
                             | CompanionStatus::Applying
                             | CompanionStatus::Removing
-                            | CompanionStatus::Failed(CompanionFailure::Removal { .. })
+                            | CompanionStatus::Failed(CompanionFailure::Removal)
                     )
                 },
                 move || {
@@ -787,7 +788,7 @@ fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElemen
                         },
                     ))
                     .child(when(
-                        move || status.get().can_remove(),
+                        move || removable.can_remove(),
                         move || {
                             let companion = remove.clone();
                             prims::quiet_action(
@@ -823,7 +824,7 @@ fn cjk_font_status_text(status: CompanionStatus, total: u64, language: Language)
         CompanionStatus::Failed(CompanionFailure::Verification) => S::FontFailedVerification,
         CompanionStatus::Failed(CompanionFailure::Disk) => S::FontFailedDisk,
         CompanionStatus::Failed(CompanionFailure::Registration) => S::FontFailedRegistration,
-        CompanionStatus::Failed(CompanionFailure::Removal { .. }) => S::FontFailedRemoval,
+        CompanionStatus::Failed(CompanionFailure::Removal) => S::FontFailedRemoval,
     };
     s(key, language).into()
 }
@@ -1130,7 +1131,7 @@ fn s(key: S, language: Language) -> &'static str {
                 "Download failed: the file was not the expected font, so it was discarded."
             }
             S::FontFailedDisk => {
-                "Download failed: the font could not be saved in MarkTurbo's data folder."
+                "Download failed: the font file could not be saved or read back in MarkTurbo's data folder."
             }
             S::FontFailedRegistration => "The font could not be registered and was not applied.",
             S::FontFailedRemoval => {
@@ -1163,7 +1164,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::FontRemoved => "已移除。重启 MarkTurbo 前，中文仍使用思源黑体 CN。",
             S::FontFailedNetwork => "下载失败：网络请求未完成。未安装任何内容。",
             S::FontFailedVerification => "下载失败：文件与预期字体不符，已丢弃。",
-            S::FontFailedDisk => "下载失败：无法将字体保存到 MarkTurbo 的数据目录。",
+            S::FontFailedDisk => "下载失败：无法在 MarkTurbo 的数据目录中保存或读回字体文件。",
             S::FontFailedRegistration => "字体注册失败，未能应用。",
             S::FontFailedRemoval => "移除失败：无法从 MarkTurbo 的数据目录中删除字体。",
         },
