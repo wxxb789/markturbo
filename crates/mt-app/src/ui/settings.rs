@@ -699,9 +699,8 @@ fn ink_bar(color: Color) -> impl IntoElement {
 }
 
 /// The companion Chinese font: what it is and where it would come from, and
-/// the one action of each state. Nothing is fetched until its action is
-/// pressed, and the disclosure above that action names the host, the size and
-/// the licence first.
+/// the actions available in each state. Nothing is fetched until Download or
+/// Retry is pressed, after the disclosure names the host, size and licence.
 fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElement {
     let status = companion.status;
     let total = companion.size();
@@ -737,6 +736,8 @@ fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElemen
                         CompanionStatus::Installed
                             | CompanionStatus::Downloading(_)
                             | CompanionStatus::Applying
+                            | CompanionStatus::Removing
+                            | CompanionStatus::Failed(CompanionFailure::Removal { .. })
                     )
                 },
                 move || {
@@ -762,7 +763,7 @@ fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElemen
                         .into_element()
                     }))
                     .child(when(
-                        move || matches!(status.get(), CompanionStatus::Failed(_)),
+                        move || status.get().can_retry_download(),
                         move || {
                             let companion = retry.clone();
                             prims::primary_action(
@@ -786,7 +787,7 @@ fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElemen
                         },
                     ))
                     .child(when(
-                        move || status.get() == CompanionStatus::Installed,
+                        move || status.get().can_remove(),
                         move || {
                             let companion = remove.clone();
                             prims::quiet_action(
@@ -816,11 +817,13 @@ fn cjk_font_status_text(status: CompanionStatus, total: u64, language: Language)
         CompanionStatus::Applying => S::FontApplying,
         CompanionStatus::Absent => S::FontAbsent,
         CompanionStatus::Installed => S::FontInstalled,
+        CompanionStatus::Removing => S::FontRemoving,
         CompanionStatus::Removed => S::FontRemoved,
         CompanionStatus::Failed(CompanionFailure::Network) => S::FontFailedNetwork,
         CompanionStatus::Failed(CompanionFailure::Verification) => S::FontFailedVerification,
         CompanionStatus::Failed(CompanionFailure::Disk) => S::FontFailedDisk,
         CompanionStatus::Failed(CompanionFailure::Registration) => S::FontFailedRegistration,
+        CompanionStatus::Failed(CompanionFailure::Removal { .. }) => S::FontFailedRemoval,
     };
     s(key, language).into()
 }
@@ -1082,11 +1085,13 @@ enum S {
     FontDownloading,
     FontApplying,
     FontInstalled,
+    FontRemoving,
     FontRemoved,
     FontFailedNetwork,
     FontFailedVerification,
     FontFailedDisk,
     FontFailedRegistration,
+    FontFailedRemoval,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -1114,6 +1119,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::FontDownloading => "Downloading",
             S::FontApplying => "Applying…",
             S::FontInstalled => "Installed and applied: Chinese text is set in Source Han Sans CN.",
+            S::FontRemoving => "Removing…",
             S::FontRemoved => {
                 "Removed. Chinese text keeps Source Han Sans CN until MarkTurbo restarts."
             }
@@ -1127,6 +1133,9 @@ fn s(key: S, language: Language) -> &'static str {
                 "Download failed: the font could not be saved in MarkTurbo's data folder."
             }
             S::FontFailedRegistration => "The font could not be registered and was not applied.",
+            S::FontFailedRemoval => {
+                "Removal failed: the font could not be deleted from MarkTurbo's data folder."
+            }
         },
         Language::Chinese => match key {
             S::Endpoint => "端点",
@@ -1150,11 +1159,13 @@ fn s(key: S, language: Language) -> &'static str {
             S::FontDownloading => "正在下载",
             S::FontApplying => "正在应用…",
             S::FontInstalled => "已安装并应用：中文使用思源黑体 CN。",
+            S::FontRemoving => "正在移除…",
             S::FontRemoved => "已移除。重启 MarkTurbo 前，中文仍使用思源黑体 CN。",
             S::FontFailedNetwork => "下载失败：网络请求未完成。未安装任何内容。",
             S::FontFailedVerification => "下载失败：文件与预期字体不符，已丢弃。",
             S::FontFailedDisk => "下载失败：无法将字体保存到 MarkTurbo 的数据目录。",
             S::FontFailedRegistration => "字体注册失败，未能应用。",
+            S::FontFailedRemoval => "移除失败：无法从 MarkTurbo 的数据目录中删除字体。",
         },
     }
 }

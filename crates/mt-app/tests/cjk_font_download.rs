@@ -6,13 +6,14 @@
 //! The font comes from a loopback server through the test-build seam
 //! (`serve_companion_from`); no test build can reach the pinned remote host.
 
+use std::fs::{self, File, FileTimes};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpListener;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use nsh_core::{ApproxTextEngine, AttributedText, Size, TextEngine, TextLayout, font_family};
 use nsh_engine::{EngineConfig, Points, Root};
@@ -112,12 +113,44 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
     }
+    let wait = Duration::from_secs(10);
+    fs::create_dir_all(installed.parent().unwrap()).expect("fonts directory");
+    fs::write(&installed, FONT).expect("existing font");
+    let (mut app, _) = start();
+    app.wait(Duration::from_millis(300))
+        .expect("idle with no test source");
+    assert_eq!(
+        fs::read(&installed).expect("the default test source left the file alone"),
+        FONT
+    );
+    drop(app);
+
     let (url, requests) = serve(FONT, true);
     mt_app::ui::fonts::serve_companion_from(&url, FONT);
-    let wait = Duration::from_secs(10);
 
-    // Absent: the disclosure and the action, and nothing fetched.
+    // Keep restore pending while Settings opens: removing a corrupt copy
+    // needs the lifecycle lock held by another instance.
+    fs::write(&installed, INVALID_FONT).expect("corrupt font");
+    let stale = installed.with_file_name(".companion-font-crashed.part");
+    File::create(&stale)
+        .and_then(|file| file.set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH)))
+        .expect("stale partial download");
+    let lock =
+        File::create(config.path().join("data/.companion-font.lock")).expect("lifecycle lock file");
+    lock.lock().expect("hold the lifecycle lock");
     let (mut app, registrations) = start();
+    app.wait_for("text:Applying…").expect("restore pending");
+    assert!(!app.shows("id:settings-cjk-font-download"));
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    drop(lock);
+    app.wait_for("id:settings-cjk-font-download")
+        .expect("download offered once restore finds no valid copy");
+    assert!(!installed.exists(), "restore discarded the corrupt copy");
+    assert!(
+        !stale.exists(),
+        "restore discarded the stale partial download"
+    );
+    // Absent: the disclosure and the action, and nothing fetched.
     app.wait_for("id:settings-cjk-font")
         .expect("the Chinese font entry");
     app.wait_for("text:Not installed. Chinese text uses the system's font.")
@@ -210,6 +243,22 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         "startup fetched nothing"
     );
 
+    // A disk failure offers another removal, not a new download.
+    fs::remove_file(&installed).expect("clear the installed file");
+    fs::create_dir(&installed).expect("make the file path unremovable as a file");
+    app.press("id:settings-cjk-font-remove").expect("remove");
+    app.wait_for_within(
+        "text:Removal failed: the font could not be deleted from MarkTurbo's data folder.",
+        wait,
+    )
+    .expect("removal disk failure");
+    app.wait_for("id:settings-cjk-font-remove")
+        .expect("retry removal");
+    assert!(!app.shows("id:settings-cjk-font-retry"));
+    assert!(!app.shows("id:settings-cjk-font-download"));
+    fs::remove_dir(&installed).expect("clear the obstruction");
+    fs::write(&installed, FONT).expect("put the font back");
+
     // Removed: the file goes; the face stays until a restart.
     app.press("id:settings-cjk-font-remove").expect("remove");
     app.wait_for_within(
@@ -236,7 +285,8 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     app.wait_for("id:settings-cjk-font-retry")
         .expect("retry after registration failure");
     assert!(!app.shows("Installed and applied"));
-    assert!(!app.shows("id:settings-cjk-font-remove"));
+    app.wait_for("id:settings-cjk-font-remove")
+        .expect("remove after registration failure");
     assert_eq!(
         std::fs::read(&installed).expect("verified font file"),
         INVALID_FONT
@@ -251,6 +301,12 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         wait,
     )
     .expect("registration failure on restore");
-    assert!(!app.shows("id:settings-cjk-font-remove"));
+    app.press("id:settings-cjk-font-remove")
+        .expect("remove the verified but unregistered file");
+    app.wait_for("id:settings-cjk-font-download")
+        .expect("downloadable again");
+    app.wait_for("text:Not installed. Chinese text uses the system's font.")
+        .expect("no font is applied after removing an unregistered copy");
+    assert!(!installed.exists());
     assert_eq!(invalid_requests.load(Ordering::SeqCst), 1);
 }

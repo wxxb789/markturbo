@@ -33,6 +33,10 @@ pub const SHA256: &str = "ad10f878ea1af97d66ec8bd10eb39798784f3a1ee3d5987a570ef6
 pub const LICENSE: &str = "SIL Open Font License 1.1";
 /// The file's name in the fonts directory.
 pub const FILE_NAME: &str = "SourceHanSansCN-VF.otf";
+const PARTIAL_PREFIX: &str = ".companion-font-";
+const PARTIAL_SUFFIX: &str = ".part";
+const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+const PARTIAL_STALE_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The companion font in one data directory: where it lives, and the source
 /// and digest it must match.
@@ -166,6 +170,71 @@ impl CompanionFont {
         self.path().is_file()
     }
 
+    /// Removes abandoned partial downloads left behind by a crashed process.
+    pub fn cleanup_stale_parts(&self) -> io::Result<()> {
+        match fs::metadata(&self.dir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let _lifecycle = self.lock_lifecycle()?;
+        self.cleanup_stale_parts_unlocked(std::time::SystemTime::now())
+    }
+
+    fn cleanup_stale_parts_unlocked(&self, now: std::time::SystemTime) -> io::Result<()> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let stale_after = STALL_LIMIT + PARTIAL_STALE_MARGIN;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(PARTIAL_PREFIX)
+                || !name.ends_with(PARTIAL_SUFFIX)
+                || !entry.file_type()?.is_file()
+            {
+                continue;
+            }
+            let path = entry.path();
+            let modified = entry.metadata()?.modified()?;
+            if !now
+                .duration_since(modified)
+                .is_ok_and(|age| age > stale_after)
+            {
+                continue;
+            }
+
+            let file = match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+            let modified = file.metadata()?.modified()?;
+            if !now
+                .duration_since(modified)
+                .is_ok_and(|age| age > stale_after)
+            {
+                continue;
+            }
+            drop(file);
+            match fs::remove_file(path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The verified font, for registration: `None` when it is absent, or when
     /// the file present does not match the pinned size and digest — that file
     /// is removed, so a damaged copy is never handed to the text engine.
@@ -266,12 +335,14 @@ impl CompanionFont {
     ) -> Result<(), DownloadError> {
         let runtime = crate::model::transport::runtime().map_err(|_| DownloadError::Network)?;
         fs::create_dir_all(&self.dir).map_err(|_| DownloadError::Disk)?;
-        // Dropped (and deleted) on every early return below.
+        let lifecycle = self.lock_lifecycle().map_err(|_| DownloadError::Disk)?;
         let mut part = tempfile::Builder::new()
-            .prefix(".companion-font-")
-            .suffix(".part")
+            .prefix(PARTIAL_PREFIX)
+            .suffix(PARTIAL_SUFFIX)
             .tempfile_in(&self.dir)
             .map_err(|_| DownloadError::Disk)?;
+        part.as_file().lock().map_err(|_| DownloadError::Disk)?;
+        drop(lifecycle);
         let digest = runtime.block_on(self.fetch(part.as_file_mut(), progress, control))?;
         after_fetch();
         if digest != self.sha256 {
@@ -335,9 +406,6 @@ impl CompanionFont {
 /// How often a waiting download looks at its cancel flag.
 #[cfg(feature = "model-transport")]
 const CANCEL_TICK: std::time::Duration = std::time::Duration::from_millis(100);
-/// How long a connection or the stream may stall before the download fails.
-#[cfg(feature = "model-transport")]
-const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `future`'s output, unless `cancel` is set first or it stalls past
 /// [`STALL_LIMIT`].
@@ -441,6 +509,66 @@ mod tests {
         font.remove().unwrap();
         assert!(!font.is_installed());
         font.remove().expect("removing an absent font is fine");
+    }
+
+    fn set_modified(path: &Path, modified: std::time::SystemTime) {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_removes_stale_part_and_keeps_fresh_one() {
+        let data = tempfile::tempdir().unwrap();
+        let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
+        fs::create_dir_all(&font.dir).unwrap();
+        let stale = font.dir.join(".companion-font-stale.part");
+        fs::write(&stale, b"unfinished").unwrap();
+        set_modified(&stale, std::time::SystemTime::UNIX_EPOCH);
+        let fresh = font.dir.join(".companion-font-fresh.part");
+        fs::write(&fresh, b"still writing").unwrap();
+
+        font.cleanup_stale_parts().unwrap();
+
+        assert!(!stale.exists(), "stale partial download was removed");
+        assert!(fresh.exists(), "fresh partial download was kept");
+    }
+
+    #[test]
+    fn startup_cleanup_keeps_a_locked_stale_part() {
+        let data = tempfile::tempdir().unwrap();
+        let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
+        fs::create_dir_all(&font.dir).unwrap();
+        let active = font.dir.join(".companion-font-active.part");
+        fs::write(&active, b"still writing").unwrap();
+        set_modified(&active, std::time::SystemTime::UNIX_EPOCH);
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_path = active.clone();
+        let holder = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            file.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        font.cleanup_stale_parts().unwrap();
+
+        assert!(
+            active.exists(),
+            "a locked part survives even with stale mtime"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     #[cfg(feature = "model-transport")]

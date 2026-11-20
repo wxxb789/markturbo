@@ -107,28 +107,50 @@ pub fn register() {
 /// The companion CJK face as the settings page shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompanionStatus {
-    /// Not on this device (or not found yet at startup).
+    /// No usable file on this device.
     Absent,
     /// Being downloaded: the bytes received so far.
     Downloading(u64),
-    /// Verified and committed; nsh is registering the face.
+    /// Checking a stored file or registering the verified face.
     Applying,
     /// Verified and registered: Chinese text is set in it.
     Installed,
+    /// Deleting the stored file.
+    Removing,
     /// Removed this session. nsh 0.5.1 cannot unregister a face, so the
     /// registered one stays until the app restarts.
     Removed,
-    /// The last download or registration failed; the face is not applied.
+    /// The last operation failed.
     Failed(CompanionFailure),
 }
 
-/// Why downloading or applying the companion failed, as the page names it.
+impl CompanionStatus {
+    pub fn can_remove(self) -> bool {
+        self.applied_before_removal().is_some()
+    }
+
+    pub fn can_retry_download(self) -> bool {
+        matches!(self, Self::Failed(failure) if !matches!(failure, CompanionFailure::Removal { .. }))
+    }
+
+    fn applied_before_removal(self) -> Option<bool> {
+        match self {
+            Self::Installed => Some(true),
+            Self::Failed(CompanionFailure::Registration) => Some(false),
+            Self::Failed(CompanionFailure::Removal { was_applied }) => Some(was_applied),
+            _ => None,
+        }
+    }
+}
+
+/// Why an operation on the companion failed, as the page names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompanionFailure {
     Network,
     Verification,
     Disk,
     Registration,
+    Removal { was_applied: bool },
 }
 
 const PROGRESS_TICK: Duration = Duration::from_millis(150);
@@ -150,12 +172,18 @@ pub struct Companion {
 }
 
 impl Companion {
-    /// The companion in this user's data directory, not yet looked at. Call
+    /// The companion in this user's data directory, not yet verified. Call
     /// it under the owner the tasks should live with (the app state's).
     pub fn new() -> Self {
+        let font = companion_font();
+        let status = if font.as_ref().is_some_and(CompanionFont::is_installed) {
+            CompanionStatus::Applying
+        } else {
+            CompanionStatus::Absent
+        };
         Self {
-            status: signal(CompanionStatus::Absent),
-            font: companion_font(),
+            status: signal(status),
+            font,
             cancel: Rc::default(),
             generation: Rc::default(),
             owner: Owner::current(),
@@ -177,10 +205,21 @@ impl Companion {
             return;
         };
         let this = self.clone();
+        let generation = self.generation.get();
         self.run(async move {
-            let generation = this.generation.get();
-            match blocking(move || font.load()).await {
+            let outcome = blocking(move || {
+                if font.cleanup_stale_parts().is_err() {
+                    log::warn!("fonts: stale companion downloads could not be cleaned up");
+                }
+                font.load()
+            })
+            .await;
+            if this.generation.get() != generation {
+                return;
+            }
+            match outcome {
                 Ok(Ok(Some(bytes))) => {
+                    this.status.set(CompanionStatus::Applying);
                     let status = match register_companion(bytes).await {
                         Ok(()) => CompanionStatus::Installed,
                         Err(failure) => CompanionStatus::Failed(failure),
@@ -189,8 +228,11 @@ impl Companion {
                         this.status.set(status);
                     }
                 }
-                Ok(Ok(None)) => {}
-                _ => log::warn!("fonts: the companion could not be read"),
+                Ok(Ok(None)) => this.status.set(CompanionStatus::Absent),
+                _ => {
+                    log::warn!("fonts: the companion could not be read");
+                    this.status.set(CompanionStatus::Absent);
+                }
             }
         });
     }
@@ -198,10 +240,10 @@ impl Companion {
     /// Downloads, verifies, installs and registers the font: only ever on
     /// the person's press.
     pub fn download(&self) {
-        if matches!(
-            self.status.get(),
-            CompanionStatus::Downloading(_) | CompanionStatus::Applying
-        ) {
+        let status = self.status.get();
+        if !matches!(status, CompanionStatus::Absent | CompanionStatus::Removed)
+            && !status.can_retry_download()
+        {
             return;
         }
         let Some(font) = self.font.clone() else {
@@ -291,15 +333,24 @@ impl Companion {
 
     /// Deletes the file. The registered face stays until the app restarts.
     pub fn remove(&self) {
+        let Some(was_applied) = self.status.get().applied_before_removal() else {
+            return;
+        };
         let Some(font) = self.font.clone() else {
             return;
         };
+        self.status.set(CompanionStatus::Removing);
         let this = self.clone();
         self.run(async move {
-            match blocking(move || font.remove()).await {
-                Ok(Ok(())) => this.status.set(CompanionStatus::Removed),
-                _ => log::warn!("fonts: the companion could not be removed"),
-            }
+            let status = match blocking(move || font.remove()).await {
+                Ok(Ok(())) if was_applied => CompanionStatus::Removed,
+                Ok(Ok(())) => CompanionStatus::Absent,
+                _ => {
+                    log::warn!("fonts: the companion could not be removed");
+                    CompanionStatus::Failed(CompanionFailure::Removal { was_applied })
+                }
+            };
+            this.status.set(status);
         });
     }
 
@@ -348,8 +399,8 @@ async fn register_companion(bytes: Vec<u8>) -> Result<(), CompanionFailure> {
 }
 
 /// The companion in this user's data directory. A test build never names
-/// the pinned remote source: it downloads from what
-/// [`serve_companion_from`] set, else from a loopback port nothing answers.
+/// the pinned remote source and leaves any installed file alone unless a
+/// test explicitly sets its source with [`serve_companion_from`].
 fn companion_font() -> Option<CompanionFont> {
     #[cfg(not(any(test, feature = "test-vault")))]
     {
@@ -358,12 +409,10 @@ fn companion_font() -> Option<CompanionFont> {
     #[cfg(any(test, feature = "test-vault"))]
     {
         let data = mt_core::runtime_paths::data_dir()?;
-        let source = TEST_SOURCE
+        let (url, expected) = TEST_SOURCE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let (url, expected) =
-            source.unwrap_or_else(|| ("http://127.0.0.1:9/".to_owned(), Vec::new()));
+            .clone()?;
         Some(CompanionFont::with_source(&data, &url, &expected))
     }
 }
