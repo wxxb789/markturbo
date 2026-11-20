@@ -12,7 +12,7 @@
 //! A download streams into a temporary file beside the destination, hard
 //! capped at the pinned size, and is renamed into place only once verified;
 //! every failure leaves no partial or unverified file. A stored file that no
-//! longer verifies is treated as absent and removed.
+//! longer verifies is never loaded; failure to remove it is reported.
 
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -35,8 +35,8 @@ pub const LICENSE: &str = "SIL Open Font License 1.1";
 pub const FILE_NAME: &str = "SourceHanSansCN-VF.otf";
 const PARTIAL_PREFIX: &str = ".companion-font-";
 const PARTIAL_SUFFIX: &str = ".part";
+#[cfg(feature = "model-transport")]
 const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
-const PARTIAL_STALE_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The companion font in one data directory: where it lives, and the source
 /// and digest it must match.
@@ -178,16 +178,11 @@ impl CompanionFont {
             Ok(_) => {}
         }
         let _lifecycle = self.lock_lifecycle()?;
-        self.cleanup_stale_parts_unlocked(std::time::SystemTime::now())
-    }
-
-    fn cleanup_stale_parts_unlocked(&self, now: std::time::SystemTime) -> io::Result<()> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         };
-        let stale_after = STALL_LIMIT + PARTIAL_STALE_MARGIN;
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
@@ -201,14 +196,6 @@ impl CompanionFont {
                 continue;
             }
             let path = entry.path();
-            let modified = entry.metadata()?.modified()?;
-            if !now
-                .duration_since(modified)
-                .is_ok_and(|age| age > stale_after)
-            {
-                continue;
-            }
-
             let file = match OpenOptions::new().read(true).write(true).open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -219,13 +206,7 @@ impl CompanionFont {
                 Err(std::fs::TryLockError::WouldBlock) => continue,
                 Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
-            let modified = file.metadata()?.modified()?;
-            if !now
-                .duration_since(modified)
-                .is_ok_and(|age| age > stale_after)
-            {
-                continue;
-            }
+            // A live download locks its part before releasing the lifecycle lock.
             drop(file);
             match fs::remove_file(path) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
@@ -236,8 +217,8 @@ impl CompanionFont {
     }
 
     /// The verified font, for registration: `None` when it is absent, or when
-    /// the file present does not match the pinned size and digest — that file
-    /// is removed, so a damaged copy is never handed to the text engine.
+    /// a file that does not match the pinned size and digest has been removed.
+    /// Returns an error if the stored file cannot be read or discarded.
     pub fn load(&self) -> io::Result<Option<Vec<u8>>> {
         self.load_after_failed_verification(|| {})
     }
@@ -521,20 +502,36 @@ mod tests {
     }
 
     #[test]
-    fn startup_cleanup_removes_stale_part_and_keeps_fresh_one() {
+    fn startup_cleanup_removes_stale_part_and_keeps_other_entries() {
         let data = tempfile::tempdir().unwrap();
         let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
         fs::create_dir_all(&font.dir).unwrap();
         let stale = font.dir.join(".companion-font-stale.part");
         fs::write(&stale, b"unfinished").unwrap();
         set_modified(&stale, std::time::SystemTime::UNIX_EPOCH);
-        let fresh = font.dir.join(".companion-font-fresh.part");
-        fs::write(&fresh, b"still writing").unwrap();
+        let unrelated = font.dir.join("unrelated.part");
+        fs::write(&unrelated, b"unrelated").unwrap();
+        let directory = font.dir.join(".companion-font-directory.part");
+        fs::create_dir(&directory).unwrap();
 
         font.cleanup_stale_parts().unwrap();
 
         assert!(!stale.exists(), "stale partial download was removed");
-        assert!(fresh.exists(), "fresh partial download was kept");
+        assert!(unrelated.is_file(), "an unrelated file was kept");
+        assert!(directory.is_dir(), "a matching directory was kept");
+    }
+
+    #[test]
+    fn startup_cleanup_removes_a_fresh_unlocked_part() {
+        let data = tempfile::tempdir().unwrap();
+        let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
+        fs::create_dir_all(&font.dir).unwrap();
+        let fresh = font.dir.join(".companion-font-fresh.part");
+        fs::write(&fresh, b"unfinished").unwrap();
+
+        font.cleanup_stale_parts().unwrap();
+
+        assert!(!fresh.exists(), "a newly abandoned part was removed");
     }
 
     #[test]

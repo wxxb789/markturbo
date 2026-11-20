@@ -155,6 +155,11 @@ pub enum CompanionFailure {
 
 const PROGRESS_TICK: Duration = Duration::from_millis(150);
 
+struct RunningDownload {
+    control: Arc<DownloadControl>,
+    previous_status: CompanionStatus,
+}
+
 /// The companion CJK face of one window: its file and its status. Every
 /// change to [`Companion::status`] is made on the engine thread, by the tasks
 /// below, after the blocking work they await.
@@ -163,8 +168,7 @@ pub struct Companion {
     pub status: Signal<CompanionStatus>,
     /// `None` without a data directory: a download then fails as a disk one.
     font: Option<CompanionFont>,
-    /// The running download's cancellation and commit state.
-    cancel: Rc<RefCell<Option<Arc<DownloadControl>>>>,
+    running_download: Rc<RefCell<Option<RunningDownload>>>,
     /// Bumped by every download and cancel: a task whose generation is stale
     /// writes nothing, so a cancelled run cannot overwrite a newer one.
     generation: Rc<Cell<u64>>,
@@ -184,7 +188,7 @@ impl Companion {
         Self {
             status: signal(status),
             font,
-            cancel: Rc::default(),
+            running_download: Rc::default(),
             generation: Rc::default(),
             owner: Owner::current(),
         }
@@ -229,7 +233,14 @@ impl Companion {
                     }
                 }
                 Ok(Ok(None)) => this.status.set(CompanionStatus::Absent),
-                _ => {
+                Ok(Err(_)) => {
+                    log::warn!("fonts: the stored companion could not be read or removed");
+                    this.status
+                        .set(CompanionStatus::Failed(CompanionFailure::Removal {
+                            was_applied: false,
+                        }));
+                }
+                Err(_) => {
                     log::warn!("fonts: the companion could not be read");
                     this.status.set(CompanionStatus::Absent);
                 }
@@ -240,9 +251,11 @@ impl Companion {
     /// Downloads, verifies, installs and registers the font: only ever on
     /// the person's press.
     pub fn download(&self) {
-        let status = self.status.get();
-        if !matches!(status, CompanionStatus::Absent | CompanionStatus::Removed)
-            && !status.can_retry_download()
+        let previous_status = self.status.get();
+        if !matches!(
+            previous_status,
+            CompanionStatus::Absent | CompanionStatus::Removed
+        ) && !previous_status.can_retry_download()
         {
             return;
         }
@@ -254,7 +267,10 @@ impl Companion {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         let control = Arc::new(DownloadControl::default());
-        *self.cancel.borrow_mut() = Some(control.clone());
+        *self.running_download.borrow_mut() = Some(RunningDownload {
+            control: control.clone(),
+            previous_status,
+        });
         let received = Arc::new(AtomicU64::new(0));
         let worker_control = control.clone();
         self.status.set(CompanionStatus::Downloading(0));
@@ -298,13 +314,13 @@ impl Companion {
             if let Ok(Ok(_)) = &outcome {
                 this.status.set(CompanionStatus::Applying);
             }
-            this.cancel.borrow_mut().take();
+            this.running_download.borrow_mut().take();
             let status = match outcome {
                 Ok(Ok(bytes)) => match register_companion(bytes).await {
                     Ok(()) => CompanionStatus::Installed,
                     Err(failure) => CompanionStatus::Failed(failure),
                 },
-                Ok(Err(DownloadError::Cancelled)) => CompanionStatus::Absent,
+                Ok(Err(DownloadError::Cancelled)) => previous_status,
                 Ok(Err(DownloadError::Verification)) => {
                     CompanionStatus::Failed(CompanionFailure::Verification)
                 }
@@ -321,13 +337,14 @@ impl Companion {
 
     /// Stops the running download; it leaves nothing behind.
     pub fn cancel(&self) {
-        if let Some(control) = self.cancel.borrow_mut().take() {
-            if control.cancel() {
-                self.generation.set(self.generation.get() + 1);
-                self.status.set(CompanionStatus::Absent);
-            } else if control.is_committing() {
-                self.status.set(CompanionStatus::Applying);
-            }
+        let Some(download) = self.running_download.borrow_mut().take() else {
+            return;
+        };
+        if download.control.cancel() {
+            self.generation.set(self.generation.get() + 1);
+            self.status.set(download.previous_status);
+        } else if download.control.is_committing() {
+            self.status.set(CompanionStatus::Applying);
         }
     }
 

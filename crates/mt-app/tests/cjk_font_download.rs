@@ -50,8 +50,13 @@ impl TextEngine for FontProbe {
 }
 
 /// A loopback server that returns `content`, optionally corrupting the first
-/// response; its URL and the count of requests it heard.
-fn serve(content: &'static [u8], corrupt_first: bool) -> (String, Arc<AtomicUsize>) {
+/// response or holding a request unanswered for Cancel. Returns its URL and
+/// request count.
+fn serve(
+    content: &'static [u8],
+    corrupt_first: bool,
+    stall_at: Option<usize>,
+) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let url = format!(
         "http://{}/SourceHanSansCN-VF.otf",
@@ -68,6 +73,13 @@ fn serve(content: &'static [u8], corrupt_first: bool) -> (String, Arc<AtomicUsiz
                 line.clear();
             }
             let request_number = heard.fetch_add(1, Ordering::SeqCst);
+            if stall_at == Some(request_number) {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let _ = reader.read_line(&mut line);
+                continue;
+            }
             let mut body = content.to_vec();
             if corrupt_first && request_number == 0 {
                 body[0] ^= 0xff;
@@ -125,8 +137,53 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     );
     drop(app);
 
-    let (url, requests) = serve(FONT, true);
+    let (url, requests) = serve(FONT, true, Some(2));
     mt_app::ui::fonts::serve_companion_from(&url, FONT);
+
+    fs::write(&installed, INVALID_FONT).expect("corrupt font");
+    #[cfg(windows)]
+    let deny_delete = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ, but not FILE_SHARE_DELETE
+            .open(&installed)
+            .expect("hold the corrupt font open without delete sharing")
+    };
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(&installed).expect("clear the font path");
+        fs::create_dir(&installed).expect("obstruct the font path");
+    }
+    let (mut app, registrations) = start();
+    app.wait_for_within(
+        "text:Removal failed: the font could not be deleted from MarkTurbo's data folder.",
+        wait,
+    )
+    .expect("restore reports the removal failure");
+    app.wait_for("id:settings-cjk-font-remove")
+        .expect("retry removal on restore");
+    assert!(!app.shows("id:settings-cjk-font-download"));
+    assert!(!app.shows("id:settings-cjk-font-retry"));
+    assert!(installed.exists());
+    assert!(
+        !registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|family| family == "KaTeX_Main")
+    );
+    #[cfg(windows)]
+    drop(deny_delete);
+    #[cfg(not(windows))]
+    fs::remove_dir(&installed).expect("clear the obstruction");
+    app.press("id:settings-cjk-font-remove")
+        .expect("retry removal");
+    app.wait_for("text:Not installed. Chinese text uses the system's font.")
+        .expect("no font was applied before removal");
+    assert!(!installed.exists());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    drop(app);
 
     // Keep restore pending while Settings opens: the stale-part sweep first
     // waits for the lifecycle lock held by another instance.
@@ -269,10 +326,21 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     app.wait_for("id:settings-cjk-font-download")
         .expect("downloadable again");
     assert!(!installed.exists(), "the file was removed");
+    app.press("id:settings-cjk-font-download")
+        .expect("download again");
+    app.wait_for("id:settings-cjk-font-cancel")
+        .expect("cancel offered");
+    app.press("id:settings-cjk-font-cancel").expect("cancel");
+    app.wait_for_within(
+        "text:Removed. Chinese text keeps Source Han Sans CN until MarkTurbo restarts.",
+        wait,
+    )
+    .expect("cancelling preserves the applied face's restart status");
+    assert!(!installed.exists(), "cancelling did not install a file");
     drop(app);
 
     // Registration failures are reported after a verified file reaches nsh.
-    let (invalid_url, invalid_requests) = serve(INVALID_FONT, false);
+    let (invalid_url, invalid_requests) = serve(INVALID_FONT, false, None);
     mt_app::ui::fonts::serve_companion_from(&invalid_url, INVALID_FONT);
     let (mut app, _) = start();
     app.press("id:settings-cjk-font-download")
