@@ -205,7 +205,7 @@ impl Companion {
                 let loaded = font.load();
                 let on_disk = match &loaded {
                     Ok(bytes) => bytes.is_some(),
-                    Err(_) => font.path().exists(),
+                    Err(_) => font.path().try_exists().unwrap_or(true),
                 };
                 (loaded, on_disk)
             })
@@ -251,7 +251,11 @@ impl Companion {
 
     fn download_with(
         &self,
-        fetch: impl FnOnce(&CompanionFont, &dyn Fn(u64), &DownloadControl) -> Result<(), DownloadError>
+        fetch: impl FnOnce(
+            &CompanionFont,
+            &dyn Fn(u64),
+            &DownloadControl,
+        ) -> Result<Vec<u8>, DownloadError>
         + Send
         + 'static,
     ) {
@@ -285,14 +289,8 @@ impl Companion {
                     &font,
                     &|bytes| heard.store(bytes, Ordering::Relaxed),
                     &worker_control,
-                )
-                // Verify the stored copy again before the engine sees it.
-                .and_then(|()| match font.load() {
-                    Ok(Some(bytes)) => Ok(bytes),
-                    Ok(None) => Err(DownloadError::Verification),
-                    Err(_) => Err(DownloadError::Disk),
-                });
-                let on_disk = result.is_ok() || font.path().exists();
+                );
+                let on_disk = result.is_ok() || font.path().try_exists().unwrap_or(true);
                 (result, on_disk)
             }));
             // The job's end wakes this task itself; the timer only paces the
@@ -326,6 +324,9 @@ impl Companion {
                             CompanionStatus::Failed(CompanionFailure::Verification)
                         }
                         Err(DownloadError::Disk) => CompanionStatus::Failed(CompanionFailure::Disk),
+                        Err(DownloadError::Removal) => {
+                            CompanionStatus::Failed(CompanionFailure::Removal)
+                        }
                         Err(DownloadError::Network) => {
                             CompanionStatus::Failed(CompanionFailure::Network)
                         }
@@ -378,7 +379,10 @@ impl Companion {
         self.run(async move {
             let removed = blocking(move || {
                 let result = font.remove();
-                (result.is_ok(), result.is_err() && font.path().exists())
+                (
+                    result.is_ok(),
+                    result.is_err() && font.path().try_exists().unwrap_or(true),
+                )
             })
             .await;
             let status = match removed {
@@ -416,13 +420,17 @@ fn fetch(
     font: &CompanionFont,
     progress: &dyn Fn(u64),
     control: &DownloadControl,
-) -> Result<(), DownloadError> {
+) -> Result<Vec<u8>, DownloadError> {
     font.download(progress, control)
 }
 
 /// A build without the transport has no way to fetch it.
 #[cfg(not(feature = "model-transport"))]
-fn fetch(_: &CompanionFont, _: &dyn Fn(u64), _: &DownloadControl) -> Result<(), DownloadError> {
+fn fetch(
+    _: &CompanionFont,
+    _: &dyn Fn(u64),
+    _: &DownloadControl,
+) -> Result<Vec<u8>, DownloadError> {
     Err(DownloadError::Network)
 }
 
@@ -498,8 +506,7 @@ mod tests {
     enum Fetch {
         NetworkFailure,
         WaitForCancel(Arc<Mutex<mpsc::Receiver<()>>>),
-        #[cfg(windows)]
-        CommitWithReadDenied(Arc<Mutex<Option<fs::File>>>),
+        RollbackFailure,
     }
 
     #[derive(Clone, PartialEq, Props)]
@@ -523,27 +530,15 @@ mod tests {
                 "Test fetch",
                 move || {
                     let fetch = fetch.clone();
-                    companion.download_with(move |_font, _, _| match fetch {
+                    companion.download_with(move |font, _, _| match fetch {
                         Fetch::NetworkFailure => Err(DownloadError::Network),
                         Fetch::WaitForCancel(release) => {
                             let _ = release.lock().unwrap().recv();
                             Err(DownloadError::Cancelled)
                         }
-                        #[cfg(windows)]
-                        Fetch::CommitWithReadDenied(handle) => {
-                            use std::os::windows::fs::OpenOptionsExt as _;
-
-                            let staged = _font.path().with_extension("staged");
-                            fs::write(&staged, FONT).unwrap();
-                            fs::rename(staged, _font.path()).unwrap();
-                            *handle.lock().unwrap() = Some(
-                                fs::OpenOptions::new()
-                                    .read(true)
-                                    .share_mode(0)
-                                    .open(_font.path())
-                                    .unwrap(),
-                            );
-                            Ok(())
+                        Fetch::RollbackFailure => {
+                            fs::write(font.path(), FONT).unwrap();
+                            Err(DownloadError::Removal)
                         }
                     });
                 },
@@ -610,26 +605,36 @@ mod tests {
         assert!(!font.path().exists());
     }
 
-    #[cfg(windows)]
     #[test]
-    fn remove_is_offered_when_post_commit_read_back_fails() {
+    fn remove_is_offered_when_file_presence_cannot_be_checked() {
+        let data = tempfile::tempdir().unwrap();
+        let font = CompanionFont::with_source(
+            &data.path().join("invalid\0path"),
+            "http://127.0.0.1:0/font",
+            FONT,
+        );
+        assert!(font.path().try_exists().is_err());
+        let mut app = start(font, Fetch::NetworkFailure);
+        app.wait_for(
+            "text:Removal failed: the font could not be deleted from MarkTurbo's data folder.",
+        )
+        .unwrap();
+        app.wait_for(REMOVE).expect("the file may still be present");
+    }
+
+    #[test]
+    fn remove_is_offered_when_post_commit_rollback_fails() {
         let data = tempfile::tempdir().unwrap();
         let font = font(data.path(), FONT);
-        let handle = Arc::default();
-        let mut app = start(
-            font.clone(),
-            Fetch::CommitWithReadDenied(Arc::clone(&handle)),
-        );
+        let mut app = start(font.clone(), Fetch::RollbackFailure);
         app.wait_for(ABSENT).unwrap();
         app.press("id:test-fetch").unwrap();
-        app.wait_for("text:Download failed: the font file could not be saved or read back in MarkTurbo's data folder.")
-            .unwrap();
+        app.wait_for(
+            "text:Removal failed: the font could not be deleted from MarkTurbo's data folder.",
+        )
+        .unwrap();
         app.wait_for(REMOVE)
-            .expect("remove offered while reads are denied");
-        assert!(
-            handle.lock().unwrap().take().is_some(),
-            "the committed file was held open"
-        );
+            .expect("remove offered after rollback fails");
         assert_eq!(fs::read(font.path()).unwrap(), FONT);
         app.press(REMOVE).expect("remove the committed copy");
         app.wait_for(ABSENT).expect("the copy was never applied");

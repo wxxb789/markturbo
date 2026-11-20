@@ -59,8 +59,10 @@ pub enum DownloadError {
     Network,
     /// The response was not the pinned file: wrong size or wrong digest.
     Verification,
-    /// The data directory could not hold the file.
+    /// The file could not be saved or read back.
     Disk,
+    /// The newly installed file could not be removed after a failed read-back.
+    Removal,
     /// The person cancelled it.
     Cancelled,
 }
@@ -70,7 +72,8 @@ impl std::fmt::Display for DownloadError {
         formatter.write_str(match self {
             Self::Network => "the font download did not complete",
             Self::Verification => "the downloaded file is not the pinned font",
-            Self::Disk => "the font could not be saved",
+            Self::Disk => "the font could not be saved or read back",
+            Self::Removal => "the font could not be removed",
             Self::Cancelled => "the font download was cancelled",
         })
     }
@@ -304,30 +307,32 @@ impl CompanionFont {
         bytes.len() as u64 == self.size && hex_digest(bytes) == self.sha256
     }
 
-    /// Downloads, verifies and installs the font. Blocking: run it off the UI
-    /// thread. `progress` hears the bytes received so far (of
+    /// Downloads, verifies and installs the font, returning its read-back bytes.
+    /// Blocking: run it off the UI thread. `progress` hears the bytes received so far (of
     /// [`Self::size`]); `control.cancel()` stops it before file commit begins.
     ///
     /// The body streams into a temporary file in the data directory and is
     /// abandoned as soon as it exceeds the pinned size; it is renamed into
     /// the fonts directory only after its size and digest match. Any failure,
     /// including a cancel, leaves no part and an existing installed copy intact.
+    /// A failed read-back rolls back a new install, unless removal also fails.
     #[cfg(feature = "model-transport")]
     pub fn download(
         &self,
         progress: &dyn Fn(u64),
         control: &DownloadControl,
-    ) -> Result<(), DownloadError> {
-        self.download_after_fetch(progress, control, || {})
+    ) -> Result<Vec<u8>, DownloadError> {
+        self.download_with_hooks(progress, control, || {}, |_| {})
     }
 
     #[cfg(feature = "model-transport")]
-    fn download_after_fetch(
+    fn download_with_hooks(
         &self,
         progress: &dyn Fn(u64),
         control: &DownloadControl,
         after_fetch: impl FnOnce(),
-    ) -> Result<(), DownloadError> {
+        after_commit: impl FnOnce(&Path),
+    ) -> Result<Vec<u8>, DownloadError> {
         let runtime = crate::model::transport::runtime().map_err(|_| DownloadError::Network)?;
         fs::create_dir_all(&self.dir).map_err(|_| DownloadError::Disk)?;
         let lifecycle = self.lock_lifecycle().map_err(|_| DownloadError::Disk)?;
@@ -346,8 +351,25 @@ impl CompanionFont {
         let _lock = self.lock_lifecycle().map_err(|_| DownloadError::Disk)?;
         part.as_file().sync_all().map_err(|_| DownloadError::Disk)?;
         control.begin_commit()?;
-        part.persist(self.path()).map_err(|_| DownloadError::Disk)?;
-        Ok(())
+        let path = self.path();
+        // Keep any verified copy another process installed, including during this download.
+        match self.read_verified(&path) {
+            Ok(Some(bytes)) => return Ok(bytes),
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(DownloadError::Disk),
+        }
+        part.persist(&path).map_err(|_| DownloadError::Disk)?;
+        after_commit(&path);
+        let failure = match self.read_verified(&path) {
+            Ok(Some(bytes)) => return Ok(bytes),
+            Ok(None) => DownloadError::Verification,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => DownloadError::Verification,
+            Err(_) => DownloadError::Disk,
+        };
+        // Keep the lock through rollback so we only remove our own commit.
+        self.remove_unlocked().map_err(|_| DownloadError::Removal)?;
+        Err(failure)
     }
 
     /// Streams the response into `file`, returning the body's digest once
@@ -731,7 +753,7 @@ mod tests {
 
         /// Downloads from `reply` into a fresh data directory; the result,
         /// the progress heard, and what the fonts directory holds after.
-        fn download(reply: Reply) -> (Result<(), DownloadError>, Vec<u64>, Vec<String>) {
+        fn download(reply: Reply) -> (Result<Vec<u8>, DownloadError>, Vec<u64>, Vec<String>) {
             let data = tempfile::tempdir().unwrap();
             let font = CompanionFont::with_source(data.path(), &serve(reply), FONT);
             let heard = Mutex::new(Vec::new());
@@ -774,7 +796,7 @@ mod tests {
         #[test]
         fn the_pinned_bytes_are_installed_and_verified() {
             let (result, heard, left) = download(Reply::Body(FONT.to_vec()));
-            assert_eq!(result, Ok(()));
+            assert_eq!(result.as_deref(), Ok(FONT));
             assert_eq!(left, [FILE_NAME]);
             assert_eq!(heard.last().copied(), Some(FONT.len() as u64), "{heard:?}");
             assert!(heard.windows(2).all(|pair| pair[0] < pair[1]), "{heard:?}");
@@ -828,6 +850,65 @@ mod tests {
             assert_eq!(good.load().unwrap().as_deref(), Some(FONT));
         }
 
+        #[test]
+        fn a_download_reuses_an_existing_verified_copy_without_replacing_it() {
+            let data = tempfile::tempdir().unwrap();
+            let font =
+                CompanionFont::with_source(data.path(), &serve(Reply::Body(FONT.to_vec())), FONT);
+            let result = font.download_with_hooks(
+                &|_| {},
+                &DownloadControl::default(),
+                || fs::write(font.path(), FONT).unwrap(),
+                |_| panic!("the existing file must not be replaced"),
+            );
+
+            assert_eq!(result.as_deref(), Ok(FONT));
+            assert_eq!(fs::read(font.path()).unwrap(), FONT);
+            assert_no_staged_parts(data.path());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn a_failed_post_commit_read_removes_the_new_file() {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            const FILE_SHARE_DELETE: u32 = 4;
+            assert_read_back_failure(
+                OpenOptions::new().share_mode(FILE_SHARE_DELETE),
+                DownloadError::Disk,
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn a_failed_rollback_reports_removal_and_leaves_the_file() {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            assert_read_back_failure(OpenOptions::new().share_mode(0), DownloadError::Removal);
+        }
+
+        #[cfg(windows)]
+        fn assert_read_back_failure(options: &mut OpenOptions, expected: DownloadError) {
+            let data = tempfile::tempdir().unwrap();
+            let font =
+                CompanionFont::with_source(data.path(), &serve(Reply::Body(FONT.to_vec())), FONT);
+            let mut handle = None;
+            let result = font.download_with_hooks(
+                &|_| {},
+                &DownloadControl::default(),
+                || {},
+                |path| handle = Some(options.read(true).open(path).unwrap()),
+            );
+
+            assert_eq!(result, Err(expected));
+            drop(handle);
+            assert_eq!(
+                font.path().try_exists().unwrap(),
+                expected == DownloadError::Removal
+            );
+            assert_no_staged_parts(data.path());
+        }
+
         mod late_cancel {
             use super::*;
 
@@ -847,10 +928,15 @@ mod tests {
                 let cancel_ref = &cancel;
                 let (cancel_won, resumed, result) = std::thread::scope(move |scope| {
                     let job = scope.spawn(move || {
-                        font_ref.download_after_fetch(&|_| {}, cancel_ref, move || {
-                            ready_tx.send(()).unwrap();
-                            resume_rx.recv().unwrap();
-                        })
+                        font_ref.download_with_hooks(
+                            &|_| {},
+                            cancel_ref,
+                            move || {
+                                ready_tx.send(()).unwrap();
+                                resume_rx.recv().unwrap();
+                            },
+                            |_| {},
+                        )
                     });
                     ready_rx.recv().unwrap();
                     let cancel_won = cancel_ref.cancel();

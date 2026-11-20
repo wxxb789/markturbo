@@ -163,8 +163,18 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     .expect("restore reports the removal failure");
     app.wait_for("id:settings-cjk-font-remove")
         .expect("retry removal on restore");
-    assert!(!app.shows("id:settings-cjk-font-download"));
-    assert!(!app.shows("id:settings-cjk-font-retry"));
+    assert!(
+        !app.screen()
+            .matches("id:settings-cjk-font-download")
+            .expect("valid download selector"),
+        "download is hidden after restore removal failure"
+    );
+    assert!(
+        !app.screen()
+            .matches("id:settings-cjk-font-retry")
+            .expect("valid retry selector"),
+        "retry is hidden after restore removal failure"
+    );
     assert!(installed.exists());
     assert!(
         !registrations
@@ -197,7 +207,12 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     lock.lock().expect("hold the lifecycle lock");
     let (mut app, registrations) = start();
     app.wait_for("text:Applying…").expect("restore pending");
-    assert!(!app.shows("id:settings-cjk-font-download"));
+    assert!(
+        !app.screen()
+            .matches("id:settings-cjk-font-download")
+            .expect("valid download selector"),
+        "download is hidden while restore is applying"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     drop(lock);
     app.wait_for("id:settings-cjk-font-download")
@@ -311,8 +326,18 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     .expect("removal disk failure");
     app.wait_for("id:settings-cjk-font-remove")
         .expect("retry removal");
-    assert!(!app.shows("id:settings-cjk-font-retry"));
-    assert!(!app.shows("id:settings-cjk-font-download"));
+    assert!(
+        !app.screen()
+            .matches("id:settings-cjk-font-retry")
+            .expect("valid retry selector"),
+        "retry is hidden after removal failure"
+    );
+    assert!(
+        !app.screen()
+            .matches("id:settings-cjk-font-download")
+            .expect("valid download selector"),
+        "download is hidden after removal failure"
+    );
     fs::remove_dir(&installed).expect("clear the obstruction");
     fs::write(&installed, FONT).expect("put the font back");
 
@@ -343,6 +368,8 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     let (invalid_url, invalid_requests) = serve(INVALID_FONT, false, None);
     mt_app::ui::fonts::serve_companion_from(&invalid_url, INVALID_FONT);
     let (mut app, _) = start();
+    app.wait_for("id:settings-cjk-font-download")
+        .expect("download offered once restore finds no valid copy");
     app.press("id:settings-cjk-font-download")
         .expect("download the invalid font");
     app.wait_for_within(
