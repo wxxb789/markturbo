@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -162,6 +163,17 @@ class ReleaseArtifactTests(unittest.TestCase):
             ):
                 with self.assertRaises(checks.CheckFailure):
                     checks.build_release_binary()
+
+
+class ReleaseSuiteTests(unittest.TestCase):
+    def test_release_suite_includes_every_app_integration_test(self) -> None:
+        # The nightly release-profile run builds only `release_suite`, so a test
+        # file it does not name would silently drop out of that run.
+        tests = checks.ROOT / "crates" / "mt-app" / "tests"
+        suite = (tests / "release_suite.rs").read_text(encoding="utf-8")
+        included = set(re.findall(r'^#\[path = "([^"]+)"\]\nmod \w+;$', suite, re.MULTILINE))
+        files = {path.name for path in tests.glob("*.rs")} - {"release_suite.rs"}
+        self.assertEqual(included, files)
 
 
 if __name__ == "__main__":

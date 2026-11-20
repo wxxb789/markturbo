@@ -108,7 +108,8 @@ job keeps only the evidence its name claims. The
 combinations that used to repeat on every platform run once a day in
 `.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
 `cargo test --locked --profile ci --workspace` and
-`cargo test --release --locked -p mt-app` on `macos-15` and `windows-2022`);
+`cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
+release_suite` on `macos-15` and `windows-2022`);
 the scheduled run is a non-blocking safety net and never gates a merge. It is
 also the only writer of the rust-cache entries the pull-request jobs restore, so
 per-PR jobs restore from the default branch instead of each paying a cache save.
