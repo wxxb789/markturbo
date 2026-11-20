@@ -1613,7 +1613,7 @@ fn answer_field(
                 .on_change(move |text: &str| answer.set(text.to_owned()))
                 .on_submit(move |_: &str| submit())
                 .placeholder(s(S::TypeYourAnswer, language))
-                .font_family(tokens::FONT_UI)
+                .font_family(tokens::FONT_INPUT)
                 .text_size(px(TYPE_UI))
                 .line_height(px(TYPE_UI_LINE))
                 .h(px(40.0))

@@ -27,8 +27,8 @@ use crate::{
         motion::{RAIL_WIDEN_MS, rail_easing, reduced_motion},
         prims, shell,
         tokens::{
-            self, COLUMN_GAP, FIELD_GAP, FONT_UI, HAIRLINE, Layout, RAIL_DOT, RAIL_HOVER_W, RAIL_W,
-            SPACE_1, SPACE_2, SPACE_3, SPACE_5, TYPE_UI, TYPE_UI_LINE,
+            self, COLUMN_GAP, FIELD_GAP, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT,
+            RAIL_HOVER_W, RAIL_W, SPACE_1, SPACE_2, SPACE_3, SPACE_5, TYPE_UI, TYPE_UI_LINE,
         },
     },
 };
@@ -619,7 +619,7 @@ fn palette_input(state: AppState, language: Language, palette: Palette) -> impl 
                     PaletteMode::Files => s(S::FindFile, language).to_owned(),
                     PaletteMode::Search => i18n::t(language, Key::SearchFiles).to_owned(),
                 })
-                .font_family(FONT_UI)
+                .font_family(FONT_INPUT)
                 .text_size(px(TYPE_UI))
                 .bg(Color::TRANSPARENT)
                 .w_full()
