@@ -599,21 +599,21 @@ mod tests {
     fn the_font_roles_have_exact_ordered_fallbacks() {
         #[cfg(target_os = "windows")]
         let (sans, model, mono) = (
-            "DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Text, sans-serif",
-            "DengXian Light, DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Display, sans-serif",
-            "DengXian, Microsoft YaHei UI, Cascadia Mono, Consolas, monospace",
+            "Source Han Sans CN VF, DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Text, sans-serif",
+            "Source Han Sans CN VF, DengXian Light, DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Display, sans-serif",
+            "Source Han Sans CN VF, DengXian, Microsoft YaHei UI, Cascadia Mono, Consolas, monospace",
         );
         #[cfg(target_os = "macos")]
         let (sans, model, mono) = (
-            "PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
-            "PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
-            "PingFang SC, Hiragino Sans GB, ui-monospace, Menlo, monospace",
+            "Source Han Sans CN VF, PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
+            "Source Han Sans CN VF, PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
+            "Source Han Sans CN VF, PingFang SC, Hiragino Sans GB, ui-monospace, Menlo, monospace",
         );
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let (sans, model, mono) = (
-            "Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
-            "Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
-            "Noto Sans Mono CJK SC, Noto Sans CJK SC, Adwaita Mono, DejaVu Sans Mono, monospace",
+            "Source Han Sans CN VF, Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
+            "Source Han Sans CN VF, Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
+            "Source Han Sans CN VF, Noto Sans Mono CJK SC, Noto Sans CJK SC, Adwaita Mono, DejaVu Sans Mono, monospace",
         );
 
         for (role, list, expected) in [
