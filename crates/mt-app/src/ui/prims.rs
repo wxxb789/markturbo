@@ -27,8 +27,8 @@ use nsh_core::{
 use crate::ui::{
     motion::{HOVER_MS, Heat},
     tokens::{
-        self, FONT_MODEL, FONT_SOURCE, FONT_UI, HAIRLINE, TYPE_MODEL, TYPE_MODEL_LINE, TYPE_UI,
-        TYPE_UI_LINE,
+        self, FONT_INPUT, FONT_MODEL, FONT_SOURCE, FONT_UI, HAIRLINE, TYPE_MODEL, TYPE_MODEL_LINE,
+        TYPE_UI, TYPE_UI_LINE,
     },
 };
 
@@ -197,7 +197,7 @@ pub fn text_field(
                 .label(SharedString::from(label))
                 .value(value)
                 .placeholder(placeholder)
-                .font_family(FONT_UI)
+                .font_family(FONT_INPUT)
                 .text_size(px(TYPE_UI))
                 .bg(Color::TRANSPARENT)
                 .on_change(move |text: &str| on_change(text))

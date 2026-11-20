@@ -354,20 +354,107 @@ impl Layout {
 // in every list as the second family, for platforms that register the faces
 // under those; they are fallbacks, never the first entry.
 
+// After Martian, each platform falls back to the faces it ships that sit
+// closest to it: a clean, geometric-leaning CJK sans first — so CJK
+// characters missing from Martian, such as `―`, are drawn by the CJK face,
+// as Chinese text sets them — then the platform's own neo-grotesk UI face for
+// what neither has, then the generic family. Displayed text takes a character
+// the first family lacks from the next family that has it. Windows text inputs
+// resolve only the first family from system fonts; see `FONT_INPUT`.
+//
+// * Windows: DengXian — geometric, low-contrast and open, the system's
+//   closest Simplified Chinese match to Martian — then Microsoft YaHei UI.
+//   For Latin, Bahnschrift: its DIN skeleton shares Martian's engineered,
+//   squared rounds, where Segoe UI's humanist strokes do not; Segoe UI
+//   Variable follows. Code falls back to Cascadia Mono, then Consolas.
+// * macOS: PingFang SC, cut in SF's neo-grotesk spirit, then Hiragino Sans
+//   GB; for Latin the system face (`system-ui`, SF Pro), whose large x-height
+//   sits with Martian's. Code falls back to the system monospace
+//   (`ui-monospace`, SF Mono, squared and technical like Martian Mono), then
+//   Menlo.
+// * Linux: Noto Sans CJK SC (or Source Han Sans SC, WenQuanYi Micro Hei),
+//   then Inter / Adwaita Sans where installed and Noto Sans; code falls back
+//   to Adwaita Mono, then DejaVu Sans Mono.
+#[cfg(target_os = "windows")]
+macro_rules! sans_fallback {
+    () => {
+        "DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Text, sans-serif"
+    };
+}
+#[cfg(target_os = "windows")]
+macro_rules! light_fallback {
+    () => {
+        "DengXian Light, DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Display, sans-serif"
+    };
+}
+#[cfg(target_os = "windows")]
+macro_rules! mono_fallback {
+    () => {
+        "DengXian, Microsoft YaHei UI, Cascadia Mono, Consolas, monospace"
+    };
+}
+#[cfg(target_os = "macos")]
+macro_rules! sans_fallback {
+    () => {
+        "PingFang SC, Hiragino Sans GB, system-ui, sans-serif"
+    };
+}
+#[cfg(not(target_os = "windows"))]
+macro_rules! light_fallback {
+    () => {
+        sans_fallback!()
+    };
+}
+#[cfg(target_os = "macos")]
+macro_rules! mono_fallback {
+    () => {
+        "PingFang SC, Hiragino Sans GB, ui-monospace, Menlo, monospace"
+    };
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+macro_rules! sans_fallback {
+    () => {
+        "Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif"
+    };
+}
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+macro_rules! mono_fallback {
+    () => {
+        "Noto Sans Mono CJK SC, Noto Sans CJK SC, Adwaita Mono, DejaVu Sans Mono, monospace"
+    };
+}
+
 /// Martian Grotesk 400 (the `Std Rg` instance): UI and preview body.
-pub const FONT_UI: &str =
-    "Martian Grotesk Std Rg, Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
+pub const FONT_UI: &str = concat!(
+    "Martian Grotesk Std Rg, Martian Grotesk, ",
+    sans_fallback!()
+);
 /// Martian Grotesk 300 (the `Std Lt` instance): the model's voice, the only
-/// large type in the app. Its CJK follows the spec's light cut.
-pub const FONT_MODEL: &str = "Martian Grotesk Std Lt, Martian Grotesk, DengXian Light, DengXian, Microsoft YaHei UI, sans-serif";
+/// large type in the app.
+pub const FONT_MODEL: &str = concat!(
+    "Martian Grotesk Std Lt, Martian Grotesk, ",
+    light_fallback!()
+);
 /// Martian Grotesk 500 (the `Std Md` instance): the few labels that must not
 /// be quiet. Pair it with [`WEIGHT_MEDIUM`].
-pub const FONT_MEDIUM: &str =
-    "Martian Grotesk Std Md, Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif";
-/// Martian Mono 400 (the condensed `Cn Rg` instance): source mode. zh-CN
-/// falls back from Martian Mono to DengXian without forcing monospace widths.
-pub const FONT_SOURCE: &str =
-    "Martian Mono Cn Rg, Martian Mono, DengXian, Microsoft YaHei UI, monospace";
+pub const FONT_MEDIUM: &str = concat!(
+    "Martian Grotesk Std Md, Martian Grotesk, ",
+    sans_fallback!()
+);
+/// Martian Mono 400 (the condensed `Cn Rg` instance): source mode. CJK falls
+/// back to the platform's sans without forcing monospace widths.
+pub const FONT_SOURCE: &str = concat!("Martian Mono Cn Rg, Martian Mono, ", mono_fallback!());
+/// Text inputs. nsh 0.5.1's Windows input takes only the *first* family of
+/// a list and only from the system's fonts — never a registered one, with no
+/// fallback through the rest — so a list led by Martian left its placeholder
+/// in DirectWrite's last-resort serif. There it leads with Bahnschrift, the
+/// shipped face nearest Martian. macOS and Linux inputs resolve the whole
+/// list, so they keep Martian.
+#[cfg(target_os = "windows")]
+pub const FONT_INPUT: &str = "Bahnschrift, DengXian, Microsoft YaHei UI, sans-serif";
+/// Text inputs: the UI list, which this platform's inputs resolve in full.
+#[cfg(not(target_os = "windows"))]
+pub const FONT_INPUT: &str = FONT_UI;
 
 /// The model's voice: Martian Grotesk 300, the only large type in the app.
 pub const WEIGHT_MODEL: FontWeight = FontWeight(300);
@@ -426,9 +513,16 @@ mod tests {
     #[test]
     fn the_family_lists_name_the_legacy_families_first() {
         // What the text engine resolves on Windows: the file's legacy name
-        // (name table ID 1), then the typographic one, then the spec's CJK
-        // fallbacks. The resolution itself is proven through the real engine
-        // in `document::tests::the_ui_and_model_lists_resolve_to_martian`.
+        // (name table ID 1), then the typographic one, then the platform's
+        // own fallbacks. The resolution itself is proven through the real
+        // engine in `document::tests::the_ui_and_model_lists_resolve_to_martian`.
+        let cjk = if cfg!(target_os = "windows") {
+            "DengXian"
+        } else if cfg!(target_os = "macos") {
+            "PingFang SC"
+        } else {
+            "Noto Sans CJK SC"
+        };
         for (list, legacy, typographic) in [
             (FONT_UI, "Martian Grotesk Std Rg", "Martian Grotesk"),
             (FONT_MODEL, "Martian Grotesk Std Lt", "Martian Grotesk"),
@@ -438,14 +532,74 @@ mod tests {
             let families: Vec<&str> = list.split(',').map(str::trim).collect();
             assert_eq!(families[0], legacy, "{list}");
             assert_eq!(families[1], typographic, "{list}");
-            assert!(families.contains(&"DengXian"), "{list}");
-            assert!(families.contains(&"Microsoft YaHei UI"), "{list}");
+            assert!(families.contains(&cjk), "{list}");
+            // A CJK face follows Martian directly: it draws the CJK
+            // punctuation Martian lacks, before any Latin system face.
+            let is_cjk = |family: &str| {
+                [
+                    "DengXian",
+                    "PingFang SC",
+                    "Noto Sans CJK SC",
+                    "Noto Sans Mono CJK SC",
+                ]
+                .iter()
+                .any(|face| family.starts_with(face))
+            };
+            assert!(is_cjk(families[2]), "{list}");
         }
         // The model's 22px CJK follows the light cut before the body's.
-        assert!(
-            FONT_MODEL.contains("DengXian Light, DengXian"),
-            "{FONT_MODEL}"
+        if cfg!(target_os = "windows") {
+            assert!(
+                FONT_MODEL.contains("DengXian Light, DengXian"),
+                "{FONT_MODEL}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_font_roles_have_exact_ordered_fallbacks() {
+        #[cfg(target_os = "windows")]
+        let (sans, model, mono) = (
+            "DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Text, sans-serif",
+            "DengXian Light, DengXian, Microsoft YaHei UI, Bahnschrift, Segoe UI Variable Display, sans-serif",
+            "DengXian, Microsoft YaHei UI, Cascadia Mono, Consolas, monospace",
         );
+        #[cfg(target_os = "macos")]
+        let (sans, model, mono) = (
+            "PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
+            "PingFang SC, Hiragino Sans GB, system-ui, sans-serif",
+            "PingFang SC, Hiragino Sans GB, ui-monospace, Menlo, monospace",
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let (sans, model, mono) = (
+            "Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
+            "Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Micro Hei, Inter, Adwaita Sans, Noto Sans, sans-serif",
+            "Noto Sans Mono CJK SC, Noto Sans CJK SC, Adwaita Mono, DejaVu Sans Mono, monospace",
+        );
+
+        for (role, list, expected) in [
+            ("FONT_UI", FONT_UI, sans),
+            ("FONT_MODEL", FONT_MODEL, model),
+            ("FONT_MEDIUM", FONT_MEDIUM, sans),
+            ("FONT_SOURCE", FONT_SOURCE, mono),
+        ] {
+            assert_eq!(list.splitn(3, ", ").nth(2), Some(expected), "{role}");
+        }
+    }
+
+    /// nsh 0.5.1's Windows text input resolves only the first family of a
+    /// list, from the system's fonts alone: it must name a face Windows
+    /// ships, never a registered Martian one (which left its placeholder in
+    /// a serif). Elsewhere inputs resolve the whole list and keep Martian.
+    #[test]
+    fn the_input_list_leads_with_a_face_its_platform_input_can_load() {
+        let first = FONT_INPUT.split(',').next().map(str::trim);
+        if cfg!(target_os = "windows") {
+            assert_eq!(first, Some("Bahnschrift"), "{FONT_INPUT}");
+        } else {
+            assert_eq!(first, Some("Martian Grotesk Std Rg"), "{FONT_INPUT}");
+            assert_eq!(FONT_INPUT, FONT_UI);
+        }
     }
 
     /// WCAG contrast of `ink` drawn over the opaque `ground` (its alpha

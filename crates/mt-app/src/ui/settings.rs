@@ -33,8 +33,9 @@ use crate::{
     ui::{
         motion, notices, prims,
         tokens::{
-            self, COLUMN_GAP, FONT_UI, HAIRLINE, MEASURE_WIDE, RAIL_W, SPACE_2, SPACE_3, SPACE_4,
-            SPACE_5, TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MEDIUM,
+            self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_WIDE, RAIL_W, SPACE_2,
+            SPACE_3, SPACE_4, SPACE_5, TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE,
+            WEIGHT_MEDIUM,
         },
     },
 };
@@ -435,7 +436,7 @@ fn credential_section(state: AppState, language: Language) -> impl IntoElement {
                             .masked(true)
                             .value(move || value_state.settings_credential.get())
                             .placeholder(s(S::ReplacementKey, language))
-                            .font_family(FONT_UI)
+                            .font_family(FONT_INPUT)
                             .text_size(px(TYPE_UI))
                             .bg(Color::TRANSPARENT)
                             .on_change(move |value: &str| {

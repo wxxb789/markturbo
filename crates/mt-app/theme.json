@@ -3,8 +3,8 @@
     "theme": {
       "radius": "0px",
       "radius-lg": "0px",
-      "font-sans": "Martian Grotesk Std Rg, Martian Grotesk, DengXian, Microsoft YaHei UI, sans-serif",
-      "font-mono": "Martian Mono Cn Rg, Martian Mono, DengXian, Microsoft YaHei UI, monospace"
+      "font-sans": "Martian Grotesk Std Rg",
+      "font-mono": "Martian Mono Cn Rg"
     },
     "dark": {
       "background": "#101113",
