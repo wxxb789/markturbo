@@ -9,13 +9,13 @@
 //! by itself: no background, startup or retried request.
 //!
 //! A file is trusted only after its size and SHA-256 match the pinned ones.
-//! A download streams into a temporary file beside the destination, hard
-//! capped at the pinned size, and is renamed into place only once verified;
-//! every failure leaves no partial or unverified file. A stored file that no
-//! longer verifies is never loaded; failure to remove it is reported.
+//! A download streams into a temporary file in the data directory, hard
+//! capped at the pinned size, and is renamed into `fonts/` only once verified.
+//! A stored file that no longer verifies is never loaded; failure to remove
+//! it is reported.
 
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -172,13 +172,14 @@ impl CompanionFont {
 
     /// Removes abandoned partial downloads left behind by a crashed process.
     pub fn cleanup_stale_parts(&self) -> io::Result<()> {
-        match fs::metadata(&self.dir) {
+        let data_dir = self.data_dir();
+        match fs::metadata(data_dir) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
             Ok(_) => {}
         }
         let _lifecycle = self.lock_lifecycle()?;
-        let entries = match fs::read_dir(&self.dir) {
+        let entries = match fs::read_dir(data_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
@@ -228,19 +229,17 @@ impl CompanionFont {
         after_failed_verification: impl FnOnce(),
     ) -> io::Result<Option<Vec<u8>>> {
         let path = self.path();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        match self.read_verified(&path) {
+            Ok(Some(bytes)) => return Ok(Some(bytes)),
+            Ok(None) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
-        };
-        if self.verifies(&bytes) {
-            return Ok(Some(bytes));
         }
         after_failed_verification();
         let _lock = self.lock_lifecycle()?;
-        match fs::read(&path) {
-            Ok(current) if self.verifies(&current) => Ok(Some(current)),
-            Ok(_) => {
+        match self.read_verified(&path) {
+            Ok(Some(current)) => Ok(Some(current)),
+            Ok(None) => {
                 log::warn!("companion font: the stored file does not verify; removing it");
                 self.remove_unlocked()?;
                 Ok(None)
@@ -248,6 +247,18 @@ impl CompanionFont {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    fn read_verified(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        if fs::metadata(path)?.len() != self.size {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        // The file can change after the metadata check; read at most one extra byte.
+        fs::File::open(path)?
+            .take(self.size + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(self.verifies(&bytes).then_some(bytes))
     }
 
     /// Deletes the file; an absent file is already removed.
@@ -268,14 +279,17 @@ impl CompanionFont {
         }
     }
 
+    fn data_dir(&self) -> &Path {
+        self.dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
     /// Locks the companion-file lifecycle across cooperating processes. The
     /// sentinel stays beside `fonts/`, outside the font directory.
     fn lock_lifecycle(&self) -> io::Result<fs::File> {
-        let lock_path = self
-            .dir
-            .parent()
-            .unwrap_or(&self.dir)
-            .join(".companion-font.lock");
+        let lock_path = self.data_dir().join(".companion-font.lock");
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -294,10 +308,10 @@ impl CompanionFont {
     /// thread. `progress` hears the bytes received so far (of
     /// [`Self::size`]); `control.cancel()` stops it before file commit begins.
     ///
-    /// The body streams into a temporary file in the fonts directory and is
+    /// The body streams into a temporary file in the data directory and is
     /// abandoned as soon as it exceeds the pinned size; it is renamed into
-    /// place only after its size and digest match. Any failure, including a
-    /// cancel, leaves no file behind and an existing installed copy intact.
+    /// the fonts directory only after its size and digest match. Any failure,
+    /// including a cancel, leaves no part and an existing installed copy intact.
     #[cfg(feature = "model-transport")]
     pub fn download(
         &self,
@@ -320,7 +334,7 @@ impl CompanionFont {
         let mut part = tempfile::Builder::new()
             .prefix(PARTIAL_PREFIX)
             .suffix(PARTIAL_SUFFIX)
-            .tempfile_in(&self.dir)
+            .tempfile_in(self.data_dir())
             .map_err(|_| DownloadError::Disk)?;
         part.as_file().lock().map_err(|_| DownloadError::Disk)?;
         drop(lifecycle);
@@ -492,6 +506,33 @@ mod tests {
         font.remove().expect("removing an absent font is fine");
     }
 
+    #[test]
+    fn a_stored_file_of_the_wrong_size_is_removed_without_reading_it() {
+        let data = tempfile::tempdir().unwrap();
+        let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
+        fs::create_dir_all(&font.dir).unwrap();
+        fs::write(font.path(), b"short font fixture").unwrap();
+
+        #[cfg(windows)]
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            const FILE_SHARE_DELETE: u32 = 4;
+            let file = OpenOptions::new()
+                .write(true)
+                .share_mode(FILE_SHARE_DELETE)
+                .open(font.path())
+                .unwrap();
+            assert!(fs::File::open(font.path()).is_err());
+            file
+        };
+
+        assert_eq!(font.load().unwrap(), None);
+        #[cfg(windows)]
+        drop(held);
+        assert!(!font.path().exists(), "the wrong-size file was removed");
+    }
+
     fn set_modified(path: &Path, modified: std::time::SystemTime) {
         OpenOptions::new()
             .write(true)
@@ -505,13 +546,12 @@ mod tests {
     fn startup_cleanup_removes_stale_part_and_keeps_other_entries() {
         let data = tempfile::tempdir().unwrap();
         let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
-        fs::create_dir_all(&font.dir).unwrap();
-        let stale = font.dir.join(".companion-font-stale.part");
+        let stale = data.path().join(".companion-font-stale.part");
         fs::write(&stale, b"unfinished").unwrap();
         set_modified(&stale, std::time::SystemTime::UNIX_EPOCH);
-        let unrelated = font.dir.join("unrelated.part");
+        let unrelated = data.path().join("unrelated.part");
         fs::write(&unrelated, b"unrelated").unwrap();
-        let directory = font.dir.join(".companion-font-directory.part");
+        let directory = data.path().join(".companion-font-directory.part");
         fs::create_dir(&directory).unwrap();
 
         font.cleanup_stale_parts().unwrap();
@@ -525,8 +565,7 @@ mod tests {
     fn startup_cleanup_removes_a_fresh_unlocked_part() {
         let data = tempfile::tempdir().unwrap();
         let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
-        fs::create_dir_all(&font.dir).unwrap();
-        let fresh = font.dir.join(".companion-font-fresh.part");
+        let fresh = data.path().join(".companion-font-fresh.part");
         fs::write(&fresh, b"unfinished").unwrap();
 
         font.cleanup_stale_parts().unwrap();
@@ -538,8 +577,7 @@ mod tests {
     fn startup_cleanup_keeps_a_locked_stale_part() {
         let data = tempfile::tempdir().unwrap();
         let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"font");
-        fs::create_dir_all(&font.dir).unwrap();
-        let active = font.dir.join(".companion-font-active.part");
+        let active = data.path().join(".companion-font-active.part");
         fs::write(&active, b"still writing").unwrap();
         set_modified(&active, std::time::SystemTime::UNIX_EPOCH);
 
@@ -566,6 +604,8 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+        font.cleanup_stale_parts().unwrap();
+        assert!(!active.exists(), "an unlocked part is removed");
     }
 
     #[cfg(feature = "model-transport")]
@@ -696,7 +736,14 @@ mod tests {
             let font = CompanionFont::with_source(data.path(), &serve(reply), FONT);
             let heard = Mutex::new(Vec::new());
             let result = font.download(
-                &|received| heard.lock().unwrap().push(received),
+                &|received| {
+                    assert_eq!(
+                        fs::read_dir(&font.dir).unwrap().count(),
+                        0,
+                        "fonts contains no file during the download"
+                    );
+                    heard.lock().unwrap().push(received);
+                },
                 &DownloadControl::default(),
             );
             let left = fs::read_dir(data.path().join("fonts"))
@@ -706,6 +753,7 @@ mod tests {
                         .collect()
                 })
                 .unwrap_or_default();
+            assert_no_staged_parts(data.path());
             if result.is_ok() {
                 assert_eq!(
                     font.load().unwrap().as_deref(),
@@ -714,6 +762,13 @@ mod tests {
                 );
             }
             (result, heard.into_inner().unwrap(), left)
+        }
+
+        fn assert_no_staged_parts(data_dir: &Path) {
+            assert!(fs::read_dir(data_dir).unwrap().all(|entry| {
+                let name = entry.unwrap().file_name();
+                !name.to_string_lossy().starts_with(PARTIAL_PREFIX)
+            }));
         }
 
         #[test]
@@ -809,6 +864,7 @@ mod tests {
                 assert_eq!(result, Err(DownloadError::Cancelled));
                 assert!(!font.is_installed());
                 assert_eq!(fs::read_dir(font.dir).unwrap().count(), 0);
+                assert_no_staged_parts(data.path());
             }
         }
 
@@ -877,6 +933,7 @@ mod tests {
             assert_eq!(result, Err(DownloadError::Cancelled));
             assert!(started.elapsed() < std::time::Duration::from_secs(3));
             assert_eq!(fs::read_dir(data.path().join("fonts")).unwrap().count(), 0);
+            assert_no_staged_parts(data.path());
         }
     }
 }

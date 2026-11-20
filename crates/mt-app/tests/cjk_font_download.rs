@@ -188,7 +188,7 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     // Keep restore pending while Settings opens: the stale-part sweep first
     // waits for the lifecycle lock held by another instance.
     fs::write(&installed, INVALID_FONT).expect("corrupt font");
-    let stale = installed.with_file_name(".companion-font-crashed.part");
+    let stale = config.path().join("data/.companion-font-crashed.part");
     File::create(&stale)
         .and_then(|file| file.set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH)))
         .expect("stale partial download");
