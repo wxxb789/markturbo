@@ -40,5 +40,5 @@ mono, the condensed (0.6 em) advance rather than the standard 0.7 em one. The
 native port uses the same instances so the two look alike.
 
 Registering these is `crates/mt-app/src/ui/fonts.rs`; the family names above are
-what `ui::tokens` passes to `font_family` strings, and CJK falls back to
-DengXian, then Microsoft YaHei UI, in the same family list.
+what `ui::tokens` passes to `font_family` strings. See `ui::tokens` for the
+per-platform CJK fallbacks in those family lists.

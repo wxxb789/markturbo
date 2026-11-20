@@ -103,7 +103,8 @@ Performance claims require production-profile measurements; consult existing
   one per instance (`Martian Grotesk Std Lt`/`Std Rg`/`Std Md`,
   `Martian Mono Cn Rg`). Use the `tokens::FONT_*` lists, which put the legacy
   name first, then the typographic name, then CJK fallbacks. Weight alone does
-  not select a Grotesk instance.
+  not select a Grotesk instance. Windows `FONT_INPUT` is the exception: nsh
+  0.5.1 inputs load only the first family, from system fonts.
 - Preserve consent, credential confidentiality and content-free native evidence.
   Do not log test text, user documents, secrets or local paths into that evidence.
 - Ship required fonts (KaTeX, Martian)/sample inside the executable. Windows 11

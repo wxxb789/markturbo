@@ -358,9 +358,9 @@ impl Layout {
 // closest to it: a clean, geometric-leaning CJK sans first — so the CJK
 // punctuation and symbols Martian lacks (`―`, `…`) are drawn by the CJK face,
 // as Chinese text sets them — then the platform's own neo-grotesk UI face for
-// what neither has, then the generic family. Displayed text uses the next
-// family that has a missing character. Windows text inputs resolve only the
-// first family from system fonts; see `FONT_INPUT`.
+// what neither has, then the generic family. Displayed text takes a character
+// the first family lacks from the next family that has it. Windows text inputs
+// resolve only the first family from system fonts; see `FONT_INPUT`.
 //
 // * Windows: DengXian — geometric, low-contrast and open, the system's
 //   closest Simplified Chinese match to Martian — then Microsoft YaHei UI.
@@ -596,9 +596,8 @@ mod tests {
         let first = FONT_INPUT.split(',').next().map(str::trim);
         if cfg!(target_os = "windows") {
             assert_eq!(first, Some("Bahnschrift"), "{FONT_INPUT}");
-            assert!(FONT_INPUT.contains("DengXian"), "{FONT_INPUT}");
         } else {
-            assert_eq!(FONT_INPUT, FONT_UI);
+            assert_eq!(first, Some("Martian Grotesk Std Rg"), "{FONT_INPUT}");
         }
     }
 

@@ -16,9 +16,10 @@
 //!
 //! The preview body uses [`tokens::FONT_UI`], which leads with the Regular
 //! instance's legacy family so DirectWrite finds the registered face.
-//! The Windows ruler (60 `M`s at 14 px) measures 884 for both `FONT_UI` and
-//! the registered Regular face, 755 for a missing family, and 727 for
-//! DengXian; see `document::tests::the_ui_and_model_lists_resolve_to_martian`.
+//! The Windows editor probe (`document::tests::the_editor_draws_the_registered_source_font`)
+//! measured 60 `M`s at 14 px in editor rows, not in the preview's TextView:
+//! 884 for both `FONT_UI` and the registered Regular face, 755 for a missing
+//! family, and 727 for DengXian.
 //!
 //! The web pane never navigates from render: its [`WebDocument`] watches the
 //! document text, the trust level and the appearance, marks the page dirty and
