@@ -484,7 +484,7 @@ revalidated on nsh.
 
 [AGENTS.md](AGENTS.md) is how work gets done here: what to measure and how, what
 a test owes you, and the handful of structural rules whose violation breaks
-something guaranteed elsewhere. `CLAUDE.md` symlinks to it.
+something guaranteed elsewhere.
 
 ## License
 

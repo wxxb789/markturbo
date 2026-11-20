@@ -3,7 +3,7 @@
 This is the validation cadence for AGENTS.md and the ordered goals. It changes
 when evidence is collected, not PRODUCT.md's safety, usefulness, visual or
 release acceptance criteria. Historical reports are evidence for their named
-revision, not commands to rerun every time. CLAUDE.md links to AGENTS.md.
+revision, not commands to rerun every time.
 
 ## Short development loop
 
