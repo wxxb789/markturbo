@@ -14,11 +14,10 @@
 //! every failure leaves no partial or unverified file. A stored file that no
 //! longer verifies is treated as absent and removed.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "model-transport")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use sha2::{Digest as _, Sha256};
 
@@ -75,6 +74,53 @@ impl std::fmt::Display for DownloadError {
 
 impl std::error::Error for DownloadError {}
 
+/// Cancellation for one companion-font download.
+///
+/// Cancellation succeeds only before the verified file begins committing.
+#[derive(Debug, Default)]
+pub struct DownloadControl(AtomicU8);
+
+impl DownloadControl {
+    const ACTIVE: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const COMMITTING: u8 = 2;
+
+    /// Marks the download cancelled if file commit has not started.
+    pub fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::ACTIVE,
+                Self::CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Whether the final file-install phase has begun.
+    pub fn is_committing(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::COMMITTING
+    }
+
+    #[cfg(feature = "model-transport")]
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::CANCELLED
+    }
+
+    #[cfg(feature = "model-transport")]
+    fn begin_commit(&self) -> Result<(), DownloadError> {
+        match self.0.compare_exchange(
+            Self::ACTIVE,
+            Self::COMMITTING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(DownloadError::Cancelled),
+        }
+    }
+}
+
 impl CompanionFont {
     /// The pinned font below `data_dir` (`<data_dir>/fonts/`).
     pub fn in_data_dir(data_dir: &Path) -> Self {
@@ -124,6 +170,13 @@ impl CompanionFont {
     /// the file present does not match the pinned size and digest — that file
     /// is removed, so a damaged copy is never handed to the text engine.
     pub fn load(&self) -> io::Result<Option<Vec<u8>>> {
+        self.load_after_failed_verification(|| {})
+    }
+
+    fn load_after_failed_verification(
+        &self,
+        after_failed_verification: impl FnOnce(),
+    ) -> io::Result<Option<Vec<u8>>> {
         let path = self.path();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -133,17 +186,54 @@ impl CompanionFont {
         if self.verifies(&bytes) {
             return Ok(Some(bytes));
         }
-        log::warn!("companion font: the stored file does not verify; removing it");
-        self.remove()?;
-        Ok(None)
+        after_failed_verification();
+        let _lock = self.lock_lifecycle()?;
+        match fs::read(&path) {
+            Ok(current) if self.verifies(&current) => Ok(Some(current)),
+            Ok(_) => {
+                log::warn!("companion font: the stored file does not verify; removing it");
+                self.remove_unlocked()?;
+                Ok(None)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Deletes the file; an absent file is already removed.
     pub fn remove(&self) -> io::Result<()> {
+        if fs::symlink_metadata(self.path())
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(());
+        }
+        let _lock = self.lock_lifecycle()?;
+        self.remove_unlocked()
+    }
+
+    fn remove_unlocked(&self) -> io::Result<()> {
         match fs::remove_file(self.path()) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         }
+    }
+
+    /// Locks the companion-file lifecycle across cooperating processes. The
+    /// sentinel stays beside `fonts/`, outside the font directory.
+    fn lock_lifecycle(&self) -> io::Result<fs::File> {
+        let lock_path = self
+            .dir
+            .parent()
+            .unwrap_or(&self.dir)
+            .join(".companion-font.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        lock.lock()?;
+        Ok(lock)
     }
 
     fn verifies(&self, bytes: &[u8]) -> bool {
@@ -152,7 +242,7 @@ impl CompanionFont {
 
     /// Downloads, verifies and installs the font. Blocking: run it off the UI
     /// thread. `progress` hears the bytes received so far (of
-    /// [`Self::size`]); setting `cancel` stops it within a moment.
+    /// [`Self::size`]); `control.cancel()` stops it before file commit begins.
     ///
     /// The body streams into a temporary file in the fonts directory and is
     /// abandoned as soon as it exceeds the pinned size; it is renamed into
@@ -162,7 +252,17 @@ impl CompanionFont {
     pub fn download(
         &self,
         progress: &dyn Fn(u64),
-        cancel: &AtomicBool,
+        control: &DownloadControl,
+    ) -> Result<(), DownloadError> {
+        self.download_after_fetch(progress, control, || {})
+    }
+
+    #[cfg(feature = "model-transport")]
+    fn download_after_fetch(
+        &self,
+        progress: &dyn Fn(u64),
+        control: &DownloadControl,
+        after_fetch: impl FnOnce(),
     ) -> Result<(), DownloadError> {
         let runtime = crate::model::transport::runtime().map_err(|_| DownloadError::Network)?;
         fs::create_dir_all(&self.dir).map_err(|_| DownloadError::Disk)?;
@@ -172,11 +272,14 @@ impl CompanionFont {
             .suffix(".part")
             .tempfile_in(&self.dir)
             .map_err(|_| DownloadError::Disk)?;
-        let digest = runtime.block_on(self.fetch(part.as_file_mut(), progress, cancel))?;
+        let digest = runtime.block_on(self.fetch(part.as_file_mut(), progress, control))?;
+        after_fetch();
         if digest != self.sha256 {
             return Err(DownloadError::Verification);
         }
+        let _lock = self.lock_lifecycle().map_err(|_| DownloadError::Disk)?;
         part.as_file().sync_all().map_err(|_| DownloadError::Disk)?;
+        control.begin_commit()?;
         part.persist(self.path()).map_err(|_| DownloadError::Disk)?;
         Ok(())
     }
@@ -188,15 +291,15 @@ impl CompanionFont {
         &self,
         file: &mut fs::File,
         progress: &dyn Fn(u64),
-        cancel: &AtomicBool,
+        control: &DownloadControl,
     ) -> Result<String, DownloadError> {
         use std::io::Write as _;
 
-        let client = crate::model::transport::http_client_builder(proxy_policy(&self.url))
+        let client = font_client_builder(&self.url)
             .connect_timeout(STALL_LIMIT)
             .build()
             .map_err(|_| DownloadError::Network)?;
-        let mut response = until_cancelled(cancel, client.get(&self.url).send())
+        let mut response = until_cancelled(control, client.get(&self.url).send())
             .await?
             .map_err(|_| DownloadError::Network)?;
         if !response.status().is_success() {
@@ -210,7 +313,7 @@ impl CompanionFont {
         }
         let mut digest = Sha256::new();
         let mut received = 0_u64;
-        while let Some(chunk) = until_cancelled(cancel, response.chunk())
+        while let Some(chunk) = until_cancelled(control, response.chunk())
             .await?
             .map_err(|_| DownloadError::Network)?
         {
@@ -240,13 +343,13 @@ const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// [`STALL_LIMIT`].
 #[cfg(feature = "model-transport")]
 async fn until_cancelled<F: std::future::Future>(
-    cancel: &AtomicBool,
+    control: &DownloadControl,
     future: F,
 ) -> Result<F::Output, DownloadError> {
     let mut future = std::pin::pin!(future);
     let mut waited = std::time::Duration::ZERO;
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if control.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
         match tokio::time::timeout(CANCEL_TICK, future.as_mut()).await {
@@ -275,6 +378,11 @@ fn proxy_policy(url: &str) -> crate::model::transport::ProxyPolicy {
     }
 }
 
+#[cfg(feature = "model-transport")]
+fn font_client_builder(url: &str) -> reqwest::ClientBuilder {
+    crate::model::transport::http_client_builder(proxy_policy(url)).retry(reqwest::retry::never())
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -291,6 +399,14 @@ mod tests {
         assert!(URL.starts_with(&format!("https://{HOST}/")), "{URL}");
         assert!(URL.contains("/2.005R/"), "{URL}");
         assert!(URL.ends_with(FILE_NAME), "{URL}");
+        assert_eq!(
+            URL,
+            "https://raw.githubusercontent.com/adobe-fonts/source-han-sans/2.005R/Variable/OTF/Subset/SourceHanSansCN-VF.otf"
+        );
+        assert_eq!(
+            SHA256,
+            "ad10f878ea1af97d66ec8bd10eb39798784f3a1ee3d5987a570ef6083f941ef3"
+        );
         assert_eq!(SHA256.len(), 64);
         assert!(
             SHA256
@@ -302,6 +418,14 @@ mod tests {
     #[test]
     fn a_stored_file_that_does_not_verify_is_absent_and_removed() {
         let data = tempfile::tempdir().unwrap();
+        let missing_data = data.path().join("not-created");
+        let missing = CompanionFont::with_source(&missing_data, "http://127.0.0.1:9/", b"the font");
+        missing.remove().expect("an absent font is already removed");
+        assert!(
+            !missing_data.exists(),
+            "removing does not create its data root"
+        );
+
         let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"the font");
         assert_eq!(font.load().unwrap(), None, "absent");
         assert!(!font.is_installed());
@@ -317,6 +441,74 @@ mod tests {
         font.remove().unwrap();
         assert!(!font.is_installed());
         font.remove().expect("removing an absent font is fine");
+    }
+
+    #[cfg(feature = "model-transport")]
+    mod retry {
+        use super::font_client_builder;
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        #[test]
+        fn a_refused_http2_font_request_is_not_retried() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/font.otf", listener.local_addr().unwrap());
+            let requests = std::sync::Arc::new(AtomicUsize::new(0));
+            let server_requests = requests.clone();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut preface = [0; 24];
+                stream.read_exact(&mut preface).unwrap();
+                assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).unwrap();
+
+                loop {
+                    let mut header = [0; 9];
+                    if stream.read_exact(&mut header).is_err() {
+                        break;
+                    }
+                    let length = (usize::from(header[0]) << 16)
+                        | (usize::from(header[1]) << 8)
+                        | usize::from(header[2]);
+                    let mut payload = vec![0; length];
+                    if stream.read_exact(&mut payload).is_err() {
+                        break;
+                    }
+                    if header[3] == 4 && header[4] & 1 == 0 {
+                        stream.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).unwrap();
+                    } else if header[3] == 1 {
+                        server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let stream_id =
+                            u32::from_be_bytes(header[5..9].try_into().unwrap()) & 0x7fff_ffff;
+                        let mut refused = [0; 13];
+                        refused[2] = 4;
+                        refused[3] = 3;
+                        refused[5..9].copy_from_slice(&stream_id.to_be_bytes());
+                        refused[12] = 7;
+                        stream.write_all(&refused).unwrap();
+                    }
+                }
+            });
+
+            let result = crate::model::transport::runtime().unwrap().block_on(async {
+                let client = font_client_builder(&url)
+                    .http2_prior_knowledge()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap();
+                let result = client.get(url).send().await;
+                drop(client);
+                result
+            });
+            assert!(result.is_err());
+            server.join().unwrap();
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
     }
 
     #[cfg(feature = "model-transport")]
@@ -380,7 +572,7 @@ mod tests {
             let heard = Mutex::new(Vec::new());
             let result = font.download(
                 &|received| heard.lock().unwrap().push(received),
-                &AtomicBool::new(false),
+                &DownloadControl::default(),
             );
             let left = fs::read_dir(data.path().join("fonts"))
                 .map(|entries| {
@@ -447,13 +639,94 @@ mod tests {
             let data = tempfile::tempdir().unwrap();
             let good =
                 CompanionFont::with_source(data.path(), &serve(Reply::Body(FONT.to_vec())), FONT);
-            good.download(&|_| {}, &AtomicBool::new(false)).unwrap();
+            good.download(&|_| {}, &DownloadControl::default()).unwrap();
             let bad = CompanionFont::with_source(data.path(), &serve(Reply::Status(500)), FONT);
             assert_eq!(
-                bad.download(&|_| {}, &AtomicBool::new(false)),
+                bad.download(&|_| {}, &DownloadControl::default()),
                 Err(DownloadError::Network)
             );
             assert_eq!(good.load().unwrap().as_deref(), Some(FONT));
+        }
+
+        mod late_cancel {
+            use super::*;
+
+            #[test]
+            fn cancellation_after_the_stream_ends_prevents_the_commit() {
+                let data = tempfile::tempdir().unwrap();
+                let font = CompanionFont::with_source(
+                    data.path(),
+                    &serve(Reply::Body(FONT.to_vec())),
+                    FONT,
+                );
+                let cancel = DownloadControl::default();
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+                let font_ref = &font;
+                let cancel_ref = &cancel;
+                let (cancel_won, resumed, result) = std::thread::scope(move |scope| {
+                    let job = scope.spawn(move || {
+                        font_ref.download_after_fetch(&|_| {}, cancel_ref, move || {
+                            ready_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        })
+                    });
+                    ready_rx.recv().unwrap();
+                    let cancel_won = cancel_ref.cancel();
+                    let resumed = resume_tx.send(());
+                    let result = job.join().unwrap();
+                    (cancel_won, resumed, result)
+                });
+
+                assert!(cancel_won);
+                resumed.unwrap();
+                assert_eq!(result, Err(DownloadError::Cancelled));
+                assert!(!font.is_installed());
+                assert_eq!(fs::read_dir(font.dir).unwrap().count(), 0);
+            }
+        }
+
+        mod restore_interleaving {
+            use super::*;
+
+            #[test]
+            fn startup_cleanup_removes_old_bytes_but_keeps_a_new_commit() {
+                let data = tempfile::tempdir().unwrap();
+                let font = CompanionFont::with_source(
+                    data.path(),
+                    &serve(Reply::Body(FONT.to_vec())),
+                    FONT,
+                );
+                fs::create_dir_all(font.path().parent().unwrap()).unwrap();
+                fs::write(font.path(), b"old bad file").unwrap();
+                assert_eq!(font.load().unwrap(), None);
+                assert!(!font.is_installed(), "an old invalid file is removed");
+
+                fs::write(font.path(), b"old bad file").unwrap();
+                let (read_tx, read_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                let font_ref = &font;
+                let (downloaded, resumed, restored) = std::thread::scope(move |scope| {
+                    let load_font = font_ref;
+                    let load = scope.spawn(move || {
+                        load_font.load_after_failed_verification(|| {
+                            read_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        })
+                    });
+                    read_rx.recv().unwrap();
+                    let downloaded = font_ref.download(&|_| {}, &DownloadControl::default());
+                    let resumed = resume_tx.send(());
+                    let restored = load.join();
+                    (downloaded, resumed, restored)
+                });
+
+                downloaded.unwrap();
+                resumed.unwrap();
+                assert_eq!(restored.unwrap().unwrap().as_deref(), Some(FONT));
+                assert_eq!(font.load().unwrap().as_deref(), Some(FONT));
+            }
         }
 
         #[test]
@@ -467,12 +740,12 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_secs(5));
             });
             let font = CompanionFont::with_source(data.path(), &url, FONT);
-            let cancel = AtomicBool::new(false);
+            let cancel = DownloadControl::default();
             let started = std::time::Instant::now();
             let result = std::thread::scope(|scope| {
                 scope.spawn(|| {
                     std::thread::sleep(std::time::Duration::from_millis(300));
-                    cancel.store(true, Ordering::Relaxed);
+                    assert!(cancel.cancel());
                 });
                 font.download(&|_| {}, &cancel)
             });

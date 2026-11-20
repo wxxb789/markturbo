@@ -28,13 +28,13 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     task::Poll,
     time::Duration,
 };
 
-use mt_core::companion_font::{CompanionFont, DownloadError};
+use mt_core::companion_font::{CompanionFont, DownloadControl, DownloadError};
 use nsh_core::element::{register_font, spawn};
 use nsh_core::prelude::{Owner, Signal, blocking, signal, stored, timer};
 
@@ -111,24 +111,26 @@ pub enum CompanionStatus {
     Absent,
     /// Being downloaded: the bytes received so far.
     Downloading(u64),
+    /// Verified and committed; nsh is registering the face.
+    Applying,
     /// Verified and registered: Chinese text is set in it.
     Installed,
     /// Removed this session. nsh 0.5.1 cannot unregister a face, so the
     /// registered one stays until the app restarts.
     Removed,
-    /// The last download failed; nothing was installed.
+    /// The last download or registration failed; the face is not applied.
     Failed(CompanionFailure),
 }
 
-/// Why a download failed, as the page names it.
+/// Why downloading or applying the companion failed, as the page names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompanionFailure {
     Network,
     Verification,
     Disk,
+    Registration,
 }
 
-/// How often a running download's progress reaches the page.
 const PROGRESS_TICK: Duration = Duration::from_millis(150);
 
 /// The companion CJK face of one window: its file and its status. Every
@@ -139,8 +141,8 @@ pub struct Companion {
     pub status: Signal<CompanionStatus>,
     /// `None` without a data directory: a download then fails as a disk one.
     font: Option<CompanionFont>,
-    /// The running download's cancel flag.
-    cancel: Rc<RefCell<Option<Arc<AtomicBool>>>>,
+    /// The running download's cancellation and commit state.
+    cancel: Rc<RefCell<Option<Arc<DownloadControl>>>>,
     /// Bumped by every download and cancel: a task whose generation is stale
     /// writes nothing, so a cancelled run cannot overwrite a newer one.
     generation: Rc<Cell<u64>>,
@@ -179,9 +181,12 @@ impl Companion {
             let generation = this.generation.get();
             match blocking(move || font.load()).await {
                 Ok(Ok(Some(bytes))) => {
-                    register_companion(bytes).await;
+                    let status = match register_companion(bytes).await {
+                        Ok(()) => CompanionStatus::Installed,
+                        Err(failure) => CompanionStatus::Failed(failure),
+                    };
                     if this.generation.get() == generation {
-                        this.status.set(CompanionStatus::Installed);
+                        this.status.set(status);
                     }
                 }
                 Ok(Ok(None)) => {}
@@ -193,7 +198,10 @@ impl Companion {
     /// Downloads, verifies, installs and registers the font: only ever on
     /// the person's press.
     pub fn download(&self) {
-        if matches!(self.status.get(), CompanionStatus::Downloading(_)) {
+        if matches!(
+            self.status.get(),
+            CompanionStatus::Downloading(_) | CompanionStatus::Applying
+        ) {
             return;
         }
         let Some(font) = self.font.clone() else {
@@ -203,9 +211,10 @@ impl Companion {
         };
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
-        let cancel = Arc::new(AtomicBool::new(false));
-        *self.cancel.borrow_mut() = Some(cancel.clone());
+        let control = Arc::new(DownloadControl::default());
+        *self.cancel.borrow_mut() = Some(control.clone());
         let received = Arc::new(AtomicU64::new(0));
+        let worker_control = control.clone();
         self.status.set(CompanionStatus::Downloading(0));
         let this = self.clone();
         self.run(async move {
@@ -214,7 +223,7 @@ impl Companion {
                 fetch(
                     &font,
                     &|bytes| heard.store(bytes, Ordering::Relaxed),
-                    &cancel,
+                    &worker_control,
                 )?;
                 // Read back and verified again before the engine sees it.
                 match font.load() {
@@ -237,17 +246,22 @@ impl Companion {
                 }
                 match finished {
                     Some(outcome) => break outcome,
-                    None => this.status.set(CompanionStatus::Downloading(
-                        received.load(Ordering::Relaxed),
-                    )),
+                    None => this.status.set(if control.is_committing() {
+                        CompanionStatus::Applying
+                    } else {
+                        CompanionStatus::Downloading(received.load(Ordering::Relaxed))
+                    }),
                 }
             };
+            if let Ok(Ok(_)) = &outcome {
+                this.status.set(CompanionStatus::Applying);
+            }
             this.cancel.borrow_mut().take();
             let status = match outcome {
-                Ok(Ok(bytes)) => {
-                    register_companion(bytes).await;
-                    CompanionStatus::Installed
-                }
+                Ok(Ok(bytes)) => match register_companion(bytes).await {
+                    Ok(()) => CompanionStatus::Installed,
+                    Err(failure) => CompanionStatus::Failed(failure),
+                },
                 Ok(Err(DownloadError::Cancelled)) => CompanionStatus::Absent,
                 Ok(Err(DownloadError::Verification)) => {
                     CompanionStatus::Failed(CompanionFailure::Verification)
@@ -265,11 +279,14 @@ impl Companion {
 
     /// Stops the running download; it leaves nothing behind.
     pub fn cancel(&self) {
-        if let Some(flag) = self.cancel.borrow_mut().take() {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(control) = self.cancel.borrow_mut().take() {
+            if control.cancel() {
+                self.generation.set(self.generation.get() + 1);
+                self.status.set(CompanionStatus::Absent);
+            } else if control.is_committing() {
+                self.status.set(CompanionStatus::Applying);
+            }
         }
-        self.generation.set(self.generation.get() + 1);
-        self.status.set(CompanionStatus::Absent);
     }
 
     /// Deletes the file. The registered face stays until the app restarts.
@@ -305,22 +322,28 @@ impl Default for Companion {
 fn fetch(
     font: &CompanionFont,
     progress: &dyn Fn(u64),
-    cancel: &AtomicBool,
+    control: &DownloadControl,
 ) -> Result<(), DownloadError> {
-    font.download(progress, cancel)
+    font.download(progress, control)
 }
 
 /// A build without the transport has no way to fetch it.
 #[cfg(not(feature = "model-transport"))]
-fn fetch(_: &CompanionFont, _: &dyn Fn(u64), _: &AtomicBool) -> Result<(), DownloadError> {
+fn fetch(_: &CompanionFont, _: &dyn Fn(u64), _: &DownloadControl) -> Result<(), DownloadError> {
     Err(DownloadError::Network)
 }
 
 /// Registers the companion's verified bytes.
-async fn register_companion(bytes: Vec<u8>) {
+async fn register_companion(bytes: Vec<u8>) -> Result<(), CompanionFailure> {
     match register_font(bytes).await {
-        Ok(family) => log::debug!("fonts: registered the companion as {family}"),
-        Err(why) => log::warn!("fonts: the companion is no font: {why}"),
+        Ok(family) => {
+            log::debug!("fonts: registered the companion as {family}");
+            Ok(())
+        }
+        Err(why) => {
+            log::warn!("fonts: the companion is no font: {why}");
+            Err(CompanionFailure::Registration)
+        }
     }
 }
 

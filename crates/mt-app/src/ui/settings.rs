@@ -32,7 +32,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, CredentialStatus},
     ui::{
-        fonts::{CompanionFailure, CompanionStatus},
+        fonts::{Companion, CompanionFailure, CompanionStatus},
         motion, notices, prims,
         tokens::{
             self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_WIDE, RAIL_W, SPACE_2,
@@ -171,7 +171,7 @@ fn content(state: AppState, language: Language) -> impl IntoElement {
             |state, value| state.set_language(value),
         ))
         .child(theme_row(state.clone(), language))
-        .child(cjk_font_section(state.clone(), language))
+        .child(cjk_font_section(state.companion_font.clone(), language))
         .child(usage_section(state, language))
 }
 
@@ -702,8 +702,7 @@ fn ink_bar(color: Color) -> impl IntoElement {
 /// the one action of each state. Nothing is fetched until its action is
 /// pressed, and the disclosure above that action names the host, the size and
 /// the licence first.
-fn cjk_font_section(state: AppState, language: Language) -> impl IntoElement {
-    let companion = state.companion_font;
+fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElement {
     let status = companion.status;
     let total = companion.size();
     let can_download = move || {
@@ -735,7 +734,9 @@ fn cjk_font_section(state: AppState, language: Language) -> impl IntoElement {
                 move || {
                     !matches!(
                         status.get(),
-                        CompanionStatus::Installed | CompanionStatus::Downloading(_)
+                        CompanionStatus::Installed
+                            | CompanionStatus::Downloading(_)
+                            | CompanionStatus::Applying
                     )
                 },
                 move || {
@@ -778,7 +779,7 @@ fn cjk_font_section(state: AppState, language: Language) -> impl IntoElement {
                             let companion = cancel.clone();
                             prims::quiet_action(
                                 "settings-cjk-font-cancel",
-                                s(S::Cancel, language),
+                                i18n::t(language, Key::Cancel),
                                 move || companion.cancel(),
                             )
                             .into_element()
@@ -800,7 +801,6 @@ fn cjk_font_section(state: AppState, language: Language) -> impl IntoElement {
     )
 }
 
-/// The companion font's status line.
 fn cjk_font_status_text(status: CompanionStatus, total: u64, language: Language) -> SharedString {
     let key = match status {
         CompanionStatus::Downloading(received) => {
@@ -813,12 +813,14 @@ fn cjk_font_status_text(status: CompanionStatus, total: u64, language: Language)
             )
             .into();
         }
+        CompanionStatus::Applying => S::FontApplying,
         CompanionStatus::Absent => S::FontAbsent,
         CompanionStatus::Installed => S::FontInstalled,
         CompanionStatus::Removed => S::FontRemoved,
         CompanionStatus::Failed(CompanionFailure::Network) => S::FontFailedNetwork,
         CompanionStatus::Failed(CompanionFailure::Verification) => S::FontFailedVerification,
         CompanionStatus::Failed(CompanionFailure::Disk) => S::FontFailedDisk,
+        CompanionStatus::Failed(CompanionFailure::Registration) => S::FontFailedRegistration,
     };
     s(key, language).into()
 }
@@ -1076,14 +1078,15 @@ enum S {
     ChineseFont,
     DownloadAndApply,
     TryAgain,
-    Cancel,
     FontAbsent,
     FontDownloading,
+    FontApplying,
     FontInstalled,
     FontRemoved,
     FontFailedNetwork,
     FontFailedVerification,
     FontFailedDisk,
+    FontFailedRegistration,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -1107,9 +1110,9 @@ fn s(key: S, language: Language) -> &'static str {
             S::ChineseFont => "Chinese font",
             S::DownloadAndApply => "Download and apply",
             S::TryAgain => "Try again",
-            S::Cancel => "Cancel",
             S::FontAbsent => "Not installed. Chinese text uses the system's font.",
             S::FontDownloading => "Downloading",
+            S::FontApplying => "Applying…",
             S::FontInstalled => "Installed and applied: Chinese text is set in Source Han Sans CN.",
             S::FontRemoved => {
                 "Removed. Chinese text keeps Source Han Sans CN until MarkTurbo restarts."
@@ -1123,6 +1126,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::FontFailedDisk => {
                 "Download failed: the font could not be saved in MarkTurbo's data folder."
             }
+            S::FontFailedRegistration => "The font could not be registered and was not applied.",
         },
         Language::Chinese => match key {
             S::Endpoint => "端点",
@@ -1142,14 +1146,15 @@ fn s(key: S, language: Language) -> &'static str {
             S::ChineseFont => "中文字体",
             S::DownloadAndApply => "下载并应用",
             S::TryAgain => "重试",
-            S::Cancel => "取消",
             S::FontAbsent => "未安装。中文使用系统字体。",
             S::FontDownloading => "正在下载",
+            S::FontApplying => "正在应用…",
             S::FontInstalled => "已安装并应用：中文使用思源黑体 CN。",
             S::FontRemoved => "已移除。重启 MarkTurbo 前，中文仍使用思源黑体 CN。",
             S::FontFailedNetwork => "下载失败：网络请求未完成。未安装任何内容。",
             S::FontFailedVerification => "下载失败：文件与预期字体不符，已丢弃。",
             S::FontFailedDisk => "下载失败：无法将字体保存到 MarkTurbo 的数据目录。",
+            S::FontFailedRegistration => "字体注册失败，未能应用。",
         },
     }
 }

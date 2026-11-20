@@ -565,6 +565,7 @@ mod tests {
             // platform's own CJK face: they draw the CJK punctuation Martian
             // lacks, before any Latin system face.
             assert_eq!(families[2], FONT_CJK_COMPANION, "{list}");
+            assert_eq!(families[2], "Source Han Sans CN VF", "{list}");
             assert_eq!(
                 families
                     .iter()

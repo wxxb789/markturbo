@@ -9,20 +9,48 @@
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpListener;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
+use nsh_core::{ApproxTextEngine, AttributedText, Size, TextEngine, TextLayout, font_family};
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
-/// A real face stands in for the companion, so registration succeeds.
-const FONT: &[u8] = include_bytes!("../fonts/martian/MartianMono-CnRg.ttf");
+/// A face not registered by the app stands in for the companion.
+const FONT: &[u8] = include_bytes!("../../../fonts/katex/KaTeX_Main-Regular.ttf");
+const INVALID_FONT: &[u8] = b"not a font";
 
-/// A loopback server whose first answer is the wrong bytes and every later
-/// one the expected font; its URL and the count of requests it heard.
-fn serve() -> (String, Arc<AtomicUsize>) {
+type Registrations = Arc<Mutex<Vec<String>>>;
+
+struct FontProbe(Registrations);
+
+impl TextEngine for FontProbe {
+    type Prepared = <ApproxTextEngine as TextEngine>::Prepared;
+
+    fn prepare(&self, text: &AttributedText) -> Self::Prepared {
+        ApproxTextEngine.prepare(text)
+    }
+
+    fn measure(&self, prepared: &Self::Prepared, max_width: Option<Points>) -> Size<Points> {
+        ApproxTextEngine.measure(prepared, max_width)
+    }
+
+    fn layout(&self, prepared: &Self::Prepared, size: Size<Points>) -> TextLayout {
+        ApproxTextEngine.layout(prepared, size)
+    }
+
+    fn register_font(&self, data: &[u8]) -> Result<(), String> {
+        let family = font_family(data)?;
+        self.0.lock().unwrap().push(family);
+        Ok(())
+    }
+}
+
+/// A loopback server that returns `content`, optionally corrupting the first
+/// response; its URL and the count of requests it heard.
+fn serve(content: &'static [u8], corrupt_first: bool) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let url = format!(
         "http://{}/SourceHanSansCN-VF.otf",
@@ -38,8 +66,9 @@ fn serve() -> (String, Arc<AtomicUsize>) {
             while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
                 line.clear();
             }
-            let mut body = FONT.to_vec();
-            if heard.fetch_add(1, Ordering::SeqCst) == 0 {
+            let request_number = heard.fetch_add(1, Ordering::SeqCst);
+            let mut body = content.to_vec();
+            if corrupt_first && request_number == 0 {
                 body[0] ^= 0xff;
             }
             let _ = write!(
@@ -53,16 +82,21 @@ fn serve() -> (String, Arc<AtomicUsize>) {
     (url, requests)
 }
 
-fn start() -> Headless {
+fn start() -> (Headless, Registrations) {
+    let registrations = Arc::new(Mutex::new(Vec::new()));
+    let probe = FontProbe(registrations.clone());
     let mut app =
-        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+        Headless::start_with_text_engine(EngineConfig::new(Root::of::<mt_app::App>()), move || {
+            probe
+        })
+        .expect("start the app");
     app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
         .expect("wide viewport");
     app.wait_for("id:shell").expect("shell");
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-settings").expect("open settings");
     app.wait_for("id:settings-page").expect("settings page");
-    app
+    (app, registrations)
 }
 
 #[test]
@@ -78,12 +112,12 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
     }
-    let (url, requests) = serve();
+    let (url, requests) = serve(FONT, true);
     mt_app::ui::fonts::serve_companion_from(&url, FONT);
     let wait = Duration::from_secs(10);
 
     // Absent: the disclosure and the action, and nothing fetched.
-    let mut app = start();
+    let (mut app, registrations) = start();
     app.wait_for("id:settings-cjk-font")
         .expect("the Chinese font entry");
     app.wait_for("text:Not installed. Chinese text uses the system's font.")
@@ -112,6 +146,14 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         0,
         "no request before the press"
     );
+    assert!(
+        !registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|family| family == "KaTeX_Main"),
+        "the app's embedded faces do not register the fixture family"
+    );
 
     // Failed: the wrong bytes are refused, with the reason and a retry.
     app.press("id:settings-cjk-font-download")
@@ -134,18 +176,34 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     .expect("installed");
     app.wait_for("id:settings-cjk-font-remove")
         .expect("the remove action");
+    assert!(
+        registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|family| family == "KaTeX_Main"),
+        "the companion face was registered"
+    );
     assert!(!app.shows("Download and apply"));
     assert_eq!(std::fs::read(&installed).expect("installed file"), FONT);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     drop(app);
 
     // A later launch applies it from disk, without a request.
-    let mut app = start();
+    let (mut app, registrations) = start();
     app.wait_for_within(
         "text:Installed and applied: Chinese text is set in Source Han Sans CN.",
         wait,
     )
     .expect("restored at startup");
+    assert!(
+        registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|family| family == "KaTeX_Main"),
+        "the restored companion face was registered"
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         2,
@@ -162,4 +220,37 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     app.wait_for("id:settings-cjk-font-download")
         .expect("downloadable again");
     assert!(!installed.exists(), "the file was removed");
+    drop(app);
+
+    // Registration failures are reported after a verified file reaches nsh.
+    let (invalid_url, invalid_requests) = serve(INVALID_FONT, false);
+    mt_app::ui::fonts::serve_companion_from(&invalid_url, INVALID_FONT);
+    let (mut app, _) = start();
+    app.press("id:settings-cjk-font-download")
+        .expect("download the invalid font");
+    app.wait_for_within(
+        "text:The font could not be registered and was not applied.",
+        wait,
+    )
+    .expect("registration failure");
+    app.wait_for("id:settings-cjk-font-retry")
+        .expect("retry after registration failure");
+    assert!(!app.shows("Installed and applied"));
+    assert!(!app.shows("id:settings-cjk-font-remove"));
+    assert_eq!(
+        std::fs::read(&installed).expect("verified font file"),
+        INVALID_FONT
+    );
+    assert_eq!(invalid_requests.load(Ordering::SeqCst), 1);
+    drop(app);
+
+    // Restore uses the same registration result and does not claim success.
+    let (mut app, _) = start();
+    app.wait_for_within(
+        "text:The font could not be registered and was not applied.",
+        wait,
+    )
+    .expect("registration failure on restore");
+    assert!(!app.shows("id:settings-cjk-font-remove"));
+    assert_eq!(invalid_requests.load(Ordering::SeqCst), 1);
 }

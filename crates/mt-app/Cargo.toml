@@ -61,7 +61,6 @@ nsh-platform-windows = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]
 mt-app = { path = ".", features = ["test-vault"] }
-mt-core = { workspace = true, features = ["test-support"] }
 nsh-engine = "0.5.1"
 nsh-testing = "0.5.1"
 serde_json.workspace = true
