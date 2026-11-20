@@ -21,7 +21,7 @@
 PRODUCT.md owns product scope, goals own acceptance, `docs/development.md` owns
 validation cadence, and source/tests establish current implementation. History
 and `docs/goals/archive/` do not establish current acceptance. Preserve user work,
-immutable evaluation snapshots and existing evidence. CLAUDE.md shares this file.
+immutable evaluation snapshots and existing evidence.
 
 ## Work to a bounded result
 
