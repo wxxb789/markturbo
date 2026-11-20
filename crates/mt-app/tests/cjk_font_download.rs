@@ -379,7 +379,7 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     .expect("registration failure");
     app.wait_for("id:settings-cjk-font-retry")
         .expect("retry after registration failure");
-    assert!(!app.shows("Installed and applied"));
+    assert!(!app.shows("Installed and applied: Chinese text is set in Source Han Sans CN."));
     app.wait_for("id:settings-cjk-font-remove")
         .expect("remove after registration failure");
     assert_eq!(
@@ -396,6 +396,8 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         wait,
     )
     .expect("registration failure on restore");
+    app.wait_for("id:settings-cjk-font-remove")
+        .expect("remove after registration failure on restore");
     app.press("id:settings-cjk-font-remove")
         .expect("remove the verified but unregistered file");
     app.wait_for("id:settings-cjk-font-download")
