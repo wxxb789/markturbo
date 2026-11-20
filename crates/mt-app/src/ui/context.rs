@@ -247,7 +247,7 @@ fn diagnostics(state: AppState) -> impl IntoElement {
                         .text_color(move || match severity {
                             Severity::Error => tokens::palette().danger,
                             Severity::Warning => tokens::palette().ink_rest,
-                            Severity::Info => tokens::palette().ink_faint,
+                            Severity::Info => tokens::palette().ink_caption,
                         })
                 },
             ))
@@ -688,7 +688,7 @@ fn include_toggle(
                                     if selected() {
                                         tokens::palette().ink
                                     } else {
-                                        tokens::palette().ink_faint
+                                        tokens::palette().ink_caption
                                     }
                                 })
                                 .bg(move || {
@@ -948,7 +948,7 @@ fn inventory_row(
                                 .font_family(FONT_UI)
                                 .text_size(px(TYPE_UI))
                                 .line_height(px(TYPE_UI_LINE))
-                                .text_color(move || tokens::palette().ink_faint),
+                                .text_color(move || tokens::palette().ink_caption),
                         ),
                 ),
         )
@@ -972,7 +972,7 @@ fn section_label(label: &'static str, count: impl Fn() -> String + 'static) -> i
                 .font_family(FONT_UI)
                 .text_size(px(TYPE_UI))
                 .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_faint),
+                .text_color(move || tokens::palette().ink_caption),
         )
 }
 

@@ -367,12 +367,21 @@ It records each cell's source revision, executable hash, DPI, DIP and pixel
 viewport, language, effective theme, obstruction observations, control names and
 roles, PNG hash and status. All eleven states are exercised end to end through
 the real packaged app at minimum/default/wide widths in both modes and
-languages.
+languages. The cells drive the Afterglow UI with the native acceptance
+harness's steps (`title-menu-*` rows, AutomationIds, a pointer hold on
+`consent-send` against a loopback that refuses an unconsented Review) and prove
+each state by its own controls before capturing; a cell that cannot reach its
+state fails with a code prefixed by the state, such as
+`SETTINGS_PAGE_MISSING`, and leaves a `failure.png`. A receipt keeps the
+proving `state_markers` even when a later check (such as accessibility)
+fails, and a Review receipt counts its `consent_hold_count`: the harness holds
+once more only while the card is still open and nothing was sent.
 
 WebView2 renders through a DirectComposition visual that `PrintWindow` omits.
 For the compatibility-preview state the harness starts the app with
 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<free port>` and
-captures the page through CDP `Page.captureScreenshot`, then composites it into
+its own `LOCALAPPDATA` (nsh keeps the WebView2 profile there, and a browser
+still serving a previous cell's profile ignores the new port), and captures the page through CDP `Page.captureScreenshot`, then composites it into
 the UIA-reported pane rectangle over the PrintWindow chrome. It rejects a blank
 page as `WEBVIEW_CONTENT_MISSING`; it does not record an empty pane as a pass.
 The capture is release-build visual evidence, not owner approval. Headless

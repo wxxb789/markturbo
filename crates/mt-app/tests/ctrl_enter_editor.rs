@@ -265,7 +265,7 @@ fn ctrl_enter_from_the_focused_editor_is_done_while_hunks_are_docked() {
         .expect("review ready");
     app.press("label:Prepare revision")
         .expect("prepare revision");
-    app.wait_for("text:Send the revision?")
+    app.wait_for("text:Ask for a revision?")
         .expect("revision disclosure");
     app.long_press("id:consent-send").expect("send revision");
     app.wait_for_within("id:revision-accept", Duration::from_secs(20))

@@ -28,12 +28,18 @@ use mt_core::{
     settings::Language,
 };
 use nsh_base::{TextViewMath, TextViewPart, TextViewParts, text_view};
-use nsh_core::{element::ImageSrc, prelude::*};
+use nsh_core::{
+    element::{ImageSrc, StyleRefinement},
+    prelude::*,
+};
 
 use crate::{
     i18n::{self, Key},
     state::{AppState, Pane, Tab},
-    ui::{prims, tokens},
+    ui::{
+        prims,
+        tokens::{self, WEIGHT_MEDIUM},
+    },
     web,
 };
 
@@ -78,9 +84,6 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
         .h(relative(1.0))
         .flex_col()
         .gap(px(tokens::SPACE_3))
-        // The field's docked column starts 40px in, as the prototype's
-        // `.field > *` does.
-        .pl(px(tokens::SPACE_5))
         .child(quiet_label(move || {
             if pane_state
                 .active_tab()
@@ -196,12 +199,7 @@ fn rendered(state: AppState, language: Language) -> impl IntoElement {
         move |tab: ReadSignal<Tab>, _| {
             let tab = tab.get();
             let preview = preview_of(&tab);
-            // Inline code at the source's size: text_view's own is 13pt, a
-            // step below the source column. Its face is the theme's
-            // `font-mono` (theme.json), the source's Martian Mono.
-            provide_context(TextViewParts::new().part(TextViewPart::Code, |style| {
-                style.text_size(px(tokens::TYPE_SOURCE))
-            }));
+            provide_context(preview_parts());
             view()
                 .test_id("preview")
                 .flex_1()
@@ -230,6 +228,62 @@ fn rendered(state: AppState, language: Language) -> impl IntoElement {
         },
     )
 }
+
+/// The preview's calm typography: the model's 22px light stays the only large
+/// size in the app, so headings step up from the 16/27 body by size and the
+/// Medium instance, never by a synthetic bold.
+///
+/// * H1 is 20/28, H2 18/27, the rest at the body's 16/27 — all Martian
+///   Grotesk Medium (500), with no tracking of their own;
+/// * strong text is Medium (500), not text_view's semibold;
+/// * inline code is at the source's size: text_view's own is 13pt, a step
+///   below the source column. Its face is the theme's `font-mono`
+///   (theme.json), the source's Martian Mono;
+/// * a task's box is a 12px square, radius 0 like every corner here, centred
+///   on the body's first line.
+fn preview_parts() -> TextViewParts {
+    let medium = |style: StyleRefinement| {
+        style
+            .font_family(tokens::FONT_MEDIUM)
+            .font_weight(WEIGHT_MEDIUM)
+    };
+    // Every heading is Medium at the body's size; the level's own part
+    // comes after it and lifts H1 and H2.
+    TextViewParts::new()
+        .part(TextViewPart::Heading, move |style| {
+            medium(style)
+                .text_size(px(tokens::TYPE_PREVIEW))
+                .line_height(px(tokens::TYPE_PREVIEW_LINE))
+                .letter_spacing(px(0.0))
+        })
+        .part(TextViewPart::Heading1, |style| {
+            style
+                .text_size(px(PREVIEW_H1))
+                .line_height(px(PREVIEW_H1_LINE))
+        })
+        .part(TextViewPart::Heading2, |style| {
+            style.text_size(px(PREVIEW_H2))
+        })
+        .part(TextViewPart::Strong, medium)
+        .part(TextViewPart::Code, |style| {
+            style.text_size(px(tokens::TYPE_SOURCE))
+        })
+        .part(TextViewPart::TaskMarker, |style| {
+            style
+                .size(px(TASK_BOX))
+                .mt(px((tokens::TYPE_PREVIEW_LINE - TASK_BOX) / 2.0))
+                .rounded(px(0.0))
+                .border(px(tokens::HAIRLINE))
+        })
+}
+
+/// The preview's first heading: 20/28, two steps under the model's 22/30.
+const PREVIEW_H1: f32 = 20.0;
+const PREVIEW_H1_LINE: f32 = 28.0;
+/// The second heading, one step above the body.
+const PREVIEW_H2: f32 = 18.0;
+/// A task's box: a 12px square.
+const TASK_BOX: f32 = 12.0;
 
 /// The Markdown the preview shows: the tab's text with every diagram block
 /// replaced by its SVG, recomputed when the text changes.
@@ -358,14 +412,18 @@ mod tests {
     use super::*;
     use crate::state::AppState;
 
-    /// The fixture the probes open: a heading, inline code and body lines.
+    /// The fixture the probes open: headings, inline code, strong text, two
+    /// tasks and body lines.
     fn probe_path() -> &'static std::path::Path {
         static FIXTURE: OnceLock<(tempfile::TempDir, std::path::PathBuf)> = OnceLock::new();
         FIXTURE
             .get_or_init(|| {
                 let dir = tempfile::tempdir().expect("temp dir");
                 let path = dir.path().join("probe.md");
-                let mut text = String::from("# Release plan\n\nthe `agent` runs\n");
+                let mut text = String::from(
+                    "# Release plan\n\nthe `agent` runs\n\nlist **one** risk\n\n## Scope\n\n\
+                     - [ ] verify install\n- [x] verify uninstall\n\n",
+                );
                 for index in 0..20 {
                     text.push_str(&format!("line {index}\n"));
                 }
@@ -544,6 +602,72 @@ mod tests {
         );
     }
 
+    /// The preview's typography stays under the model's 22px light: H1 is
+    /// 20/28 and H2 18, both in the Medium instance; strong text is Medium
+    /// (500), not a synthetic bold; a task's box is a 12px square.
+    #[test]
+    fn the_preview_typography_is_calm() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<ColumnProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the probe");
+        app.wait_for("id:preview").expect("the preview renders");
+        app.settle();
+        let medium = |style: &nsh_core::ResolvedTextStyle| {
+            style
+                .font_family
+                .as_ref()
+                .map(|family| family.name().to_string())
+                .unwrap_or_default()
+                .starts_with("Martian Grotesk Std Md")
+        };
+
+        let h1 = app
+            .screen()
+            .span_style("text:Release plan")
+            .expect("the first heading's style");
+        assert_eq!(
+            (h1.font_size.0, h1.line_height.0, h1.font_weight),
+            (PREVIEW_H1, PREVIEW_H1_LINE, 500),
+            "H1"
+        );
+        assert!(
+            h1.font_size.0 < tokens::TYPE_MODEL,
+            "H1 under the model's size"
+        );
+        assert!(medium(&h1), "H1 in {:?}", h1.font_family);
+
+        let h2 = app
+            .screen()
+            .span_style("text:Scope")
+            .expect("the second heading's style");
+        assert_eq!((h2.font_size.0, h2.font_weight), (PREVIEW_H2, 500), "H2");
+        assert!(medium(&h2), "H2 in {:?}", h2.font_family);
+
+        let strong = app
+            .screen()
+            .span_style("text:one")
+            .expect("the strong text's style");
+        assert_eq!(strong.font_weight, 500, "strong text's weight");
+        assert!(medium(&strong), "strong text in {:?}", strong.font_family);
+        assert_eq!(strong.font_size.0, tokens::TYPE_PREVIEW);
+
+        // The two task boxes are 12px squares; text_view's 15px box is gone.
+        let boxes = |side: f32| {
+            app.screen()
+                .layout_nodes()
+                .iter()
+                .filter(|node| {
+                    node.text.is_none()
+                        && (node.bounds.size.width.0 - side).abs() < 0.01
+                        && (node.bounds.size.height.0 - side).abs() < 0.01
+                })
+                .count()
+        };
+        assert_eq!(boxes(TASK_BOX), 2, "{}", dump(&app));
+        assert_eq!(boxes(15.0), 0, "{}", dump(&app));
+    }
+
     /// The same document renders in the field's docked column (Split), under
     /// the pane's quiet label.
     #[test]
@@ -598,18 +722,44 @@ mod tests {
         );
     }
 
-    /// The whole app, with a document opened in Split: the shell's field holds
-    /// the preview, not just its label.
+    /// The shell with the fixture open in Split — chosen here, not left to
+    /// the default pane — re-keyed at each breakpoint as `app.rs` re-keys it.
+    #[component]
+    fn SplitShellProbe() -> impl IntoElement {
+        use crate::ui::{shell, tokens::Layout};
+        let state = probe_state();
+        let split_state = state.clone();
+        effect(move || {
+            if let Some(tab) = split_state.active_tab() {
+                tab.pane.set(Pane::Split);
+            }
+        });
+        each(
+            move || vec![Layout::of(shell::client_width_now())],
+            |layout: &Layout| format!("{layout:?}"),
+            move |layout: ReadSignal<Layout>, _| {
+                shell::shell(state.clone(), Language::English, layout.get()).into_element()
+            },
+        )
+    }
+
+    /// The shell with a document open in Split: the field holds the preview,
+    /// not just its label.
     #[test]
     fn the_shell_shows_the_preview_in_the_field() {
-        let _env = crate::test_env::lock();
-        // SAFETY: every test that sets a process-global variable holds
-        // `test_env::lock` while its probe reads it.
-        unsafe { std::env::set_var("MARKTURBO_OPEN", probe_path()) };
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<crate::App>())).expect("start the app");
+        let mut app = Headless::start(EngineConfig::new(Root::of::<SplitShellProbe>()))
+            .expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(
+            nsh_core::Points(1000.0),
+            nsh_core::Points(900.0),
+        ))
+        .expect("a narrow window");
         app.wait_for("label:Markdown source")
             .expect("the source editor");
+        // A document opens in Source; the user picks Split.
+        app.press("id:title-settings")
+            .expect("open the glyph's menu");
+        app.press("id:title-menu-split").expect("choose Split");
         app.wait_for("id:preview-field").expect("the field renders");
         app.wait_for("text:Release plan")
             .expect("the document renders");

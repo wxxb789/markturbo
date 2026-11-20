@@ -36,6 +36,8 @@ const A_38: u8 = 97;
 const A_08: u8 = 20;
 const A_10: u8 = 26;
 const A_30: u8 = 77;
+const A_66: u8 = 168;
+const A_54: u8 = 138;
 const A_18: u8 = 46;
 const A_22: u8 = 56;
 const A_16: u8 = 41;
@@ -54,14 +56,23 @@ const A_03: u8 = 8;
 pub struct Palette {
     /// The room: the window ground behind everything.
     pub room: Color,
-    /// The column's ground, a hair off the room.
+    /// The text column's ground: the room itself in both appearances, so no
+    /// sheet shows under the text.
     pub column_ground: Color,
+    /// A floating card's ground (the consent card): the room in light, lifted
+    /// a hair off it in dark, where a shadow alone does not show on graphite.
+    pub card_ground: Color,
     /// Body ink: your text, labels at full attention.
     pub ink: Color,
     /// Resting ink: quiet local actions, captions (steps to [`Palette::ink`]
     /// on hover).
     pub ink_rest: Color,
-    /// Non-text ink: rules, dots, disabled states.
+    /// Caption ink: the quietest text that must still be read (hints,
+    /// disclosures, secondary lines), at least 4.5:1 on every ground. Also a
+    /// control's resting border, which needs 3:1.
+    pub ink_caption: Color,
+    /// Non-text ink: rules, dots, disabled states. Never text: it is about
+    /// 2.2:1 (light) and 2.6:1 (dark) on the room.
     pub ink_faint: Color,
     /// The 1px hairline.
     pub hairline: Color,
@@ -115,9 +126,11 @@ pub struct Palette {
 /// The dark appearance: warm graphite, amber model light.
 pub const DARK: Palette = Palette {
     room: hex(0x101113),
-    column_ground: hex(0x121315),
+    column_ground: hex(0x101113),
+    card_ground: hex(0x15161A),
     ink: hexa(0xD9DCE1, A_84),
     ink_rest: hexa(0xD9DCE1, A_56),
+    ink_caption: hexa(0xD9DCE1, A_54),
     ink_faint: hexa(0xD9DCE1, A_34),
     hairline: hexa(0xD9DCE1, A_08),
     hot: hex(0xFFB36B),
@@ -147,15 +160,21 @@ pub const DARK: Palette = Palette {
 /// room plus saturated glyphs.
 pub const LIGHT: Palette = Palette {
     room: hex(0xF2F0EB),
-    column_ground: hex(0xF7F5F1),
+    column_ground: hex(0xF2F0EB),
+    card_ground: hex(0xF2F0EB),
     ink: hexa(0x23262B, A_88),
     ink_rest: hexa(0x23262B, A_70),
+    ink_caption: hexa(0x23262B, A_66),
     ink_faint: hexa(0x23262B, A_38),
     hairline: hexa(0x23262B, A_10),
-    hot: hex(0x9A4300),
+    hot: hex(0xB04E00),
+    // The prototype's bloom peaks at .30 inside a gradient; a stated finding
+    // draws it as one flat tint under the glyphs (`glow::stated_decoration`),
+    // where .30 would leave HOT at 4.41:1 on the plate. .22 keeps it above
+    // 4.5:1.
     hot_bloom: hexa(0xFFB04D, A_22),
     halo: hexa(0xFFB04D, A_06),
-    ember: hex(0x8A5A33),
+    ember: hex(0x7A6A5C),
     ember_bloom: hexa(0xB88458, A_08P),
     haze: hexa(0x4E8C84, A_12),
     haze_edge: hex(0x4E8C84),
@@ -427,5 +446,93 @@ mod tests {
             FONT_MODEL.contains("DengXian Light, DengXian"),
             "{FONT_MODEL}"
         );
+    }
+
+    /// WCAG contrast of `ink` drawn over the opaque `ground` (its alpha
+    /// composited first, as the screen shows it).
+    fn contrast(ink: Color, ground: Color) -> f32 {
+        let ground = Hsla::from(ground);
+        ground.blend(Hsla::from(ink)).contrast_ratio(ground)
+    }
+
+    /// `layer` composited over the opaque `ground`.
+    fn over(ground: Color, layer: Color) -> Color {
+        Hsla::from(ground).blend(Hsla::from(layer)).into()
+    }
+
+    /// The grounds text sits on: the room, the column, the cards (room) and
+    /// the light emitter plate.
+    fn grounds(p: &Palette) -> [(&'static str, Color); 3] {
+        [
+            ("room", p.room),
+            ("column", p.column_ground),
+            ("emitter plate", p.emitter_plate),
+        ]
+    }
+
+    #[test]
+    fn every_text_ink_reads_at_4_5_to_1_on_every_ground() {
+        for p in [&LIGHT, &DARK] {
+            for (ink_name, ink) in [
+                ("ink", p.ink),
+                ("ink_rest", p.ink_rest),
+                ("ink_caption", p.ink_caption),
+            ] {
+                for (ground_name, ground) in grounds(p) {
+                    let ratio = contrast(ink, ground);
+                    assert!(
+                        ratio >= 4.5,
+                        "{ink_name} on {ground_name} (dark: {}) is {ratio:.2}:1",
+                        p.is_dark
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_controls_resting_border_reaches_3_to_1() {
+        // `prims::primary_action` rests on `ink_caption` (WCAG 1.4.11);
+        // `ink_faint` does not reach it and stays for non-text marks.
+        for p in [&LIGHT, &DARK] {
+            for (ground_name, ground) in grounds(p) {
+                let ratio = contrast(p.ink_caption, ground);
+                assert!(
+                    ratio >= 3.0,
+                    "border on {ground_name} (dark: {}) is {ratio:.2}:1",
+                    p.is_dark
+                );
+                assert!(
+                    contrast(p.ink_faint, ground) < 3.0,
+                    "ink_faint is the non-text step below the border"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_light_reads_at_4_5_to_1_on_its_plate_and_bloom() {
+        for p in [&LIGHT, &DARK] {
+            // A stated finding draws its bloom as one flat tint over the
+            // plate (the room in dark), the worst ground HOT and ember meet.
+            let plate = p.emitter_plate;
+            for (name, glyph, ground) in [
+                ("hot on room", p.hot, p.room),
+                ("hot on plate", p.hot, plate),
+                ("hot on bloom", p.hot, over(plate, p.hot_bloom)),
+                ("ember on room", p.ember, p.room),
+                ("ember on plate", p.ember, plate),
+                ("ember on bloom", p.ember, over(plate, p.ember_bloom)),
+            ] {
+                let ratio = contrast(glyph, ground);
+                assert!(ratio >= 4.5, "{name} (dark: {}) is {ratio:.2}:1", p.is_dark);
+            }
+        }
+    }
+
+    #[test]
+    fn the_column_has_no_sheet() {
+        assert_eq!(LIGHT.column_ground, LIGHT.room);
+        assert_eq!(DARK.column_ground, DARK.room);
     }
 }

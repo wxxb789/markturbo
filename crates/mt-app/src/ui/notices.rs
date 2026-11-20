@@ -24,8 +24,10 @@
 //! carries an accessibility label.
 
 use std::{
+    cell::RefCell,
     ops::Range,
-    time::{SystemTime, UNIX_EPOCH},
+    rc::Rc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mt_core::{recovery::RecoveredRecord, settings::Language};
@@ -43,7 +45,7 @@ use crate::{
         AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest, Tab,
     },
     ui::{
-        motion::HOVER_MS,
+        motion::{HOVER_MS, reduced_motion},
         prims,
         tokens::{
             self, CONSENT_BUTTON_H, CONSENT_BUTTON_W, FOCUS_RING, FOCUS_RING_OFFSET, HAIRLINE,
@@ -1107,7 +1109,7 @@ fn card_action(
                     if danger {
                         tokens::palette().hairline
                     } else {
-                        tokens::palette().ink_faint
+                        tokens::palette().ink_caption
                     }
                 })
                 .transition_colors()
@@ -1147,17 +1149,64 @@ fn card_action(
 
 // ─── status line ──────────────────────────────────────────────────────────
 
+/// How long a done message stays at resting ink before it fades.
+const STATUS_HOLD_MS: u64 = 3_000;
+/// The fade of a done message; reduced motion drops it at once.
+const STATUS_FADE_MS: u64 = 240;
+
 /// The quiet line at the foot of the column: what the app last did, at resting
-/// ink. Local, so it never glows.
+/// ink. Local, so it never glows. Something done fades after a moment and
+/// leaves the line empty; an error, a refusal or a wait
+/// ([`AppState::notify_held`]) stays until the next message. The line keeps
+/// its height either way, so nothing under or above it moves.
 pub fn status_line(state: AppState, language: Language) -> impl IntoElement {
     let _ = language;
+    let opacity = animated_value(1.0);
+    let steps: Rc<RefCell<Vec<Spawned<()>>>> = Rc::default();
+    let watched = state.clone();
+    effect(move || {
+        let message = watched.status.get();
+        let held = watched.status_held.get_untracked();
+        // A new message cancels the last one's fade and shows at full ink.
+        steps.borrow_mut().clear();
+        opacity.stop();
+        opacity.set(1.0);
+        if message.is_empty() || held {
+            return;
+        }
+        let fade = set_timeout(Duration::from_millis(STATUS_HOLD_MS), move || {
+            if reduced_motion() {
+                opacity.set(0.0);
+            } else {
+                opacity.timing_with(0.0, Timing::new(STATUS_FADE_MS as f32, Easing::EaseInOut));
+            }
+        });
+        // Faded, the message leaves the line, so nothing reads it any more —
+        // unless another one took its place meanwhile.
+        let clearing = watched.clone();
+        let clear = set_timeout(
+            Duration::from_millis(STATUS_HOLD_MS + STATUS_FADE_MS),
+            move || {
+                if clearing.status.get_untracked() == message {
+                    clearing.status.set(SharedString::default());
+                }
+            },
+        );
+        steps.borrow_mut().extend([fade, clear]);
+    });
     view().test_id("status").w_full().pt(px(SPACE_3)).child(
-        text(move || state.status.get())
-            .font_family(tokens::FONT_UI)
-            .text_size(px(tokens::TYPE_UI))
-            .line_height(px(tokens::TYPE_UI_LINE))
-            .number_of_lines(1)
-            .text_color(move || tokens::palette().ink_rest),
+        view()
+            .w_full()
+            .h(px(tokens::TYPE_UI_LINE))
+            .bind_opacity(&opacity)
+            .child(
+                text(move || state.status.get())
+                    .font_family(tokens::FONT_UI)
+                    .text_size(px(tokens::TYPE_UI))
+                    .line_height(px(tokens::TYPE_UI_LINE))
+                    .number_of_lines(1)
+                    .text_color(move || tokens::palette().ink_rest),
+            ),
     )
 }
 

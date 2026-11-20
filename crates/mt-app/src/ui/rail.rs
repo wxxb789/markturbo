@@ -360,7 +360,7 @@ fn names(
                                     .font_family(FONT_UI)
                                     .text_size(px(TYPE_UI))
                                     .line_height(px(TYPE_UI_LINE))
-                                    .text_color(move || tokens::palette().ink_faint)
+                                    .text_color(move || tokens::palette().ink_caption)
                                     .hover(|s| s.text_color(tokens::palette().ink)),
                             ),
                     )
@@ -696,7 +696,7 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
                                 .font_family(FONT_UI)
                                 .text_size(px(TYPE_UI))
                                 .line_height(px(TYPE_UI_LINE))
-                                .text_color(move || tokens::palette().ink_faint)
+                                .text_color(move || tokens::palette().ink_caption)
                                 .truncate(),
                         )
                 },

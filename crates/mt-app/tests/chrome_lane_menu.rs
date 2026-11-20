@@ -59,8 +59,8 @@ fn the_menu_starts_a_new_file_and_a_pasted_document() {
         .expect("open the glyph's menu");
     app.press("id:title-menu-paste")
         .expect("paste as a new document");
-    app.wait_for("text:Pasted from the menu")
-        .expect("the pasted text rendered");
+    app.wait_for("text:# Pasted from the menu")
+        .expect("the pasted text in the editor");
     assert!(
         app.shows("# Pasted from the menu"),
         "the editor holds the clipboard's bytes: {:?}",

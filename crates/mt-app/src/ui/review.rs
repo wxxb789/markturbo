@@ -25,7 +25,7 @@ use mt_core::{
     review::{ArtifactLens, ClarificationPriority, provider::REVIEW_REQUEST_TIMEOUT},
     settings::Language,
 };
-use nsh_base::{button, input};
+use nsh_base::input;
 use nsh_core::{Color, EllipsizeMode, element::KeyOptions, keymap::When, prelude::*};
 
 use crate::{
@@ -506,7 +506,7 @@ fn spacer() -> impl IntoElement {
     view().flex_1().min_h(px(SPACE_2))
 }
 
-/// 'Stale — edited after review' with `Review again`.
+/// 'Text changed since this review' with `Review again`.
 fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
     let again = state.clone();
     // 'Review again' takes the focus when the result goes stale: it is the
@@ -789,21 +789,18 @@ fn questions(
                     let order = order.to_vec();
                     move || reopen_question(session, &order, index)
                 };
+                // The line is the button itself, as `prims::press_target` is: a
+                // pressable view around a named button reads as a second,
+                // unnamed button to UIA.
                 view()
                     .test_id("review-question-line")
+                    .role(AccessibilityRole::Button)
+                    .optional_label(Some(SharedString::from(text.clone())))
                     .w_full()
-                    .on_press(reopen.clone())
-                    .child(
-                        button()
-                            .accessibility_label(Some(SharedString::from(text.clone())))
-                            .w_full()
-                            .p(px(0.0))
-                            .bg(Color::TRANSPARENT)
-                            .cursor_pointer()
-                            .focus_visible(|style| style.text_color(tokens::palette().ink))
-                            .on_press(reopen)
-                            .child(row),
-                    )
+                    .cursor_pointer()
+                    .focus_visible(|style| style.text_color(tokens::palette().ink))
+                    .on_press(reopen)
+                    .child(row)
                     .into_element()
             })),
     );
@@ -1061,24 +1058,23 @@ fn step_control(
 ) -> AnyElement {
     let state = state.clone();
     let step = move || step_finding(&state, session, delta);
+    // The control is the button itself, as `prims::press_target` is: a
+    // pressable view around a named button reads as a second, unnamed button
+    // to UIA.
     view()
         .test_id(id)
-        .on_press(step.clone())
-        .child(
-            button()
-                .accessibility_label(Some(SharedString::from(s(label, language))))
-                .p(px(0.0))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .focus_visible(|style| style.text_color(tokens::palette().ink))
-                .on_press(step)
-                .child(prims::kbd(key)),
-        )
+        .role(AccessibilityRole::Button)
+        .optional_label(Some(SharedString::from(s(label, language))))
+        .cursor_pointer()
+        .focus_visible(|style| style.text_color(tokens::palette().ink))
+        .on_press(step)
+        .child(prims::kbd(key))
         .into_element()
 }
 
 /// The legend, and the state's one next action once every question is
-/// answered or skipped.
+/// answered or skipped. A stale result offers no `Prepare revision`: the
+/// banner's `Review again` is its only next step.
 fn footer(
     state: AppState,
     language: Language,
@@ -1089,6 +1085,7 @@ fn footer(
     let order = priority_order(&review.questions_detail);
     let done =
         review.questions_detail.is_empty() || current_question(&session_now, &order).is_none();
+    let stale = review.stale;
     let prepare_state = state.clone();
     let prepare_session = session;
     let close_state = state.clone();
@@ -1146,7 +1143,9 @@ fn footer(
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .child(if done {
+                .child(if stale {
+                    view().into_element()
+                } else if done {
                     // The state's one next action takes the focus once, when
                     // every question is done.
                     let reference = element_ref();
@@ -1353,7 +1352,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::ReviewingWith => "Reviewing with {host}…",
             S::UsuallySeconds => "Usually 10–30 seconds. Esc cancels.",
             S::Cancelled => "Cancelled — nothing changed.",
-            S::Stale => "Stale — edited after review",
+            S::Stale => "Text changed since this review",
             S::NoModelSetUp => "No model set up",
             S::NoModelHint => "Add a provider and an API key in Settings, then run Review again.",
             S::OpenSettings => "Open settings",
@@ -1390,7 +1389,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::ReviewingWith => "正在审查 · {host}…",
             S::UsuallySeconds => "通常需要 10–30 秒。按 Esc 取消。",
             S::Cancelled => "已取消——没有任何更改。",
-            S::Stale => "已过期——审查后文档被编辑",
+            S::Stale => "审查后文本已更改",
             S::NoModelSetUp => "未配置模型",
             S::NoModelHint => "请在设置中添加服务商和 API 密钥，然后重新运行审查。",
             S::OpenSettings => "打开设置",

@@ -16,7 +16,7 @@
 //!   window;
 //! * the three layout breakpoints (client width ≥ 1280, 1040–1279, < 1040),
 //!   the rail's 44px, the text column's 40 + measure + 40 box and the field's
-//!   remaining width with its 32px right inset;
+//!   remaining width with its 40px left and 32px right insets;
 //! * below 1040 client width the field becomes an overlay over the right 46%
 //!   of the column, and the column dims to 40% beneath it;
 //! * the overlay layer the consent card and the notices guard live in;
@@ -198,13 +198,21 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
         .child(notices::status_line(status_state, language))
 }
 
-/// The field: all remaining width, unbordered, with the app's 32px right inset
-/// and the docked reading position capped at 440px.
+/// The field: all remaining width, unbordered, with the 40px field gap as its
+/// left inset, the app's 32px right inset and the docked reading position
+/// capped at 440px.
+///
+/// The left inset is the field's, once, for every surface and in both modes
+/// (the prototype's `.field > *`): a review's lens line and the preview's
+/// label start at the same x, and no surface adds an inset of its own.
 ///
 /// Below 1040 client width it is an opaque overlay across the right 46% of the
 /// window, over the dimmed column.
 fn field(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
-    let area = view().h(relative(1.0)).pr(px(tokens::FIELD_RIGHT_INSET));
+    let area = view()
+        .h(relative(1.0))
+        .pl(px(tokens::FIELD_GAP))
+        .pr(px(tokens::FIELD_RIGHT_INSET));
     let area = if layout.field_overlays() {
         area.absolute()
             .top(px(0.0))
@@ -333,4 +341,258 @@ fn hide_system_title_bar() {
         attributes.title_bar = Some(title_bar);
         nsh_core::element::desktop::current_window().set(attributes);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use nsh_engine::{EngineConfig, Root};
+    use nsh_testing::{Headless, LayoutNode};
+
+    use super::*;
+    use crate::state::Pane;
+
+    /// The document the probes open: a heading on its first line, so the
+    /// first glyph the column draws is known.
+    fn probe_path() -> &'static std::path::Path {
+        static FIXTURE: OnceLock<(tempfile::TempDir, std::path::PathBuf)> = OnceLock::new();
+        FIXTURE
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let path = dir.path().join("plan.md");
+                let mut text = String::from("# Release plan\n\nDescribe the next release.\n");
+                for index in 4..12 {
+                    text.push_str(&format!("line {index}\n"));
+                }
+                std::fs::write(&path, text).expect("write the fixture");
+                (dir, path)
+            })
+            .1
+            .as_path()
+    }
+
+    /// A control the test presses: a small box above the shell that runs
+    /// `act` on the state.
+    fn control(
+        id: &'static str,
+        state: &AppState,
+        act: impl Fn(&AppState) + 'static,
+    ) -> impl IntoElement {
+        let state = state.clone();
+        view()
+            .test_id(id)
+            .w(px(8.0))
+            .h(px(8.0))
+            .on_press(move || act(&state))
+    }
+
+    /// Sets the active tab's pane.
+    fn pane(state: &AppState, pane: Pane) {
+        if let Some(tab) = state.active_tab() {
+            state.set_pane(tab.id, pane);
+        }
+    }
+
+    /// The shell at `layout` with the fixture open, under controls that open
+    /// and close the review and pick the pane. The pane is chosen by the
+    /// test, never left to the default.
+    fn probe(layout: Layout) -> impl IntoElement {
+        let state = AppState::new();
+        if let Some(parent) = probe_path().parent() {
+            state.open_folder(parent.to_path_buf());
+        }
+        state.open_file(probe_path().to_path_buf());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(
+                view()
+                    .flex_row()
+                    .child(control("probe-review-open", &state, |state| {
+                        state.review_open.set(true)
+                    }))
+                    .child(control("probe-review-close", &state, |state| {
+                        state.review_open.set(false)
+                    }))
+                    .child(control("probe-source", &state, |state| {
+                        pane(state, Pane::Source)
+                    }))
+                    .child(control("probe-split", &state, |state| {
+                        pane(state, Pane::Split)
+                    })),
+            )
+            .child(shell(state, Language::English, layout))
+    }
+
+    #[component]
+    fn WideProbe() -> impl IntoElement {
+        probe(Layout::Wide)
+    }
+
+    #[component]
+    fn NarrowProbe() -> impl IntoElement {
+        probe(Layout::Narrow)
+    }
+
+    /// The shell with nothing open: the welcome.
+    #[component]
+    fn WelcomeProbe() -> impl IntoElement {
+        shell(AppState::new(), Language::English, Layout::Wide)
+    }
+
+    /// `root` started in a `width` x 900 window, the editor up, in Source.
+    fn start(root: Root, width: f32) -> Headless {
+        let mut app =
+            Headless::start(EngineConfig::new(root.tokens(tokens::theme()))).expect("start");
+        app.set_viewport(nsh_core::Size::new(Points(width), Points(900.0)))
+            .expect("the probe's window");
+        app.wait_for("label:Markdown source")
+            .expect("the source editor");
+        press(&mut app, "probe-source");
+        app
+    }
+
+    fn press(app: &mut Headless, id: &str) {
+        app.press(&format!("id:{id}"))
+            .unwrap_or_else(|why| panic!("press `{id}`: {why}"));
+        app.settle();
+    }
+
+    /// The first view with test id `id`, as laid out.
+    fn node(app: &Headless, id: &str) -> LayoutNode {
+        app.screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("no `{id}` on screen: {:?}", app.screen().texts()))
+    }
+
+    /// The left edge of the text `text` draws, wherever it is on screen.
+    fn text_x(app: &Headless, text: &str) -> f32 {
+        app.screen()
+            .layout_nodes()
+            .iter()
+            .filter_map(|node| node.text.as_ref())
+            .filter(|laid| laid.text.text.as_str() == text)
+            .map(|laid| laid.content.origin.x.0)
+            .reduce(f32::min)
+            .unwrap_or_else(|| panic!("no `{text}` on screen: {:?}", app.screen().texts()))
+    }
+
+    /// The field's surfaces start one field gap right of the column, once,
+    /// for the review and the preview alike.
+    #[test]
+    fn every_field_surface_starts_one_field_gap_from_the_column() {
+        let mut app = start(Root::of::<WideProbe>(), 1440.0);
+        let column = node(&app, "column").bounds;
+        let field_x = column.origin.x.0 + column.size.width.0 + tokens::FIELD_GAP;
+
+        press(&mut app, "probe-review-open");
+        app.wait_for("id:review-lens").expect("the review's lens");
+        let lens = node(&app, "review-lens").bounds.origin.x.0;
+
+        press(&mut app, "probe-review-close");
+        press(&mut app, "probe-split");
+        app.wait_for("id:preview-field").expect("the preview field");
+        let label = text_x(&app, "Preview");
+
+        assert_eq!(lens, field_x, "the review's lens starts at x{lens}");
+        assert_eq!(label, field_x, "the preview's label starts at x{label}");
+    }
+
+    /// Below 1040 the field overlays the right 46% of the window, and its
+    /// surface still starts one field gap in.
+    #[test]
+    fn the_overlay_field_keeps_the_field_gap() {
+        let width = 1000.0;
+        let mut app = start(Root::of::<NarrowProbe>(), width);
+        press(&mut app, "probe-review-open");
+        app.wait_for("id:review-lens").expect("the review's lens");
+        let lens = node(&app, "review-lens").bounds.origin.x.0;
+        let expected = width * (1.0 - Layout::OVERLAY_FRACTION) + tokens::FIELD_GAP;
+        assert!(
+            (lens - expected).abs() < 0.5,
+            "the overlay's lens starts at x{lens}, not x{expected}"
+        );
+    }
+
+    /// Opening a review leaves your text where it was: the line numbers it
+    /// shows sit in the column's left gap, at one size, the active line's
+    /// included.
+    #[test]
+    fn opening_a_review_does_not_move_the_text() {
+        let mut app = start(Root::of::<WideProbe>(), 1440.0);
+        let first = "# Release plan";
+        let before = text_x(&app, first);
+        let column = node(&app, "column").bounds;
+        let measure_x = column.origin.x.0 + tokens::COLUMN_GAP;
+        assert!(
+            before >= measure_x && before < measure_x + tokens::SPACE_2,
+            "the first glyph at x{before}, not at the measure (x{measure_x})"
+        );
+
+        press(&mut app, "probe-review-open");
+        app.wait_for("id:review-lens").expect("the review's lens");
+        let after = text_x(&app, first);
+        assert_eq!(after, before, "opening the review moved the text");
+
+        // The numbers live in the gap between the rail and the measure.
+        let numbers: Vec<LayoutNode> = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .filter(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|laid| matches!(laid.text.text.as_str(), "1" | "2" | "3"))
+            })
+            .collect();
+        assert_eq!(numbers.len(), 3, "lines 1-3 numbered once each");
+        for number in &numbers {
+            let left = number.bounds.origin.x.0;
+            let right = left + number.bounds.size.width.0;
+            assert!(
+                left >= column.origin.x.0 && right <= before,
+                "a line number spans x{left}..{right}, outside the gap x{}..{before}",
+                column.origin.x.0
+            );
+        }
+
+        // The active line's number (the caret is on line 1) is set like
+        // every other: 11px, in the same ink.
+        let active = app
+            .screen()
+            .span_style("id:source-editor >> text:/^1$/")
+            .expect("line 1's number");
+        let other = app
+            .screen()
+            .span_style("id:source-editor >> text:/^2$/")
+            .expect("line 2's number");
+        assert_eq!(active.font_size.0, 11.0, "the active line's number size");
+        assert_eq!(other.font_size.0, 11.0, "another line's number size");
+        assert_eq!(active.color, other.color, "the active line's number ink");
+
+        press(&mut app, "probe-review-close");
+        assert_eq!(
+            text_x(&app, first),
+            before,
+            "closing the review moved the text"
+        );
+    }
+
+    /// The welcome is not an input, so it draws no caret.
+    #[test]
+    fn the_welcome_draws_no_caret() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<WelcomeProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the probe");
+        app.wait_for("id:welcome").expect("the welcome");
+        assert!(
+            !app.screen().matches("id:welcome-caret").expect("selector"),
+            "the welcome draws a caret"
+        );
+    }
 }

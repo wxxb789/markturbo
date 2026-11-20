@@ -1,9 +1,9 @@
 //! Paste creates an editable document from clipboard text.
 //!
 //! Afterglow: the welcome's Paste choice turns the clipboard into an untitled
-//! draft, with the editor holding the clipboard's bytes and the preview
-//! rendering them. CJK text and a surrogate-pair emoji arrive unchanged: the
-//! draft saved as a file holds exactly the clipboard's text.
+//! draft, with the editor holding the clipboard's bytes. CJK text and a
+//! surrogate-pair emoji arrive unchanged: the draft saved as a file holds
+//! exactly the clipboard's text.
 
 mod support;
 
@@ -40,11 +40,11 @@ fn paste_creates_a_document() {
     app.press("label:Paste").expect("paste into a new document");
     app.wait_for("label:Markdown source")
         .expect("pasted editor");
-    app.wait_for("text:Pasted draft")
-        .expect("pasted text rendered");
+    app.wait_for("text:# Pasted draft")
+        .expect("pasted text in the editor");
 
-    // The editor itself shows the clipboard's bytes (the preview above shows
-    // the rendered copy).
+    // The editor itself shows the clipboard's bytes (a document opens in
+    // Source, so no preview renders a copy).
     assert!(
         app.shows("# Pasted draft") && app.shows("粘贴的中文 🦀 stays exact."),
         "the editor holds the clipboard's lines: {:?}",

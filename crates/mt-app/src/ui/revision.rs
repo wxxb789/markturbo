@@ -805,7 +805,7 @@ fn one_line(
     let colour = move || match hunk.with(|hunk| now.with(|now| now.decision(hunk.change_id))) {
         None => tokens::palette().ember,
         Some(true) => tokens::palette().ink_rest,
-        Some(false) => tokens::palette().ink_faint,
+        Some(false) => tokens::palette().ink_caption,
     };
     view()
         .label(label)
@@ -822,7 +822,7 @@ fn one_line(
                     .font_family(tokens::FONT_UI)
                     .text_size(px(tokens::TYPE_UI))
                     .line_height(px(tokens::TYPE_UI_LINE))
-                    .text_color(move || tokens::palette().ink_faint),
+                    .text_color(move || tokens::palette().ink_caption),
             ),
         )
         .child(
