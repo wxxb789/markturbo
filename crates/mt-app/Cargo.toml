@@ -30,7 +30,7 @@ model-transport = ["mt-core/model-transport"]
 # Test builds only: `AppState::new` uses an in-memory credential store, never
 # the platform's. Enabled for integration tests by the dev-dependency on this
 # crate below; a release build does not build dev-dependencies.
-test-vault = []
+test-vault = ["mt-core/test-support"]
 
 [dependencies]
 mt-core.workspace = true

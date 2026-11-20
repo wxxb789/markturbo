@@ -375,6 +375,19 @@ impl Layout {
 // * Linux: Noto Sans CJK SC (or Source Han Sans SC, WenQuanYi Micro Hei),
 //   then Inter / Adwaita Sans where installed and Noto Sans; code falls back
 //   to Adwaita Mono, then DejaVu Sans Mono.
+//
+// Ahead of every platform's CJK face sits the companion the settings page
+// downloads on request (`ui::fonts::Companion`): Source Han Sans CN VF. It is
+// one variable file without a typographic name, so both its legacy family
+// (nameID 1) and what `register_font` resolves are `Source Han Sans CN VF`;
+// DirectWrite picks its named instance by weight (300 / 400 / 500 draw the
+// Light / Regular / Medium cuts), so the list's weight selects the cut. Until
+// it is installed the name matches nothing and the platform's face follows.
+macro_rules! cjk_companion {
+    () => {
+        "Source Han Sans CN VF"
+    };
+}
 #[cfg(target_os = "windows")]
 macro_rules! sans_fallback {
     () => {
@@ -427,23 +440,38 @@ macro_rules! mono_fallback {
 /// Martian Grotesk 400 (the `Std Rg` instance): UI and preview body.
 pub const FONT_UI: &str = concat!(
     "Martian Grotesk Std Rg, Martian Grotesk, ",
+    cjk_companion!(),
+    ", ",
     sans_fallback!()
 );
 /// Martian Grotesk 300 (the `Std Lt` instance): the model's voice, the only
 /// large type in the app.
 pub const FONT_MODEL: &str = concat!(
     "Martian Grotesk Std Lt, Martian Grotesk, ",
+    cjk_companion!(),
+    ", ",
     light_fallback!()
 );
 /// Martian Grotesk 500 (the `Std Md` instance): the few labels that must not
 /// be quiet. Pair it with [`WEIGHT_MEDIUM`].
 pub const FONT_MEDIUM: &str = concat!(
     "Martian Grotesk Std Md, Martian Grotesk, ",
+    cjk_companion!(),
+    ", ",
     sans_fallback!()
 );
 /// Martian Mono 400 (the condensed `Cn Rg` instance): source mode. CJK falls
-/// back to the platform's sans without forcing monospace widths.
-pub const FONT_SOURCE: &str = concat!("Martian Mono Cn Rg, Martian Mono, ", mono_fallback!());
+/// back to the companion, then the platform's sans, without forcing
+/// monospace widths.
+pub const FONT_SOURCE: &str = concat!(
+    "Martian Mono Cn Rg, Martian Mono, ",
+    cjk_companion!(),
+    ", ",
+    mono_fallback!()
+);
+/// The downloadable companion CJK face's family, first in the CJK position of
+/// every list above but not in the Windows [`FONT_INPUT`].
+pub const FONT_CJK_COMPANION: &str = cjk_companion!();
 /// Text inputs. nsh 0.5.1's Windows input takes only the *first* family of
 /// a list and only from the system's fonts — never a registered one, with no
 /// fallback through the rest — so a list led by Martian left its placeholder
@@ -533,8 +561,18 @@ mod tests {
             assert_eq!(families[0], legacy, "{list}");
             assert_eq!(families[1], typographic, "{list}");
             assert!(families.contains(&cjk), "{list}");
-            // A CJK face follows Martian directly: it draws the CJK
-            // punctuation Martian lacks, before any Latin system face.
+            // The downloadable companion follows Martian directly, then the
+            // platform's own CJK face: they draw the CJK punctuation Martian
+            // lacks, before any Latin system face.
+            assert_eq!(families[2], FONT_CJK_COMPANION, "{list}");
+            assert_eq!(
+                families
+                    .iter()
+                    .filter(|family| **family == FONT_CJK_COMPANION)
+                    .count(),
+                1,
+                "{list}"
+            );
             let is_cjk = |family: &str| {
                 [
                     "DengXian",
@@ -545,7 +583,7 @@ mod tests {
                 .iter()
                 .any(|face| family.starts_with(face))
             };
-            assert!(is_cjk(families[2]), "{list}");
+            assert!(is_cjk(families[3]), "{list}");
         }
         // The model's 22px CJK follows the light cut before the body's.
         if cfg!(target_os = "windows") {
@@ -596,6 +634,9 @@ mod tests {
         let first = FONT_INPUT.split(',').next().map(str::trim);
         if cfg!(target_os = "windows") {
             assert_eq!(first, Some("Bahnschrift"), "{FONT_INPUT}");
+            // A registered face never loads there, so the companion is not
+            // named.
+            assert!(!FONT_INPUT.contains(FONT_CJK_COMPANION), "{FONT_INPUT}");
         } else {
             assert_eq!(first, Some("Martian Grotesk Std Rg"), "{FONT_INPUT}");
             assert_eq!(FONT_INPUT, FONT_UI);

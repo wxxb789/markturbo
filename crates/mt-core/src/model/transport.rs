@@ -54,15 +54,23 @@ pub(crate) fn client_for_endpoint(endpoint: &EndpointIdentity) -> Result<&'stati
 }
 
 fn build_client(proxy_policy: ProxyPolicy) -> Result<Client, ()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(120));
-    if proxy_policy == ProxyPolicy::Disabled {
-        builder = builder.no_proxy();
-    }
-    let reqwest = builder.build().map_err(|_| ())?;
+    let reqwest = http_client_builder(proxy_policy)
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|_| ())?;
     Ok(Client::builder().with_reqwest(reqwest).build())
+}
+
+/// The reqwest client every outbound request starts from: the pure-Rust TLS
+/// provider installed, redirects never followed, and the proxy policy applied.
+pub(crate) fn http_client_builder(proxy_policy: ProxyPolicy) -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if proxy_policy == ProxyPolicy::Disabled {
+        builder.no_proxy()
+    } else {
+        builder
+    }
 }
 
 pub(crate) fn request_failure_hint(error: &genai::Error) -> &'static str {

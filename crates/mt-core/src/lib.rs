@@ -4,6 +4,7 @@
 //! policy can run in headless tools or behind the desktop presentation layer.
 
 pub mod agent_artifacts;
+pub mod companion_font;
 pub mod credentials;
 pub mod diagnostic;
 pub mod document;
