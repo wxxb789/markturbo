@@ -126,8 +126,9 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
 /// Binds `Ctrl+Enter` (`mod+enter`; on an Apple keyboard `ctrl+enter` too, the
 /// key the hints name) to [`mod_enter`], the app's one handler for it. Call it
 /// inside an effect: the binding is dropped with the effect's run, and it
-/// reads whether a consent card is up, whose hold takes the key's
-/// auto-repeats (anything else fires once per press).
+/// reads whether a consent card is up and armed, whose hold takes the key's
+/// auto-repeats (anything else, an unarmed card included, fires once per
+/// press).
 ///
 /// The keymap fires the newest binding of a keystroke, and the source editor
 /// binds its own `mod+enter` (insert a line below) every time it takes the
@@ -136,7 +137,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
 /// claim the key (the consent card, the Revision field's `Done`) bind it as
 /// they come — every one of them the same binding.
 pub fn bind_mod_enter(state: &AppState) {
-    let held = consent::is_open(state);
+    let held = consent::is_open(state) && consent::key_armed();
     let keys: &[&str] = if apple_keys() {
         &["mod+enter", "ctrl+enter"]
     } else {

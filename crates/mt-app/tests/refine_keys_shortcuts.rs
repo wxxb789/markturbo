@@ -79,46 +79,60 @@ fn sent(app: &Headless) -> bool {
         .expect("the selector")
 }
 
-/// `Ctrl+Enter` held for `ms`: the press and its auto-repeats, one every
-/// 33ms (Windows' fastest repeat rate). Panics if a send happens and
-/// `must_not_send` is set.
-fn hold_ctrl_enter(app: &mut Headless, ms: u64, must_not_send: bool) {
+/// `Ctrl+Enter` held for `ms` on an armed card: the press and its
+/// auto-repeats, one every 33ms (Windows' fastest repeat rate).
+fn hold_ctrl_enter(app: &mut Headless, ms: u64) {
     for _ in 0..ms / 33 {
         app.press_key("ctrl+enter").expect("ctrl+enter");
         app.run_for(Duration::from_millis(33))
             .expect("the next repeat");
-        if must_not_send {
-            assert!(
-                !sent(app),
-                "the key that opened the card sent it: {:?}",
-                app.screen().texts()
-            );
-        }
     }
+}
+
+/// The app with the consent card opened by `Ctrl+Enter` from the editor.
+fn open_card_with_ctrl_enter() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    let (mut app, directory, config) = start(true);
+    app.type_text(EDITOR, "").expect("focus the editor");
+    app.press_key("ctrl+enter").expect("ctrl+enter");
+    app.wait_for("id:consent-card").expect("the card opened");
+    (app, directory, config)
 }
 
 #[test]
 fn the_ctrl_enter_that_opens_the_card_never_sends_it() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut app, _directory, _config) = start(true);
-    app.type_text(EDITOR, "").expect("focus the editor");
+    let (mut app, _directory, _config) = open_card_with_ctrl_enter();
 
-    // The press opens the card, and the same key stays down: its repeats
-    // arrive for well past the charge a send needs.
-    app.press_key("ctrl+enter").expect("ctrl+enter");
-    app.wait_for("id:consent-card").expect("the card opened");
-    app.run_for(Duration::from_millis(500))
-        .expect("the platform's repeat delay");
-    hold_ctrl_enter(&mut app, 2_200, true);
+    // The same key stays down for well past the charge a send needs. Until
+    // the card arms, its binding takes no auto-repeats: the platform
+    // swallows them, so the card hears nothing.
+    app.run_for(Duration::from_millis(2_700))
+        .expect("the opening key held");
+    assert!(!sent(&app), "the key that opened the card sent it");
     assert!(app.shows("Send for review?"), "the card is still waiting");
 
-    // Let go, then a deliberate hold: that one sends.
-    app.run_for(Duration::from_millis(1_200)).expect("released");
-    assert!(!sent(&app), "a release sends nothing");
-    hold_ctrl_enter(&mut app, 1_500, false);
+    // Let go, then a deliberate hold at once: that one sends.
+    hold_ctrl_enter(&mut app, 1_500);
     assert!(
         sent(&app),
         "a fresh hold after the release sends: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_fresh_hold_soon_after_the_opening_tap_sends() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _directory, _config) = open_card_with_ctrl_enter();
+
+    // The opening press was a tap; a deliberate hold follows well inside the
+    // platform's slowest repeat delay, and needs no pause before it.
+    app.run_for(Duration::from_millis(300))
+        .expect("a short release");
+    hold_ctrl_enter(&mut app, 1_500);
+    assert!(
+        sent(&app),
+        "a hold 300ms after the opening tap sends: {:?}",
         app.screen().texts()
     );
 }

@@ -30,7 +30,8 @@
 //!   auto-repeat or a handler's second hand never authorize anything, and each
 //!   consent is single-use;
 //! * the `Ctrl+Enter` that opened the card never charges it, however long it
-//!   is held: the card arms only after the key was let go ([`key_hold`]);
+//!   is held: until the card arms, its binding takes no auto-repeats, and the
+//!   next press — a fresh one, after a release — arms it ([`key_hold`]);
 //! * a rebuilt body drops what went with the old controls: the focus flag and
 //!   any press or key charge in flight, whose release can never arrive;
 //! * a loopback HTTP endpoint keeps its filament and row underlines plain grey
@@ -103,11 +104,11 @@ const HEADLINE_LINE: f32 = 24.0;
 /// The definition list's term column (`To`, `Transport`, `API`, `Proxy`,
 /// `Scope`).
 const TERM_W: f32 = 96.0;
-/// How long `Ctrl+Enter` must stay silent before the card takes it as a hold,
-/// when the card opened on that key: longer than the slowest first
+/// How recently `Ctrl+Enter` must have arrived for a card to start unarmed
+/// (the key opened it, or is held as it comes): longer than the slowest first
 /// auto-repeat the platforms offer (Windows' keyboard delay tops out at about
-/// 1s), so the press that opened the card, however long it is held, never
-/// charges it.
+/// 1s), so a key that may still be down never charges a card it did not
+/// press for.
 const ARM_SILENCE_MS: f32 = 1_100.0;
 /// A tap must never complete a hold: the watchdog a key tap charges for stays
 /// short of the charge a send needs.
@@ -838,21 +839,28 @@ fn open_hold() -> Rc<RefCell<Option<Hold>>> {
 /// unmounts it), and the hold's timers must not go with that run, or a press
 /// would never be released and the next tap would find the charge full.
 ///
-/// A card that opened on `Ctrl+Enter` is not armed: the key's presses only
-/// keep the key counted as down until [`ARM_SILENCE_MS`] pass without one —
-/// the key was let go — and the press after that is the first that charges.
+/// A card that opened on `Ctrl+Enter` is not armed, and while it is not the
+/// binding takes no auto-repeats ([`key_armed`]): the platform swallows the
+/// opening press's repeats however long it is held. A press that reaches an
+/// unarmed card is therefore a fresh one, after a release, and it arms the
+/// card and charges at once.
 pub fn key_hold() {
-    let previous = last_key().replace(Some(nsh_core::time::now()));
+    last_key().set(Some(nsh_core::time::now()));
     let hold = open_hold().borrow().clone();
     if let Some(hold) = hold {
-        if !hold.armed.get() {
-            if previous.is_some_and(|at| elapsed_ms(at) < ARM_SILENCE_MS) {
-                return;
-            }
-            hold.armed.set(true);
-        }
+        hold.armed.set(true);
         hold.owner.run(|| hold.key_press());
     }
+}
+
+/// Whether the open card's hold takes `Ctrl+Enter`'s auto-repeats
+/// ([`titlebar::bind_mod_enter`]): only once armed. Reading it subscribes, so
+/// the binding is made again as the card arms.
+pub fn key_armed() -> bool {
+    open_hold()
+        .borrow()
+        .as_ref()
+        .is_some_and(|hold| hold.armed.get())
 }
 
 /// A `Ctrl+Enter` press with no card up ([`titlebar::bind_mod_enter`]): a
@@ -1169,10 +1177,10 @@ struct Hold {
     /// The send fired: this consent is spent.
     spent: Rc<Cell<bool>>,
     /// `Ctrl+Enter` may charge: false while the press that opened the card
-    /// may still be down ([`key_hold`]). The pointer and a focused control's
-    /// `Enter`/`Space` never wait for it. A rebuilt body keeps it: a held key
-    /// is still held.
-    armed: Rc<Cell<bool>>,
+    /// may still be down, when the binding takes no auto-repeats
+    /// ([`key_armed`]). The pointer and a focused control's `Enter`/`Space`
+    /// never wait for it. A rebuilt body keeps it: a held key is still held.
+    armed: Signal<bool>,
     /// The card's owner: the hold's timers live under it, whoever presses.
     owner: Owner,
 }
@@ -1195,11 +1203,11 @@ impl Hold {
             steps: Rc::new(RefCell::new(Vec::new())),
             notice: Rc::new(RefCell::new(None)),
             spent: Rc::new(Cell::new(false)),
-            armed: Rc::new(Cell::new(
+            armed: signal(
                 last_key()
                     .get()
                     .is_none_or(|at| elapsed_ms(at) >= ARM_SILENCE_MS),
-            )),
+            ),
             owner: Owner::current(),
         }
     }
