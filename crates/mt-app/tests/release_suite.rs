@@ -42,6 +42,12 @@ mod quit_guard;
 mod quit_untitled;
 #[path = "recovery_restore.rs"]
 mod recovery_restore;
+#[path = "refine_keys_shortcuts.rs"]
+mod refine_keys_shortcuts;
+#[path = "refine_state_pane.rs"]
+mod refine_state_pane;
+#[path = "refine_state_status.rs"]
+mod refine_state_status;
 #[path = "review_partial.rs"]
 mod review_partial;
 #[path = "review_selection.rs"]
