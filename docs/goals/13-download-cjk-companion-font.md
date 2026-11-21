@@ -12,8 +12,10 @@ device without that click.
 1. Settings shows a Chinese-font entry. Before any request, it states the
    destination host, the size, the licence, and that no document content is
    sent. Its states are Not installed, Downloading (progress and Cancel),
-   Installed (Remove) and Failed (reason and retry), in English and Simplified
-   Chinese.
+   Installed (Remove) and Failed (reason and a way forward: Retry when no file
+   is on disk, Remove when one remains), in English and Simplified Chinese.
+   One table over (busy, on disk) decides the offered action, so no state is a
+   dead end.
 2. Clicking the action downloads Source Han Sans CN VF 2.005 (SIL OFL 1.1)
    from the pinned `raw.githubusercontent.com` URL at the `2.005R` tag:
    - it is capped at 15,636,088 bytes and verified against the pinned SHA-256;
