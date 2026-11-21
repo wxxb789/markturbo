@@ -2233,7 +2233,7 @@ mod tests {
             .expect("the document path")
             .clone()
             .expect("the test set the document path");
-        let state = AppState::with_vault(mt_core::credentials::CredentialVault::with_store(
+        let state = AppState::with_vault(mt_core::credentials::CredentialVault::with_test_store(
             std::sync::Arc::new(EmptyStore),
         ));
         state.open_file(path);

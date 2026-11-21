@@ -56,3 +56,7 @@ smol = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+# Binary tests link the library without cfg(test).
+mt-core = { path = ".", features = ["test-support"] }

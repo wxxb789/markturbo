@@ -1382,7 +1382,7 @@ mod tests {
     #[component]
     fn SettingsProbe() -> impl IntoElement {
         crate::ui::fonts::register();
-        let state = AppState::with_vault(mt_core::credentials::CredentialVault::with_store(
+        let state = AppState::with_vault(mt_core::credentials::CredentialVault::with_test_store(
             PROBE_STORE.clone(),
         ));
         // A custom endpoint, so the environment is never consulted: the status

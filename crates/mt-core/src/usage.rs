@@ -302,7 +302,7 @@ impl UsageStore {
         if !self.enabled {
             return Ok(());
         }
-        let _guard = crate::settings::lock_settings_writes()?;
+        let _guard = self.lock_settings_writes()?;
         if !self.persisted_consent() {
             return Ok(());
         }
@@ -317,7 +317,7 @@ impl UsageStore {
     /// Inspect retained counts even when recording is disabled. A disabled
     /// handle never rewrites the store, including for retention maintenance.
     pub fn inspect(&self, now: SystemTime) -> Result<UsageAggregate, UsageError> {
-        let _guard = crate::settings::lock_settings_writes()?;
+        let _guard = self.lock_settings_writes()?;
         let path = self.path()?;
         let mut aggregate = Self::load(path)?;
         if aggregate.prune(day_bucket(now)) && self.enabled && self.persisted_consent() {
@@ -352,7 +352,7 @@ impl UsageStore {
     /// Explicit Clear deletes the aggregate, including while recording is off.
     /// It does not change consent or delete copies previously exported by users.
     pub fn clear(&self) -> Result<(), UsageError> {
-        let _guard = crate::settings::lock_settings_writes()?;
+        let _guard = self.lock_settings_writes()?;
         let path = self.path()?;
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -360,6 +360,14 @@ impl UsageStore {
             Err(error) => return Err(error.into()),
         }
         Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)
+    }
+
+    fn lock_settings_writes(&self) -> io::Result<crate::settings::SettingsWriteGuard> {
+        #[cfg(test)]
+        if let Some(path) = self.consent_path.as_deref() {
+            return crate::settings::lock_settings_writes_for_path(path);
+        }
+        crate::settings::lock_settings_writes()
     }
 
     fn persisted_consent(&self) -> bool {
@@ -435,6 +443,3 @@ impl UsageStore {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-pub(crate) use tests::USAGE_TEST_LOCK;

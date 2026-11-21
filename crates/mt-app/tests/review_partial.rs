@@ -93,9 +93,16 @@ fn a_package_missing_a_referenced_file_is_reviewed_as_partial() {
         .expect("Review selection");
     app.wait_for("text:An Agent Skill is reviewed as one package: use Review.")
         .expect("the package is reviewed whole");
-    assert!(!app.shows("id:consent-card"), "nothing was prepared");
     assert!(
-        !app.shows("id:review-unavailable"),
+        !app.screen()
+            .matches("id:consent-card")
+            .expect("the selector"),
+        "nothing was prepared"
+    );
+    assert!(
+        !app.screen()
+            .matches("id:review-unavailable")
+            .expect("the selector"),
         "not a failure to prepare"
     );
 
