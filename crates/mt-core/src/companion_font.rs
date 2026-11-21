@@ -170,24 +170,13 @@ impl CompanionFont {
         self.dir.join(FILE_NAME)
     }
 
-    /// Whether the file is present. Unverified: [`Self::load`]
-    /// verifies before anything uses the bytes.
-    pub fn is_installed(&self) -> bool {
-        let Ok(_lock) = self.lock_lifecycle() else {
-            return false;
-        };
-        self.path().is_file()
-    }
-
     /// Removes abandoned partial downloads left behind by a crashed process.
     pub fn cleanup_stale_parts(&self) -> io::Result<()> {
         let data_dir = self.data_dir();
-        match fs::metadata(data_dir) {
+        let _lifecycle = match self.lock_lifecycle() {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-            Ok(_) => {}
-        }
-        let _lifecycle = self.lock_lifecycle()?;
+            result => result?,
+        };
         let entries = match fs::read_dir(data_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -498,6 +487,11 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let missing_data = data.path().join("not-created");
         let missing = CompanionFont::with_source(&missing_data, "http://127.0.0.1:9/", b"the font");
+        missing.cleanup_stale_parts().unwrap();
+        assert!(
+            !missing_data.exists(),
+            "cleaning up does not create its data root"
+        );
         assert_eq!(missing.load().unwrap(), None);
         missing.remove().expect("an absent font is already removed");
         assert!(
@@ -507,18 +501,18 @@ mod tests {
 
         let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", b"the font");
         assert_eq!(font.load().unwrap(), None, "absent");
-        assert!(!font.is_installed());
+        assert!(!font.path().try_exists().unwrap());
 
         fs::create_dir_all(font.path().parent().unwrap()).unwrap();
         fs::write(font.path(), b"the fonT").unwrap();
-        assert!(font.is_installed(), "present, not yet verified");
+        assert!(font.path().is_file(), "present, not yet verified");
         assert_eq!(font.load().unwrap(), None, "a damaged copy is absent");
         assert!(!font.path().exists(), "and removed");
 
         fs::write(font.path(), b"the font").unwrap();
         assert_eq!(font.load().unwrap().as_deref(), Some(&b"the font"[..]));
         font.remove().unwrap();
-        assert!(!font.is_installed());
+        assert!(!font.path().try_exists().unwrap());
         font.remove().expect("removing an absent font is fine");
     }
 
@@ -942,7 +936,7 @@ mod tests {
                 assert!(cancel_won);
                 resumed.unwrap();
                 assert_eq!(result, Err(DownloadError::Cancelled));
-                assert!(!font.is_installed());
+                assert!(!font.path().try_exists().unwrap());
                 assert_eq!(fs::read_dir(font.dir).unwrap().count(), 0);
                 assert_no_staged_parts(data.path());
             }
@@ -959,7 +953,10 @@ mod tests {
                 fs::create_dir_all(&font.dir).unwrap();
                 fs::write(font.path(), b"old bad file").unwrap();
                 assert_eq!(font.load().unwrap(), None);
-                assert!(!font.is_installed(), "an old invalid file is removed");
+                assert!(
+                    !font.path().try_exists().unwrap(),
+                    "an old invalid file is removed"
+                );
 
                 let restored = while_committing(&font, CompanionFont::load).unwrap();
                 assert_eq!(restored.as_deref(), Some(FONT));
