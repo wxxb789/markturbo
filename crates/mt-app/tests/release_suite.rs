@@ -22,6 +22,8 @@ mod chrome_lane_menu;
 mod chrome_lane_review;
 #[path = "chrome_lane_title_row.rs"]
 mod chrome_lane_title_row;
+#[path = "cjk_font_download.rs"]
+mod cjk_font_download;
 #[path = "conflict.rs"]
 mod conflict;
 #[path = "conflict_compare.rs"]

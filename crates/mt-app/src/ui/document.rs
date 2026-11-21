@@ -797,9 +797,7 @@ mod tests {
         ))
     }
 
-    /// The CJK trials: the three lists whose CJK must come from DengXian, the
-    /// cuts and the YaHei the widths compare against, and the engine's own
-    /// fallback for the family that does not exist.
+    /// The dash trials distinguish the Windows fallback faces.
     #[cfg(windows)]
     const CJK_TRIALS: [FontTrial; 8] = [
         FontTrial {
@@ -844,10 +842,10 @@ mod tests {
         },
     ];
 
-    /// The DengXian-cut trials: the three lists, so each one's `ǔ` width
-    /// shows which cut its CJK follows.
+    /// The pinyin trials distinguish the companion from a missing family
+    /// and identify the companion or DengXian cut each list uses.
     #[cfg(windows)]
-    const PINYIN_TRIALS: [FontTrial; 5] = [
+    const PINYIN_TRIALS: [FontTrial; 8] = [
         FontTrial {
             label: "FONT_UI",
             family: tokens::FONT_UI,
@@ -861,6 +859,21 @@ mod tests {
         FontTrial {
             label: "FONT_SOURCE",
             family: tokens::FONT_SOURCE,
+            weight: 400,
+        },
+        FontTrial {
+            label: "Source Han Sans CN VF",
+            family: "Source Han Sans CN VF",
+            weight: 400,
+        },
+        FontTrial {
+            label: "Source Han Sans CN VF 300",
+            family: "Source Han Sans CN VF",
+            weight: 300,
+        },
+        FontTrial {
+            label: "absent",
+            family: "No Such Family 12345",
             weight: 400,
         },
         FontTrial {
@@ -1088,18 +1101,32 @@ mod tests {
         }
     }
 
-    /// The CJK fallback: the three lists take their CJK from DengXian before
-    /// Microsoft YaHei UI, and the model's 22px text from the light cut while
-    /// the body and source stay regular. Without DengXian installed, all three
-    /// fall back to Microsoft YaHei UI.
+    /// After Martian, the three lists prefer Source Han Sans CN VF when
+    /// DirectWrite can resolve it, then DengXian, then Microsoft YaHei UI.
     #[cfg(windows)]
     #[test]
-    fn the_cjk_fallback_prefers_dengxian() {
+    fn the_cjk_fallback_takes_the_first_available_face() {
         let app = font_app(Root::of::<CjkProbe>(), "id:cjk-probe");
         let dash = widths_by_label(&app, &CJK_TRIALS, &"―".repeat(DASH_RULER));
         let pinyin = widths_by_label(&app, &PINYIN_TRIALS, &"ǔ".repeat(PINYIN_RULER));
         println!("dash widths: {}", table_text(&dash));
         println!("pinyin widths: {}", table_text(&pinyin));
+
+        let companion = width_of(&pinyin, "Source Han Sans CN VF");
+        if (companion - width_of(&pinyin, "absent")).abs() > 0.5 {
+            for (list, face) in [
+                ("FONT_UI", "Source Han Sans CN VF"),
+                ("FONT_MODEL", "Source Han Sans CN VF 300"),
+                ("FONT_SOURCE", "Source Han Sans CN VF"),
+            ] {
+                assert!(
+                    (width_of(&pinyin, list) - width_of(&pinyin, face)).abs() <= 0.5,
+                    "{list}'s CJK is not {face}: {}",
+                    table_text(&pinyin)
+                );
+            }
+            return;
+        }
 
         let dengxian = width_of(&dash, "DengXian");
         // Each list's YaHei at the list's own weight: the model's 300 draws
