@@ -1254,7 +1254,7 @@ fn status_line_with_opacity(
 ) -> impl IntoElement {
     let _ = language;
     let rise = animated_value(motion::CARD_RISE_PX);
-    let steps: Rc<RefCell<Vec<Spawned<()>>>> = Rc::default();
+    let active_fade = Cell::new(None::<Spawned<()>>);
     let watched = state.clone();
     effect(move || {
         let message = watched.status.get();
@@ -1262,7 +1262,7 @@ fn status_line_with_opacity(
         let held = watched.status_held.get_untracked();
         // A new message cancels the last one's fade and retargets from the
         // current opacity and offset.
-        steps.borrow_mut().clear();
+        active_fade.set(None);
         opacity.stop();
         rise.stop();
         if message.is_empty() {
@@ -1276,11 +1276,6 @@ fn status_line_with_opacity(
         } else {
             motion::ENTER_MS
         };
-        let exit_ms = if reduced {
-            motion::REDUCED_CROSSFADE_MS
-        } else {
-            motion::EXIT_MS
-        };
         if reduced {
             rise.set(0.0);
             opacity.timing(1.0, enter_ms, motion::EASE_OUT);
@@ -1291,20 +1286,22 @@ fn status_line_with_opacity(
         if held {
             return;
         }
-        let fade = set_timeout(
-            Duration::from_millis(motion::STATUS_HOLD_MS + enter_ms as u64),
-            move || {
-                opacity.timing(0.0, exit_ms, motion::EASE_OUT);
-            },
-        );
-        // Faded, the message leaves the line, so nothing reads it any more —
-        // unless another one took its place meanwhile.
         let clearing = watched.clone();
-        let clear = set_timeout(
-            Duration::from_millis(motion::STATUS_HOLD_MS + enter_ms as u64 + exit_ms as u64),
-            move || clear_status_if_current(&clearing, generation),
-        );
-        steps.borrow_mut().extend([fade, clear]);
+        active_fade.set(Some(spawn(async move {
+            timer(Duration::from_millis(
+                motion::STATUS_HOLD_MS + enter_ms as u64,
+            ))
+            .await;
+            let reduced = untracked(reduced_motion);
+            let exit_ms = if reduced {
+                motion::REDUCED_CROSSFADE_MS
+            } else {
+                motion::EXIT_MS
+            };
+            if opacity.timing(0.0, exit_ms, motion::EASE_OUT).await {
+                clear_status_if_current(&clearing, generation);
+            }
+        })));
     });
     view().test_id("status").w_full().pt(px(SPACE_3)).child(
         view()
@@ -1638,6 +1635,69 @@ mod tests {
         assert!(
             opacity_did_not_rise && cleared_on_time,
             "changing motion settings must not restart a fading status: opacity {before} -> {after} (non-rising: {opacity_did_not_rise}); cleared by the original deadline: {cleared_on_time}"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_during_the_hold_shortens_status_exit_to_an_opacity_crossfade() {
+        use nsh_core::{
+            MountItem,
+            animation::{AnimationOp, Driver},
+        };
+
+        let (sent, _) = mpsc::channel();
+        let mut app = status_app(sent);
+        let (batches_sent, batches) = mpsc::channel();
+        app.observe(move |_, batch| {
+            let _ = batches_sent.send(batch.items.clone());
+        });
+
+        press_without_settling(&mut app, "id:status-start");
+        app.next_frame(Duration::from_millis(16))
+            .expect("start the status timers");
+        let opacity_node = batches
+            .try_iter()
+            .flatten()
+            .find_map(|item| match item {
+                MountItem::Animation(AnimationOp::Start {
+                    node,
+                    driver: Driver::Timing { to: 1.0, .. },
+                    ..
+                }) => Some(node),
+                _ => None,
+            })
+            .expect("the status entry opacity animation");
+        app.wait(Duration::from_millis(motion::ENTER_MS as u64 - 16))
+            .expect("finish the normal-motion entry before the hold");
+        app.set_environment("setReducedMotion(true)", |environment| {
+            environment.reduce_motion = true;
+        })
+        .expect("enable reduced motion during the hold");
+        app.catch_up();
+        let _ = batches.try_iter().count();
+
+        app.wait(Duration::from_millis(motion::STATUS_HOLD_MS + 16))
+            .expect("advance to the status exit");
+        app.catch_up();
+        let exit_animations: Vec<_> = batches
+            .try_iter()
+            .flatten()
+            .filter_map(|item| match item {
+                MountItem::Animation(AnimationOp::Start { node, driver, .. }) => {
+                    let duration = match driver {
+                        Driver::Timing { duration_ms, .. } => duration_ms,
+                        Driver::Spring { .. } | Driver::Decay { .. } => f32::INFINITY,
+                    };
+                    Some((node, duration))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            exit_animations.len() == 1
+                && exit_animations[0].0 == opacity_node
+                && exit_animations[0].1 <= motion::REDUCED_CROSSFADE_MS,
+            "the reduced-motion exit must animate only opacity for at most 100ms: {exit_animations:?}"
         );
     }
 

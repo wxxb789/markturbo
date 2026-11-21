@@ -1796,9 +1796,7 @@ impl AppState {
 
     /// The guard's Cancel: nothing changes and the guard goes.
     pub fn guard_cancel(&self) {
-        if let Some(request) = self.guard.get() {
-            request.busy.set(false);
-            request.notice.set(None);
+        if self.guard.get().is_some() {
             self.guard.set(None);
         }
     }

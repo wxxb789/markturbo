@@ -160,7 +160,6 @@ fn workspace(state: AppState, language: Language, layout: Layout) -> impl IntoEl
 fn column(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
     let active = state.active;
     let content_state = state.clone();
-    let first_mount = Cell::new(true);
     view()
         .test_id("column")
         .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
@@ -176,14 +175,12 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
         .child(each(
             move || vec![active.get()],
             |id| *id,
-            move |_, _| {
-                column_content(content_state.clone(), language, !first_mount.replace(false))
-            },
+            move |_, _| column_content(content_state.clone(), language),
         ))
         .child(notices::status_line(state, language))
 }
 
-fn column_content(state: AppState, language: Language, snap_on_mount: bool) -> [AnyElement; 3] {
+fn column_content(state: AppState, language: Language) -> [AnyElement; 3] {
     let document_state = state.clone();
     let recovery_state = state.clone();
     let conflict_state = state.clone();
@@ -192,14 +189,12 @@ fn column_content(state: AppState, language: Language, snap_on_mount: bool) -> [
     [
         banner_slot(
             "recovery-banner-slot",
-            snap_on_mount,
             move || notices::has_recovery(&recovery_state),
             move || notices::recovery_banner(state_for_recovery.clone(), language),
         )
         .into_element(),
         banner_slot(
             "conflict-banner-slot",
-            snap_on_mount,
             move || notices::has_conflict(&conflict_state),
             move || notices::conflict_banner(conflict_banner_state.clone(), language),
         )
@@ -340,23 +335,20 @@ pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoEle
         ))
 }
 
-/// The slot has a real, zero-height frame before its first reveal. The child
-/// keeps its natural height while the slot clips it and moves the text below.
+/// Mount at the banner's current height; only changes to a mounted slot
+/// animate. The child keeps its natural height while the slot clips it.
 fn banner_slot<E: IntoElement + 'static>(
     id: &'static str,
-    snap_on_mount: bool,
     open: impl Fn() -> bool + Clone + 'static,
     content: impl Fn() -> E + 'static,
 ) -> impl IntoElement {
     let frame = element_ref();
-    let laid_out = signal(snap_on_mount);
-    let expanded = move || laid_out.get() && open();
-    let presence = motion::Presence::with_initial(expanded.clone(), snap_on_mount);
+    let presence = motion::Presence::with_initial(open.clone(), true);
     effect({
-        let expanded = expanded.clone();
+        let open = open.clone();
         let before = Cell::new(None);
         move || {
-            let open = expanded();
+            let open = open();
             if before.replace(Some(open)) == Some(!open) && !motion::reduced_motion() {
                 let ms = if open {
                     motion::ENTER_MS
@@ -370,20 +362,15 @@ fn banner_slot<E: IntoElement + 'static>(
     view()
         .test_id(id)
         .element_ref(&frame)
-        .on_layout(move |bounds: &nsh_core::Bounds<Points>| {
-            if bounds.size.width.0 > 0.0 {
-                laid_out.set(true);
-            }
-        })
         .w_full()
         .h({
-            let expanded = expanded.clone();
-            move || if expanded() { auto() } else { px(0.0).into() }
+            let open = open.clone();
+            move || if open() { auto() } else { px(0.0).into() }
         })
         .flex_shrink_0()
         .flex_col()
         .overflow_hidden()
-        .pointer_events(move || surface_pointer(expanded()))
+        .pointer_events(move || surface_pointer(open()))
         .child(when(
             move || presence.visible.get(),
             move || {
@@ -807,6 +794,32 @@ mod tests {
     }
 
     #[component]
+    fn GuardSaveFailureProbe() -> impl IntoElement {
+        let directory = tempfile::tempdir().expect("save-failure fixture directory");
+        let path = directory.path().join("draft.md");
+        std::fs::write(&path, "Saved content").expect("write the save-failure fixture");
+
+        let state = AppState::new();
+        state.open_file(path.clone());
+        let path_for_failure = path.clone();
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .child(control("probe-close", &state, |state| {
+                let tab = state.active_tab().expect("the opened document");
+                tab.text.set("Edited content".into());
+                tab.dirty.set(true);
+                state.request_close_tab(tab.id);
+            }))
+            .child(control("probe-break-save", &state, move |_| {
+                let _keep_directory = &directory;
+                std::fs::remove_file(&path_for_failure).expect("remove the save destination");
+                std::fs::create_dir(&path_for_failure).expect("replace it with a directory");
+            }))
+            .child(shell(state, Language::English, Layout::Wide))
+    }
+
+    #[component]
     fn GuardDiscardProbe() -> impl IntoElement {
         let state = AppState::new();
         state.new_document();
@@ -907,6 +920,53 @@ mod tests {
         assert!(
             app.screen().texts().contains(&"Close presses: 1"),
             "Shift+Enter activated the background close control"
+        );
+    }
+
+    #[test]
+    fn cancel_after_a_failed_guard_save_keeps_the_notice_and_geometry_during_exit() {
+        let mut config =
+            EngineConfig::new(Root::of::<GuardSaveFailureProbe>().tokens(tokens::theme()));
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the failed-save probe");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("the probe's window");
+        app.wait_for("text:Saved content")
+            .expect("the fixture document");
+
+        press_without_settling(&mut app, "probe-close");
+        app.wait_for("id:guard-save").expect("the close guard");
+        press_without_settling(&mut app, "probe-break-save");
+        press_without_settling(&mut app, "guard-save");
+        let error = "Still open: the document could not be saved.";
+        app.wait_for(&format!("text:{error}"))
+            .expect("the failed-save notice");
+
+        let before_nodes = app.screen().layout_nodes();
+        let before_notice = before_nodes
+            .iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == error)
+            })
+            .expect("the failed-save row");
+        let before_notice_bounds = before_notice.bounds;
+        let before_card_bounds = node(&app, "guard-card").bounds;
+
+        press_without_settling(&mut app, "guard-cancel");
+
+        let after_nodes = app.screen().layout_nodes();
+        let notice_row_unchanged = after_nodes.iter().any(|row| {
+            row.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == error)
+                && row.bounds == before_notice_bounds
+        });
+        let card_geometry_unchanged = node(&app, "guard-card").bounds == before_card_bounds;
+        assert!(
+            notice_row_unchanged && card_geometry_unchanged,
+            "Cancel must freeze the failed-save row and card geometry through the exit; row unchanged: {notice_row_unchanged}, card unchanged: {card_geometry_unchanged}"
         );
     }
 
@@ -1122,6 +1182,49 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn returning_from_settings_mounts_the_existing_banner_at_its_final_frame() {
+        use nsh_core::MountItem;
+
+        let mut app = recovery_probe();
+        let batches = capture_batches(&mut app);
+        press(&mut app, "probe-show-recovery");
+        let ids = ["recovery-banner-slot", "document-slot"];
+        let frame_in = |batch: &[MountItem], target| {
+            batch.iter().find_map(|item| match item {
+                MountItem::Frame { id, frame } if *id == target => Some(*frame),
+                _ => None,
+            })
+        };
+        let before: Vec<_> = batches.try_iter().collect();
+        let final_frames = ids.map(|id| {
+            let target = node(&app, id).id;
+            before
+                .iter()
+                .rev()
+                .find_map(|batch| frame_in(batch, target))
+        });
+        press(&mut app, "title-settings");
+        press(&mut app, "title-menu-settings");
+        let _ = batches.try_iter().count();
+        press_without_settling(&mut app, "settings-close");
+
+        let targets = ids.map(|id| node(&app, id).id);
+        let returned: Vec<_> = batches.try_iter().collect();
+        let first = returned
+            .iter()
+            .find(|batch| targets.iter().any(|id| frame_in(batch, *id).is_some()))
+            .expect("workspace remount batch");
+        let animated = returned.iter().flatten().any(|item| {
+            matches!(item, MountItem::LayoutAnimation(animation) if animation.update.is_some())
+        });
+        assert_eq!(
+            (animated, targets.map(|id| frame_in(first, id))),
+            (false, final_frames),
+            "returning from Settings must mount the banner and document in place without reflow"
+        );
     }
 
     #[test]
