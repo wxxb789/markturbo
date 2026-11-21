@@ -442,7 +442,8 @@ impl SettingsData {
         target: &str,
         path: &Path,
     ) -> Result<Self, LegacyCredentialMigrationSaveError> {
-        let _guard = lock_settings_writes().map_err(LegacyCredentialMigrationSaveError::Io)?;
+        let _guard =
+            lock_settings_writes_for_path(path).map_err(LegacyCredentialMigrationSaveError::Io)?;
         let latest = match std::fs::read_to_string(path) {
             Ok(contents) => toml::from_str::<Self>(&contents).map_err(|_| {
                 LegacyCredentialMigrationSaveError::Io(std::io::Error::new(
@@ -505,7 +506,7 @@ impl SettingsData {
         path: &Path,
         intent: SettingsWriteIntent,
     ) -> std::io::Result<Self> {
-        let _guard = lock_settings_writes()?;
+        let _guard = lock_settings_writes_for_path(path)?;
         let current = match std::fs::read_to_string(path) {
             Ok(current) => toml::from_str::<Self>(&current).map_err(|_| {
                 std::io::Error::new(
@@ -570,6 +571,37 @@ impl Drop for SettingsWriteGuard {
 #[cfg(target_os = "windows")]
 pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes_named("Global\\markturbo-settings-write-v1")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn lock_settings_writes_for_test(root: &Path) -> std::io::Result<SettingsWriteGuard> {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    lock_settings_writes_named(&format!(
+        "Local\\markturbo-settings-test-{:016x}",
+        hasher.finish()
+    ))
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+pub(crate) fn lock_settings_writes_for_test(_root: &Path) -> std::io::Result<SettingsWriteGuard> {
+    lock_settings_writes()
+}
+
+#[cfg(test)]
+pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(path);
+    lock_settings_writes_for_test(root)
+}
+
+#[cfg(not(test))]
+fn lock_settings_writes_for_path(_path: &Path) -> std::io::Result<SettingsWriteGuard> {
+    lock_settings_writes()
 }
 
 #[cfg(target_os = "windows")]
@@ -655,7 +687,6 @@ mod tests {
 
     #[test]
     fn usage_metrics_default_off_and_round_trip_explicit_consent() {
-        let _usage_guard = crate::usage::USAGE_TEST_LOCK.lock().unwrap();
         assert!(!SettingsData::default().usage_metrics_enabled);
         let legacy: SettingsData = toml::from_str("theme = 'dark'").unwrap();
         assert!(!legacy.usage_metrics_enabled);
@@ -682,6 +713,42 @@ mod tests {
         assert_eq!(saved.theme, ThemePreference::Dark);
         assert!(!saved.usage_metrics_enabled);
         assert!(!SettingsData::load_from(&path).usage_metrics_enabled);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn settings_and_usage_with_same_relative_consent_path_share_a_test_lock() {
+        use std::io::ErrorKind;
+
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let consent_path = Path::new(directory.path().file_name().unwrap());
+        // Check both writers against the expected lock from a different thread.
+        let settings_guard = lock_settings_writes_for_test(consent_path).unwrap();
+        let usage = crate::usage::UsageStore::open_in(directory.path(), consent_path, false);
+
+        let (settings_write, usage_write) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    (
+                        SettingsData::default()
+                            .try_save_to_with_intent(consent_path, SettingsWriteIntent::General),
+                        usage.clear(),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(
+            settings_write.map_err(|error| error.kind()),
+            Err(ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            usage_write,
+            Err(crate::usage::UsageError::Io(ErrorKind::WouldBlock))
+        );
+
+        drop(settings_guard);
+        assert_eq!(usage.clear(), Ok(()));
     }
 
     #[test]
