@@ -37,9 +37,9 @@
 //! * a loopback HTTP endpoint keeps its filament and row underlines plain grey
 //!   and reads `HTTP (not encrypted)`.
 //!
-//! nsh 0.5.1 reports no key-up, so a held key is read through its
-//! auto-repeats: the first press starts the charge and every repeat (or
-//! [`KEY_ALIVE_MS`] of silence) says whether the key is still down. A tap
+//! The hold uses the app's key bindings, not the view-level key-up events
+//! available in nsh 0.6.1 on Windows. The first press starts the charge;
+//! repeats keep it alive and [`KEY_ALIVE_MS`] of silence ends it. A tap
 //! therefore charges for one watchdog and cools back, while two presses in
 //! quick succession carry the charge on.
 //!
@@ -47,14 +47,11 @@
 //! strings: the shell's `when` re-makes its branch when *that* flips, never
 //! when a manifest inside it is replaced.
 //!
-//! Where the platform focuses views (macOS, Linux, the web), Cancel takes the
-//! focus as the card opens and Tab reaches the hold control, which then
-//! charges on `Space` or `Enter`. nsh 0.5.1 on Windows focuses text inputs
-//! only, and focuses no other view from code, so there `Enter` and `Space`
-//! stay on the safe path (`Enter` activates the card's default, Cancel) and
-//! the hold is `Ctrl+Enter`, which needs no focus at all. A text input that
-//! keeps the focus loses these keys to the card (the keys that edit it still
-//! reach it: only the shell can block them).
+//! The card asks for focus on Cancel. When Tab reaches the hold control,
+//! `Space` or `Enter` charges it; elsewhere those keys cancel. A held
+//! `Ctrl+Enter` still works without moving focus. A text input that keeps
+//! the focus loses these keys to the card (the keys that edit it still reach
+//! it: only the shell can block them).
 
 use std::{
     cell::{Cell, RefCell},
@@ -805,6 +802,9 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
                 KeyOptions {
                     repeat: true,
                     when: When::Always,
+                    // Enter and Space must use the card's hold gate, not a
+                    // synthesized press on whichever view has native focus.
+                    for_focus: true,
                     ..KeyOptions::default()
                 },
                 move |_| {
@@ -2111,8 +2111,7 @@ mod tests {
     #[test]
     fn a_keyboard_tap_alone_sends_nothing_and_cancels() {
         let mut app = start_harness();
-        // The focus is on nothing the card can charge (Cancel, or nothing at
-        // all on Windows): Enter and Space are the default control's.
+        // The hold is not focused: Enter and Space take the safe default.
         app.press_key("space").expect("space");
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("the card closed, cancelled");
@@ -2200,11 +2199,8 @@ mod tests {
 
     #[test]
     fn ctrl_enter_charges_without_any_focus_and_an_early_release_sends_nothing() {
-        // The focus-independent route: nothing is focused (the host platform
-        // focuses no views), and an early release — the harness reports no
-        // key-up, so the watchdog is the release — charges and then says so,
-        // with nothing authorized. The completion this charge reaches on a
-        // platform that repeats the key is `a_held_press_sends_once`'s path.
+        // The focus-independent route: the watchdog ends the charge after
+        // an early release, with nothing authorized.
         let mut app = start_harness();
         app.press_key("ctrl+enter").expect("ctrl+enter");
         assert!(

@@ -321,8 +321,7 @@ fn menu_panel(state: AppState, language: Language, menu: Signal<bool>) -> impl I
         // document on screen.
         .child({
             let open_state = state.clone();
-            // The keyboard comes to the first row as the menu appears. A
-            // platform that focuses only inputs leaves it where it was.
+            // Ask for keyboard focus on the first row as the menu appears.
             let first = element_ref();
             effect(move || first.focus());
             menu_row(

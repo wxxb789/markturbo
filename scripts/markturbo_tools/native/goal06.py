@@ -115,7 +115,7 @@ SAFE_STRINGS = (
 # `source_before`) and the measured durations.
 # `clean_close_ms` is how the document's clean state is measured: the title
 # row's unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
-# which nsh 0.5.1's UIA folds away, so a close request that ends the process
+# which nsh 0.6.1's UIA folds away, so a close request that ends the process
 # without the 'Close without saving?' guard is the native proof.
 CONFIGURED_PHASES = ("document", "selection")
 OBSERVATIONS = {

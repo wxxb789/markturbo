@@ -28,7 +28,7 @@ bytes after the write (`tests/revision_flow.rs`); every hunk accepted
 (`one_accepted` here plus `revision_flow.rs`); an edit over every hunk, then
 `Done` writing nothing; and frontmatter, fence and link anchoring. The unsaved
 mark (`title-dirty`) is a Text inside the `title-file` Button, which nsh
-0.5.1's Windows UIA folds away, so dirty state is proven headless:
+0.6.1's Windows UIA folds away, so dirty state is proven headless:
 `tests/revision_flow.rs` `copy_exports_only_the_approved_result_and_saves_nothing`
 (Copy saves nothing and leaves the mark) and
 `rejecting_every_hunk_then_done_keeps_the_exact_bytes` (no decision, clean).
@@ -41,9 +41,8 @@ fails at once (`REVIEW_REQUEST_NOT_SENT` / `REVISION_REQUEST_NOT_SENT`). The
 Revision field decides one docked hunk at a time (`Accept` / `Reject`,
 counted by `n of m decided`). Each decision writes at once
 (`ui/revision.rs`). The harness presses the field's buttons, never its keys:
-reading the editor focuses it, and on nsh 0.5.1 Windows no press or UIA focus
-moves the keyboard off a text input again, so `A` and `Ctrl+Z` would reach the
-editor. The field's keys (`A`, `R`, `Ctrl+Z`, `A` refused on a changed part)
+reading the editor focuses it, and an Invoke is not a request to move keyboard
+focus. The field's keys (`A`, `R`, `Ctrl+Z`, `A` refused on a changed part)
 are proven headless in `ui/revision.rs`. Editor text is read with the editor's
 Select All + Copy.
 

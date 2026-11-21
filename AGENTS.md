@@ -87,24 +87,24 @@ Performance claims require production-profile measurements; consult existing
 ## Invariants and delivery
 
 - `mt-core` stays UI-framework-free. Keep `panic = "unwind"` and the vendored
-  RaTeX allocation clamp (now 0.1.15, matching nsh-base). Content failures become
+  RaTeX allocation clamp (0.1.15, matching nsh-base 0.6.1). Content failures become
   diagnostics; preserve editable text.
 - Never mutate a WebView from render; mark it dirty (`web_dirty`) and defer the
   update, as `ui/preview.rs` does by writing the page from an effect into the
   `Signal<String>` that `web_view_html` reads.
 - Afterglow UI (`crates/mt-app/src/ui/`; `mod.rs` and file headers supersede
-  `docs/architecture.md`, still nsh 0.4). Take colours, sizes and fonts from `ui::tokens`;
+  `docs/architecture.md`). Take colours, sizes and fonts from `ui::tokens`;
   read `tokens::palette()` inside style closures. Keep the overlay layer
   `PointerEvents::BoxNone`. Build editor decoration styles from declarations
   (`Style::default().with(StyleKey::Color, …)`), not typed refinements.
-- nsh 0.5.1 on Windows focuses only text inputs: give card actions a focus-free
-  key (consent sends on held `Ctrl+Enter`).
+- Preserve focus-independent card keys (consent sends on held `Ctrl+Enter`).
+  nsh 0.6.1 on Windows also supports focus and key events on ordinary views.
 - On Windows, DirectWrite matches an embedded face only by its legacy family,
   one per instance (`Martian Grotesk Std Lt`/`Std Rg`/`Std Md`,
   `Martian Mono Cn Rg`). Use the `tokens::FONT_*` lists, which put the legacy
   name first, then the typographic name, then CJK fallbacks. Weight alone does
   not select a Grotesk instance. Windows `FONT_INPUT` is the exception: nsh
-  0.5.1 inputs load only the first family, from system fonts.
+  0.6.1 inputs load only the first nonempty family, from system fonts.
 - Preserve consent, credential confidentiality and content-free native evidence.
   Do not log test text, user documents, secrets or local paths into that evidence.
 - Ship required fonts (KaTeX, Martian)/sample inside the executable. Windows 11

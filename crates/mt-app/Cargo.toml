@@ -43,26 +43,27 @@ encoding_rs.workspace = true
 dirs.workspace = true
 rust-embed.workspace = true
 
-nsh-core = "0.5.1"
+nsh-core = "=0.6.1"
 # Only the parts the app uses: the editor and the preview's code highlighting.
 # The defaults also compile plot, rich-editor and term, which the app never
 # shows but `nsh_base::registry()` links in.
-nsh-base = { version = "0.5.1", default-features = false, features = ["editor", "highlight"] }
+nsh-base = { version = "=0.6.1", default-features = false, features = ["editor", "highlight"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `webview` links WebKitGTK 6.0; the Web pane is part of the product surface.
-nsh-platform-linux = { version = "0.5.1", default-features = false, features = ["webview"] }
+nsh-platform-linux = { version = "=0.6.1", default-features = false, features = ["webview"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nsh-platform-macos = { version = "0.5.1", default-features = false }
+nsh-platform-macos = { version = "=0.6.1", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-nsh-platform-windows = { version = "0.5.1", default-features = false }
+# WebView2 is used by the preview; the app has no native media surface.
+nsh-platform-windows = { version = "=0.6.1", default-features = false, features = ["webview"] }
 
 [dev-dependencies]
 mt-app = { path = ".", features = ["test-vault"] }
 mt-core = { workspace = true, features = ["test-support"] }
-nsh-engine = "0.5.1"
-nsh-testing = "0.5.1"
+nsh-engine = "=0.6.1"
+nsh-testing = "=0.6.1"
 serde_json.workspace = true
 tempfile.workspace = true
