@@ -38,7 +38,9 @@ fn assert_no_selection_review(app: &mut Headless, after: &str) {
     app.wait_for(&format!("text:{NO_SELECTION}"))
         .unwrap_or_else(|_| panic!("after {after}, Review selection asks for a selection"));
     assert!(
-        !app.shows("id:consent-card"),
+        !app.screen()
+            .matches("id:consent-card")
+            .expect("the selector"),
         "after {after}, no consent card for a selection nobody sees"
     );
     app.press("id:title-review").expect("open Review");

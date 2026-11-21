@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import subprocess
 import tempfile
 import unittest
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import chdir, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -1111,22 +1112,69 @@ class Goal04BuildEvidenceTests(unittest.TestCase):
                 probe.validate_build_evidence(evidence)
 
     def test_cargo_config_context_records_only_content_free_fingerprints(self) -> None:
-        from scripts.markturbo_tools import goal04
-
-        with tempfile.TemporaryDirectory() as directory:
+        data = b'[target.x86_64-pc-windows-msvc]\nlinker = "C:/secret/tool.exe"\n'
+        # A relative workspace stops the ancestor walk at the temporary cwd.
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            chdir(directory),
+            mock.patch.object(goal04, "REPO", Path("workspace")),
+        ):
             cargo_home = Path(directory)
             config = cargo_home / "config.toml"
-            config.write_text(
-                '[target.x86_64-pc-windows-msvc]\nlinker = "C:/secret/tool.exe"\n',
-                encoding="utf-8",
-            )
+            config.write_bytes(data)
             context = goal04.goal04_cargo_config_context({"CARGO_HOME": directory})
 
-        self.assertTrue(context["cargo_home_overridden"])
-        self.assertEqual(len(context["files"]), 1)
-        self.assertEqual(context["files"][0]["scope"], "cargo-home")
-        self.assertNotIn("secret", repr(context))
-        self.assertNotIn(directory, repr(context))
+        self.assertEqual(
+            context,
+            {
+                "cargo_home_overridden": True,
+                "files": [
+                    {
+                        "scope": "cargo-home",
+                        "name": "config.toml",
+                        "byte_count": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                ],
+            },
+        )
+        serialized = json.dumps(context)
+        self.assertNotIn("secret", serialized)
+        for path in (directory, cargo_home.as_posix()):
+            self.assertNotIn(json.dumps(path)[1:-1], serialized)
+
+    def test_cargo_config_context_records_ancestor_fingerprint(self) -> None:
+        data = b'[build]\ntarget-dir = "private-target"\n'
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            chdir(directory),
+            mock.patch.object(goal04, "REPO", Path("outer/workspace")),
+        ):
+            goal04.REPO.mkdir(parents=True)
+            config = Path("outer/.cargo/config.toml")
+            config.parent.mkdir()
+            config.write_bytes(data)
+            decoy = Path("unrelated/.cargo/config.toml")
+            decoy.parent.mkdir(parents=True)
+            decoy.write_bytes(b'[build]\ntarget-dir = "decoy-target"\n')
+            context = goal04.goal04_cargo_config_context(
+                {"CARGO_HOME": str(Path(directory) / "cargo-home")}
+            )
+
+        self.assertEqual(
+            context,
+            {
+                "cargo_home_overridden": True,
+                "files": [
+                    {
+                        "scope": "ancestor-1",
+                        "name": "config.toml",
+                        "byte_count": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                ],
+            },
+        )
 
     def test_toolchain_parsers_reject_unknown_output_lines(self) -> None:
         from scripts.markturbo_tools import goal04

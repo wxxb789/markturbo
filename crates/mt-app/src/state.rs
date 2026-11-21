@@ -3905,7 +3905,7 @@ mod tests {
     /// A new document holding [`SOURCE`] with a one-change Revision on
     /// screen, over an empty credential store.
     fn proposed() -> (AppState, Tab) {
-        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
         state.new_document();
         let tab = state.active_tab().expect("the new document");
         tab.text.set(SharedString::from(SOURCE));
@@ -4018,7 +4018,7 @@ mod tests {
             clarification_questions: Vec::new(),
         };
         let prepared = |edit: bool| {
-            let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+            let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
             state.new_document();
             let tab = state.active_tab().expect("the new document");
             tab.text.set(SharedString::from(SOURCE));
@@ -4064,7 +4064,7 @@ mod tests {
     /// and nothing can reach the platform's secure store or the network.
     /// Beside the room, the document's exact text and dirty flag.
     fn not_set_up_room(language: Language) -> impl IntoElement {
-        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
         state.settings.update(|settings| {
             settings.language = language;
             settings.model_provider = mt_core::model::Provider::OpenAiResponses.key().to_owned();
@@ -4203,7 +4203,7 @@ mod tests {
 ",
         )
         .expect("the file on disk");
-        let state = AppState::with_vault(CredentialVault::with_store(Arc::new(NoStore)));
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
         state.new_document();
         let tab = state.active_tab().expect("the new document");
         tab.text.set(SharedString::from(SOURCE));

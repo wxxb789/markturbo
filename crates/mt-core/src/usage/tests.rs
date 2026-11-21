@@ -1,20 +1,15 @@
 use super::*;
 use crate::review::{ByteRange, ReviewSource, SourceSnapshot};
 
-// Every fixture uses the same production named mutex, whose bounded wait is
-// deliberately short. Do not turn test-thread queueing into storage failures.
-pub(crate) static USAGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn at_day(day: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(day * SECONDS_PER_DAY)
 }
 
-fn enabled_store(root: &Path) -> (UsageStore, std::sync::MutexGuard<'static, ()>) {
-    let guard = USAGE_TEST_LOCK.lock().unwrap();
+fn enabled_store(root: &Path) -> UsageStore {
     std::fs::create_dir_all(root).unwrap();
     let consent = root.join("settings.toml");
     std::fs::write(&consent, "usage-metrics-enabled = true\n").unwrap();
-    (UsageStore::open_in(root, &consent, true), guard)
+    UsageStore::open_in(root, &consent, true)
 }
 
 fn events() -> [UsageEvent; 16] {
@@ -73,7 +68,6 @@ fn duration_buckets_have_fixed_coarse_boundaries() {
 
 #[test]
 fn disabled_recording_creates_no_files_or_directories() {
-    let _guard = USAGE_TEST_LOCK.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("not-created");
     let store = UsageStore::open_in(&root, &directory.path().join("settings.toml"), false);
@@ -88,7 +82,7 @@ fn disabled_recording_creates_no_files_or_directories() {
 #[test]
 fn daily_schema_aggregates_events_lenses_durations_and_hunk_counts() {
     let directory = tempfile::tempdir().unwrap();
-    let (store, _guard) = enabled_store(directory.path());
+    let store = enabled_store(directory.path());
     for event in events() {
         store.record(event, at_day(200)).unwrap();
     }
@@ -148,7 +142,7 @@ fn pruning_keeps_exactly_180_day_old_entries_and_removes_older_and_future_days_o
             .record(UsageEvent::ArtifactOpened);
     }
     std::fs::write(&path, serde_json::to_vec(&aggregate).unwrap()).unwrap();
-    let (store, _guard) = enabled_store(directory.path());
+    let store = enabled_store(directory.path());
     let counts = store.inspect(at_day(200)).unwrap();
     assert_eq!(counts.days().keys().copied().collect::<Vec<_>>(), [20, 200]);
     let persisted: UsageAggregate = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -158,7 +152,7 @@ fn pruning_keeps_exactly_180_day_old_entries_and_removes_older_and_future_days_o
 #[test]
 fn recording_prunes_before_save_and_bounds_retention() {
     let directory = tempfile::tempdir().unwrap();
-    let (store, _guard) = enabled_store(directory.path());
+    let store = enabled_store(directory.path());
     store
         .record(UsageEvent::ArtifactOpened, at_day(20))
         .unwrap();
@@ -181,7 +175,7 @@ fn recording_prunes_before_save_and_bounds_retention() {
 fn disabling_preserves_store_bytes_and_inspection_and_export_still_prune_in_memory() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("usage.json");
-    let (mut store, _guard) = enabled_store(directory.path());
+    let mut store = enabled_store(directory.path());
     store.record(UsageEvent::FirstLaunch, at_day(1)).unwrap();
     let original = std::fs::read(&path).unwrap();
     store.set_enabled(false);
@@ -203,7 +197,7 @@ fn disabling_preserves_store_bytes_and_inspection_and_export_still_prune_in_memo
 #[test]
 fn export_contains_only_version_and_aggregates_and_never_overwrites_a_file() {
     let directory = tempfile::tempdir().unwrap();
-    let (store, _guard) = enabled_store(&directory.path().join("data"));
+    let store = enabled_store(&directory.path().join("data"));
     store
         .record(UsageEvent::ArtifactCopied, at_day(200))
         .unwrap();
@@ -233,7 +227,7 @@ fn export_contains_only_version_and_aggregates_and_never_overwrites_a_file() {
 #[test]
 fn clear_deletes_the_store_without_resurrecting_old_counts_or_deleting_exports() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut store, _guard) = enabled_store(directory.path());
+    let mut store = enabled_store(directory.path());
     store
         .record(UsageEvent::ArtifactSaved, at_day(200))
         .unwrap();
@@ -270,7 +264,7 @@ fn recording_reduces_sentinel_content_path_and_fake_key_before_storage_or_export
     )
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let (store, _guard) = enabled_store(directory.path());
+    let store = enabled_store(directory.path());
     let event = UsageEvent::review_started(&request);
     store
         .record(event, at_day(200) + Duration::from_secs(43_210))
@@ -327,7 +321,7 @@ fn selection_reduction_keeps_only_the_scope_category_not_selection_offsets() {
 fn malformed_unknown_or_content_bearing_store_is_not_rewritten_or_exported() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("usage.json");
-    let (store, _guard) = enabled_store(directory.path());
+    let store = enabled_store(directory.path());
     for text in [
         r#"{"schema_version":1,"days":{},"content":"PRIVATE-INPUT"}"#,
         r#"{"schema_version":1,"days":{"PRIVATE-INPUT":{}}}"#,
@@ -375,7 +369,7 @@ fn aggregate_counts_saturate_instead_of_overflowing() {
 #[test]
 fn revoked_persisted_consent_stops_an_already_enabled_handle_and_retention_writes() {
     let directory = tempfile::tempdir().unwrap();
-    let (store, _guard) = enabled_store(directory.path());
+    let store = enabled_store(directory.path());
     store.record(UsageEvent::ArtifactOpened, at_day(1)).unwrap();
     let path = directory.path().join("usage.json");
     let original = std::fs::read(&path).unwrap();
@@ -394,7 +388,6 @@ fn revoked_persisted_consent_stops_an_already_enabled_handle_and_retention_write
 
 #[test]
 fn absent_unreadable_malformed_or_missing_consent_fails_closed_without_creating_data() {
-    let _guard = USAGE_TEST_LOCK.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("data");
     let consent = directory.path().join("settings.toml");
@@ -433,7 +426,7 @@ fn absent_unreadable_malformed_or_missing_consent_fails_closed_without_creating_
 #[test]
 fn save_and_clear_remove_only_usage_owned_staging_files() {
     let directory = tempfile::tempdir().unwrap();
-    let (store, _guard) = enabled_store(directory.path());
+    let store = enabled_store(directory.path());
     let stale = directory.path().join(".markturbo-usage-AbCd12.tmp");
     let unrelated = directory.path().join("unrelated.tmp");
     let wrong_suffix = directory.path().join(".markturbo-usage-keep.txt");
