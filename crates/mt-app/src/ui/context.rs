@@ -38,7 +38,7 @@ use mt_core::{
 use nsh_base::{button, checkbox};
 use nsh_core::{
     Color,
-    element::{AdaptiveColor, AnimatedNode, AnimatedValue, Easing, animated_value},
+    element::{AdaptiveColor, AnimatedNode, AnimatedValue, animated_value},
     prelude::*,
 };
 
@@ -46,7 +46,10 @@ use crate::{
     i18n::{self, Key},
     state::AppState,
     ui::{
-        motion::{HOVER_MS, IGNITE_MS, REDUCED_CROSSFADE_MS, reduced_motion},
+        motion::{
+            EASE_IN_OUT, EASE_OUT, IGNITE_MS, LINEAR, OUTBOUND_DECAY_MS, REDUCED_CROSSFADE_MS,
+            reduced_motion,
+        },
         prims,
         tokens::{
             self, FONT_SOURCE, FONT_UI, HAIRLINE, SPACE_1, SPACE_2, SPACE_4, SPACE_5, TYPE_SOURCE,
@@ -58,10 +61,6 @@ use crate::{
 /// The order-number gutter: one column, so the numbers line up and the scope
 /// lines hang under the paths.
 const ORDINAL_W: f32 = 20.0;
-
-/// How long an included source's light takes to decay back to plain ink (the
-/// spec's 'Switching it off: 0-250ms').
-const OUTBOUND_DECAY_MS: f32 = 250.0;
 
 /// Whether the field is showing the agent context.
 pub fn is_open(state: &AppState) -> bool {
@@ -127,7 +126,10 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                 .child(prims::quiet_action(
                     "context-close",
                     i18n::t(language, Key::Close),
-                    move || close_state.close_context(),
+                    move || {
+                        close_state.close_context();
+                        close_state.focus_editor();
+                    },
                 )),
         )
 }
@@ -434,10 +436,10 @@ impl Outbound {
     fn ignite(&self) {
         self.0.stop();
         if reduced_motion() {
-            self.0.timing(1.0, REDUCED_CROSSFADE_MS, Easing::EaseInOut);
+            self.0.timing(1.0, REDUCED_CROSSFADE_MS, EASE_IN_OUT);
             return;
         }
-        self.0.timing(1.0, IGNITE_MS, Easing::Linear);
+        self.0.timing(1.0, IGNITE_MS, LINEAR);
     }
 
     /// Decay to plain ink: [`OUTBOUND_DECAY_MS`], eased out, one crossfade
@@ -445,10 +447,10 @@ impl Outbound {
     fn decay(&self) {
         self.0.stop();
         if reduced_motion() {
-            self.0.timing(0.0, REDUCED_CROSSFADE_MS, Easing::EaseInOut);
+            self.0.timing(0.0, REDUCED_CROSSFADE_MS, EASE_IN_OUT);
             return;
         }
-        self.0.timing(0.0, OUTBOUND_DECAY_MS, Easing::EaseOut);
+        self.0.timing(0.0, OUTBOUND_DECAY_MS, EASE_OUT);
     }
 
     /// A glyph colour that follows the light: `ink` at rest, white-hot lit.
@@ -514,42 +516,42 @@ fn path_expand(
         .min_w(px(0.0))
         .bg(Color::TRANSPARENT)
         .child(
-            button()
-                .accessibility_label(move || {
-                    let label = row.get_untracked().path_label.clone();
-                    let open =
-                        expanded.get().as_deref() == Some(row.get_untracked().path.as_path());
-                    Some(SharedString::from(if open {
-                        hide_text_label(language, &label)
-                    } else {
-                        show_text_label(language, &label)
-                    }))
-                })
-                .w_full()
-                .px(px(0.0))
-                .py(px(0.0))
-                .bg(Color::TRANSPARENT)
-                .rounded(px(0.0))
-                .cursor_pointer()
-                .transition_colors()
-                .duration(HOVER_MS)
-                .hover(|style| style.text_color(tokens::palette().ink).underline())
-                .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
-                .on_press(move || {
-                    let path = path.clone();
-                    expanded.update(move |open| {
-                        *open = (open.as_deref() != Some(path.as_path())).then_some(path);
-                    });
-                })
-                .child(
-                    text(move || row.get().path_label.clone())
-                        .font_family(FONT_SOURCE)
-                        .text_size(px(TYPE_SOURCE))
-                        .line_height(px(TYPE_SOURCE_LINE))
-                        .bind_color(&ink)
-                        .w_full()
-                        .truncate(),
-                ),
+            prims::press_feedback(
+                button()
+                    .accessibility_label(move || {
+                        let label = row.get_untracked().path_label.clone();
+                        let open =
+                            expanded.get().as_deref() == Some(row.get_untracked().path.as_path());
+                        Some(SharedString::from(if open {
+                            hide_text_label(language, &label)
+                        } else {
+                            show_text_label(language, &label)
+                        }))
+                    })
+                    .w_full()
+                    .px(px(0.0))
+                    .py(px(0.0))
+                    .bg(Color::TRANSPARENT)
+                    .rounded(px(0.0))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(tokens::palette().ink).underline())
+                    .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+                    .on_press(move || {
+                        let path = path.clone();
+                        expanded.update(move |open| {
+                            *open = (open.as_deref() != Some(path.as_path())).then_some(path);
+                        });
+                    }),
+            )
+            .child(
+                text(move || row.get().path_label.clone())
+                    .font_family(FONT_SOURCE)
+                    .text_size(px(TYPE_SOURCE))
+                    .line_height(px(TYPE_SOURCE_LINE))
+                    .bind_color(&ink)
+                    .w_full()
+                    .truncate(),
+            ),
         )
 }
 
@@ -599,30 +601,28 @@ fn quiet_action_named(
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     let label: SharedString = label.into();
-    // One plain view is the button, its test id the control's AutomationId,
-    // as `prims::quiet_action`'s is.
-    view()
-        .test_id(test_id)
-        .role(AccessibilityRole::Button)
-        .optional_label(Some(name))
-        .window_drag(false)
-        .px(px(2.0))
-        .py(px(4.0))
-        .bg(Color::TRANSPARENT)
-        .cursor_pointer()
-        .rounded(px(0.0))
-        .transition_colors()
-        .duration(HOVER_MS)
-        .hover(|style| style.text_color(tokens::palette().ink).underline())
-        .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
-        .on_press(move |_: &PressEvent| on_press())
-        .child(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest),
-        )
+    prims::press_feedback(
+        view()
+            .test_id(test_id)
+            .role(AccessibilityRole::Button)
+            .optional_label(Some(name))
+            .window_drag(false)
+            .px(px(2.0))
+            .py(px(4.0))
+            .bg(Color::TRANSPARENT)
+            .cursor_pointer()
+            .rounded(px(0.0))
+            .hover(|style| style.text_color(tokens::palette().ink).underline())
+            .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+            .on_press(move |_: &PressEvent| on_press()),
+    )
+    .child(
+        text(label)
+            .font_family(FONT_UI)
+            .text_size(px(TYPE_UI))
+            .line_height(px(TYPE_UI_LINE))
+            .text_color(move || tokens::palette().ink_rest),
+    )
 }
 
 /// The `Include in review` toggle: a checked square and a full-ink label,
@@ -660,58 +660,58 @@ fn include_toggle(
                 .flex_shrink_0()
                 .bg(Color::TRANSPARENT)
                 .child(
-                    checkbox()
-                        .checked(selected)
-                        .on_change(move |next: &bool| {
-                            if *next != changed.context_selected.get().contains(&index) {
-                                changed.toggle_context_source(index);
-                            }
-                        })
-                        .accessibility_label(name)
-                        .flex_row()
-                        .items_center()
-                        .gap(px(SPACE_2))
-                        .px(px(SPACE_1))
-                        .py(px(SPACE_1))
-                        .bg(Color::TRANSPARENT)
-                        .cursor_pointer()
-                        .transition_colors()
-                        .duration(HOVER_MS)
-                        .hover(|style| style.underline())
-                        .focus_visible(|style| style.underline())
-                        .indicator(
-                            view()
-                                .w(px(11.0))
-                                .h(px(11.0))
-                                .border(px(HAIRLINE))
-                                .border_color(move || {
-                                    if selected() {
-                                        tokens::palette().ink
-                                    } else {
-                                        tokens::palette().ink_caption
-                                    }
-                                })
-                                .bg(move || {
-                                    if selected() {
-                                        tokens::palette().ink
-                                    } else {
-                                        Color::TRANSPARENT
-                                    }
-                                }),
-                        )
-                        .child(
-                            text(s(S::IncludeInReview, language))
-                                .font_family(FONT_UI)
-                                .text_size(px(TYPE_UI))
-                                .line_height(px(TYPE_UI_LINE))
-                                .text_color(move || {
-                                    if selected() {
-                                        tokens::palette().ink
-                                    } else {
-                                        tokens::palette().ink_rest
-                                    }
-                                }),
-                        ),
+                    prims::press_feedback(
+                        checkbox()
+                            .checked(selected)
+                            .on_change(move |next: &bool| {
+                                if *next != changed.context_selected.get().contains(&index) {
+                                    changed.toggle_context_source(index);
+                                }
+                            })
+                            .accessibility_label(name)
+                            .flex_row()
+                            .items_center()
+                            .gap(px(SPACE_2))
+                            .px(px(SPACE_1))
+                            .py(px(SPACE_1))
+                            .bg(Color::TRANSPARENT)
+                            .cursor_pointer()
+                            .hover(|style| style.underline())
+                            .focus_visible(|style| style.underline())
+                            .indicator(
+                                view()
+                                    .w(px(11.0))
+                                    .h(px(11.0))
+                                    .border(px(HAIRLINE))
+                                    .border_color(move || {
+                                        if selected() {
+                                            tokens::palette().ink
+                                        } else {
+                                            tokens::palette().ink_caption
+                                        }
+                                    })
+                                    .bg(move || {
+                                        if selected() {
+                                            tokens::palette().ink
+                                        } else {
+                                            Color::TRANSPARENT
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        text(s(S::IncludeInReview, language))
+                            .font_family(FONT_UI)
+                            .text_size(px(TYPE_UI))
+                            .line_height(px(TYPE_UI_LINE))
+                            .text_color(move || {
+                                if selected() {
+                                    tokens::palette().ink
+                                } else {
+                                    tokens::palette().ink_rest
+                                }
+                            }),
+                    ),
                 )
         },
     )
@@ -919,38 +919,38 @@ fn inventory_row(
         .items_center()
         .gap(px(SPACE_2))
         .child(
-            button()
-                .accessibility_label(name)
-                .px(px(0.0))
-                .py(px(SPACE_1))
-                .bg(Color::TRANSPARENT)
-                .rounded(px(0.0))
-                .cursor_pointer()
-                .transition_colors()
-                .duration(HOVER_MS)
-                .hover(|style| style.text_color(tokens::palette().ink).underline())
-                .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
-                .on_press(move || state.open_file(path.clone()))
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(SPACE_2))
-                        .child(
-                            text(label)
-                                .font_family(FONT_UI)
-                                .text_size(px(TYPE_UI))
-                                .line_height(px(TYPE_UI_LINE))
-                                .text_color(ink),
-                        )
-                        .child(
-                            text(origin)
-                                .font_family(FONT_UI)
-                                .text_size(px(TYPE_UI))
-                                .line_height(px(TYPE_UI_LINE))
-                                .text_color(move || tokens::palette().ink_caption),
-                        ),
-                ),
+            prims::press_feedback(
+                button()
+                    .accessibility_label(name)
+                    .px(px(0.0))
+                    .py(px(SPACE_1))
+                    .bg(Color::TRANSPARENT)
+                    .rounded(px(0.0))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(tokens::palette().ink).underline())
+                    .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+                    .on_press(move || state.open_file(path.clone())),
+            )
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(SPACE_2))
+                    .child(
+                        text(label)
+                            .font_family(FONT_UI)
+                            .text_size(px(TYPE_UI))
+                            .line_height(px(TYPE_UI_LINE))
+                            .text_color(ink),
+                    )
+                    .child(
+                        text(origin)
+                            .font_family(FONT_UI)
+                            .text_size(px(TYPE_UI))
+                            .line_height(px(TYPE_UI_LINE))
+                            .text_color(move || tokens::palette().ink_caption),
+                    ),
+            ),
         )
 }
 

@@ -11,7 +11,7 @@ mod support;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use nsh_core::element::{Idiom, Os};
@@ -29,10 +29,28 @@ const EDITOR: &str = "label:Markdown source";
 /// be played at the platform's rate. The directories live as long as the
 /// returned guards.
 fn start(provider: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    start_with_clock(provider, provider)
+}
+
+fn start_with_clock(
+    provider: bool,
+    manual_clock: bool,
+) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    start_with_files(provider, manual_clock, &[])
+}
+
+fn start_with_files(
+    provider: bool,
+    manual_clock: bool,
+    files: &[(&str, &str)],
+) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let directory = tempfile::tempdir().expect("document dir");
     let config = tempfile::tempdir().expect("config dir");
     let document = directory.path().join("plan.md");
     std::fs::write(&document, SOURCE).expect("write document");
+    for (name, text) in files {
+        std::fs::write(directory.path().join(name), text).expect("write extra document");
+    }
     if provider {
         let base_url = loopback_provider();
         let endpoint = mt_core::model::EndpointIdentity::parse(
@@ -61,16 +79,37 @@ fn start(provider: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
     engine.environment.os = Os::Windows;
     engine.environment.idiom = Idiom::Desktop;
-    if provider {
+    if manual_clock {
         engine.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
-        engine.environment.reduce_motion = true;
     }
+    engine.environment.reduce_motion = provider;
     let mut app = Headless::start(engine).expect("start the app");
     app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
         .expect("viewport");
     app.wait_for(EDITOR).expect("the source editor");
     app.settle();
     (app, directory, config)
+}
+
+fn press_without_settling(app: &Headless, selector: &str) {
+    let id = app
+        .screen()
+        .press_target(selector)
+        .expect("the selector parses")
+        .unwrap_or_else(|| panic!("{selector} is pressable"));
+    let engine = app.engine().control();
+    engine.dispatch_event(
+        id,
+        nsh_core::EventKind::Press,
+        nsh_core::EventPayload::Press(Default::default()),
+    );
+    let (sent, received) = mpsc::channel();
+    engine.flush(move |_| {
+        let _ = sent.send(());
+    });
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the non-settling press was handled");
 }
 
 fn sent(app: &Headless) -> bool {
@@ -262,14 +301,19 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
         "screen readers name it as it reads"
     );
 
-    // The pane on screen is Source after choosing it.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-edit").expect("Source");
+    assert_eq!(
+        app.screen()
+            .press_target("id:title-menu-edit")
+            .expect("the Source row selector"),
+        None,
+        "closed menu rows cannot receive presses during the exit"
+    );
     app.wait_for_gone("id:title-menu", Duration::from_secs(5))
-        .expect("the row closes the menu");
+        .expect("the panel dismounts after the exit");
 
     app.press("id:title-settings").expect("open the menu");
-    app.wait_for("id:title-menu").expect("the menu");
     assert_eq!(
         app.screen()
             .accessibility_state("id:title-settings")
@@ -331,9 +375,104 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
             "`{row}` is one line high"
         );
     }
+
+    app.press("id:title-settings").expect("close the menu");
+    app.press("id:title-file")
+        .expect("open Context and return focus to the editor");
+    app.press_key("z").expect("type into the editor");
+    assert!(
+        app.screen().texts().iter().any(|text| {
+            text.contains("Original") && (text.contains("zOriginal") || text.contains("Originalz"))
+        }),
+        "the editor received the character after the title-file press: {:?}",
+        app.screen().texts()
+    );
 }
 
-// ─── the loopback provider ────────────────────────────────────────────────
+#[test]
+fn a_fading_menu_row_does_not_take_a_press_and_web_action_remains_reachable() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _directory, _config) =
+        start_with_files(false, true, &[("second.md", "Second document\n")]);
+    app.press_key("mod+p").expect("open the file palette");
+    app.wait_for("id:palette-input")
+        .expect("the palette's line");
+    app.type_text("id:palette-input", "second")
+        .expect("filter to second.md");
+    app.submit("id:palette-input").expect("open second.md");
+    app.wait_for("id:title-file >> text:second.md")
+        .expect("second.md becomes active");
+    let settings = "id:title-settings";
+    let split = "id:title-menu-split";
+
+    press_without_settling(&app, settings);
+    app.wait_for("id:title-menu-split-web")
+        .expect("the split web row is open");
+    app.press("id:title-menu-split-web")
+        .expect("show the web pane in the field");
+    app.wait_for("id:web-trust")
+        .expect("the untrusted web pane's action");
+
+    app.press(settings)
+        .expect("reopen the menu over the web pane");
+    let split_row = app
+        .screen()
+        .press_target(split)
+        .expect("the selector parses")
+        .expect("the open row receives presses");
+
+    app.answer_dialogs_myself();
+
+    press_without_settling(&app, settings);
+    for _ in 0..2 {
+        app.next_frame(Duration::from_millis(16))
+            .expect("advance into the menu exit");
+    }
+    let exit_nodes = app.screen().layout_nodes();
+    let menu = exit_nodes
+        .iter()
+        .find(|node| node.test_id.as_deref() == Some("title-menu"))
+        .expect("the menu remains mounted during the fade");
+    let web_trust = exit_nodes
+        .iter()
+        .find(|node| node.test_id.as_deref() == Some("web-trust"))
+        .expect("the web action remains under the menu during the fade");
+    assert!(
+        menu.bounds.contains(&web_trust.bounds.center()),
+        "the web action center {:?} lies under the exiting menu {:?}",
+        web_trust.bounds.center(),
+        menu.bounds
+    );
+    exit_nodes
+        .iter()
+        .find(|node| node.id == split_row)
+        .expect("the split row remains mounted during the fade");
+    assert!(
+        !exit_nodes
+            .iter()
+            .any(|node| node.test_id.as_deref() == Some("title-menu-scrim")),
+        "the full-window scrim is removed while the menu fades"
+    );
+    app.press(split)
+        .expect_err("the fading split row cannot take a press");
+    // Headless::press checks the control's center against overlays; the trust
+    // prompt proves the underlay action received the press.
+    app.press("id:web-trust")
+        .expect("the web action remains reachable during the menu exit");
+    support::wait_for_pending_dialog(
+        &mut app,
+        "the web trust action received the press",
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        app.pending_dialog()
+            .and_then(|dialog| dialog.title.as_deref()),
+        Some("Run scripts in this document?"),
+        "the web action, not the exiting menu, received the press"
+    );
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Cancel".to_owned()))
+        .expect("cancel the web trust prompt");
+}
 
 /// A provider on loopback that answers every Review with no findings; its
 /// base URL.

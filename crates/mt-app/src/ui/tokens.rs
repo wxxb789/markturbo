@@ -278,9 +278,6 @@ pub const HAIRLINE: f32 = 1.0;
 /// The focus ring: a designed 1px ink ring, offset from the control.
 pub const FOCUS_RING: f32 = 1.0;
 pub const FOCUS_RING_OFFSET: f32 = 2.0;
-/// The rail's hover widening, and the 4px the consent card rises.
-pub const RAIL_WIDEN_MS: f32 = 160.0;
-pub const CARD_RISE: f32 = 4.0;
 
 /// The type scale: 12.5, 14, 16, 22 (with their line heights).
 pub const TYPE_UI: f32 = 12.5;

@@ -33,7 +33,7 @@ use crate::{
     state::{AppState, CredentialStatus},
     ui::{
         fonts::{Companion, CompanionAction, CompanionFailure, CompanionStatus},
-        motion, notices, prims,
+        notices, prims,
         tokens::{
             self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_WIDE, RAIL_W, SPACE_2,
             SPACE_3, SPACE_4, SPACE_5, TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE,
@@ -51,9 +51,11 @@ pub fn is_open(state: &AppState) -> bool {
     state.settings_open.get()
 }
 
-/// The settings page, under the title row: the header, the form, and the app's
-/// own words at the foot.
-pub fn page(state: AppState, language: Language) -> impl IntoElement {
+pub(crate) fn page(
+    state: AppState,
+    language: Language,
+    presence: notices::StatusPresence,
+) -> impl IntoElement {
     // The store can change under us — another instance storing or removing a
     // key — and nothing in this process reports that, so every (re)build of the
     // page reads the vault afresh. Within a page, the status is memoised.
@@ -110,7 +112,7 @@ pub fn page(state: AppState, language: Language) -> impl IntoElement {
                 .child(content(state.clone(), language)),
         )
         .child(notice_line(state.clone()))
-        .child(notices::status_line(state, language))
+        .child(notices::status_line(state, language, presence))
 }
 
 /// The page's one heading: 16px medium ink — 22px is the model's voice alone.
@@ -979,34 +981,32 @@ fn choice_button(
             }
         }
     };
-    // One plain view is the button: its test id, UI Automation's
-    // AutomationId, names the control a press reaches, as `prims`' do.
-    view()
-        .test_id(test_id)
-        .role(AccessibilityRole::Button)
-        .optional_label(Some(label.clone()))
-        .accessibility_state(move || AccessibilityState {
-            selected: current(),
-            ..AccessibilityState::default()
-        })
-        .window_drag(false)
-        .px(px(2.0))
-        .py(px(4.0))
-        .bg(Color::TRANSPARENT)
-        .cursor_pointer()
-        .rounded(px(0.0))
-        .transition_colors()
-        .duration(motion::HOVER_MS)
-        .hover(|s| s.text_color(tokens::palette().ink).underline())
-        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-        .on_press(move |_: &PressEvent| on_press())
-        .child(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(colour),
-        )
+    prims::press_feedback(
+        view()
+            .test_id(test_id)
+            .role(AccessibilityRole::Button)
+            .optional_label(Some(label.clone()))
+            .accessibility_state(move || AccessibilityState {
+                selected: current(),
+                ..AccessibilityState::default()
+            })
+            .window_drag(false)
+            .px(px(2.0))
+            .py(px(4.0))
+            .bg(Color::TRANSPARENT)
+            .cursor_pointer()
+            .rounded(px(0.0))
+            .hover(|s| s.text_color(tokens::palette().ink).underline())
+            .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+            .on_press(move |_: &PressEvent| on_press()),
+    )
+    .child(
+        text(label)
+            .font_family(FONT_UI)
+            .text_size(px(TYPE_UI))
+            .line_height(px(TYPE_UI_LINE))
+            .text_color(colour),
+    )
 }
 
 /// A quiet local action whose label follows the state. The credential's one
@@ -1023,28 +1023,28 @@ fn reactive_action(
         .bg(Color::TRANSPARENT)
         .window_drag(false)
         .child(
-            button()
-                .accessibility_label({
-                    let label = label.clone();
-                    move || Some(label())
-                })
-                .px(px(2.0))
-                .py(px(4.0))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .rounded(px(0.0))
-                .transition_colors()
-                .duration(motion::HOVER_MS)
-                .hover(|s| s.text_color(tokens::palette().ink).underline())
-                .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-                .on_press(on_press)
-                .child(
-                    text(label)
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || tokens::palette().ink_rest),
-                ),
+            prims::press_feedback(
+                button()
+                    .accessibility_label({
+                        let label = label.clone();
+                        move || Some(label())
+                    })
+                    .px(px(2.0))
+                    .py(px(4.0))
+                    .bg(Color::TRANSPARENT)
+                    .cursor_pointer()
+                    .rounded(px(0.0))
+                    .hover(|s| s.text_color(tokens::palette().ink).underline())
+                    .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                    .on_press(on_press),
+            )
+            .child(
+                text(label)
+                    .font_family(FONT_UI)
+                    .text_size(px(TYPE_UI))
+                    .line_height(px(TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink_rest),
+            ),
         )
 }
 
