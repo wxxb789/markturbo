@@ -41,6 +41,9 @@ const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The companion font in one data directory: where it lives, and the source
 /// and digest it must match.
 ///
+/// Every disk operation on the companion file holds the lifecycle lock;
+/// only the network fetch runs outside it.
+///
 /// Built from the pinned constants ([`CompanionFont::in_data_dir`]); only a
 /// test build can name another source ([`CompanionFont::with_source`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,9 +170,12 @@ impl CompanionFont {
         self.dir.join(FILE_NAME)
     }
 
-    /// Whether the file is present. Cheap and unverified: [`Self::load`]
+    /// Whether the file is present. Unverified: [`Self::load`]
     /// verifies before anything uses the bytes.
     pub fn is_installed(&self) -> bool {
+        let Ok(_lock) = self.lock_lifecycle() else {
+            return false;
+        };
         self.path().is_file()
     }
 
@@ -224,24 +230,12 @@ impl CompanionFont {
     /// a file that does not match the pinned size and digest has been removed.
     /// Returns an error if the stored file cannot be read or discarded.
     pub fn load(&self) -> io::Result<Option<Vec<u8>>> {
-        self.load_after_failed_verification(|| {})
-    }
-
-    fn load_after_failed_verification(
-        &self,
-        after_failed_verification: impl FnOnce(),
-    ) -> io::Result<Option<Vec<u8>>> {
-        let path = self.path();
-        match self.read_verified(&path) {
-            Ok(Some(bytes)) => return Ok(Some(bytes)),
-            Ok(None) => {}
+        let _lock = match self.lock_lifecycle() {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        }
-        after_failed_verification();
-        let _lock = self.lock_lifecycle()?;
-        match self.read_verified(&path) {
-            Ok(Some(current)) => Ok(Some(current)),
+            result => result?,
+        };
+        match self.read_verified(&self.path()) {
+            Ok(Some(bytes)) => Ok(Some(bytes)),
             Ok(None) => {
                 log::warn!("companion font: the stored file does not verify; removing it");
                 self.remove_unlocked()?;
@@ -266,12 +260,10 @@ impl CompanionFont {
 
     /// Deletes the file; an absent file is already removed.
     pub fn remove(&self) -> io::Result<()> {
-        if fs::symlink_metadata(self.path())
-            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-        {
-            return Ok(());
-        }
-        let _lock = self.lock_lifecycle()?;
+        let _lock = match self.lock_lifecycle() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
         self.remove_unlocked()
     }
 
@@ -290,7 +282,8 @@ impl CompanionFont {
     }
 
     /// Locks the companion-file lifecycle across cooperating processes. The
-    /// sentinel stays beside `fonts/`, outside the font directory.
+    /// sentinel stays beside `fonts/`; a missing data directory means there is
+    /// no companion file to inspect or remove.
     fn lock_lifecycle(&self) -> io::Result<fs::File> {
         let lock_path = self.data_dir().join(".companion-font.lock");
         let lock = OpenOptions::new()
@@ -505,6 +498,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let missing_data = data.path().join("not-created");
         let missing = CompanionFont::with_source(&missing_data, "http://127.0.0.1:9/", b"the font");
+        assert_eq!(missing.load().unwrap(), None);
         missing.remove().expect("an absent font is already removed");
         assert!(
             !missing_data.exists(),
@@ -956,43 +950,54 @@ mod tests {
 
         mod restore_interleaving {
             use super::*;
+            use std::{sync::mpsc, thread, time::Duration};
 
             #[test]
-            fn startup_cleanup_removes_old_bytes_but_keeps_a_new_commit() {
+            fn startup_cleanup_removes_old_bytes_and_load_waits_for_a_new_commit() {
                 let data = tempfile::tempdir().unwrap();
-                let font = CompanionFont::with_source(
-                    data.path(),
-                    &serve(Reply::Body(FONT.to_vec())),
-                    FONT,
-                );
-                fs::create_dir_all(font.path().parent().unwrap()).unwrap();
+                let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", FONT);
+                fs::create_dir_all(&font.dir).unwrap();
                 fs::write(font.path(), b"old bad file").unwrap();
                 assert_eq!(font.load().unwrap(), None);
                 assert!(!font.is_installed(), "an old invalid file is removed");
 
-                fs::write(font.path(), b"old bad file").unwrap();
-                let (read_tx, read_rx) = std::sync::mpsc::channel();
-                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-                let font_ref = &font;
-                let (downloaded, resumed, restored) = std::thread::scope(move |scope| {
-                    let load_font = font_ref;
-                    let load = scope.spawn(move || {
-                        load_font.load_after_failed_verification(|| {
-                            read_tx.send(()).unwrap();
-                            resume_rx.recv().unwrap();
-                        })
-                    });
-                    read_rx.recv().unwrap();
-                    let downloaded = font_ref.download(&|_| {}, &DownloadControl::default());
-                    let resumed = resume_tx.send(());
-                    let restored = load.join();
-                    (downloaded, resumed, restored)
-                });
-
-                downloaded.unwrap();
-                resumed.unwrap();
-                assert_eq!(restored.unwrap().unwrap().as_deref(), Some(FONT));
+                let restored = while_committing(&font, CompanionFont::load).unwrap();
+                assert_eq!(restored.as_deref(), Some(FONT));
                 assert_eq!(font.load().unwrap().as_deref(), Some(FONT));
+            }
+
+            #[test]
+            fn remove_waits_for_a_commit_even_when_the_file_is_absent() {
+                let data = tempfile::tempdir().unwrap();
+                let font = CompanionFont::with_source(data.path(), "http://127.0.0.1:9/", FONT);
+                fs::create_dir_all(&font.dir).unwrap();
+
+                while_committing(&font, CompanionFont::remove).unwrap();
+                assert!(!font.path().exists(), "the concurrent commit was removed");
+            }
+
+            fn while_committing<T: Send>(
+                font: &CompanionFont,
+                operation: impl FnOnce(&CompanionFont) -> T + Send,
+            ) -> T {
+                thread::scope(|scope| {
+                    let holder = font.lock_lifecycle().unwrap();
+                    let (started_tx, started_rx) = mpsc::sync_channel(0);
+                    let (finished_tx, finished_rx) = mpsc::channel();
+                    let job = scope.spawn(move || {
+                        started_tx.send(()).unwrap();
+                        let result = operation(font);
+                        finished_tx.send(()).unwrap();
+                        result
+                    });
+                    started_rx.recv().unwrap();
+                    let finished = finished_rx.recv_timeout(Duration::from_millis(250));
+                    fs::write(font.path(), FONT).unwrap();
+                    drop(holder);
+
+                    assert_eq!(finished, Err(mpsc::RecvTimeoutError::Timeout));
+                    job.join().unwrap()
+                })
             }
         }
 
