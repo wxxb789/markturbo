@@ -55,6 +55,31 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
      loosen the sandbox.
    - Existing preview behaviour must survive inside the frame: scrolling, theme colours, math and
      diagram rendering, and text selection.
+3b. **Process-level network kill switch** (amended 2026-11-21 after the review found that CSP and
+   the sandbox do not cover WebRTC/ICE, DNS prefetch or similar channels).
+   - nsh 0.6.1 creates the WebView2 environment with `options = null`
+     (`nsh-platform-windows` `web.rs`, `create_environment`), so the loader honours
+     `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`. Before any web view is created, the app sets it, in
+     its own process only, to arguments that leave the WebView's browser process **no route to
+     any network**. Candidates:
+     - a host-resolver rule that maps every name to NOTFOUND;
+     - a proxy that points at a closed loopback port, with no bypass;
+     - a WebRTC IP-handling policy that forbids non-proxied UDP.
+   - Verify each flag against current WebView2/Chromium behaviour rather than assuming it, and
+     keep only what the native proof needs.
+   - If the variable is already set in the user's environment, the app overrides it for its own
+     process; it does not merge with it.
+   - The app's own non-WebView networking (model transport, font download) is unaffected; it does
+     not run inside WebView2.
+   - Native proof (clause 6). The harness listens on loopback TCP and UDP ports. A fixture
+     attempts, against those ports and against a hostname:
+     - `fetch`, `<img>`, `sendBeacon` and `WebSocket`;
+     - a `RTCPeerConnection` with a STUN/TURN server and a data channel;
+     - `<link rel=dns-prefetch/preconnect>`;
+     - a form post.
+
+     The listeners must record **zero** contacts. Unit tests assert the exact argument string and
+     that it is set before the first web view.
 4. **Scripts run without a click.** A headless or unit test shows that an MDX component, or a
    browser-side diagram that needs scripts, is in the built page for a freshly opened tab, with no
    preceding action.
