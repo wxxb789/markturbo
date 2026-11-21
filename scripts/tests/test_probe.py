@@ -1112,6 +1112,7 @@ class Goal04BuildEvidenceTests(unittest.TestCase):
                 probe.validate_build_evidence(evidence)
 
     def test_cargo_config_context_records_only_content_free_fingerprints(self) -> None:
+        data = b'[target.x86_64-pc-windows-msvc]\nlinker = "C:/secret/tool.exe"\n'
         # A relative workspace stops the ancestor walk at the temporary cwd.
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -1120,15 +1121,23 @@ class Goal04BuildEvidenceTests(unittest.TestCase):
         ):
             cargo_home = Path(directory)
             config = cargo_home / "config.toml"
-            config.write_text(
-                '[target.x86_64-pc-windows-msvc]\nlinker = "C:/secret/tool.exe"\n',
-                encoding="utf-8",
-            )
+            config.write_bytes(data)
             context = goal04.goal04_cargo_config_context({"CARGO_HOME": directory})
 
-        self.assertTrue(context["cargo_home_overridden"])
-        self.assertEqual(len(context["files"]), 1)
-        self.assertEqual(context["files"][0]["scope"], "cargo-home")
+        self.assertEqual(
+            context,
+            {
+                "cargo_home_overridden": True,
+                "files": [
+                    {
+                        "scope": "cargo-home",
+                        "name": "config.toml",
+                        "byte_count": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                ],
+            },
+        )
         serialized = json.dumps(context)
         self.assertNotIn("secret", serialized)
         for path in (directory, cargo_home.as_posix()):
