@@ -377,11 +377,15 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         wait,
     )
     .expect("registration failure");
-    app.wait_for("id:settings-cjk-font-retry")
-        .expect("retry after registration failure");
     assert!(!app.shows("Installed and applied: Chinese text is set in Source Han Sans CN."));
     app.wait_for("id:settings-cjk-font-remove")
         .expect("remove after registration failure");
+    assert!(
+        !app.screen()
+            .matches("id:settings-cjk-font-retry")
+            .expect("valid retry selector"),
+        "retry is hidden while the verified file remains on disk"
+    );
     assert_eq!(
         std::fs::read(&installed).expect("verified font file"),
         INVALID_FONT

@@ -32,7 +32,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, CredentialStatus},
     ui::{
-        fonts::{Companion, CompanionFailure, CompanionStatus},
+        fonts::{Companion, CompanionAction, CompanionFailure, CompanionStatus},
         motion, notices, prims,
         tokens::{
             self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_WIDE, RAIL_W, SPACE_2,
@@ -704,19 +704,17 @@ fn ink_bar(color: Color) -> impl IntoElement {
 pub(super) fn cjk_font_section(companion: Companion, language: Language) -> impl IntoElement {
     let status = companion.status;
     let total = companion.size();
-    let can_download = move || {
-        matches!(
-            status.get(),
-            CompanionStatus::Absent | CompanionStatus::Removed
-        )
+    let offers = |action| {
+        let companion = companion.clone();
+        move || companion.action() == Some(action)
     };
+    let disclosure = companion.clone();
     let (download, retry, cancel, remove) = (
         companion.clone(),
         companion.clone(),
         companion.clone(),
-        companion,
+        companion.clone(),
     );
-    let removable = remove.clone();
     section(
         s(S::ChineseFont, language),
         view()
@@ -732,13 +730,9 @@ pub(super) fn cjk_font_section(companion: Companion, language: Language) -> impl
             )
             .child(when(
                 move || {
-                    !matches!(
-                        status.get(),
-                        CompanionStatus::Installed
-                            | CompanionStatus::Downloading(_)
-                            | CompanionStatus::Applying
-                            | CompanionStatus::Removing
-                            | CompanionStatus::Failed(CompanionFailure::Removal)
+                    matches!(
+                        disclosure.action(),
+                        Some(CompanionAction::Download | CompanionAction::Retry)
                     )
                 },
                 move || {
@@ -754,7 +748,7 @@ pub(super) fn cjk_font_section(companion: Companion, language: Language) -> impl
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_3))
-                    .child(when(can_download, move || {
+                    .child(when(offers(CompanionAction::Download), move || {
                         let companion = download.clone();
                         prims::primary_action(
                             "settings-cjk-font-download",
@@ -763,42 +757,33 @@ pub(super) fn cjk_font_section(companion: Companion, language: Language) -> impl
                         )
                         .into_element()
                     }))
-                    .child(when(
-                        move || status.get().can_retry_download(),
-                        move || {
-                            let companion = retry.clone();
-                            prims::primary_action(
-                                "settings-cjk-font-retry",
-                                s(S::TryAgain, language),
-                                move || companion.download(),
-                            )
-                            .into_element()
-                        },
-                    ))
-                    .child(when(
-                        move || matches!(status.get(), CompanionStatus::Downloading(_)),
-                        move || {
-                            let companion = cancel.clone();
-                            prims::quiet_action(
-                                "settings-cjk-font-cancel",
-                                i18n::t(language, Key::Cancel),
-                                move || companion.cancel(),
-                            )
-                            .into_element()
-                        },
-                    ))
-                    .child(when(
-                        move || removable.can_remove(),
-                        move || {
-                            let companion = remove.clone();
-                            prims::quiet_action(
-                                "settings-cjk-font-remove",
-                                s(S::Remove, language),
-                                move || companion.remove(),
-                            )
-                            .into_element()
-                        },
-                    )),
+                    .child(when(offers(CompanionAction::Retry), move || {
+                        let companion = retry.clone();
+                        prims::primary_action(
+                            "settings-cjk-font-retry",
+                            s(S::Retry, language),
+                            move || companion.download(),
+                        )
+                        .into_element()
+                    }))
+                    .child(when(offers(CompanionAction::Cancel), move || {
+                        let companion = cancel.clone();
+                        prims::quiet_action(
+                            "settings-cjk-font-cancel",
+                            i18n::t(language, Key::Cancel),
+                            move || companion.cancel(),
+                        )
+                        .into_element()
+                    }))
+                    .child(when(offers(CompanionAction::Remove), move || {
+                        let companion = remove.clone();
+                        prims::quiet_action(
+                            "settings-cjk-font-remove",
+                            s(S::Remove, language),
+                            move || companion.remove(),
+                        )
+                        .into_element()
+                    })),
             ),
     )
 }
@@ -1081,7 +1066,7 @@ enum S {
     Remove,
     ChineseFont,
     DownloadAndApply,
-    TryAgain,
+    Retry,
     FontAbsent,
     FontDownloading,
     FontApplying,
@@ -1115,7 +1100,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::Remove => "Remove",
             S::ChineseFont => "Chinese font",
             S::DownloadAndApply => "Download and apply",
-            S::TryAgain => "Try again",
+            S::Retry => "Retry",
             S::FontAbsent => "Not installed. Chinese text uses the system's font.",
             S::FontDownloading => "Downloading",
             S::FontApplying => "Applying…",
@@ -1131,7 +1116,7 @@ fn s(key: S, language: Language) -> &'static str {
                 "Download failed: the file was not the expected font, so it was discarded."
             }
             S::FontFailedDisk => {
-                "Download failed: the font file could not be saved or read back in MarkTurbo's data folder."
+                "The font file could not be saved or read back in MarkTurbo's data folder."
             }
             S::FontFailedRegistration => "The font could not be registered and was not applied.",
             S::FontFailedRemoval => {
@@ -1155,7 +1140,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::Remove => "移除",
             S::ChineseFont => "中文字体",
             S::DownloadAndApply => "下载并应用",
-            S::TryAgain => "重试",
+            S::Retry => "重试",
             S::FontAbsent => "未安装。中文使用系统字体。",
             S::FontDownloading => "正在下载",
             S::FontApplying => "正在应用…",
@@ -1164,7 +1149,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::FontRemoved => "已移除。重启 MarkTurbo 前，中文仍使用思源黑体 CN。",
             S::FontFailedNetwork => "下载失败：网络请求未完成。未安装任何内容。",
             S::FontFailedVerification => "下载失败：文件与预期字体不符，已丢弃。",
-            S::FontFailedDisk => "下载失败：无法在 MarkTurbo 的数据目录中保存或读回字体文件。",
+            S::FontFailedDisk => "无法在 MarkTurbo 的数据目录中保存或读回字体文件。",
             S::FontFailedRegistration => "字体注册失败，未能应用。",
             S::FontFailedRemoval => "移除失败：无法从 MarkTurbo 的数据目录中删除字体。",
         },

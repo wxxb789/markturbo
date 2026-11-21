@@ -124,10 +124,12 @@ pub enum CompanionStatus {
     Failed(CompanionFailure),
 }
 
-impl CompanionStatus {
-    pub fn can_retry_download(self) -> bool {
-        matches!(self, Self::Failed(failure) if failure != CompanionFailure::Removal)
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompanionAction {
+    Download,
+    Retry,
+    Cancel,
+    Remove,
 }
 
 /// Why an operation on the companion failed, as the page names it.
@@ -217,6 +219,10 @@ impl Companion {
                         Ok(Some(bytes)) => this.apply(bytes).await,
                         Ok(None) if this.applied.get() => CompanionStatus::Removed,
                         Ok(None) => CompanionStatus::Absent,
+                        Err(_) if !on_disk => {
+                            log::warn!("fonts: the companion could not be read");
+                            CompanionStatus::Failed(CompanionFailure::Disk)
+                        }
                         Err(_) => {
                             log::warn!("fonts: the stored companion could not be read or removed");
                             CompanionStatus::Failed(CompanionFailure::Removal)
@@ -259,14 +265,13 @@ impl Companion {
         + Send
         + 'static,
     ) {
-        let previous_status = self.status.get();
         if !matches!(
-            previous_status,
-            CompanionStatus::Absent | CompanionStatus::Removed
-        ) && !previous_status.can_retry_download()
-        {
+            self.action(),
+            Some(CompanionAction::Download | CompanionAction::Retry)
+        ) {
             return;
         }
+        let previous_status = self.status.get();
         let Some(font) = self.font.clone() else {
             self.status
                 .set(CompanionStatus::Failed(CompanionFailure::Disk));
@@ -358,16 +363,19 @@ impl Companion {
         }
     }
 
-    pub fn can_remove(&self) -> bool {
-        !matches!(
-            self.status.get(),
-            CompanionStatus::Downloading(_) | CompanionStatus::Applying | CompanionStatus::Removing
-        ) && self.on_disk.get()
+    pub(super) fn action(&self) -> Option<CompanionAction> {
+        match (self.status.get(), self.on_disk.get()) {
+            (CompanionStatus::Downloading(_), _) => Some(CompanionAction::Cancel),
+            (CompanionStatus::Applying | CompanionStatus::Removing, _) => None,
+            (_, true) => Some(CompanionAction::Remove),
+            (CompanionStatus::Failed(_), false) => Some(CompanionAction::Retry),
+            (_, false) => Some(CompanionAction::Download),
+        }
     }
 
     /// Deletes the file. The registered face stays until the app restarts.
     pub fn remove(&self) {
-        if !self.can_remove() {
+        if self.action() != Some(CompanionAction::Remove) {
             return;
         }
         let Some(font) = self.font.clone() else {
@@ -494,11 +502,10 @@ mod tests {
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
 
-    use super::{Companion, CompanionFont, CompanionStatus, DownloadError};
+    use super::{Companion, CompanionFailure, CompanionFont, CompanionStatus, DownloadError};
     use crate::ui::{prims, settings::cjk_font_section};
 
     const FONT: &[u8] = include_bytes!("../../../../fonts/katex/KaTeX_Main-Regular.ttf");
-    const UNREGISTERABLE: &[u8] = b"not a font";
     const ABSENT: &str = "text:Not installed. Chinese text uses the system's font.";
     const REMOVE: &str = "id:settings-cjk-font-remove";
 
@@ -570,6 +577,99 @@ mod tests {
     }
 
     #[test]
+    fn restore_lock_open_failure_without_a_file_offers_retry() {
+        let data = tempfile::tempdir().unwrap();
+        let font = font(data.path(), FONT);
+        let lock_path = data.path().join(".companion-font.lock");
+        #[cfg(windows)]
+        let _lock = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .share_mode(0)
+                .open(lock_path)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        fs::create_dir(lock_path).unwrap();
+
+        assert!(!font.path().exists());
+        let mut app = start(font, Fetch::NetworkFailure);
+        app.wait_for("id:settings-cjk-font-retry")
+            .expect("an absent font can be retried after a restore lock failure");
+        app.wait_for("label:Retry").expect("retry label");
+        app.wait_for(
+            "text:The font file could not be saved or read back in MarkTurbo's data folder.",
+        )
+        .expect("restore reports a disk failure, not a removal failure");
+        app.wait_for("id:settings-cjk-font-disclosure")
+            .expect("the retry has a download disclosure");
+    }
+
+    #[test]
+    fn settings_font_actions_follow_busy_and_file_presence() {
+        use CompanionStatus::*;
+
+        let selectors = [
+            "id:settings-cjk-font-download",
+            "id:settings-cjk-font-retry",
+            "id:settings-cjk-font-cancel",
+            REMOVE,
+        ];
+        for (status, absent, present) in [
+            (Downloading(0), Some(selectors[2]), Some(selectors[2])),
+            (Applying, None, None),
+            (Removing, None, None),
+            (Absent, Some(selectors[0]), Some(REMOVE)),
+            (Installed, Some(selectors[0]), Some(REMOVE)),
+            (Removed, Some(selectors[0]), Some(REMOVE)),
+            (
+                Failed(CompanionFailure::Network),
+                Some(selectors[1]),
+                Some(REMOVE),
+            ),
+            (
+                Failed(CompanionFailure::Verification),
+                Some(selectors[1]),
+                Some(REMOVE),
+            ),
+            (
+                Failed(CompanionFailure::Disk),
+                Some(selectors[1]),
+                Some(REMOVE),
+            ),
+            (
+                Failed(CompanionFailure::Registration),
+                Some(selectors[1]),
+                Some(REMOVE),
+            ),
+            (
+                Failed(CompanionFailure::Removal),
+                Some(selectors[1]),
+                Some(REMOVE),
+            ),
+        ] {
+            for (on_disk, expected) in [(false, absent), (true, present)] {
+                let mut app = start_with(move || {
+                    let companion = Companion::with_font(None);
+                    companion.status.set(status);
+                    companion.on_disk.set(on_disk);
+                    cjk_font_section(companion, Language::English)
+                });
+                app.wait_for("id:settings-cjk-font-status").unwrap();
+                for selector in selectors {
+                    assert_eq!(
+                        app.screen().matches(selector).unwrap(),
+                        expected == Some(selector),
+                        "{status:?}, on_disk={on_disk}, {selector}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn remove_is_hidden_while_applying_a_stored_font() {
         let data = tempfile::tempdir().unwrap();
         let font = font(data.path(), FONT);
@@ -588,17 +688,21 @@ mod tests {
     #[test]
     fn remove_is_offered_when_retry_fails_with_a_file_still_on_disk() {
         let data = tempfile::tempdir().unwrap();
-        let font = font(data.path(), UNREGISTERABLE);
-        fs::write(font.path(), UNREGISTERABLE).unwrap();
+        let font = font(data.path(), FONT);
         let mut app = start(font.clone(), Fetch::NetworkFailure);
-        app.wait_for("text:The font could not be registered and was not applied.")
-            .unwrap();
-        app.wait_for("id:settings-cjk-font-retry").unwrap();
+        app.wait_for(ABSENT).unwrap();
         app.press("id:test-fetch").unwrap();
+        app.wait_for("id:settings-cjk-font-retry").unwrap();
+        // Another instance can install the font after Settings offers Retry.
+        fs::write(font.path(), FONT).unwrap();
+        app.press("id:test-fetch").unwrap();
+        app.wait_for(REMOVE)
+            .expect("the retry found the file on disk");
         app.wait_for(
             "text:Download failed: the network request did not complete. Nothing was installed.",
         )
         .unwrap();
+        assert!(!app.screen().matches("id:settings-cjk-font-retry").unwrap());
         assert!(font.path().is_file());
         app.press(REMOVE).expect("remove the copy left on disk");
         app.wait_for(ABSENT).unwrap();
