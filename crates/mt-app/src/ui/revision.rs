@@ -504,7 +504,10 @@ fn outcome(state: AppState, language: Language) -> impl IntoElement {
                 prims::quiet_action(
                     "revision-dismiss",
                     i18n::t(language, Key::Close),
-                    move || dismiss(&state),
+                    move || {
+                        dismiss(&state);
+                        state.focus_editor();
+                    },
                 )
             },
         ))
@@ -1787,6 +1790,37 @@ mod tests {
         crate::ui::shell(state, Language::English, crate::ui::tokens::Layout::Wide)
     }
 
+    /// The shell with a textual probe of the source buffer, so keyboard focus
+    /// after a field action can be checked without targeting the editor.
+    #[component]
+    fn DismissFocusProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let text_state = state.clone();
+        view()
+            .flex_col()
+            .h(relative(1.0))
+            .child(
+                text(move || {
+                    if text_state
+                        .active_tab()
+                        .is_some_and(|tab| tab.text.get().contains('q'))
+                    {
+                        "typed"
+                    } else {
+                        "untouched"
+                    }
+                })
+                .test_id("dismiss-editor-state"),
+            )
+            .child(crate::ui::shell(
+                state,
+                Language::English,
+                crate::ui::tokens::Layout::Wide,
+            ))
+    }
+
     #[test]
     fn the_docked_proposal_sits_near_the_fields_middle_with_the_rows_around_it() {
         let mut app =
@@ -1847,6 +1881,40 @@ mod tests {
             decisions.origin.y.0 + decisions.size.height.0
                 <= field.origin.y.0 + field.size.height.0
         );
+    }
+
+    #[test]
+    fn dismissing_done_returns_keyboard_focus_to_the_editor() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<DismissFocusProbe>()))
+            .expect("start the shell");
+        app.set_viewport(Size {
+            width: Points(1440.0),
+            height: Points(900.0),
+        })
+        .expect("a 1440x900 window");
+        app.first_render().expect("first render");
+        app.wait_for("id:revision-accept")
+            .expect("the first hunk is on screen");
+
+        app.press("id:revision-accept")
+            .expect("accept the first hunk");
+        app.wait_for("text:1 of 2 decided")
+            .expect("the first decision");
+        app.wait(Duration::from_millis(motion::EXTINGUISH_MS as u64 + 20))
+            .expect("the next hunk docks");
+        app.press("id:revision-accept")
+            .expect("accept the second hunk");
+        app.wait_for("text:2 of 2 decided")
+            .expect("both hunk decisions");
+        app.press("id:revision-done").expect("finish the proposal");
+        app.wait_for("id:revision-dismiss")
+            .expect("the Done outcome has a dismiss action");
+        app.press("id:revision-dismiss")
+            .expect("dismiss the outcome");
+
+        app.press_key("q").expect("type into the focused editor");
+        app.wait_for("text:typed")
+            .expect("the source buffer receives the character");
     }
 
     #[test]

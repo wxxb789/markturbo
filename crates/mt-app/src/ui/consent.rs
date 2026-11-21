@@ -113,18 +113,27 @@ pub fn is_open(state: &AppState) -> bool {
 struct Waiting {
     is_revision: bool,
     consent: Option<OutboundConsent>,
+    fallback: SharedString,
+    offers_selection: bool,
+    offers_context: bool,
 }
 
 fn waiting(state: &AppState) -> Waiting {
-    if state.review_consent.get().is_some() {
+    if let Some(fallback) = state.review_consent.get() {
         return Waiting {
             is_revision: false,
             consent: state.review_manifest.get(),
+            fallback,
+            offers_selection: state.review_consent_offers_selection(),
+            offers_context: state.review_consent_offers_context(),
         };
     }
     Waiting {
         is_revision: true,
         consent: state.revision_manifest.get(),
+        fallback: state.revision_consent.get().unwrap_or_default(),
+        offers_selection: false,
+        offers_context: false,
     }
 }
 
@@ -133,7 +142,7 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     // The card owns Enter, Escape and the hold: the source editor gives up
     // the focus it may still hold from the Ctrl+Enter that opened the card.
     state.blur_source_editor();
-    let is_revision = state.revision_consent.get().is_some();
+    let is_revision = state.revision_consent.get_untracked().is_some();
     // The app's only shadow: sending is the one thing that breaks the room.
     // It takes its colour adaptively, so the theme stays current without a
     // rebuild.
@@ -147,7 +156,19 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     keyboard(state.clone(), is_revision, hold.clone());
     let body_state = state.clone();
     let body_hold = hold.clone();
-    motion::card_enter(view())
+    let presented = signal_with(None, SignalEquals::Never);
+    effect({
+        let state = state.clone();
+        let hold = hold.clone();
+        move || {
+            if is_open(&state) {
+                presented.set(Some(waiting(&state)));
+            } else {
+                hold.rebuild(None, 0);
+            }
+        }
+    });
+    view()
         .test_id("consent-card")
         .w(px(tokens::CONSENT_CARD_MAX_W))
         .flex_col()
@@ -183,15 +204,18 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             .text_color(move || tokens::palette().ink),
         )
         .child(dynamic(move || {
-            card_body(&body_state, language, &body_hold, is_revision)
+            presented.with(|waiting| {
+                waiting
+                    .as_ref()
+                    .map(|waiting| card_body(&body_state, language, &body_hold, waiting))
+            })
         }))
 }
 
 /// The card's body, as the manifest stands now: the rows, the total, the
 /// controls and the hold's bytes follow the binding that will actually leave.
 /// A `dynamic` region, so a scope switch redraws all of it.
-fn card_body(state: &AppState, language: Language, hold: &Hold, is_revision: bool) -> AnyElement {
-    let waiting = waiting(state);
+fn card_body(state: &AppState, language: Language, hold: &Hold, waiting: &Waiting) -> AnyElement {
     let rows = waiting
         .consent
         .as_ref()
@@ -205,31 +229,25 @@ fn card_body(state: &AppState, language: Language, hold: &Hold, is_revision: boo
             .child(disclosure_body(
                 state,
                 language,
-                &waiting,
+                waiting,
                 consent,
                 rows.as_ref().expect("a manifest has its rows"),
             ))
             .child(buttons(
                 state.clone(),
-                is_revision,
+                waiting.is_revision,
                 language,
                 hold.clone(),
                 total,
             ))
             .into_element(),
         // No manifest was kept: the state's own disclosure, verbatim.
-        None => text(
-            state
-                .review_consent
-                .get()
-                .or_else(|| state.revision_consent.get())
-                .unwrap_or_default(),
-        )
-        .font_family(tokens::FONT_UI)
-        .text_size(px(tokens::TYPE_UI))
-        .line_height(px(tokens::TYPE_UI_LINE))
-        .text_color(move || tokens::palette().ink_rest)
-        .into_element(),
+        None => text(waiting.fallback.clone())
+            .font_family(tokens::FONT_UI)
+            .text_size(px(tokens::TYPE_UI))
+            .line_height(px(tokens::TYPE_UI_LINE))
+            .text_color(move || tokens::palette().ink_rest)
+            .into_element(),
     }
 }
 
@@ -353,9 +371,6 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
     } else {
         ReviewScopeChoice::Document
     };
-    let review = !waiting.is_revision;
-    let offers_selection = review && state.review_consent_offers_selection();
-    let offers_context = review && state.review_consent_offers_context();
     // The current scope in ink; another one a quiet switch when it can be
     // bound, and not drawn at all when it cannot.
     let option = |choice: ReviewScopeChoice, test_id: &'static str, label: S, offered: bool| {
@@ -365,10 +380,14 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
         }
         let state = state.clone();
         offered.then(|| {
+            let enabled = state.clone();
             view()
-                .child(prims::quiet_action(test_id, label, move || {
-                    state.set_review_consent_scope(choice)
-                }))
+                .child(
+                    prims::quiet_action(test_id, label, move || {
+                        state.set_review_consent_scope(choice)
+                    })
+                    .disabled(move || !is_open(&enabled)),
+                )
                 .into_element()
         })
     };
@@ -377,19 +396,19 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
             ReviewScopeChoice::Selection,
             "consent-scope-selection",
             S::ScopeSelection,
-            offers_selection,
+            waiting.offers_selection,
         ),
         option(
             ReviewScopeChoice::Document,
             "consent-scope-document",
             S::ScopeDocument,
-            review,
+            !waiting.is_revision,
         ),
         option(
             ReviewScopeChoice::DocumentWithContext,
             "consent-scope-context",
             S::ScopeContext,
-            offers_context,
+            waiting.offers_context,
         ),
     ]
     .into_iter()
@@ -608,10 +627,12 @@ fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl
     // button itself: nsh focuses an input or a view that takes presses, and
     // `prims::primary_action` takes no ref, so Cancel draws its own control.
     effect(move || reference.focus());
+    let enabled = state.clone();
     view().test_id("consent-cancel").child(cancel_action(
         i18n::t(language, Key::Cancel),
         move || cancel(&state, is_revision),
         reference,
+        move || !is_open(&enabled),
     ))
 }
 
@@ -626,8 +647,10 @@ fn cancel_action(
     label: &'static str,
     on_press: impl Fn() + 'static,
     reference: ElementRef,
+    disabled: impl Fn() -> bool + 'static,
 ) -> AnyElement {
-    prims::press_feedback(
+    let duration = prims::press_color_duration();
+    prims::press_feedback_with_duration(
         view()
             .test_id("consent-cancel-button")
             .flex_row()
@@ -638,6 +661,7 @@ fn cancel_action(
             .cursor_pointer()
             .group()
             .focusable(true)
+            .disabled(disabled)
             .role(AccessibilityRole::Button)
             .label(SharedString::from(label))
             .on_press(move |_: &PressEvent| on_press())
@@ -650,10 +674,11 @@ fn cancel_action(
                     .text_color(move || tokens::palette().ink_rest)
                     .underline_offset(px(4.0))
                     .transition_colors()
-                    .duration(motion::HOVER_MS)
+                    .duration(move || duration.get())
                     .group_hover(|s| s.text_color(tokens::palette().ink).underline())
                     .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
             ),
+        duration,
     )
     .into_element()
 }
@@ -668,6 +693,20 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
     let up = hold.clone();
     let tap = hold.clone();
     let label_hold = hold.clone();
+    let enabled = hold.state.clone();
+    let filament_fill = view()
+        .absolute()
+        .left(px(0.0))
+        .bottom(px(0.0))
+        .w_full()
+        .h(px(FILAMENT_H))
+        .origin_bottom_left()
+        .bind_background(&heat.filament_glow());
+    let filament_fill = if motion::reduced_motion() {
+        filament_fill.bind_opacity(&heat)
+    } else {
+        filament_fill.bind_transform(TransformKind::ScaleX, &heat)
+    };
     prims::press_feedback(
         view()
             .test_id("consent-send")
@@ -682,6 +721,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
             .focus_visible(|s| s.border_color(tokens::palette().ink))
             .cursor_pointer()
             .focusable(true)
+            .disabled(move || !is_open(&enabled))
             .label(SharedString::from(hold_accessibility(language, total)))
             // Where the keyboard is decides what `Space` and `Enter` do: on this
             // control they charge it, anywhere else they cancel.
@@ -729,15 +769,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
             .child(
                 // The charge itself: the ramp from dull to white-hot, as wide as
                 // the hold.
-                view()
-                    .absolute()
-                    .left(px(0.0))
-                    .bottom(px(0.0))
-                    .w_full()
-                    .h(px(FILAMENT_H))
-                    .origin_bottom_left()
-                    .bind_background(&heat.filament_glow())
-                    .bind_transform(TransformKind::ScaleX, &heat),
+                filament_fill,
             ),
     )
 }
@@ -766,11 +798,18 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
     });
     // Bound as the card comes, so it is newer than any binding made before.
     let ctrl_enter_state = state.clone();
-    effect(move || titlebar::bind_mod_enter(&ctrl_enter_state));
+    effect(move || {
+        if is_open(&ctrl_enter_state) {
+            titlebar::bind_mod_enter(&ctrl_enter_state);
+        }
+    });
     let escape_state = state.clone();
     let enter_state = state.clone();
     let space_state = state.clone();
     effect(move || {
+        if !is_open(&escape_state) {
+            return;
+        }
         on_key_with("escape", KeyOptions::default(), {
             let state = escape_state.clone();
             move |_| cancel(&state, is_revision)
@@ -1969,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_removes_the_cards_transform_bindings() {
+    fn reduced_motion_keeps_transforms_out_of_the_card_subtree() {
         let mut config = EngineConfig::new(Root::of::<ReducedMotionHarness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the harness");
@@ -1977,17 +2016,18 @@ mod tests {
             .expect("viewport");
         app.set_environment("reduced motion", |env| env.reduce_motion = true)
             .expect("the environment");
-        let transforms = Arc::new(Mutex::new(Vec::<(nsh_core::NodeId, bool)>::new()));
+        let binding_events = Arc::new(Mutex::new(Vec::<(
+            nsh_core::NodeId,
+            Vec<nsh_core::animation::AnimationProp>,
+        )>::new()));
         app.observe({
-            let transforms = transforms.clone();
+            let binding_events = binding_events.clone();
             move |_, batch| {
                 for item in &batch.items {
                     if let nsh_core::MountItem::AnimationBindings { id, bindings } = item {
-                        transforms.lock().expect("lock the test record").push((
+                        binding_events.lock().expect("lock the test record").push((
                             *id,
-                            bindings.iter().any(|(property, _)| {
-                                matches!(property, nsh_core::animation::AnimationProp::Transform(_))
-                            }),
+                            bindings.iter().map(|(property, _)| *property).collect(),
                         ));
                     }
                 }
@@ -2002,14 +2042,54 @@ mod tests {
             .find(|node| node.test_id.as_deref() == Some("consent-card"))
             .expect("the consent card")
             .id;
+        use nsh_core::geometry::point;
+        app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
+            .expect("start the hold");
+        app.drop_held().expect("release the hold");
+        app.settle();
+
+        let layout_nodes = app.screen().layout_nodes();
+        let card_nodes: Vec<_> = layout_nodes
+            .iter()
+            .filter(|node| {
+                let mut current = node.id;
+                loop {
+                    if current == card {
+                        return true;
+                    }
+                    let Some(parent) = layout_nodes
+                        .iter()
+                        .find(|candidate| candidate.id == current)
+                        .map(|candidate| candidate.parent)
+                    else {
+                        return false;
+                    };
+                    if parent == current {
+                        return false;
+                    }
+                    current = parent;
+                }
+            })
+            .map(|node| node.id)
+            .collect();
+        let binding_events = binding_events.lock().expect("lock the test record");
+        let card_bindings: Vec<_> = binding_events
+            .iter()
+            .filter(|(id, _)| card_nodes.contains(id))
+            .collect();
         assert!(
-            transforms
-                .lock()
-                .expect("lock the test record")
+            card_bindings
                 .iter()
-                .filter(|(id, _)| *id == card)
-                .all(|(_, has_transform)| !has_transform),
-            "the reduced-motion card has no transform animation binding"
+                .any(|(_, properties)| !properties.is_empty()),
+            "the card subtree has recorded animation bindings"
+        );
+        assert!(
+            card_bindings.iter().all(|(_, properties)| {
+                properties.iter().all(|property| {
+                    !matches!(property, nsh_core::animation::AnimationProp::Transform(_))
+                })
+            }),
+            "no animated binding in the reduced-motion card subtree uses a transform"
         );
     }
 

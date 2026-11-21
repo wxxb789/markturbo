@@ -31,24 +31,28 @@ These are surface timings, not pointer feedback. A press snaps on, releases
 over 120ms, and does not scale text. The 100ms hover does not animate tab or rail
 selection. Errors, refusals and in-progress status remain readable until
 superseded. Reduced motion removes spatial transitions and caps surface fades
-at 100ms. On Windows, nsh skips layout deletion animations under reduced
-motion, so banners and cards dismount immediately rather than keeping
-inactive handlers alive for a fade.
+at 100ms. Banners and cards dismount immediately under reduced motion.
 
 ## Local checks
 
 Gate results are separate from desktop acceptance. The motion token scan is
 in `ui/motion.rs`. `ui/prims.rs` checks the pressed plate for a quiet action,
 plate button and row while the gesture is held, using the native pressed-state
-report that Headless does not send automatically. `ui/titlebar.rs` checks
+report that Headless does not send automatically. It also checks the mounted
+transition on press-down and on a theme change under stationary hover.
+`ui/titlebar.rs` checks
 disabled Review and samples live menu opacity and scale on both sides of each
 reversal without advancing the clock between samples. `ui/consent.rs` checks
-that a reduced-motion card mounts without transform bindings. The
-`refine_keys_shortcuts` and `revision_flow` integration tests check editor
-typing after a toolbar press and visible, non-actionable Accept, respectively.
+that a reduced-motion card mounts without transform bindings in its subtree.
+Headless checks editor typing after closing a Revision result, that reopening
+Review does not replay the previous anchor, and that Accept stays visible
+and non-actionable when unavailable.
 The clean-profile welcome test checks that Review remains visible and disabled.
-Headless checks the banner exit batch for matching frame-update and fade
-transitions; it reports target layout frames, not native in-flight positions.
+Headless checks the banner's persistent zero-height slot, the scoped frame
+updates for that slot and the document, and the exit fade. It reports target
+layout frames, not native in-flight positions. The modal tests sample the
+mounted animation graph through a close/reopen and check that discarding a
+dirty tab does not animate removal of its rail row or editor.
 The menu exit test checks that the scrim is gone and the workspace action
 still executes. Headless routes those presses semantically; native pointer
 hit testing remains part of desktop acceptance.
@@ -57,7 +61,7 @@ hit testing remains part of desktop acceptance.
 | --- | ---: | --- |
 | `cargo fmt --all -- --check` | 0 | No formatting differences. |
 | `cargo clippy --profile ci -p mt-core -p mt-app --all-targets` | 0 | 2 existing mt-core warnings and 1 existing mt-app test warning; no new warnings. |
-| `cargo test --profile ci -p mt-app` | 0 | 42 test targets; 245 passed, 0 failed, 0 ignored. |
+| `cargo test --profile ci -p mt-app` | 0 | 42 test targets; 252 passed, 0 failed, 0 ignored (245 passed before the review fixes). |
 | `cargo test --profile ci -p mt-core --features model-transport` | 0 | 833 passed, 0 failed, 7 ignored. |
 | `uv run --locked --project scripts scripts/mt.py check fast` | 1 | 232 passed; 1 known failure in 1 of 8 tooling shards. |
 
@@ -78,10 +82,19 @@ executable or receipts were generated in this implementation stage.
 
 - Run the native acceptance suite on the final release executable with its
   expected SHA-256 using the command in [verification.md](verification.md).
+- Reveal a recovery or conflict banner with Animation effects on. Verify that
+  the banner grows from zero height while fading in and that the document
+  below moves continuously with it, without a jump.
 - Dismiss a recovery or conflict banner with Animation effects on. Around the
   midpoint of the exit, verify the content below is between its start and end
   positions while the banner is still fading. With Animation effects off,
   verify the banner dismounts immediately without animated reflow.
+- With two tabs open, edit the active tab, close it and choose **Don't save**.
+  Verify that its rail row and editor disappear immediately while the guard
+  fades, and that the remaining editor accepts input during the fade.
+- Close and reopen the guard or consent before its fade ends. Verify that
+  opacity, scale and vertical position do not jump on the first frame back,
+  and that the fading surface does not intercept pointer or keyboard input.
 - Run the 22-state visual matrix on that release executable. Keep receipts
   separate from the historical Goal 09 captures. Use the existing harness with
   `--languages en-us --viewports default --modes light,dark` for eleven states

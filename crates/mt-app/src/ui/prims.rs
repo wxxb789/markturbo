@@ -17,9 +17,10 @@
 use nsh_base::input;
 use nsh_core::{
     Color, EventKind, EventPayload,
+    element::effect,
     element::{
         Accessible, AdaptiveColor, AnimatedNode, ComponentBuilder, Element, Interactive,
-        IntoListener, IntoReactive, ParentElement, SharedString, StyleRefinement, Styled,
+        IntoListener, IntoReactive, ParentElement, SharedString, Signal, StyleRefinement, Styled,
     },
     prelude::*,
 };
@@ -181,8 +182,28 @@ fn press_target(test_id: &str, label: SharedString) -> View {
 /// contains. The active plate snaps on; the normal colour transition takes
 /// over when the pointer or key is released.
 pub(crate) fn press_feedback<T: PressControl<Kind>, Kind>(control: T) -> T {
-    let duration = signal(HOVER_MS);
+    press_feedback_with_duration(control, press_color_duration())
+}
+
+/// A colour transition's duration, shared by a press target and any text
+/// inside it that also changes on hover.
+pub(crate) fn press_color_duration() -> Signal<f32> {
+    signal(HOVER_MS)
+}
+
+pub(crate) fn press_feedback_with_duration<T: PressControl<Kind>, Kind>(
+    control: T,
+    duration: Signal<f32>,
+) -> T {
     let pressed = signal(false);
+    let appearance = signal(tokens::palette().is_dark);
+    effect(move || {
+        let is_dark = tokens::palette().is_dark;
+        if appearance.get() != is_dark {
+            appearance.set(is_dark);
+            duration.set(0.0);
+        }
+    });
     motion::ease_out(control.transition_colors().duration(move || duration.get()))
         .feedback_on(EventKind::MouseEnter, move |_| {
             if !pressed.get() {
@@ -198,7 +219,10 @@ pub(crate) fn press_feedback<T: PressControl<Kind>, Kind>(control: T) -> T {
             pressed.set(true);
             duration.set(PRESS_RELEASE_MS);
         })
-        .feedback_on(EventKind::PressUp, move |_| pressed.set(false))
+        .feedback_on(EventKind::PressUp, move |_| {
+            pressed.set(false);
+            duration.set(PRESS_RELEASE_MS);
+        })
         .feedback_styles()
 }
 
@@ -492,5 +516,116 @@ mod tests {
             app.wait_for("text:1 presses")
                 .expect("activated on release");
         }
+    }
+
+    #[test]
+    fn a_theme_switch_does_not_transition_a_stationary_hover_plate() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::{MountItem, platform::ColorScheme};
+
+        let mut config = EngineConfig::new(Root::of::<Harness>().tokens(tokens::theme()));
+        config.environment.color_scheme = ColorScheme::Light;
+        config.environment.reduce_motion = false;
+        let mut app = Headless::start(config).expect("start the harness");
+        app.wait_for("id:harness-quiet").expect("the quiet action");
+        let control = node_with(&app, "harness-quiet");
+        app.engine()
+            .control()
+            .set_states(control, nsh_core::tailwind::state::HOVERED);
+        app.settle();
+        assert_eq!(
+            app.screen()
+                .view_style("id:harness-quiet")
+                .unwrap()
+                .unwrap()
+                .background_color,
+            Some(tokens::LIGHT.ink_at(0.06).0),
+            "the light hover plate is visible before the theme changes"
+        );
+
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        app.observe({
+            let updates = updates.clone();
+            move |_, batch| {
+                for item in &batch.items {
+                    if let MountItem::ViewStyle { id, style } = item
+                        && *id == control
+                    {
+                        updates
+                            .lock()
+                            .expect("lock the test record")
+                            .push((style.background_color, style.transition));
+                    }
+                }
+            }
+        });
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("report OS appearance");
+
+        let first_dark_update = updates
+            .lock()
+            .expect("lock the test record")
+            .iter()
+            .find(|(background, _)| *background == tokens::DARK.ink_at(0.06))
+            .copied()
+            .unwrap_or_else(|| panic!("the hovered control never took the dark plate"));
+        assert!(
+            first_dark_update
+                .1
+                .is_none_or(|transition| transition.duration == 0.0),
+            "the theme's hover plate applies without a transition: {first_dark_update:?}"
+        );
+    }
+
+    #[test]
+    fn press_down_does_not_transition_the_pressed_plate() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::MountItem;
+
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+        app.wait_for("id:harness-presses").expect("the harness");
+        app.drag_and_hold(
+            "id:harness-quiet",
+            nsh_core::geometry::point(px(0.0), px(0.0)),
+        )
+        .expect("pointer down");
+        let node = node_with(&app, "harness-quiet");
+        let engine = app.engine().control();
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        app.observe({
+            let transitions = transitions.clone();
+            move |_, batch| {
+                for item in &batch.items {
+                    if let MountItem::ViewStyle { id, style } = item
+                        && *id == node
+                    {
+                        transitions
+                            .lock()
+                            .expect("lock the test record")
+                            .push(style.transition);
+                    }
+                }
+            }
+        });
+        engine.set_states(node, nsh_core::tailwind::state::PRESSED);
+        app.settle();
+        let transition = transitions
+            .lock()
+            .expect("lock the test record")
+            .last()
+            .copied()
+            .unwrap_or_else(|| panic!("press-down emitted no style update"));
+        assert_eq!(transition, None, "the pressed plate snaps on");
+        app.wait_for("text:0 presses")
+            .expect("press does not fire on down");
+        engine.set_states(node, 0);
+        app.drop_held().expect("pointer up");
+        app.wait_for("text:1 presses")
+            .expect("activated on release");
     }
 }

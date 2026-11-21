@@ -9,13 +9,13 @@
 //! Under reduced motion (`reduce_motion()`, the system setting) an ignition is
 //! one 100ms crossfade instead of a 90ms flash plus a 1260ms decay.
 
-use std::sync::OnceLock;
+use std::{cell::Cell, sync::OnceLock};
 
 use nsh_core::{
     Color, LayoutCurve, LayoutTransition,
     element::{
-        AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming, Styled,
-        animated_value, effect, reduce_motion, sample_easing,
+        AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming, Signal, Spawned,
+        Styled, animated_value, effect, reduce_motion, sample_easing, signal, spawn,
     },
 };
 
@@ -82,30 +82,67 @@ pub fn ease_out<T: Styled>(control: T) -> T {
     control.ease_bezier(x1, y1, x2, y2)
 }
 
-pub fn fade_in<T: Element>(element: T) -> T {
-    let opacity = animated_value(0.0);
-    let ms = if reduced_motion() {
-        REDUCED_CROSSFADE_MS
-    } else {
-        ENTER_MS
-    };
-    effect(move || {
-        opacity.timing(1.0, ms, EASE_OUT);
-    });
-    element.bind_opacity(&opacity)
+/// Keep the drawing and its animation values alive until its fade ends.
+/// The caller gates interaction on logical openness, not on visibility.
+#[derive(Clone, Copy)]
+pub(super) struct Presence {
+    pub visible: Signal<bool>,
+    pub opacity: AnimatedValue,
 }
 
-/// Applies the consent/guard card's shared rise and scale enter motion.
-pub fn card_enter<T: Element>(card: T) -> T {
+impl Presence {
+    pub fn new(open: impl Fn() -> bool + 'static) -> Self {
+        let visible = signal(false);
+        let opacity = animated_value(0.0);
+        let previous = Cell::new(None);
+        let hide = Cell::new(None::<Spawned<()>>);
+        effect(move || {
+            let open = open();
+            let reduced = reduced_motion();
+            if previous.replace(Some((open, reduced))) == Some((open, reduced)) {
+                return;
+            }
+            hide.set(None);
+            if open {
+                visible.set(true);
+                let ms = if reduced {
+                    REDUCED_CROSSFADE_MS
+                } else {
+                    ENTER_MS
+                };
+                opacity.timing(1.0, ms, EASE_OUT);
+            } else if reduced {
+                opacity.set(0.0);
+                visible.set(false);
+            } else if visible.get_untracked() {
+                let end = opacity.timing(0.0, EXIT_MS, EASE_OUT);
+                hide.set(Some(spawn(async move {
+                    if end.await {
+                        visible.set(false);
+                    }
+                })));
+            }
+        });
+        Self { visible, opacity }
+    }
+}
+
+/// Run the card's rise/scale inside its retained owner. An exit freezes the
+/// two transforms, so a new entrance can continue from the displayed frame.
+pub(super) fn card_geometry<T: Element>(card: T, open: impl Fn() -> bool + 'static) -> T {
     let rise = animated_value(CARD_RISE_PX);
     let scale = animated_value(SCALE_FLOOR);
     effect(move || {
+        let open = open();
         if reduced_motion() {
             rise.set(0.0);
             scale.set(1.0);
-        } else {
+        } else if open {
             rise.timing(0.0, CARD_RISE_MS, EASE_OUT);
             scale.timing(1.0, ENTER_MS, EASE_OUT);
+        } else {
+            rise.stop();
+            scale.stop();
         }
     });
     if reduced_motion() {

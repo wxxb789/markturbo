@@ -149,9 +149,13 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     let glide = Glide::default();
     let camera_glide = glide.clone();
     let mounting = Cell::new(true);
+    let last_request = Cell::new(None);
     effect(move || {
         let mounted = mounting.replace(false);
         let focus = camera_state.document_focus.get();
+        if last_request.replace(Some(focus.request)) == Some(focus.request) {
+            return;
+        }
         let instant = mounted || !focus.animated;
         if focus.tab != camera_tab.id || !docked_surfaces(&camera_state) {
             return;
@@ -603,6 +607,8 @@ mod tests {
         let last_state = state.clone();
         let preview_state = state.clone();
         let source_state = state.clone();
+        let close_review_state = state.clone();
+        let open_review_state = state.clone();
         view()
             .test_id("probe")
             .flex_col()
@@ -656,6 +662,20 @@ mod tests {
                             source_state.set_pane(tab.id, Pane::Source);
                         }
                     }),
+            )
+            .child(
+                view()
+                    .test_id("probe-review-close")
+                    .w_full()
+                    .h(px(8.0))
+                    .on_press(move || close_review_state.close_review()),
+            )
+            .child(
+                view()
+                    .test_id("probe-review-open")
+                    .w_full()
+                    .h(px(8.0))
+                    .on_press(move || open_review_state.review_open.set(true)),
             )
             .child(column(state, Language::English))
     }
@@ -1364,6 +1384,39 @@ mod tests {
         assert!(
             offset.abs() <= tokens::TYPE_SOURCE_LINE,
             "back in Source line 3 sits {offset} points off the centre with no time passing"
+        );
+    }
+
+    /// Closing and reopening Review without a new result must not replay the
+    /// last result's anchor over the position the user scrolled to.
+    #[test]
+    fn reopening_review_does_not_replay_the_last_camera_request() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-last")
+            .expect("the result has an anchor near the end");
+        app.run_for(Duration::from_millis(motion::CAMERA_MS as u64 + 60))
+            .expect("the result's camera glide ends");
+        let anchored = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+
+        app.press("id:probe-review-close").expect("close Review");
+        app.scroll("id:source-editor", px(-500.0))
+            .expect("scroll elsewhere");
+        app.wait(Duration::from_millis(20))
+            .expect("the scroll lands");
+        let scrolled = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            (scrolled - anchored).abs() > 2.0 * tokens::TYPE_SOURCE_LINE,
+            "the test scroll must leave the result anchor: {anchored} -> {scrolled}"
+        );
+
+        app.press("id:probe-review-open")
+            .expect("prepare another Review without a result yet");
+        app.run_for(Duration::from_millis(60))
+            .expect("a frame before another result arrives");
+        let reopened = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            (reopened - scrolled).abs() <= 1.0,
+            "Review replayed the previous anchor before a new result: {scrolled} -> {reopened}"
         );
     }
 

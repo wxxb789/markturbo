@@ -76,14 +76,23 @@ pub fn has_recovery(state: &AppState) -> bool {
 /// The recovery banner: unsaved work that survived a crash or a quick quit.
 /// One row per checkpoint, each with its own Restore and Discard.
 pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement {
-    let rows_state = state.clone();
+    let rows = signal_with(state.recovery_records.get_untracked(), SignalEquals::Never);
+    effect({
+        let state = state.clone();
+        move || {
+            let records = state.recovery_records.get();
+            if !records.is_empty() {
+                rows.set(records);
+            }
+        }
+    });
     view()
         .test_id("recovery-banner")
         .w_full()
         .flex_col()
         .pt(px(SPACE_4))
         .child(each(
-            move || rows_state.recovery_records.get(),
+            move || rows.get(),
             |record: &RecoveredRecord| record.record.key.clone(),
             move |record: ReadSignal<RecoveredRecord>, index: ReadSignal<usize>| {
                 let record = record.get();
@@ -92,6 +101,8 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                 let restore_state = state.clone();
                 let discard_state = state.clone();
                 let ring_state = state.clone();
+                let enabled_state = state.clone();
+                let disabled = move || !has_recovery(&enabled_state);
                 let restored = record.clone();
                 let discarded = record;
                 let restore_id = format!("recovery-restore-{index}");
@@ -114,6 +125,8 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                 if index == 0 {
                     let ringed = restore.clone();
                     let ringed_id = restore_id.clone();
+                    let ring_disabled = disabled.clone();
+                    let quiet_disabled = disabled.clone();
                     row = row.child(
                         when(
                             move || !has_conflict(&ring_state),
@@ -123,6 +136,7 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                                     s(S::Restore, language),
                                     ringed.clone(),
                                 )
+                                .disabled(ring_disabled.clone())
                                 .into_element()
                             },
                         )
@@ -132,21 +146,22 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                                 s(S::Restore, language),
                                 restore.clone(),
                             )
+                            .disabled(quiet_disabled.clone())
                             .into_element()
                         }),
                     );
                 } else {
-                    row = row.child(prims::quiet_action(
-                        &restore_id,
-                        s(S::Restore, language),
-                        restore,
-                    ));
+                    row = row.child(
+                        prims::quiet_action(&restore_id, s(S::Restore, language), restore)
+                            .disabled(disabled.clone()),
+                    );
                 }
-                row.child(prims::quiet_action(
-                    &discard_id,
-                    s(S::Discard, language),
-                    move || discard_state.discard_recovered(&discarded),
-                ))
+                row.child(
+                    prims::quiet_action(&discard_id, s(S::Discard, language), move || {
+                        discard_state.discard_recovered(&discarded)
+                    })
+                    .disabled(disabled),
+                )
                 .into_element()
             },
         ))
@@ -275,6 +290,7 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
     let disk_state = state.clone();
     let save_as_state = state.clone();
     let panel_state = state.clone();
+    let disabled = move || !has_conflict(&state);
     view()
         .test_id("conflict-banner")
         .w_full()
@@ -291,26 +307,36 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
                         .flex_1()
                         .child(prims::ink(s(S::ChangedOnDisk, language))),
                 )
-                .child(prims::primary_action(
-                    "conflict-compare",
-                    s(S::Compare, language),
-                    move || toggle_compare(&compare_state),
-                ))
-                .child(prims::quiet_action(
-                    "conflict-keep-mine",
-                    s(S::KeepMine, language),
-                    move || keep_state.overwrite_active(),
-                ))
-                .child(prims::quiet_action(
-                    "conflict-use-disk",
-                    s(S::UseDiskVersion, language),
-                    move || disk_state.reload_active(),
-                ))
-                .child(prims::quiet_action(
-                    "conflict-save-as",
-                    i18n::t(language, Key::SaveAsPicker),
-                    move || save_as_state.save_as_active(),
-                )),
+                .child(
+                    prims::primary_action("conflict-compare", s(S::Compare, language), move || {
+                        toggle_compare(&compare_state)
+                    })
+                    .disabled(disabled.clone()),
+                )
+                .child(
+                    prims::quiet_action(
+                        "conflict-keep-mine",
+                        s(S::KeepMine, language),
+                        move || keep_state.overwrite_active(),
+                    )
+                    .disabled(disabled.clone()),
+                )
+                .child(
+                    prims::quiet_action(
+                        "conflict-use-disk",
+                        s(S::UseDiskVersion, language),
+                        move || disk_state.reload_active(),
+                    )
+                    .disabled(disabled.clone()),
+                )
+                .child(
+                    prims::quiet_action(
+                        "conflict-save-as",
+                        i18n::t(language, Key::SaveAsPicker),
+                        move || save_as_state.save_as_active(),
+                    )
+                    .disabled(disabled),
+                ),
         )
         .child(when(
             {
@@ -907,25 +933,44 @@ pub fn guard_is_open(state: &AppState) -> bool {
 /// which control the keyboard is on — and Left/Right (or Tab/Shift+Tab) move
 /// the ring, so every decision is keyboard-reachable without moving focus.
 pub fn guard(state: AppState, language: Language) -> impl IntoElement {
-    match state.guard.get() {
-        Some(request) => guard_card(state, request, language).into_element(),
-        None => view().test_id("guard-card").into_element(),
-    }
+    let request = signal(state.guard.get_untracked());
+    effect({
+        let state = state.clone();
+        move || {
+            if let Some(open) = state.guard.get() {
+                request.set(Some(open));
+            }
+        }
+    });
+    dynamic(move || {
+        request
+            .get()
+            .map(|request| guard_card(state.clone(), request, language))
+    })
 }
 
 /// The card itself, for the request the state is holding.
 fn guard_card(state: AppState, request: GuardRequest, language: Language) -> AnyElement {
     // The card owns its keys: the source editor gives up the focus.
     state.blur_source_editor();
-    bind_guard_keys(&state);
+    effect({
+        let state = state.clone();
+        move || {
+            if guard_is_open(&state) {
+                bind_guard_keys(&state);
+            }
+        }
+    });
     let names_state = state.clone();
     let save_state = state.clone();
     let discard_state = state.clone();
     let cancel_state = state.clone();
+    let disabled = move || !guard_is_open(&state);
     let choice = request.choice;
     let busy = request.busy;
     let notice = request.notice;
-    motion::card_enter(view())
+    let names = RefCell::new(String::new());
+    view()
         .test_id("guard-card")
         .w(px(GUARD_CARD_W))
         .flex_col()
@@ -936,11 +981,16 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .border_color(move || tokens::palette().hairline)
         .child(prims::ink(s(S::CloseWithoutSaving, language)))
         .child(
-            text(move || documents_line(&names_state, request.tab, language))
-                .font_family(tokens::FONT_UI)
-                .text_size(px(tokens::TYPE_UI))
-                .line_height(px(tokens::TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest),
+            text(move || {
+                if guard_is_open(&names_state) {
+                    names.replace(documents_line(&names_state, request.tab, language));
+                }
+                names.borrow().clone()
+            })
+            .font_family(tokens::FONT_UI)
+            .text_size(px(tokens::TYPE_UI))
+            .line_height(px(tokens::TYPE_UI_LINE))
+            .text_color(move || tokens::palette().ink_rest),
         )
         .child(when(
             move || notice.get().is_some(),
@@ -962,6 +1012,7 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
                     s(S::Save, language),
                     false,
                     move || choice.get() == GUARD_SAVE_CHOICE,
+                    disabled.clone(),
                     move || {
                         if !busy.get() {
                             save_state.guard_save();
@@ -973,6 +1024,7 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
                     s(S::DontSave, language),
                     true,
                     move || choice.get() == GUARD_DISCARD_CHOICE,
+                    disabled.clone(),
                     move || {
                         if !busy.get() {
                             discard_state.guard_discard();
@@ -984,6 +1036,7 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
                     s(S::Cancel, language),
                     false,
                     move || choice.get() == GUARD_CANCEL_CHOICE,
+                    disabled,
                     move || {
                         if !busy.get() {
                             cancel_state.guard_cancel();
@@ -1091,6 +1144,7 @@ fn card_action(
     label: &'static str,
     danger: bool,
     selected: impl IntoReactive<bool> + 'static,
+    disabled: impl IntoReactive<bool> + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     let selected = selected.into_reactive();
@@ -1130,6 +1184,7 @@ fn card_action(
                         view()
                             .test_id(test_id)
                             .role(AccessibilityRole::Button)
+                            .disabled(disabled)
                             .optional_label(Some(SharedString::from(label)))
                             .w_full()
                             .h_full()

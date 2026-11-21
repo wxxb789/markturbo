@@ -29,9 +29,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Pane},
     ui::{
-        consent,
-        motion::{self, HOVER_MS},
-        notices, prims, revision, shell,
+        consent, motion, notices, prims, revision, shell,
         tokens::{
             self, COLUMN_GAP, HAIRLINE, RAIL_DOT, RAIL_W, SPACE_1, SPACE_2, SPACE_3, TITLE_ROW_H,
             TYPE_UI, TYPE_UI_LINE,
@@ -712,7 +710,8 @@ fn menu_row(
     hint: Option<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> View {
-    prims::press_feedback(
+    let duration = prims::press_color_duration();
+    prims::press_feedback_with_duration(
         view()
             .test_id(test_id)
             .w_full()
@@ -730,6 +729,7 @@ fn menu_row(
             .disabled(move || !menu.is_open())
             .focusable(move || menu.is_open())
             .on_press(on_press),
+        duration,
     )
     .child(
         text(label)
@@ -741,7 +741,7 @@ fn menu_row(
             .min_w(px(0.0))
             .truncate()
             .transition_colors()
-            .duration(HOVER_MS)
+            .duration(move || duration.get())
             .group_hover(|s| s.text_color(tokens::palette().ink).underline())
             .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
     )
@@ -770,6 +770,7 @@ fn row_action(
     enabled: impl Fn() -> bool + Clone + 'static,
     on_press: impl Fn() + 'static,
 ) -> View {
+    let duration = prims::press_color_duration();
     let mut label_text = text(label)
         .font_family(if strong {
             tokens::FONT_MEDIUM
@@ -792,7 +793,7 @@ fn row_action(
         })
         .underline_offset(px(4.0))
         .transition_colors()
-        .duration(HOVER_MS)
+        .duration(move || duration.get())
         .group_hover(|s| {
             s.text_color(tokens::palette().ink)
                 .underline()
@@ -812,7 +813,7 @@ fn row_action(
     // carries the test id, so a test presses `id:` and lands on the view that
     // hears the press.
     let press_enabled = enabled.clone();
-    prims::press_feedback(
+    prims::press_feedback_with_duration(
         view()
             .test_id(test_id)
             .role(AccessibilityRole::Button)
@@ -827,6 +828,7 @@ fn row_action(
             .disabled(move || !press_enabled())
             .disabled_style(|s| s.opacity(0.45))
             .on_press(on_press),
+        duration,
     )
     .child(label_text)
 }

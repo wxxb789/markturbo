@@ -30,9 +30,8 @@ use std::cell::Cell;
 
 use mt_core::settings::Language;
 use nsh_core::{
-    LayoutAnimation, Points,
+    Points,
     desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes},
-    element::animate_layout,
     prelude::*,
 };
 
@@ -163,12 +162,10 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
     let recovery_state = state.clone();
     let conflict_state = state.clone();
     let status_state = state.clone();
-    let recovery_banner_state = state.clone();
+    let state_for_recovery = state.clone();
     let conflict_banner_state = state.clone();
-    let frame = element_ref();
     view()
         .test_id("column")
-        .element_ref(&frame)
         .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
         .h(relative(1.0))
         .flex_col()
@@ -177,31 +174,32 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
         .when(layout.field_overlays(), |column| {
             column.opacity(Layout::DIMMED)
         })
-        .child(occasional(
+        .child(banner_slot(
+            "recovery-banner-slot",
             move || notices::has_recovery(&recovery_state),
-            Some(frame),
-            move || {
-                notices::recovery_banner(recovery_banner_state.clone(), language).into_element()
-            },
+            move || notices::recovery_banner(state_for_recovery.clone(), language),
         ))
-        .child(occasional(
+        .child(banner_slot(
+            "conflict-banner-slot",
             move || notices::has_conflict(&conflict_state),
-            Some(frame),
-            move || {
-                notices::conflict_banner(conflict_banner_state.clone(), language).into_element()
-            },
+            move || notices::conflict_banner(conflict_banner_state.clone(), language),
         ))
         .child(
-            view().flex_1().min_h(px(0.0)).w_full().child(
-                when(move || document::has_document(&document_state), {
-                    let state = state.clone();
-                    move || document::column(state.clone(), language).into_element()
-                })
-                .otherwise({
-                    let state = state.clone();
-                    move || welcome::welcome(state.clone(), language).into_element()
-                }),
-            ),
+            view()
+                .test_id("document-slot")
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .child(
+                    when(move || document::has_document(&document_state), {
+                        let state = state.clone();
+                        move || document::column(state.clone(), language).into_element()
+                    })
+                    .otherwise({
+                        let state = state.clone();
+                        move || welcome::welcome(state.clone(), language).into_element()
+                    }),
+                ),
         )
         .child(notices::status_line(status_state, language))
 }
@@ -286,102 +284,146 @@ fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
         // The layer itself never takes a press: empty, it would cover every
         // control in the window. Its scrims and cards still do.
         .pointer_events(PointerEvents::BoxNone)
-        .child(occasional(
+        .child(modal_presence(
+            "consent-layer",
+            "consent-motion-card",
             {
                 let condition_state = consent_state.clone();
                 move || consent::is_open(&condition_state)
             },
-            None,
             {
-                let state = consent_state.clone();
-                move || consent_scrim(state.clone(), language).into_element()
+                let session = signal(0usize);
+                let previous = Cell::new(None);
+                effect({
+                    let state = consent_state.clone();
+                    move || {
+                        let kind = consent::is_open(&state)
+                            .then(|| state.revision_consent.get().is_some());
+                        if previous.replace(kind) != kind && kind.is_some() {
+                            session.update(|session| *session += 1);
+                        }
+                    }
+                });
+                move || {
+                    let state = consent_state.clone();
+                    dynamic(move || {
+                        session.get();
+                        consent::card(state.clone(), language)
+                    })
+                }
             },
         ))
-        .child(occasional(
+        .child(modal_presence(
+            "guard-layer",
+            "guard-motion-card",
             {
                 let condition_state = guard_state.clone();
                 move || notices::guard_is_open(&condition_state)
             },
-            None,
-            {
-                let state = guard_state;
-                move || guard_scrim(state.clone(), language).into_element()
+            move || notices::guard(guard_state.clone(), language),
+        ))
+}
+
+/// The slot has a real, zero-height frame before its first reveal. The child
+/// keeps its natural height while the slot clips it and moves the text below.
+fn banner_slot<E: IntoElement + 'static>(
+    id: &'static str,
+    open: impl Fn() -> bool + Clone + 'static,
+    content: impl Fn() -> E + 'static,
+) -> impl IntoElement {
+    let frame = element_ref();
+    let laid_out = signal(false);
+    let expanded = move || laid_out.get() && open();
+    let presence = motion::Presence::new(expanded.clone());
+    let before = Cell::new(false);
+    effect({
+        let expanded = expanded.clone();
+        move || {
+            let open = expanded();
+            if before.replace(open) != open && !motion::reduced_motion() {
+                let ms = if open {
+                    motion::ENTER_MS
+                } else {
+                    motion::EXIT_MS
+                };
+                frame.animate_layout(motion::ease_out_layout(ms));
+            }
+        }
+    });
+    view()
+        .test_id(id)
+        .element_ref(&frame)
+        .on_layout(move |bounds: &nsh_core::Bounds<Points>| {
+            if bounds.size.width.0 > 0.0 {
+                laid_out.set(true);
+            }
+        })
+        .w_full()
+        .h({
+            let expanded = expanded.clone();
+            move || if expanded() { auto() } else { px(0.0).into() }
+        })
+        .flex_shrink_0()
+        .flex_col()
+        .overflow_hidden()
+        .pointer_events(move || surface_pointer(expanded()))
+        .child(when(
+            move || presence.visible.get(),
+            move || {
+                view()
+                    .w_full()
+                    .flex_col()
+                    .flex_shrink_0()
+                    .test_id("banner-fade")
+                    .bind_opacity(&presence.opacity)
+                    .child(content())
             },
         ))
 }
 
-/// Let nsh retain the removed drawing, not the live handlers. Banner layout
-/// changes are scoped to the column by its own frame animation.
-fn occasional(
-    present: impl Fn() -> bool + Clone + 'static,
-    reflow: Option<ElementRef>,
-    content: impl Fn() -> AnyElement + 'static,
+fn modal_presence<E: IntoElement + 'static>(
+    id: &'static str,
+    card_id: &'static str,
+    open: impl Fn() -> bool + Clone + 'static,
+    content: impl Fn() -> E + 'static,
 ) -> impl IntoElement {
-    let before = Cell::new(false);
-    effect({
-        let present = present.clone();
+    let presence = motion::Presence::new(open.clone());
+    when(
+        move || presence.visible.get(),
         move || {
-            let open = present();
-            if before.replace(open) == open {
-                return;
-            }
-            if motion::reduced_motion() {
-                return;
-            }
-            let ms = if open {
-                motion::ENTER_MS
-            } else {
-                motion::EXIT_MS
-            };
-            let fade = motion::ease_out_layout(ms);
-            if open {
-                if let Some(frame) = reflow {
-                    frame.animate_layout(fade);
-                }
-            } else {
-                animate_layout(LayoutAnimation {
-                    update: reflow.map(|_| fade),
-                    delete: Some(fade),
-                    ..LayoutAnimation::default()
-                });
-            }
-        }
-    });
-    when(present, move || {
-        if reflow.is_some() {
-            motion::fade_in(view().w_full().flex_col().child(content())).into_element()
-        } else {
-            content()
-        }
-    })
-}
-
-/// The dimmed room and the consent card, centred over everything.
-fn consent_scrim(state: AppState, language: Language) -> impl IntoElement {
-    modal_layer()
-        .test_id("consent-layer")
-        .child(consent::card(state, language))
-}
-
-/// The dimmed room and the notices guard, centred over everything.
-fn guard_scrim(state: AppState, language: Language) -> impl IntoElement {
-    modal_layer().child(notices::guard(state, language))
-}
-
-fn modal_layer() -> View {
-    view()
-        .absolute()
-        .inset_0()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .child(motion::fade_in(
             view()
+                .test_id(id)
                 .absolute()
                 .inset_0()
-                .pointer_events(PointerEvents::None)
-                .bg(move || tokens::palette().scrim()),
-        ))
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .pointer_events({
+                    let open = open.clone();
+                    move || surface_pointer(open())
+                })
+                .bind_opacity(&presence.opacity)
+                .child(
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .pointer_events(PointerEvents::None)
+                        .bg(move || tokens::palette().scrim()),
+                )
+                .child(motion::card_geometry(
+                    view().test_id(card_id).child(content()),
+                    open.clone(),
+                ))
+        },
+    )
+}
+
+fn surface_pointer(open: bool) -> PointerEvents {
+    if open {
+        PointerEvents::Auto
+    } else {
+        PointerEvents::None
+    }
 }
 
 /// Hides the system title bar: the room runs to the window's top edge, and the
@@ -509,7 +551,7 @@ mod tests {
         };
 
         let state = AppState::new();
-        state.recovery_records.set(vec![RecoveredRecord {
+        let record = RecoveredRecord {
             record: RecoveryRecord {
                 key: RecoveryKey::for_document_id("banner-motion-probe"),
                 text: "Recovered text".to_owned(),
@@ -531,8 +573,14 @@ mod tests {
                 revision: None,
             },
             source_conflicted: false,
-        }]);
-        shell(state, Language::English, Layout::Wide)
+        };
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .child(control("probe-show-recovery", &state, move |state| {
+                state.recovery_records.set(vec![record.clone()]);
+            }))
+            .child(shell(state, Language::English, Layout::Wide))
     }
 
     #[component]
@@ -550,6 +598,12 @@ mod tests {
                 presses.update(|count| *count += 1);
                 state.request_close_tab(tab.id);
             }))
+            .child(control("probe-consent", &state, |state| {
+                state.review_consent.set(Some("Consent disclosure".into()));
+            }))
+            .child(control("probe-consent-cancel", &state, |state| {
+                state.cancel_review();
+            }))
             .child(text(move || format!("Close presses: {}", presses.get())))
             .child(text(move || {
                 match selection.get().map(|guard| guard.choice.get()) {
@@ -559,6 +613,74 @@ mod tests {
                 }
             }))
             .child(overlay_layer(state, Language::English))
+    }
+
+    #[component]
+    fn GuardDiscardProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        state.new_document();
+        let tab = state.active_tab().expect("second tab");
+        tab.dirty.set(true);
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .child(control("probe-close", &state, move |state| {
+                state.request_close_tab(tab.id);
+            }))
+            .child(shell(state, Language::English, Layout::Wide))
+    }
+
+    #[test]
+    fn discarding_a_guarded_tab_does_not_animate_the_editor_or_rail_removal() {
+        use nsh_core::MountItem;
+        use std::sync::mpsc;
+
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<GuardDiscardProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the probe");
+        app.wait_for("id:probe-close").expect("close control");
+        press(&mut app, "probe-close");
+        app.wait_for("id:guard-dont-save").expect("guard open");
+        let watched: Vec<_> = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .filter_map(|node| match node.test_id.as_deref() {
+                Some("source-editor" | "rail-file-row") => Some((node.id, node.test_id.unwrap())),
+                _ => None,
+            })
+            .collect();
+        let (send, receive) = mpsc::channel();
+        app.observe(move |_, batch| {
+            let mut deletes_animate = false;
+            for item in &batch.items {
+                match item {
+                    MountItem::LayoutAnimation(animation) => {
+                        deletes_animate = animation.delete.is_some();
+                    }
+                    MountItem::Remove { id } | MountItem::Delete { id } => {
+                        if let Some((_, name)) = watched.iter().find(|(node, _)| node == id) {
+                            send.send((name.clone(), deletes_animate)).unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        press(&mut app, "guard-dont-save");
+        let removals: Vec<_> = receive.try_iter().collect();
+        for expected in ["source-editor", "rail-file-row"] {
+            let relevant: Vec<_> = removals
+                .iter()
+                .filter(|(name, _)| name.as_ref() == expected)
+                .collect();
+            assert!(
+                !relevant.is_empty() && relevant.iter().all(|(_, animated)| !animated),
+                "{expected} must be removed without motion: {removals:?}"
+            );
+        }
     }
 
     #[test]
@@ -664,48 +786,217 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dismissing_a_banner_animates_the_content_reflow_with_its_fade() {
-        use std::sync::{Arc, Mutex};
-
-        use nsh_core::MountItem;
-
+    fn recovery_probe() -> Headless {
         let mut app = Headless::start(EngineConfig::new(
             Root::of::<RecoveryBannerProbe>().tokens(tokens::theme()),
         ))
         .expect("start the probe");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("the probe's window");
-        app.wait_for("id:recovery-discard-0")
-            .expect("the recovery banner's Discard action");
-        let removal = Arc::new(Mutex::new(None));
-        app.observe({
-            let removal = removal.clone();
-            move |_, batch| {
-                if let Some(animation) = batch.items.iter().find_map(|item| match item {
-                    MountItem::LayoutAnimation(animation) if animation.delete.is_some() => {
-                        Some(*animation)
-                    }
-                    _ => None,
-                }) {
-                    *removal.lock().unwrap() = Some(animation);
-                }
+        app
+    }
+
+    fn capture_motion(app: &mut Headless) -> std::sync::mpsc::Receiver<nsh_core::MountItem> {
+        let (send, receive) = std::sync::mpsc::channel();
+        app.observe(move |_, batch| {
+            for item in &batch.items {
+                let _ = send.send(item.clone());
             }
         });
+        receive
+    }
 
-        app.press("id:recovery-discard-0")
-            .expect("dismiss the recovery banner");
+    fn press_without_settling(app: &mut Headless, id: &str) {
+        let target = app
+            .screen()
+            .press_target(&format!("id:{id}"))
+            .unwrap()
+            .unwrap();
+        let engine = app.engine().control();
+        engine.dispatch_event(
+            target,
+            nsh_core::EventKind::Press,
+            nsh_core::EventPayload::Press(Default::default()),
+        );
+        let (send, receive) = std::sync::mpsc::channel();
+        engine.flush(move |_| {
+            let _ = send.send(());
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        app.catch_up();
+    }
 
-        let exit = removal.lock().unwrap().to_owned();
-        let expected = motion::ease_out_layout(motion::EXIT_MS);
+    fn binding_nodes(items: &[nsh_core::MountItem], id: nsh_core::NodeId) -> Vec<u32> {
+        items
+            .iter()
+            .find_map(|item| match item {
+                nsh_core::MountItem::AnimationBindings { id: view, bindings } if *view == id => {
+                    Some(bindings.iter().map(|(_, node)| *node).collect())
+                }
+                _ => None,
+            })
+            .expect("animation bindings")
+    }
+
+    #[test]
+    fn reopening_a_fading_modal_preserves_the_sampled_opacity_scale_and_rise() {
+        use nsh_core::{
+            MountItem,
+            animation::{AnimationOp, Animator},
+        };
+
+        let mut jumps = Vec::new();
+        for (open, close, layer, card) in [
+            (
+                "probe-close",
+                "guard-cancel",
+                "guard-layer",
+                "guard-motion-card",
+            ),
+            (
+                "probe-consent",
+                "probe-consent-cancel",
+                "consent-layer",
+                "consent-motion-card",
+            ),
+        ] {
+            let mut config = EngineConfig::new(Root::of::<GuardProbe>().tokens(tokens::theme()));
+            config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+            let mut app = Headless::start(config).expect("start the probe");
+            app.wait_for(&format!("id:{open}")).expect("open control");
+            let batches = capture_motion(&mut app);
+            press_without_settling(&mut app, open);
+            let entry: Vec<_> = batches.try_iter().collect();
+            let layer_id = node(&app, layer).id;
+            let card_id = node(&app, card).id;
+            let opacity = binding_nodes(&entry, layer_id)[0];
+            let [scale, rise] = binding_nodes(&entry, card_id)
+                .try_into()
+                .expect("two transforms");
+
+            // Replay the mounted bindings with the same graph as nsh's
+            // renderer; Headless's screen reports style targets, not samples.
+            let mut animator = Animator::default();
+            animator.apply(&MountItem::Animation(AnimationOp::CreateValue {
+                node: opacity,
+                value: 0.0,
+            }));
+            for item in &entry {
+                animator.apply(item);
+            }
+            animator.tick(0.0);
+            animator.tick(0.04);
+            press_without_settling(&mut app, close);
+            for item in batches.try_iter() {
+                animator.apply(&item);
+            }
+            animator.tick(0.08);
+            let sample =
+                |animator: &Animator| [opacity, scale, rise].map(|node| animator.value(node));
+            let exit = sample(&animator);
+            assert!(
+                (0.05..0.90).contains(&exit[0]),
+                "{layer}: expected mid-fade, got {exit:?}"
+            );
+
+            press_without_settling(&mut app, open);
+            for item in batches.try_iter() {
+                animator.apply(&item);
+            }
+            animator.tick(0.08);
+            let reopen = sample(&animator);
+            if layer_id != node(&app, layer).id
+                || card_id != node(&app, card).id
+                || exit.iter().zip(reopen).any(|(a, b)| (a - b).abs() > 0.001)
+            {
+                jumps.push(format!("{layer}: {exit:?} to {reopen:?}"));
+            }
+        }
+        assert!(jumps.is_empty(), "modals jumped on reopen: {jumps:?}");
+    }
+
+    fn transitioned_frames(items: &[nsh_core::MountItem], ms: f32) -> Vec<nsh_core::NodeId> {
+        use nsh_core::MountItem;
+        let mut update = None;
+        items
+            .iter()
+            .filter_map(|item| match item {
+                MountItem::LayoutAnimation(animation) => {
+                    update = animation.update;
+                    None
+                }
+                MountItem::Frame { id, .. } if update == Some(motion::ease_out_layout(ms)) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn revealing_a_banner_grows_its_existing_slot_and_reflows_the_document() {
+        let mut app = recovery_probe();
+        let before = node(&app, "recovery-banner-slot");
+        let document = node(&app, "document-slot");
+        let batches = capture_motion(&mut app);
+        press(&mut app, "probe-show-recovery");
+        let after = node(&app, "recovery-banner-slot");
+        let transitioned =
+            transitioned_frames(&batches.try_iter().collect::<Vec<_>>(), motion::ENTER_MS);
         assert!(
-            !app.screen()
-                .matches("id:recovery-banner")
-                .expect("selector")
-                && exit.is_some_and(|animation| {
-                    animation.update == Some(expected) && animation.delete == Some(expected)
-                }),
-            "banner exit should remove the banner and animate both its fade and content reflow; got {exit:?}"
+            before.id == after.id
+                && before.bounds.size.height.0 == 0.0
+                && after.bounds.size.height.0 > 0.0
+                && node(&app, "document-slot").bounds.origin.y.0 > document.bounds.origin.y.0
+                && transitioned.contains(&before.id)
+                && transitioned.contains(&document.id),
+            "the existing banner slot must expand from zero and move the document in the same transition: {transitioned:?}"
+        );
+    }
+
+    #[test]
+    fn dismissing_a_banner_animates_the_content_reflow_with_its_fade() {
+        use nsh_core::{MountItem, animation::AnimationOp};
+
+        let mut app = recovery_probe();
+        let batches = capture_motion(&mut app);
+        press(&mut app, "probe-show-recovery");
+        let slot = node(&app, "recovery-banner-slot");
+        let document = node(&app, "document-slot");
+        let all: Vec<_> = batches.try_iter().collect();
+        let fade = node(&app, "banner-fade");
+        let opacity = binding_nodes(&all, fade.id)[0];
+        press(&mut app, "recovery-discard-0");
+        app.wait_for_gone("id:recovery-banner", std::time::Duration::from_secs(2))
+            .unwrap();
+        let exit: Vec<_> = batches.try_iter().collect();
+        let transitioned = transitioned_frames(&exit, motion::EXIT_MS);
+        let mut animator = nsh_core::animation::Animator::default();
+        animator.apply(&MountItem::Animation(AnimationOp::CreateValue {
+            node: opacity,
+            value: 1.0,
+        }));
+        animator.tick(1.0);
+        for item in &exit {
+            if matches!(item, MountItem::Animation(AnimationOp::Start { node, .. }) if *node == opacity)
+            {
+                animator.apply(item);
+            }
+        }
+        animator.tick(1.0);
+        animator.tick(1.05);
+        let mid_fade = animator.value(opacity);
+        animator.tick(1.2);
+        assert!(
+            transitioned.contains(&slot.id)
+                && transitioned.contains(&document.id)
+                && node(&app, "recovery-banner-slot").bounds.size.height.0 == 0.0
+                && mid_fade > 0.0
+                && mid_fade < 1.0
+                && animator.value(opacity) == 0.0,
+            "the slot and document must reflow during the banner's fade: {transitioned:?}, opacity {mid_fade}"
         );
     }
 
