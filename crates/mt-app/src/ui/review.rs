@@ -206,7 +206,7 @@ fn observe(state: &AppState, session: Signal<Session>) {
                 emitters.set(built.clone());
                 // Every result arrives together. The current question stays
                 // HOT; the column holds the finding the user steps to.
-                built.goal.ignite(0.0);
+                built.goal.ignite();
                 for (slot, index) in order.iter().enumerate() {
                     let Some(heat) = built.questions.get(slot).copied() else {
                         continue;
@@ -214,7 +214,7 @@ fn observe(state: &AppState, session: Signal<Session>) {
                     if Some(*index) == current {
                         ignite_hold(heat);
                     } else {
-                        heat.ignite(0.0);
+                        heat.ignite();
                     }
                 }
                 // Nothing is focused yet: the question is the one HOT item
@@ -222,7 +222,7 @@ fn observe(state: &AppState, session: Signal<Session>) {
                 glow::focus_finding(None);
                 // The column moves so the first anchored lines sit level with
                 // the docked question as the result arrives.
-                level_finding(&state, view.tab_id, 0);
+                level_finding(&state, view.tab_id, 0, true);
                 focus_request().set(Some(match (view.stale, current) {
                     (true, _) => Focus::ReviewAgain,
                     (false, Some(index)) => Focus::Answer(index),
@@ -300,8 +300,8 @@ fn keys(state: &AppState, session: Signal<Session>) {
     }
 }
 
-/// `J`/`K`: the next finding's words go HOT, the previous one cools, and its
-/// explanation takes the docked position.
+/// `J`/`K` and the stepper move the docked finding at once: this is frequent
+/// navigation, so it does not use the occasional camera glide.
 fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
     let Some(view) = state.review_view.get_untracked() else {
         return;
@@ -331,7 +331,7 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
     glow::focus_finding(Some(to));
     // The column re-centres so the finding's anchored lines sit level with
     // its explanation, docked in the field (document.rs reveals the line).
-    level_finding(state, view.tab_id, to);
+    level_finding(state, view.tab_id, to, false);
     let heats = emitters().get_untracked().findings;
     if let Some(from) = from
         && from != to
@@ -344,15 +344,19 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
     }
 }
 
-/// Asks the column's camera for the finding the field just made HOT: the
-/// source editor levels the anchored line with the docked explanation
-/// ([`AppState::focus_document_line`]). Nothing is asked when the finding is
-/// not anchored in this document (document-wide, or another file's).
-fn level_finding(state: &AppState, tab_id: Option<u64>, finding: usize) {
+/// Asks the column's camera for a finding's anchored line. A result arrival
+/// may glide there; frequent finding navigation is immediate. Nothing is
+/// asked when the finding is not anchored in this document (document-wide, or
+/// another file's).
+fn level_finding(state: &AppState, tab_id: Option<u64>, finding: usize, animated: bool) {
     if let Some(tab_id) = tab_id
         && let Some(line) = glow::anchor_line(finding)
     {
-        state.focus_document_line(tab_id, line);
+        if animated {
+            state.focus_document_line(tab_id, line);
+        } else {
+            state.focus_document_line_instant(tab_id, line);
+        }
     }
 }
 
@@ -1757,7 +1761,11 @@ mod tests {
             std::sync::LazyLock::new(|| {
                 let dir = tempfile::tempdir().expect("temp dir");
                 let path = dir.path().join("camera.md");
-                std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("write the fixture");
+                let mut text = String::from("alpha\nbeta\ngamma\n");
+                for line in 3..64 {
+                    text.push_str(&format!("line {line}\n"));
+                }
+                std::fs::write(&path, text).expect("write the fixture");
                 (dir, path)
             });
         FIXTURE.1.as_path()
@@ -1849,6 +1857,25 @@ mod tests {
             )
     }
 
+    /// The real review key binding beside the document camera, so a test can
+    /// sample the editor after the key's next frame.
+    #[component]
+    fn KeyboardCameraProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.open_file(camera_fixture().to_path_buf());
+        state.review_open.set(true);
+        load_result(state.clone());
+        keys(&state, session());
+        view()
+            .test_id("keyboard-camera-probe")
+            .flex_col()
+            .w(px(760.0))
+            .h(px(700.0))
+            .child(camera_tab(&state))
+            .child(camera_request(&state))
+            .child(crate::ui::document::column(state, Language::English))
+    }
+
     /// A review that arrives through the field's own result watcher, so the
     /// camera request comes from the arrival path itself.
     #[component]
@@ -1936,6 +1963,67 @@ mod tests {
             format!("{tab}:1"),
             "the step must level the stepped finding's own line"
         );
+    }
+
+    /// With motion enabled, J puts the current finding at the camera's target
+    /// on the next display frame rather than beginning the pointer glide.
+    #[test]
+    fn keyboard_finding_step_levels_the_line_on_the_next_frame() {
+        let mut config = EngineConfig::new(Root::of::<KeyboardCameraProbe>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_environment("motion enabled", |env| env.reduce_motion = false)
+            .expect("enable motion");
+        app.wait_for("label:Markdown source")
+            .expect("the source editor renders");
+        app.settle();
+
+        let tab = text_of(&app, "camera-tab");
+        let tab = (!tab.is_empty())
+            .then_some(tab)
+            .expect("the fixture's tab opens");
+        let start = camera_level_offset(&app, "alpha");
+
+        let frame_start = app.clock().now();
+        app.press_key("j").expect("step to the first finding");
+        let request = text_of(&app, "camera-request");
+        let elapsed = app.clock().now().saturating_duration_since(frame_start);
+        if elapsed.is_zero() {
+            app.next_frame(Duration::from_millis(17))
+                .expect("the key's next frame");
+        }
+
+        let elapsed = app.clock().now().saturating_duration_since(frame_start);
+        let offset = camera_level_offset(&app, "alpha");
+        assert!(
+            start.abs() > 2.0
+                && request == format!("{tab}:0")
+                && elapsed <= Duration::from_millis(17)
+                && offset.abs() <= tokens::TYPE_SOURCE_LINE,
+            "J must level its finding within one frame; start {start}, request {request}, elapsed {elapsed:?}, offset {offset}"
+        );
+    }
+
+    /// How far a text row's centre is from the source editor's centre.
+    fn camera_level_offset(app: &Headless, line: &str) -> f32 {
+        let nodes = app.screen().layout_nodes();
+        let editor = nodes
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some("source-editor"))
+            .expect("the source editor is laid out")
+            .bounds;
+        let row = nodes
+            .iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == line)
+            })
+            .unwrap_or_else(|| panic!("the row `{line}` is in view"))
+            .bounds;
+        let row_middle = row.origin.y.0 + row.size.height.0 / 2.0;
+        let editor_middle = editor.origin.y.0 + editor.size.height.0 / 2.0;
+        row_middle - editor_middle
     }
 
     /// A result's arrival asks the camera for the first finding's line: its

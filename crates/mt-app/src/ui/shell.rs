@@ -85,7 +85,7 @@ pub fn surface(state: &AppState) -> FieldSurface {
 pub fn shell(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
     hide_system_title_bar();
     let body_state = state.clone();
-    motion::theme_colors(view())
+    view()
         .test_id("shell")
         .flex_1()
         .h(relative(1.0))
@@ -166,7 +166,7 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
     let recovery_banner_state = state.clone();
     let conflict_banner_state = state.clone();
     let frame = element_ref();
-    motion::theme_colors(view())
+    view()
         .test_id("column")
         .element_ref(&frame)
         .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
@@ -222,8 +222,7 @@ fn field(state: AppState, language: Language, layout: Layout) -> impl IntoElemen
         .pl(px(tokens::FIELD_GAP))
         .pr(px(tokens::FIELD_RIGHT_INSET));
     let area = if layout.field_overlays() {
-        motion::theme_colors(area)
-            .absolute()
+        area.absolute()
             .top(px(0.0))
             .bottom(px(0.0))
             .right(px(0.0))
@@ -334,12 +333,14 @@ fn occasional(
             } else {
                 motion::EXIT_MS
             };
-            let fade = motion::layout_fade(ms);
-            if let Some(frame) = reflow {
-                frame.animate_layout(fade);
-            }
-            if !open {
+            let fade = motion::ease_out_layout(ms);
+            if open {
+                if let Some(frame) = reflow {
+                    frame.animate_layout(fade);
+                }
+            } else {
                 animate_layout(LayoutAnimation {
+                    update: reflow.map(|_| fade),
                     delete: Some(fade),
                     ..LayoutAnimation::default()
                 });
@@ -501,6 +502,40 @@ mod tests {
     }
 
     #[component]
+    fn RecoveryBannerProbe() -> impl IntoElement {
+        use mt_core::{
+            document::io::{FileStamp, Newline, SourceIdentity},
+            recovery::{RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord},
+        };
+
+        let state = AppState::new();
+        state.recovery_records.set(vec![RecoveredRecord {
+            record: RecoveryRecord {
+                key: RecoveryKey::for_document_id("banner-motion-probe"),
+                text: "Recovered text".to_owned(),
+                metadata: RecoveryMetadata {
+                    source_path: None,
+                    encoding_name: "UTF-8".to_owned(),
+                    had_bom: false,
+                    newline: Newline::Lf,
+                    original_stamp: FileStamp {
+                        modified: None,
+                        len: 0,
+                        digest: [0; 32],
+                        object_id: None,
+                    },
+                    source_identity: SourceIdentity::Regular,
+                    decode_had_errors: false,
+                },
+                checkpointed_at: std::time::SystemTime::UNIX_EPOCH,
+                revision: None,
+            },
+            source_conflicted: false,
+        }]);
+        shell(state, Language::English, Layout::Wide)
+    }
+
+    #[component]
     fn GuardProbe() -> impl IntoElement {
         let state = AppState::new();
         state.new_document();
@@ -587,6 +622,91 @@ mod tests {
             .into_iter()
             .find(|node| node.test_id.as_deref() == Some(id))
             .unwrap_or_else(|| panic!("no `{id}` on screen: {:?}", app.screen().texts()))
+    }
+
+    #[test]
+    fn system_theme_switch_updates_the_open_document_without_a_crossfade() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::{MountItem, platform::ColorScheme};
+
+        let mut config = EngineConfig::new(Root::of::<WideProbe>().tokens(tokens::theme()));
+        config.environment.color_scheme = ColorScheme::Light;
+        config.environment.reduce_motion = false;
+        let mut app = Headless::start(config).expect("start");
+        app.wait_for("text:Describe the next release.")
+            .expect("document text");
+        let shell = node(&app, "shell").id;
+        let first_update = Arc::new(Mutex::new(None));
+        app.observe({
+            let first_update = first_update.clone();
+            move |_, batch| {
+                for item in &batch.items {
+                    if let MountItem::ViewStyle { id, style } = item
+                        && *id == shell
+                    {
+                        first_update
+                            .lock()
+                            .unwrap()
+                            .get_or_insert((style.background_color, style.transition.is_some()));
+                    }
+                }
+            }
+        });
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("report OS appearance");
+        assert_eq!(
+            *first_update.lock().unwrap(),
+            Some((tokens::DARK.room, false)),
+            "the first shell color update must be the dark ground without a native transition"
+        );
+    }
+
+    #[test]
+    fn dismissing_a_banner_animates_the_content_reflow_with_its_fade() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::MountItem;
+
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<RecoveryBannerProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("the probe's window");
+        app.wait_for("id:recovery-discard-0")
+            .expect("the recovery banner's Discard action");
+        let removal = Arc::new(Mutex::new(None));
+        app.observe({
+            let removal = removal.clone();
+            move |_, batch| {
+                if let Some(animation) = batch.items.iter().find_map(|item| match item {
+                    MountItem::LayoutAnimation(animation) if animation.delete.is_some() => {
+                        Some(*animation)
+                    }
+                    _ => None,
+                }) {
+                    *removal.lock().unwrap() = Some(animation);
+                }
+            }
+        });
+
+        app.press("id:recovery-discard-0")
+            .expect("dismiss the recovery banner");
+
+        let exit = removal.lock().unwrap().to_owned();
+        let expected = motion::ease_out_layout(motion::EXIT_MS);
+        assert!(
+            !app.screen()
+                .matches("id:recovery-banner")
+                .expect("selector")
+                && exit.is_some_and(|animation| {
+                    animation.update == Some(expected) && animation.delete == Some(expected)
+                }),
+            "banner exit should remove the banner and animate both its fade and content reflow; got {exit:?}"
+        );
     }
 
     /// The left edge of the text `text` draws, wherever it is on screen.

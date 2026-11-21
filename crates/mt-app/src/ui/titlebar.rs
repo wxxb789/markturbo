@@ -193,46 +193,44 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         },
     );
 
-    motion::theme_colors(
-        view()
-            .test_id("title-row")
-            .relative()
-            // Above the workspace and the field, so the menu's panel is not
-            // painted over. The shell's overlay layer (the consent card) belongs
-            // to the window's root view and stays above the whole room.
-            .z_index(5)
-            // The native controls' area arrives after the first frame and changes
-            // when the window is maximized: the row's height and insets are bound
-            // to it, so they follow without the row being rebuilt.
-            .h(move || Length::from(px(TITLE_ROW_H.max(prims::caption_insets().top.0))))
-            .w_full()
-            .flex_row()
-            .items_center()
-            .gap(px(SPACE_3))
-            .pl(move || {
-                Length::from(px(
-                    (RAIL_W + COLUMN_GAP).max(prims::caption_insets().left.0 + SPACE_3)
-                ))
-            })
-            .pr(move || Length::from(px(prims::caption_insets().right.0 + SPACE_3)))
-            .bg(move || tokens::palette().room),
-    )
-    .window_drag(true)
-    .child(when(move || menu.is_open(), move || menu_scrim(menu)))
-    // The welcome has no filename, but still keeps the Review position.
-    .child(when(
-        {
-            let state = state.clone();
-            move || state.active.get().is_some()
-        },
-        {
-            let state = state.clone();
-            move || file_name(state.clone()).into_element()
-        },
-    ))
-    .child(view().flex_1())
-    .child(review_action(state.clone(), language))
-    .child(menu_anchor(state.clone(), language, menu))
+    view()
+        .test_id("title-row")
+        .relative()
+        // Above the workspace and the field, so the menu's panel is not
+        // painted over. The shell's overlay layer (the consent card) belongs
+        // to the window's root view and stays above the whole room.
+        .z_index(5)
+        // The native controls' area arrives after the first frame and changes
+        // when the window is maximized: the row's height and insets are bound
+        // to it, so they follow without the row being rebuilt.
+        .h(move || Length::from(px(TITLE_ROW_H.max(prims::caption_insets().top.0))))
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_3))
+        .pl(move || {
+            Length::from(px(
+                (RAIL_W + COLUMN_GAP).max(prims::caption_insets().left.0 + SPACE_3)
+            ))
+        })
+        .pr(move || Length::from(px(prims::caption_insets().right.0 + SPACE_3)))
+        .bg(move || tokens::palette().room)
+        .window_drag(true)
+        .child(when(move || menu.is_open(), move || menu_scrim(menu)))
+        // The welcome has no filename, but still keeps the Review position.
+        .child(when(
+            {
+                let state = state.clone();
+                move || state.active.get().is_some()
+            },
+            {
+                let state = state.clone();
+                move || file_name(state.clone()).into_element()
+            },
+        ))
+        .child(view().flex_1())
+        .child(review_action(state.clone(), language))
+        .child(menu_anchor(state.clone(), language, menu))
 }
 
 /// Binds `Ctrl+Enter` (`mod+enter`; on an Apple keyboard `ctrl+enter` too, the
@@ -592,30 +590,28 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
 }
 
 fn menu_panel_frame(menu: MenuMotion, test_id: &str) -> View {
-    motion::theme_colors(
-        view()
-            .test_id(test_id)
-            .absolute()
-            .top(px(TITLE_ROW_H))
-            .right(px(0.0))
-            .w(px(MENU_W))
-            .flex_col()
-            .py(px(SPACE_2))
-            .bg(move || tokens::palette().room)
-            .border(px(HAIRLINE))
-            .border_color(move || tokens::palette().hairline)
-            .origin_top_right()
-            .bind_opacity(&menu.opacity)
-            .bind_scale(&menu.scale)
-            .pointer_events(move || {
-                if menu.is_open() {
-                    PointerEvents::Auto
-                } else {
-                    PointerEvents::None
-                }
-            })
-            .focusable(false),
-    )
+    view()
+        .test_id(test_id)
+        .absolute()
+        .top(px(TITLE_ROW_H))
+        .right(px(0.0))
+        .w(px(MENU_W))
+        .flex_col()
+        .py(px(SPACE_2))
+        .bg(move || tokens::palette().room)
+        .border(px(HAIRLINE))
+        .border_color(move || tokens::palette().hairline)
+        .origin_top_right()
+        .bind_opacity(&menu.opacity)
+        .bind_scale(&menu.scale)
+        .pointer_events(move || {
+            if menu.is_open() {
+                PointerEvents::Auto
+            } else {
+                PointerEvents::None
+            }
+        })
+        .focusable(false)
 }
 
 /// One menu row, wired to `run`: it closes the menu first.
@@ -901,7 +897,7 @@ mod tests {
         props.content.unwrap().render("menu-motion", true)
     }
 
-    fn menu_motion_contents(samples: Sender<f32>) -> impl IntoElement {
+    fn menu_motion_contents(samples: Sender<(f32, f32)>) -> impl IntoElement {
         let menu = MenuMotion::new();
         let read_task = Cell::new(None::<Spawned<()>>);
 
@@ -919,7 +915,9 @@ mod tests {
             .child(prims::quiet_action("menu-motion-read", "Read", move || {
                 let samples = samples.clone();
                 read_task.set(Some(spawn(async move {
-                    let _ = samples.send(menu.opacity.value().await);
+                    let opacity = menu.opacity.value().await;
+                    let scale = menu.scale.value().await;
+                    let _ = samples.send((opacity, scale));
                 })));
             }))
     }
@@ -950,7 +948,7 @@ mod tests {
         received.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
-    fn opacity(app: &mut Headless, samples: &Receiver<f32>) -> f32 {
+    fn menu_values(app: &mut Headless, samples: &Receiver<(f32, f32)>) -> (f32, f32) {
         press_without_settling(app, "id:menu-motion-read");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -959,7 +957,7 @@ mod tests {
             match samples.recv_timeout(Duration::from_millis(10)) {
                 Ok(value) => return value,
                 Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {}
-                Err(error) => panic!("read menu opacity: {error}"),
+                Err(error) => panic!("read menu motion: {error}"),
             }
         }
     }
@@ -987,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_and_reopening_the_menu_retargets_its_live_opacity() {
+    fn closing_and_reopening_the_menu_retargets_its_live_opacity_and_scale() {
         let (sent, samples) = mpsc::channel();
         let mut app = manual_app(Root::new::<MenuMotionProbe>(move || {
             let sent = sent.clone();
@@ -1003,26 +1001,61 @@ mod tests {
         for _ in 0..3 {
             app.next_frame(Duration::from_millis(16)).unwrap();
         }
-        let entering = opacity(&mut app, &samples);
-        assert!(entering > 0.05 && entering < 0.99, "mid-enter: {entering}");
+        let entering = menu_values(&mut app, &samples);
+        assert!(
+            entering.0 > 0.05 && entering.0 < 0.99,
+            "mid-enter opacity: {}",
+            entering.0
+        );
+        assert!(
+            entering.1 > motion::MENU_SCALE + 0.001 && entering.1 < 0.999,
+            "mid-enter scale must be between its floor and 1: {}",
+            entering.1
+        );
 
         press_without_settling(&app, toggle);
-        let leaving = opacity(&mut app, &samples);
+        let leaving = menu_values(&mut app, &samples);
         assert!(
-            (leaving - entering).abs() <= 0.01,
-            "close starts at {entering}, got {leaving}"
+            (leaving.0 - entering.0).abs() <= 0.01,
+            "close starts at opacity {}, got {}",
+            entering.0,
+            leaving.0
+        );
+        assert!(
+            (leaving.1 - entering.1).abs() <= 0.001,
+            "close starts at scale {}, got {}",
+            entering.1,
+            leaving.1
         );
         for _ in 0..2 {
             app.next_frame(Duration::from_millis(16)).unwrap();
         }
-        let closing = opacity(&mut app, &samples);
-        assert!(closing > 0.05 && closing < leaving, "mid-exit: {closing}");
+        let closing = menu_values(&mut app, &samples);
+        assert!(
+            closing.0 > 0.05 && closing.0 < leaving.0,
+            "mid-exit opacity: {}",
+            closing.0
+        );
+        assert!(
+            (closing.1 - entering.1).abs() <= 0.001,
+            "mid-exit scale must preserve its in-flight value: {} to {}",
+            entering.1,
+            closing.1
+        );
 
         press_without_settling(&app, toggle);
-        let reopening = opacity(&mut app, &samples);
+        let reopening = menu_values(&mut app, &samples);
         assert!(
-            (reopening - closing).abs() <= 0.01,
-            "reopening at the same clock time must preserve opacity: {closing} to {reopening}"
+            (reopening.0 - closing.0).abs() <= 0.01,
+            "reopening at the same clock time must preserve opacity: {} to {}",
+            closing.0,
+            reopening.0
+        );
+        assert!(
+            (reopening.1 - closing.1).abs() <= 0.001,
+            "reopening at the same clock time must preserve scale: {} to {}",
+            closing.1,
+            reopening.1
         );
     }
 }

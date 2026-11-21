@@ -54,7 +54,7 @@ pub fn opaque(color: Color) -> Color {
 /// Body ink at the UI size and line height: your own text and the labels that
 /// are not quiet.
 pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
-    motion::theme_colors(text(content))
+    text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
@@ -63,7 +63,7 @@ pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 
 /// Resting ink: quiet local actions and captions.
 pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
-    motion::theme_colors(text(content))
+    text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
@@ -73,7 +73,7 @@ pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 /// Caption ink: the quietest text that must still be read (hints,
 /// disclosures, secondary lines), at 4.5:1 or better on every ground.
 pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement {
-    motion::theme_colors(text(content))
+    text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
@@ -85,7 +85,7 @@ pub fn source_ink(
     content: impl IntoReactive<SharedString>,
     color: impl IntoReactive<AdaptiveColor>,
 ) -> impl IntoElement {
-    motion::theme_colors(text(content))
+    text(content)
         .font_family(FONT_SOURCE)
         .text_size(px(tokens::TYPE_SOURCE))
         .line_height(px(tokens::TYPE_SOURCE_LINE))

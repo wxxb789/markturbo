@@ -23,7 +23,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Tab},
     ui::{
-        motion::{self, EASE_OUT, RAIL_WIDEN_MS, reduced_motion},
+        motion::{EASE_OUT, RAIL_WIDEN_MS, reduced_motion},
         prims, shell,
         tokens::{
             self, COLUMN_GAP, FIELD_GAP, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT,
@@ -97,7 +97,7 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         },
     );
 
-    motion::theme_colors(view())
+    view()
         .test_id("rail")
         .relative()
         // Above the text column and the field, so the widening and the
@@ -161,7 +161,7 @@ fn strip(
         })
         // The hit area widens immediately; only the names fade.
         .child(
-            motion::theme_colors(view())
+            view()
                 .test_id("rail-ground")
                 .absolute()
                 .top(px(0.0))

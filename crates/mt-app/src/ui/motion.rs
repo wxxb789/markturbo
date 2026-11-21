@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use nsh_core::{
     Color, LayoutCurve, LayoutTransition,
     element::{
-        AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming, Styled, Timing,
+        AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming, Styled,
         animated_value, effect, reduce_motion, sample_easing,
     },
 };
@@ -63,7 +63,6 @@ pub const SCALE_FLOOR: f32 = 0.96;
 pub const MENU_SCALE: f32 = 0.97;
 pub const CARD_RISE_PX: f32 = 4.0;
 pub const CARD_RISE_MS: f32 = ENTER_MS;
-pub const THEME_MS: f32 = ENTER_MS;
 pub const STATUS_HOLD_MS: u64 = 3000;
 pub const CONSENT_NOTICE_MS: u64 = 1500;
 /// The rail's names fade as the hover strip widens.
@@ -73,13 +72,9 @@ pub const CAMERA_TICK: std::time::Duration = std::time::Duration::from_micros(16
 /// Maximum opacity or heat fade under reduced motion.
 pub const REDUCED_CROSSFADE_MS: f32 = 100.0;
 
-pub fn layout_fade(ms: f32) -> LayoutTransition {
+pub fn ease_out_layout(ms: f32) -> LayoutTransition {
     let (x1, y1, x2, y2) = EASE_OUT_POINTS;
     LayoutTransition::new(LayoutCurve::bezier(x1, y1, x2, y2), ms)
-}
-
-pub fn theme_colors<T: Styled>(control: T) -> T {
-    ease_out(control.transition_colors().duration(THEME_MS))
 }
 
 pub fn ease_out<T: Styled>(control: T) -> T {
@@ -98,6 +93,26 @@ pub fn fade_in<T: Element>(element: T) -> T {
         opacity.timing(1.0, ms, EASE_OUT);
     });
     element.bind_opacity(&opacity)
+}
+
+/// Applies the consent/guard card's shared rise and scale enter motion.
+pub fn card_enter<T: Element>(card: T) -> T {
+    let rise = animated_value(CARD_RISE_PX);
+    let scale = animated_value(SCALE_FLOOR);
+    effect(move || {
+        if reduced_motion() {
+            rise.set(0.0);
+            scale.set(1.0);
+        } else {
+            rise.timing(0.0, CARD_RISE_MS, EASE_OUT);
+            scale.timing(1.0, ENTER_MS, EASE_OUT);
+        }
+    });
+    if reduced_motion() {
+        card
+    } else {
+        card.bind_scale(&scale).bind_translate_y(&rise)
+    }
 }
 
 /// The cooling curve `1 - e^(-t/420ms)`, normalised to reach exactly 1 at the
@@ -196,24 +211,18 @@ impl Heat {
         self.0
     }
 
-    /// Ignite: to HOT in 90ms, then cool to ember on `e^(-t/420ms)`, starting
-    /// `delay_ms` from now.
+    /// Ignite: to HOT in 90ms, then cool to ember on `e^(-t/420ms)`.
     ///
     /// Under reduced motion this is one 100ms crossfade to ember: no flash.
-    pub fn ignite(&self, delay_ms: f32) {
+    pub fn ignite(&self) {
         self.0.stop();
         if reduced_motion() {
-            let timing = Timing::new(REDUCED_CROSSFADE_MS, Easing::EaseInOut);
-            if delay_ms > 0.0 {
-                self.0.timing_with(EMBER, Timing { delay_ms, ..timing });
-            } else {
-                self.0.timing_with(EMBER, timing);
-            }
+            self.0
+                .timing(EMBER, REDUCED_CROSSFADE_MS, Easing::EaseInOut);
             return;
         }
         // `KeyframeTiming` is `#[non_exhaustive]`: built from its defaults.
         let mut timing = KeyframeTiming::new(IGNITE_MS + COOL_MS);
-        timing.delay_ms = delay_ms;
         timing.easing = Easing::Linear;
         self.0.keyframes(ignition_frames(), timing);
     }

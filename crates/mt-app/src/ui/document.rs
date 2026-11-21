@@ -15,16 +15,15 @@
 //! deferral, and the Split routing that puts the preview (or the web pane) in
 //! the field.
 //!
-//! The camera: a docked surface (the review's racked finding, a revision's
-//! current hunk) asks for a line with
+//! The camera: a docked surface asks for a line with
 //! [`crate::state::AppState::focus_document_line`], and the source editor
-//! levels it with the field's docked reading position, gliding there over
-//! [`motion::CAMERA_MS`] on the camera's curve (at once under reduced
-//! motion). With a docked surface open the editor's content carries half a
-//! viewport of room above its first row, so a line near the top of the
-//! document can be levelled too (the editor clamps its scroll at 0, so the
-//! room has to be in the content); the bottom half is
-//! `scroll_beyond_last_line`.
+//! levels it with the field's docked reading position. Occasional requests
+//! glide over [`motion::CAMERA_MS`] on the camera's curve; keyboard and
+//! frequent requests cut to the target, as does reduced motion. With a docked
+//! surface open the editor's content carries half a viewport of room above its
+//! first row, so a line near the top of the document can be levelled too (the
+//! editor clamps its scroll at 0, so the room has to be in the content); the
+//! bottom half is `scroll_beyond_last_line`.
 
 use std::{
     cell::{Cell, RefCell},
@@ -151,13 +150,14 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     let camera_glide = glide.clone();
     let mounting = Cell::new(true);
     effect(move || {
-        let cut = mounting.replace(false);
+        let mounted = mounting.replace(false);
         let focus = camera_state.document_focus.get();
+        let instant = mounted || !focus.animated;
         if focus.tab != camera_tab.id || !docked_surfaces(&camera_state) {
             return;
         }
         let glide = camera_glide.clone();
-        request_animation_frame(move |_| level_line(camera, &glide, focus.line, cut));
+        request_animation_frame(move |_| level_line(camera, &glide, focus.line, instant));
     });
 
     // The half-viewport inset, in points: the visible height of the column's
@@ -317,9 +317,6 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
         )
 }
 
-/// How often the camera steps the column while it glides: a display frame
-/// at 60 Hz. The glide's position is read from the clock at each step, so a
-/// late step lands where the curve is by then, not behind it.
 /// The camera's glide in flight, if any. A new target, the user's own scroll
 /// and the user's typing end it.
 #[derive(Clone, Default)]
@@ -343,20 +340,20 @@ impl Glide {
 /// Levels line `line` with the field's docked reading position (the
 /// editor's own centre, as `reveal_position(.., center)` places it) by a
 /// [`motion::CAMERA_MS`] glide on the camera's curve from where the column is
-/// now; at once under reduced motion or when `cut` (the editor was just
-/// mounted).
+/// now; at once under reduced motion, for an instant request, or when the
+/// editor was just mounted.
 ///
 /// The target is the editor's own: the reveal is asked for, its scroll offset
 /// read, and the offset put back before anything is drawn. A glide already in
 /// flight is replaced from the column's current position, so a new target
 /// mid-glide turns the column without a jump.
-fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, cut: bool) {
+fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, instant: bool) {
     let Some(api) = editor.api::<EditorApi>() else {
         return;
     };
     glide.stop();
     let position = EditorPosition::new(line, 0);
-    if cut || motion::reduced_motion() {
+    if instant || motion::reduced_motion() {
         api.reveal_position(position, true);
         return;
     }
@@ -1273,10 +1270,9 @@ mod tests {
         app
     }
 
-    /// The camera glides: `focus_document_line` (what `J`/`K`, a review's
-    /// arrival and a revision's current hunk call) moves the column over
-    /// [`motion::CAMERA_MS`] on the camera's curve, not at once, and ends
-    /// with the line level with the docked reading position.
+    /// An occasional `focus_document_line` request moves the column over
+    /// [`motion::CAMERA_MS`] on the camera's curve, not at once, and ends with
+    /// the line level with the docked reading position.
     #[test]
     fn the_camera_glides_to_the_anchored_line() {
         let mut app = glide_probe(false);

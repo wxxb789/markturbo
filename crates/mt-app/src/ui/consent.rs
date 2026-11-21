@@ -128,16 +128,6 @@ fn waiting(state: &AppState) -> Waiting {
     }
 }
 
-fn enter_card_motion(rise: &AnimatedValue, scale: &AnimatedValue) {
-    if motion::reduced_motion() {
-        rise.set(0.0);
-        scale.set(1.0);
-    } else {
-        rise.timing(0.0, motion::CARD_RISE_MS, motion::EASE_OUT);
-        scale.timing(1.0, motion::ENTER_MS, motion::EASE_OUT);
-    }
-}
-
 /// The consent card.
 pub fn card(state: AppState, language: Language) -> impl IntoElement {
     // The card owns Enter, Escape and the hold: the source editor gives up
@@ -148,13 +138,6 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     // It takes its colour adaptively, so the theme stays current without a
     // rebuild.
     let shadow = shadow();
-    // The card rises and scales only when the system allows motion. The shell
-    // owns the scrim and exit lifecycle.
-    let rise = animated_value(motion::CARD_RISE_PX);
-    let scale = animated_value(motion::SCALE_FLOOR);
-    effect(move || {
-        enter_card_motion(&rise, &scale);
-    });
     // One hold for as long as the card lives, shared with the keyboard
     // bindings below: the body resets it whenever it is built again.
     let hold = Hold::new(state.clone(), is_revision, language);
@@ -164,7 +147,7 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     keyboard(state.clone(), is_revision, hold.clone());
     let body_state = state.clone();
     let body_hold = hold.clone();
-    view()
+    motion::card_enter(view())
         .test_id("consent-card")
         .w(px(tokens::CONSENT_CARD_MAX_W))
         .flex_col()
@@ -187,9 +170,6 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             Color::rgba(0, 0, 0, 36),
             Color::rgba(0, 0, 0, 115),
         ))
-        .when(!motion::reduced_motion(), |card| {
-            card.bind_scale(&scale).bind_translate_y(&rise)
-        })
         .child(
             text(if is_revision {
                 S::HeadlineRevision.text(language)

@@ -11,7 +11,7 @@ mod support;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use nsh_core::element::{Idiom, Os};
@@ -29,10 +29,28 @@ const EDITOR: &str = "label:Markdown source";
 /// be played at the platform's rate. The directories live as long as the
 /// returned guards.
 fn start(provider: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    start_with_clock(provider, provider)
+}
+
+fn start_with_clock(
+    provider: bool,
+    manual_clock: bool,
+) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    start_with_files(provider, manual_clock, &[])
+}
+
+fn start_with_files(
+    provider: bool,
+    manual_clock: bool,
+    files: &[(&str, &str)],
+) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let directory = tempfile::tempdir().expect("document dir");
     let config = tempfile::tempdir().expect("config dir");
     let document = directory.path().join("plan.md");
     std::fs::write(&document, SOURCE).expect("write document");
+    for (name, text) in files {
+        std::fs::write(directory.path().join(name), text).expect("write extra document");
+    }
     if provider {
         let base_url = loopback_provider();
         let endpoint = mt_core::model::EndpointIdentity::parse(
@@ -61,16 +79,37 @@ fn start(provider: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
     engine.environment.os = Os::Windows;
     engine.environment.idiom = Idiom::Desktop;
-    if provider {
+    if manual_clock {
         engine.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
-        engine.environment.reduce_motion = true;
     }
+    engine.environment.reduce_motion = provider;
     let mut app = Headless::start(engine).expect("start the app");
     app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
         .expect("viewport");
     app.wait_for(EDITOR).expect("the source editor");
     app.settle();
     (app, directory, config)
+}
+
+fn press_without_settling(app: &Headless, selector: &str) {
+    let id = app
+        .screen()
+        .press_target(selector)
+        .expect("the selector parses")
+        .unwrap_or_else(|| panic!("{selector} is pressable"));
+    let engine = app.engine().control();
+    engine.dispatch_event(
+        id,
+        nsh_core::EventKind::Press,
+        nsh_core::EventPayload::Press(Default::default()),
+    );
+    let (sent, received) = mpsc::channel();
+    engine.flush(move |_| {
+        let _ = sent.send(());
+    });
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the non-settling press was handled");
 }
 
 fn sent(app: &Headless) -> bool {
@@ -349,6 +388,63 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
         "the editor received the character after the title-file press: {:?}",
         app.screen().texts()
     );
+}
+
+#[test]
+fn a_fading_menu_row_does_not_take_a_press_and_workspace_remains_reachable() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _directory, _config) =
+        start_with_files(false, true, &[("second.md", "Second document\n")]);
+    app.press_key("mod+p").expect("open the file palette");
+    app.wait_for("id:palette-input")
+        .expect("the palette's line");
+    app.type_text("id:palette-input", "second")
+        .expect("filter to second.md");
+    app.submit("id:palette-input").expect("open second.md");
+    app.wait_for("id:title-file >> text:second.md")
+        .expect("second.md becomes active");
+    let settings = "id:title-settings";
+    let split = "id:title-menu-split";
+
+    press_without_settling(&app, settings);
+    app.wait_for(split).expect("the split row is open");
+    for _ in 0..2 {
+        app.next_frame(Duration::from_millis(16))
+            .expect("advance the menu entrance");
+    }
+    let split_row = app
+        .screen()
+        .press_target(split)
+        .expect("the selector parses")
+        .expect("the open row receives presses");
+
+    press_without_settling(&app, settings);
+    for _ in 0..2 {
+        app.next_frame(Duration::from_millis(16))
+            .expect("advance into the menu exit");
+    }
+    let exit_nodes = app.screen().layout_nodes();
+    exit_nodes
+        .iter()
+        .find(|node| node.test_id.as_deref() == Some("title-menu"))
+        .expect("the menu remains mounted during the fade");
+    exit_nodes
+        .iter()
+        .find(|node| node.id == split_row)
+        .expect("the split row remains mounted during the fade");
+    assert!(
+        !exit_nodes
+            .iter()
+            .any(|node| node.test_id.as_deref() == Some("title-menu-scrim")),
+        "the full-window scrim is removed while the menu fades"
+    );
+    app.press(split)
+        .expect_err("the fading split row cannot take a press");
+    // Headless::press dispatches the selected press before settling the animation.
+    app.press("label:plan.md")
+        .expect("the workspace rail remains reachable during the exit");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("the rail row switched to plan.md before exit settled");
 }
 
 // ─── the loopback provider ────────────────────────────────────────────────

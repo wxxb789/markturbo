@@ -362,7 +362,7 @@ fn toggle_compare(state: &AppState) {
 /// racks a finding.
 fn focus_line(state: &AppState, tab: &Tab) {
     if let Some(line) = conflict_focus_line(state, tab) {
-        state.focus_document_line(tab.id, line);
+        state.focus_document_line_instant(tab.id, line);
     }
 }
 
@@ -918,17 +918,6 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
     // The card owns its keys: the source editor gives up the focus.
     state.blur_source_editor();
     bind_guard_keys(&state);
-    let rise = animated_value(motion::CARD_RISE_PX);
-    let scale = animated_value(motion::SCALE_FLOOR);
-    effect(move || {
-        if reduced_motion() {
-            rise.set(0.0);
-            scale.set(1.0);
-        } else {
-            rise.timing(0.0, motion::CARD_RISE_MS, motion::EASE_OUT);
-            scale.timing(1.0, motion::ENTER_MS, motion::EASE_OUT);
-        }
-    });
     let names_state = state.clone();
     let save_state = state.clone();
     let discard_state = state.clone();
@@ -936,7 +925,7 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
     let choice = request.choice;
     let busy = request.busy;
     let notice = request.notice;
-    view()
+    motion::card_enter(view())
         .test_id("guard-card")
         .w(px(GUARD_CARD_W))
         .flex_col()
@@ -945,9 +934,6 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .bg(move || tokens::palette().column_ground)
         .border(px(HAIRLINE))
         .border_color(move || tokens::palette().hairline)
-        .when(!reduced_motion(), |card| {
-            card.bind_scale(&scale).bind_translate_y(&rise)
-        })
         .child(prims::ink(s(S::CloseWithoutSaving, language)))
         .child(
             text(move || documents_line(&names_state, request.tab, language))
@@ -1365,7 +1351,97 @@ fn more_lines_text(hidden: usize, language: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        sync::mpsc,
+        time::{Duration, SystemTime},
+    };
+
+    use nsh_engine::{EngineConfig, Points, Root};
+    use nsh_testing::Headless;
+
+    #[component]
+    fn StatusProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let start = state.clone();
+        let takeover = state.clone();
+        view()
+            .w(px(400.0))
+            .h(px(120.0))
+            .flex_col()
+            .child(
+                view()
+                    .test_id("status-start")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        start.notify("First status");
+                    })
+                    .child(prims::ink("Start status")),
+            )
+            .child(
+                view()
+                    .test_id("status-takeover")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        takeover.notify_held("Second status");
+                    })
+                    .child(prims::ink("Take over")),
+            )
+            .child(status_line(state, Language::English))
+    }
+
+    fn press_without_settling(app: &mut Headless, selector: &str) {
+        let id = app.screen().press_target(selector).unwrap().unwrap();
+        let (sent, received) = mpsc::channel();
+        {
+            let engine = app.engine().control();
+            engine.dispatch_event(
+                id,
+                nsh_core::EventKind::Press,
+                nsh_core::EventPayload::Press(Default::default()),
+            );
+            engine.flush(move |_| {
+                let _ = sent.send(());
+            });
+        }
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.catch_up();
+    }
+
+    fn status_app() -> Headless {
+        let mut config = EngineConfig::new(Root::of::<StatusProbe>());
+        config.clock = nsh_core::time::Clock::manual(SystemTime::now());
+        let mut app = Headless::start(config).expect("start the status harness");
+        app.set_viewport(nsh_core::Size::new(Points(400.0), Points(120.0)))
+            .expect("set the viewport");
+        app.wait_for("id:status-start")
+            .expect("the status harness mounts");
+        app
+    }
+
+    #[test]
+    fn a_new_status_takes_over_during_the_previous_exit() {
+        let mut app = status_app();
+        press_without_settling(&mut app, "id:status-start");
+        assert!(app.screen().shows("First status"));
+        app.next_frame(Duration::from_millis(16))
+            .expect("start the status timers");
+
+        let before_old_clear =
+            motion::STATUS_HOLD_MS + motion::ENTER_MS as u64 + motion::EXIT_MS as u64 / 2;
+        app.wait(Duration::from_millis(before_old_clear))
+            .expect("advance halfway through the old status exit");
+        assert!(app.screen().shows("First status"));
+
+        press_without_settling(&mut app, "id:status-takeover");
+        assert!(app.screen().shows("Second status"));
+
+        app.wait(Duration::from_millis(motion::EXIT_MS as u64 + 250))
+            .expect("advance past the old status clear deadline");
+        assert!(
+            app.screen().shows("Second status"),
+            "the old status timeout must not clear its replacement"
+        );
+    }
 
     #[test]
     fn identical_files_have_no_differences() {

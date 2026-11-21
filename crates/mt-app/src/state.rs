@@ -458,16 +458,17 @@ pub struct ReviewView {
     pub partial: bool,
 }
 
-/// The column's camera: the document line a surface asked the source editor to
-/// level with its docked reading position (a review's racked finding, a
-/// revision's current hunk). The document lane's `ui::document` scrolls to it;
-/// nothing here changes the document.
+/// The column's camera: the document line a docked review or conflict surface
+/// asked the source editor to level with its reading position. The document
+/// lane's `ui::document` scrolls to it; nothing here changes the document.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DocumentFocus {
     /// The tab the line belongs to; another tab's request is ignored.
     pub tab: u64,
     /// The line, from 0.
     pub line: u32,
+    /// Whether this request may glide; frequent and keyboard navigation cuts.
+    pub animated: bool,
     /// Bumped by every request, so asking again for the same line levels it
     /// again.
     pub request: u64,
@@ -1274,15 +1275,24 @@ impl AppState {
     }
 
     /// Ask the source column to level `line` (from 0) of tab `tab_id` with
-    /// its docked reading position — the review's racked finding, a
-    /// revision's current hunk. The document lane's `ui::document` does the
-    /// scrolling, so the anchored lines and the field's docked explanation
-    /// sit level; the document itself is never touched.
+    /// its docked reading position, with an occasional camera glide. Frequent
+    /// or keyboard navigation uses [`Self::focus_document_line_instant`].
     pub fn focus_document_line(&self, tab_id: u64, line: u32) {
+        self.request_document_line(tab_id, line, true);
+    }
+
+    /// Ask the source column to level `line` (from 0) of tab `tab_id` at once.
+    /// Use for frequent or keyboard-driven navigation.
+    pub fn focus_document_line_instant(&self, tab_id: u64, line: u32) {
+        self.request_document_line(tab_id, line, false);
+    }
+
+    fn request_document_line(&self, tab_id: u64, line: u32, animated: bool) {
         let request = self.document_focus.get().request.wrapping_add(1);
         self.document_focus.set(DocumentFocus {
             tab: tab_id,
             line,
+            animated,
             request,
         });
     }
