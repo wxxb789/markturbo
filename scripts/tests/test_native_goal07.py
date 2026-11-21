@@ -34,7 +34,7 @@ ALL_ACCEPTED = runtime.fingerprint_bytes(HARNESS.apply_edits(HARNESS.EDITOR_SOUR
 DISK = runtime.fingerprint_bytes(HARNESS.SOURCE_BYTES)
 STALE = runtime.fingerprint_text(HARNESS.STALE_EDIT)
 PROPOSAL_AFTER = 'goal07 = "new"'
-PIXEL_CELL_RESULTS = [True] * (len(HARNESS.FIXTURE_ATTEMPT_SOURCE) + 2)
+PIXEL_CELL_RESULTS = [True] * (len(HARNESS.FIXTURE_ATTEMPT_SOURCE) + 3)
 
 
 def credential_target(endpoint: str) -> str:
@@ -659,9 +659,9 @@ class PixelCellObservationTests(unittest.TestCase):
     def test_detector_reports_each_dynamic_cell_with_color_tolerance(self) -> None:
         expected = [
             HARNESS.CELL_SCRIPT_COLOR,
-            HARNESS.CELL_ATTEMPT_COLOR,
-            HARNESS.CELL_ATTEMPT_COLOR,
+            *([HARNESS.CELL_ATTEMPT_COLOR] * len(HARNESS.FIXTURE_ATTEMPT_SOURCE)),
             HARNESS.CELL_COMPLETE_COLOR,
+            HARNESS.CELL_ASSIGNED_COLOR,
         ]
         image = self.synthetic_grid(expected)
         self.assertEqual(HARNESS.detect_fixture_cells(image), [True] * len(expected))
@@ -674,18 +674,19 @@ class PixelCellObservationTests(unittest.TestCase):
     def test_detector_rejects_a_missing_or_wrong_color_cell(self) -> None:
         expected = [
             HARNESS.CELL_SCRIPT_COLOR,
-            HARNESS.CELL_ATTEMPT_COLOR,
-            HARNESS.CELL_ATTEMPT_COLOR,
+            *([HARNESS.CELL_ATTEMPT_COLOR] * len(HARNESS.FIXTURE_ATTEMPT_SOURCE)),
             HARNESS.CELL_COMPLETE_COLOR,
+            HARNESS.CELL_ASSIGNED_COLOR,
         ]
         missing = self.synthetic_grid(expected, missing=1)
-        self.assertEqual(HARNESS.detect_fixture_cells(missing), [True, False, True, True])
+        incomplete = [True, False, *([True] * (len(expected) - 2))]
+        self.assertEqual(HARNESS.detect_fixture_cells(missing), incomplete)
 
         wrong_color = self.synthetic_grid(
             [expected[0], (255, 0, 0), *expected[2:]]
         )
         self.assertEqual(
-            HARNESS.detect_fixture_cells(wrong_color), [True, False, True, True]
+            HARNESS.detect_fixture_cells(wrong_color), incomplete
         )
 
     def test_unpainted_attempt_cells_cannot_satisfy_the_verdict(self) -> None:
@@ -796,7 +797,9 @@ class PhaseTests(unittest.TestCase):
                 with (
                     mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
                     mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
-                    self.assertRaisesRegex(runtime.HarnessFailure, "SELF_NAVIGATION_NOT_RUN"),
+                    self.assertRaisesRegex(
+                        runtime.HarnessFailure, "SELF_NAVIGATION_FRAME_NOT_REPLACED"
+                    ),
                 ):
                     harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
@@ -821,6 +824,36 @@ class PhaseTests(unittest.TestCase):
         harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
 
+    def test_web_phase_requires_the_assigned_cell_in_sample_one(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [list(PIXEL_CELL_RESULTS[:-1]), []]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_fails_when_sample_one_is_blank(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [[], []]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
     def test_web_phase_fails_when_sample_two_is_never_read(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
 
@@ -832,7 +865,9 @@ class PhaseTests(unittest.TestCase):
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=skip_navigation_sample),
-            self.assertRaisesRegex(runtime.HarnessFailure, "SELF_NAVIGATION_NOT_RUN"),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_SAMPLE_TWO_NOT_OBSERVED"
+            ),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
@@ -846,7 +881,9 @@ class PhaseTests(unittest.TestCase):
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
-            self.assertRaisesRegex(runtime.HarnessFailure, "PIXEL_CELLS_TIMEOUT"),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE"
+            ),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
@@ -898,10 +935,10 @@ class PhaseTests(unittest.TestCase):
             self.assertIn('`https://127.0.0.1:${tcpPort}`', source)
             self.assertNotIn("location = `${tcpLoopback}/frame`", source)
             self.assertEqual(
-                source.count('location = "https://blocked-preview-navigation.invalid/"'), 1
+                source.count('location.href = "https://blocked-preview-navigation.invalid/"'), 1
             )
             self_location = source.index(
-                'location = "https://blocked-preview-navigation.invalid/"'
+                'location.href = "https://blocked-preview-navigation.invalid/"'
             )
             for attempt in (
                 'window.open(`${tcpLoopback}/popup`',
@@ -933,11 +970,13 @@ const expectedAttempts = Number(process.argv[1]);
 const mode = process.argv[2];
 const webrtcAttemptIndex = Number(process.argv[3]);
 const samplePauseMilliseconds = Number(process.argv[4]);
-const [pendingColor, scriptColor, attemptColor, completeColor] = process.argv.slice(5);
+const [pendingColor, scriptColor, attemptColor, completeColor, assignedColor] = process.argv.slice(5);
 const cells = [];
 const calls = [];
 const cellWrites = [];
 let sampleOne = null;
+let replaceAfterAssigned = false;
+let cellGrid;
 function makeStyle() {
   let backgroundColor = "";
   return {
@@ -950,6 +989,10 @@ function makeStyle() {
     set backgroundColor(value) {
       backgroundColor = value;
       cellWrites.push([value, calls.length]);
+      if (value === assignedColor) {
+        sampleOne = sampleCells();
+        if (replaceAfterAssigned) cellGrid.children.length = 0;
+      }
     },
     get backgroundColor() { return backgroundColor; },
   };
@@ -960,11 +1003,20 @@ function makeCell() {
   return cell;
 }
 const scriptCell = makeCell();
-const cellGrid = {
+cellGrid = {
   style: makeStyle(),
   appendChild(cell) { this.children.push(cell); },
   children: [scriptCell],
 };
+function sampleCells() {
+  return cellGrid.children.map((cell, index) => {
+    let expected = attemptColor;
+    if (index === 0) expected = scriptColor;
+    else if (index === expectedAttempts + 1) expected = completeColor;
+    else if (index === expectedAttempts + 2) expected = assignedColor;
+    return cell.style.backgroundColor === expected;
+  });
+}
 const userLink = {
   href: "",
   target: "_self",
@@ -1036,10 +1088,6 @@ const context = {
   } : mode === "rtc-fails" ? function () { throw new Error("blocked"); } : undefined,
   setTimeout(callback, milliseconds) {
     if (milliseconds === samplePauseMilliseconds) {
-      sampleOne = cellGrid.children.map((cell, index) => {
-        const expected = index === 0 ? scriptColor : index === cellGrid.children.length - 1 ? completeColor : attemptColor;
-        return cell.style.backgroundColor === expected;
-      });
       if (mode === "missing-navigation") return 0;
     }
     if (mode !== "never-run") callback();
@@ -1050,13 +1098,15 @@ context.top = {};
 Object.defineProperty(context.top, "location", {
   set(url) { calls.push(["top", url]); throw new Error("blocked"); },
 });
-Object.defineProperty(context, "location", {
+const location = {};
+Object.defineProperty(location, "href", {
   set(url) {
     calls.push(["location", url]);
-    if (mode === "success" || mode === "rtc-fails") cellGrid.children.length = 0;
-    throw new Error("blocked");
+    if (mode === "setter-throws") throw new Error("blocked");
+    replaceAfterAssigned = mode === "success" || mode === "rtc-fails";
   },
 });
+context.location = location;
 async function main() {
   const source = require("node:fs").readFileSync(0, "utf8");
   const runCall = "runAttempts();";
@@ -1066,18 +1116,21 @@ async function main() {
   const runner = vm.runInNewContext(code, context);
   if (mode === "missing-navigation") await new Promise(setImmediate);
   else if (mode !== "never-run") await runner;
-  const attemptCells = cells.slice(1, -1);
-  const completeCell = cells[cells.length - 1];
-  const results = cellGrid.children.map((cell, index) => {
-    const expected = index === 0 ? scriptColor : index === cellGrid.children.length - 1 ? completeColor : attemptColor;
-    return cell.style.backgroundColor === expected;
-  });
+  const attemptCells = cells.slice(1, -2);
+  const completeCell = cells[cells.length - 2];
+  const assignedCell = cells[cells.length - 1];
+  const results = sampleCells();
   if (attemptCells.length !== expectedAttempts) throw new Error("attempt cell count mismatch");
   if (mode === "never-run") {
     if (calls.length !== 0) throw new Error("fake browser unexpectedly ran an attempt");
-    if (attemptCells[0].style.backgroundColor !== pendingColor || completeCell.style.backgroundColor !== pendingColor) throw new Error("unstarted attempt painted a cell");
+    if (attemptCells[0].style.backgroundColor !== pendingColor || completeCell.style.backgroundColor !== pendingColor || assignedCell.style.backgroundColor !== pendingColor) throw new Error("unstarted attempt painted a cell");
     if (results.every(Boolean)) throw new Error("unstarted attempt passed the cell verdict");
     console.log("pixel-cell verdict rejected unstarted attempts");
+    return;
+  }
+  if (mode === "setter-throws") {
+    if (sampleOne !== null || assignedCell.style.backgroundColor !== pendingColor) throw new Error("throwing navigation painted the assigned marker");
+    console.log("throwing navigation did not paint the assigned marker");
     return;
   }
   if (mode === "rtc-available") {
@@ -1086,8 +1139,8 @@ async function main() {
     return;
   }
   if (mode === "missing-navigation") {
-    if (!sampleOne || !sampleOne.every(Boolean) || calls.some(([kind]) => kind === "location")) throw new Error("missing self-navigation did not fail after sample 1");
-    console.log("fixture reached sample 1 but not self-navigation");
+    if (sampleOne !== null || calls.some(([kind]) => kind === "location") || assignedCell.style.backgroundColor !== pendingColor) throw new Error("missing self-navigation reached the assigned marker");
+    console.log("fixture did not reach the assigned marker");
     return;
   }
   if (mode === "rtc-fails") {
@@ -1104,6 +1157,8 @@ async function main() {
   if (attemptWrites.at(-1)[1] !== calls.length - 1) throw new Error("HTTPS navigation cell was not painted before its call");
   const completeWrites = cellWrites.filter(([color]) => color === completeColor);
   if (completeWrites.length !== 1 || completeWrites[0][1] !== calls.length - 1) throw new Error("about-to-self-navigate cell was not painted before HTTPS self-navigation");
+  const assignedWrites = cellWrites.filter(([color]) => color === assignedColor);
+  if (assignedWrites.length !== 1 || assignedWrites[0][1] !== calls.length) throw new Error("assigned cell was not painted after HTTPS self-navigation returned");
   if (calls.length !== expectedAttempts - 1) throw new Error("not every automatic attempt ran");
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
@@ -1113,7 +1168,15 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
             for index, attempt in enumerate(HARNESS.FIXTURE_ATTEMPT_SOURCE)
             if "new RTCPeerConnection" in attempt
         )
-        for mode in ("success", "rtc-fails", "rtc-available", "never-run", "missing-navigation", "cancelled-navigation"):
+        for mode in (
+            "success",
+            "rtc-fails",
+            "rtc-available",
+            "never-run",
+            "missing-navigation",
+            "cancelled-navigation",
+            "setter-throws",
+        ):
             with self.subTest(mode=mode):
                 result = subprocess.run(
                     [
@@ -1128,6 +1191,7 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
                         HARNESS._css_rgb(HARNESS.CELL_SCRIPT_COLOR),
                         HARNESS._css_rgb(HARNESS.CELL_ATTEMPT_COLOR),
                         HARNESS._css_rgb(HARNESS.CELL_COMPLETE_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_ASSIGNED_COLOR),
                     ],
                     input=script,
                     text=True,
@@ -1141,7 +1205,9 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
                 elif mode == "rtc-available":
                     self.assertIn("working WebRTC did not reach self-navigation", result.stdout)
                 elif mode == "missing-navigation":
-                    self.assertIn("fixture reached sample 1 but not self-navigation", result.stdout)
+                    self.assertIn("fixture did not reach the assigned marker", result.stdout)
+                elif mode == "setter-throws":
+                    self.assertIn("throwing navigation did not paint the assigned marker", result.stdout)
 
     def test_probe_listeners_bind_ephemeral_loopback_ports_and_count_only_contacts(self) -> None:
         with HARNESS.NetworkProbeListeners() as probes:
@@ -1171,11 +1237,11 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
 
     def test_web_phase_rejects_a_missing_completion_cell(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
-        order.read_fixture_cell_results.side_effect = [PIXEL_CELL_RESULTS[:-1]]
+        order.read_fixture_cell_results.side_effect = [[*PIXEL_CELL_RESULTS[:-2], False, True], []]
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
-            self.assertRaisesRegex(runtime.HarnessFailure, "PIXEL_CELLS_TIMEOUT"),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^PIXEL_CELLS_TIMEOUT$"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
         order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)

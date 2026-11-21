@@ -154,6 +154,7 @@ CELL_PENDING_COLOR = (72, 72, 72)
 CELL_SCRIPT_COLOR = (24, 168, 93)
 CELL_ATTEMPT_COLOR = (48, 112, 224)
 CELL_COMPLETE_COLOR = (240, 176, 32)
+CELL_ASSIGNED_COLOR = (176, 72, 184)
 SELF_NAVIGATION_SAMPLE_MS = 1000
 
 
@@ -199,7 +200,7 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => { const frame = document.createElement(\"iframe\"); frame.src = `https://127.0.0.1:${tcpPort}/subframe`; document.body.appendChild(frame); } },",
     "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} } },",
     "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
-    '  { run: () => { try { location = "https://blocked-preview-navigation.invalid/"; } catch (_) {} } },',
+    '  { run: () => { try { location.href = "https://blocked-preview-navigation.invalid/"; assignedCell.style.backgroundColor = assignedCellColor; } catch (_) {} } },',
 )
 
 
@@ -228,6 +229,7 @@ SOURCE_TEXT = (
     f"const scriptCellColor = \"{_css_rgb(CELL_SCRIPT_COLOR)}\";\r\n"
     f"const attemptCellColor = \"{_css_rgb(CELL_ATTEMPT_COLOR)}\";\r\n"
     f"const completeCellColor = \"{_css_rgb(CELL_COMPLETE_COLOR)}\";\r\n"
+    f"const assignedCellColor = \"{_css_rgb(CELL_ASSIGNED_COLOR)}\";\r\n"
     f"const borderColor = \"{_css_rgb(CELL_BORDER_COLOR)}\";\r\n"
     f'cellGrid.style.left = ({CELL_GRID_LEFT} / pixelRatio) + "px";\r\n'
     f'cellGrid.style.top = ({CELL_GRID_TOP} / pixelRatio) + "px";\r\n'
@@ -264,7 +266,8 @@ SOURCE_TEXT = (
     + "\r\n];\r\n"
     "prepareCell(scriptCell);\r\n"
     "const attemptCells = networkAttempts.map(() => createCell());\r\n"
-    "const selfNavigationCell = createCell();\r\n"
+    "const aboutToNavigateCell = createCell();\r\n"
+    "const assignedCell = createCell();\r\n"
     "scriptCell.style.backgroundColor = scriptCellColor;\r\n"
     "async function runAttempts() {\r\n"
     "  const finalIndex = networkAttempts.length - 1;\r\n"
@@ -283,7 +286,7 @@ SOURCE_TEXT = (
     "  await delay(50);\r\n"
     "  // Hold the final attempt's cells long enough for the native harness to sample them.\r\n"
     "  attemptCells[finalIndex].style.backgroundColor = attemptCellColor;\r\n"
-    "  selfNavigationCell.style.backgroundColor = completeCellColor;\r\n"
+    "  aboutToNavigateCell.style.backgroundColor = completeCellColor;\r\n"
     "  await delay(SELF_NAVIGATION_SAMPLE_MS);\r\n"
     "  networkAttempts[finalIndex].run();\r\n"
     "}\r\n"
@@ -473,6 +476,7 @@ def detect_fixture_cells(image: Any) -> list[bool]:
         CELL_SCRIPT_COLOR,
         CELL_ATTEMPT_COLOR,
         CELL_COMPLETE_COLOR,
+        CELL_ASSIGNED_COLOR,
     )
     for index in range(slot_count):
         left = CELL_GRID_LEFT + index * step
@@ -491,8 +495,10 @@ def detect_fixture_cells(image: Any) -> list[bool]:
         center = image.getpixel((first_center_x + index * step, center_y))
         if index == 0:
             expected = CELL_SCRIPT_COLOR
-        elif index == last_cell:
+        elif index == len(FIXTURE_ATTEMPT_SOURCE) + 1:
             expected = CELL_COMPLETE_COLOR
+        elif index == len(FIXTURE_ATTEMPT_SOURCE) + 2:
+            expected = CELL_ASSIGNED_COLOR
         else:
             expected = CELL_ATTEMPT_COLOR
         cells.append(_pixel_matches(center, expected))
@@ -502,7 +508,7 @@ def detect_fixture_cells(image: Any) -> list[bool]:
 def fixture_cells_complete(cells: Any) -> bool:
     return (
         isinstance(cells, list)
-        and len(cells) == len(FIXTURE_ATTEMPT_SOURCE) + 2
+        and len(cells) == len(FIXTURE_ATTEMPT_SOURCE) + 3
         and all(type(cell) is bool for cell in cells)
         and all(cells)
     )
@@ -511,7 +517,7 @@ def fixture_cells_complete(cells: Any) -> bool:
 def validate_cell_results(value: Any) -> None:
     if (
         not isinstance(value, list)
-        or len(value) != len(FIXTURE_ATTEMPT_SOURCE) + 2
+        or len(value) != len(FIXTURE_ATTEMPT_SOURCE) + 3
         or any(type(cell) is not bool for cell in value)
     ):
         raise ValueError("invalid WebView pixel-cell observations")
@@ -1152,16 +1158,27 @@ class Goal07Harness(NativeHarness):
         record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
 
+        assigned_index = len(FIXTURE_ATTEMPT_SOURCE) + 2
+        assigned_seen = False
+
         def completed_cells() -> list[bool] | None:
+            nonlocal assigned_seen
             cells = self.read_fixture_cell_results(app)
+            if len(cells) > assigned_index and cells[assigned_index] is True:
+                assigned_seen = True
             return cells if fixture_cells_complete(cells) else None
 
-        cell_results = wait_until(
-            completed_cells,
-            self.ui_timeout,
-            "PIXEL_CELLS_TIMEOUT",
-            interval=0.1,
-        )
+        try:
+            cell_results = wait_until(
+                completed_cells,
+                self.ui_timeout,
+                "PIXEL_CELLS_TIMEOUT",
+                interval=0.1,
+            )
+        except HarnessFailure as error:
+            if error.code == "PIXEL_CELLS_TIMEOUT" and not assigned_seen:
+                raise HarnessFailure("SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE") from error
+            raise
         observed["web_security_cell_results"] = cell_results
         if app.process.poll() is not None:
             raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
@@ -1179,11 +1196,11 @@ class Goal07Harness(NativeHarness):
         wait_until(
             frame_replaced,
             SELF_NAVIGATION_TIMEOUT_SECONDS,
-            "SELF_NAVIGATION_NOT_RUN",
+            "SELF_NAVIGATION_FRAME_NOT_REPLACED",
             interval=0.1,
         )
         if post_navigation_cells is None:
-            raise HarnessFailure("SELF_NAVIGATION_NOT_RUN")
+            raise HarnessFailure("SELF_NAVIGATION_SAMPLE_TWO_NOT_OBSERVED")
         record(
             observed,
             "web_security_post_navigation_cell_results",

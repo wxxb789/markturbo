@@ -5,6 +5,12 @@
 
 use std::borrow::Cow;
 
+use html5ever::buffer_queue::BufferQueue;
+use html5ever::tokenizer::{
+    Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerResult,
+};
+use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts};
+use markup5ever_rcdom::{Handle, RcDom};
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
 use mt_core::{Block, BlockKind, DocType, Document};
 
@@ -54,6 +60,7 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
             )
         }
     };
+    let page = strip_resource_hints(&page);
     let host = format!(
         "<!doctype html><html><head>{host_csp}<meta charset=\"utf-8\">\
          <style>iframe{{position:fixed;inset:0;width:100%;height:100%;border:0}}</style>\
@@ -70,6 +77,133 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
     } else {
         host
     }
+}
+
+fn strip_resource_hints(page: &str) -> Cow<'_, str> {
+    let candidates = page.match_indices('<').filter_map(|(start, _)| {
+        let tag = page.as_bytes().get(start + 1..start + 6)?;
+        (tag[..4].eq_ignore_ascii_case(b"link")
+            && (html_whitespace(char::from(tag[4])) || matches!(tag[4], b'/' | b'>')))
+        .then_some(start)
+    });
+    let mut candidates = candidates.peekable();
+    if candidates.peek().is_none() {
+        return Cow::Borrowed(page);
+    }
+
+    let mut tokenizer = Tokenizer::new(ResourceHintTokens::default(), Default::default());
+    let mut input = BufferQueue::default();
+    let mut previous = 0;
+    let mut copied = 0;
+    let mut filtered = String::new();
+    for (end, next_link) in candidates
+        .map(|start| (start + 1, Some(start)))
+        .chain(std::iter::once((page.len(), None)))
+    {
+        input.push_back(page[previous..end].into());
+        while let TokenizerResult::Script(_) = tokenizer.feed(&mut input) {
+            if let Some(start) = tokenizer.sink.hint_start.take() {
+                filtered.push_str(&page[copied..start]);
+                filtered.push_str("<!---->");
+                copied = opening_tag_end(&page[start..], "link").map_or_else(
+                    || end - queued_bytes(&mut input),
+                    |rest| page.len() - rest.len(),
+                );
+            }
+        }
+        if tokenizer.sink.candidate.is_none() {
+            tokenizer.sink.candidate = next_link;
+        }
+        previous = end;
+    }
+    if copied == 0 {
+        Cow::Borrowed(page)
+    } else {
+        filtered.push_str(&page[copied..]);
+        Cow::Owned(filtered)
+    }
+}
+
+fn queued_bytes(input: &mut BufferQueue) -> usize {
+    let mut tail = Vec::new();
+    while let Some(chunk) = input.pop_front() {
+        tail.push(chunk);
+    }
+    let bytes = tail.iter().map(|chunk| chunk.len()).sum();
+    for chunk in tail {
+        input.push_back(chunk);
+    }
+    bytes
+}
+
+struct ResourceHintTokens {
+    tree: TreeBuilder<Handle, RcDom>,
+    candidate: Option<usize>,
+    hint_start: Option<usize>,
+}
+
+impl Default for ResourceHintTokens {
+    fn default() -> Self {
+        Self {
+            tree: TreeBuilder::new(
+                RcDom::default(),
+                TreeBuilderOpts {
+                    iframe_srcdoc: true,
+                    ..TreeBuilderOpts::default()
+                },
+            ),
+            candidate: None,
+            hint_start: None,
+        }
+    }
+}
+
+impl TokenSink for ResourceHintTokens {
+    type Handle = Option<Handle>;
+
+    fn process_token(&mut self, token: Token, line: u64) -> TokenSinkResult<Self::Handle> {
+        if !matches!(token, Token::ParseError(_)) {
+            let candidate = self.candidate.take();
+            if let Token::TagToken(tag) = &token
+                && is_resource_hint(tag)
+            {
+                self.hint_start = candidate;
+                // Pause after the tag to measure its original end in the input queue.
+                return TokenSinkResult::Script(None);
+            }
+        }
+        match self.tree.process_token(token, line) {
+            TokenSinkResult::Continue => TokenSinkResult::Continue,
+            TokenSinkResult::Plaintext => TokenSinkResult::Plaintext,
+            TokenSinkResult::RawData(kind) => TokenSinkResult::RawData(kind),
+            TokenSinkResult::Script(handle) => TokenSinkResult::Script(Some(handle)),
+        }
+    }
+
+    fn adjusted_current_node_present_but_not_in_html_namespace(&self) -> bool {
+        self.tree
+            .adjusted_current_node_present_but_not_in_html_namespace()
+    }
+}
+
+fn is_resource_hint(tag: &Tag) -> bool {
+    const HINTS: [&str; 6] = [
+        "preconnect",
+        "dns-prefetch",
+        "prefetch",
+        "preload",
+        "modulepreload",
+        "prerender",
+    ];
+    tag.kind == TagKind::StartTag
+        && tag.name.as_ref() == "link"
+        && tag.attrs.iter().any(|attr| {
+            attr.name.local.as_ref() == "rel"
+                && attr
+                    .value
+                    .split(html_whitespace)
+                    .any(|token| HINTS.iter().any(|hint| token.eq_ignore_ascii_case(hint)))
+        })
 }
 
 fn escape_srcdoc(page: &str) -> String {
@@ -326,7 +460,7 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
         run.clear();
         return;
     }
-    let options = markdown::Options {
+    let mut options = markdown::Options {
         parse: mt_core::document::doc::parse_options(doc.doc_type()),
         compile: markdown::CompileOptions {
             // The source is a local file the user opened; raw HTML in it is
@@ -338,6 +472,9 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
         },
     };
     let rendered = preserve_inline_scripts(run, &options.parse).and_then(|(source, scripts)| {
+        if !scripts.is_empty() {
+            options.parse.constructs.html_text = true;
+        }
         let html = markdown::to_html_with_options(source.as_ref(), &options)
             .map_err(|message| message.reason)?;
         restore_inline_scripts(html, scripts)
@@ -367,7 +504,8 @@ fn preserve_inline_scripts<'a>(
         return Ok((Cow::Borrowed(source), Vec::new()));
     };
     let mut ranges = Vec::new();
-    collect_inline_script_ranges(&ast, source, &mut ranges);
+    let mut jsx_names = Vec::new();
+    collect_inline_script_ranges(&ast, source, &mut ranges, &mut jsx_names);
     ranges.sort_unstable_by_key(|(start, _)| *start);
     if ranges.is_empty() {
         return Ok((Cow::Borrowed(source), Vec::new()));
@@ -376,30 +514,52 @@ fn preserve_inline_scripts<'a>(
     let marker_prefix = random_script_marker_prefix()?;
     let mut protected = String::with_capacity(source.len());
     let mut scripts = Vec::with_capacity(ranges.len());
+    jsx_names.sort_unstable();
+    let mut jsx_names = jsx_names.into_iter().peekable();
     let mut cursor = 0;
     for (index, (start, end)) in ranges.into_iter().enumerate() {
-        let Some(script) = source.get(start..end) else {
-            continue;
-        };
         if start < cursor {
             continue;
         }
-        let marker = format!("{marker_prefix}{index}END");
-        protected.push_str(&source[cursor..start]);
-        // Keep MDX markers plain text so adjacent delimiters cannot merge.
-        let rendered_marker = if parse_options.constructs.mdx_jsx_text {
-            protected.push_str(&marker);
-            marker
+        copy_mdx_text(&mut protected, source, cursor, start, &mut jsx_names);
+        let line_prefix = source[..start]
+            .rsplit_once('\n')
+            .map_or(&source[..start], |(_, line)| line);
+        // A punctuation guard keeps a line-leading comment in MDX's inline grammar.
+        let guard = if parse_options.constructs.mdx_jsx_text
+            && line_prefix
+                .trim_start_matches(|c| html_whitespace(c) || c == '>')
+                .is_empty()
+        {
+            "."
         } else {
-            let comment = format!("<!--{marker}-->");
-            protected.push_str(&comment);
-            comment
+            ""
         };
-        scripts.push((rendered_marker, script.to_string()));
+        let marker = format!("{guard}{marker_prefix}:{index}-->");
+        protected.push_str(&marker);
+        scripts.push((marker, source[start..end].to_string()));
         cursor = end;
     }
-    protected.push_str(&source[cursor..]);
+    copy_mdx_text(&mut protected, source, cursor, source.len(), &mut jsx_names);
     Ok((Cow::Owned(protected), scripts))
+}
+
+fn copy_mdx_text(
+    out: &mut String,
+    source: &str,
+    mut cursor: usize,
+    end: usize,
+    jsx_names: &mut std::iter::Peekable<impl Iterator<Item = usize>>,
+) {
+    while let Some(offset) = jsx_names.next_if(|&offset| offset < end) {
+        out.push_str(&source[cursor..offset]);
+        // A dollar-prefixed name stays an MDX tag when HTML text is enabled.
+        if !source[offset..].starts_with(html_whitespace) {
+            out.push('$');
+        }
+        cursor = offset;
+    }
+    out.push_str(&source[cursor..end]);
 }
 
 fn random_script_marker_prefix() -> Result<String, String> {
@@ -408,8 +568,7 @@ fn random_script_marker_prefix() -> Result<String, String> {
     getrandom::fill(&mut nonce)
         .map_err(|error| format!("could not generate script placeholder nonce: {error}"))?;
 
-    let mut prefix = String::with_capacity("MTMARKDOWNRAWSCRIPT".len() + nonce.len() * 2);
-    prefix.push_str("MTMARKDOWNRAWSCRIPT");
+    let mut prefix = String::from("<!--mt-script:");
     for byte in nonce {
         prefix.push(HEX[usize::from(byte >> 4)] as char);
         prefix.push(HEX[usize::from(byte & 0x0f)] as char);
@@ -421,16 +580,24 @@ fn collect_inline_script_ranges(
     node: &markdown::mdast::Node,
     source: &str,
     ranges: &mut Vec<(usize, usize)>,
+    jsx_names: &mut Vec<usize>,
 ) {
     use markdown::mdast::Node;
     if let Node::MdxJsxTextElement(jsx) = node
-        && jsx.name.as_deref() == Some("script")
         && let Some(position) = &jsx.position
         && let Some(raw) = source.get(position.start.offset..position.end.offset)
-        && !raw.ends_with("/>")
     {
-        ranges.push((position.start.offset, position.end.offset));
-        return;
+        let start = position.start.offset;
+        if jsx.name.as_deref() == Some("script") && !raw.ends_with("/>") {
+            ranges.push((start, position.end.offset));
+            return;
+        }
+        jsx_names.push(start + 1);
+        if !raw.ends_with("/>")
+            && let Some(close) = raw.rfind("</")
+        {
+            jsx_names.push(start + close + 2);
+        }
     }
 
     if matches!(
@@ -455,7 +622,7 @@ fn collect_inline_script_ranges(
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_inline_script_ranges(child, source, ranges);
+            collect_inline_script_ranges(child, source, ranges, jsx_names);
         }
     }
 }
@@ -490,8 +657,8 @@ fn is_script_tag(tag: &str, closing: bool) -> bool {
 }
 
 fn restore_inline_scripts(mut html: String, scripts: ScriptPlaceholders) -> Result<String, String> {
-    for (marker, script) in scripts {
-        let mut matches = html.match_indices(&marker);
+    for (marker, script) in &scripts {
+        let mut matches = html.match_indices(marker);
         let Some((start, _)) = matches.next() else {
             return Err("an inline script placeholder was lost during Markdown rendering".into());
         };
@@ -501,7 +668,14 @@ fn restore_inline_scripts(mut html: String, scripts: ScriptPlaceholders) -> Resu
                     .into(),
             );
         }
-        html.replace_range(start..start + marker.len(), &script);
+        html.replace_range(start..start + marker.len(), script);
+    }
+    if let Some((prefix, _)) = scripts
+        .first()
+        .and_then(|(marker, _)| marker.rsplit_once(':'))
+        && html.contains(prefix.trim_start_matches('.'))
+    {
+        return Err("an inline script placeholder remained after Markdown rendering".into());
     }
     Ok(html)
 }
@@ -973,6 +1147,63 @@ mod tests {
     }
 
     #[test]
+    fn mdx_inline_script_preserves_adjacent_emphasis_and_appears_once() {
+        let script = "<script>void 0</script>";
+        let doc = Document::with_type(DocType::Mdx, format!("_label_{script}"));
+        let rendered_page = page(&doc, &registry(), false);
+        assert_eq!(
+            body(&rendered_page).trim_end(),
+            format!("<p><em>label</em>{script}</p>")
+        );
+    }
+
+    #[test]
+    fn mdx_inline_script_does_not_activate_other_inline_jsx() {
+        let script = "<script>void 0</script>";
+        let doc = Document::with_type(
+            DocType::Mdx,
+            format!("before <link rel=\"stylesheet\" /> <Widget>label</Widget> {script}"),
+        );
+        let rendered_page = page(&doc, &registry(), false);
+        assert_eq!(
+            body(&rendered_page).trim_end(),
+            format!("<p>before  label {script}</p>")
+        );
+    }
+
+    #[test]
+    fn strips_static_resource_hints_without_editing_other_markup() {
+        let cases = [
+            ("<LiNk ReL=PrEcOnNeCt href='about:blank'>", "<!---->"),
+            (
+                "<link href='about:blank' rel='alternate\tDNS-prefetch'>",
+                "<!---->",
+            ),
+            ("<link disabled rel=prefetch href='about:blank'>", "<!---->"),
+            ("<link rel='preload' href='about:blank' />", "<!---->"),
+            ("<link href='about:blank' rel=modulepreload>", "<!---->"),
+            ("<link rel=prerender>", "<!---->"),
+            (
+                "<link rel=stylesheet href='theme.css'>",
+                "<link rel=stylesheet href='theme.css'>",
+            ),
+            ("<!-- <link rel=preload> -->", "<!-- <link rel=preload> -->"),
+        ];
+        let registry = registry();
+        let mut failures = Vec::new();
+        for kind in [DocType::Html, DocType::Markdown] {
+            for (markup, expected) in cases {
+                let doc = Document::with_type(kind, format!("<div>{markup}end</div>"));
+                let rendered = page(&doc, &registry, false);
+                if !rendered.contains(&format!("<div>{expected}end</div>")) {
+                    failures.push((kind, markup));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
     fn mdx_script_marker_cannot_be_forged_with_character_references() {
         let script = r#"<script>document.body.dataset.x="ran"</script>"#;
         let source = format!("`code`{script} and MTMARKDOWNRAWSCRIP&#84;0END.");
@@ -997,6 +1228,18 @@ mod tests {
         );
         assert!(
             restore_inline_scripts(format!("{marker}{marker}"), vec![(marker, script)]).is_err()
+        );
+    }
+
+    #[test]
+    fn inline_script_restoration_rejects_an_unclaimed_marker() {
+        let prefix = "<!--mt-script:0123456789abcdef0123456789abcdef";
+        assert!(
+            restore_inline_scripts(
+                format!("{prefix}:0-->{prefix}:1-->"),
+                vec![(format!("{prefix}:0-->"), "<script>void 0</script>".into())],
+            )
+            .is_err()
         );
     }
 

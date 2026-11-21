@@ -80,8 +80,8 @@ all 288 tests without altering the timeout or Goal 06 code.
 
 The locked release build was measured with `mt.py probe -- startup --rounds 5
 --warmup 1` using isolated data and configuration directories. Time to the
-first visible titled window was 497.1, 455.8, 792.6, 704.6, and 722.3 ms
-(median 704.6 ms, p95 778.5 ms). This is a startup diagnostic, not a
+first visible titled window was 821.7, 761.3, 899.9, 766.0, and 655.2 ms
+(median 766.0 ms, p95 884.3 ms). This is a startup diagnostic, not a
 quiet-gated regression comparison or native isolation proof.
 
 ### Pending release checks
@@ -91,12 +91,14 @@ no release-bound native isolation evidence.
 
 - On the owner's active, unlocked Windows 11 x64 desktop, run
   `mt.py accept all --exe <release exe> --expect-exe-sha256 <release sha256>`.
-  The Goal 07 phase must first observe the script-start, attempt, completion
-  and self-navigation readiness cells in captured WebView pixels. The fixture
-  then makes its one self-navigation to
-  `https://blocked-preview-navigation.invalid/`. A second capture must no
-  longer show the cells; there must be zero loopback contacts and exactly one
-  app window. The harness unit tests do not run the desktop phase.
+  The first Goal 07 WebView sample must show the script-start, every attempt,
+  the "about to navigate" and "assigned" cells. The fixture assigns
+  `location.href` to `https://blocked-preview-navigation.invalid/` (the final
+  target uses the reserved `.invalid` domain), then paints "assigned"
+  synchronously. The second sample must show no cells because the fixture was
+  replaced; "assigned" followed by replaced is the causal check. There must
+  also be zero loopback contacts and exactly one app window. Harness unit tests
+  do not run the desktop phase.
 - Clause 3b native proof is pending: the fixture must visibly report its
   network attempts and the loopback TCP and UDP listeners must record zero
   contacts on the release build. Unit tests do not verify WebView2 egress,
