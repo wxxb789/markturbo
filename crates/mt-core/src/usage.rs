@@ -363,9 +363,9 @@ impl UsageStore {
     }
 
     fn lock_settings_writes(&self) -> io::Result<crate::settings::SettingsWriteGuard> {
-        #[cfg(test)]
-        if let Some(root) = self.consent_path.as_deref().and_then(Path::parent) {
-            return crate::settings::lock_settings_writes_for_test(root);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(path) = self.consent_path.as_deref() {
+            return crate::settings::lock_settings_writes_for_path(path);
         }
         crate::settings::lock_settings_writes()
     }

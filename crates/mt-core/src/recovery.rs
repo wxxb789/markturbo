@@ -560,6 +560,8 @@ pub struct RecoveryStore {
     root_guard: Option<Arc<ProductionRootGuard>>,
     #[cfg(any(test, feature = "test-support"))]
     failures: Arc<TestFailurePoints>,
+    #[cfg(test)]
+    test_worker_limit: Option<usize>,
 }
 
 /// Process-lifetime ownership of the production recovery root.
@@ -1051,6 +1053,8 @@ impl RecoveryStore {
             root_guard: None,
             #[cfg(any(test, feature = "test-support"))]
             failures: Arc::new(TestFailurePoints::default()),
+            #[cfg(test)]
+            test_worker_limit: None,
         }
     }
 
@@ -1231,6 +1235,16 @@ impl RecoveryStore {
             .iter()
             .map(|attempt| checkpoint_wave_input_bytes(attempt.checkpoint, now))
             .collect();
+        #[cfg(test)]
+        let ranges = match self.test_worker_limit {
+            Some(worker_limit) => recovery_wave_ranges_with_worker_limit(
+                &input_bytes,
+                self.limits.max_total_bytes,
+                worker_limit,
+            ),
+            None => recovery_wave_ranges(&input_bytes, self.limits.max_total_bytes),
+        };
+        #[cfg(not(test))]
         let ranges = recovery_wave_ranges(&input_bytes, self.limits.max_total_bytes);
         let (sender, receiver) = std::sync::mpsc::sync_channel(0);
 
@@ -4162,6 +4176,30 @@ mod tests {
 
     const TEST_SYNC_DEADLOCK_GUARD: Duration = Duration::from_secs(5);
 
+    enum PreparedCheckpointEvent {
+        Protected(Vec<u8>),
+        Failed,
+    }
+
+    struct ThreadExitCompletion {
+        sender: std::sync::mpsc::Sender<PreparedCheckpointEvent>,
+        event: Option<PreparedCheckpointEvent>,
+    }
+
+    impl Drop for ThreadExitCompletion {
+        fn drop(&mut self) {
+            if let Some(event) = self.event.take() {
+                let _ = self.sender.send(event);
+            }
+        }
+    }
+
+    thread_local! {
+        // Thread-local destruction runs after the scoped worker stores its result.
+        static PREPARED_CHECKPOINT_ON_THREAD_EXIT: std::cell::RefCell<Option<ThreadExitCompletion>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     #[derive(Default)]
     struct TestProtector;
 
@@ -4363,18 +4401,8 @@ mod tests {
     }
 
     struct OutOfOrderProtector {
-        fast_finished: std::sync::mpsc::Sender<()>,
-        fast_ready: Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-
-    impl Default for OutOfOrderProtector {
-        fn default() -> Self {
-            let (fast_finished, fast_ready) = std::sync::mpsc::channel();
-            Self {
-                fast_finished,
-                fast_ready: Mutex::new(fast_ready),
-            }
-        }
+        completed: std::sync::mpsc::Sender<PreparedCheckpointEvent>,
+        slow_release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     impl RecoveryProtector for OutOfOrderProtector {
@@ -4382,21 +4410,44 @@ mod tests {
             let slow_first = plaintext
                 .windows(b"slow-first".len())
                 .any(|window| window == b"slow-first");
-            let fast_last = plaintext
-                .windows(b"fast-last".len())
-                .any(|window| window == b"fast-last");
+            let fail_third = plaintext
+                .windows(b"fail-third".len())
+                .any(|window| window == b"fail-third");
             let ciphertext: Vec<_> = plaintext.iter().rev().copied().collect();
 
             if slow_first {
-                self.fast_ready
+                self.slow_release
                     .lock()
                     .unwrap()
                     .recv_timeout(TEST_SYNC_DEADLOCK_GUARD)
-                    .expect("fast checkpoint protection must finish while slow protection waits");
-            } else if fast_last {
-                self.fast_finished
-                    .send(())
-                    .expect("slow checkpoint must be waiting for fast protection");
+                    .expect(
+                        "slow checkpoint must remain blocked until fast completion is observed",
+                    );
+            }
+
+            let event = if fail_third {
+                Some(PreparedCheckpointEvent::Failed)
+            } else if !slow_first {
+                Some(PreparedCheckpointEvent::Protected(ciphertext.clone()))
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                PREPARED_CHECKPOINT_ON_THREAD_EXIT.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    assert!(
+                        slot.is_none(),
+                        "one completion event is expected per worker"
+                    );
+                    *slot = Some(ThreadExitCompletion {
+                        sender: self.completed.clone(),
+                        event: Some(event),
+                    });
+                });
+            }
+
+            if fail_third {
+                return Err(RecoveryError::Protection);
             }
             Ok(ciphertext)
         }
@@ -6780,12 +6831,51 @@ mod tests {
     #[test]
     fn batch_keeps_input_order_and_last_same_key_checkpoint_when_workers_finish_out_of_order() {
         let dir = tempfile::tempdir().unwrap();
-        let protector = Arc::new(OutOfOrderProtector::default());
-        let store = RecoveryStore::new_at(dir.path().join("recovery"), protector.clone()).unwrap();
+        let (completed, completed_receiver) = std::sync::mpsc::channel();
+        let (release_slow, slow_release) = std::sync::mpsc::channel();
         let first = checkpoint("out-of-order", "slow-first");
         let latest = checkpoint("out-of-order", "fast-last");
+        let failed = checkpoint("out-of-order-failed", "fail-third");
+        let protector = Arc::new(OutOfOrderProtector {
+            completed,
+            slow_release: Mutex::new(slow_release),
+        });
+        let mut store =
+            RecoveryStore::new_at(dir.path().join("recovery"), protector.clone()).unwrap();
+        store.test_worker_limit = Some(3);
         let first_token = store.current_token(&first.key);
         let latest_token = store.current_token(&latest.key);
+        let failed_token = store.current_token(&failed.key);
+        let completion_protector = protector.clone();
+        let completion_key = latest.key.clone();
+        let completion_text = latest.text.clone();
+        let completion_observer = std::thread::spawn(move || {
+            let mut observed_fast = false;
+            let mut observed_failure = false;
+            for _ in 0..2 {
+                match completed_receiver
+                    .recv_timeout(TEST_SYNC_DEADLOCK_GUARD)
+                    .expect("fast and failing workers must complete before slow is released")
+                {
+                    PreparedCheckpointEvent::Protected(ciphertext) => {
+                        assert!(!observed_fast, "fast checkpoint must complete once");
+                        let plaintext = completion_protector.unprotect(&ciphertext).unwrap();
+                        let record: DiskRecord = serde_json::from_slice(&plaintext).unwrap();
+                        assert_eq!(record.key, completion_key.as_str());
+                        assert_eq!(record.text, completion_text);
+                        observed_fast = true;
+                    }
+                    PreparedCheckpointEvent::Failed => {
+                        assert!(!observed_failure, "failing checkpoint must complete once");
+                        observed_failure = true;
+                    }
+                }
+            }
+            assert!(observed_fast && observed_failure);
+            release_slow
+                .send(())
+                .expect("slow worker must still be waiting");
+        });
 
         let batch = store.checkpoint_batch_if_current(
             [
@@ -6797,15 +6887,21 @@ mod tests {
                     checkpoint: &latest,
                     token: &latest_token,
                 },
+                RecoveryCheckpointAttempt {
+                    checkpoint: &failed,
+                    token: &failed_token,
+                },
             ],
             &HashSet::new(),
         );
+        completion_observer.join().unwrap();
 
         assert!(matches!(
             batch.outcomes.as_slice(),
             [
                 CheckpointBatchOutcome::Written,
-                CheckpointBatchOutcome::Written
+                CheckpointBatchOutcome::Written,
+                CheckpointBatchOutcome::Failed(RecoveryError::Protection)
             ]
         ));
         let recovered = store.recover().unwrap().records;

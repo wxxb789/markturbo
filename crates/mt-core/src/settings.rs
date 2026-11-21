@@ -573,7 +573,7 @@ pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes_named("Global\\markturbo-settings-write-v1")
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
 pub(crate) fn lock_settings_writes_for_test(root: &Path) -> std::io::Result<SettingsWriteGuard> {
     use std::hash::{Hash, Hasher};
 
@@ -585,13 +585,13 @@ pub(crate) fn lock_settings_writes_for_test(root: &Path) -> std::io::Result<Sett
     ))
 }
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(all(any(test, feature = "test-support"), not(target_os = "windows")))]
 pub(crate) fn lock_settings_writes_for_test(_root: &Path) -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes()
 }
 
-#[cfg(test)]
-fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
     let root = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -599,7 +599,7 @@ fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGu
     lock_settings_writes_for_test(root)
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn lock_settings_writes_for_path(_path: &Path) -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes()
 }
@@ -713,6 +713,24 @@ mod tests {
         assert_eq!(saved.theme, ThemePreference::Dark);
         assert!(!saved.usage_metrics_enabled);
         assert!(!SettingsData::load_from(&path).usage_metrics_enabled);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn settings_and_usage_with_same_relative_consent_path_share_a_test_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let consent_path = Path::new("settings.toml");
+        let settings_guard = lock_settings_writes_for_path(consent_path).unwrap();
+        let usage = crate::usage::UsageStore::open_in(directory.path(), consent_path, false);
+
+        assert_eq!(
+            std::thread::spawn(move || usage.clear()).join().unwrap(),
+            Err(crate::usage::UsageError::Io(std::io::ErrorKind::WouldBlock))
+        );
+
+        drop(settings_guard);
+        let usage = crate::usage::UsageStore::open_in(directory.path(), consent_path, false);
+        assert_eq!(usage.clear(), Ok(()));
     }
 
     #[test]

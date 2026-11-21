@@ -168,8 +168,8 @@ impl fmt::Debug for ResolvedCredential {
 pub struct CredentialVault {
     secure: Arc<dyn SecureCredentialStore>,
     session: Arc<Mutex<HashMap<String, Secret>>>,
-    #[cfg(all(test, target_os = "windows"))]
-    test_operation_scope: Option<usize>,
+    #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
+    isolate_test_operations: bool,
 }
 
 impl CredentialVault {
@@ -177,21 +177,30 @@ impl CredentialVault {
         Self {
             secure: Arc::new(PlatformCredentialStore),
             session: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(all(test, target_os = "windows"))]
-            test_operation_scope: None,
+            #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
+            isolate_test_operations: false,
         }
     }
 
     pub fn with_store(secure: Arc<dyn SecureCredentialStore>) -> Self {
-        #[cfg(all(test, target_os = "windows"))]
-        let test_operation_scope = Arc::as_ptr(&secure) as *const () as usize;
-
         Self {
             secure,
             session: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(all(test, target_os = "windows"))]
-            test_operation_scope: Some(test_operation_scope),
+            #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
+            isolate_test_operations: cfg!(test),
         }
+    }
+
+    /// Use a fake store shared only within this test process.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_store(secure: Arc<dyn SecureCredentialStore>) -> Self {
+        let vault = Self::with_store(secure);
+        #[cfg(target_os = "windows")]
+        let vault = Self {
+            isolate_test_operations: true,
+            ..vault
+        };
+        vault
     }
 
     pub fn secure_store_supported(&self) -> bool {
@@ -311,8 +320,9 @@ impl CredentialVault {
     }
 
     fn lock_operations(&self) -> Result<CredentialOperationGuard, CredentialError> {
-        #[cfg(all(test, target_os = "windows"))]
-        if let Some(scope) = self.test_operation_scope {
+        #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
+        if self.isolate_test_operations {
+            let scope = Arc::as_ptr(&self.secure) as *const () as usize;
             return lock_persistent_operations_for_test(scope);
         }
 
@@ -404,7 +414,7 @@ fn lock_persistent_operations() -> Result<CredentialOperationGuard, CredentialEr
     lock_persistent_operations_named("Global\\markturbo-model-credential-operation-v1")
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
 fn lock_persistent_operations_for_test(
     scope: usize,
 ) -> Result<CredentialOperationGuard, CredentialError> {

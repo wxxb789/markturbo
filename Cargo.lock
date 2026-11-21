@@ -3348,6 +3348,7 @@ dependencies = [
  "log",
  "markdown",
  "mermaid-svg",
+ "mt-core",
  "notify",
  "notify-debouncer-full",
  "ratex-font",

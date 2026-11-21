@@ -55,7 +55,7 @@ static STORE: LazyLock<Arc<MemoryStore>> = LazyLock::new(Arc::default);
 /// The vault [`AppState::new`](crate::state::AppState::new) uses in a test
 /// build.
 pub(crate) fn vault() -> CredentialVault {
-    CredentialVault::with_store(STORE.clone())
+    CredentialVault::with_test_store(STORE.clone())
 }
 
 /// The secret this process's store holds for `target`, for a test's own
