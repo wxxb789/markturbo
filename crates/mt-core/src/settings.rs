@@ -573,7 +573,7 @@ pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes_named("Global\\markturbo-settings-write-v1")
 }
 
-#[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
+#[cfg(all(test, target_os = "windows"))]
 pub(crate) fn lock_settings_writes_for_test(root: &Path) -> std::io::Result<SettingsWriteGuard> {
     use std::hash::{Hash, Hasher};
 
@@ -585,12 +585,12 @@ pub(crate) fn lock_settings_writes_for_test(root: &Path) -> std::io::Result<Sett
     ))
 }
 
-#[cfg(all(any(test, feature = "test-support"), not(target_os = "windows")))]
+#[cfg(all(test, not(target_os = "windows")))]
 pub(crate) fn lock_settings_writes_for_test(_root: &Path) -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes()
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
     let root = path
         .parent()
@@ -599,7 +599,7 @@ pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<Sett
     lock_settings_writes_for_test(root)
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(not(test))]
 fn lock_settings_writes_for_path(_path: &Path) -> std::io::Result<SettingsWriteGuard> {
     lock_settings_writes()
 }
@@ -718,18 +718,36 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn settings_and_usage_with_same_relative_consent_path_share_a_test_lock() {
-        let directory = tempfile::tempdir().unwrap();
-        let consent_path = Path::new("settings.toml");
-        let settings_guard = lock_settings_writes_for_path(consent_path).unwrap();
+        use std::io::ErrorKind;
+
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let consent_path = Path::new(directory.path().file_name().unwrap());
+        // Check both writers against the expected lock from a different thread.
+        let settings_guard = lock_settings_writes_for_test(consent_path).unwrap();
         let usage = crate::usage::UsageStore::open_in(directory.path(), consent_path, false);
 
+        let (settings_write, usage_write) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    (
+                        SettingsData::default()
+                            .try_save_to_with_intent(consent_path, SettingsWriteIntent::General),
+                        usage.clear(),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
         assert_eq!(
-            std::thread::spawn(move || usage.clear()).join().unwrap(),
-            Err(crate::usage::UsageError::Io(std::io::ErrorKind::WouldBlock))
+            settings_write.map_err(|error| error.kind()),
+            Err(ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            usage_write,
+            Err(crate::usage::UsageError::Io(ErrorKind::WouldBlock))
         );
 
         drop(settings_guard);
-        let usage = crate::usage::UsageStore::open_in(directory.path(), consent_path, false);
         assert_eq!(usage.clear(), Ok(()));
     }
 

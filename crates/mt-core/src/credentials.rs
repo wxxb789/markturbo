@@ -203,6 +203,12 @@ impl CredentialVault {
         vault
     }
 
+    /// Whether this vault uses the Windows process-local test operation lock.
+    #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
+    pub fn uses_isolated_test_lock(&self) -> bool {
+        self.isolate_test_operations
+    }
+
     pub fn secure_store_supported(&self) -> bool {
         self.secure.is_supported()
     }

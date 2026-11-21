@@ -934,6 +934,8 @@ mod tests {
     #[test]
     fn environment_only_store_cannot_prefer_a_persistent_credential() {
         let vault = CredentialVault::with_test_store(Arc::new(EnvironmentOnlyStore));
+        #[cfg(target_os = "windows")]
+        assert!(vault.uses_isolated_test_lock());
         let credential = vault
             .resolve(
                 "fixed-evaluation-target",
