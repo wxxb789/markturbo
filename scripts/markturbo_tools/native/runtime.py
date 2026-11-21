@@ -97,8 +97,8 @@ INTEGRITY_NAMES = {
 #   editor's own Select All + Copy, which writes the exact text
 #   (system.rs `set_clipboard_text`). SetFocus supports inputs and focusable
 #   views (access/uia.rs and access.rs).
-# * System alerts (`nsh::alert_dialog()`: the Overwrite and Run scripts
-#   confirmations in `state.rs`) are not in the UIA tree. They are drawn inside
+# * System alerts (`nsh::alert_dialog()`: the Overwrite confirmation in
+#   `state.rs`) are not in the UIA tree. They are drawn inside
 #   the surface as hosted items (system.rs), and the UIA tree walks views only.
 #   While one shows, it owns keyboard input. Enter presses its selected button,
 #   initially the last Default-styled button, else the first.
@@ -152,6 +152,8 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_TERMINATE = 0x0001
+JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+ERROR_MORE_DATA = 234
 TOKEN_QUERY = 0x0008
 TOKEN_INTEGRITY_LEVEL = 25
 DESKTOP_READOBJECTS = 0x0001
@@ -247,6 +249,14 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 
 class JOBOBJECT_ASSOCIATE_COMPLETION_PORT(ctypes.Structure):
     _fields_ = [("CompletionKey", wt.LPVOID), ("CompletionPort", wt.HANDLE)]
+
+
+class JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+    _fields_ = [
+        ("NumberOfAssignedProcesses", wt.DWORD),
+        ("NumberOfProcessIdsInList", wt.DWORD),
+        ("ProcessIdList", ctypes.c_size_t * 1),
+    ]
 
 
 class HarnessBlocked(RuntimeError):
@@ -715,6 +725,43 @@ class OwnedProcess:
             self.cleanup()
             raise
 
+    def active_process_ids(self) -> tuple[int, ...]:
+        """List this launch's live processes from the job, not a PID tree scan."""
+        if self._closed or not self._job:
+            raise HarnessFailure("PROCESS_JOB_UNAVAILABLE")
+        capacity = 16
+        while True:
+            buffer_size = (
+                ctypes.sizeof(wt.DWORD) * 2 + ctypes.sizeof(ctypes.c_size_t) * capacity
+            )
+            buffer = ctypes.create_string_buffer(buffer_size)
+            returned = wt.DWORD()
+            succeeded = self.win32.kernel32.QueryInformationJobObject(
+                self._job,
+                JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                buffer,
+                buffer_size,
+                ctypes.byref(returned),
+            )
+            info = ctypes.cast(
+                buffer, ctypes.POINTER(JOBOBJECT_BASIC_PROCESS_ID_LIST)
+            ).contents
+            assigned = int(info.NumberOfAssignedProcesses)
+            count = int(info.NumberOfProcessIdsInList)
+            if succeeded:
+                if assigned > capacity or count > capacity:
+                    capacity = max(capacity * 2, assigned, count)
+                    continue
+                if count == 0:
+                    raise HarnessFailure("PROCESS_JOB_EMPTY")
+                process_ids = (ctypes.c_size_t * count).from_buffer(
+                    buffer, ctypes.sizeof(wt.DWORD) * 2
+                )
+                return tuple(int(process_ids[index]) for index in range(count))
+            if ctypes.get_last_error() != ERROR_MORE_DATA:
+                raise HarnessFailure("PROCESS_JOB_QUERY_FAILED")
+            capacity = max(capacity * 2, assigned, count)
+
     def poll(self) -> int | None:
         try:
             return self.wait(0)
@@ -838,6 +885,14 @@ class Win32:
         self.kernel32.CreateJobObjectW.restype = wt.HANDLE
         self.kernel32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, wt.LPVOID, wt.DWORD]
         self.kernel32.SetInformationJobObject.restype = wt.BOOL
+        self.kernel32.QueryInformationJobObject.argtypes = [
+            wt.HANDLE,
+            ctypes.c_int,
+            wt.LPVOID,
+            wt.DWORD,
+            ctypes.POINTER(wt.DWORD),
+        ]
+        self.kernel32.QueryInformationJobObject.restype = wt.BOOL
         self.kernel32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
         self.kernel32.AssignProcessToJobObject.restype = wt.BOOL
         self.kernel32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
@@ -1224,6 +1279,10 @@ class Win32:
             raise HarnessFailure("NATIVE_FOCUS_QUERY_FAILED")
         return int(info.hwndFocus or 0)
 
+    def foreground_window(self) -> int:
+        """The visible top-level window receiving native input."""
+        return int(self.user32.GetForegroundWindow() or 0)
+
     def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
         dialogs: list[int] = []
         failure_code: str | None = None
@@ -1252,6 +1311,33 @@ class Win32:
         if failure_code is not None:
             raise HarnessFailure(failure_code)
         return dialogs
+
+    def visible_top_level_windows(self, process_ids: tuple[int, ...]) -> tuple[int, ...]:
+        """Visible desktop windows belonging to one app's owned process job."""
+        owned_processes = frozenset(process_id for process_id in process_ids if process_id > 0)
+        if not owned_processes:
+            raise HarnessFailure("PROCESS_JOB_EMPTY")
+        handles: list[int] = []
+        failure_code: str | None = None
+
+        @self._enum_windows_proc
+        def collect(hwnd: int, _lparam: int) -> bool:
+            nonlocal failure_code
+            if not self.user32.IsWindowVisible(hwnd):
+                return True
+            process = wt.DWORD()
+            if not self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process)):
+                failure_code = "APP_WINDOW_PROCESS_QUERY_FAILED"
+                return False
+            if process.value in owned_processes:
+                handles.append(int(hwnd))
+            return True
+
+        if not self.user32.EnumWindows(collect, 0) and failure_code is None:
+            raise HarnessFailure("APP_WINDOW_ENUM_FAILED")
+        if failure_code is not None:
+            raise HarnessFailure(failure_code)
+        return tuple(handles)
 
     def post_close(self, hwnd: int) -> None:
         if not self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):

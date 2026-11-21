@@ -406,26 +406,16 @@ Settings outranks its matching environment variable.
 
 ## Security
 
-The web layouts (**Web preview**, **Split · Web**) hand the page to the
-platform WebView as an HTML string with no base URL.
+The web layouts (**Web preview**, **Split · Web**) use one policy for Markdown,
+MDX and HTML. Inline scripts can run from the first render, without a prompt.
+The app loads a fixed, base-free host page; document content runs only in its
+sandboxed frame.
 
-Every tab starts **Restricted**. The web pane shows **Restricted: scripts
-disabled** and a **Trust scripts** button; trusting asks **Run scripts in this
-document?** and, after **Run scripts**, shows **Trusted: scripts may run**.
-Trust applies to that open tab. Accepting or undoing a Revision change
-revokes it before the text changes.
-
-| | Restricted (default) | Trusted |
-|---|---|---|
-| Markdown / MDX | CSP: no network, no scripts | CSP: no network, inline scripts run |
-| HTML | Injected CSP: no network, no scripts | Original source, no CSP; scripts run and may reach the network |
-
-The CSP is `default-src 'none'; style-src 'unsafe-inline'; img-src data:;
-font-src data:;` plus `script-src 'none'` (Restricted) or `'unsafe-inline'`
-(Trusted). Because there is no base URL, relative images and stylesheets in a
-trusted HTML file do not resolve. The CSP governs what a page loads, not
-top-level navigation such as following a link, and the app does not intercept
-navigation.
+The frame policy permits inline scripts and styles, plus images and fonts
+embedded as `data:`. It denies network and file resource loads, and the
+sandbox disables popups, form submissions and navigation out of the preview.
+Remote scripts and relative assets in HTML, including images and stylesheets,
+do not load. The app does not open document links in another app.
 
 ## Keyboard
 

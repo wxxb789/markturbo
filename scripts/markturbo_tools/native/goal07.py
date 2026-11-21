@@ -7,21 +7,23 @@ hashes, byte counts, booleans, counts and safe reason codes. The harness never
 reads or writes the Windows Credential Manager: the child process gets one
 fresh synthetic key in its environment only.
 
-One launch opens `trusted.html` from argv (a new tab opens in Split) and runs
-one Review -> answer -> Revision chain against the loopback, across two
-phases, each with its own observation-key prefix and failure-code prefix:
+One launch opens `security-fixture.html` from argv (a new tab opens in Split),
+checks that its inline script runs and its navigation attempts stay in the
+preview, then runs one Review -> answer -> Revision chain against the loopback,
+across two phases, each with its own observation-key prefix and failure-code prefix:
 
-1. `trust`: scripts are trusted first, through the Web pane's
-   `Trust scripts` and its Run scripts system alert; the Edit mode then hands
-   the keyboard back from the WebView before the Review shortcut is sent.
+1. `web_security`: the Web pane shows the inline script's effect without a
+   trust action; its popup, top-level/frame navigation and form attempts leave
+   the preview in place, with one visible window in the app's process job.
+   Edit mode then hands the keyboard back before the Review shortcut is sent.
 2. `decisions`: the proposal holds two hunks, h1 the executable script value
    after the CJK/emoji line and h2 the owner line. Accept(h1) writes across
    the multibyte offsets at once; Reject(h2) reads `2 of 2 decided`; `Undo`
    takes the rejection back to `1 of 2 decided`; `Copy` round-trips the
    approved result through the OS clipboard; one replacement over the whole
    document leaves h2 `Can't apply — this part changed` without an `Accept`;
-   `Done` writes nothing to disk; and the Web pane is Restricted, because the
-   accepted write revoked the trust.
+   `Done` writes nothing to disk. The script's effect and navigation checks
+   have already completed before the Review chain.
 
 Proven headless or in mt-core instead: `Undo` restoring an accepted hunk's
 bytes after the write (`tests/revision_flow.rs`); every hunk accepted
@@ -45,9 +47,6 @@ reading the editor focuses it, and an Invoke is not a request to move keyboard
 focus. The field's keys (`A`, `R`, `Ctrl+Z`, `A` refused on a changed part)
 are proven headless in `ui/revision.rs`. Editor text is read with the editor's
 Select All + Copy.
-
-Trust scripts' Run scripts confirmation is an nsh system alert outside the UIA
-tree, answered with Enter (`runtime.py` `confirm_system_alert`).
 
 Evidence follows the shared native schema (`evidence.py`).
 """
@@ -120,24 +119,19 @@ REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
 REVISION_PROPOSAL_AFTER_NAME = "Proposed text"
 # `state.rs` `finish_revision`: Done's outcome line with an accepted hunk.
 REVISION_APPLIED = "Approved changes applied to the buffer."
-# `ui/preview.rs`. `state.rs` `request_web_trust` confirms with an nsh system
-# alert outside the UIA tree, answered with Enter (`confirm_system_alert`).
-TRUST_SCRIPTS_AUTOMATION_ID = "web-trust"
-TRUSTED_BANNER = "Trusted: scripts may run"
-RESTRICTED_BANNER = "Restricted: scripts disabled"
-
 CASE_REVISION_SESSION = "revision_session"
 CASE_FLOWS = {
     CASE_REVISION_SESSION: (
-        "one launch on trusted HTML: trust scripts -> one Review and Revision -> "
+        "one launch on sandbox fixture: script effect and blocked navigation -> "
+        "one Review and Revision -> "
         "Accept, Reject, Undo, Copy -> an edit over the open hunk offers no Accept "
-        "-> Done -> Restricted; Undo after a write, every hunk accepted and "
+        "-> Done; Undo after a write, every hunk accepted and "
         "frontmatter, fence and link anchoring are proven headless"
     ),
 }
 REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
 # Each phase's observation-key prefix; upper-cased, its failure-code prefix.
-PHASES = ("trust", "decisions")
+PHASES = ("web_security", "decisions")
 # The session's one chain: one Review and one Revision request.
 EXPECTED_REQUEST_COUNT = 2
 
@@ -146,8 +140,21 @@ DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
 # accepted write proves multibyte and CRLF offsets; h2 is the owner line.
 SOURCE_TEXT = (
     "<!doctype html>\r\n"
-    "<p>trusted 文档 🚀</p>\r\n"
-    "<script>window.goal07 = \"old\";</script>\r\n"
+    "<p>fixture 文档 🚀</p>\r\n"
+    "<p id=\"goal07-effect\">Script has not run</p>\r\n"
+    "<script>\r\n"
+    "window.goal07 = \"old\";\r\n"
+    "document.getElementById(\"goal07-effect\").textContent = "
+    "\"Script ran automatically\";\r\n"
+    "try { window.open(\"https://127.0.0.1:65535/goal07-popup\", \"_blank\"); } catch (_) {}\r\n"
+    "try { top.location = \"https://127.0.0.1:65535/goal07-top\"; } catch (_) {}\r\n"
+    "try { location = \"https://127.0.0.1:65535/goal07-frame\"; } catch (_) {}\r\n"
+    "const form = document.createElement(\"form\");\r\n"
+    "form.method = \"get\";\r\n"
+    "form.action = \"https://127.0.0.1:65535/goal07-form\";\r\n"
+    "document.body.appendChild(form);\r\n"
+    "try { form.submit(); } catch (_) {}\r\n"
+    "</script>\r\n"
     "<p>owner: TBD</p>\r\n"
     f"<!-- {DOCUMENT_SENTINEL} -->\r\n"
 )
@@ -157,14 +164,16 @@ EDITOR_SOURCE_BYTES = EDITOR_SOURCE_TEXT.encode("utf-8")
 # Typed over the whole document after the decisions: it touches the open
 # hunk's part.
 STALE_EDIT = f"{DOCUMENT_SENTINEL}:stale"
-TRUST_FILE = "trusted.html"
+FIXTURE_FILE = "security-fixture.html"
+SCRIPT_EFFECT_TEXT = "Script ran automatically"
+SCRIPT_NAVIGATION_SETTLE_SECONDS = 1.0
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
 # Every fingerprint is compared with exact expected bytes
 # (`expected_fingerprints`); the names say when it was read.
 FINGERPRINT_OBSERVATION_KEYS = frozenset(
     {
-        "trust_disk_before",
+        "web_security_disk_before",
         "decisions_proposal_after",
         "decisions_editor_proposed",
         "decisions_editor_one_accepted",
@@ -173,7 +182,11 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
         "decisions_disk_after",
     }
 )
-OBSERVATION_KEYS = FINGERPRINT_OBSERVATION_KEYS | {"provider_request_count"}
+OBSERVATION_KEYS = FINGERPRINT_OBSERVATION_KEYS | {
+    "web_security_script_effect",
+    "web_security_window_count",
+    "provider_request_count",
+}
 REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
 
@@ -274,7 +287,7 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
     # so this is also the approved result Copy exports.
     one_accepted = fingerprint_bytes(apply_edits(EDITOR_SOURCE_BYTES, edits[:1]))
     expected = {
-        "trust_disk_before": disk,
+        "web_security_disk_before": disk,
         # The field shows the docked h1's replacement itself, not its line.
         "decisions_proposal_after": fingerprint_text(edits[0]["replacement"]),
         "decisions_editor_proposed": fingerprint_bytes(EDITOR_SOURCE_BYTES),
@@ -284,6 +297,14 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
         "decisions_disk_after": disk,
     }
     return {key: value.evidence() for key, value in expected.items()}
+
+
+def expected_observations() -> dict[str, Any]:
+    return {
+        **expected_fingerprints(),
+        "web_security_script_effect": True,
+        "web_security_window_count": 1,
+    }
 
 
 def _operation(expected_request_count: int) -> str:
@@ -341,9 +362,15 @@ def validate_runtime_scan(value: Any) -> None:
 
 
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
-    for key, expected in expected_fingerprints().items():
-        if validate_fingerprint(observations[key]) != expected:
-            raise ValueError(f"{key} does not hold the expected bytes")
+    for key, expected in expected_observations().items():
+        actual = (
+            validate_fingerprint(observations[key])
+            if key in FINGERPRINT_OBSERVATION_KEYS
+            else observations[key]
+        )
+        if actual != expected or type(actual) is not type(expected):
+            kind = "bytes" if key in FINGERPRINT_OBSERVATION_KEYS else "value"
+            raise ValueError(f"{key} does not hold the expected {kind}")
     if observations["provider_request_count"] != EXPECTED_REQUEST_COUNT:
         raise ValueError("loopback provider did not receive one Review and one Revision")
 
@@ -410,19 +437,23 @@ def review_settings_document(endpoint: str) -> bytes:
 
 @functools.cache
 def _expected_values() -> dict[str, Any]:
-    return expected_fingerprints()
+    return expected_observations()
 
 
 def record(observed: dict[str, Any], key: str, value: Any) -> None:
     """Record one measurement as evidence, failing at once if it is unexpected.
 
     The check runs as the value is read, so a later step cannot fail first
-    and hide it. The key's phase prefix comes back through `phase`,
-    giving `<KEY>_UNEXPECTED`; `validate_passed_case` checks them all again.
+    and hide it. The phase prefix is selected from the observation key and
+    `phase` adds it to the resulting failure code. Final validation checks
+    the complete set again.
     """
     recorded = value.evidence() if isinstance(value, Fingerprint) else value
-    if recorded != _expected_values()[key]:
-        raise HarnessFailure(f"{key.partition('_')[2].upper()}_UNEXPECTED")
+    expected = _expected_values()[key]
+    if recorded != expected or type(recorded) is not type(expected):
+        phase_name = next((name for name in PHASES if key.startswith(f"{name}_")), None)
+        suffix = key.removeprefix(f"{phase_name}_") if phase_name else key.partition("_")[2]
+        raise HarnessFailure(f"{suffix.upper()}_UNEXPECTED")
     observed[key] = recorded
 
 
@@ -439,7 +470,7 @@ class Goal07Harness(NativeHarness):
         data_root, config_root, workspace_root, stderr_path = self.case_roots(
             CASE_REVISION_SESSION
         )
-        write_durable(workspace_root / TRUST_FILE, SOURCE_BYTES)
+        write_durable(workspace_root / FIXTURE_FILE, SOURCE_BYTES)
         write_durable(config_root / "settings.toml", review_settings_document(endpoint))
         return data_root.parent, data_root, config_root, workspace_root, stderr_path
 
@@ -674,24 +705,26 @@ class Goal07Harness(NativeHarness):
         self.click_control(copy, "REVISION_COPY_CLICK_FAILED")
         return self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
 
-    def phase_trust(
+    def phase_web_security(
         self, app: Any, _provider: provider_fixtures.LoopbackRevisionServer, source: Path
     ) -> dict[str, Any]:
-        """Trust the page's scripts, then hand the keyboard back to the editor."""
+        """Prove scripts run and navigation attempts stay in the sandboxed preview."""
         observed: dict[str, Any] = {}
-        record(observed, "trust_disk_before", sha256_file(source))
+        record(observed, "web_security_disk_before", sha256_file(source))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-        self._press(app, TRUST_SCRIPTS_AUTOMATION_ID, "WEB_TRUST")
-        # The Run scripts alert is outside the UIA tree; Enter answers it
-        # with Run scripts, proven by the Trusted banner.
-        self.confirm_system_alert(
-            app,
-            lambda: not self.name_present(app, TRUSTED_BANNER, "Text"),
-            "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION",
-            confirmed=lambda: self.name_present(app, TRUSTED_BANNER, "Text"),
-        )
-        self.wait_name(app, TRUSTED_BANNER, "Text", "SCRIPTS_TRUSTED_TIMEOUT")
-        # Leaving the Web pane must hand keyboard ownership back to the main
+        self.wait_name(app, SCRIPT_EFFECT_TEXT, "Text", "SCRIPT_EFFECT_TIMEOUT")
+        self.win32.sleep(SCRIPT_NAVIGATION_SETTLE_SECONDS)
+        self.wait_name(app, SCRIPT_EFFECT_TEXT, "Text", "PREVIEW_LEFT_FIXTURE")
+        if app.process.poll() is not None:
+            raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
+        windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
+        if len(windows) != 1 or windows[0] != app.hwnd:
+            raise HarnessFailure("APP_WINDOW_COUNT_UNEXPECTED")
+        if self.win32.foreground_window() != app.hwnd:
+            raise HarnessFailure("APP_WINDOW_FOREGROUND_LOST")
+        record(observed, "web_security_script_effect", True)
+        record(observed, "web_security_window_count", len(windows))
+        # Leaving the Web pane hands keyboard ownership back to the main
         # window before the Review shortcut is sent, without a refocus.
         self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
         self.editor_control(app)
@@ -746,9 +779,6 @@ class Goal07Harness(NativeHarness):
             raise HarnessFailure("REVISION_OFFERS_ACCEPT")
         self.done(app, REVISION_APPLIED)
         record(observed, "decisions_disk_after", sha256_file(source))
-        # The accepted write revoked the trust granted to the text before it.
-        self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-        self.wait_name(app, RESTRICTED_BANNER, "Text", "SCRIPTS_RESTRICTED_TIMEOUT")
         provider.verify_chain()
         return observed
 
@@ -771,13 +801,13 @@ class Goal07Harness(NativeHarness):
         app = None
         try:
             case_root, data, config, workspace, stderr = self.profile(provider.base_url)
-            source = workspace / TRUST_FILE
+            source = workspace / FIXTURE_FILE
             app = self.launch_app(source, data, config, workspace, stderr)
             observations: dict[str, Any] = {
                 "flow": CASE_FLOWS[CASE_REVISION_SESSION],
                 "process_context": app.security_context.evidence(),
             }
-            phases = (self.phase_trust, self.phase_decisions)
+            phases = (self.phase_web_security, self.phase_decisions)
             for run, name_of_phase in zip(phases, PHASES, strict=True):
                 with phase(name_of_phase.upper()):
                     observations.update(run(app, provider, source))

@@ -14,7 +14,7 @@
 |---|---|
 |`app.rs`|Application root: startup, the checkpoint ticker, the main window's close request (routed to the unsaved-changes guard), and the shell, re-keyed on language or layout-breakpoint changes.|
 |`ui/`|The Afterglow UI: `shell` (title row, rail, text column, field, overlay layer), `titlebar` (file name, Review, settings menu), `rail`, `welcome`, `document`/`preview`, `context`, `review`/`glow`, `revision`, `consent`, `notices`, `settings`, and the `tokens`/`fonts`/`prims`/`motion` foundation.|
-|`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore, Web trust.|
+|`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore.|
 |`state/revision_ledger.rs`|`RevisionLedger`: where each hunk of a live Approved Revision sits in its tab's text.|
 |`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
 |`web.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, localized strings and disclosures, log setup.|
@@ -146,9 +146,8 @@ decisions: hunks wholly before or after the edited span move, while a hunk the
 edit touched loses its place and can be neither accepted ("Can't apply — this
 part changed") nor, once accepted, taken back. Every write also checks that the
 bytes at the hunk's place are the ones it expects, so a refusal leaves the
-text untouched. Before a decision's text replaces the buffer, the tab's Web
-script trust is revoked, so revised text never runs scripts under trust
-granted to the text before it. `Done` discards the ledger, keeps the
+text untouched. The Web preview applies the same document isolation policy
+after a Revision as it does on open. `Done` discards the ledger, keeps the
 decisions as written, and reports undecided hunks as not applied; `Copy` reads
 the tab's current text without changing it. Nothing is saved. The paragraphs
 below describe the retired GPUI flow and remain as history.
@@ -208,7 +207,7 @@ useful only when removing it would spread a real rule back across its callers.
 | `review.rs`: immutable source and package requests, anchors, output validation | Retain one provider-independent Review contract | Request validation and grounded quote-to-anchor resolution share the frozen source/selection/package identity. A separate package validator would force both sides to coordinate the same error and scope rules. |
 | `views/i18n.rs`: typed strings and fallback | Retain one catalog | Exhaustive English keys and Chinese fallback share a coverage rule; per-screen catalogs would make missing strings harder to detect. |
 | `bin/markturbo-goal07-evaluate.rs`: offline Review/Revision capture evaluation | Retain the single capture-to-content-free-receipt command | Input path safety, source/proposal binding and receipt creation are one evaluation contract, not reusable UI workflows. |
-| `translate/provider.rs`, `views/model_settings.rs`, `views/web.rs`, `bin/markturbo-goal06-evaluate.rs`: Translation transport, credential settings UI, trusted Web projection and owner-operated corpus evaluation respectively | Retain their separate owners | Translation freezes endpoint/credential and consent for one operation; the settings view adapts secure vault state without owning policy; Web rendering applies one trust/CSP contract; the evaluator binds a fixed corpus to explicit send authorization. Splitting these smaller seams would make their callers reassemble privacy or source-identity rules. |
+| `translate/provider.rs`, `views/model_settings.rs`, `views/web.rs`, `bin/markturbo-goal06-evaluate.rs`: Translation transport, credential settings UI, isolated Web projection and owner-operated corpus evaluation respectively | Retain their separate owners | Translation freezes endpoint/credential and consent for one operation; the settings view adapts secure vault state without owning policy; Web rendering applies one sandbox/CSP contract; the evaluator binds a fixed corpus to explicit send authorization. Splitting these smaller seams would make their callers reassemble privacy or source-identity rules. |
 | `views/workspace/web_surface.rs`, `agent_artifacts/skill.rs`, `credentials.rs`, `rendering/mod.rs`: OS WebView lease, Skill discovery, vault transaction and renderer registry respectively | Retain their existing owners | Each has one shared state/identity or registry invariant; splitting its platform helpers would make callers reconstruct that invariant. These near-threshold sources were checked as well as the larger files. |
 
 ### Tooling, native acceptance, and test ownership
@@ -246,7 +245,7 @@ specific to their jobs.
 Tests follow their owner rather than one common runner: core unit tests stay
 beside GPUI-free invariants; Workspace Welcome headless interaction tests live
 in `workspace/tests/welcome.rs` and reuse the Workspace fixtures; DocumentView
-Apply/undo tests share file-backed setup but retain separate source, trust and
+Apply/undo tests share file-backed setup but retain separate source and
 failure assertions. App/core integration tests retain real fixture and
 discovery coverage, while machine-dependent cost diagnostics stay ignored.
 Python fake-UIA/provider tests in `scripts/tests/` prove harness selection,
@@ -385,49 +384,28 @@ the two, `\def\N{1000000000}...{\N}` and a macro-supplied environment name all
 defeat a guard written over the source text. See
 `vendor/ratex-parser/README.markturbo.md`.
 
-### MDX: structure natively, fidelity in the WebView
+### MDX: structural rendering
 
-`markdown-rs` parses MDX constructs, so native mode identifies JSX elements,
-ESM statements, and expressions, builds an outline from them, and never
-corrupts the document. It does not evaluate them: there is no JS engine in the
-document engine at all, which is also why opening executable content cannot run
-it.
+`markdown-rs` parses JSX elements, ESM statements and expressions so the
+document engine can build an outline and preserve source without evaluating
+them. The Web preview still renders MDX components as placeholders; it does
+not bundle an MDX compiler or runtime.
 
-`markdown-rs` gates ESM behind an `mdx_esm_parse` callback. We supply one that
-accepts every statement, because the structural boundary is a blank line, which
-the parser already finds — and the WebView path, running a real compiler, stays
-the authority on JS validity.
+### Web preview isolation
 
-### Trust boundary
+Markdown, MDX and HTML use the same path. The app supplies a base-free HTML
+string for a static host. It contains one full-viewport iframe with only
+`sandbox="allow-scripts"`, and the author document occupies its escaped
+`srcdoc` attribute. The app listens to no document bridge messages.
 
-MDX can contain executable code and a local HTML file can reference its own
-directory, so the boundary had to be decided now even though no MDX runtime
-ships in v0.1.
-
-Everything markturbo *renders itself* is served to the WebView as a `data:` URL
-— an opaque origin with no filesystem access, no `file://` reach, and no ambient
-credentials — under a CSP where `default-src 'none'` blocks **all** network
-access at both trust levels. `Restricted`, the default for every document,
-additionally blocks scripts.
-
-Trust is explicit and per-document, and it grants a different power to each of
-the two types it applies to:
-
-| | Restricted | Trusted |
-|---|---|---|
-| MDX | `data:`, no scripts, no network | `data:`, scripts run, still no network |
-| HTML | `data:` with an injected CSP | `file://`, loaded from disk |
-
-The HTML row is the actual boundary, and it is deliberate: a trusted `.html` is
-loaded through `web::to_file_url` so its relative images and stylesheets
-resolve, which is the only reason a user would trust one. That gives it a real
-origin, read access to whatever the user can read, and whatever CSP the file
-itself carries — which may be none. `to_file_url` documents that exposure;
-source scans are not evidence of WebView runtime behavior.
-
-So the honest summary is not "content can never reach anything". It is: nothing
-reaches the filesystem or the network unless the user trusted that specific
-document, and for HTML, trusting is exactly the act of handing it the disk.
+The document head starts with
+`default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:`.
+An HTML document retains its shell and styles; its own CSP may only add
+restrictions. Inline scripts run from the first render, but remote scripts,
+file resources and relative assets do not load. The sandbox blocks popups,
+forms and top-level navigation, and the host's additional `frame-src 'self'`
+directive restricts the frame from navigating to external resources. Source
+checks verify the generated policy, not WebView runtime enforcement.
 
 On Windows, the WebView worker requests an InPrivate profile and checks the
 created profile's actual mode through WebView2 before reporting ready or
@@ -975,12 +953,9 @@ Ordered by how cheap they are:
 - PlantUML needs a local install. Everything else is self-contained.
 - The WebView is Windows/macOS only, upstream. Linux gets an explanation in the
   Web pane rather than a broken one; native rendering is unaffected.
-- MDX components render as placeholders in both trust levels. The trust boundary
-  and CSP are in place for when a runtime ships.
+- MDX components render as placeholders; there is no MDX runtime.
 - Live web preview pauses above 512KB; the editor and native preview stay live.
 - Translation is the one feature that leaves the machine *on its own*, and only
   when the user invokes it with a key configured. What crosses the wire is prose
-  the user asked to have translated. Document content is separate: it cannot
-  fetch anything at any trust level — except a trusted HTML file, which is
-  loaded from `file://` outside markturbo's CSP and is therefore bounded by the
-  browser engine rather than by us. See the trust boundary above.
+  the user asked to have translated. The Web preview's sandbox and resource
+  policy are separate from model transport. See Web preview isolation above.

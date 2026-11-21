@@ -300,6 +300,63 @@ class PlatformAndExecutableTests(unittest.TestCase):
 
 
 class OwnedProcessTests(unittest.TestCase):
+    def test_active_process_ids_retries_with_a_larger_job_buffer(self) -> None:
+        process = object.__new__(runtime.OwnedProcess)
+        process._job = 11
+        process._closed = False
+        calls = 0
+
+        def query(_job, kind, buffer, _size, _returned):
+            nonlocal calls
+            self.assertEqual(kind, runtime.JOB_OBJECT_BASIC_PROCESS_ID_LIST)
+            calls += 1
+            info = ctypes.cast(
+                buffer, ctypes.POINTER(runtime.JOBOBJECT_BASIC_PROCESS_ID_LIST)
+            ).contents
+            if calls == 1:
+                info.NumberOfAssignedProcesses = 17
+                info.NumberOfProcessIdsInList = 16
+                return False
+            info.NumberOfAssignedProcesses = 17
+            info.NumberOfProcessIdsInList = 17
+            process_ids = (ctypes.c_size_t * 17).from_buffer(
+                buffer, ctypes.sizeof(wt.DWORD) * 2
+            )
+            for index in range(17):
+                process_ids[index] = 100 + index
+            return True
+
+        process.win32 = SimpleNamespace(
+            kernel32=SimpleNamespace(QueryInformationJobObject=query)
+        )
+        with mock.patch.object(
+            runtime.ctypes, "get_last_error", return_value=runtime.ERROR_MORE_DATA, create=True
+        ):
+            self.assertEqual(process.active_process_ids(), tuple(range(100, 117)))
+        self.assertEqual(calls, 2)
+
+    def test_visible_top_level_windows_include_all_processes_in_the_owned_job(self) -> None:
+        windows = {101: (73, True), 102: (88, False), 103: (89, True)}
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = windows[hwnd][0]
+            return 1
+
+        def enum_windows(callback, _lparam):
+            for hwnd in windows:
+                if not callback(hwnd, 0):
+                    return False
+            return True
+
+        win32.user32 = SimpleNamespace(
+            IsWindowVisible=lambda hwnd: windows[hwnd][1],
+            GetWindowThreadProcessId=process_id,
+            EnumWindows=enum_windows,
+        )
+        self.assertEqual(win32.visible_top_level_windows((73, 89)), (101, 103))
+
     def test_launch_subscribes_and_assigns_before_resuming(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             harness, kernel = owned_harness(Path(directory))

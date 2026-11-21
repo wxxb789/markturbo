@@ -41,7 +41,7 @@ def passing_observations(case_id: str = CASE) -> dict[str, Any]:
     """A passed session's observations: every phase's measurements as expected."""
     return case_observations(
         HARNESS.CASE_FLOWS[case_id],
-        **HARNESS.expected_fingerprints(),
+        **HARNESS.expected_observations(),
         provider_request_count=HARNESS.EXPECTED_REQUEST_COUNT,
     )
 
@@ -101,8 +101,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertGreater(script["range"]["start"], multibyte_line_end)
         self.assertLess(script["range"]["end"], owner["range"]["start"])
         accepted = HARNESS.apply_edits(HARNESS.SOURCE_BYTES, PROVIDER.fixture_edits(HARNESS.SOURCE_TEXT)[:1])
-        self.assertIn(b'<script>window.goal07 = "new";</script>\r\n<p>owner: TBD</p>', accepted)
-        self.assertIn("<p>trusted 文档 🚀</p>\r\n".encode("utf-8"), accepted)
+        self.assertIn(b'window.goal07 = "new";\r\n', accepted)
+        self.assertIn(b"<p>owner: TBD</p>\r\n", accepted)
+        self.assertIn("<p>fixture 文档 🚀</p>\r\n".encode("utf-8"), accepted)
 
     def test_each_fingerprint_must_hold_its_expected_bytes(self) -> None:
         for key in sorted(HARNESS.FINGERPRINT_OBSERVATION_KEYS):
@@ -110,6 +111,18 @@ class EvidenceTests(unittest.TestCase):
                 evidence = valid_evidence()
                 evidence["cases"][0]["observations"][key] = fingerprint(b"other bytes")
                 with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected bytes"):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_script_effect_and_window_count_are_required_and_typed(self) -> None:
+        for key, value in (
+            ("web_security_script_effect", False),
+            ("web_security_window_count", 2),
+            ("web_security_window_count", True),
+        ):
+            with self.subTest(key=key, value=value):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected value"):
                     HARNESS.validate_evidence(evidence)
 
     def test_the_session_needs_exactly_one_review_and_one_revision(self) -> None:
@@ -416,7 +429,7 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
 class SessionTests(unittest.TestCase):
     """The single launch: its profile, its phases in order and their failures."""
 
-    def test_profile_writes_only_the_trusted_document_and_never_touches_credential_manager(
+    def test_profile_writes_only_the_security_fixture_and_never_touches_credential_manager(
         self,
     ) -> None:
         win32 = mock.Mock()
@@ -429,7 +442,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(case_root, data.parent)
             self.assertEqual(
                 {path.name: path.read_bytes() for path in workspace.iterdir()},
-                {HARNESS.TRUST_FILE: HARNESS.SOURCE_BYTES},
+                {HARNESS.FIXTURE_FILE: HARNESS.SOURCE_BYTES},
             )
             self.assertEqual(
                 (config / "settings.toml").read_bytes(),
@@ -449,7 +462,7 @@ class SessionTests(unittest.TestCase):
         harness = bare_harness(
             profile=mock.Mock(return_value=(Path("case"), Path("data"), Path("config"), workspace, Path("stderr"))),
             launch_app=order.launch_app,
-            phase_trust=order.phase_trust,
+            phase_web_security=order.phase_web_security,
             phase_decisions=order.phase_decisions,
             quit_via_menu=order.quit_via_menu,
             click_lifecycle_decision=order.click_lifecycle_decision,
@@ -458,7 +471,11 @@ class SessionTests(unittest.TestCase):
             _finalize_observations=lambda _provider, _root, _app, observations: observations,
         )
         order.launch_app.return_value = app
-        order.phase_trust.return_value = {"trust_disk_before": DISK.evidence()}
+        order.phase_web_security.return_value = {
+            "web_security_disk_before": DISK.evidence(),
+            "web_security_script_effect": True,
+            "web_security_window_count": 1,
+        }
         order.phase_decisions.return_value = {"decisions_editor_stale": STALE.evidence()}
         return harness, order, app, provider
 
@@ -467,7 +484,7 @@ class SessionTests(unittest.TestCase):
         with mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider):
             observations = harness.scenario_revision_session()
 
-        source = Path("workspace") / HARNESS.TRUST_FILE
+        source = Path("workspace") / HARNESS.FIXTURE_FILE
         self.assertEqual(
             # The app is the launch's return value: its own calls are not steps.
             [call for call in order.mock_calls if not call[0].startswith("launch_app()")],
@@ -475,7 +492,7 @@ class SessionTests(unittest.TestCase):
                 mock.call.launch_app(
                     source, Path("data"), Path("config"), Path("workspace"), Path("stderr"),
                 ),
-                mock.call.phase_trust(app, provider, source),
+                mock.call.phase_web_security(app, provider, source),
                 mock.call.phase_decisions(app, provider, source),
                 mock.call.quit_via_menu(app),
                 mock.call.click_lifecycle_decision(app, "Discard"),
@@ -483,17 +500,19 @@ class SessionTests(unittest.TestCase):
                 mock.call.reap(app),
             ],
         )
-        self.assertEqual(observations["trust_disk_before"], DISK.evidence())
+        self.assertEqual(observations["web_security_disk_before"], DISK.evidence())
         self.assertEqual(observations["decisions_editor_stale"], STALE.evidence())
         self.assertEqual(observations["flow"], HARNESS.CASE_FLOWS[CASE])
         provider.close.assert_called_once_with()
 
     def test_a_phase_failure_names_its_phase_and_stops_the_session(self) -> None:
         harness, order, app, provider = self.session_harness()
-        order.phase_trust.side_effect = runtime.HarnessFailure("SCRIPTS_TRUSTED_TIMEOUT")
+        order.phase_web_security.side_effect = runtime.HarnessFailure("SCRIPT_EFFECT_TIMEOUT")
         with (
             mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
-            self.assertRaisesRegex(runtime.HarnessFailure, "^TRUST_SCRIPTS_TRUSTED_TIMEOUT$"),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "^WEB_SECURITY_SCRIPT_EFFECT_TIMEOUT$"
+            ),
         ):
             harness.scenario_revision_session()
         order.phase_decisions.assert_not_called()
@@ -503,7 +522,10 @@ class SessionTests(unittest.TestCase):
 
     def test_an_unexpected_measurement_fails_with_its_phase_key(self) -> None:
         for key, value, code in (
-            ("trust_disk_before", REVIEWED, "TRUST_DISK_BEFORE_UNEXPECTED"),
+            ("web_security_disk_before", REVIEWED, "WEB_SECURITY_DISK_BEFORE_UNEXPECTED"),
+            ("web_security_script_effect", False, "WEB_SECURITY_SCRIPT_EFFECT_UNEXPECTED"),
+            ("web_security_window_count", 2, "WEB_SECURITY_WINDOW_COUNT_UNEXPECTED"),
+            ("web_security_window_count", True, "WEB_SECURITY_WINDOW_COUNT_UNEXPECTED"),
             ("decisions_editor_one_accepted", ALL_ACCEPTED, "DECISIONS_EDITOR_ONE_ACCEPTED_UNEXPECTED"),
             ("decisions_clipboard_copied", ALL_ACCEPTED, "DECISIONS_CLIPBOARD_COPIED_UNEXPECTED"),
             ("decisions_disk_after", ONE_ACCEPTED, "DECISIONS_DISK_AFTER_UNEXPECTED"),
@@ -511,7 +533,8 @@ class SessionTests(unittest.TestCase):
             with self.subTest(code=code):
                 observed: dict[str, Any] = {}
                 with self.assertRaisesRegex(runtime.HarnessFailure, f"^{code}$"):
-                    with HARNESS.phase(key.partition("_")[0].upper()):
+                    phase_name = "WEB_SECURITY" if key.startswith("web_security_") else "DECISIONS"
+                    with HARNESS.phase(phase_name):
                         HARNESS.record(observed, key, value)
                 self.assertEqual(observed, {})
         observed = {}
@@ -530,56 +553,96 @@ class SessionTests(unittest.TestCase):
 class PhaseTests(unittest.TestCase):
     """Each phase's UI steps, in order, against fakes."""
 
-    def trust_harness(self, focus_returns: bool) -> tuple[HARNESS.Goal07Harness, mock.Mock, mock.Mock]:
+    def web_security_harness(
+        self, focus_returns: bool
+    ) -> tuple[HARNESS.Goal07Harness, mock.Mock, mock.Mock]:
         order = mock.Mock()
         app = mock.Mock(hwnd=73)
-        harness = bare_harness(win32=mock.Mock())
-        for name in (
-            "menu_command", "_press", "confirm_system_alert", "wait_name", "editor_control",
-        ):
+        win32 = mock.Mock()
+        win32.foreground_focus.return_value = app.hwnd if focus_returns else 0
+        win32.foreground_window.return_value = app.hwnd
+        win32.visible_top_level_windows.return_value = (app.hwnd,)
+        app.process.poll.return_value = None
+        app.process.active_process_ids.return_value = (73, 74)
+        harness = bare_harness(win32=win32)
+        for name in ("menu_command", "wait_name", "editor_control"):
             setattr(harness, name, getattr(order, name))
-        harness.name_present = mock.Mock(return_value=False)
-        harness.win32.foreground_focus.return_value = app.hwnd if focus_returns else 0
         return harness, order, app
 
-    def test_trust_phase_trusts_scripts_then_hands_the_keyboard_back(self) -> None:
-        harness, order, app = self.trust_harness(focus_returns=True)
+    def test_web_phase_checks_script_navigation_and_window_then_hands_keyboard_back(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
         with (
             mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
         ):
-            observed = harness.phase_trust(app, order.provider, Path("trusted.html"))
+            observed = harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
         self.assertEqual(
             order.mock_calls,
             [
                 mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
-                mock.call._press(app, HARNESS.TRUST_SCRIPTS_AUTOMATION_ID, "WEB_TRUST"),
-                mock.call.confirm_system_alert(
-                    app, mock.ANY, "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION", confirmed=mock.ANY
+                mock.call.wait_name(
+                    app, HARNESS.SCRIPT_EFFECT_TEXT, "Text", "SCRIPT_EFFECT_TIMEOUT"
                 ),
-                mock.call.wait_name(app, HARNESS.TRUSTED_BANNER, "Text", "SCRIPTS_TRUSTED_TIMEOUT"),
+                mock.call.wait_name(
+                    app, HARNESS.SCRIPT_EFFECT_TEXT, "Text", "PREVIEW_LEFT_FIXTURE"
+                ),
                 mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
                 mock.call.editor_control(app),
             ],
         )
-        self.assertEqual(observed, {"trust_disk_before": DISK.evidence()})
-        # The Run scripts alert is outside UIA: Enter answers it only while
-        # trust is still off, then the banner proves it.
-        still_undecided = order.confirm_system_alert.call_args.args[1]
-        self.assertTrue(still_undecided())
-        harness.name_present.return_value = True
-        self.assertFalse(still_undecided())
-        harness.name_present.assert_called_with(app, HARNESS.TRUSTED_BANNER, "Text")
+        self.assertEqual(
+            observed,
+            {
+                "web_security_disk_before": DISK.evidence(),
+                "web_security_script_effect": True,
+                "web_security_window_count": 1,
+            },
+        )
+        harness.win32.sleep.assert_called_once_with(HARNESS.SCRIPT_NAVIGATION_SETTLE_SECONDS)
+        harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
+        harness.win32.foreground_window.assert_called_once_with()
 
-    def test_trust_phase_fails_while_the_web_view_keeps_the_keyboard(self) -> None:
-        harness, order, app = self.trust_harness(focus_returns=False)
+    def test_web_phase_fails_when_navigation_replaces_the_fixture(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.wait_name.side_effect = [None, runtime.HarnessFailure("PREVIEW_LEFT_FIXTURE")]
+        with (
+            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "PREVIEW_LEFT_FIXTURE"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_fails_if_a_popup_creates_an_extra_owned_window(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        harness.win32.visible_top_level_windows.return_value = (app.hwnd, 93)
+        with (
+            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_COUNT_UNEXPECTED"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.editor_control.assert_not_called()
+
+    def test_web_phase_fails_when_a_new_window_leaves_the_app_foreground(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        harness.win32.foreground_window.return_value = 93
+        with (
+            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_FOREGROUND_LOST"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
+
+    def test_web_phase_fails_while_the_web_view_keeps_the_keyboard(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=False)
         with (
             mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
             self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"),
         ):
-            harness.phase_trust(app, order.provider, Path("trusted.html"))
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
     def decisions_harness(self, accept_offered: bool = False) -> tuple[HARNESS.Goal07Harness, mock.Mock]:
         order = mock.Mock()
@@ -600,11 +663,11 @@ class PhaseTests(unittest.TestCase):
         order.control_absent.return_value = not accept_offered
         return harness, order
 
-    def test_decisions_phase_walks_accept_reject_undo_copy_stale_done_restricted(self) -> None:
+    def test_decisions_phase_walks_accept_reject_undo_copy_stale_and_done(self) -> None:
         harness, order = self.decisions_harness()
         app, provider = mock.Mock(hwnd=73), order.provider
         with mock.patch.object(HARNESS, "sha256_file", return_value=DISK):
-            observed = harness.phase_decisions(app, provider, Path("trusted.html"))
+            observed = harness.phase_decisions(app, provider, Path(HARNESS.FIXTURE_FILE))
 
         self.assertEqual(
             order.mock_calls,
@@ -630,10 +693,6 @@ class PhaseTests(unittest.TestCase):
                     "REVISION_ACCEPT_UIA_QUERY_FAILED", "REVISION_ACCEPT_UIA_CONTRACT_MISMATCH",
                 ),
                 mock.call.done(app, HARNESS.REVISION_APPLIED),
-                mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
-                mock.call.wait_name(
-                    app, HARNESS.RESTRICTED_BANNER, "Text", "SCRIPTS_RESTRICTED_TIMEOUT"
-                ),
                 mock.call.provider.verify_chain(),
             ],
         )
@@ -657,7 +716,7 @@ class PhaseTests(unittest.TestCase):
             mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "^EDITOR_ONE_ACCEPTED_UNEXPECTED$"),
         ):
-            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path("trusted.html"))
+            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE))
         self.assertEqual(order.decide_hunks.call_count, 1)
         order.copy_approved.assert_not_called()
 
@@ -667,7 +726,7 @@ class PhaseTests(unittest.TestCase):
             mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "^REVISION_OFFERS_ACCEPT$"),
         ):
-            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path("trusted.html"))
+            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE))
         order.done.assert_not_called()
 
 

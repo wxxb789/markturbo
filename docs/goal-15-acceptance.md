@@ -1,13 +1,116 @@
 # Goal 15 implementation evidence
 
 Contract: [Scripts always run; documents never reach the network](goals/15-scripts-always-on.md).
-Plan: [Goal 15 implementation plan](plans/2026-11-21-goal-15-scripts-always-on-plan.md).
 
-Status: blocked on native isolation. No application, dependency, test or native
-harness changes were made. The active contract, its index and the README
-Security section are unchanged. No after text exists to compare.
+## Sandboxed-frame candidate
 
-## Locked source inspection
+The amended contract replaces the first run's top-level document with one
+static host and one opaque-origin `srcdoc` iframe. The Rust page builder no
+longer takes a trust argument. Source tests cover the host policy and exact
+sandbox token, attribute escaping, document policy ordering for all three
+formats, shell and author-policy preservation, theme, diagrams and math. An
+inline script needed by an authored Markdown diagram is present on the first
+build. MDX JSX remains a structural placeholder; no runtime was added.
+
+README Security before: the per-tab Restricted/Trusted table described a
+prompt, Revision-time revocation, and trusted HTML with no CSP. After: the
+same base-free host, sandboxed frame and resource policy apply to Markdown,
+MDX and HTML on first render; remote scripts and relative assets do not load.
+The exact wording change is in `git diff -- README.md`.
+
+The Rust root declares an empty external WebView host list. In nsh 0.6.1,
+`nsh-engine/src/lib.rs:4301` consumes it for engine access checks;
+`nsh-platform-windows/src/app.rs:441` separately installs the default native
+access for Rust roots. The declaration denies external app-side loads, but
+is not an override for the Windows renderer's native navigation handler.
+
+The literal contract search still reports nine unchanged `ProjectTrust::`
+references in Agent Context and its callers. Adding a word boundary before
+`Trust::` leaves no matches for the document-trust identifiers or UI copy.
+The unrelated project trust type was not renamed.
+
+### Candidate gates
+
+| Command | Exit | Result |
+|---|---:|---|
+| `cargo fmt --all -- --check` | 0 | No output after formatting the new import. |
+| `cargo clippy --profile ci -p mt-core -p mt-app --all-targets` | 0 | Isolated target; 3 existing warnings: 2 argument-count warnings in mt-core and 1 clone-on-Copy warning in mt-app tests. |
+| `cargo test --profile ci -p mt-app --lib` | 0 | Isolated target; 167 passed, 0 failed, including all 12 Web page tests. |
+| `cargo test --profile ci -p mt-app --test hierarchy_layouts` | 0 | Isolated target; 1 passed, 0 failed. |
+| `cargo test --profile ci -p mt-app` | 0 | Isolated target; 222 passed, 0 failed, 0 ignored across 42 test targets. |
+| `cargo test --profile ci -p mt-core --features model-transport` | 0 | 833 passed, 0 failed, 7 ignored across 9 test targets. No `WouldBlock` or `PoisonError` on this run. |
+| `uv run --locked --project scripts scripts/mt.py check fast` | 1 | 1 of 8 tooling shards failed; 28 passed and 1 failed in that shard. |
+| `uv run --locked --project scripts scripts/mt.py check native` | 0 | 288 passed across 8 shards. No desktop acceptance run. |
+| `uv run --locked --project scripts scripts/mt.py check ci` | 1 | Same tooling shard failure as `fast`; workspace Rust checks did not start. |
+
+`fast` and `ci` stop at the existing
+`test_cargo_config_context_records_only_content_free_fingerprints` failure:
+the host's ancestor Cargo configuration yields two configs instead of one.
+The test and shared configuration are unchanged.
+
+The first focused `cargo test --profile ci -p mt-app --lib web::tests`
+exited 101 (11 passed, 1 failed): the GFM compiler escaped the Markdown
+fixture's script. The Web renderer now preserves inline script markup for
+the sandbox to govern. The first full mt-app run against the shared target
+also exited 101 (185 passed, 1 failed), but ran a titlebar test absent from
+this tree and reported a line beyond the end of the local source file.
+Those counts are not evidence for the candidate.
+
+The retry used a worktree-local Cargo target (four build jobs initially,
+eight for the final full run) without changing the shared Cargo config. The
+first isolated run exited 101 before tests: the capability test called
+private or unavailable methods on `Capabilities`. It now queries the
+public `Access` type, as the nsh engine does. The next isolated run exited
+101 (165 passed, 2 failed): a buffer test expected CRLF instead of LF,
+and the Markdown fixture placed its script in a paragraph, where the
+parser escaped the JavaScript string literals. The fixture now uses a
+raw HTML script block and checks its exact contents and position.
+
+The next app run reached integration tests, then exited 101 (178 passed,
+1 failed). The hierarchy test still waited for the retired Restricted
+banner. It now checks the WebView, keeps its layout-transition assertions,
+and verifies the banner is absent. The visual harness also waits for the
+WebView instead of the removed button.
+
+One `check native` run after the visual change exited 1: the unchanged
+Goal 06 clean-close test timed out in two subcases in a 36-test shard.
+A focused replay reproduced one subcase timeout. The full retry passed
+all 288 tests without altering the timeout or Goal 06 code.
+
+### Pending release checks
+
+The contract stays active. The CI tier has not passed and the candidate has
+no release-bound native isolation evidence.
+
+- On the owner's active, unlocked Windows 11 x64 desktop, run
+  `mt.py accept all --exe <release exe> --expect-exe-sha256 <release sha256>`.
+  The Goal 07 phase must see the script's visible effect, the fixture still in
+  the frame after its navigation attempts, and no new window. The acceptance
+  harness unit tests do not run the desktop phase.
+- Verify frame scrolling, text selection, light and dark colours, math and
+  diagrams in the actual preview. If WebView2 rejects the frame policy, stop
+  and record the result without loosening the sandbox.
+- Verify zero document-driven outbound activity and file loads independently
+  of the visibility check. The locked Windows backend checks top-level
+  navigation against its own native access value, but does not install a
+  `FrameNavigationStarting` handler or a general resource filter for
+  `NavigateToString`. CSP fetch restrictions are not evidence about other
+  browser network facilities: the CSP draft defines a separate
+  [RTC pre-connect check](https://w3c.github.io/webappsec-csp/#should-block-rtc-connection),
+  which the prescribed policy does not configure. The app does not register
+  a handler for the bridge messages nsh can deliver.
+- The shared diagram registry runs before the WebView receives the host.
+  An installed PlantUML remains an optional external renderer
+  (`crates/mt-core/src/rendering/mod.rs:766`); browser policy does not govern
+  that subprocess. Include configured external renderers in any
+  document-wide no-network/no-file verification.
+
+## Run 1 (before the sandboxed-frame amendment)
+
+The first attempt was blocked by the live-popup behavior described below.
+It changed no application, dependencies, tests, native harness or product docs.
+
+### Locked source inspection
 
 The following paths are relative to the locked nsh 0.6.1 crate roots.
 
@@ -33,7 +136,7 @@ in the Goal 15 worktree returned 52 lines: 43 document-trust matches and 9
 unrelated `ProjectTrust::` matches. The latter are a substring collision in the
 contract's search, not evidence of additional per-tab state.
 
-## Gate results
+### Gate results
 
 These commands check the existing application at `d70f645`, not an implemented
 Goal 15 candidate. Native acceptance (`mt.py accept all`) is not run in this

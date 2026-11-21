@@ -14,7 +14,7 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
      **Trust scripts** button, the **Run scripts in this document?** alert, and the Revision-time
      trust revocation are gone.
    - No code path keeps a per-tab script or trust state.
-   - `git grep -nE "Trust::|allows_scripts|to_file_url|Run scripts|Trust scripts" crates/` is empty.
+   - `git grep -nE "\bTrust::|allows_scripts|to_file_url|Run scripts|Trust scripts" crates/` is empty (`ProjectTrust` is a different concept and stays).
 2. **One page policy for all three types.**
    - `web::build_html` serves Markdown, MDX and HTML as a `data:`/string page with no base URL.
    - Each page carries one CSP: `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:`.

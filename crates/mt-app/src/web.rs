@@ -1,65 +1,148 @@
 //! The WebView compatibility path for browser-only document semantics.
 //!
-//! Markdown, MDX and HTML all use the authoritative [`Document`]; diagrams and
-//! math use the same [`RendererRegistry`] as the native preview. Generated
-//! markup is served as a self-contained `data:` URL with an opaque origin and
-//! a restrictive CSP, so restricted documents cannot run scripts or fetch
-//! workspace files or network resources.
-//!
-//! [`to_file_url`] is the explicit escape from that sandbox for a local HTML
-//! file the user has trusted. Callers must gate that transition on [`Trust`].
-
-use std::path::Path;
+//! The application supplies a static host. Only its sandboxed document frame
+//! contains author markup, with no file base or application bridge.
 
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
-use mt_core::{Block, BlockKind, Document};
+use mt_core::{Block, BlockKind, DocType, Document};
 
-/// How much the WebView is allowed to execute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Trust {
-    /// No scripting at all. Markdown and HTML render; MDX components do not.
-    /// This is the default for any document, because a Markdown file in a
-    /// cloned repository is not automatically trustworthy.
-    Restricted,
-    /// Scripts from the bundled runtime may run, enabling MDX components and
-    /// browser-side diagram rendering. Requires an explicit user action.
-    Trusted,
+const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:";
+const HOST_FRAME_SRC: &str = "; frame-src 'self'";
+
+/// Build a base-free WebView host; only the opaque-origin frame runs scripts.
+pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> String {
+    let csp = csp_meta("");
+    let page = match doc.doc_type() {
+        DocType::Html => build_html_raw(doc.source(), &csp),
+        kind => {
+            let body = if kind == DocType::Mdx {
+                render_mdx_body(doc, registry)
+            } else {
+                render_markdown_body(doc, registry)
+            };
+            format!(
+                "<!doctype html><html><head>{csp}<meta charset=\"utf-8\">\
+                 <style>{vars}\n{STYLE}</style></head><body>{body}</body></html>",
+                vars = css_variables(dark),
+            )
+        }
+    };
+    format!(
+        "<!doctype html><html><head>{host_csp}<meta charset=\"utf-8\">\
+         <style>iframe{{position:fixed;inset:0;width:100%;height:100%;border:0}}</style>\
+         </head><body><iframe sandbox=\"allow-scripts\" srcdoc=\"{}\"></iframe></body></html>",
+        escape(&page),
+        host_csp = csp_meta(HOST_FRAME_SRC),
+    )
 }
 
-impl Trust {
-    pub fn label(self) -> &'static str {
-        match self {
-            Trust::Restricted => "Restricted",
-            Trust::Trusted => "Trusted",
+fn csp_meta(extra: &str) -> String {
+    format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}{extra}\">")
+}
+
+/// Preserve the original shell when its leading structure is unambiguous.
+/// Otherwise let the HTML parser imply a head from the leading policy meta.
+fn build_html_raw(source: &str, csp: &str) -> String {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let start = skip_html_trivia(source);
+    let doctype = "<!doctype html>";
+    let after_doctype = if start
+        .get(..doctype.len())
+        .is_some_and(|tag| tag.eq_ignore_ascii_case(doctype))
+    {
+        &start[doctype.len()..]
+    } else {
+        start
+    };
+    let before_html = skip_html_trivia(after_doctype);
+    let after_html = opening_tag_end(before_html, "html").unwrap_or(before_html);
+    let head = opening_tag_end(skip_html_trivia(after_html), "head");
+    let (prefix, rest) = source.split_at(source.len() - head.unwrap_or(after_html).len());
+    let doctype = if start.len() == after_doctype.len() {
+        "<!doctype html>"
+    } else {
+        ""
+    };
+    format!("{doctype}{prefix}{csp}{rest}")
+}
+
+fn html_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n' | '\x0c')
+}
+
+fn skip_html_trivia(mut source: &str) -> &str {
+    loop {
+        source = source.trim_start_matches(html_whitespace);
+        let Some(comment) = source.strip_prefix("<!--") else {
+            return source;
+        };
+        // Do not skip ambiguous comments: the parser can end them early.
+        if comment.starts_with(['-', '>']) {
+            return source;
+        }
+        let Some((_, tail)) = comment.split_once("--") else {
+            return source;
+        };
+        let Some(rest) = tail.strip_prefix('>') else {
+            return source;
+        };
+        source = rest;
+    }
+}
+
+/// Recognize only ordinary opening tags and attributes, not HTML error recovery.
+fn opening_tag_end<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let source = source.strip_prefix('<')?;
+    if !source.get(..name.len())?.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    let mut rest = &source[name.len()..];
+    loop {
+        if let Some(tail) = rest.strip_prefix('>') {
+            return Some(tail);
+        }
+        let attrs = rest.trim_start_matches(html_whitespace);
+        if attrs.len() == rest.len() {
+            return None;
+        }
+        if let Some(tail) = attrs.strip_prefix('>') {
+            return Some(tail);
+        }
+        let name_end = attrs
+            .find(|c: char| {
+                html_whitespace(c) || matches!(c, '=' | '>' | '/' | '<' | '\'' | '"' | '\0')
+            })
+            .unwrap_or(attrs.len());
+        if name_end == 0 {
+            return None;
+        }
+        let attr = &attrs[..name_end];
+        if attr.eq_ignore_ascii_case("style")
+            || attr.eq_ignore_ascii_case("manifest")
+            || attr
+                .get(..2)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on"))
+        {
+            return None;
+        }
+        rest = &attrs[name_end..];
+        if let Some(value) = rest.trim_start_matches(html_whitespace).strip_prefix('=') {
+            let value = value.trim_start_matches(html_whitespace);
+            if let Some(quote @ ('\'' | '"')) = value.chars().next() {
+                rest = value[1..].split_once(quote)?.1;
+            } else {
+                let end = value
+                    .find(|c: char| {
+                        html_whitespace(c) || matches!(c, '>' | '<' | '=' | '\'' | '"' | '`' | '\0')
+                    })
+                    .unwrap_or(value.len());
+                if end == 0 {
+                    return None;
+                }
+                rest = &value[end..];
+            }
         }
     }
-
-    pub fn allows_scripts(self) -> bool {
-        self == Trust::Trusted
-    }
-}
-
-/// Build the HTML document shown in the WebView.
-///
-/// The application supplies its current light/dark mode instead of relying on
-/// the browser's system preference. HTML files retain their own document shell
-/// and styling; Markdown and MDX use the application's reading palette.
-/// Diagrams and math are pre-rendered by the shared registry, not reparsed by
-/// an independent browser-side Markdown pipeline.
-pub fn build_html(doc: &Document, registry: &RendererRegistry, trust: Trust, dark: bool) -> String {
-    let body = match doc.doc_type() {
-        mt_core::DocType::Html => return build_html_raw(doc, trust),
-        mt_core::DocType::Mdx => render_mdx_body(doc, registry, trust),
-        _ => render_markdown_body(doc, registry),
-    };
-
-    format!(
-        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>{vars}\n{style}</style>\n</head><body>{banner}{body}</body></html>",
-        csp = csp_meta(trust),
-        vars = css_variables(dark),
-        style = STYLE,
-        banner = trust_banner(doc, trust),
-    )
 }
 
 /// The original Light and Dark reading palettes, independent of UI toolkit.
@@ -105,99 +188,6 @@ fn css_variables(dark: bool) -> &'static str {
     }
 }
 
-/// The Content-Security-Policy for this trust level.
-///
-/// Both generated-document levels forbid every network fetch (`default-src 'none'`), so a document
-/// can never phone home or leak what the user is reading. Restricted
-/// additionally forbids script execution.
-fn csp_meta(trust: Trust) -> String {
-    let script = if trust.allows_scripts() {
-        // 'unsafe-inline' is required because the MDX runtime is inlined into
-        // the document; there is no server to issue a nonce. It is scoped to a
-        // document the user explicitly trusted, and `default-src 'none'` still
-        // blocks all network access.
-        "script-src 'unsafe-inline'"
-    } else {
-        "script-src 'none'"
-    };
-    format!(
-        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; {script}\">"
-    )
-}
-
-fn trust_banner(doc: &Document, trust: Trust) -> String {
-    if trust.allows_scripts() {
-        return String::new();
-    }
-    match doc.doc_type() {
-        // MDX needs a scripting warning; HTML uses its own filesystem warning.
-        mt_core::DocType::Mdx => "<div class=\"mt-banner\">This MDX document is not trusted. Components are shown as placeholders and no code runs. Use <b>Trust this document</b> to enable full rendering.</div>".to_string(),
-        // Restricted HTML executes nothing; trusting a local file also buys filesystem access,
-        // so the warning is about the missing images and stylesheets rather
-        // than about code.
-        //
-        // Inline styles, not `.mt-banner`: this banner is inserted into the
-        // user's *own* document, which never saw [`STYLE`], so a class would
-        // render as an unstyled line of text.
-        //
-        // English regardless of the UI language: `build_html`'s signature is
-        // fixed by callers outside this crate, so there is no `App` here to
-        // read the setting from — the same limitation the MDX banner above has
-        // always had.
-        mt_core::DocType::Html => format!(
-            "<div style=\"background:rgba(240,173,78,.18);border:1px solid rgba(240,173,78,.6);\
-             border-radius:8px;padding:10px 14px;margin:0 0 1.5em;font-size:.92em;\
-             font-family:system-ui,sans-serif\">{}</div>",
-            crate::i18n::t(
-                mt_core::settings::Language::default(),
-                crate::i18n::Key::HtmlNeedsTrust,
-            )
-        ),
-        _ => String::new(),
-    }
-}
-
-/// Serve an HTML file's own text without nesting it in another document.
-///
-/// Trusted HTML remains an explicit byte-for-byte passthrough. Restricted HTML
-/// gets its CSP before any author markup, because scripts earlier in a head
-/// would already have executed if the policy were inserted at `</head>`.
-/// A leading standards-mode doctype keeps that early insertion from putting
-/// an ordinary HTML page into quirks mode; the author's own doctype is ignored
-/// by the browser. The banner stays at the original head/body seam.
-pub fn build_html_raw(doc: &Document, trust: Trust) -> String {
-    let source = doc.source();
-    if trust.allows_scripts() {
-        return source.to_string();
-    }
-    let (head, body) = source.split_at(head_end(source));
-    format!(
-        "<!doctype html>\n{}\n{head}{}{body}",
-        csp_meta(trust),
-        trust_banner(doc, trust)
-    )
-}
-
-/// Byte offset of the banner seam: just before `</head>`.
-///
-/// Inserting at the very top instead would reparent the file's own `<head>`
-/// children into `<body>` — the parser closes the head it built as soon as it
-/// sees the banner's `<div>` — which is how a `<meta charset>` stops being
-/// read. A document with no `</head>` has no head content to protect, so it
-/// takes the offset just past its doctype: an element ahead of the declaration
-/// puts the browser in quirks mode, changing the box model of the very page we
-/// are trying to show faithfully.
-fn head_end(source: &str) -> usize {
-    let lower = source.to_ascii_lowercase();
-    if let Some(at) = lower.find("</head>") {
-        return at;
-    }
-    match lower.trim_start().starts_with("<!doctype") {
-        true => lower.find('>').map_or(0, |at| at + 1),
-        false => 0,
-    }
-}
-
 /// Render an ordinary Markdown document to HTML.
 fn render_markdown_body(doc: &Document, registry: &RendererRegistry) -> String {
     let mut out = String::new();
@@ -234,10 +224,10 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
             compile: markdown::CompileOptions {
                 // The source is a local file the user opened; raw HTML in it is
                 // authored content, and blocking it would break ordinary
-                // documents. Scripts are still blocked by the CSP.
+                // documents. The frame policy governs scripts and loads.
                 allow_dangerous_html: true,
                 allow_dangerous_protocol: false,
-                ..markdown::CompileOptions::gfm()
+                ..markdown::CompileOptions::default()
             },
         },
     ) {
@@ -259,11 +249,8 @@ fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> S
 
 /// Render an MDX document.
 ///
-/// v0.1 does not embed a JS engine, so MDX components are shown as native-style
-/// placeholders in both trust levels; what `Trusted` changes today is the CSP,
-/// which is the boundary that has to be right before any runtime ships. The
-/// Markdown parts of the document render fully either way.
-fn render_mdx_body(doc: &Document, registry: &RendererRegistry, trust: Trust) -> String {
+/// JSX still uses the shared placeholders; this path does not compile MDX components.
+fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
     let mut out = String::new();
     let mut markdown_run = String::new();
 
@@ -276,7 +263,7 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry, trust: Trust) ->
         match block.kind {
             BlockKind::Mdx(kind) => {
                 flush_markdown(&mut out, &mut markdown_run, doc);
-                out.push_str(&mdx_placeholder(kind, &block.content, trust));
+                out.push_str(&mdx_placeholder(kind, &block.content));
             }
             _ => {
                 markdown_run.push_str(&doc.source()[block.range.clone()]);
@@ -292,7 +279,7 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry, trust: Trust) ->
     out
 }
 
-fn mdx_placeholder(kind: mt_core::document::block::MdxKind, source: &str, _trust: Trust) -> String {
+fn mdx_placeholder(kind: mt_core::document::block::MdxKind, source: &str) -> String {
     let label = match kind {
         mt_core::document::block::MdxKind::JsxElement => {
             mt_core::document::outline::jsx_tag_name(source)
@@ -336,84 +323,6 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// Encode `html` as a `data:` URL for `WebView::load_url`.
-///
-/// Percent-encoding rather than base64 keeps the payload debuggable and avoids
-/// pulling in an encoder. The opaque origin of a `data:` URL is the point: it
-/// has no filesystem or same-origin access to anything in the workspace.
-///
-/// A string that is **already** a `file://` URL passes through untouched. The
-/// workspace's WebView sync is one call site that encodes whatever the active
-/// document built, so this is what lets a trusted HTML file arrive as the URL
-/// [`to_file_url`] produced; encoding it again would show the text of a URL
-/// instead of loading the file it names. Markup can never be mistaken for one —
-/// a document starts with `<`.
-pub fn to_data_url(html: &str) -> String {
-    if html.starts_with("file://") {
-        return html.to_string();
-    }
-    // `len * 3` rather than `* 2`: an encoded byte is three characters, and
-    // most of an HTML payload's bytes need encoding. The old capacity was
-    // short enough that the buffer reallocated partway through every document.
-    let mut out = String::with_capacity(html.len() * 3 + 32);
-    out.push_str("data:text/html;charset=utf-8,");
-    for byte in html.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => push_percent(&mut out, *other),
-        }
-    }
-    out
-}
-
-/// Append `%XX` for one byte, without allocating.
-///
-/// `format!("%{byte:02X}")` builds a `String` per call, and every call site
-/// here runs once per byte of an HTML payload. Measured on a 293 KB document:
-/// 17.4ms with `format!`, 730µs with this — **24x**, and the Web pane pays it
-/// on every rebuild.
-fn push_percent(out: &mut String, byte: u8) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    out.push('%');
-    out.push(HEX[(byte >> 4) as usize] as char);
-    out.push(HEX[(byte & 0xf) as usize] as char);
-}
-
-/// Encode `path` as a `file://` URL for `WebView::load_url`.
-///
-/// **This is the sandbox boundary.** Unlike [`to_data_url`], a `file://`
-/// document has a real origin: it can load its own directory's images and
-/// stylesheets — which is the point — and therefore also anything else the user
-/// can read. Only an explicit Trust action may reach this, exactly as with MDX
-/// script execution.
-///
-/// Windows separators become `/` and the drive letter's `:` survives, because
-/// `file:///C:/Users/...` is the form every engine accepts; `C:\Users` is not a
-/// URL path at all. Everything outside the unreserved set is percent-encoded,
-/// so a space or a `#` in a folder name cannot truncate the path.
-pub fn to_file_url(path: &Path) -> String {
-    let mut out = String::from("file://");
-    let mut encoded = String::new();
-    for byte in path.to_string_lossy().as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
-                encoded.push(*byte as char)
-            }
-            b'\\' => encoded.push('/'),
-            other => push_percent(&mut encoded, *other),
-        }
-    }
-    // A POSIX path already supplies the third slash; a Windows one starts at
-    // the drive letter and would otherwise read as a hostname.
-    if !encoded.starts_with('/') {
-        out.push('/');
-    }
-    out.push_str(&encoded);
-    out
-}
-
 /// The document stylesheet.
 ///
 /// Colors consume the light/dark variables above; translucent fallbacks keep
@@ -454,14 +363,14 @@ img, svg { max-width: 100%; }
           padding: 8px 12px; margin: 1.2em 0; }
 .mt-mdx-label { font-family: ui-monospace, monospace; font-size: .85em;
                 color: var(--text-muted, inherit); }
-.mt-banner { background: rgba(240,173,78,.18); border: 1px solid rgba(240,173,78,.6);
-             border-radius: 8px; padding: 10px 14px; margin-bottom: 1.5em; font-size: .92em; }
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mt_core::DocType;
+
+    const DOCUMENT_POLICY: &str = r#"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:">"#;
+    const HOST_POLICY: &str = r#"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; frame-src 'self'">"#;
 
     fn registry() -> RendererRegistry {
         RendererRegistry::with_defaults()
@@ -481,97 +390,24 @@ mod tests {
 
     #[test]
     fn renders_ordinary_markdown() {
-        let html = build_html(
-            &md("# Title\n\nSome *text*.\n"),
-            &registry(),
-            Trust::Restricted,
-            false,
-        );
+        let html = page(&md("# Title\n\nSome *text*.\n"), &registry(), false);
         assert!(html.contains("<h1>Title</h1>"), "got {html}");
         assert!(html.contains("<em>text</em>"));
     }
 
     #[test]
-    fn restricted_csp_blocks_scripts_and_network() {
-        let html = build_html(
-            &md("<script>run()</script>\n\n# x\n"),
-            &registry(),
-            Trust::Restricted,
-            false,
-        );
-        for directive in [
-            "default-src 'none'",
-            "style-src 'unsafe-inline'",
-            "img-src data:",
-            "font-src data:",
-            "script-src 'none'",
-        ] {
-            assert!(html.contains(directive), "missing {directive}");
-        }
-        assert!(!html.contains("script-src 'unsafe-inline'"));
-        let policy = html.find("Content-Security-Policy").expect("policy");
-        // The Markdown parser escapes or drops a raw script; either way the
-        // policy is present and script execution is disabled.
-        assert!(policy < html.len());
-    }
-
-    #[test]
-    fn trusted_allows_scripts_but_still_blocks_network() {
-        let html = build_html(&md("# x\n"), &registry(), Trust::Trusted, false);
-        assert!(html.contains("script-src 'unsafe-inline'"));
-        assert!(
-            html.contains("default-src 'none'"),
-            "trusted must not open network access"
-        );
-    }
-
-    #[test]
     fn math_renders_to_svg() {
-        let html = build_html(
-            &md("$$\n\\frac{a}{b}\n$$\n"),
-            &registry(),
-            Trust::Restricted,
-            false,
-        );
+        let html = page(&md("$$\n\\frac{a}{b}\n$$\n"), &registry(), false);
         assert!(body(&html).contains("<svg"), "got {}", body(&html));
     }
 
     #[test]
     fn failed_render_shows_a_diagnostic_and_keeps_the_source() {
         let src = "```d2\nthis is the original source\n```\n";
-        let html = build_html(&md(src), &RendererRegistry::new(), Trust::Restricted, false);
+        let html = page(&md(src), &RendererRegistry::new(), false);
         assert!(body(&html).contains("mt-error"));
         assert!(html.contains("this is the original source"));
         assert!(html.contains("no renderer registered"));
-    }
-
-    #[test]
-    fn mdx_shows_component_placeholders_and_an_untrusted_banner() {
-        let src = "# Title\n\n<RevenueChart data={rows} />\n";
-        let doc = Document::with_type(DocType::Mdx, src.to_string());
-        let html = build_html(&doc, &registry(), Trust::Restricted, false);
-        assert!(
-            body(&html).contains("mt-banner"),
-            "untrusted MDX must be flagged"
-        );
-        assert!(html.contains("&lt;RevenueChart /&gt;"), "got {html}");
-        assert!(
-            html.contains("<h1>Title</h1>"),
-            "markdown parts still render"
-        );
-    }
-
-    #[test]
-    fn trusted_mdx_has_no_banner() {
-        let doc = Document::with_type(DocType::Mdx, "<Chart />\n".to_string());
-        let html = build_html(&doc, &registry(), Trust::Trusted, false);
-        assert!(!body(&html).contains("mt-banner"));
-    }
-
-    #[test]
-    fn plain_markdown_never_shows_the_mdx_banner() {
-        let html = build_html(&md("# x\n"), &registry(), Trust::Restricted, false);
-        assert!(!body(&html).contains("mt-banner"));
     }
 
     #[test]
@@ -583,52 +419,9 @@ mod tests {
     }
 
     #[test]
-    fn data_url_round_trips_unicode() {
-        let url = to_data_url("<p>中文 & <b>emoji 🎉</b></p>");
-        assert!(url.starts_with("data:text/html;charset=utf-8,"));
-        let encoded = &url["data:text/html;charset=utf-8,".len()..];
-        // Decode and compare.
-        let mut bytes = Vec::new();
-        let mut chars = encoded.chars();
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                let hex: String = chars.by_ref().take(2).collect();
-                bytes.push(u8::from_str_radix(&hex, 16).unwrap());
-            } else {
-                bytes.push(c as u8);
-            }
-        }
-        assert_eq!(
-            String::from_utf8(bytes).unwrap(),
-            "<p>中文 & <b>emoji 🎉</b></p>"
-        );
-    }
-
-    #[test]
-    fn data_url_contains_no_unescaped_structural_characters() {
-        // A `#` would truncate the document at a fragment; a quote or space
-        // could break out of the URL in whatever context it is used. Encoding
-        // everything outside the unreserved set is what makes the opaque-origin
-        // sandbox actually hold.
-        let html = build_html(
-            &md("# Title\n\nText with \"quotes\", <tags>, #hashes & ampersands.\n"),
-            &registry(),
-            Trust::Restricted,
-            false,
-        );
-        let url = to_data_url(&html);
-        for bad in ['"', '\'', '<', '>', '#', '&', ' ', '\n', '\r'] {
-            assert!(
-                !url.contains(bad),
-                "unescaped {bad:?} in the data URL would let content escape it"
-            );
-        }
-    }
-
-    #[test]
     fn cjk_and_tables_survive() {
         let src = "# 标题\n\n| 列一 | 列二 |\n|---|---|\n| 值 | 值 |\n";
-        let html = build_html(&md(src), &registry(), Trust::Restricted, false);
+        let html = page(&md(src), &registry(), false);
         assert!(html.contains("标题"));
         assert!(html.contains("<table>"), "got {html}");
         assert!(
@@ -646,7 +439,7 @@ mod tests {
             (false, "light", "#ffffff", "#24292f"),
             (true, "dark", "#0d1117", "#e6edf3"),
         ] {
-            let html = build_html(&doc, &registry(), Trust::Restricted, dark);
+            let html = page(&doc, &registry(), dark);
             assert!(html.contains(&format!("color-scheme: {scheme};")));
             assert!(!html.contains("color-scheme: light dark"));
             assert!(html.contains(&format!("--bg-color: {background};")));
@@ -654,14 +447,13 @@ mod tests {
             assert!(html.contains("var(--bg-color"));
             assert!(html.contains("var(--text-color"));
             assert!(html.contains("default-src 'none'"));
-            assert!(html.contains("script-src 'none'"));
         }
     }
 
     #[test]
     fn block_order_is_preserved_around_diagrams() {
         let src = "First.\n\n$$\nx\n$$\n\nLast.\n";
-        let html = build_html(&md(src), &registry(), Trust::Restricted, false);
+        let html = page(&md(src), &registry(), false);
         let body = body(&html);
         let first = body.find("First.").expect("first paragraph");
         let math = body.find("mt-render").expect("rendered math");
@@ -673,167 +465,130 @@ mod tests {
         );
     }
 
-    fn html_doc(src: &str) -> Document {
-        Document::with_type(DocType::Html, src.to_string())
+    fn page(doc: &Document, registry: &RendererRegistry, dark: bool) -> String {
+        frame_document(&build_html(doc, registry, dark))
+    }
+
+    fn frame_document(host: &str) -> String {
+        let (_, iframe) = host
+            .split_once("<iframe sandbox=\"allow-scripts\" srcdoc=\"")
+            .unwrap();
+        let (encoded, tail) = iframe.split_once('"').unwrap();
+        assert_eq!(tail, "></iframe></body></html>");
+        assert!(!encoded.contains(['<', '>']));
+        encoded
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
     }
 
     #[test]
-    fn an_html_file_is_served_as_its_own_document() {
-        // The public builder must dispatch HTML without a second document
-        // shell, retaining the file's own stylesheet and metadata.
-        let src =
-            "<!doctype html><html><head><title>Mine</title></head><body><p>Hi</p></body></html>";
-        let out = build_html(&html_doc(src), &registry(), Trust::Trusted, false);
-        assert_eq!(out, src, "a trusted file is served byte for byte");
-        assert_eq!(out.matches("<html").count(), 1, "no nesting");
-    }
-
-    #[test]
-    fn an_untrusted_html_file_still_gets_a_csp() {
-        // A verbatim document would carry none, and "no document can phone
-        // home" would hold for every path but this one.
-        let src = "<!doctype html><html><head></head><body><p>Hi</p></body></html>";
-        let out = build_html_raw(&html_doc(src), Trust::Restricted);
-        assert!(out.contains("default-src 'none'"), "got {out}");
-        assert!(out.contains("script-src 'none'"));
-    }
-
-    #[test]
-    fn an_untrusted_html_file_is_told_why_its_images_are_missing() {
-        let src = "<!doctype html>\n<html><head></head><body><img src=\"logo.png\"></body></html>";
-        let out = build_html_raw(&html_doc(src), Trust::Restricted);
-        assert!(out.contains("Trust this document"), "got {out}");
-        // The banner is inserted into someone else's document, which never saw
-        // our stylesheet, so a bare class name would render as unstyled text.
-        assert!(!out.contains("class=\"mt-banner\""));
-        assert!(out.contains("style="));
-        // The document's own markup survives the insertion.
-        assert!(out.contains("<img src=\"logo.png\">"));
-    }
-
-    #[test]
-    fn restricted_html_gets_its_policy_before_author_scripts() {
-        // Include malformed doctypes and script-like text in a doctype so no
-        // search for the first `>` can put the policy after executable markup.
-        for prefix in [
-            "<!doctype html>",
-            "<!DOCTYPE HTML>",
-            "<!doctype html PUBLIC \"quoted > identifier\">",
-            "<!doctype x \"><script>early()</script>\">",
-            "<!-- comment -->",
-            "",
-        ] {
-            let src = format!(
-                "{prefix}<html><head><meta charset=\"utf-8\"><title>Mine</title>\
-                 <script>run()</script></head><body>x</body></html>"
-            );
-            let out = build_html(&html_doc(&src), &registry(), Trust::Restricted, true);
-            let policy = out.find("Content-Security-Policy").expect("policy");
-            let author = out.find(prefix).unwrap_or(out.len());
-            let script = out.find("<script>").expect("author script");
-            let charset = out.find("charset=\"utf-8\"").expect("author charset");
-            let banner = out.find("Trust this document").expect("trust banner");
-            let head_close = out.find("</head>").expect("head close");
-            assert!(policy < script && policy < charset, "got {out}");
-            if !prefix.is_empty() && !prefix.eq_ignore_ascii_case("<!doctype html>") {
-                assert!(policy < author, "policy must precede author markup: {out}");
-            }
-            assert!(charset < banner && banner < head_close);
-            assert!(out.contains("<title>Mine</title>"));
-            assert!(out.contains("script-src 'none'"));
-        }
-    }
-
-    #[test]
-    fn diagram_and_math_use_the_registry_in_both_trust_modes() {
-        let doc = md("```d2\na -> b\n```\n\n$$\nx^2\n$$\n");
-        for trust in [Trust::Restricted, Trust::Trusted] {
-            let html = build_html(&doc, &registry(), trust, true);
-            let body = body(&html);
-            let diagram = body
-                .find("<figure class=\"mt-render mt-d2\">")
-                .expect("diagram");
-            let math = body
-                .find("<figure class=\"mt-render mt-math\">")
-                .expect("math");
-            assert!(diagram < math, "blocks out of order: {body}");
-            assert!(body[diagram..math].contains("<svg"), "{body}");
-            assert!(body[math..].contains("<svg"), "{body}");
-        }
-    }
-
-    #[test]
-    fn trusted_html_keeps_its_scripts_and_resources_unchanged() {
-        let src = "<!doctype html><head><script>run()</script>\
-                   <link rel=\"stylesheet\" href=\"local.css\"></head><body>x</body>";
-        let out = build_html(&html_doc(src), &registry(), Trust::Trusted, true);
-        assert_eq!(out, src);
-        assert!(!out.contains("Content-Security-Policy"));
-    }
-
-    #[test]
-    fn a_document_without_a_head_keeps_its_doctype_first() {
-        // Anything before the declaration puts the browser into quirks mode,
-        // which changes the box model of the very page we are showing.
-        let out = build_html_raw(
-            &html_doc("<!DOCTYPE HTML>\n<body>x</body>"),
-            Trust::Restricted,
-        );
-        let doctype = out.to_ascii_lowercase().find("<!doctype").expect("doctype");
-        let ours = out.find("Content-Security-Policy").expect("our CSP");
-        assert!(doctype < ours, "insertion ahead of the doctype in {out}");
-        // A fragment with neither is prepended to, which is already valid.
-        let out = build_html_raw(&html_doc("<p>fragment</p>"), Trust::Restricted);
-        assert!(out.ends_with("<p>fragment</p>"), "got {out}");
-    }
-
-    #[test]
-    fn a_file_url_passes_through_the_data_url_encoder() {
-        // The workspace's WebView sync encodes whatever the active document
-        // built, and a trusted HTML file builds a URL rather than markup.
-        // Without the pass-through the WebView is handed a `data:` document
-        // whose entire content is the text of a `file://` URL.
-        let url = to_file_url(Path::new(r"C:\a\page.html"));
-        assert_eq!(to_data_url(&url), url);
-        // Markup is still encoded — it cannot be mistaken for a URL because a
-        // document starts with `<`.
-        assert!(to_data_url("<p>file://not-a-url</p>").starts_with("data:"));
-    }
-
-    #[test]
-    fn a_windows_path_becomes_a_three_slash_file_url() {
-        // `C:\Users\a\page.html` is not a URL path: the separators have to turn
-        // around and the drive letter needs the third slash ahead of it, or the
-        // `C:` reads as a scheme and `Users` as a hostname.
-        let url = to_file_url(Path::new(r"C:\Users\a\page.html"));
-        assert_eq!(url, "file:///C:/Users/a/page.html");
-    }
-
-    #[test]
-    fn a_posix_path_keeps_its_leading_slash() {
-        // Already absolute, so the third slash is the path's own — doubling it
-        // would make an empty first segment.
+    fn host_is_static_and_author_markup_cannot_escape_srcdoc() {
+        let author = r#"<script>const text = '"</iframe>&lt;&quot;';</script>"#;
+        let doc = Document::with_type(DocType::Html, author.into());
+        let host = build_html(&doc, &registry(), false);
+        assert!(host.starts_with(&format!("<!doctype html><html><head>{HOST_POLICY}")));
+        assert_eq!(host.matches("<iframe ").count(), 1);
+        assert!(!host.contains("<script"));
+        let document = frame_document(&host);
         assert_eq!(
-            to_file_url(Path::new("/home/a/page.html")),
-            "file:///home/a/page.html"
+            document,
+            format!("<!doctype html>{DOCUMENT_POLICY}{author}")
         );
     }
 
     #[test]
-    fn a_file_url_encodes_what_would_truncate_the_path() {
-        // A space ends the URL in several parsers and a `#` starts a fragment;
-        // either one silently loads a different file, or none.
-        let url = to_file_url(Path::new(r"C:\My Docs\a#b\page.html"));
-        assert!(!url.contains(' '), "got {url}");
-        assert!(!url.contains('#'), "got {url}");
-        assert_eq!(url, "file:///C:/My%20Docs/a%23b/page.html");
+    fn generated_pages_install_csp_before_scripts_or_components_on_first_build() {
+        let diagram = r#"<svg><text id="node"></text></svg>"#;
+        let script =
+            r#"<script>document.getElementById("node").textContent = "Diagram label";</script>"#;
+        let registry = registry();
+        let markdown = page(&md(&format!("{diagram}\n\n{script}")), &registry, false);
+        let mdx = page(
+            &Document::with_type(DocType::Mdx, "# Title\n\n<Chart data={rows} />\n".into()),
+            &registry,
+            false,
+        );
+        let prefix = format!("<!doctype html><html><head>{DOCUMENT_POLICY}");
+        for (page, author) in [(&markdown, script), (&mdx, "<div class=\"mt-mdx\">")] {
+            assert!(page.starts_with(&prefix), "{page}");
+            assert!(page[prefix.len()..].contains(author), "{page}");
+            assert_eq!(page.matches("Content-Security-Policy").count(), 1);
+        }
+        assert!(markdown.find(diagram).unwrap() < markdown.find(script).unwrap());
+        assert!(mdx.contains("&lt;Chart /&gt;"));
+        assert!(mdx.contains("<h1>Title</h1>"));
     }
 
     #[test]
-    fn a_file_url_survives_a_non_ascii_directory() {
-        let url = to_file_url(Path::new(r"C:\文档\page.html"));
-        assert!(url.starts_with("file:///C:/%"), "got {url}");
-        assert!(url.ends_with("/page.html"));
-        assert!(url.is_ascii(), "a URL with raw UTF-8 in it is not one");
+    fn html_inserts_csp_at_the_start_of_the_real_or_implied_head() {
+        let registry = registry();
+        let author = r#"<link rel="stylesheet" href="relative.css"><script>run()</script>"#;
+        let policy = DOCUMENT_POLICY;
+        for (prefix, expected_prefix) in [
+            ("<!doctype html><html><head>", "<!doctype html><html><head>"),
+            (
+                "<!DOCTYPE HTML><HTML lang=en><HEAD data-x='>'>",
+                "<!DOCTYPE HTML><HTML lang=en><HEAD data-x='>'>",
+            ),
+            (
+                "<!-- <head> --><head>",
+                "<!doctype html><!-- <head> --><head>",
+            ),
+            ("<!DOCTYPE HTML><html>", "<!DOCTYPE HTML><html>"),
+            ("\u{feff}<head>", "<!doctype html><head>"),
+            ("", "<!doctype html>"),
+        ] {
+            let doc = Document::with_type(DocType::Html, format!("{prefix}{author}"));
+            assert_eq!(
+                page(&doc, &registry, true),
+                format!("{expected_prefix}{policy}{author}")
+            );
+        }
+        for unsafe_prefix in [
+            "<head data-x='",
+            "<head",
+            "<html style=\"background:url(relative.png)\"><head>",
+            "<head onload='run()'>",
+            "<!--><script>early()</script>--><head>",
+            "<!-- --!><script>early()</script>--><head>",
+            "<!doctype x \"><script>early()</script>\"><head>",
+        ] {
+            let source = format!("{unsafe_prefix}{author}");
+            let doc = Document::with_type(DocType::Html, source.clone());
+            assert_eq!(
+                page(&doc, &registry, false),
+                format!("<!doctype html>{policy}{source}")
+            );
+        }
+    }
+
+    #[test]
+    fn html_keeps_author_shell_styles_and_additional_policy() {
+        let before = "<!doctype html><html><head>";
+        let author = r#"<meta http-equiv="Content-Security-Policy" content="script-src 'none'"><style>p{color:red}</style></head><body><p>Hi</p></body></html>"#;
+        let doc = Document::with_type(DocType::Html, format!("{before}{author}"));
+        assert_eq!(
+            page(&doc, &registry(), true),
+            format!("{before}{DOCUMENT_POLICY}{author}")
+        );
+    }
+
+    #[test]
+    fn diagram_and_math_use_the_registry_inside_the_frame() {
+        let doc = md("```d2\na -> b\n```\n\n$$\nx^2\n$$\n");
+        let page = page(&doc, &registry(), true);
+        let body = body(&page);
+        let diagram = body
+            .find("<figure class=\"mt-render mt-d2\">")
+            .expect("diagram");
+        let math = body
+            .find("<figure class=\"mt-render mt-math\">")
+            .expect("math");
+        assert!(diagram < math, "blocks out of order: {body}");
+        assert!(body[diagram..math].contains("<svg"), "{body}");
+        assert!(body[math..].contains("<svg"), "{body}");
     }
 }
