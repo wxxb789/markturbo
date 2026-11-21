@@ -55,13 +55,7 @@ use crate::{
     },
 };
 
-/// One review's emission in the column: which result it belongs to, when it
-/// arrived, which finding is HOT, and the anchors resolved once against the
-/// text the review was made from.
-///
-/// One per window (a [`global`]), so it survives the shell being rebuilt
-/// across a language or layout change. The decorations read it; [`observe`]
-/// and [`focus_finding`] write it.
+/// Per-window emission state survives shell reconstruction.
 #[derive(Clone, Default)]
 struct Emission {
     /// The result the schedule belongs to; `None` when nothing is live.
@@ -72,7 +66,6 @@ struct Emission {
     /// One slot per finding, in the field's order; `None` for a finding
     /// with no anchor in this document (document-wide, another file).
     anchors: Vec<Option<Anchor>>,
-    /// When this result arrived.
     arrived: Option<Instant>,
     /// The finding whose words are HOT, and when it took the focus, in ms
     /// from the arrival.
@@ -125,13 +118,7 @@ fn ticker_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
 }
 
-/// Registers the result the field is showing: a new one starts the shared
-/// heat arrival and resolves its anchors against `tab`'s text — the tab the
-/// review was made from, and its text as it stands at arrival; a result that
-/// just went stale begins the afterimage drain; `None` ends everything.
-///
-/// Called from an effect, never from a render: it writes the emission the
-/// decorations read.
+/// Register the visible result from an effect; never write emission state during render.
 pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
     let signal = emission();
     let current = signal.get_untracked();
@@ -157,10 +144,7 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
         }
         return;
     }
-    // A new result: resolve every anchor at the same arrival time. The
-    // anchors are resolved here, once, against the text the review was made
-    // from; a repaint never re-resolves them, and the editor carries them
-    // through edits.
+    // Resolve anchors against reviewed text, never the current text on repaint.
     let Some(tab) = tab else {
         signal.set(Emission::default());
         return;
@@ -832,15 +816,12 @@ mod tests {
             pulse: false,
             now_ms: 0.0,
         };
-        // The entire findings list shares one ignition time.
         assert_eq!(heat_at(&e, 0, 0.0, false), 0.0);
         assert_eq!(heat_at(&e, 1, 0.0, false), 0.0);
         assert!((heat_at(&e, 0, IGNITE_MS, false) - 1.0).abs() < 0.001);
         assert!((heat_at(&e, 1, IGNITE_MS, false) - 1.0).abs() < 0.001);
-        // It cools toward EMBER and stays there.
         let cooled = heat_at(&e, 1, IGNITE_MS + COOL_MS, false);
         assert!((cooled - EMBER).abs() < 0.01, "cooled to {cooled}");
-        // The focused finding holds HOT.
         e.focus = Some(1);
         e.focus_ms = 1000.0;
         assert_eq!(heat_at(&e, 1, 1000.0 + IGNITE_MS + COOL_MS, false), 1.0);
@@ -851,7 +832,6 @@ mod tests {
         // Stale drains everything to the afterimage.
         e.stale_ms = Some(2000.0);
         assert_eq!(heat_at(&e, 1, 2000.0 + AFTERIMAGE_MS + 1.0, false), 0.0);
-        // Reduced motion steps to ember at once.
         e.stale_ms = None;
         e.focus = None;
         let stepped = heat_at(&e, 1, REDUCED_CROSSFADE_MS + 1.0, true);

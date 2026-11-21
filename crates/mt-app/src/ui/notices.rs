@@ -442,12 +442,7 @@ fn step_difference(state: &AppState, delta: isize) {
     focus_line(state, &tab);
 }
 
-/// The comparison: the counter, the keys, and the disk version of the current
-/// difference with its differing words dashed warm-grey. Entering it binds J,
-/// K and Escape.
-///
-/// Its lines are keyed by (difference, line), so stepping to another
-/// difference replaces them, and the counter is bound to the state.
+// Keyboard bindings follow the logical comparison, not its fading view.
 fn compare_panel(
     state: AppState,
     comparison: Signal<Option<Rc<Comparison>>>,
@@ -592,8 +587,6 @@ fn compare_summary(state: &AppState) -> Option<(usize, usize)> {
     Some((state.conflict_difference.get().min(total - 1), total))
 }
 
-/// Capture the panel's marked disk lines and counter together, so both can
-/// outlive the conflict during the banner's exit.
 fn comparison_content(state: &AppState, tab: &Tab) -> Option<Comparison> {
     let disk = disk_text(state, tab)?;
     let mine = tab.text.get().to_string();
@@ -966,7 +959,6 @@ pub fn guard(state: AppState, language: Language) -> impl IntoElement {
     })
 }
 
-/// The card itself, for the request the state is holding.
 fn guard_card(state: AppState, request: GuardRequest, language: Language) -> AnyElement {
     // The card owns its keys: the source editor gives up the focus.
     state.blur_source_editor();
@@ -1194,39 +1186,35 @@ fn card_action(
                         tokens::palette().ink_caption
                     }
                 })
-                .child(
-                    // The control itself carries the test id (UI Automation's
-                    // AutomationId): a plain press target, as `prims`' are.
-                    prims::press_feedback(
-                        view()
-                            .test_id(test_id)
-                            .role(AccessibilityRole::Button)
-                            .disabled(disabled)
-                            .optional_label(Some(SharedString::from(label)))
-                            .w_full()
-                            .h_full()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .bg(Color::TRANSPARENT)
-                            .cursor_pointer()
-                            .rounded(px(0.0))
-                            .on_press(on_press)
-                            .child(
-                                text(label)
-                                    .font_family(tokens::FONT_UI)
-                                    .text_size(px(tokens::TYPE_UI))
-                                    .line_height(px(tokens::TYPE_UI_LINE))
-                                    .text_color(move || {
-                                        if danger {
-                                            tokens::palette().danger
-                                        } else {
-                                            tokens::palette().ink
-                                        }
-                                    }),
-                            ),
-                    ),
-                ),
+                .child(prims::press_feedback(
+                    view()
+                        .test_id(test_id)
+                        .role(AccessibilityRole::Button)
+                        .disabled(disabled)
+                        .optional_label(Some(SharedString::from(label)))
+                        .w_full()
+                        .h_full()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .bg(Color::TRANSPARENT)
+                        .cursor_pointer()
+                        .rounded(px(0.0))
+                        .on_press(on_press)
+                        .child(
+                            text(label)
+                                .font_family(tokens::FONT_UI)
+                                .text_size(px(tokens::TYPE_UI))
+                                .line_height(px(tokens::TYPE_UI_LINE))
+                                .text_color(move || {
+                                    if danger {
+                                        tokens::palette().danger
+                                    } else {
+                                        tokens::palette().ink
+                                    }
+                                }),
+                        ),
+                )),
         )
 }
 
@@ -1238,30 +1226,72 @@ fn clear_status_if_current(state: &AppState, generation: u64) {
     }
 }
 
-/// The quiet line at the foot of the column: what the app last did, at resting
-/// ink. Local, so it never glows. Something done fades after a moment and
-/// leaves the line empty; an error, a refusal or a wait
-/// ([`AppState::notify_held`]) stays until the next message. The line keeps
-/// its height either way, so nothing under or above it moves.
-pub fn status_line(state: AppState, language: Language) -> impl IntoElement {
-    status_line_with_opacity(state, language, animated_value(0.0))
+/// Create under the app owner so its motion and timer survive workspace remounts.
+#[derive(Clone, Copy)]
+pub(crate) struct StatusPresence {
+    opacity: AnimatedValue,
+    rise: AnimatedValue,
 }
 
+impl StatusPresence {
+    pub(crate) fn new(state: AppState) -> Self {
+        let presence = Self {
+            opacity: animated_value(0.0),
+            rise: animated_value(motion::CARD_RISE_PX),
+        };
+        observe_status(state, presence);
+        presence
+    }
+}
+
+pub(crate) fn status_line(
+    state: AppState,
+    language: Language,
+    presence: StatusPresence,
+) -> impl IntoElement {
+    let _ = language;
+    view().test_id("status").w_full().pt(px(SPACE_3)).child(
+        view()
+            .w_full()
+            .h(px(tokens::TYPE_UI_LINE))
+            .bind_opacity(&presence.opacity)
+            .when(!reduced_motion(), |line| {
+                line.bind_translate_y(&presence.rise)
+            })
+            .child(
+                text(move || state.status.get())
+                    .font_family(tokens::FONT_UI)
+                    .text_size(px(tokens::TYPE_UI))
+                    .line_height(px(tokens::TYPE_UI_LINE))
+                    .number_of_lines(1)
+                    .text_color(move || tokens::palette().ink_rest),
+            ),
+    )
+}
+
+#[cfg(test)]
 fn status_line_with_opacity(
     state: AppState,
     language: Language,
     opacity: AnimatedValue,
 ) -> impl IntoElement {
-    let _ = language;
-    let rise = animated_value(motion::CARD_RISE_PX);
+    let presence = StatusPresence {
+        opacity,
+        rise: animated_value(motion::CARD_RISE_PX),
+    };
+    observe_status(state.clone(), presence);
+    status_line(state, language, presence)
+}
+
+fn observe_status(watched: AppState, presence: StatusPresence) {
     let active_fade = Cell::new(None::<Spawned<()>>);
-    let watched = state.clone();
+    let opacity = presence.opacity;
+    let rise = presence.rise;
     effect(move || {
         let message = watched.status.get();
         let generation = watched.status_generation.get();
         let held = watched.status_held.get_untracked();
-        // A new message cancels the last one's fade and retargets from the
-        // current opacity and offset.
+        // A new generation cancels the old exit before retargeting its presence.
         active_fade.set(None);
         opacity.stop();
         rise.stop();
@@ -1303,21 +1333,6 @@ fn status_line_with_opacity(
             }
         })));
     });
-    view().test_id("status").w_full().pt(px(SPACE_3)).child(
-        view()
-            .w_full()
-            .h(px(tokens::TYPE_UI_LINE))
-            .bind_opacity(&opacity)
-            .when(!reduced_motion(), |line| line.bind_translate_y(&rise))
-            .child(
-                text(move || state.status.get())
-                    .font_family(tokens::FONT_UI)
-                    .text_size(px(tokens::TYPE_UI))
-                    .line_height(px(tokens::TYPE_UI_LINE))
-                    .number_of_lines(1)
-                    .text_color(move || tokens::palette().ink_rest),
-            ),
-    )
 }
 
 /// The hairline a banner uses to separate itself from the document.
@@ -1327,9 +1342,8 @@ pub fn banner_rule() -> impl IntoElement {
 
 // ─── the comparison's keys ────────────────────────────────────────────────
 
-/// J and K walk the differences while the comparison is on screen (and no text
-/// input is being edited, so the editor keeps its own letters); Escape closes
-/// it. The bindings die when the comparison stops being active.
+/// Bind only while the conflict is active and no text input is being edited,
+/// so closing the comparison stops capture before its exit.
 fn bind_compare_keys(state: &AppState) {
     for (key, delta) in [("j", 1isize), ("k", -1isize)] {
         let state = state.clone();

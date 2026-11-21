@@ -51,9 +51,11 @@ pub fn is_open(state: &AppState) -> bool {
     state.settings_open.get()
 }
 
-/// The settings page, under the title row: the header, the form, and the app's
-/// own words at the foot.
-pub fn page(state: AppState, language: Language) -> impl IntoElement {
+pub(crate) fn page(
+    state: AppState,
+    language: Language,
+    presence: notices::StatusPresence,
+) -> impl IntoElement {
     // The store can change under us — another instance storing or removing a
     // key — and nothing in this process reports that, so every (re)build of the
     // page reads the vault afresh. Within a page, the status is memoised.
@@ -110,7 +112,7 @@ pub fn page(state: AppState, language: Language) -> impl IntoElement {
                 .child(content(state.clone(), language)),
         )
         .child(notice_line(state.clone()))
-        .child(notices::status_line(state, language))
+        .child(notices::status_line(state, language, presence))
 }
 
 /// The page's one heading: 16px medium ink — 22px is the model's voice alone.
@@ -979,8 +981,6 @@ fn choice_button(
             }
         }
     };
-    // One plain view is the button: its test id, UI Automation's
-    // AutomationId, names the control a press reaches, as `prims`' do.
     prims::press_feedback(
         view()
             .test_id(test_id)

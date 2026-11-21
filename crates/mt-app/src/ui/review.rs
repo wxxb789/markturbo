@@ -4,10 +4,8 @@
 //! (the current one HOT with its `Why it matters:` and its answer field), the
 //! cooled question list, `All fields`, loading, stale and the diagnostics.
 //!
-//! Contract: [`is_open`] says whether the field is the review's; [`field`]
-//! draws it. The shell routes to it and gives it the field's box; everything
-//! inside — the docked reading position, the model output's one arrival, the
-//! focus on the answer field — belongs here.
+//! The shell chooses this field surface and gives it its box;
+//! review owns its reading position and contents.
 //!
 //! The session this file keeps ([`session`], [`emitters`]) is UI state the
 //! state has no name for: which question the user is on, which they answered
@@ -158,8 +156,6 @@ fn hint_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
 }
 
-/// Watches the state's result: a new one resets the session, starts its model
-/// emitters together and hands the column its anchors.
 fn observe(state: &AppState, session: Signal<Session>) {
     let state = state.clone();
     effect(move || {
@@ -204,8 +200,6 @@ fn observe(state: &AppState, session: Signal<Session>) {
                         .collect(),
                 });
                 emitters.set(built.clone());
-                // Every result arrives together. The current question stays
-                // HOT; the column holds the finding the user steps to.
                 built.goal.ignite();
                 for (slot, index) in order.iter().enumerate() {
                     let Some(heat) = built.questions.get(slot).copied() else {
@@ -220,8 +214,6 @@ fn observe(state: &AppState, session: Signal<Session>) {
                 // Nothing is focused yet: the question is the one HOT item
                 // until `J`/`K` (or the stepper) steps to a finding.
                 glow::focus_finding(None);
-                // The column moves so the first anchored lines sit level with
-                // the docked question as the result arrives.
                 level_finding(&state, view.tab_id, 0, true);
                 focus_request().set(Some(match (view.stale, current) {
                     (true, _) => Focus::ReviewAgain,
@@ -300,8 +292,6 @@ fn keys(state: &AppState, session: Signal<Session>) {
     }
 }
 
-/// `J`/`K` and the stepper move the docked finding at once: this is frequent
-/// navigation, so it does not use the occasional camera glide.
 fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
     let Some(view) = state.review_view.get_untracked() else {
         return;
@@ -329,8 +319,6 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
         session.showing_finding = true;
     });
     glow::focus_finding(Some(to));
-    // The column re-centres so the finding's anchored lines sit level with
-    // its explanation, docked in the field (document.rs reveals the line).
     level_finding(state, view.tab_id, to, false);
     let heats = emitters().get_untracked().findings;
     if let Some(from) = from
@@ -344,10 +332,6 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
     }
 }
 
-/// Asks the column's camera for a finding's anchored line. A result arrival
-/// may glide there; frequent finding navigation is immediate. Nothing is
-/// asked when the finding is not anchored in this document (document-wide, or
-/// another file's).
 fn level_finding(state: &AppState, tab_id: Option<u64>, finding: usize, animated: bool) {
     if let Some(tab_id) = tab_id
         && let Some(line) = glow::anchor_line(finding)
@@ -783,9 +767,7 @@ fn questions(
                     let order = order.to_vec();
                     move || reopen_question(session, &order, index)
                 };
-                // The line is the button itself, as `prims::press_target` is: a
-                // pressable view around a named button reads as a second,
-                // unnamed button to UIA.
+                // A pressable wrapper would add an unnamed UIA button.
                 prims::press_feedback(
                     view()
                         .test_id("review-question-line")
@@ -1054,9 +1036,7 @@ fn step_control(
 ) -> AnyElement {
     let state = state.clone();
     let step = move || step_finding(&state, session, delta);
-    // The control is the button itself, as `prims::press_target` is: a
-    // pressable view around a named button reads as a second, unnamed button
-    // to UIA.
+    // A pressable wrapper would add an unnamed UIA button.
     prims::press_feedback(
         view()
             .test_id(id)
@@ -1857,8 +1837,6 @@ mod tests {
             )
     }
 
-    /// The real review key binding beside the document camera, so a test can
-    /// sample the editor after the key's next frame.
     #[component]
     fn KeyboardCameraProbe() -> impl IntoElement {
         let state = AppState::new();
@@ -1965,8 +1943,6 @@ mod tests {
         );
     }
 
-    /// With motion enabled, J puts the current finding at the camera's target
-    /// on the next display frame rather than beginning the pointer glide.
     #[test]
     fn keyboard_finding_step_levels_the_line_on_the_next_frame() {
         let mut config = EngineConfig::new(Root::of::<KeyboardCameraProbe>());
@@ -2004,7 +1980,6 @@ mod tests {
         );
     }
 
-    /// How far a text row's centre is from the source editor's centre.
     fn camera_level_offset(app: &Headless, line: &str) -> f32 {
         let nodes = app.screen().layout_nodes();
         let editor = nodes
@@ -2026,8 +2001,6 @@ mod tests {
         row_middle - editor_middle
     }
 
-    /// A result's arrival asks the camera for the first finding's line: its
-    /// simultaneous ignition with the first question is the link.
     #[test]
     fn the_arrival_levels_the_first_finding() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<ArrivalProbe>()))

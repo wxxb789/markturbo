@@ -601,8 +601,6 @@ fn quiet_action_named(
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     let label: SharedString = label.into();
-    // One plain view is the button, its test id the control's AutomationId,
-    // as `prims::quiet_action`'s is.
     prims::press_feedback(
         view()
             .test_id(test_id)

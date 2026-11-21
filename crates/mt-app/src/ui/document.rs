@@ -15,15 +15,8 @@
 //! deferral, and the Split routing that puts the preview (or the web pane) in
 //! the field.
 //!
-//! The camera: a docked surface asks for a line with
-//! [`crate::state::AppState::focus_document_line`], and the source editor
-//! levels it with the field's docked reading position. Occasional requests
-//! glide over [`motion::CAMERA_MS`] on the camera's curve; keyboard and
-//! frequent requests cut to the target, as does reduced motion. With a docked
-//! surface open the editor's content carries half a viewport of room above its
-//! first row, so a line near the top of the document can be levelled too (the
-//! editor clamps its scroll at 0, so the room has to be in the content); the
-//! bottom half is `scroll_beyond_last_line`.
+//! Docked surfaces request source positioning through
+//! [`AppState::focus_document_line`].
 
 use std::{
     cell::{Cell, RefCell},
@@ -341,16 +334,6 @@ impl Glide {
     }
 }
 
-/// Levels line `line` with the field's docked reading position (the
-/// editor's own centre, as `reveal_position(.., center)` places it) by a
-/// [`motion::CAMERA_MS`] glide on the camera's curve from where the column is
-/// now; at once under reduced motion, for an instant request, or when the
-/// editor was just mounted.
-///
-/// The target is the editor's own: the reveal is asked for, its scroll offset
-/// read, and the offset put back before anything is drawn. A glide already in
-/// flight is replaced from the column's current position, so a new target
-/// mid-glide turns the column without a jump.
 fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, instant: bool) {
     let Some(api) = editor.api::<EditorApi>() else {
         return;
@@ -362,6 +345,8 @@ fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, instant: b
         return;
     }
     let from = api.scroll_offset();
+    // Measure the editor's own reveal target, then restore the starting offset
+    // so measuring or retargeting a glide does not jump to its end.
     api.reveal_position(position, true);
     let to = api.scroll_offset().y.0;
     api.set_scroll_offset(from);
@@ -371,14 +356,6 @@ fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, instant: b
     glide.run(spawn(glide_to(editor, from.y.0, to)));
 }
 
-/// The glide itself: steps the editor's scroll offset from `from` to `to`
-/// along [`motion::camera_progress`], one [`motion::CAMERA_TICK`] at a time.
-///
-/// It ends early when the offset is no longer one it set: the user scrolled
-/// (a wheel, the scrollbar, a caret moved into view by typing), and the
-/// column is theirs again. A scroll the platform reports late is one the
-/// glide set a step before, or the target the reveal visited, so those are
-/// still its own.
 async fn glide_to(editor: ComponentRef<Editor>, from: f32, to: f32) {
     let start = nsh_core::time::now();
     let mut own = [from, from];
@@ -388,6 +365,8 @@ async fn glide_to(editor: ComponentRef<Editor>, from: f32, to: f32) {
             return;
         };
         let at = api.scroll_offset().y.0;
+        // Late native scroll reports can still show the previous tick or the
+        // probe reveal, so neither counts as a user scroll.
         if own
             .iter()
             .chain(std::iter::once(&to))
@@ -396,10 +375,15 @@ async fn glide_to(editor: ComponentRef<Editor>, from: f32, to: f32) {
             return;
         }
         let elapsed = (nsh_core::time::now() - start).as_secs_f32() * 1000.0;
-        let y = from + (to - from) * motion::camera_progress(elapsed);
+        let finished = motion::reduced_motion() || elapsed >= motion::CAMERA_MS;
+        let y = if finished {
+            to
+        } else {
+            from + (to - from) * motion::camera_progress(elapsed)
+        };
         api.set_scroll_offset(Point::new(px(0.0), px(y)));
         own = [own[1], y];
-        if elapsed >= motion::CAMERA_MS {
+        if finished {
             return;
         }
     }
@@ -418,14 +402,8 @@ fn docked_surfaces(state: &AppState) -> bool {
     state.review_open.get() || revision::is_open(state) || notices::compare_is_open(state)
 }
 
-/// The editor's half-viewport top inset, in points: half of `visible` while a
-/// docked surface holds a camera request for `tab`, nothing otherwise.
-///
-/// The inset is the room the camera needs — the editor clamps its scroll at 0,
-/// so a line near the top of the document can only be levelled if the content
-/// carries half a viewport above its first row — and it is tied to the request
-/// rather than to the docked surface, so opening a field alone never moves the
-/// document: it moves when the camera has somewhere to go.
+// The editor clamps scroll at zero, so centering an early line needs space
+// above the first row. Opening a field without a camera request adds no inset.
 fn inset(state: &AppState, tab: u64, visible: f32) -> f32 {
     if visible > 0.0 && docked_surfaces(state) && state.document_focus.get().tab == tab {
         visible / 2.0
@@ -532,9 +510,6 @@ fn gutter_style(reading: bool) -> Style {
     ])
 }
 
-/// Every line number, the active line's included: 11px in non-text ink,
-/// shown only while a docked surface is reading the document (the prototype
-/// hides them while you edit), without animating a field change.
 fn line_number_style(reading: bool) -> Style {
     declared(&[
         (StyleKey::FontSize, StyleValue::Number(LINE_NUMBER_SIZE)),
@@ -1290,9 +1265,6 @@ mod tests {
         app
     }
 
-    /// An occasional `focus_document_line` request moves the column over
-    /// [`motion::CAMERA_MS`] on the camera's curve, not at once, and ends with
-    /// the line level with the docked reading position.
     #[test]
     fn the_camera_glides_to_the_anchored_line() {
         let mut app = glide_probe(false);
@@ -1319,6 +1291,22 @@ mod tests {
         assert!(
             end.abs() <= tokens::TYPE_SOURCE_LINE,
             "after the glide line 3 sits {end} points off the editor's centre"
+        );
+    }
+
+    #[test]
+    fn enabling_reduced_motion_finishes_a_running_camera_glide() {
+        let mut app = glide_probe(false);
+        app.press("id:probe-focus-first").expect("focus line 3");
+        app.run_for(Duration::from_millis(32)).expect("begin glide");
+        let mid = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduce motion");
+        app.run_for(motion::CAMERA_TICK).expect("next camera tick");
+        let end = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
+        assert!(
+            mid < -tokens::TYPE_SOURCE_LINE && end.abs() <= tokens::TYPE_SOURCE_LINE,
+            "reduced motion must finish the running glide: {mid} -> {end}"
         );
     }
 
@@ -1387,8 +1375,6 @@ mod tests {
         );
     }
 
-    /// Closing and reopening Review without a new result must not replay the
-    /// last result's anchor over the position the user scrolled to.
     #[test]
     fn reopening_review_does_not_replay_the_last_camera_request() {
         let mut app = glide_probe(false);

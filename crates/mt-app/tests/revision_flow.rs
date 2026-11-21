@@ -684,10 +684,6 @@ fn copy_exports_only_the_approved_result_and_saves_nothing() {
 /// What `Replace the document` types over the whole buffer.
 const REPLACEMENT: &str = "Typed over everything\n";
 
-/// The user types over the whole document after the hunks arrive: every
-/// hunk says it can't apply and keeps `Accept` disabled, `Done` approves
-/// nothing, the buffer keeps the user's text and the disk keeps the
-/// reviewed bytes.
 #[test]
 fn an_edit_over_every_hunk_keeps_accept_disabled_and_done_writes_nothing() {
     let _guard = TEST_LOCK
@@ -713,7 +709,6 @@ fn an_edit_over_every_hunk_keeps_accept_disabled_and_done_writes_nothing() {
         app.press("id:revision-accept").is_err(),
         "the unavailable Accept cannot be pressed"
     );
-    // `A` decides nothing, and the next hunk refuses too.
     app.press_key("a").expect("press A");
     app.press_key("j").expect("dock the second hunk");
     app.settle();

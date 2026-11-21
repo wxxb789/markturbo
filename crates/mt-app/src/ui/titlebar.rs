@@ -1,19 +1,9 @@
-//! Owner lane: chrome.
-//!
-//! The 32px title row: the file's name at the left (aligned with the text
-//! column), `Review` and `Settings` at the right, and the menu `Settings` opens.
-//!
 //! Contract: [`title_row`] fills the row and owns its height and its padding.
 //! The window runs with the system title bar hidden (`shell` sets it), so the
 //! row reserves the native controls' area — `prims::caption_insets()` — and
 //! marks itself draggable, or the window cannot be moved.
 //!
-//! `Review` is the row's one action: it is the document's one next step and it
-//! sits at full ink when available, dimmed in place otherwise. Every other
-//! command — the pane modes, Context, Save and Save As among them — lives in the `Settings` menu, which also carries
-//! Quit, names the shortcuts its commands have and marks the pane on screen;
-//! pressing the file's name opens Context (the spec's "'Context' expands the
-//! title row's file path"). The row holds nothing else, at any width.
+//! `Review` stays in the row, dimmed while unavailable.
 
 use std::{cell::Cell, time::Duration};
 
@@ -149,8 +139,6 @@ impl MenuMotion {
     }
 }
 
-/// The title row. `state` is the shell's handle on the app; `language` is the
-/// language the shell was re-keyed with.
 pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     // `Review` (and the rest of `Ctrl+Enter`) from wherever the focus is.
     let review_state = state.clone();
@@ -215,7 +203,6 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         .bg(move || tokens::palette().room)
         .window_drag(true)
         .child(when(move || menu.is_open(), move || menu_scrim(menu)))
-        // The welcome has no filename, but still keeps the Review position.
         .child(when(
             {
                 let state = state.clone();
@@ -319,8 +306,6 @@ fn file_name(state: AppState) -> impl IntoElement {
     .flex_row()
     .items_center()
     .gap(px(SPACE_2))
-    // The name gives way first: `Review` and `Settings` keep their room at
-    // any width, and a long name truncates instead of running under them.
     .flex_shrink(1.0)
     .min_w(px(0.0))
     .hover(|s| s.text_color(tokens::palette().ink).underline())
@@ -369,7 +354,6 @@ fn file_name(state: AppState) -> impl IntoElement {
     ))
 }
 
-/// `Review`, the document's one next step. It stays in the row while disabled.
 fn review_action(state: AppState, language: Language) -> impl IntoElement {
     let enabled_state = state.clone();
     let enabled = move || {
@@ -421,26 +405,22 @@ fn menu_anchor(state: AppState, language: Language, menu: MenuMotion) -> impl In
         ))
 }
 
-/// The row's menu, under `Settings`: the document's actions with their
-/// shortcuts, the panes with the one on screen marked, Context, the settings
-/// page, and Quit.
 fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl IntoElement {
     let document_rows = signal(state.active.get_untracked().is_some());
+    let pane_selection = signal(untracked(|| state.active_tab().map(|tab| tab.pane.get())));
     let document_state = state.clone();
+    // Retain the menu's last snapshot while it fades out.
     effect(move || {
-        // Freeze the rows at the last open state while the panel exits.
         if menu.is_open() {
             document_rows.set(document_state.active.get().is_some());
+            pane_selection.set(document_state.active_tab().map(|tab| tab.pane.get()));
         }
     });
     let document = move || document_rows.get();
     let panel = menu_panel_frame(menu, "title-menu");
     panel
-        // A press anywhere opens the workspace it names, with or without a
-        // document on screen.
         .child({
             let open_state = state.clone();
-            // Ask for keyboard focus on the first row as the menu appears.
             let first = element_ref();
             effect(move || {
                 if menu.is_open() {
@@ -497,7 +477,6 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
         .child(when(document, {
             let state = state.clone();
             move || {
-                // Every row closes the menu first, then does its one thing.
                 let row = |test_id: &'static str,
                            label: &'static str,
                            hint: Option<SharedString>,
@@ -509,9 +488,8 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                     })
                     .into_element()
                 };
-                // A pane's row: the pane on screen carries the mark.
                 let pane = |test_id: &'static str, label: &'static str, pane: Pane| {
-                    pane_row(&state, menu, test_id, label, pane)
+                    pane_row(&state, menu, pane_selection, test_id, label, pane)
                 };
                 view()
                     .child(row(
@@ -617,7 +595,6 @@ fn menu_panel_frame(menu: MenuMotion, test_id: &str) -> View {
         .focusable(false)
 }
 
-/// One menu row, wired to `run`: it closes the menu first.
 fn menu_item(
     state: &AppState,
     menu: MenuMotion,
@@ -632,21 +609,16 @@ fn menu_item(
     })
 }
 
-/// A pane's row: it shows the active document in `pane`. The pane on screen
-/// carries the mark — the rail's dot, where a shortcut would be — and is the
-/// current item for screen readers.
 fn pane_row(
     state: &AppState,
     menu: MenuMotion,
+    pane_selection: Signal<Option<Pane>>,
     test_id: &'static str,
     label: &'static str,
     pane: Pane,
 ) -> AnyElement {
-    let on_screen = {
-        let state = state.clone();
-        move || state.active_tab().is_some_and(|tab| tab.pane.get() == pane)
-    };
-    let current = on_screen.clone();
+    let on_screen = move || pane_selection.get() == Some(pane);
+    let current = on_screen;
     let state = state.clone();
     menu_row(menu, test_id, label, None, move || {
         menu.close();
@@ -660,6 +632,7 @@ fn pane_row(
     })
     .child(when(on_screen, || {
         view()
+            .test_id("title-menu-pane-dot")
             .w(px(RAIL_DOT))
             .h(px(RAIL_DOT))
             .rounded(px(RAIL_DOT / 2.0))
@@ -704,10 +677,7 @@ fn menu_scrim(menu: MenuMotion) -> impl IntoElement {
         .on_press(move || menu.close())
 }
 
-/// One row of the menu, on one line: its label at quiet ink (full ink and
-/// underlined on hover or keyboard focus), then the shortcut it has, if any,
-/// right-aligned in caption ink. The label's text draws the hover itself: a
-/// style on the row would not reach it.
+/// Hover and focus styles belong on the label text so they reach its glyphs.
 fn menu_row(
     menu: MenuMotion,
     test_id: &'static str,
@@ -761,13 +731,6 @@ fn menu_row(
     }))
 }
 
-/// A title-row action, named as it reads. `strong` is `Review`, the app's one
-/// plain emphasis: the medium face at body ink over a 34% underline (the
-/// prototype's `.act`), the underline stepping to full ink on hover or
-/// keyboard focus. Otherwise (`Settings`) resting ink that steps to full ink,
-/// underlined, on hover or focus. No heat: it is local work, lit by ambient
-/// ink. The underline is the text's own: a decoration on the view around it
-/// would not reach the glyphs.
 fn row_action(
     test_id: &'static str,
     label: &'static str,
@@ -814,9 +777,6 @@ fn row_action(
             .underline()
             .text_decoration_color(move || tokens::palette().ink_at(0.34));
     }
-    // A plain press target, not `nsh_base`'s button: the control itself
-    // carries the test id, so a test presses `id:` and lands on the view that
-    // hears the press.
     let press_enabled = enabled.clone();
     prims::press_feedback_with_duration(
         view()
@@ -897,6 +857,15 @@ mod tests {
     #[component]
     fn WelcomeMenuProbe() -> impl IntoElement {
         shell::shell(AppState::new(), Language::English, tokens::Layout::Wide)
+    }
+
+    #[component]
+    fn PaneMenuProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let tab = state.active_tab().expect("the untitled tab");
+        state.set_pane(tab.id, Pane::Source);
+        title_row(state, Language::English)
     }
 
     #[derive(Clone, PartialEq, Props)]
@@ -997,6 +966,19 @@ mod tests {
         .count()
     }
 
+    fn pane_dot_is_in_row(app: &Headless, row_id: &str) -> bool {
+        let nodes = app.screen().layout_nodes();
+        let dot = nodes
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some("title-menu-pane-dot"))
+            .expect("the active pane's menu dot");
+        let row = nodes
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some(row_id))
+            .expect("the pane's menu row");
+        row.bounds.contains(&dot.bounds.center())
+    }
+
     #[test]
     fn review_stays_visible_and_disabled_without_a_document() {
         let mut app = manual_app(Root::of::<ReviewProbe>());
@@ -1049,6 +1031,27 @@ mod tests {
             item_count,
             "the fading menu must retain its welcome item set"
         );
+    }
+
+    #[test]
+    fn pane_dot_stays_with_the_selection_when_the_menu_fades() {
+        let mut app = manual_app(Root::of::<PaneMenuProbe>());
+        app.wait_for("id:title-settings")
+            .expect("the title settings action");
+        press_without_settling(&app, "id:title-settings");
+        app.wait_for("id:title-menu-preview")
+            .expect("the Preview pane row");
+        assert!(pane_dot_is_in_row(&app, "title-menu-edit"));
+
+        press_without_settling(&app, "id:title-menu-preview");
+        for _ in 0..2 {
+            app.next_frame(Duration::from_millis(16))
+                .expect("advance during the menu exit");
+        }
+
+        assert!(app.screen().matches("id:title-menu").unwrap());
+        assert!(pane_dot_is_in_row(&app, "title-menu-edit"));
+        assert!(!pane_dot_is_in_row(&app, "title-menu-preview"));
     }
 
     #[test]

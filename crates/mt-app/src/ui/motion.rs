@@ -3,11 +3,7 @@
 //! The Afterglow motion tokens, and [`Heat`]: one emitter's temperature,
 //! rising to HOT and cooling to ember on the spec's curve.
 //!
-//! Frequent changes are instant. Occasional surfaces use short ease-out
-//! transitions; the model's light uses a separate thermal curve.
-//!
-//! Under reduced motion (`reduce_motion()`, the system setting) an ignition is
-//! one 100ms crossfade instead of a 90ms flash plus a 1260ms decay.
+//! See [Goal 16](../../../../docs/goals/16-crisp-afterglow-motion.md) for the motion frequency map.
 
 use std::{cell::Cell, sync::OnceLock};
 
@@ -32,16 +28,15 @@ pub const AFTERIMAGE_MS: f32 = 1200.0;
 pub const EMBER: f32 = 0.18;
 /// The filament's charge (hold to send), linear from dull red to white.
 pub const FILAMENT_CHARGE_MS: f32 = 900.0;
-/// Platform hold delay, longer than the charge so a full hold completes it.
+/// Consent's 1.2s threshold (`docs/verification.md`) exceeds [`FILAMENT_CHARGE_MS`].
 pub const FILAMENT_HOLD_MS: f32 = 1_200.0;
 /// Its release: decay toward dull, tau 250ms.
 pub const FILAMENT_RELEASE_TAU_MS: f32 = 250.0;
 pub const FILAMENT_COOL_MS: f32 = 3.0 * FILAMENT_RELEASE_TAU_MS;
 /// A pip lighting, a leaving row's flash.
 pub const FLASH_MS: f32 = 120.0;
-/// The emitter extinguishes with an ease-in.
 pub const EXTINGUISH_MS: f32 = 120.0;
-/// Follow moving editor decorations, then only poll for appearance changes.
+/// Mounted editor decorations keep resolved styles when appearance changes.
 pub const HEAT_TICK_MS: u64 = 33;
 pub const HEAT_WATCH_MS: u64 = 250;
 pub const OUTBOUND_DECAY_MS: f32 = 250.0;
@@ -65,7 +60,6 @@ pub const CARD_RISE_PX: f32 = 4.0;
 pub const CARD_RISE_MS: f32 = ENTER_MS;
 pub const STATUS_HOLD_MS: u64 = 3000;
 pub const CONSENT_NOTICE_MS: u64 = 1500;
-/// The rail's names fade as the hover strip widens.
 pub const RAIL_WIDEN_MS: f32 = 160.0;
 pub const CAMERA_MS: f32 = 360.0;
 pub const CAMERA_TICK: std::time::Duration = std::time::Duration::from_micros(16_667);
@@ -95,7 +89,6 @@ impl Presence {
         Self::with_initial(open, false)
     }
 
-    /// With `snap_on_mount`, an already-open surface mounts at full opacity.
     pub fn with_initial(open: impl Fn() -> bool + 'static, snap_on_mount: bool) -> Self {
         let visible = signal(false);
         let opacity = animated_value(0.0);
@@ -257,9 +250,8 @@ impl Heat {
         self.0
     }
 
-    /// Ignite: to HOT in 90ms, then cool to ember on `e^(-t/420ms)`.
-    ///
-    /// Under reduced motion this is one 100ms crossfade to ember: no flash.
+    /// Ignite over [`IGNITE_MS`] and cool to [`EMBER`] over [`COOL_MS`].
+    /// Reduced motion crossfades directly to [`EMBER`] over [`REDUCED_CROSSFADE_MS`].
     pub fn ignite(&self) {
         self.0.stop();
         if reduced_motion() {

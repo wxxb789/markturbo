@@ -4,9 +4,7 @@
 //! (plain ink; the dot turns ember only while the file holds live model
 //! output), widening to 240px on hover to show names.
 //!
-//! Contract: [`rail`] is the strip's whole column — the shell places it beside
-//! the text column and gives it no width of its own, so the hover widening
-//! and the names' opacity both belong here.
+//! The shell gives `rail` no width; `rail` owns the strip's width.
 //!
 //! The rail also carries the app's file lists: `Ctrl+P` opens the workspace's
 //! files and `Ctrl+Shift+F` opens a content search as one input line at the
@@ -120,8 +118,6 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         }))
 }
 
-/// The 44px strip itself: the ground that widens, the dots, and the names
-/// that fade in over it without travelling.
 fn strip(
     state: AppState,
     language: Language,
@@ -159,7 +155,6 @@ fn strip(
                 names_opacity.timing(0.0, RAIL_WIDEN_MS, EASE_OUT);
             }
         })
-        // The hit area widens immediately; only the names fade.
         .child(
             view()
                 .test_id("rail-ground")

@@ -49,6 +49,7 @@ pub fn App() -> impl IntoElement {
     }));
     let _ticker_guard = stored(TickerGuard(ticker_alive));
     let shell_state = state.clone();
+    let status = ui::notices::StatusPresence::new(state.clone());
     view()
         .flex_1()
         .h(relative(1.0))
@@ -72,7 +73,8 @@ pub fn App() -> impl IntoElement {
                         layout,
                         ui::shell::client_width_now()
                     );
-                    ui::shell(state.clone(), language, layout).into_element()
+                    ui::shell::shell_with_status(state.clone(), language, layout, status)
+                        .into_element()
                 }
             },
         ))

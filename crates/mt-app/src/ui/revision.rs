@@ -10,14 +10,9 @@
 //! column in the same frame the proposal extinguishes (the struck words are
 //! gone with it); `Reject` writes nothing. `Undo` takes the last decision back
 //! together with its text — the reviewed bytes of that hunk, exactly — and
-//! repeated `Undo` walks further back. The state's ledger
-//! ([`AppState::set_revision_change_applied`]) does every write, keeps later
-//! hunks on their own bytes after an earlier one changed length, and follows
-//! the user's own edits between decisions: a hunk whose part the user edited
-//! says `Can't apply — this part changed` and keeps `Accept` disabled, and an
-//! `Undo` whose accepted text was edited since is refused with a message on
-//! the status line (the decision stays), never written over the edit.
-//! Nothing here saves; the tab only turns dirty.
+//! repeated `Undo` walks further back.
+//! The state's ledger applies every decision and keeps later hunks correct
+//! after a length change. This field never saves; it only marks the tab dirty.
 //!
 //! `Ctrl+Z` belongs to whoever has the keyboard: while the source editor (or
 //! any text input) has the focus, the editor's own undo wins and takes back
@@ -43,13 +38,8 @@
 //! state's one HOT item ([`Heat`] pinned at 1.0 rather than cooling, then
 //! extinguished when it is decided, which leaves it docked and plain until
 //! the next undecided hunk takes its place); the other hunks are ember lines.
-//! Both sides of the docked hunk are complete: a tall one scrolls in place,
-//! so `Accept` never approves text that was hidden. A hunk whose part of the
-//! document was edited says `Can't apply — this part changed`; a proposal
-//! whose document is no longer the one on screen says `This Revision belongs
-//! to another document` with `Review again`. Neither permits `Accept`, and
-//! the field always offers a way out (`Close`, and `Review again` on another
-//! document).
+//! Both sides of the docked hunk are complete; a tall one scrolls in place.
+//! `Accept` cannot write hidden or mismatched text.
 //!
 //! The decision log and the reading position live here, in a module-local
 //! session keyed by the proposal ([`Session`]); a decision is recorded only
@@ -773,11 +763,6 @@ fn halo_off_the_pointer(heat: Heat) -> impl IntoElement {
         .child(prims::halo(heat))
 }
 
-/// One hunk that is not in the reading position: its ordinal in the pip row's
-/// own order, a single line of the model's reason, and what it is decided as —
-/// ember while it still asks to be judged, plain ink once accepted, faint once
-/// rejected. Pressing it moves the reading position to its hunk — the mouse's
-/// `J` / `K`.
 fn one_line(
     state: AppState,
     language: Language,
@@ -1790,8 +1775,6 @@ mod tests {
         crate::ui::shell(state, Language::English, crate::ui::tokens::Layout::Wide)
     }
 
-    /// The shell with a textual probe of the source buffer, so keyboard focus
-    /// after a field action can be checked without targeting the editor.
     #[component]
     fn DismissFocusProbe() -> impl IntoElement {
         let state = AppState::new();
@@ -2088,9 +2071,6 @@ mod tests {
         );
     }
 
-    /// The two-change proposal with the column's marks for the tab on screen
-    /// written out, and the controls that change them from outside the
-    /// field: an edit inside the first hunk's old text, and another document.
     #[component]
     fn ColumnMarksProbe() -> impl IntoElement {
         let state = AppState::new();
@@ -2198,8 +2178,6 @@ mod tests {
         app.wait_for("text:marks: 0:0-0:12 0:13-0:21")
             .expect("the reviewed words are back, and struck");
 
-        // An edit inside the first hunk's old words: it has no place left to
-        // mark and its Accept is disabled; the untouched hunk keeps its bytes.
         app.press("text:edit-first")
             .expect("edit inside the first hunk");
         app.wait_for("text:marks: 0:14-0:22")

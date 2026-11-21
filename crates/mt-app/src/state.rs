@@ -461,9 +461,8 @@ pub struct ReviewView {
     pub partial: bool,
 }
 
-/// The column's camera: the document line a docked review or conflict surface
-/// asked the source editor to level with its reading position. The document
-/// lane's `ui::document` scrolls to it; nothing here changes the document.
+/// A request to align one source line with the column's reading position.
+/// The request scrolls the source view only; document contents are unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DocumentFocus {
     /// The tab the line belongs to; another tab's request is ignored.
@@ -1282,9 +1281,8 @@ impl AppState {
         }
     }
 
-    /// Ask the source column to level `line` (from 0) of tab `tab_id` with
-    /// its docked reading position, with an occasional camera glide. Frequent
-    /// or keyboard navigation uses [`Self::focus_document_line_instant`].
+    /// Ask the column to align `line` in `tab_id` with its reading position.
+    /// Use [`Self::focus_document_line_instant`] for frequent or keyboard navigation.
     pub fn focus_document_line(&self, tab_id: u64, line: u32) {
         self.request_document_line(tab_id, line, true);
     }

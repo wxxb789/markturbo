@@ -37,7 +37,6 @@ fn clean_launch_shows_welcome() {
         "a second status line under the welcome: {texts:?}"
     );
 
-    // With no document there is no name and Review is visible but disabled.
     assert_eq!(
         app.screen()
             .count("id:title-row >> role:button")

@@ -26,7 +26,7 @@
 //! Every surface is reached through its module's `is_open` / drawing function;
 //! the shell never draws a surface's insides.
 
-use std::cell::Cell;
+use std::{cell::Cell, rc::Rc, time::Duration};
 
 use mt_core::settings::Language;
 use nsh_core::{
@@ -82,6 +82,16 @@ pub fn surface(state: &AppState) -> FieldSurface {
 /// `layout` is the breakpoint `app.rs` re-keyed the shell with, so a shell that
 /// is rebuilt is a shell that crosses one.
 pub fn shell(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
+    let status = notices::StatusPresence::new(state.clone());
+    shell_with_status(state, language, layout, status)
+}
+
+pub(crate) fn shell_with_status(
+    state: AppState,
+    language: Language,
+    layout: Layout,
+    status: notices::StatusPresence,
+) -> impl IntoElement {
     hide_system_title_bar();
     let body_state = state.clone();
     view()
@@ -111,12 +121,12 @@ pub fn shell(state: AppState, language: Language, layout: Layout) -> impl IntoEl
                 },
                 {
                     let state = body_state.clone();
-                    move || settings::page(state.clone(), language).into_element()
+                    move || settings::page(state.clone(), language, status).into_element()
                 },
             )
             .otherwise({
                 let state = body_state;
-                move || workspace(state.clone(), language, layout).into_element()
+                move || workspace(state.clone(), language, layout, status).into_element()
             }),
         )
         .child(overlay_layer(state, language))
@@ -141,7 +151,12 @@ pub fn client_width_now() -> f32 {
 }
 
 /// The room under the title row: rail, column, field.
-fn workspace(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
+fn workspace(
+    state: AppState,
+    language: Language,
+    layout: Layout,
+    status: notices::StatusPresence,
+) -> impl IntoElement {
     view()
         .test_id("workspace")
         .flex_1()
@@ -149,7 +164,7 @@ fn workspace(state: AppState, language: Language, layout: Layout) -> impl IntoEl
         .min_h(px(0.0))
         .flex_row()
         .child(rail::rail(state.clone(), language))
-        .child(column(state.clone(), language, layout))
+        .child(column(state.clone(), language, layout, status))
         .child(field(state, language, layout))
 }
 
@@ -157,9 +172,28 @@ fn workspace(state: AppState, language: Language, layout: Layout) -> impl IntoEl
 /// the banners that belong above the text and the status line at its foot.
 ///
 /// Below 1040 client width it dims to 40% under the field.
-fn column(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
+fn column(
+    state: AppState,
+    language: Language,
+    layout: Layout,
+    status: notices::StatusPresence,
+) -> impl IntoElement {
     let active = state.active;
     let content_state = state.clone();
+    let frame_generation = signal(0_u64);
+    let reflow_deadline = Rc::new(Cell::new(None));
+    effect({
+        let reflow_deadline = reflow_deadline.clone();
+        move || {
+            if motion::reduced_motion()
+                && reflow_deadline
+                    .take()
+                    .is_some_and(|deadline| nsh_core::time::now() < deadline)
+            {
+                frame_generation.update(|generation| *generation += 1);
+            }
+        }
+    });
     view()
         .test_id("column")
         .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
@@ -170,17 +204,32 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
         .when(layout.field_overlays(), |column| {
             column.opacity(Layout::DIMMED)
         })
-        // nsh keeps a native frame tween if its target is unchanged. Replace
-        // the frames a banner can move when the document changes ownership.
+        // Win32 ignores frames equal to a running tween's target.
+        // Replacing their nodes drops the tween.
         .child(each(
-            move || vec![active.get()],
-            |id| *id,
-            move |_, _| column_content(content_state.clone(), language),
+            move || vec![(active.get(), frame_generation.get())],
+            |key| *key,
+            move |_, _| {
+                reflow_deadline.set(None);
+                let reflow_deadline = reflow_deadline.clone();
+                column_content(content_state.clone(), language, move |ms| {
+                    let deadline = nsh_core::time::now() + Duration::from_secs_f32(ms / 1000.0);
+                    reflow_deadline.set(Some(
+                        reflow_deadline
+                            .get()
+                            .map_or(deadline, |old| old.max(deadline)),
+                    ));
+                })
+            },
         ))
-        .child(notices::status_line(state, language))
+        .child(notices::status_line(state, language, status))
 }
 
-fn column_content(state: AppState, language: Language) -> [AnyElement; 3] {
+fn column_content(
+    state: AppState,
+    language: Language,
+    on_reflow: impl Fn(f32) + Clone + 'static,
+) -> [AnyElement; 3] {
     let document_state = state.clone();
     let recovery_state = state.clone();
     let conflict_state = state.clone();
@@ -191,12 +240,14 @@ fn column_content(state: AppState, language: Language) -> [AnyElement; 3] {
             "recovery-banner-slot",
             move || notices::has_recovery(&recovery_state),
             move || notices::recovery_banner(state_for_recovery.clone(), language),
+            on_reflow.clone(),
         )
         .into_element(),
         banner_slot(
             "conflict-banner-slot",
             move || notices::has_conflict(&conflict_state),
             move || notices::conflict_banner(conflict_banner_state.clone(), language),
+            on_reflow,
         )
         .into_element(),
         view()
@@ -341,6 +392,7 @@ fn banner_slot<E: IntoElement + 'static>(
     id: &'static str,
     open: impl Fn() -> bool + Clone + 'static,
     content: impl Fn() -> E + 'static,
+    on_reflow: impl Fn(f32) + 'static,
 ) -> impl IntoElement {
     let frame = element_ref();
     let presence = motion::Presence::with_initial(open.clone(), true);
@@ -356,6 +408,7 @@ fn banner_slot<E: IntoElement + 'static>(
                     motion::EXIT_MS
                 };
                 frame.animate_layout(motion::ease_out_layout(ms));
+                on_reflow(ms);
             }
         }
     });
@@ -679,8 +732,7 @@ mod tests {
             .expect("advance partway through the entry tween");
         press_without_settling(&mut app, "probe-switch-tab");
         let switched = ids.map(|id| node(&app, id));
-        // Headless reports layout targets, not the native tween. An unchanged
-        // target on the same node is ignored by Win32, so check the mount too.
+        // Headless reports target frames, not native tween samples.
         assert!(
             switched.each_ref().map(|node| node.bounds) == final_bounds
                 && batches.try_iter().any(|batch| {
@@ -697,6 +749,49 @@ mod tests {
                     ))
                 }),
             "the switch must replace the in-flight frames with final frames in one batch"
+        );
+    }
+
+    #[test]
+    fn enabling_reduced_motion_snaps_a_running_banner_reflow() {
+        use nsh_core::MountItem;
+
+        let mut app = conflict_probe();
+        app.settle();
+        let ids = ["conflict-banner-slot", "document-slot"];
+        let final_bounds = ids.map(|id| node(&app, id).bounds);
+        press_without_settling(&mut app, "probe-switch-tab");
+        let batches = capture_batches(&mut app);
+        press_without_settling(&mut app, "probe-conflict");
+        let moving = ids.map(|id| node(&app, id).id);
+        batches
+            .try_iter()
+            .find(|batch| {
+                let frames = transitioned_frames(batch, motion::ENTER_MS);
+                moving.iter().all(|id| frames.contains(id))
+            })
+            .expect("banner and document must have an entry tween");
+        app.wait(std::time::Duration::from_millis(32))
+            .expect("advance partway through reflow");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduce motion");
+        let snapped = ids.map(|id| node(&app, id));
+        assert!(
+            snapped.each_ref().map(|node| node.bounds) == final_bounds
+                && batches.try_iter().any(|batch| {
+                    moving.iter().all(|old| {
+                        batch.iter().any(|item| matches!(
+                            item, MountItem::Delete { id } if id == old
+                        ))
+                    }) && snapped.iter().all(|node| {
+                        batch.iter().any(|item| matches!(
+                            item, MountItem::Frame { id, .. } if *id == node.id
+                        ))
+                    }) && !batch.iter().any(|item| matches!(
+                        item, MountItem::LayoutAnimation(animation) if animation.update.is_some()
+                    ))
+                }),
+            "reduced motion must replace the in-flight frames with their final frames"
         );
     }
 
@@ -970,7 +1065,6 @@ mod tests {
         );
     }
 
-    /// `root` started in a `width` x 900 window, the editor up, in Source.
     fn start(root: Root, width: f32) -> Headless {
         let mut app =
             Headless::start(EngineConfig::new(root.tokens(tokens::theme()))).expect("start");
@@ -1125,8 +1219,7 @@ mod tests {
                 .try_into()
                 .expect("two transforms");
 
-            // Replay the mounted bindings with the same graph as nsh's
-            // renderer; Headless's screen reports style targets, not samples.
+            // Headless reports style targets, so sample the renderer's graph.
             let mut animator = Animator::default();
             animator.apply(&MountItem::Animation(AnimationOp::CreateValue {
                 node: opacity,
@@ -1299,7 +1392,6 @@ mod tests {
         );
     }
 
-    /// The left edge of the text `text` draws, wherever it is on screen.
     fn text_x(app: &Headless, text: &str) -> f32 {
         app.screen()
             .layout_nodes()
@@ -1423,6 +1515,143 @@ mod tests {
         assert!(
             !app.screen().matches("id:welcome-caret").expect("selector"),
             "the welcome draws a caret"
+        );
+    }
+
+    #[component]
+    fn StatusSettingsProbe() -> impl IntoElement {
+        let directory = tempfile::tempdir().expect("status fixture directory");
+        let path = directory.path().join("status-save.md");
+        std::fs::write(&path, "# Saved status\n").expect("write status fixture");
+        let state = AppState::new();
+        state.open_file(path);
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(control("probe-save", &state, move |state| {
+                std::fs::metadata(directory.path()).expect("status fixture remains available");
+                state.save_active();
+            }))
+            .child(control("probe-settings-close", &state, |state| {
+                state.settings_open.set(false);
+            }))
+            .child(shell(state, Language::English, Layout::Wide))
+    }
+
+    fn status_settings_app() -> Headless {
+        let mut config =
+            EngineConfig::new(Root::of::<StatusSettingsProbe>().tokens(tokens::theme()));
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        config.environment.reduce_motion = false;
+        let mut app = Headless::start(config).expect("start the status-settings probe");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("the status probe's window");
+        app.wait_for("label:Markdown source")
+            .expect("the saved document");
+        app
+    }
+
+    fn return_from_settings(
+        app: &mut Headless,
+        batches: &std::sync::mpsc::Receiver<Vec<nsh_core::MountItem>>,
+    ) -> Vec<nsh_core::MountItem> {
+        press_without_settling(app, "title-settings");
+        app.wait_for("id:title-menu-settings")
+            .expect("the Settings menu item");
+        press_without_settling(app, "title-menu-settings");
+        app.wait_for("id:settings-close")
+            .expect("the Settings close control");
+        let _ = batches.try_iter().count();
+        press_without_settling(app, "probe-settings-close");
+        app.catch_up();
+        batches.try_iter().flatten().collect()
+    }
+
+    fn save_status(app: &mut Headless) {
+        press_without_settling(app, "probe-save");
+        app.wait_for("text:Saved status-save.md")
+            .expect("the save status");
+        app.next_frame(std::time::Duration::from_millis(16))
+            .expect("start the status timers");
+    }
+
+    fn status_animation_starts(items: &[nsh_core::MountItem]) -> (bool, bool) {
+        let entry = items.iter().any(|item| {
+            matches!(
+                item,
+                nsh_core::MountItem::Animation(nsh_core::animation::AnimationOp::Start {
+                    driver: nsh_core::animation::Driver::Timing { to: 1.0, .. },
+                    ..
+                })
+            )
+        });
+        let exit = items.iter().any(|item| {
+            matches!(
+                item,
+                nsh_core::MountItem::Animation(nsh_core::animation::AnimationOp::Start {
+                    driver: nsh_core::animation::Driver::Timing {
+                        to: 0.0,
+                        duration_ms,
+                        ..
+                    },
+                    ..
+                }) if *duration_ms == motion::EXIT_MS
+            )
+        });
+        (entry, exit)
+    }
+
+    #[test]
+    fn saving_status_survives_settings_remount_during_hold_and_exit() {
+        let mut app = status_settings_app();
+        let batches = capture_batches(&mut app);
+        let saved = "Saved status-save.md";
+
+        save_status(&mut app);
+        app.wait(std::time::Duration::from_millis(
+            motion::ENTER_MS as u64 + 32,
+        ))
+        .expect("finish the status entry");
+        assert!(app.screen().shows(saved));
+
+        let visible_return = return_from_settings(&mut app, &batches);
+        let (visible_replayed, _) = status_animation_starts(&visible_return);
+        let visible_status_returned = app.screen().shows(saved);
+        app.wait(std::time::Duration::from_millis(
+            motion::STATUS_HOLD_MS + motion::EXIT_MS as u64 + 64,
+        ))
+        .expect("reach the original status deadline");
+        let visible_deadline_preserved = !app.screen().shows(saved);
+
+        save_status(&mut app);
+        app.wait(std::time::Duration::from_millis(
+            motion::STATUS_HOLD_MS + motion::ENTER_MS as u64 + motion::EXIT_MS as u64 / 2,
+        ))
+        .expect("reach the status exit");
+        let exit_batches: Vec<_> = batches.try_iter().flatten().collect();
+        let (_, reached_fade) = status_animation_starts(&exit_batches);
+        let fading_status_visible = app.screen().shows(saved);
+
+        let fading_return = return_from_settings(&mut app, &batches);
+        let (fading_replayed, _) = status_animation_starts(&fading_return);
+        let fading_status_returned = app.screen().shows(saved);
+        app.wait(std::time::Duration::from_millis(
+            motion::EXIT_MS as u64 + 32,
+        ))
+        .expect("finish the original status exit");
+        let fading_deadline_preserved = !app.screen().shows(saved);
+
+        assert!(
+            visible_status_returned
+                && !visible_replayed
+                && visible_deadline_preserved
+                && reached_fade
+                && fading_status_visible
+                && fading_status_returned
+                && !fading_replayed
+                && fading_deadline_preserved,
+            "visible return={visible_status_returned}, visible replayed={visible_replayed}, visible deadline={visible_deadline_preserved}, reached fade={reached_fade}, fading visible={fading_status_visible}, fading return={fading_status_returned}, fading replayed={fading_replayed}, fading deadline={fading_deadline_preserved}"
         );
     }
 }

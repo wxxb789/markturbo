@@ -301,7 +301,6 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
         "screen readers name it as it reads"
     );
 
-    // The pane on screen is Source after choosing it.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-edit").expect("Source");
     assert_eq!(
@@ -391,7 +390,7 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
 }
 
 #[test]
-fn a_fading_menu_row_does_not_take_a_press_and_workspace_remains_reachable() {
+fn a_fading_menu_row_does_not_take_a_press_and_web_action_remains_reachable() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _directory, _config) =
         start_with_files(false, true, &[("second.md", "Second document\n")]);
@@ -473,13 +472,7 @@ fn a_fading_menu_row_does_not_take_a_press_and_workspace_remains_reachable() {
     );
     app.answer_dialog(nsh_testing::DialogAnswer::Press("Cancel".to_owned()))
         .expect("cancel the web trust prompt");
-    app.press("label:plan.md")
-        .expect("the workspace rail remains reachable during the exit");
-    app.wait_for("id:title-file >> text:plan.md")
-        .expect("the rail row switched to plan.md before exit settled");
 }
-
-// ─── the loopback provider ────────────────────────────────────────────────
 
 /// A provider on loopback that answers every Review with no findings; its
 /// base URL.

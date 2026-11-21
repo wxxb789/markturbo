@@ -178,15 +178,12 @@ fn press_target(test_id: &str, label: SharedString) -> View {
         .rounded(px(0.0))
 }
 
-/// Keep press feedback independent of the action it invokes or the label it
-/// contains. The active plate snaps on; the normal colour transition takes
-/// over when the pointer or key is released.
+/// Pointer press-down snaps the plate; release eases ink over [`PRESS_RELEASE_MS`].
+/// Win32 nsh 0.6.1 keyboard activation dispatches `Press`, not `PressDown` or `PressUp`.
 pub(crate) fn press_feedback<T: PressControl<Kind>, Kind>(control: T) -> T {
     press_feedback_with_duration(control, press_color_duration())
 }
 
-/// A colour transition's duration, shared by a press target and any text
-/// inside it that also changes on hover.
 pub(crate) fn press_color_duration() -> Signal<f32> {
     signal(HOVER_MS)
 }
