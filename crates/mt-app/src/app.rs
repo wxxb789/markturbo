@@ -24,6 +24,9 @@ pub fn App() -> impl IntoElement {
     // ignores a font it has already seen.
     ui::fonts::register();
     let state = AppState::new();
+    // A downloaded companion CJK face is read, verified and registered on a
+    // blocking thread, after the first frame is on its way.
+    state.companion_font.restore();
     if let Some(path) = startup_path() {
         log::debug!("startup: opening {}", path.display());
         if path.is_dir() {

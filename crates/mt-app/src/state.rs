@@ -198,6 +198,8 @@ pub struct AppState {
     /// keyed by its tab and read when the comparison opens. A tab's entry is
     /// ignored while its `conflict` is false.
     pub conflict_disks: Signal<Vec<(u64, String)>>,
+    /// The companion CJK face the settings page downloads on request.
+    pub companion_font: crate::ui::fonts::Companion,
     owner: Owner,
     vault: CredentialVault,
     usage: Rc<RefCell<UsageStore>>,
@@ -637,6 +639,7 @@ impl AppState {
             conflict_compare: signal(None),
             conflict_difference: signal(0),
             conflict_disks: signal(Vec::new()),
+            companion_font: crate::ui::fonts::Companion::new(),
             usage: Rc::new(RefCell::new(usage)),
             pending_review: Rc::new(RefCell::new(None)),
             review_origin: Rc::new(RefCell::new(None)),
