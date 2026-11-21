@@ -4160,6 +4160,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_SYNC_DEADLOCK_GUARD: Duration = Duration::from_secs(5);
+
     #[derive(Default)]
     struct TestProtector;
 
@@ -4215,9 +4217,11 @@ mod tests {
         protect_active: AtomicUsize,
         protect_peak: AtomicUsize,
         protect_calls: AtomicUsize,
+        protect_gate: BlockingWaveGate,
         unprotect_active: AtomicUsize,
         unprotect_peak: AtomicUsize,
         unprotect_calls: AtomicUsize,
+        unprotect_gate: BlockingWaveGate,
         combined_peak: AtomicUsize,
         stages_overlapped: AtomicBool,
     }
@@ -4230,6 +4234,8 @@ mod tests {
             self.unprotect_active.store(0, Ordering::SeqCst);
             self.unprotect_peak.store(0, Ordering::SeqCst);
             self.unprotect_calls.store(0, Ordering::SeqCst);
+            self.protect_gate.reset_calls();
+            self.unprotect_gate.reset_calls();
             self.combined_peak.store(0, Ordering::SeqCst);
             self.stages_overlapped.store(false, Ordering::SeqCst);
         }
@@ -4241,6 +4247,7 @@ mod tests {
             calls: &AtomicUsize,
             combined_peak: &AtomicUsize,
             stages_overlapped: &AtomicBool,
+            gate: &BlockingWaveGate,
         ) {
             calls.fetch_add(1, Ordering::SeqCst);
             let current = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -4250,7 +4257,9 @@ mod tests {
                 Ordering::SeqCst,
             );
             stages_overlapped.fetch_or(other_active.load(Ordering::SeqCst) != 0, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(25));
+            if !gate.observe() {
+                std::thread::sleep(Duration::from_millis(25));
+            }
             combined_peak.fetch_max(
                 active.load(Ordering::SeqCst) + other_active.load(Ordering::SeqCst),
                 Ordering::SeqCst,
@@ -4269,6 +4278,7 @@ mod tests {
                 &self.protect_calls,
                 &self.combined_peak,
                 &self.stages_overlapped,
+                &self.protect_gate,
             );
             Ok(plaintext.iter().rev().copied().collect())
         }
@@ -4281,6 +4291,7 @@ mod tests {
                 &self.unprotect_calls,
                 &self.combined_peak,
                 &self.stages_overlapped,
+                &self.unprotect_gate,
             );
             Ok(ciphertext.iter().rev().copied().collect())
         }
@@ -4306,9 +4317,10 @@ mod tests {
             (started_receiver, release_sender)
         }
 
-        fn observe(&self) {
+        fn observe(&self) -> bool {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            if self.enabled.load(Ordering::Acquire) && !self.entered.swap(true, Ordering::AcqRel) {
+            let enabled = self.enabled.load(Ordering::Acquire);
+            if enabled && !self.entered.swap(true, Ordering::AcqRel) {
                 self.started
                     .lock()
                     .unwrap()
@@ -4324,6 +4336,7 @@ mod tests {
                     .recv()
                     .unwrap();
             }
+            enabled
         }
 
         fn reset_calls(&self) {
@@ -4349,28 +4362,43 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct OutOfOrderProtector {
-        fast_finished: AtomicBool,
-        slow_observed_fast: AtomicBool,
+        fast_finished: std::sync::mpsc::Sender<()>,
+        fast_ready: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Default for OutOfOrderProtector {
+        fn default() -> Self {
+            let (fast_finished, fast_ready) = std::sync::mpsc::channel();
+            Self {
+                fast_finished,
+                fast_ready: Mutex::new(fast_ready),
+            }
+        }
     }
 
     impl RecoveryProtector for OutOfOrderProtector {
         fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
-            if plaintext
+            let slow_first = plaintext
                 .windows(b"slow-first".len())
-                .any(|window| window == b"slow-first")
-            {
-                std::thread::sleep(Duration::from_millis(40));
-                self.slow_observed_fast
-                    .store(self.fast_finished.load(Ordering::SeqCst), Ordering::SeqCst);
-            } else if plaintext
+                .any(|window| window == b"slow-first");
+            let fast_last = plaintext
                 .windows(b"fast-last".len())
-                .any(|window| window == b"fast-last")
-            {
-                self.fast_finished.store(true, Ordering::SeqCst);
+                .any(|window| window == b"fast-last");
+            let ciphertext: Vec<_> = plaintext.iter().rev().copied().collect();
+
+            if slow_first {
+                self.fast_ready
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(TEST_SYNC_DEADLOCK_GUARD)
+                    .expect("fast checkpoint protection must finish while slow protection waits");
+            } else if fast_last {
+                self.fast_finished
+                    .send(())
+                    .expect("slow checkpoint must be waiting for fast protection");
             }
-            Ok(plaintext.iter().rev().copied().collect())
+            Ok(ciphertext)
         }
 
         fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>, RecoveryError> {
@@ -6054,7 +6082,31 @@ mod tests {
             .zip(&updated_tokens)
             .map(|(checkpoint, token)| RecoveryCheckpointAttempt { checkpoint, token })
             .collect();
-        let batch = store.checkpoint_batch_if_current(updated_attempts, &HashSet::new());
+        let (protect_started, release_protect) = protector.protect_gate.block_next_wave();
+        let (unprotect_started, release_unprotect) = protector.unprotect_gate.block_next_wave();
+        let batch = std::thread::scope(|scope| {
+            let worker = scope
+                .spawn(|| store.checkpoint_batch_if_current(updated_attempts, &HashSet::new()));
+            let deadline = Instant::now() + TEST_SYNC_DEADLOCK_GUARD;
+            let protect_entered = protect_started
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_ok();
+            let unprotect_entered = unprotect_started
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_ok();
+            let _ = release_protect.send(());
+            let _ = release_unprotect.send(());
+            let batch = worker.join().unwrap();
+            assert!(
+                protect_entered,
+                "checkpoint preparation did not reach protection while retention was blocked"
+            );
+            assert!(
+                unprotect_entered,
+                "retention decoding did not start while checkpoint protection was blocked"
+            );
+            batch
+        });
 
         assert!(
             batch
@@ -6756,7 +6808,6 @@ mod tests {
                 CheckpointBatchOutcome::Written
             ]
         ));
-        assert!(protector.slow_observed_fast.load(Ordering::SeqCst));
         let recovered = store.recover().unwrap().records;
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].record.text, latest.text);

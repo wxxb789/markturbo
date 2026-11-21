@@ -129,10 +129,8 @@
   per-chain `requests`, and `scripts/tests/test_native_goal07_provider.py`
   still runs a three-chain test (`request_count == 6`). Revalidate that no
   caller needs more than one chain, then drop the extra state and test.
-- [ ] **Make load-sensitive core tests deterministic**: The recovery tests
-  `batch_keeps_input_order_and_last_same_key_checkpoint_when_workers_finish_out_of_order`
-  (`slow_observed_fast`, 40 ms timing window) and
-  `batch_prepares_current_wave_while_pruning_retained_records` have flaked under
-  load. Tests in `usage::tests::*` and `settings::tests::usage_metrics_*` also
-  failed together once under heavy load. The affected tests pass in isolation;
-  replace timing assumptions with explicit synchronization in a follow-up.
+- [ ] **Isolate the opt-in Windows credential round-trip**:
+  `goal_05a_credential_lifecycle_windows_round_trip` is excluded from the
+  default suite but uses the current user's Windows Credential Manager when
+  explicitly run. Preserve native round-trip coverage in a disposable Windows
+  environment before running it again.

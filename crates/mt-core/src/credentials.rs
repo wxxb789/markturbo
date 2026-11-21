@@ -168,17 +168,29 @@ impl fmt::Debug for ResolvedCredential {
 pub struct CredentialVault {
     secure: Arc<dyn SecureCredentialStore>,
     session: Arc<Mutex<HashMap<String, Secret>>>,
+    #[cfg(all(test, target_os = "windows"))]
+    test_operation_scope: Option<usize>,
 }
 
 impl CredentialVault {
     pub fn production() -> Self {
-        Self::with_store(Arc::new(PlatformCredentialStore))
+        Self {
+            secure: Arc::new(PlatformCredentialStore),
+            session: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(test, target_os = "windows"))]
+            test_operation_scope: None,
+        }
     }
 
     pub fn with_store(secure: Arc<dyn SecureCredentialStore>) -> Self {
+        #[cfg(all(test, target_os = "windows"))]
+        let test_operation_scope = Arc::as_ptr(&secure) as *const () as usize;
+
         Self {
             secure,
             session: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(test, target_os = "windows"))]
+            test_operation_scope: Some(test_operation_scope),
         }
     }
 
@@ -208,7 +220,7 @@ impl CredentialVault {
             }));
         }
 
-        let _operation = lock_persistent_operations()?;
+        let _operation = self.lock_operations()?;
         let secure_read = self.read_persistent_unless_pending(target);
         if let Ok(Some(secret)) = secure_read.as_ref() {
             return Ok(Some(ResolvedCredential {
@@ -246,7 +258,7 @@ impl CredentialVault {
     /// Write, read back, and compare before reporting persistent success.
     pub fn replace_persistent(&self, target: &str, value: String) -> Result<(), CredentialError> {
         let secret = Secret::new(value)?;
-        let _operation = lock_persistent_operations()?;
+        let _operation = self.lock_operations()?;
         let marker_target = Self::pending_target(target);
         let marker_present = self.secure.read(&marker_target)?.is_some();
         let previous = if marker_present {
@@ -281,12 +293,12 @@ impl CredentialVault {
     }
 
     pub fn has_persistent(&self, target: &str) -> Result<bool, CredentialError> {
-        let _operation = lock_persistent_operations()?;
+        let _operation = self.lock_operations()?;
         Ok(self.read_persistent_unless_pending(target)?.is_some())
     }
 
     pub fn delete(&self, target: &str) -> Result<(), CredentialError> {
-        let _operation = lock_persistent_operations()?;
+        let _operation = self.lock_operations()?;
         if self.secure.is_supported() {
             self.secure.delete(target)?;
             self.secure.delete(&Self::pending_target(target))?;
@@ -296,6 +308,15 @@ impl CredentialVault {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(target);
         Ok(())
+    }
+
+    fn lock_operations(&self) -> Result<CredentialOperationGuard, CredentialError> {
+        #[cfg(all(test, target_os = "windows"))]
+        if let Some(scope) = self.test_operation_scope {
+            return lock_persistent_operations_for_test(scope);
+        }
+
+        lock_persistent_operations()
     }
 
     fn pending_target(target: &str) -> String {
@@ -380,6 +401,23 @@ impl Drop for CredentialOperationGuard {
 
 #[cfg(target_os = "windows")]
 fn lock_persistent_operations() -> Result<CredentialOperationGuard, CredentialError> {
+    lock_persistent_operations_named("Global\\markturbo-model-credential-operation-v1")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+fn lock_persistent_operations_for_test(
+    scope: usize,
+) -> Result<CredentialOperationGuard, CredentialError> {
+    lock_persistent_operations_named(&format!(
+        "Local\\markturbo-model-credential-test-{}-{scope:x}",
+        std::process::id()
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn lock_persistent_operations_named(
+    name: &str,
+) -> Result<CredentialOperationGuard, CredentialError> {
     use windows::Win32::{
         Foundation::{CloseHandle, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::Threading::{CreateMutexW, WaitForSingleObject},
@@ -387,7 +425,7 @@ fn lock_persistent_operations() -> Result<CredentialOperationGuard, CredentialEr
     use windows::core::PCWSTR;
 
     const WAIT_MILLISECONDS: u32 = 100;
-    let name = wide("Global\\markturbo-model-credential-operation-v1");
+    let name = wide(name);
     let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.map_err(|error| {
         CredentialError::new(CredentialErrorKind::Unavailable, Some(error.code().0))
     })?;
