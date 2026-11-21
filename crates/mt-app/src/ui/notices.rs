@@ -44,7 +44,7 @@ use crate::{
         AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest, Tab,
     },
     ui::{
-        motion::{HOVER_MS, reduced_motion},
+        motion::{self, reduced_motion},
         prims,
         tokens::{
             self, CONSENT_BUTTON_H, CONSENT_BUTTON_W, FOCUS_RING, FOCUS_RING_OFFSET, HAIRLINE,
@@ -918,6 +918,17 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
     // The card owns its keys: the source editor gives up the focus.
     state.blur_source_editor();
     bind_guard_keys(&state);
+    let rise = animated_value(motion::CARD_RISE_PX);
+    let scale = animated_value(motion::SCALE_FLOOR);
+    effect(move || {
+        if reduced_motion() {
+            rise.set(0.0);
+            scale.set(1.0);
+        } else {
+            rise.timing(0.0, motion::CARD_RISE_MS, motion::EASE_OUT);
+            scale.timing(1.0, motion::ENTER_MS, motion::EASE_OUT);
+        }
+    });
     let names_state = state.clone();
     let save_state = state.clone();
     let discard_state = state.clone();
@@ -934,6 +945,9 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .bg(move || tokens::palette().column_ground)
         .border(px(HAIRLINE))
         .border_color(move || tokens::palette().hairline)
+        .when(!reduced_motion(), |card| {
+            card.bind_scale(&scale).bind_translate_y(&rise)
+        })
         .child(prims::ink(s(S::CloseWithoutSaving, language)))
         .child(
             text(move || documents_line(&names_state, request.tab, language))
@@ -1123,47 +1137,42 @@ fn card_action(
                         tokens::palette().ink_caption
                     }
                 })
-                .transition_colors()
-                .duration(HOVER_MS)
                 .child(
                     // The control itself carries the test id (UI Automation's
                     // AutomationId): a plain press target, as `prims`' are.
-                    view()
-                        .test_id(test_id)
-                        .role(AccessibilityRole::Button)
-                        .optional_label(Some(SharedString::from(label)))
-                        .w_full()
-                        .h_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .bg(Color::TRANSPARENT)
-                        .cursor_pointer()
-                        .rounded(px(0.0))
-                        .on_press(on_press)
-                        .child(
-                            text(label)
-                                .font_family(tokens::FONT_UI)
-                                .text_size(px(tokens::TYPE_UI))
-                                .line_height(px(tokens::TYPE_UI_LINE))
-                                .text_color(move || {
-                                    if danger {
-                                        tokens::palette().danger
-                                    } else {
-                                        tokens::palette().ink
-                                    }
-                                }),
-                        ),
+                    prims::press_feedback(
+                        view()
+                            .test_id(test_id)
+                            .role(AccessibilityRole::Button)
+                            .optional_label(Some(SharedString::from(label)))
+                            .w_full()
+                            .h_full()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .bg(Color::TRANSPARENT)
+                            .cursor_pointer()
+                            .rounded(px(0.0))
+                            .on_press(on_press)
+                            .child(
+                                text(label)
+                                    .font_family(tokens::FONT_UI)
+                                    .text_size(px(tokens::TYPE_UI))
+                                    .line_height(px(tokens::TYPE_UI_LINE))
+                                    .text_color(move || {
+                                        if danger {
+                                            tokens::palette().danger
+                                        } else {
+                                            tokens::palette().ink
+                                        }
+                                    }),
+                            ),
+                    ),
                 ),
         )
 }
 
 // ─── status line ──────────────────────────────────────────────────────────
-
-/// How long a done message stays at resting ink before it fades.
-const STATUS_HOLD_MS: u64 = 3_000;
-/// The fade of a done message; reduced motion drops it at once.
-const STATUS_FADE_MS: u64 = 240;
 
 /// The quiet line at the foot of the column: what the app last did, at resting
 /// ink. Local, so it never glows. Something done fades after a moment and
@@ -1172,31 +1181,55 @@ const STATUS_FADE_MS: u64 = 240;
 /// its height either way, so nothing under or above it moves.
 pub fn status_line(state: AppState, language: Language) -> impl IntoElement {
     let _ = language;
-    let opacity = animated_value(1.0);
+    let opacity = animated_value(0.0);
+    let rise = animated_value(motion::CARD_RISE_PX);
     let steps: Rc<RefCell<Vec<Spawned<()>>>> = Rc::default();
     let watched = state.clone();
     effect(move || {
         let message = watched.status.get();
         let held = watched.status_held.get_untracked();
-        // A new message cancels the last one's fade and shows at full ink.
+        // A new message cancels the last one's fade and retargets from the
+        // current opacity and offset.
         steps.borrow_mut().clear();
         opacity.stop();
-        opacity.set(1.0);
-        if message.is_empty() || held {
+        rise.stop();
+        if message.is_empty() {
+            opacity.set(0.0);
+            rise.set(motion::CARD_RISE_PX);
             return;
         }
-        let fade = set_timeout(Duration::from_millis(STATUS_HOLD_MS), move || {
-            if reduced_motion() {
-                opacity.set(0.0);
-            } else {
-                opacity.timing_with(0.0, Timing::new(STATUS_FADE_MS as f32, Easing::EaseInOut));
-            }
-        });
+        let reduced = reduced_motion();
+        let enter_ms = if reduced {
+            motion::REDUCED_CROSSFADE_MS
+        } else {
+            motion::ENTER_MS
+        };
+        let exit_ms = if reduced {
+            motion::REDUCED_CROSSFADE_MS
+        } else {
+            motion::EXIT_MS
+        };
+        if reduced {
+            rise.set(0.0);
+            opacity.timing(1.0, enter_ms, motion::EASE_OUT);
+        } else {
+            rise.timing(0.0, motion::ENTER_MS, motion::EASE_OUT);
+            opacity.timing(1.0, enter_ms, motion::EASE_OUT);
+        }
+        if held {
+            return;
+        }
+        let fade = set_timeout(
+            Duration::from_millis(motion::STATUS_HOLD_MS + enter_ms as u64),
+            move || {
+                opacity.timing(0.0, exit_ms, motion::EASE_OUT);
+            },
+        );
         // Faded, the message leaves the line, so nothing reads it any more —
         // unless another one took its place meanwhile.
         let clearing = watched.clone();
         let clear = set_timeout(
-            Duration::from_millis(STATUS_HOLD_MS + STATUS_FADE_MS),
+            Duration::from_millis(motion::STATUS_HOLD_MS + enter_ms as u64 + exit_ms as u64),
             move || {
                 if clearing.status.get_untracked() == message {
                     clearing.status.set(SharedString::default());
@@ -1210,6 +1243,7 @@ pub fn status_line(state: AppState, language: Language) -> impl IntoElement {
             .w_full()
             .h(px(tokens::TYPE_UI_LINE))
             .bind_opacity(&opacity)
+            .when(!reduced_motion(), |line| line.bind_translate_y(&rise))
             .child(
                 text(move || state.status.get())
                     .font_family(tokens::FONT_UI)

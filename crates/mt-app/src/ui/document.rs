@@ -320,8 +320,6 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
 /// How often the camera steps the column while it glides: a display frame
 /// at 60 Hz. The glide's position is read from the clock at each step, so a
 /// late step lands where the curve is by then, not behind it.
-const GLIDE_STEP: std::time::Duration = std::time::Duration::from_micros(16_667);
-
 /// The camera's glide in flight, if any. A new target, the user's own scroll
 /// and the user's typing end it.
 #[derive(Clone, Default)]
@@ -373,7 +371,7 @@ fn level_line(editor: ComponentRef<Editor>, glide: &Glide, line: u32, cut: bool)
 }
 
 /// The glide itself: steps the editor's scroll offset from `from` to `to`
-/// along [`motion::camera_progress`], one [`GLIDE_STEP`] at a time.
+/// along [`motion::camera_progress`], one [`motion::CAMERA_TICK`] at a time.
 ///
 /// It ends early when the offset is no longer one it set: the user scrolled
 /// (a wheel, the scrollbar, a caret moved into view by typing), and the
@@ -384,7 +382,7 @@ async fn glide_to(editor: ComponentRef<Editor>, from: f32, to: f32) {
     let start = nsh_core::time::now();
     let mut own = [from, from];
     loop {
-        timer(GLIDE_STEP).await;
+        timer(motion::CAMERA_TICK).await;
         let Some(api) = editor.api::<EditorApi>() else {
             return;
         };
@@ -535,24 +533,13 @@ fn gutter_style(reading: bool) -> Style {
 
 /// Every line number, the active line's included: 11px in non-text ink,
 /// shown only while a docked surface is reading the document (the prototype
-/// hides them while you edit), fading in and out over the extinguish.
+/// hides them while you edit), without animating a field change.
 fn line_number_style(reading: bool) -> Style {
-    let fade = if motion::reduced_motion() {
-        motion::REDUCED_CROSSFADE_MS
-    } else {
-        motion::EXTINGUISH_MS
-    };
     declared(&[
         (StyleKey::FontSize, StyleValue::Number(LINE_NUMBER_SIZE)),
         (
             StyleKey::Opacity,
             StyleValue::Number(if reading { 1.0 } else { 0.0 }),
-        ),
-        (StyleKey::TransitionProperty, StyleValue::Str("opacity")),
-        (StyleKey::TransitionDuration, StyleValue::Number(fade)),
-        (
-            StyleKey::TransitionTimingFunction,
-            StyleValue::Str("ease-in"),
         ),
     ])
     .with(

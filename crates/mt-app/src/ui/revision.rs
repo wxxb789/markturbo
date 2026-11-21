@@ -14,7 +14,7 @@
 //! ([`AppState::set_revision_change_applied`]) does every write, keeps later
 //! hunks on their own bytes after an earlier one changed length, and follows
 //! the user's own edits between decisions: a hunk whose part the user edited
-//! says `Can't apply — this part changed` and offers no `Accept`, and an
+//! says `Can't apply — this part changed` and keeps `Accept` disabled, and an
 //! `Undo` whose accepted text was edited since is refused with a message on
 //! the status line (the decision stays), never written over the edit.
 //! Nothing here saves; the tab only turns dirty.
@@ -47,7 +47,7 @@
 //! so `Accept` never approves text that was hidden. A hunk whose part of the
 //! document was edited says `Can't apply — this part changed`; a proposal
 //! whose document is no longer the one on screen says `This Revision belongs
-//! to another document` with `Review again`. Neither offers an `Accept`, and
+//! to another document` with `Review again`. Neither permits `Accept`, and
 //! the field always offers a way out (`Close`, and `Review again` on another
 //! document).
 //!
@@ -75,7 +75,7 @@ use crate::{
     state::{AppState, RevisionHunkView, Tab},
     ui::{
         glow,
-        motion::{self, Heat},
+        motion::{self, EASE_IN_OUT, Heat, LINEAR},
         prims, titlebar,
         tokens::{self, SPACE_1, SPACE_2, SPACE_3},
     },
@@ -739,12 +739,14 @@ fn docked_proposal(
                 .flex_row()
                 .items_center()
                 .gap(px(SPACE_3))
-                .child(when_not(accept_condition, move || {
+                .child(
                     prims::primary_action("revision-accept", S::Accept.text(language), {
                         let state = accept_state.clone();
                         move || decide(&state, heat, true)
                     })
-                }))
+                    .disabled(accept_condition)
+                    .disabled_style(|style| style.opacity(0.5)),
+                )
                 .child(prims::quiet_action(
                     "revision-reject",
                     S::Reject.text(language),
@@ -766,16 +768,6 @@ fn halo_off_the_pointer(heat: Heat) -> impl IntoElement {
         .inset(px(0.0))
         .pointer_events(PointerEvents::None)
         .child(prims::halo(heat))
-}
-
-/// The negation of `when`, for a region that must be absent while a condition
-/// holds.
-fn when_not<E: IntoElements>(
-    condition: impl IntoReactive<bool>,
-    then: impl Fn() -> E + 'static,
-) -> impl IntoElement {
-    let condition = condition.into_reactive();
-    when(move || !condition.get(), then)
 }
 
 /// One hunk that is not in the reading position: its ordinal in the pip row's
@@ -807,31 +799,33 @@ fn one_line(
         Some(true) => tokens::palette().ink_rest,
         Some(false) => tokens::palette().ink_caption,
     };
-    view()
-        .label(label)
-        .focusable(true)
-        .cursor_pointer()
-        .on_press(move || move_to(&state, index.get()))
-        .w_full()
-        .flex_row()
-        .items_center()
-        .gap(px(SPACE_3))
-        .child(
-            view().w(px(24.0)).child(
-                text(word)
+    prims::press_feedback(
+        view()
+            .label(label)
+            .focusable(true)
+            .cursor_pointer()
+            .on_press(move || move_to(&state, index.get()))
+            .w_full()
+            .flex_row()
+            .items_center()
+            .gap(px(SPACE_3))
+            .child(
+                view().w(px(24.0)).child(
+                    text(word)
+                        .font_family(tokens::FONT_UI)
+                        .text_size(px(tokens::TYPE_UI))
+                        .line_height(px(tokens::TYPE_UI_LINE))
+                        .text_color(move || tokens::palette().ink_caption),
+                ),
+            )
+            .child(
+                text(digest_text)
                     .font_family(tokens::FONT_UI)
                     .text_size(px(tokens::TYPE_UI))
                     .line_height(px(tokens::TYPE_UI_LINE))
-                    .text_color(move || tokens::palette().ink_caption),
+                    .text_color(colour),
             ),
-        )
-        .child(
-            text(digest_text)
-                .font_family(tokens::FONT_UI)
-                .text_size(px(tokens::TYPE_UI))
-                .line_height(px(tokens::TYPE_UI_LINE))
-                .text_color(colour),
-        )
+    )
 }
 
 // ─── the decision row ─────────────────────────────────────────────────────
@@ -923,7 +917,10 @@ fn decisions(
                 .child(prims::quiet_action(
                     "revision-close",
                     i18n::t(language, Key::Close),
-                    move || close_state.close_review(),
+                    move || {
+                        close_state.close_review();
+                        close_state.focus_editor();
+                    },
                 ))
                 // `Done` is the one next action only once nothing is left to
                 // judge; while hunks wait it stays the quiet one.
@@ -935,27 +932,27 @@ fn decisions(
 /// so a screen reader (and UI Automation) finds one button by it.
 fn copy_action(state: AppState, language: Language) -> impl IntoElement {
     let label = SharedString::from(S::Copy.text(language));
-    view()
-        .test_id("revision-copy")
-        .role(AccessibilityRole::Button)
-        .label(label.clone())
-        .focusable(true)
-        .cursor_pointer()
-        .bg(Color::TRANSPARENT)
-        .px(px(2.0))
-        .py(px(4.0))
-        .transition_colors()
-        .duration(motion::HOVER_MS)
-        .hover(|s| s.text_color(tokens::palette().ink).underline())
-        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-        .on_press(move || copy_approved(&state))
-        .child(
-            text(label)
-                .font_family(tokens::FONT_UI)
-                .text_size(px(tokens::TYPE_UI))
-                .line_height(px(tokens::TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest),
-        )
+    prims::press_feedback(
+        view()
+            .test_id("revision-copy")
+            .role(AccessibilityRole::Button)
+            .label(label.clone())
+            .focusable(true)
+            .cursor_pointer()
+            .bg(Color::TRANSPARENT)
+            .px(px(2.0))
+            .py(px(4.0))
+            .hover(|s| s.text_color(tokens::palette().ink).underline())
+            .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+            .on_press(move || copy_approved(&state)),
+    )
+    .child(
+        text(label)
+            .font_family(tokens::FONT_UI)
+            .text_size(px(tokens::TYPE_UI))
+            .line_height(px(tokens::TYPE_UI_LINE))
+            .text_color(move || tokens::palette().ink_rest),
+    )
 }
 
 /// `Done`: absent while the proposal is stale (nothing here can apply), the
@@ -1069,8 +1066,8 @@ fn decide(state: &AppState, heat: Heat, accepted: bool) {
     let Some(index) = next.current(&hunks) else {
         return;
     };
-    // A hunk whose part changed offers no Accept; the ledger's own byte check
-    // is the second gate.
+    // The disabled Accept and the ledger both refuse a hunk whose part
+    // changed, including an edit between render and press.
     if accepted && (state.revision_is_stale() || cannot_apply(state, &hunks[index])) {
         return;
     }
@@ -1214,9 +1211,9 @@ fn ignite_hot(heat: Heat) {
     let value = heat.value();
     value.stop();
     let (ms, easing) = if motion::reduced_motion() {
-        (motion::REDUCED_CROSSFADE_MS, Easing::EaseInOut)
+        (motion::REDUCED_CROSSFADE_MS, EASE_IN_OUT)
     } else {
-        (motion::IGNITE_MS, Easing::Linear)
+        (motion::IGNITE_MS, LINEAR)
     };
     value.timing(1.0, ms, easing);
 }
@@ -1474,11 +1471,15 @@ mod tests {
             .expect("the edited hunk says it cannot apply");
         assert!(app.shows("Can't apply — this part changed"));
         assert!(
-            !app.screen()
+            app.screen()
                 .matches("id:revision-accept")
                 .expect("the selector"),
-            "no Accept on a hunk whose base changed: {:?}",
+            "Accept stays in the row: {:?}",
             app.screen().texts()
+        );
+        assert!(
+            app.press("id:revision-accept").is_err(),
+            "the unavailable Accept cannot be pressed"
         );
         app.press_key("a").expect("press A");
         app.wait(Duration::from_millis(50)).expect("a frame");
@@ -1502,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn a_proposal_for_another_document_says_so_and_offers_no_accept() {
+    fn a_proposal_for_another_document_says_so_and_disables_accept() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<OtherDocumentProbe>()))
             .expect("start the field");
         app.wait_for("id:revision-stale")
@@ -1513,11 +1514,15 @@ mod tests {
             "nothing was edited after the review"
         );
         assert!(
-            !app.screen()
+            app.screen()
                 .matches("id:revision-accept")
                 .expect("the selector"),
-            "no Accept into a document the proposal was not made for: {:?}",
+            "Accept stays in the row: {:?}",
             app.screen().texts()
+        );
+        assert!(
+            app.press("id:revision-accept").is_err(),
+            "the proposal cannot be accepted into another document"
         );
     }
 
@@ -2126,7 +2131,7 @@ mod tests {
             .expect("the reviewed words are back, and struck");
 
         // An edit inside the first hunk's old words: it has no place left to
-        // mark (and no Accept); the untouched hunk keeps its own bytes.
+        // mark and its Accept is disabled; the untouched hunk keeps its bytes.
         app.press("text:edit-first")
             .expect("edit inside the first hunk");
         app.wait_for("text:marks: 0:14-0:22")

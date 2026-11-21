@@ -5,9 +5,8 @@
 //! output), widening to 240px on hover to show names.
 //!
 //! Contract: [`rail`] is the strip's whole column — the shell places it beside
-//! the text column and gives it no width of its own, so the width, the hover
-//! widening (160ms `cubic-bezier(0.2, 0, 0, 1)`) and the names all belong
-//! here.
+//! the text column and gives it no width of its own, so the hover widening
+//! and the names' opacity both belong here.
 //!
 //! The rail also carries the app's file lists: `Ctrl+P` opens the workspace's
 //! files and `Ctrl+Shift+F` opens a content search as one input line at the
@@ -24,7 +23,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Tab},
     ui::{
-        motion::{RAIL_WIDEN_MS, rail_easing, reduced_motion},
+        motion::{self, EASE_OUT, RAIL_WIDEN_MS, reduced_motion},
         prims, shell,
         tokens::{
             self, COLUMN_GAP, FIELD_GAP, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT,
@@ -39,7 +38,7 @@ const MAX_ROWS: usize = 200;
 /// The rail: one dot per open file, the active file's at full ink.
 pub fn rail(state: AppState, language: Language) -> impl IntoElement {
     let hovered = signal(false);
-    let slide = animated_value(0.0);
+    let names_opacity = animated_value(0.0);
     let palette = Palette {
         open: signal(false),
         mode: signal(PaletteMode::Files),
@@ -98,7 +97,7 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         },
     );
 
-    view()
+    motion::theme_colors(view())
         .test_id("rail")
         .relative()
         // Above the text column and the field, so the widening and the
@@ -108,7 +107,13 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         .w(px(RAIL_W))
         .h(relative(1.0))
         .bg(move || tokens::palette().room)
-        .child(strip(state.clone(), language, hovered, slide, palette))
+        .child(strip(
+            state.clone(),
+            language,
+            hovered,
+            names_opacity,
+            palette,
+        ))
         .child(when(move || palette.open.get(), {
             let state = state.clone();
             move || palette_line(state.clone(), language, palette).into_element()
@@ -116,18 +121,14 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
 }
 
 /// The 44px strip itself: the ground that widens, the dots, and the names
-/// that appear with it.
+/// that fade in over it without travelling.
 fn strip(
     state: AppState,
     language: Language,
     hovered: Signal<bool>,
-    slide: AnimatedValue,
+    names_opacity: AnimatedValue,
     palette: Palette,
 ) -> impl IntoElement {
-    let offset = slide
-        .node()
-        .mul(RAIL_HOVER_W - RAIL_W)
-        .sub(RAIL_HOVER_W - RAIL_W);
     view()
         .test_id("rail-hover")
         .absolute()
@@ -145,36 +146,39 @@ fn strip(
         .on_mouse_enter(move |_: &MouseEvent| {
             hovered.set(true);
             if reduced_motion() {
-                slide.set(1.0);
+                names_opacity.set(1.0);
             } else {
-                slide.timing(1.0, RAIL_WIDEN_MS, rail_easing());
+                names_opacity.timing(1.0, RAIL_WIDEN_MS, EASE_OUT);
             }
         })
         .on_mouse_leave(move |_: &MouseEvent| {
             hovered.set(false);
             if reduced_motion() {
-                slide.set(0.0);
+                names_opacity.set(0.0);
             } else {
-                slide.timing(0.0, RAIL_WIDEN_MS, rail_easing());
+                names_opacity.timing(0.0, RAIL_WIDEN_MS, EASE_OUT);
             }
         })
-        // The widened ground slides out from under the dots; the names it
-        // uncovers fade in with it. Nothing moves: the dots stay where they
-        // are, and the column does not move at all.
+        // The hit area widens immediately; only the names fade.
         .child(
-            view()
+            motion::theme_colors(view())
                 .test_id("rail-ground")
                 .absolute()
                 .top(px(0.0))
                 .bottom(px(0.0))
                 .left(px(0.0))
                 .w(px(RAIL_HOVER_W))
-                .bg(move || tokens::palette().room)
-                .bind_translate_x(&offset),
+                .bg(move || tokens::palette().room),
         )
         // Painted over the invisible names, so a press in the 44px strip is
         // always a press on a dot.
-        .child(names(state.clone(), language, hovered, slide, palette))
+        .child(names(
+            state.clone(),
+            language,
+            hovered,
+            names_opacity,
+            palette,
+        ))
         .child(dots(state, palette))
 }
 
@@ -199,7 +203,7 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                 let press_state = state.clone();
                 let live_state = state.clone();
                 let live_dot_state = state.clone();
-                view()
+                prims::press_feedback(view())
                     .test_id("rail-file-row")
                     .role(AccessibilityRole::Button)
                     .optional_label(Some(tab.title.clone()))
@@ -218,6 +222,7 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                             press_state.pin_tab(id);
                         }
                         palette.close(&press_state);
+                        press_state.focus_editor();
                     })
                     .child(
                         view()
@@ -262,7 +267,7 @@ fn names(
     state: AppState,
     language: Language,
     hovered: Signal<bool>,
-    slide: AnimatedValue,
+    names_opacity: AnimatedValue,
     palette: Palette,
 ) -> impl IntoElement {
     let list_state = state.clone();
@@ -276,7 +281,7 @@ fn names(
         .overflow_hidden()
         .pt(px(SPACE_5))
         .flex_col()
-        .bind_opacity(&slide)
+        .bind_opacity(&names_opacity)
         .child(each(
             move || list_state.tabs.get(),
             |tab| tab.id,
@@ -296,7 +301,7 @@ fn names(
                     .flex_row()
                     .items_center()
                     .child(
-                        view()
+                        prims::press_feedback(view())
                             .test_id("rail-name")
                             // The dot row is this tab's keyboard stop: the
                             // name is the pointer's way into the strip, and
@@ -316,6 +321,7 @@ fn names(
                                     press_state.pin_tab(id);
                                 }
                                 palette.close(&press_state);
+                                press_state.focus_editor();
                             })
                             .child(
                                 text(title.clone())
@@ -334,7 +340,7 @@ fn names(
                             ),
                     )
                     .child(
-                        view()
+                        prims::press_feedback(view())
                             .test_id("rail-close")
                             .w(px(16.0))
                             .h(px(16.0))
@@ -354,7 +360,10 @@ fn names(
                             .border(px(HAIRLINE))
                             .border_color(Color::TRANSPARENT)
                             .focus_visible(|s| s.border_color(tokens::palette().ink))
-                            .on_press(move || close_state.request_close_tab(id))
+                            .on_press(move || {
+                                close_state.request_close_tab(id);
+                                close_state.focus_editor();
+                            })
                             .child(
                                 text("\u{00D7}")
                                     .font_family(FONT_UI)
@@ -656,7 +665,7 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
                     // element with its index read once, so an index would
                     // point at whatever moved into that place.
                     let key = row.key.clone();
-                    view()
+                    prims::press_feedback(view())
                         .test_id("palette-row")
                         .w_full()
                         .flex_row()

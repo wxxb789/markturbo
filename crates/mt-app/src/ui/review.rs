@@ -6,7 +6,7 @@
 //!
 //! Contract: [`is_open`] says whether the field is the review's; [`field`]
 //! draws it. The shell routes to it and gives it the field's box; everything
-//! inside — the docked reading position, the ignition order, the stagger, the
+//! inside — the docked reading position, the model output's one arrival, the
 //! focus on the answer field — belongs here.
 //!
 //! The session this file keeps ([`session`], [`emitters`]) is UI state the
@@ -36,7 +36,7 @@ use crate::{
     },
     ui::{
         glow,
-        motion::{Heat, IGNITE_MS, REDUCED_CROSSFADE_MS, reduced_motion, stagger},
+        motion::{EASE_IN_OUT, Heat, IGNITE_MS, LINEAR, REDUCED_CROSSFADE_MS, reduced_motion},
         prims,
         tokens::{
             self, FOCUS_RING, FOCUS_RING_OFFSET, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
@@ -158,8 +158,8 @@ fn hint_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
 }
 
-/// Watches the state's result: a new one resets the session, builds the
-/// emitters, ignites them in reading order and hands the column its anchors.
+/// Watches the state's result: a new one resets the session, starts its model
+/// emitters together and hands the column its anchors.
 fn observe(state: &AppState, session: Signal<Session>) {
     let state = state.clone();
     effect(move || {
@@ -204,27 +204,24 @@ fn observe(state: &AppState, session: Signal<Session>) {
                         .collect(),
                 });
                 emitters.set(built.clone());
-                // The reading order: the goal, then the question to answer —
-                // the one that stays HOT — then the rest of the questions.
-                // The column's findings ignite on the same clock, and exactly
-                // one thing is HOT by the time the sequence is done.
-                built.goal.ignite(stagger(0));
+                // Every result arrives together. The current question stays
+                // HOT; the column holds the finding the user steps to.
+                built.goal.ignite(0.0);
                 for (slot, index) in order.iter().enumerate() {
                     let Some(heat) = built.questions.get(slot).copied() else {
                         continue;
                     };
                     if Some(*index) == current {
-                        ignite_hold(heat, stagger(1));
+                        ignite_hold(heat);
                     } else {
-                        heat.ignite(stagger(2 + slot));
+                        heat.ignite(0.0);
                     }
                 }
                 // Nothing is focused yet: the question is the one HOT item
                 // until `J`/`K` (or the stepper) steps to a finding.
                 glow::focus_finding(None);
-                // The first finding ignites with the first question (their
-                // simultaneous ignition is the link): the column moves so the
-                // anchored lines sit level with the docked question.
+                // The column moves so the first anchored lines sit level with
+                // the docked question as the result arrives.
                 level_finding(&state, view.tab_id, 0);
                 focus_request().set(Some(match (view.stale, current) {
                     (true, _) => Focus::ReviewAgain,
@@ -343,7 +340,7 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
         heat.cool();
     }
     if let Some(heat) = heats.get(to).copied() {
-        ignite_hold(heat, 0.0);
+        ignite_hold(heat);
     }
 }
 
@@ -361,21 +358,14 @@ fn level_finding(state: &AppState, tab_id: Option<u64>, finding: usize) {
 
 /// Ignites `heat` and holds it HOT: a plain [`Heat::ignite`] would cool to
 /// ember, and the one current item must stay hot.
-fn ignite_hold(heat: Heat, delay_ms: f32) {
+fn ignite_hold(heat: Heat) {
     let value = heat.value();
     value.stop();
     if reduced_motion() {
-        let timing = Timing::new(REDUCED_CROSSFADE_MS, Easing::EaseInOut);
-        if delay_ms > 0.0 {
-            value.timing_with(1.0, Timing { delay_ms, ..timing });
-        } else {
-            value.timing_with(1.0, timing);
-        }
+        value.timing_with(1.0, Timing::new(REDUCED_CROSSFADE_MS, EASE_IN_OUT));
         return;
     }
-    let mut timing = Timing::new(IGNITE_MS, Easing::Linear);
-    timing.delay_ms = delay_ms;
-    value.timing_with(1.0, timing);
+    value.timing_with(1.0, Timing::new(IGNITE_MS, LINEAR));
 }
 
 // ─── the body, by state ──────────────────────────────────────────────────
@@ -792,16 +782,18 @@ fn questions(
                 // The line is the button itself, as `prims::press_target` is: a
                 // pressable view around a named button reads as a second,
                 // unnamed button to UIA.
-                view()
-                    .test_id("review-question-line")
-                    .role(AccessibilityRole::Button)
-                    .optional_label(Some(SharedString::from(text.clone())))
-                    .w_full()
-                    .cursor_pointer()
-                    .focus_visible(|style| style.text_color(tokens::palette().ink))
-                    .on_press(reopen)
-                    .child(row)
-                    .into_element()
+                prims::press_feedback(
+                    view()
+                        .test_id("review-question-line")
+                        .role(AccessibilityRole::Button)
+                        .optional_label(Some(SharedString::from(text.clone())))
+                        .w_full()
+                        .cursor_pointer()
+                        .focus_visible(|style| style.text_color(tokens::palette().ink))
+                        .on_press(reopen),
+                )
+                .child(row)
+                .into_element()
             })),
     );
     block
@@ -939,7 +931,7 @@ fn reopen_question(session: Signal<Session>, order: &[usize], index: usize) {
     {
         question_heat(&emitters, order, previous).cool();
     }
-    ignite_hold(question_heat(&emitters, order, index), 0.0);
+    ignite_hold(question_heat(&emitters, order, index));
     // The question is the HOT item again, and the column's light goes back to
     // the question's own finding.
     glow::focus_finding(None);
@@ -995,7 +987,7 @@ fn advance_question(session: Signal<Session>, order: &[usize], index: usize) {
     question_heat(&emitters, order, index).cool();
     let next = current_question(&session.get_untracked(), order);
     if let Some(next) = next {
-        ignite_hold(question_heat(&emitters, order, next), 0.0);
+        ignite_hold(question_heat(&emitters, order, next));
     }
     // The next thing to do takes the focus: the next answer field, or
     // `Prepare revision` once every question is done.
@@ -1061,15 +1053,17 @@ fn step_control(
     // The control is the button itself, as `prims::press_target` is: a
     // pressable view around a named button reads as a second, unnamed button
     // to UIA.
-    view()
-        .test_id(id)
-        .role(AccessibilityRole::Button)
-        .optional_label(Some(SharedString::from(s(label, language))))
-        .cursor_pointer()
-        .focus_visible(|style| style.text_color(tokens::palette().ink))
-        .on_press(step)
-        .child(prims::kbd(key))
-        .into_element()
+    prims::press_feedback(
+        view()
+            .test_id(id)
+            .role(AccessibilityRole::Button)
+            .optional_label(Some(SharedString::from(s(label, language))))
+            .cursor_pointer()
+            .focus_visible(|style| style.text_color(tokens::palette().ink))
+            .on_press(step),
+    )
+    .child(prims::kbd(key))
+    .into_element()
 }
 
 /// The legend, and the state's one next action once every question is
@@ -1177,7 +1171,10 @@ fn footer(
                 .child(prims::quiet_action(
                     "review-close",
                     s(S::Close, language),
-                    move || close_state.close_review(),
+                    move || {
+                        close_state.close_review();
+                        close_state.focus_editor();
+                    },
                 )),
         )
 }
@@ -1289,7 +1286,10 @@ fn unavailable(state: AppState, language: Language, reason: ReviewUnavailable) -
                 .child(prims::quiet_action(
                     "review-close",
                     s(S::Close, language),
-                    move || close.close_review(),
+                    move || {
+                        close.close_review();
+                        close.focus_editor();
+                    },
                 )),
         )
 }

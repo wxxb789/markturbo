@@ -16,16 +16,16 @@
 
 use nsh_base::input;
 use nsh_core::{
-    Color,
+    Color, EventKind, EventPayload,
     element::{
-        Accessible, AdaptiveColor, AnimatedNode, Easing, Element, Interactive, IntoReactive,
-        ParentElement, SharedString, Styled,
+        Accessible, AdaptiveColor, AnimatedNode, ComponentBuilder, Element, Interactive,
+        IntoListener, IntoReactive, ParentElement, SharedString, StyleRefinement, Styled,
     },
     prelude::*,
 };
 
 use crate::ui::{
-    motion::{HOVER_MS, Heat},
+    motion::{self, HOVER_MS, Heat, PRESS_RELEASE_MS},
     tokens::{
         self, FONT_INPUT, FONT_MODEL, FONT_SOURCE, FONT_UI, HAIRLINE, TYPE_MODEL, TYPE_MODEL_LINE,
         TYPE_UI, TYPE_UI_LINE,
@@ -54,7 +54,7 @@ pub fn opaque(color: Color) -> Color {
 /// Body ink at the UI size and line height: your own text and the labels that
 /// are not quiet.
 pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
-    text(content)
+    motion::theme_colors(text(content))
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
@@ -63,7 +63,7 @@ pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 
 /// Resting ink: quiet local actions and captions.
 pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
-    text(content)
+    motion::theme_colors(text(content))
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
@@ -73,7 +73,7 @@ pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 /// Caption ink: the quietest text that must still be read (hints,
 /// disclosures, secondary lines), at 4.5:1 or better on every ground.
 pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement {
-    text(content)
+    motion::theme_colors(text(content))
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
@@ -85,7 +85,7 @@ pub fn source_ink(
     content: impl IntoReactive<SharedString>,
     color: impl IntoReactive<AdaptiveColor>,
 ) -> impl IntoElement {
-    text(content)
+    motion::theme_colors(text(content))
         .font_family(FONT_SOURCE)
         .text_size(px(tokens::TYPE_SOURCE))
         .line_height(px(tokens::TYPE_SOURCE_LINE))
@@ -164,7 +164,7 @@ pub fn primary_action(
 /// its test id — UI Automation's AutomationId — names the element a press
 /// reaches and screen readers announce, rather than a view around it.
 fn press_target(test_id: &str, label: SharedString) -> View {
-    view()
+    press_feedback(view())
         .test_id(test_id)
         .role(AccessibilityRole::Button)
         .optional_label(Some(label))
@@ -175,8 +175,71 @@ fn press_target(test_id: &str, label: SharedString) -> View {
         .cursor_pointer()
         .bg(Color::TRANSPARENT)
         .rounded(px(0.0))
-        .transition_colors()
-        .duration(HOVER_MS)
+}
+
+/// Keep press feedback independent of the action it invokes or the label it
+/// contains. The active plate snaps on; the normal colour transition takes
+/// over when the pointer or key is released.
+pub(crate) fn press_feedback<T: PressControl<Kind>, Kind>(control: T) -> T {
+    let duration = signal(HOVER_MS);
+    let pressed = signal(false);
+    motion::ease_out(control.transition_colors().duration(move || duration.get()))
+        .feedback_on(EventKind::MouseEnter, move |_| {
+            if !pressed.get() {
+                duration.set(HOVER_MS);
+            }
+        })
+        .feedback_on(EventKind::MouseLeave, move |_| {
+            if !pressed.get() {
+                duration.set(HOVER_MS);
+            }
+        })
+        .feedback_on(EventKind::PressDown, move |_| {
+            pressed.set(true);
+            duration.set(PRESS_RELEASE_MS);
+        })
+        .feedback_on(EventKind::PressUp, move |_| pressed.set(false))
+        .feedback_styles()
+}
+
+fn hover_plate(style: StyleRefinement) -> StyleRefinement {
+    style.bg(move || tokens::palette().ink_at(0.06))
+}
+
+fn pressed_plate(style: StyleRefinement) -> StyleRefinement {
+    style
+        .transition_none()
+        .bg(move || tokens::palette().ink_at(0.16))
+}
+
+// nsh gives views and component roots separate builder traits. The adapters
+// keep the feedback and its timing identical without replacing native widgets.
+pub(crate) enum DirectControl {}
+pub(crate) enum ComponentControl {}
+
+pub(crate) trait PressControl<Kind>: Styled {
+    fn feedback_styles(self) -> Self;
+    fn feedback_on(self, event: EventKind, listener: impl Fn(&EventPayload) + 'static) -> Self;
+}
+
+impl<T: Interactive + Styled> PressControl<DirectControl> for T {
+    fn feedback_styles(self) -> Self {
+        self.hover(hover_plate).active(pressed_plate)
+    }
+
+    fn feedback_on(self, event: EventKind, listener: impl Fn(&EventPayload) + 'static) -> Self {
+        self.on(event, listener)
+    }
+}
+
+impl<T: ComponentBuilder + Styled> PressControl<ComponentControl> for T {
+    fn feedback_styles(self) -> Self {
+        self.hover(hover_plate).active(pressed_plate)
+    }
+
+    fn feedback_on(self, event: EventKind, listener: impl Fn(&EventPayload) + 'static) -> Self {
+        self.__listen(event, listener.into_listener())
+    }
 }
 
 /// A text field per spec: no plate of its own, a 1px hairline under it, ink
@@ -285,11 +348,6 @@ const BLOOM_EMBER: f32 = 0.18;
 /// The halo's cap.
 const HALO: f32 = 0.06;
 
-/// The ink step a hover makes, for a caller binding its own transition.
-pub fn hover_easing() -> Easing {
-    Easing::EaseOut
-}
-
 /// An animated node interpolating `cold`..`hot` for a caller that mixes its
 /// own scale.
 pub fn heat_levels(heat: Heat, cold: f32, ember: f32, hot: f32) -> AnimatedNode {
@@ -314,6 +372,12 @@ mod tests {
             .child(primary_action("harness-primary", "Primary", move || {
                 presses.update(|n| *n += 1)
             }))
+            .child(
+                press_feedback(view())
+                    .test_id("harness-row")
+                    .on_press(move || presses.update(|n| *n += 1))
+                    .child(rest("A row")),
+            )
             .child(view().test_id("harness-presses").child(ink(move || {
                 SharedString::from(format!("{} presses", presses.get()))
             })))
@@ -383,5 +447,50 @@ mod tests {
         app.press("id:harness-primary")
             .expect("press the primary action");
         app.wait_for("text:2 presses").expect("both presses heard");
+    }
+
+    #[test]
+    fn all_three_controls_show_the_pressed_plate_before_activation() {
+        use nsh_core::geometry::point;
+
+        for id in ["harness-quiet", "harness-primary", "harness-row"] {
+            let mut app = Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start");
+            let selector = format!("id:{id}");
+            app.wait_for(&selector).expect("control");
+            assert_eq!(
+                app.screen()
+                    .view_style(&selector)
+                    .unwrap()
+                    .unwrap()
+                    .background_color,
+                None
+            );
+            app.drag_and_hold(&selector, point(px(0.0), px(0.0)))
+                .expect("pointer down");
+            // Headless sends the gesture, but the platform normally reports
+            // the native active state separately.
+            let node = node_with(&app, id);
+            let engine = app.engine().control();
+            engine.set_states(node, nsh_core::tailwind::state::PRESSED);
+            app.settle();
+            let color = app
+                .screen()
+                .view_style(&selector)
+                .unwrap()
+                .unwrap()
+                .background_color;
+            assert!(
+                [&tokens::DARK, &tokens::LIGHT]
+                    .iter()
+                    .any(|palette| color == Some(palette.ink_at(0.16).0)),
+                "{id} did not show the pressed plate: {color:?}"
+            );
+            app.wait_for("text:0 presses")
+                .expect("press does not fire on down");
+            engine.set_states(node, 0);
+            app.drop_held().expect("pointer up");
+            app.wait_for("text:1 presses")
+                .expect("activated on release");
+        }
     }
 }

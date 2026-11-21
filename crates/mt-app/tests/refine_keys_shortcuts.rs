@@ -265,11 +265,17 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
     // The pane on screen is Source after choosing it.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-edit").expect("Source");
+    assert_eq!(
+        app.screen()
+            .press_target("id:title-menu-edit")
+            .expect("the Source row selector"),
+        None,
+        "closed menu rows cannot receive presses during the exit"
+    );
     app.wait_for_gone("id:title-menu", Duration::from_secs(5))
-        .expect("the row closes the menu");
+        .expect("the panel dismounts after the exit");
 
     app.press("id:title-settings").expect("open the menu");
-    app.wait_for("id:title-menu").expect("the menu");
     assert_eq!(
         app.screen()
             .accessibility_state("id:title-settings")
@@ -331,6 +337,18 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
             "`{row}` is one line high"
         );
     }
+
+    app.press("id:title-settings").expect("close the menu");
+    app.press("id:title-file")
+        .expect("open Context and return focus to the editor");
+    app.press_key("z").expect("type into the editor");
+    assert!(
+        app.screen().texts().iter().any(|text| {
+            text.contains("Original") && (text.contains("zOriginal") || text.contains("Originalz"))
+        }),
+        "the editor received the character after the title-file press: {:?}",
+        app.screen().texts()
+    );
 }
 
 // ─── the loopback provider ────────────────────────────────────────────────

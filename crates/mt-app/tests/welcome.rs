@@ -37,13 +37,12 @@ fn clean_launch_shows_welcome() {
         "a second status line under the welcome: {texts:?}"
     );
 
-    // With no document there is no name and nothing to review: the title row
-    // holds the settings glyph alone.
+    // With no document there is no name and Review is visible but disabled.
     assert_eq!(
         app.screen()
             .count("id:title-row >> role:button")
             .expect("selector"),
-        1,
+        2,
         "the welcome's title row: {texts:?}"
     );
     assert_eq!(
@@ -51,6 +50,17 @@ fn clean_launch_shows_welcome() {
             .count("id:title-row >> role:button[Settings]")
             .expect("selector"),
         1,
-        "the settings glyph"
+        "the Settings action"
+    );
+    assert!(
+        app.screen()
+            .accessibility_state("id:title-review")
+            .expect("Review stays in the row")
+            .disabled
+    );
+    assert_eq!(
+        app.screen().press_target("id:title-review").unwrap(),
+        None,
+        "Review cannot be pressed without a document"
     );
 }

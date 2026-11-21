@@ -685,11 +685,11 @@ fn copy_exports_only_the_approved_result_and_saves_nothing() {
 const REPLACEMENT: &str = "Typed over everything\n";
 
 /// The user types over the whole document after the hunks arrive: every
-/// hunk says it can't apply and offers no `Accept`, `Done` approves
+/// hunk says it can't apply and keeps `Accept` disabled, `Done` approves
 /// nothing, the buffer keeps the user's text and the disk keeps the
 /// reviewed bytes.
 #[test]
-fn an_edit_over_every_hunk_offers_no_accept_and_done_writes_nothing() {
+fn an_edit_over_every_hunk_keeps_accept_disabled_and_done_writes_nothing() {
     let _guard = TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -703,11 +703,15 @@ fn an_edit_over_every_hunk_offers_no_accept_and_done_writes_nothing() {
     app.wait_for("text:Can't apply — this part changed")
         .expect("the docked hunk says it can't apply");
     assert!(
-        !app.screen()
+        app.screen()
             .matches("id:revision-accept")
             .expect("the selector"),
-        "no Accept on a hunk whose part changed: {:?}",
+        "Accept stays in the row: {:?}",
         app.screen().texts()
+    );
+    assert!(
+        app.press("id:revision-accept").is_err(),
+        "the unavailable Accept cannot be pressed"
     );
     // `A` decides nothing, and the next hunk refuses too.
     app.press_key("a").expect("press A");
@@ -716,12 +720,16 @@ fn an_edit_over_every_hunk_offers_no_accept_and_done_writes_nothing() {
     assert!(
         app.shows("0 of 2 decided")
             && app.shows("Can't apply — this part changed")
-            && !app
+            && app
                 .screen()
                 .matches("id:revision-accept")
                 .expect("the selector"),
-        "neither hunk accepts: {:?}",
+        "the unavailable Accept remains visible: {:?}",
         app.screen().texts()
+    );
+    assert!(
+        app.press("id:revision-accept").is_err(),
+        "the second unavailable Accept cannot be pressed"
     );
 
     app.press_key("ctrl+enter").expect("Done");

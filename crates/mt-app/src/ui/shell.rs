@@ -26,17 +26,21 @@
 //! Every surface is reached through its module's `is_open` / drawing function;
 //! the shell never draws a surface's insides.
 
+use std::cell::Cell;
+
 use mt_core::settings::Language;
 use nsh_core::{
-    Points,
+    LayoutAnimation, Points,
     desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes},
+    element::animate_layout,
     prelude::*,
 };
 
 use crate::{
     state::AppState,
     ui::{
-        consent, context, document, notices, preview, rail, review, revision, settings, titlebar,
+        consent, context, document, motion, notices, preview, rail, review, revision, settings,
+        titlebar,
         tokens::{self, Layout},
         welcome,
     },
@@ -81,7 +85,7 @@ pub fn surface(state: &AppState) -> FieldSurface {
 pub fn shell(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
     hide_system_title_bar();
     let body_state = state.clone();
-    view()
+    motion::theme_colors(view())
         .test_id("shell")
         .flex_1()
         .h(relative(1.0))
@@ -161,8 +165,10 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
     let status_state = state.clone();
     let recovery_banner_state = state.clone();
     let conflict_banner_state = state.clone();
-    view()
+    let frame = element_ref();
+    motion::theme_colors(view())
         .test_id("column")
+        .element_ref(&frame)
         .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
         .h(relative(1.0))
         .flex_col()
@@ -171,14 +177,16 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
         .when(layout.field_overlays(), |column| {
             column.opacity(Layout::DIMMED)
         })
-        .child(when(
+        .child(occasional(
             move || notices::has_recovery(&recovery_state),
+            Some(frame),
             move || {
                 notices::recovery_banner(recovery_banner_state.clone(), language).into_element()
             },
         ))
-        .child(when(
+        .child(occasional(
             move || notices::has_conflict(&conflict_state),
+            Some(frame),
             move || {
                 notices::conflict_banner(conflict_banner_state.clone(), language).into_element()
             },
@@ -214,7 +222,8 @@ fn field(state: AppState, language: Language, layout: Layout) -> impl IntoElemen
         .pl(px(tokens::FIELD_GAP))
         .pr(px(tokens::FIELD_RIGHT_INSET));
     let area = if layout.field_overlays() {
-        area.absolute()
+        motion::theme_colors(area)
+            .absolute()
             .top(px(0.0))
             .bottom(px(0.0))
             .right(px(0.0))
@@ -278,21 +287,23 @@ fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
         // The layer itself never takes a press: empty, it would cover every
         // control in the window. Its scrims and cards still do.
         .pointer_events(PointerEvents::BoxNone)
-        .child(when(
+        .child(occasional(
             {
                 let condition_state = consent_state.clone();
                 move || consent::is_open(&condition_state)
             },
+            None,
             {
                 let state = consent_state.clone();
                 move || consent_scrim(state.clone(), language).into_element()
             },
         ))
-        .child(when(
+        .child(occasional(
             {
                 let condition_state = guard_state.clone();
                 move || notices::guard_is_open(&condition_state)
             },
+            None,
             {
                 let state = guard_state;
                 move || guard_scrim(state.clone(), language).into_element()
@@ -300,29 +311,76 @@ fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
         ))
 }
 
+/// Let nsh retain the removed drawing, not the live handlers. Banner layout
+/// changes are scoped to the column by its own frame animation.
+fn occasional(
+    present: impl Fn() -> bool + Clone + 'static,
+    reflow: Option<ElementRef>,
+    content: impl Fn() -> AnyElement + 'static,
+) -> impl IntoElement {
+    let before = Cell::new(false);
+    effect({
+        let present = present.clone();
+        move || {
+            let open = present();
+            if before.replace(open) == open {
+                return;
+            }
+            if motion::reduced_motion() {
+                return;
+            }
+            let ms = if open {
+                motion::ENTER_MS
+            } else {
+                motion::EXIT_MS
+            };
+            let fade = motion::layout_fade(ms);
+            if let Some(frame) = reflow {
+                frame.animate_layout(fade);
+            }
+            if !open {
+                animate_layout(LayoutAnimation {
+                    delete: Some(fade),
+                    ..LayoutAnimation::default()
+                });
+            }
+        }
+    });
+    when(present, move || {
+        if reflow.is_some() {
+            motion::fade_in(view().w_full().flex_col().child(content())).into_element()
+        } else {
+            content()
+        }
+    })
+}
+
 /// The dimmed room and the consent card, centred over everything.
 fn consent_scrim(state: AppState, language: Language) -> impl IntoElement {
-    view()
+    modal_layer()
         .test_id("consent-layer")
-        .absolute()
-        .inset_0()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .bg(move || tokens::palette().scrim())
         .child(consent::card(state, language))
 }
 
 /// The dimmed room and the notices guard, centred over everything.
 fn guard_scrim(state: AppState, language: Language) -> impl IntoElement {
+    modal_layer().child(notices::guard(state, language))
+}
+
+fn modal_layer() -> View {
     view()
         .absolute()
         .inset_0()
         .flex_col()
         .items_center()
         .justify_center()
-        .bg(move || tokens::palette().scrim())
-        .child(notices::guard(state, language))
+        .child(motion::fade_in(
+            view()
+                .absolute()
+                .inset_0()
+                .pointer_events(PointerEvents::None)
+                .bg(move || tokens::palette().scrim()),
+        ))
 }
 
 /// Hides the system title bar: the room runs to the window's top edge, and the

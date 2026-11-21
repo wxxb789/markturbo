@@ -3,22 +3,19 @@
 //! The Afterglow motion tokens, and [`Heat`]: one emitter's temperature,
 //! rising to HOT and cooling to ember on the spec's curve.
 //!
-//! Thermal and almost motionless: nothing travels more than 4px, and the only
-//! thing that moves is outbound light leaving the frame. Everything here is
-//! about a value going up quickly and coming down slowly, never about a
-//! distance.
+//! Frequent changes are instant. Occasional surfaces use short ease-out
+//! transitions; the model's light uses a separate thermal curve.
 //!
 //! Under reduced motion (`reduce_motion()`, the system setting) an ignition is
-//! one 100ms crossfade instead of a 90ms flash plus a 1260ms decay, and
-//! [`stagger`] returns no delay.
+//! one 100ms crossfade instead of a 90ms flash plus a 1260ms decay.
 
 use std::sync::OnceLock;
 
 use nsh_core::{
-    Color,
+    Color, LayoutCurve, LayoutTransition,
     element::{
-        AnimatedNode, AnimatedValue, Easing, Keyframe, KeyframeTiming, Timing, animated_value,
-        reduce_motion, sample_easing,
+        AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming, Styled, Timing,
+        animated_value, effect, reduce_motion, sample_easing,
     },
 };
 
@@ -33,23 +30,75 @@ pub const COOL_MS: f32 = 3.0 * COOL_TAU_MS;
 pub const AFTERIMAGE_MS: f32 = 1200.0;
 /// Model output that has cooled sits at this level of the heat scale.
 pub const EMBER: f32 = 0.18;
-/// One step of a reading-order arrival.
-pub const STAGGER_MS: f32 = 70.0;
 /// The filament's charge (hold to send), linear from dull red to white.
 pub const FILAMENT_CHARGE_MS: f32 = 900.0;
+/// Platform hold delay, longer than the charge so a full hold completes it.
+pub const FILAMENT_HOLD_MS: f32 = 1_200.0;
 /// Its release: decay toward dull, tau 250ms.
 pub const FILAMENT_RELEASE_TAU_MS: f32 = 250.0;
+pub const FILAMENT_COOL_MS: f32 = 3.0 * FILAMENT_RELEASE_TAU_MS;
 /// A pip lighting, a leaving row's flash.
 pub const FLASH_MS: f32 = 120.0;
-/// Extinguish, and a card's exit, ease-in.
+/// The emitter extinguishes with an ease-in.
 pub const EXTINGUISH_MS: f32 = 120.0;
+/// Follow moving editor decorations, then only poll for appearance changes.
+pub const HEAT_TICK_MS: u64 = 33;
+pub const HEAT_WATCH_MS: u64 = 250;
+pub const OUTBOUND_DECAY_MS: f32 = 250.0;
 /// A local action's hover ink step (never warmth).
 pub const HOVER_MS: f32 = 100.0;
-/// The rail widening, and the camera when the column re-centres.
+const EASE_OUT_POINTS: (f32, f32, f32, f32) = (0.23, 1.0, 0.32, 1.0);
+pub const EASE_OUT: Easing = {
+    let (x1, y1, x2, y2) = EASE_OUT_POINTS;
+    Easing::Bezier(x1, y1, x2, y2)
+};
+pub const EASE_IN_OUT: Easing = Easing::EaseInOut;
+pub const LINEAR: Easing = Easing::Linear;
+pub const ENTER_MS: f32 = 200.0;
+pub const EXIT_MS: f32 = 150.0;
+pub const MENU_ENTER_MS: f32 = 125.0;
+pub const MENU_EXIT_MS: f32 = 90.0;
+pub const PRESS_RELEASE_MS: f32 = 120.0;
+pub const SCALE_FLOOR: f32 = 0.96;
+pub const MENU_SCALE: f32 = 0.97;
+pub const CARD_RISE_PX: f32 = 4.0;
+pub const CARD_RISE_MS: f32 = ENTER_MS;
+pub const THEME_MS: f32 = ENTER_MS;
+pub const STATUS_HOLD_MS: u64 = 3000;
+pub const CONSENT_NOTICE_MS: u64 = 1500;
+/// The rail's names fade as the hover strip widens.
 pub const RAIL_WIDEN_MS: f32 = 160.0;
 pub const CAMERA_MS: f32 = 360.0;
-/// A heat change under reduced motion: one crossfade, no curve.
+pub const CAMERA_TICK: std::time::Duration = std::time::Duration::from_micros(16_667);
+/// Maximum opacity or heat fade under reduced motion.
 pub const REDUCED_CROSSFADE_MS: f32 = 100.0;
+
+pub fn layout_fade(ms: f32) -> LayoutTransition {
+    let (x1, y1, x2, y2) = EASE_OUT_POINTS;
+    LayoutTransition::new(LayoutCurve::bezier(x1, y1, x2, y2), ms)
+}
+
+pub fn theme_colors<T: Styled>(control: T) -> T {
+    ease_out(control.transition_colors().duration(THEME_MS))
+}
+
+pub fn ease_out<T: Styled>(control: T) -> T {
+    let (x1, y1, x2, y2) = EASE_OUT_POINTS;
+    control.ease_bezier(x1, y1, x2, y2)
+}
+
+pub fn fade_in<T: Element>(element: T) -> T {
+    let opacity = animated_value(0.0);
+    let ms = if reduced_motion() {
+        REDUCED_CROSSFADE_MS
+    } else {
+        ENTER_MS
+    };
+    effect(move || {
+        opacity.timing(1.0, ms, EASE_OUT);
+    });
+    element.bind_opacity(&opacity)
+}
 
 /// The cooling curve `1 - e^(-t/420ms)`, normalised to reach exactly 1 at the
 /// last of 16 evenly spaced stops, so it can be played as keyframes: index `i`
@@ -80,30 +129,9 @@ pub fn camera_progress(elapsed_ms: f32) -> f32 {
     curve[index] + (curve[next] - curve[index]) * fraction
 }
 
-/// The rail's widening: 160ms of `cubic-bezier(0.2, 0, 0, 1)`.
-pub fn rail_easing() -> Easing {
-    Easing::Bezier(0.2, 0.0, 0.0, 1.0)
-}
-
 /// Whether the system asks for reduced motion. Reading it subscribes.
 pub fn reduced_motion() -> bool {
     reduce_motion()
-}
-
-/// The delay of the `index`-th item of a reading-order arrival: 70ms apart,
-/// nothing under reduced motion.
-pub fn stagger(index: usize) -> f32 {
-    stagger_with(index, reduced_motion())
-}
-
-/// [`stagger`] with the system's preference given: nothing under reduced
-/// motion, [`STAGGER_MS`] apart otherwise.
-fn stagger_with(index: usize, reduced: bool) -> f32 {
-    if reduced {
-        0.0
-    } else {
-        index as f32 * STAGGER_MS
-    }
 }
 
 /// The heat of an emitter that has just ignited: [`IGNITE_MS`] of rise, then
@@ -169,7 +197,7 @@ impl Heat {
     }
 
     /// Ignite: to HOT in 90ms, then cool to ember on `e^(-t/420ms)`, starting
-    /// `delay_ms` from now (a reading-order arrival uses [`stagger`]).
+    /// `delay_ms` from now.
     ///
     /// Under reduced motion this is one 100ms crossfade to ember: no flash.
     pub fn ignite(&self, delay_ms: f32) {
@@ -262,6 +290,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ui_durations_and_beziers_are_tokenized() {
+        fn scan(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path);
+                } else if path.file_name().unwrap() != "motion.rs"
+                    && path.extension().is_some_and(|ext| ext == "rs")
+                {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+                    let numeric_duration = compact.split(".duration(").skip(1).any(|arg| {
+                        arg.trim_start_matches(['-', '+', '('])
+                            .starts_with(|c: char| c.is_ascii_digit())
+                    });
+                    assert!(
+                        !numeric_duration && !compact.contains("Easing::Bezier("),
+                        "move the duration or curve in {} to motion.rs",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        scan(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui"));
+    }
+
+    #[test]
     fn the_cooling_curve_only_cools() {
         assert_eq!(COOL_STOPS[0], 0.0);
         assert_eq!(COOL_STOPS[15], 1.0);
@@ -325,14 +381,5 @@ mod tests {
             assert!(progress >= last, "the camera never backs up at {ms}ms");
             last = progress;
         }
-    }
-
-    #[test]
-    fn stagger_is_seventy_ms_apart() {
-        assert_eq!(STAGGER_MS, 70.0);
-        assert_eq!(stagger_with(0, false), 0.0);
-        assert_eq!(stagger_with(3, false), 210.0);
-        // Reduced motion: everything arrives together.
-        assert_eq!(stagger_with(3, true), 0.0);
     }
 }

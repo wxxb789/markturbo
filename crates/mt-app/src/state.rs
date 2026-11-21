@@ -2241,6 +2241,43 @@ impl AppState {
         self.source_editor.set(Some((tab, editor)));
     }
 
+    /// Return a local action's keyboard focus without moving the caret.
+    pub fn focus_editor(&self) {
+        let Some(active) = self.active.get() else {
+            return;
+        };
+        if self.focus_mounted_editor(active) {
+            return;
+        }
+        // A tab switch can replace the editor in the next commit.
+        let state = self.clone();
+        request_animation_frame(move |_| {
+            if state.active.get() == Some(active) {
+                state.focus_mounted_editor(active);
+            }
+        });
+    }
+
+    fn focus_mounted_editor(&self, active: u64) -> bool {
+        if self.settings_open.get()
+            || self.guard.get().is_some()
+            || self.review_consent.get().is_some()
+            || self.revision_consent.get().is_some()
+        {
+            return false;
+        }
+        let Some(api) = self
+            .source_editor
+            .get()
+            .filter(|(tab, _)| *tab == active)
+            .and_then(|(_, editor)| editor.api::<EditorApi>())
+        else {
+            return false;
+        };
+        api.focus();
+        true
+    }
+
     /// Take the keyboard focus from the mounted source editor, if it has it:
     /// a card that floats over the room (consent, the close guard) owns
     /// Enter, Escape and Tab, which the focused editor would otherwise take
