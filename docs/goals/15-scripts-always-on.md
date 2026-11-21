@@ -25,15 +25,36 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
    - Unit tests cover all three types, plus HTML sources with no head, with an uppercase head,
      with a `<head>` inside a comment, and with a leading `<script>`. Each test asserts that the
      CSP precedes the first author byte that could execute or load anything.
-3. **No top-level escape.**
-   - The WebView's nsh 0.6.1 capability grants no external hosts (`webview.hosts: []` or the
-     current equivalent; verify it in the locked nsh source).
-   - A page script or link that sets `location`, submits a form, follows a link or calls
-     `window.open` to any `http(s):`, `file:` or other URL leaves the page where it is.
-   - Nothing is opened in another app automatically. A page script can forge any bridge message,
-     so the app does not trust a page's request to open a URL.
-   - Tests prove the configured capability denies `https://example.com/` and `file:///C:/`.
-   - The native check (clause 6) proves that a real page cannot navigate away.
+3. **No escape: sandboxed document frame.**
+   - Amended 2026-11-21 after implement run 1 found that nsh 0.6.1 lets a live page's
+     `window.open` through to WebView2's default popup (`nsh-platform-windows`
+     `web.rs:991` handles `NewWindowRequested` only after the page closes), and that CSP does not
+     govern navigation.
+   - The document is never the top-level page. `web::build_html` returns a fixed **host page**
+     that carries the clause-2 CSP plus `frame-src 'self'` or the narrowest value that still
+     admits `srcdoc`. The host page holds exactly one `<iframe sandbox="allow-scripts">`, whose
+     `srcdoc` is the document page from clause 2 and which fills the viewport.
+   - The sandbox has no `allow-popups`, no `allow-top-navigation*`, no `allow-forms`, no
+     `allow-same-origin` and no `allow-modals`. So `window.open`, a form submit, `top.location`
+     and a `target=_top` or `_blank` link do nothing. The frame's own navigation to `http(s):` or
+     `file:` is refused by the inherited CSP (`frame-src`/`default-src`).
+   - The host page runs no script of its own.
+   - Also configure the nsh 0.6.1 WebView capability to grant no external hosts, as defence in
+     depth. Verify the API in the locked nsh source; if no such API is reachable from the app, say
+     so and skip it.
+   - Nothing is opened in another app. A page cannot forge a request the app would act on: the
+     app reads no bridge messages.
+   - Unit tests on the built host page assert: the exact sandbox token set (and that none of the
+     forbidden tokens appear); that the CSP comes first; that `srcdoc` is attribute-escaped, so a
+     document containing `"` and `</iframe>` cannot break out; and that the document's own CSP
+     comes first inside `srcdoc`.
+   - Native proof (clause 6): a fixture whose script calls `window.open`, sets `top.location`, sets
+     `location` to an `https:` URL, and submits a form leaves exactly one app window, with the
+     preview still showing the fixture.
+   - If WebView2 rejects any part of this design in the native check, stop and report it. Do not
+     loosen the sandbox.
+   - Existing preview behaviour must survive inside the frame: scrolling, theme colours, math and
+     diagram rendering, and text selection.
 4. **Scripts run without a click.** A headless or unit test shows that an MDX component, or a
    browser-side diagram that needs scripts, is in the built page for a freshly opened tab, with no
    preceding action.
