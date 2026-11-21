@@ -92,10 +92,11 @@ no release-bound native isolation evidence.
 - On the owner's active, unlocked Windows 11 x64 desktop, run
   `mt.py accept all --exe <release exe> --expect-exe-sha256 <release sha256>`.
   The Goal 07 phase must observe the script-start, attempt and completion
-  cells in captured WebView pixels. The automatic probes must produce zero
-  loopback contacts and leave exactly one app window. The nested-frame HTTPS
-  probe does not establish that the preview frame's own HTTPS navigation is
-  blocked. The acceptance harness unit tests do not run the desktop phase.
+  cells in captured WebView pixels. The fixture marks its final attempt
+  immediately before the preview frame sets its own location to
+  `https://blocked-preview-navigation.invalid/`. The automatic probes
+  must leave the fixture visible, produce zero loopback contacts and leave
+  exactly one app window. The harness unit tests do not run the desktop phase.
 - Clause 3b native proof is pending: the fixture must visibly report its
   network attempts and the loopback TCP and UDP listeners must record zero
   contacts on the release build. Unit tests do not verify WebView2 egress,

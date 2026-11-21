@@ -190,6 +190,7 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} } },",
     "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
     "  { run: () => { try { location = `${tcpLoopback}/frame`; } catch (_) {} } },",
+    '  { run: () => { try { location = "https://blocked-preview-navigation.invalid/"; } catch (_) {} } },',
 )
 
 
@@ -256,7 +257,8 @@ SOURCE_TEXT = (
     "const completeCell = createCell();\r\n"
     "scriptCell.style.backgroundColor = scriptCellColor;\r\n"
     "async function runAttempts() {\r\n"
-    "  for (let index = 0; index < networkAttempts.length; index += 1) {\r\n"
+    "  const finalIndex = networkAttempts.length - 1;\r\n"
+    "  for (let index = 0; index < finalIndex; index += 1) {\r\n"
     "    await delay(50);\r\n"
     "    try {\r\n"
     "      const result = networkAttempts[index].run();\r\n"
@@ -268,7 +270,11 @@ SOURCE_TEXT = (
     "    }\r\n"
     "    attemptCells[index].style.backgroundColor = attemptCellColor;\r\n"
     "  }\r\n"
+    "  await delay(50);\r\n"
+    "  // A navigation can replace this document, so mark the final attempt before it runs.\r\n"
     "  completeCell.style.backgroundColor = completeCellColor;\r\n"
+    "  attemptCells[finalIndex].style.backgroundColor = attemptCellColor;\r\n"
+    "  networkAttempts[finalIndex].run();\r\n"
     "}\r\n"
     "runAttempts();\r\n"
     "</script>\r\n"

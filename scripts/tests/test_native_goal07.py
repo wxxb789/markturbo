@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import socket
 import subprocess
@@ -957,7 +958,10 @@ const context = {
     this.createOffer = () => Promise.resolve({ type: "offer" });
     this.setLocalDescription = () => Promise.resolve();
   },
-  setTimeout(callback) { if (mode !== "never-run") callback(); return 0; },
+  setTimeout(callback) {
+    if (mode !== "never-run" && !(mode === "missing-navigation" && calls.length === expectedAttempts - 1)) callback();
+    return 0;
+  },
 };
 context.top = {};
 Object.defineProperty(context.top, "location", {
@@ -973,7 +977,8 @@ async function main() {
   if (callIndex < 0 || source.slice(callIndex + runCall.length).trim()) throw new Error("fixture runner call was not found");
   const code = source.slice(0, callIndex) + "globalThis.__run = runAttempts();" + source.slice(callIndex + runCall.length);
   const runner = vm.runInNewContext(code, context);
-  if (mode !== "never-run") await runner;
+  if (mode === "success") await runner;
+  if (mode === "missing-navigation") await new Promise(setImmediate);
   const attemptCells = cellGrid.children.slice(1, -1);
   const completeCell = cellGrid.children[cellGrid.children.length - 1];
   const results = cellGrid.children.map((cell, index) => {
@@ -988,18 +993,26 @@ async function main() {
     console.log("pixel-cell verdict rejected unstarted attempts");
     return;
   }
+  if (mode === "missing-navigation") {
+    if (calls.length !== expectedAttempts - 1 || !results.slice(0, -2).every(Boolean)) throw new Error("earlier attempts are incomplete");
+    console.log(JSON.stringify(results));
+    return;
+  }
+  const [lastKind, lastUrl] = calls.at(-1);
+  if (lastKind !== "location" || lastUrl !== "https://blocked-preview-navigation.invalid/") throw new Error("HTTPS self-navigation was not the last attempt");
   if (!results.every(Boolean)) throw new Error("automatic attempt cells are incomplete");
   if (calls.length !== expectedAttempts) throw new Error("not every automatic attempt ran");
   const attemptWrites = cellWrites.filter(([color]) => color === attemptColor);
   if (attemptWrites.length !== expectedAttempts) throw new Error("attempt cells were not painted individually");
-  if (attemptWrites.some(([, callCount], index) => callCount !== index + 1)) throw new Error("attempt cell was not painted after its call returned");
+  if (attemptWrites.slice(0, -1).some(([, callCount], index) => callCount !== index + 1)) throw new Error("earlier attempt cell was not painted after its call returned");
+  if (attemptWrites.at(-1)[1] !== expectedAttempts - 1) throw new Error("HTTPS navigation cell was not painted before its call");
   const completeWrites = cellWrites.filter(([color]) => color === completeColor);
-  if (completeWrites.length !== 1 || completeWrites[0][1] !== expectedAttempts) throw new Error("completion cell was not painted after all calls");
+  if (completeWrites.length !== 1 || completeWrites[0][1] !== expectedAttempts - 1) throw new Error("completion cell was not painted before HTTPS self-navigation");
   if (context.__iceServers.length !== 2 || !context.__dataChannel) throw new Error("WebRTC setup incomplete");
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
 """
-        for mode in ("success", "never-run"):
+        for mode in ("success", "never-run", "missing-navigation"):
             with self.subTest(mode=mode):
                 result = subprocess.run(
                     [
@@ -1022,6 +1035,10 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
                 self.assertEqual(result.returncode, 0, result.stderr.strip())
                 if mode == "never-run":
                     self.assertIn("pixel-cell verdict rejected unstarted attempts", result.stdout)
+                elif mode == "missing-navigation":
+                    results = json.loads(result.stdout)
+                    self.assertFalse(results[-2], "unattempted HTTPS navigation painted its cell")
+                    self.assertFalse(HARNESS.fixture_cells_complete(results))
 
     def test_probe_listeners_bind_ephemeral_loopback_ports_and_count_only_contacts(self) -> None:
         with HARNESS.NetworkProbeListeners() as probes:
