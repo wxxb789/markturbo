@@ -425,10 +425,15 @@ fn menu_anchor(state: AppState, language: Language, menu: MenuMotion) -> impl In
 /// shortcuts, the panes with the one on screen marked, Context, the settings
 /// page, and Quit.
 fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl IntoElement {
-    let document = {
-        let state = state.clone();
-        move || state.active.get().is_some()
-    };
+    let document_rows = signal(state.active.get_untracked().is_some());
+    let document_state = state.clone();
+    effect(move || {
+        // Freeze the rows at the last open state while the panel exits.
+        if menu.is_open() {
+            document_rows.set(document_state.active.get().is_some());
+        }
+    });
+    let document = move || document_rows.get();
     let panel = menu_panel_frame(menu, "title-menu");
     panel
         // A press anywhere opens the workspace it names, with or without a
@@ -889,6 +894,11 @@ mod tests {
         title_row(AppState::new(), Language::English)
     }
 
+    #[component]
+    fn WelcomeMenuProbe() -> impl IntoElement {
+        shell::shell(AppState::new(), Language::English, tokens::Layout::Wide)
+    }
+
     #[derive(Clone, PartialEq, Props)]
     struct MenuMotionProbeProps {
         content: Option<Renderer<bool>>,
@@ -964,6 +974,29 @@ mod tests {
         }
     }
 
+    fn menu_item_count(app: &Headless) -> usize {
+        [
+            "title-menu-open-folder",
+            "title-menu-new-file",
+            "title-menu-paste",
+            "title-menu-save",
+            "title-menu-save-as",
+            "title-menu-edit",
+            "title-menu-preview",
+            "title-menu-split",
+            "title-menu-web",
+            "title-menu-split-web",
+            "title-menu-translate",
+            "title-menu-review-selection",
+            "title-menu-context",
+            "title-menu-settings",
+            "title-menu-quit",
+        ]
+        .iter()
+        .filter(|id| app.screen().matches(&format!("id:{id}")).unwrap())
+        .count()
+    }
+
     #[test]
     fn review_stays_visible_and_disabled_without_a_document() {
         let mut app = manual_app(Root::of::<ReviewProbe>());
@@ -983,6 +1016,38 @@ mod tests {
                 .expect("Review press target"),
             None,
             "a disabled Review cannot be pressed"
+        );
+    }
+
+    #[test]
+    fn closing_the_welcome_menu_keeps_its_items_frozen_during_exit() {
+        let mut app = manual_app(Root::of::<WelcomeMenuProbe>());
+        app.wait_for("id:welcome")
+            .expect("the welcome page before opening a document");
+        press_without_settling(&app, "id:title-settings");
+        app.wait_for("id:title-menu-new-file")
+            .expect("the title menu's New file row");
+
+        let item_count = menu_item_count(&app);
+        assert_eq!(item_count, 6, "welcome menu items before New file");
+
+        press_without_settling(&app, "id:title-menu-new-file");
+        for _ in 0..2 {
+            app.next_frame(Duration::from_millis(16)).unwrap();
+        }
+
+        assert!(
+            app.screen().matches("id:title-file-name").unwrap(),
+            "New file activates a document"
+        );
+        assert!(
+            app.screen().matches("id:title-menu").unwrap(),
+            "the menu remains mounted during its exit"
+        );
+        assert_eq!(
+            menu_item_count(&app),
+            item_count,
+            "the fading menu must retain its welcome item set"
         );
     }
 

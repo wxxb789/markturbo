@@ -16,12 +16,12 @@ Contract: [Crisp afterglow](goals/16-crisp-afterglow-motion.md).
 | Close/quit guard | Occasional | Same as consent | Same as consent |
 | Status notice | Occasional | 4px rise and fade, 200ms; transient notices hold 3000ms | Fade, 150ms |
 | Findings arriving | Model | One existing Heat ignition per list, without stagger | None |
-| Theme switch | Occasional | Instant (see deviation below) | None |
+| Theme switch | Occasional | Instant throughout the app | None |
 
-Theme deviation: nsh 0.6.1's editor resolves theme foreground, caret and
-per-range decoration colours without a shared transition. The shell switches
-palette with the editor instead of fading the ground underneath the new ink
-for 200ms. Pointer hover and press feedback retain their own timings.
+The 2026-11-21 contract amendment makes theme changes instant throughout the
+app. nsh 0.6.1 cannot transition the editor's theme colours, so the shell and
+editor switch together. Pointer hover and press feedback retain their own
+timings.
 
 Finding and conflict-difference navigation positions the editor immediately.
 Only a model review result arriving at its first anchored finding keeps the

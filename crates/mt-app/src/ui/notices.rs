@@ -34,7 +34,7 @@ use nsh_base::editor::{EditorDecoration, EditorPosition, EditorRange};
 use nsh_core::{
     Color, DecorationStyle, PropertyValue, StyleKey, TextDecoration,
     element::AnimatedValue,
-    element::{KeyOptions, Style, on_key_with},
+    element::{KeyOptions, Style, on_key_with, untracked},
     keymap::When,
     prelude::*,
 };
@@ -1270,7 +1270,7 @@ fn status_line_with_opacity(
             rise.set(motion::CARD_RISE_PX);
             return;
         }
-        let reduced = reduced_motion();
+        let reduced = untracked(reduced_motion);
         let enter_ms = if reduced {
             motion::REDUCED_CROSSFADE_MS
         } else {
@@ -1601,6 +1601,43 @@ mod tests {
         assert!(
             app.screen().shows("Second status"),
             "the old status timeout must not clear its replacement"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_does_not_restart_a_fading_status() {
+        let (sent, samples) = mpsc::channel();
+        let mut app = status_app(sent);
+        press_without_settling(&mut app, "id:status-start");
+        assert!(app.screen().shows("First status"));
+        app.next_frame(Duration::from_millis(16))
+            .expect("start the status timers");
+
+        let until_mid_exit =
+            motion::STATUS_HOLD_MS + motion::ENTER_MS as u64 + motion::EXIT_MS as u64 / 2 - 16;
+        app.wait(Duration::from_millis(until_mid_exit))
+            .expect("advance halfway through the status exit");
+        let before = status_opacity(&mut app, &samples);
+        assert!(
+            before > 0.0 && before < 1.0,
+            "the status must be partway through its exit, got {before}"
+        );
+
+        app.set_environment("setReducedMotion(true)", |environment| {
+            environment.reduce_motion = true;
+        })
+        .expect("enable reduced motion");
+        app.wait(Duration::from_millis(16))
+            .expect("advance the existing status exit");
+        let after = status_opacity(&mut app, &samples);
+        let opacity_did_not_rise = after <= before;
+
+        app.wait(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("advance past the original status clear deadline");
+        let cleared_on_time = !app.screen().shows("First status");
+        assert!(
+            opacity_did_not_rise && cleared_on_time,
+            "changing motion settings must not restart a fading status: opacity {before} -> {after} (non-rising: {opacity_did_not_rise}); cleared by the original deadline: {cleared_on_time}"
         );
     }
 

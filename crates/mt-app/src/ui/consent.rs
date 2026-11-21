@@ -694,19 +694,6 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
     let tap = hold.clone();
     let label_hold = hold.clone();
     let enabled = hold.state.clone();
-    let filament_fill = view()
-        .absolute()
-        .left(px(0.0))
-        .bottom(px(0.0))
-        .w_full()
-        .h(px(FILAMENT_H))
-        .origin_bottom_left()
-        .bind_background(&heat.filament_glow());
-    let filament_fill = if motion::reduced_motion() {
-        filament_fill.bind_opacity(&heat)
-    } else {
-        filament_fill.bind_transform(TransformKind::ScaleX, &heat)
-    };
     prims::press_feedback(
         view()
             .test_id("consent-send")
@@ -769,7 +756,21 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
             .child(
                 // The charge itself: the ramp from dull to white-hot, as wide as
                 // the hold.
-                filament_fill,
+                dynamic(move || {
+                    let filament_fill = view()
+                        .absolute()
+                        .left(px(0.0))
+                        .bottom(px(0.0))
+                        .w_full()
+                        .h(px(FILAMENT_H))
+                        .origin_bottom_left()
+                        .bind_background(&heat.filament_glow());
+                    if motion::reduced_motion() {
+                        filament_fill.bind_opacity(&heat)
+                    } else {
+                        filament_fill.bind_transform(TransformKind::ScaleX, &heat)
+                    }
+                }),
             ),
     )
 }
@@ -2222,6 +2223,36 @@ mod tests {
         assert!(
             app.wait_for("text:Sending").is_ok(),
             "a full hold authorized one send"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_changes_during_a_hold_keep_progress_and_focus() {
+        let mut app = start_harness();
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduced motion");
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        // Tab's stops, in order: the scope switch, Cancel, then the hold.
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab");
+        }
+        app.press_key("space").expect("start the hold");
+        app.wait(Duration::from_millis(350))
+            .expect("the first third of the hold");
+        assert!(app.shows("1/3"), "the hold reached its first third");
+
+        app.set_environment("motion enabled", |env| env.reduce_motion = false)
+            .expect("enable motion");
+        let progress_kept = app.shows("1/3");
+        app.press_key("space")
+            .expect("the focused hold still owns Space");
+        let focus_kept = app.shows("Send for review?");
+        assert!(
+            progress_kept && focus_kept,
+            "progress kept: {progress_kept}; hold kept focus: {focus_kept}"
         );
     }
 

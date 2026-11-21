@@ -158,12 +158,9 @@ fn workspace(state: AppState, language: Language, layout: Layout) -> impl IntoEl
 ///
 /// Below 1040 client width it dims to 40% under the field.
 fn column(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
-    let document_state = state.clone();
-    let recovery_state = state.clone();
-    let conflict_state = state.clone();
-    let status_state = state.clone();
-    let state_for_recovery = state.clone();
-    let conflict_banner_state = state.clone();
+    let active = state.active;
+    let content_state = state.clone();
+    let first_mount = Cell::new(true);
     view()
         .test_id("column")
         .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
@@ -174,39 +171,53 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
         .when(layout.field_overlays(), |column| {
             column.opacity(Layout::DIMMED)
         })
-        .child(banner_slot(
-            "recovery-banner-slot",
-            move || (None, notices::has_recovery(&recovery_state)),
-            move || notices::recovery_banner(state_for_recovery.clone(), language),
-        ))
-        .child(banner_slot(
-            "conflict-banner-slot",
-            move || {
-                (
-                    conflict_state.active.get(),
-                    notices::has_conflict(&conflict_state),
-                )
+        // nsh keeps a native frame tween if its target is unchanged. Replace
+        // the frames a banner can move when the document changes ownership.
+        .child(each(
+            move || vec![active.get()],
+            |id| *id,
+            move |_, _| {
+                column_content(content_state.clone(), language, !first_mount.replace(false))
             },
-            move || notices::conflict_banner(conflict_banner_state.clone(), language),
         ))
-        .child(
-            view()
-                .test_id("document-slot")
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .child(
-                    when(move || document::has_document(&document_state), {
-                        let state = state.clone();
-                        move || document::column(state.clone(), language).into_element()
-                    })
-                    .otherwise({
-                        let state = state.clone();
-                        move || welcome::welcome(state.clone(), language).into_element()
-                    }),
-                ),
+        .child(notices::status_line(state, language))
+}
+
+fn column_content(state: AppState, language: Language, snap_on_mount: bool) -> [AnyElement; 3] {
+    let document_state = state.clone();
+    let recovery_state = state.clone();
+    let conflict_state = state.clone();
+    let state_for_recovery = state.clone();
+    let conflict_banner_state = state.clone();
+    [
+        banner_slot(
+            "recovery-banner-slot",
+            snap_on_mount,
+            move || notices::has_recovery(&recovery_state),
+            move || notices::recovery_banner(state_for_recovery.clone(), language),
         )
-        .child(notices::status_line(status_state, language))
+        .into_element(),
+        banner_slot(
+            "conflict-banner-slot",
+            snap_on_mount,
+            move || notices::has_conflict(&conflict_state),
+            move || notices::conflict_banner(conflict_banner_state.clone(), language),
+        )
+        .into_element(),
+        view()
+            .test_id("document-slot")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .child(
+                when(move || document::has_document(&document_state), {
+                    let state = state.clone();
+                    move || document::column(state.clone(), language).into_element()
+                })
+                .otherwise(move || welcome::welcome(state.clone(), language).into_element()),
+            )
+            .into_element(),
+    ]
 }
 
 /// The field: all remaining width, unbordered, with the 40px field gap as its
@@ -333,30 +344,27 @@ pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoEle
 /// keeps its natural height while the slot clips it and moves the text below.
 fn banner_slot<E: IntoElement + 'static>(
     id: &'static str,
-    target: impl Fn() -> (Option<u64>, bool) + Clone + 'static,
+    snap_on_mount: bool,
+    open: impl Fn() -> bool + Clone + 'static,
     content: impl Fn() -> E + 'static,
 ) -> impl IntoElement {
     let frame = element_ref();
-    let laid_out = signal(false);
-    let target = move || {
-        let (tab, open) = target();
-        (tab, laid_out.get() && open)
-    };
-    let expanded = {
-        let target = target.clone();
-        move || target().1
-    };
-    let presence = motion::Presence::scoped(target.clone());
-    let before = Cell::new(None);
-    effect(move || {
-        let (tab, open) = target();
-        if before.replace(Some((tab, open))) == Some((tab, !open)) && !motion::reduced_motion() {
-            let ms = if open {
-                motion::ENTER_MS
-            } else {
-                motion::EXIT_MS
-            };
-            frame.animate_layout(motion::ease_out_layout(ms));
+    let laid_out = signal(snap_on_mount);
+    let expanded = move || laid_out.get() && open();
+    let presence = motion::Presence::with_initial(expanded.clone(), snap_on_mount);
+    effect({
+        let expanded = expanded.clone();
+        let before = Cell::new(None);
+        move || {
+            let open = expanded();
+            if before.replace(Some(open)) == Some(!open) && !motion::reduced_motion() {
+                let ms = if open {
+                    motion::ENTER_MS
+                } else {
+                    motion::EXIT_MS
+                };
+                frame.animate_layout(motion::ease_out_layout(ms));
+            }
         }
     });
     view()
@@ -659,6 +667,50 @@ mod tests {
                 "switching must not leave the old banner mounted"
             );
         }
+    }
+
+    #[test]
+    fn switching_between_equal_conflict_banners_snaps_the_running_reflow() {
+        use nsh_core::MountItem;
+
+        let mut app = conflict_probe();
+        app.settle();
+        let ids = ["conflict-banner-slot", "document-slot"];
+        let final_bounds = ids.map(|id| node(&app, id).bounds);
+        press_without_settling(&mut app, "probe-switch-tab");
+        let batches = capture_batches(&mut app);
+        press_without_settling(&mut app, "probe-conflict");
+        let entering = ids.map(|id| node(&app, id).id);
+        batches
+            .try_iter()
+            .find(|batch| {
+                let frames = transitioned_frames(batch, motion::ENTER_MS);
+                entering.iter().all(|id| frames.contains(id))
+            })
+            .expect("both equal-height target frames must have an entry tween");
+        app.run_for(std::time::Duration::from_millis(32))
+            .expect("advance partway through the entry tween");
+        press_without_settling(&mut app, "probe-switch-tab");
+        let switched = ids.map(|id| node(&app, id));
+        // Headless reports layout targets, not the native tween. An unchanged
+        // target on the same node is ignored by Win32, so check the mount too.
+        assert!(
+            switched.each_ref().map(|node| node.bounds) == final_bounds
+                && batches.try_iter().any(|batch| {
+                    entering.iter().all(|old| {
+                        batch.iter().any(|item| matches!(
+                            item, MountItem::Delete { id } if id == old
+                        ))
+                    }) && switched.iter().all(|node| {
+                        batch.iter().any(|item| matches!(
+                            item, MountItem::Frame { id, .. } if *id == node.id
+                        ))
+                    }) && !batch.iter().any(|item| matches!(
+                        item, MountItem::LayoutAnimation(animation) if animation.update.is_some()
+                    ))
+                }),
+            "the switch must replace the in-flight frames with final frames in one batch"
+        );
     }
 
     #[test]
