@@ -38,7 +38,7 @@ table.
    | Close/quit guard | occasional | as consent | as consent |
    | Status notice | occasional | 4px rise + fade, `ENTER_MS`; hold 3000ms | fade, `EXIT_MS` |
    | Findings arriving (model output) | model | the existing Heat ignite; one entrance per list, no stagger | — |
-   | Theme switch | occasional | 200ms colour cross-fade | — |
+   | Theme switch | occasional | instant everywhere (amended 2026-11-21: the nsh 0.6.1 editor cannot transition its colours, and a partial cross-fade looked broken) | — |
 
 3. **Interaction states.**
    - **Pressed state.** Every pressable gets one, shown on press-down through nsh `.active(…)`. It
