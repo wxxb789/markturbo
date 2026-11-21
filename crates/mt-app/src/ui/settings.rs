@@ -78,8 +78,9 @@ pub fn page(state: AppState, language: Language) -> impl IntoElement {
                 .flex_row()
                 .items_center()
                 .child(heading(i18n::t(language, Key::Settings)))
-                // A spacer, not `justify_between`: with it, nsh 0.5.1 on Windows
-                // left this row's trailing action unpainted and UIA-offscreen.
+                // On Windows with nsh 0.5.1, justify_between in this max_w row
+                // left the trailing actions unpainted and offscreen to UIA.
+                // Keep the spacer; that layout has not been re-verified on 0.6.1.
                 .child(view().flex_1())
                 .child(
                     view()

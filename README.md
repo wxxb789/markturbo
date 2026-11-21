@@ -219,7 +219,7 @@ git, and shell tools read the files unchanged.
 
 ## Build and release
 
-Run locally:
+Run locally with Cargo, or use the matching nsh CLI (0.6.1):
 
 ```sh
 cargo run --release -p mt-app                 # Rust entry point; no nsh CLI
@@ -284,7 +284,7 @@ Then set the same version in `crates/mt-app/nsh.json`;
 
 ## Architecture
 
-Built with Rust and [Native Shell (nsh)](https://nsh.dev) 0.5.1, drawn by each
+Built with Rust and [Native Shell (nsh)](https://nsh.dev) 0.6.1, drawn by each
 desktop's native backend: Win32/Direct2D on Windows, AppKit on macOS, and GTK 4
 on Linux. There is no GPUI or GPUI Kit dependency.
 

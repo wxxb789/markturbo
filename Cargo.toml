@@ -133,10 +133,10 @@ debug = "limited"
 split-debuginfo = "unpacked"
 
 [patch.crates-io]
-# `ratex-parser` 0.1.15 plus one 25-line clamp. `\begin{alignat}{N}` allocates
-# `N * 2` 64-byte `AlignSpec` values with no bound, so a 45-byte document
-# requests 68GB and dies with an allocation abort — the one failure class
-# `catch_unwind` below cannot contain.
+# `ratex-parser` 0.1.15 (matching nsh-base 0.6.1) plus one 25-line clamp.
+# `\begin{alignat}{N}` allocates `N * 2` 64-byte `AlignSpec` values with no
+# bound, so a 45-byte document requests 68GB and dies with an allocation
+# abort — the one failure class `catch_unwind` below cannot contain.
 #
 # The clamp has to be inside the parser rather than in `MathRenderer`: a guard
 # over the source text was tried and cannot work, because the parser

@@ -129,6 +129,12 @@
   per-chain `requests`, and `scripts/tests/test_native_goal07_provider.py`
   still runs a three-chain test (`request_count == 6`). Revalidate that no
   caller needs more than one chain, then drop the extra state and test.
+- [ ] **Dead-code candidate: old WebView profile resolver** — Repository
+  search finds no caller of `mt_core::runtime_paths::webview_data_dir`;
+  its helper in `crates/mt-core/src/runtime_paths.rs` is referenced only
+  by that function and a path unit test. The nsh Windows backend computes
+  its own profile in `native/web.rs`. Check for external callers before
+  removing the public function or its helper.
 - [ ] **Isolate the opt-in Windows credential round-trip**:
   `goal_05a_credential_lifecycle_windows_round_trip` is excluded from the
   default suite but uses the current user's Windows Credential Manager when

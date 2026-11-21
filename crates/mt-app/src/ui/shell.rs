@@ -351,7 +351,7 @@ mod tests {
     use nsh_testing::{Headless, LayoutNode};
 
     use super::*;
-    use crate::state::Pane;
+    use crate::state::{GUARD_CANCEL_CHOICE, Pane};
 
     /// The document the probes open: a heading on its first line, so the
     /// first glyph the column draws is known.
@@ -440,6 +440,68 @@ mod tests {
     #[component]
     fn WelcomeProbe() -> impl IntoElement {
         shell(AppState::new(), Language::English, Layout::Wide)
+    }
+
+    #[component]
+    fn GuardProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let tab = state.active_tab().expect("the untitled tab");
+        tab.dirty.set(true);
+        let presses = signal(0);
+        let selection = state.guard.clone();
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .child(control("probe-close", &state, move |state| {
+                presses.update(|count| *count += 1);
+                state.request_close_tab(tab.id);
+            }))
+            .child(text(move || format!("Close presses: {}", presses.get())))
+            .child(text(move || {
+                match selection.get().map(|guard| guard.choice.get()) {
+                    Some(GUARD_CANCEL_CHOICE) => "Guard selection: Cancel",
+                    Some(_) => "Guard selection: not Cancel",
+                    None => "Guard closed",
+                }
+            }))
+            .child(overlay_layer(state, Language::English))
+    }
+
+    #[test]
+    fn space_does_not_press_the_focused_control_behind_the_guard() {
+        let mut config = EngineConfig::new(Root::of::<GuardProbe>().tokens(tokens::theme()));
+        config.environment.os = nsh_core::platform::Os::Windows;
+        config.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = Headless::start(config).expect("start the probe");
+        app.wait_for("id:probe-close").expect("close control");
+        // Headless does not focus an ordinary control on pointer press as Win32 does.
+        app.press_key("tab").expect("focus the close control");
+        press(&mut app, "probe-close");
+        app.wait_for("id:guard-cancel").expect("guard open");
+        assert!(app.screen().texts().contains(&"Close presses: 1"));
+
+        for key in ["space", "shift+space"] {
+            app.press_key(key)
+                .expect("press Space with or without Shift");
+            let screen = app.screen();
+            assert!(screen.matches("id:guard-cancel").expect("selector"));
+            assert!(
+                screen.texts().contains(&"Close presses: 1"),
+                "{key} activated the background close control"
+            );
+            assert!(
+                screen.texts().contains(&"Guard selection: Cancel"),
+                "{key} changed the guard selection"
+            );
+        }
+
+        app.press_key("shift+enter").expect("press Shift+Enter");
+        assert!(app.screen().texts().contains(&"Guard closed"));
+        assert!(
+            app.screen().texts().contains(&"Close presses: 1"),
+            "Shift+Enter activated the background close control"
+        );
     }
 
     /// `root` started in a `width` x 900 window, the editor up, in Source.

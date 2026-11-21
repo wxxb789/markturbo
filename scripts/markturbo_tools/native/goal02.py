@@ -20,7 +20,7 @@ guard, never close it unasked, and the guard's Save writes the exact bytes,
 retires the recovery record and exits 0.
 
 The unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
-which nsh 0.5.1's Windows UIA folds away, so the guard's Cancel keeping the
+which nsh 0.6.1's Windows UIA folds away, so the guard's Cancel keeping the
 mark is proven headless (`tests/tab_close_guard.rs`).
 
 Every phase has its own observation-key prefix and failure-code prefix
