@@ -7,21 +7,24 @@ hashes, byte counts, booleans, counts and safe reason codes. The harness never
 reads or writes the Windows Credential Manager: the child process gets one
 fresh synthetic key in its environment only.
 
-One launch opens `trusted.html` from argv (a new tab opens in Split) and runs
-one Review -> answer -> Revision chain against the loopback, across two
-phases, each with its own observation-key prefix and failure-code prefix:
+One launch opens `security-fixture.html` from argv (a new tab opens in Split),
+checks pixel cells painted by its inline script and each completed attempt,
+then it runs one Review -> answer -> Revision chain against the loopback, across
+two phases, each with its own observation-key prefix and failure-code prefix:
 
-1. `trust`: scripts are trusted first, through the Web pane's
-   `Trust scripts` and its Run scripts system alert; the Edit mode then hands
-   the keyboard back from the WebView before the Review shortcut is sent.
+1. `web_security`: the Web pane shows the inline script's painted status cells
+   without a trust action; its popup, top-level/frame navigation and form
+   attempts leave the preview in place, with one visible window in the app's
+   process job. Edit mode then hands the keyboard back before the Review
+   shortcut is sent.
 2. `decisions`: the proposal holds two hunks, h1 the executable script value
    after the CJK/emoji line and h2 the owner line. Accept(h1) writes across
    the multibyte offsets at once; Reject(h2) reads `2 of 2 decided`; `Undo`
    takes the rejection back to `1 of 2 decided`; `Copy` round-trips the
    approved result through the OS clipboard; one replacement over the whole
    document leaves h2 `Can't apply — this part changed` without an `Accept`;
-   `Done` writes nothing to disk; and the Web pane is Restricted, because the
-   accepted write revoked the trust.
+   `Done` writes nothing to disk. The script's effect and navigation checks
+   have already completed before the Review chain.
 
 Proven headless or in mt-core instead: `Undo` restoring an accepted hunk's
 bytes after the write (`tests/revision_flow.rs`); every hunk accepted
@@ -46,9 +49,6 @@ focus. The field's keys (`A`, `R`, `Ctrl+Z`, `A` refused on a changed part)
 are proven headless in `ui/revision.rs`. Editor text is read with the editor's
 Select All + Copy.
 
-Trust scripts' Run scripts confirmation is an nsh system alert outside the UIA
-tree, answered with Enter (`runtime.py` `confirm_system_alert`).
-
 Evidence follows the shared native schema (`evidence.py`).
 """
 
@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import socket
 import uuid
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,7 @@ from . import evidence
 from . import goal07_provider as provider_fixtures
 from .evidence import credential_target, leak_codes
 from .runtime import (
+    EDITOR_NAME,
     INTEGRITY_NAMES,
     MENU_EDIT_AUTOMATION_ID,
     MENU_WEB_AUTOMATION_ID,
@@ -81,7 +83,6 @@ from .runtime import (
     phase,
     preflight,
     safe_exception_name,
-    sha256_file,
     validate_fingerprint,
     wait_until,
     write_durable,
@@ -120,34 +121,177 @@ REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
 REVISION_PROPOSAL_AFTER_NAME = "Proposed text"
 # `state.rs` `finish_revision`: Done's outcome line with an accepted hunk.
 REVISION_APPLIED = "Approved changes applied to the buffer."
-# `ui/preview.rs`. `state.rs` `request_web_trust` confirms with an nsh system
-# alert outside the UIA tree, answered with Enter (`confirm_system_alert`).
-TRUST_SCRIPTS_AUTOMATION_ID = "web-trust"
-TRUSTED_BANNER = "Trusted: scripts may run"
-RESTRICTED_BANNER = "Restricted: scripts disabled"
-
 CASE_REVISION_SESSION = "revision_session"
 CASE_FLOWS = {
     CASE_REVISION_SESSION: (
-        "one launch on trusted HTML: trust scripts -> one Review and Revision -> "
+        "one launch on sandbox fixture: script effect, completed network probes with zero contacts "
+        "and blocked navigation -> "
+        "one Review and Revision -> "
         "Accept, Reject, Undo, Copy -> an edit over the open hunk offers no Accept "
-        "-> Done -> Restricted; Undo after a write, every hunk accepted and "
+        "-> Done; Undo after a write, every hunk accepted and "
         "frontmatter, fence and link anchoring are proven headless"
     ),
 }
 REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
 # Each phase's observation-key prefix; upper-cased, its failure-code prefix.
-PHASES = ("trust", "decisions")
+PHASES = ("web_security", "decisions")
 # The session's one chain: one Review and one Revision request.
 EXPECTED_REQUEST_COUNT = 2
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
+NETWORK_PROBE_HOST = "goal07-egress.invalid"
+TCP_PORT_TOKEN = "__GOAL07_TCP_PORT__"
+UDP_PORT_TOKEN = "__GOAL07_UDP_PORT__"
+CELL_GRID_LEFT = 16
+CELL_GRID_TOP = 48
+CELL_SIZE = 16
+CELL_GAP = 3
+CELL_BORDER_WIDTH = 2
+CELL_TOLERANCE = 16
+CELL_PAGE_COLOR = (255, 255, 255)
+CELL_BORDER_COLOR = (20, 20, 20)
+CELL_PENDING_COLOR = (72, 72, 72)
+CELL_SCRIPT_COLOR = (24, 168, 93)
+CELL_ATTEMPT_COLOR = (48, 112, 224)
+CELL_COMPLETE_COLOR = (240, 176, 32)
+CELL_ASSIGNED_COLOR = (176, 72, 184)
+SELF_NAVIGATION_SAMPLE_MS = 1000
+
+
+def _css_rgb(color: tuple[int, int, int]) -> str:
+    return f"rgb({color[0]}, {color[1]}, {color[2]})"
+
+
+FIXTURE_ATTEMPT_SOURCE = (
+    "  { run: () => fetchProbe(`${tcpLoopback}/fetch`) },",
+    "  { run: () => fetchProbe(`${tcpHostname}/fetch`) },",
+    "  { run: () => imageProbe(`${tcpLoopback}/image`) },",
+    "  { run: () => imageProbe(`${tcpHostname}/image`) },",
+    "  { run: () => beaconProbe(`${tcpLoopback}/beacon`) },",
+    "  { run: () => beaconProbe(`${tcpHostname}/beacon`) },",
+    "  { run: () => websocketProbe(websocketLoopback) },",
+    "  { run: () => websocketProbe(websocketHostname) },",
+    (
+        "  { run: async () => {\r\n"
+        "    if (typeof RTCPeerConnection !== \"function\") return;\r\n"
+        "    let peer;\r\n"
+        "    try {\r\n"
+        "      peer = new RTCPeerConnection({ iceServers: [\r\n"
+        "        { urls: [`stun:127.0.0.1:${udpPort}`, `stun:${probeHost}:${udpPort}`] },\r\n"
+        "        { urls: [`turn:127.0.0.1:${tcpPort}?transport=tcp`, `turn:${probeHost}:${tcpPort}?transport=tcp`], username: \"goal07\", credential: \"goal07\" }\r\n"
+        "      ] });\r\n"
+        "      peer.createDataChannel(\"probe\");\r\n"
+        "      await peer.setLocalDescription(await peer.createOffer());\r\n"
+        "    } catch (_) {\r\n"
+        "      try { peer?.close(); } catch (_) {}\r\n"
+        "      return;\r\n"
+        "    }\r\n"
+        "    peer.close();\r\n"
+        "    throw new Error(\"WebRTC is available\");\r\n"
+        "  } },"
+    ),
+    "  { run: () => linkProbe(\"dns-prefetch\", `http://${probeHost}`) },",
+    "  { run: () => linkProbe(\"preconnect\", `https://127.0.0.1:${tcpPort}`) },",
+    "  { run: () => linkProbe(\"preconnect\", `https://${probeHost}:${tcpPort}`) },",
+    "  { run: () => { const link = document.getElementById(\"goal07-user-link\"); let prevented = false; link.href = `${tcpLoopback}/link`; link.addEventListener(\"click\", event => { prevented = event.defaultPrevented; }, { once: true }); link.click(); if (!prevented) throw new Error(); } },",
+    "  { run: () => { const form = document.getElementById(\"goal07-user-form\"); form.action = `${tcpLoopback}/user-form`; const submitEvent = new SubmitEvent(\"submit\", { bubbles: true, cancelable: true }); form.dispatchEvent(submitEvent); form.requestSubmit(); if (!submitEvent.defaultPrevented) throw new Error(); } },",
+    "  { run: () => { if (typeof window.open !== \"function\") throw new Error(); try { window.open(`${tcpLoopback}/popup`, \"_blank\"); } catch (_) {} } },",
+    "  { run: () => { try { top.location = `https://${probeHost}/top`; } catch (_) {} } },",
+    "  { run: () => { const frame = document.createElement(\"iframe\"); frame.src = `https://127.0.0.1:${tcpPort}/subframe`; document.body.appendChild(frame); } },",
+    "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} } },",
+    "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
+    '  { run: () => { try { location.href = "https://blocked-preview-navigation.invalid/"; assignedCell.style.backgroundColor = assignedCellColor; } catch (_) {} } },',
+)
+
+
 # h1 (the executable script value) sits after the CJK/emoji line, so its
 # accepted write proves multibyte and CRLF offsets; h2 is the owner line.
 SOURCE_TEXT = (
     "<!doctype html>\r\n"
-    "<p>trusted 文档 🚀</p>\r\n"
-    "<script>window.goal07 = \"old\";</script>\r\n"
+    "<p>fixture 文档 🚀</p>\r\n"
+    "<style>\r\n"
+    "html,body{margin:0;padding:0;background:#fff;}\r\n"
+    "#goal07-cells{position:absolute;left:0;top:0;z-index:1;display:flex;flex-wrap:nowrap;}\r\n"
+    ".goal07-cell{display:block;box-sizing:border-box;flex:none;}\r\n"
+    ".goal07-hidden{display:none;}\r\n"
+    "</style>\r\n"
+    "<div id=\"goal07-cells\"><span id=\"goal07-script-cell\"></span></div>\r\n"
+    "<a id=\"goal07-user-link\" class=\"goal07-hidden\" target=\"_self\"></a>\r\n"
+    "<form id=\"goal07-user-form\" class=\"goal07-hidden\" method=\"post\" target=\"_blank\">\r\n"
+    "<button type=\"submit\">User form navigation probe</button>\r\n"
+    "</form>\r\n"
+    "<script>\r\n"
+    "window.goal07 = \"old\";\r\n"
+    "const cellGrid = document.getElementById(\"goal07-cells\");\r\n"
+    "const scriptCell = document.getElementById(\"goal07-script-cell\");\r\n"
+    "const pixelRatio = window.devicePixelRatio || 1;\r\n"
+    f"const pendingCellColor = \"{_css_rgb(CELL_PENDING_COLOR)}\";\r\n"
+    f"const scriptCellColor = \"{_css_rgb(CELL_SCRIPT_COLOR)}\";\r\n"
+    f"const attemptCellColor = \"{_css_rgb(CELL_ATTEMPT_COLOR)}\";\r\n"
+    f"const completeCellColor = \"{_css_rgb(CELL_COMPLETE_COLOR)}\";\r\n"
+    f"const assignedCellColor = \"{_css_rgb(CELL_ASSIGNED_COLOR)}\";\r\n"
+    f"const borderColor = \"{_css_rgb(CELL_BORDER_COLOR)}\";\r\n"
+    f'cellGrid.style.left = ({CELL_GRID_LEFT} / pixelRatio) + "px";\r\n'
+    f'cellGrid.style.top = ({CELL_GRID_TOP} / pixelRatio) + "px";\r\n'
+    f'cellGrid.style.gap = ({CELL_GAP} / pixelRatio) + "px";\r\n'
+    "function prepareCell(cell) {\r\n"
+    "  cell.className = \"goal07-cell\";\r\n"
+    f'  cell.style.width = ({CELL_SIZE} / pixelRatio) + "px";\r\n'
+    f'  cell.style.height = ({CELL_SIZE} / pixelRatio) + "px";\r\n'
+    f'  cell.style.border = ({CELL_BORDER_WIDTH} / pixelRatio) + "px solid " + borderColor;\r\n'
+    "  cell.style.backgroundColor = pendingCellColor;\r\n"
+    "}\r\n"
+    "function createCell() { const cell = document.createElement(\"span\"); prepareCell(cell); cellGrid.appendChild(cell); return cell; }\r\n"
+    f'const probeHost = "{NETWORK_PROBE_HOST}";\r\n'
+    'const tcpPort = "__GOAL07_TCP_PORT__";\r\n'
+    'const udpPort = "__GOAL07_UDP_PORT__";\r\n'
+    "const tcpLoopback = `http://127.0.0.1:${tcpPort}`;\r\n"
+    "const tcpHostname = `http://${probeHost}:${tcpPort}`;\r\n"
+    "const websocketLoopback = `ws://127.0.0.1:${tcpPort}/socket`;\r\n"
+    "const websocketHostname = `ws://${probeHost}:${tcpPort}/socket`;\r\n"
+    "const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));\r\n"
+    f"const SELF_NAVIGATION_SAMPLE_MS = {SELF_NAVIGATION_SAMPLE_MS};\r\n"
+    "function submitForm(action) {\r\n"
+    "  const form = document.createElement(\"form\");\r\n"
+    "  form.method = \"post\"; form.action = action; form.hidden = true;\r\n"
+    "  document.body.appendChild(form); form.submit();\r\n"
+    "}\r\n"
+    "function fetchProbe(url) { fetch(url, { mode: \"no-cors\" }).catch(() => {}); }\r\n"
+    "function imageProbe(url) { const image = document.createElement(\"img\"); image.src = url; document.body.appendChild(image); }\r\n"
+    "function beaconProbe(url) { if (typeof navigator.sendBeacon !== \"function\") throw new Error(); navigator.sendBeacon(url, \"probe\"); }\r\n"
+    "function websocketProbe(url) { if (typeof WebSocket !== \"function\") throw new Error(); try { const socket = new WebSocket(url); socket.onerror = () => {}; } catch (_) {} }\r\n"
+    "function linkProbe(rel, href) { const link = document.createElement(\"link\"); link.rel = rel; link.href = href; document.head.appendChild(link); }\r\n"
+    "const networkAttempts = [\r\n"
+    + "\r\n".join(FIXTURE_ATTEMPT_SOURCE)
+    + "\r\n];\r\n"
+    "prepareCell(scriptCell);\r\n"
+    "const attemptCells = networkAttempts.map(() => createCell());\r\n"
+    "const aboutToNavigateCell = createCell();\r\n"
+    "const assignedCell = createCell();\r\n"
+    "scriptCell.style.backgroundColor = scriptCellColor;\r\n"
+    "async function runAttempts() {\r\n"
+    "  const finalIndex = networkAttempts.length - 1;\r\n"
+    "  for (let index = 0; index < finalIndex; index += 1) {\r\n"
+    "    await delay(50);\r\n"
+    "    try {\r\n"
+    "      const result = networkAttempts[index].run();\r\n"
+    "      if (result && typeof result.then === \"function\") {\r\n"
+    "        await result;\r\n"
+    "      }\r\n"
+    "    } catch (_) {\r\n"
+    "      return;\r\n"
+    "    }\r\n"
+    "    attemptCells[index].style.backgroundColor = attemptCellColor;\r\n"
+    "  }\r\n"
+    "  await delay(50);\r\n"
+    "  // Hold the final attempt's cells long enough for the native harness to sample them.\r\n"
+    "  attemptCells[finalIndex].style.backgroundColor = attemptCellColor;\r\n"
+    "  aboutToNavigateCell.style.backgroundColor = completeCellColor;\r\n"
+    "  await delay(SELF_NAVIGATION_SAMPLE_MS);\r\n"
+    "  networkAttempts[finalIndex].run();\r\n"
+    "}\r\n"
+    "runAttempts();\r\n"
+    "</script>\r\n"
     "<p>owner: TBD</p>\r\n"
     f"<!-- {DOCUMENT_SENTINEL} -->\r\n"
 )
@@ -157,14 +301,19 @@ EDITOR_SOURCE_BYTES = EDITOR_SOURCE_TEXT.encode("utf-8")
 # Typed over the whole document after the decisions: it touches the open
 # hunk's part.
 STALE_EDIT = f"{DOCUMENT_SENTINEL}:stale"
-TRUST_FILE = "trusted.html"
+FIXTURE_FILE = "security-fixture.html"
+SELF_NAVIGATION_TIMEOUT_SECONDS = 3.0
+NETWORK_PROBE_SETTLE_SECONDS = 1.0
+NETWORK_OBSERVATION_KEYS = frozenset(
+    {"web_security_tcp_contact_count", "web_security_udp_contact_count"}
+)
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
 # Every fingerprint is compared with exact expected bytes
 # (`expected_fingerprints`); the names say when it was read.
 FINGERPRINT_OBSERVATION_KEYS = frozenset(
     {
-        "trust_disk_before",
+        "web_security_disk_before",
         "decisions_proposal_after",
         "decisions_editor_proposed",
         "decisions_editor_one_accepted",
@@ -173,10 +322,258 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
         "decisions_disk_after",
     }
 )
-OBSERVATION_KEYS = FINGERPRINT_OBSERVATION_KEYS | {"provider_request_count"}
+OBSERVATION_KEYS = (
+    FINGERPRINT_OBSERVATION_KEYS
+    | NETWORK_OBSERVATION_KEYS
+    | {
+        "web_security_cell_results",
+        "web_security_post_navigation_cell_results",
+        "web_security_window_count",
+        "provider_request_count",
+    }
+)
 REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
 
+class NetworkProbeListeners:
+    """Count local TCP connections and UDP datagrams synchronously."""
+
+    def __init__(self) -> None:
+        self._tcp_contacts = 0
+        self._udp_contacts = 0
+        self._failure_code: str | None = None
+        self._started = False
+        self._closed = False
+        self._tcp_socket: socket.socket | None = None
+        self._udp_socket: socket.socket | None = None
+
+    @property
+    def tcp_port(self) -> int:
+        if self._tcp_socket is None:
+            raise RuntimeError("network probe listeners are not running")
+        return self._tcp_socket.getsockname()[1]
+
+    @property
+    def udp_port(self) -> int:
+        if self._udp_socket is None:
+            raise RuntimeError("network probe listeners are not running")
+        return self._udp_socket.getsockname()[1]
+
+    def start(self) -> NetworkProbeListeners:
+        if self._started:
+            raise RuntimeError("network probe listeners already started")
+        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            tcp_socket.bind(("127.0.0.1", 0))
+            tcp_socket.listen()
+            tcp_socket.setblocking(False)
+            udp_socket.bind(("127.0.0.1", 0))
+            udp_socket.setblocking(False)
+        except Exception:
+            tcp_socket.close()
+            udp_socket.close()
+            raise
+        self._tcp_socket = tcp_socket
+        self._udp_socket = udp_socket
+        self._started = True
+        return self
+
+    def snapshot(self) -> dict[str, int]:
+        if not self._started:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_UNAVAILABLE")
+        if self._failure_code is not None:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_FAILED", self._failure_code)
+        if not self._closed:
+            self._drain_tcp()
+            self._drain_udp()
+        return {"tcp_contacts": self._tcp_contacts, "udp_contacts": self._udp_contacts}
+
+    def _drain_tcp(self) -> None:
+        listener = self._tcp_socket
+        if listener is None:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_UNAVAILABLE")
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except BlockingIOError:
+                return
+            except OSError:
+                self._fail("TCP")
+            self._tcp_contacts += 1
+            try:
+                connection.close()
+            except OSError:
+                self._fail("TCP")
+
+    def _drain_udp(self) -> None:
+        listener = self._udp_socket
+        if listener is None:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_UNAVAILABLE")
+        while True:
+            try:
+                listener.recvfrom(65535)
+            except BlockingIOError:
+                return
+            except OSError:
+                self._fail("UDP")
+            self._udp_contacts += 1
+
+    def _fail(self, protocol: str) -> None:
+        self._failure_code = f"{protocol}_LISTENER_FAILED"
+        raise HarnessFailure("NETWORK_PROBE_LISTENER_FAILED", self._failure_code) from None
+
+    def close(self) -> None:
+        if not self._started or self._closed:
+            return
+        try:
+            self.snapshot()
+        finally:
+            self._closed = True
+            try:
+                for listener in (self._tcp_socket, self._udp_socket):
+                    if listener is not None:
+                        listener.close()
+            finally:
+                self._tcp_socket = None
+                self._udp_socket = None
+
+    def __enter__(self) -> NetworkProbeListeners:
+        return self.start()
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+
+def fixture_source(network_probes: NetworkProbeListeners) -> str:
+    """Bind the static security fixture to this run's loopback listeners."""
+    return (
+        SOURCE_TEXT.replace(TCP_PORT_TOKEN, str(network_probes.tcp_port))
+        .replace(UDP_PORT_TOKEN, str(network_probes.udp_port))
+    )
+
+
+def _pixel_matches(actual: tuple[int, ...], expected: tuple[int, int, int]) -> bool:
+    return len(actual) >= 3 and max(
+        abs(actual[index] - expected[index]) for index in range(3)
+    ) <= CELL_TOLERANCE
+
+
+def detect_fixture_cells(image: Any) -> list[bool]:
+    """Read the fixture's single-row status grid from a cropped WebView image."""
+    image = image.convert("RGB")
+    width, height = image.size
+    center_y = CELL_GRID_TOP + CELL_SIZE // 2
+    if height <= center_y:
+        return []
+
+    step = CELL_SIZE + CELL_GAP
+    first_center_x = CELL_GRID_LEFT + CELL_SIZE // 2
+    slot_count = max(0, (width - first_center_x - 1) // step + 1)
+    last_cell = -1
+    known_colors = (
+        CELL_PENDING_COLOR,
+        CELL_SCRIPT_COLOR,
+        CELL_ATTEMPT_COLOR,
+        CELL_COMPLETE_COLOR,
+        CELL_ASSIGNED_COLOR,
+    )
+    for index in range(slot_count):
+        left = CELL_GRID_LEFT + index * step
+        center = image.getpixel((first_center_x + index * step, center_y))
+        border = image.getpixel((left, center_y))
+        if _pixel_matches(border, CELL_BORDER_COLOR) or any(
+            _pixel_matches(center, color) for color in known_colors
+        ):
+            last_cell = index
+
+    if last_cell < 0:
+        return []
+
+    cells = []
+    for index in range(last_cell + 1):
+        center = image.getpixel((first_center_x + index * step, center_y))
+        if index == 0:
+            expected = CELL_SCRIPT_COLOR
+        elif index == len(FIXTURE_ATTEMPT_SOURCE) + 1:
+            expected = CELL_COMPLETE_COLOR
+        elif index == len(FIXTURE_ATTEMPT_SOURCE) + 2:
+            expected = CELL_ASSIGNED_COLOR
+        else:
+            expected = CELL_ATTEMPT_COLOR
+        cells.append(_pixel_matches(center, expected))
+    return cells
+
+
+def fixture_cells_complete(cells: Any) -> bool:
+    return (
+        isinstance(cells, list)
+        and len(cells) == len(FIXTURE_ATTEMPT_SOURCE) + 3
+        and all(type(cell) is bool for cell in cells)
+        and all(cells)
+    )
+
+
+def validate_cell_results(value: Any) -> None:
+    if (
+        not isinstance(value, list)
+        or len(value) != len(FIXTURE_ATTEMPT_SOURCE) + 3
+        or any(type(cell) is not bool for cell in value)
+    ):
+        raise ValueError("invalid WebView pixel-cell observations")
+
+
+def validate_post_navigation_cell_results(value: Any) -> None:
+    if not isinstance(value, list) or any(type(cell) is not bool for cell in value):
+        raise ValueError("invalid post-navigation pixel-cell observations")
+
+
+def canonicalize_fixture_source(
+    value: str | bytes, network_probes: NetworkProbeListeners | None = None
+) -> str | bytes:
+    """Replace this run's ports before fingerprinting the fixture, editor, or
+    clipboard."""
+    if network_probes is None:
+        return value
+    if isinstance(value, bytes):
+        return (
+            value.replace(
+                f'const tcpPort = "{network_probes.tcp_port}";'.encode("ascii"),
+                f'const tcpPort = "{TCP_PORT_TOKEN}";'.encode("ascii"),
+            ).replace(
+                f'const udpPort = "{network_probes.udp_port}";'.encode("ascii"),
+                f'const udpPort = "{UDP_PORT_TOKEN}";'.encode("ascii"),
+            )
+        )
+    return (
+        value.replace(
+            f'const tcpPort = "{network_probes.tcp_port}";',
+            f'const tcpPort = "{TCP_PORT_TOKEN}";',
+        ).replace(
+            f'const udpPort = "{network_probes.udp_port}";',
+            f'const udpPort = "{UDP_PORT_TOKEN}";',
+        )
+    )
+
+
+def fixture_text_fingerprint(
+    value: str, network_probes: NetworkProbeListeners | None = None
+) -> Fingerprint:
+    canonical = canonicalize_fixture_source(value, network_probes)
+    if not isinstance(canonical, str):
+        raise TypeError("fixture text fingerprint must be text")
+    return fingerprint_text(canonical)
+
+
+def fixture_fingerprint(path: Path, network_probes: NetworkProbeListeners) -> Fingerprint:
+    raw = path.read_bytes()
+    expected = fixture_source(network_probes).encode("utf-8")
+    if raw != expected:
+        return fingerprint_bytes(raw)
+    value = canonicalize_fixture_source(raw, network_probes)
+    if not isinstance(value, bytes):
+        raise TypeError("fixture fingerprint must be bytes")
+    return fingerprint_bytes(value)
 def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
     """Apply validated non-overlapping byte edits for expected-preview checks."""
     if not isinstance(source, bytes) or len(source) > MAX_EDIT_OUTPUT_BYTES:
@@ -272,9 +669,10 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
     disk = fingerprint_bytes(SOURCE_BYTES)
     # Accept(h1) alone: Reject(h2) writes nothing and its Undo leaves h2 open,
     # so this is also the approved result Copy exports.
-    one_accepted = fingerprint_bytes(apply_edits(EDITOR_SOURCE_BYTES, edits[:1]))
+    one_accepted_source = apply_edits(EDITOR_SOURCE_BYTES, edits[:1]).decode("utf-8")
+    one_accepted = fixture_text_fingerprint(one_accepted_source)
     expected = {
-        "trust_disk_before": disk,
+        "web_security_disk_before": disk,
         # The field shows the docked h1's replacement itself, not its line.
         "decisions_proposal_after": fingerprint_text(edits[0]["replacement"]),
         "decisions_editor_proposed": fingerprint_bytes(EDITOR_SOURCE_BYTES),
@@ -284,6 +682,16 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
         "decisions_disk_after": disk,
     }
     return {key: value.evidence() for key, value in expected.items()}
+
+
+def expected_observations() -> dict[str, Any]:
+    return {
+        **expected_fingerprints(),
+        "web_security_post_navigation_cell_results": [],
+        "web_security_window_count": 1,
+        "web_security_tcp_contact_count": 0,
+        "web_security_udp_contact_count": 0,
+    }
 
 
 def _operation(expected_request_count: int) -> str:
@@ -341,9 +749,17 @@ def validate_runtime_scan(value: Any) -> None:
 
 
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
-    for key, expected in expected_fingerprints().items():
-        if validate_fingerprint(observations[key]) != expected:
-            raise ValueError(f"{key} does not hold the expected bytes")
+    for key, expected in expected_observations().items():
+        actual = (
+            validate_fingerprint(observations[key])
+            if key in FINGERPRINT_OBSERVATION_KEYS
+            else observations[key]
+        )
+        if not _same_exact_value(actual, expected):
+            kind = "bytes" if key in FINGERPRINT_OBSERVATION_KEYS else "value"
+            raise ValueError(f"{key} does not hold the expected {kind}")
+    if not fixture_cells_complete(observations["web_security_cell_results"]):
+        raise ValueError("WebView pixel cells are incomplete")
     if observations["provider_request_count"] != EXPECTED_REQUEST_COUNT:
         raise ValueError("loopback provider did not receive one Review and one Revision")
 
@@ -356,6 +772,10 @@ CONTRACT = evidence.EvidenceContract(
     required_observations=REQUIRED_OBSERVATIONS,
     validate_runtime_scan=validate_runtime_scan,
     validate_passed_case=validate_passed_case,
+    structured={
+        "web_security_cell_results": validate_cell_results,
+        "web_security_post_navigation_cell_results": validate_post_navigation_cell_results,
+    },
     private_sentinels=(
         DOCUMENT_SENTINEL,
         provider_fixtures.ANSWER_SENTINEL,
@@ -410,20 +830,36 @@ def review_settings_document(endpoint: str) -> bytes:
 
 @functools.cache
 def _expected_values() -> dict[str, Any]:
-    return expected_fingerprints()
+    return expected_observations()
+
+
+def _same_exact_value(actual: Any, expected: Any) -> bool:
+    return type(actual) is type(expected) and actual == expected
 
 
 def record(observed: dict[str, Any], key: str, value: Any) -> None:
     """Record one measurement as evidence, failing at once if it is unexpected.
 
     The check runs as the value is read, so a later step cannot fail first
-    and hide it. The key's phase prefix comes back through `phase`,
-    giving `<KEY>_UNEXPECTED`; `validate_passed_case` checks them all again.
+    and hide it. The phase prefix is selected from the observation key and
+    `phase` adds it to the resulting failure code. Final validation checks
+    the complete set again.
     """
     recorded = value.evidence() if isinstance(value, Fingerprint) else value
-    if recorded != _expected_values()[key]:
-        raise HarnessFailure(f"{key.partition('_')[2].upper()}_UNEXPECTED")
+    expected = _expected_values()[key]
+    if not _same_exact_value(recorded, expected):
+        phase_name = next((name for name in PHASES if key.startswith(f"{name}_")), None)
+        suffix = key.removeprefix(f"{phase_name}_") if phase_name else key.partition("_")[2]
+        raise HarnessFailure(f"{suffix.upper()}_UNEXPECTED")
     observed[key] = recorded
+
+
+def record_network_contacts(
+    observed: dict[str, Any], network_probes: NetworkProbeListeners
+) -> None:
+    counts = network_probes.snapshot()
+    record(observed, "web_security_tcp_contact_count", counts["tcp_contacts"])
+    record(observed, "web_security_udp_contact_count", counts["udp_contacts"])
 
 
 class Goal07Harness(NativeHarness):
@@ -434,14 +870,31 @@ class Goal07Harness(NativeHarness):
     def openai_api_key_for_child(self) -> str | None:
         return self._credential
 
-    def profile(self, endpoint: str) -> tuple[Path, Path, Path, Path, Path]:
+    def profile(
+        self, endpoint: str, network_probes: NetworkProbeListeners
+    ) -> tuple[Path, Path, Path, Path, Path]:
         """The session's isolated roots, its one document and its settings."""
         data_root, config_root, workspace_root, stderr_path = self.case_roots(
             CASE_REVISION_SESSION
         )
-        write_durable(workspace_root / TRUST_FILE, SOURCE_BYTES)
+        self.network_probes = network_probes
+        self.source_text = fixture_source(network_probes)
+        self.editor_source_text = self.source_text.replace("\r\n", "\n").replace("\r", "\n")
+        write_durable(workspace_root / FIXTURE_FILE, self.source_text.encode("utf-8"))
         write_durable(config_root / "settings.toml", review_settings_document(endpoint))
         return data_root.parent, data_root, config_root, workspace_root, stderr_path
+
+    def read_editor_fingerprint(self, app: Any) -> Fingerprint | None:
+        editor = self.control_by_name(
+            app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
+        )
+        if editor is None or not editor.is_visible() or not editor.is_enabled():
+            return None
+        text = self.read_editor_text(app, editor)
+        try:
+            return fixture_text_fingerprint(text, self.network_probes)
+        except TypeError:
+            raise HarnessFailure("SOURCE_EDITOR_TEXT_INVALID") from None
 
     def _require_foreground(self, app: Any) -> None:
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
@@ -609,8 +1062,9 @@ class Goal07Harness(NativeHarness):
         self, app: Any, provider: provider_fixtures.LoopbackRevisionServer
     ) -> int:
         """The session's Review -> answer -> Revision chain; its hunk count."""
-        provider.begin_chain(EDITOR_SOURCE_TEXT)
-        hunks = len(provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT))
+        source_text = self.editor_source_text
+        provider.begin_chain(source_text)
+        hunks = len(provider_fixtures.fixture_edits(source_text))
         self.run_review(app, provider)
         self.request_revision(app, provider=provider, hunks=hunks)
         return hunks
@@ -674,24 +1128,93 @@ class Goal07Harness(NativeHarness):
         self.click_control(copy, "REVISION_COPY_CLICK_FAILED")
         return self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
 
-    def phase_trust(
+    def read_fixture_cell_results(self, app: Any) -> list[bool]:
+        """Capture only the WebView pane and read its content-free status grid."""
+        from .visual import AppWindow, VisualFailure, capture_window
+
+        try:
+            rectangle = AppWindow(self.win32, app.window).webview_rect(self.ui_timeout)
+            image = capture_window(app.hwnd)
+        except VisualFailure as error:
+            raise HarnessFailure(error.code, error.detail) from None
+        left, top, right, bottom = rectangle
+        if (
+            left < 0
+            or top < 0
+            or right > image.width
+            or bottom > image.height
+            or right <= left
+            or bottom <= top
+        ):
+            raise HarnessFailure("WEBVIEW_PIXEL_REGION_INVALID")
+        return detect_fixture_cells(image.crop(rectangle))
+
+    def phase_web_security(
         self, app: Any, _provider: provider_fixtures.LoopbackRevisionServer, source: Path
     ) -> dict[str, Any]:
-        """Trust the page's scripts, then hand the keyboard back to the editor."""
+        """Check fixture execution before and after its final self-navigation."""
         observed: dict[str, Any] = {}
-        record(observed, "trust_disk_before", sha256_file(source))
+        network_probes = self.network_probes
+        record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-        self._press(app, TRUST_SCRIPTS_AUTOMATION_ID, "WEB_TRUST")
-        # The Run scripts alert is outside the UIA tree; Enter answers it
-        # with Run scripts, proven by the Trusted banner.
-        self.confirm_system_alert(
-            app,
-            lambda: not self.name_present(app, TRUSTED_BANNER, "Text"),
-            "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION",
-            confirmed=lambda: self.name_present(app, TRUSTED_BANNER, "Text"),
+
+        assigned_index = len(FIXTURE_ATTEMPT_SOURCE) + 2
+        assigned_seen = False
+
+        def completed_cells() -> list[bool] | None:
+            nonlocal assigned_seen
+            cells = self.read_fixture_cell_results(app)
+            if len(cells) > assigned_index and cells[assigned_index] is True:
+                assigned_seen = True
+            return cells if fixture_cells_complete(cells) else None
+
+        try:
+            cell_results = wait_until(
+                completed_cells,
+                self.ui_timeout,
+                "PIXEL_CELLS_TIMEOUT",
+                interval=0.1,
+            )
+        except HarnessFailure as error:
+            if error.code == "PIXEL_CELLS_TIMEOUT" and not assigned_seen:
+                raise HarnessFailure("SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE") from error
+            raise
+        observed["web_security_cell_results"] = cell_results
+        if app.process.poll() is not None:
+            raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
+
+        post_navigation_cells: list[bool] | None = None
+
+        def frame_replaced() -> bool | None:
+            nonlocal post_navigation_cells
+            cells = self.read_fixture_cell_results(app)
+            if cells:
+                return None
+            post_navigation_cells = cells
+            return True
+
+        wait_until(
+            frame_replaced,
+            SELF_NAVIGATION_TIMEOUT_SECONDS,
+            "SELF_NAVIGATION_FRAME_NOT_REPLACED",
+            interval=0.1,
         )
-        self.wait_name(app, TRUSTED_BANNER, "Text", "SCRIPTS_TRUSTED_TIMEOUT")
-        # Leaving the Web pane must hand keyboard ownership back to the main
+        if post_navigation_cells is None:
+            raise HarnessFailure("SELF_NAVIGATION_SAMPLE_TWO_NOT_OBSERVED")
+        record(
+            observed,
+            "web_security_post_navigation_cell_results",
+            post_navigation_cells,
+        )
+        self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
+        record_network_contacts(observed, network_probes)
+        windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
+        if windows != (app.hwnd,):
+            raise HarnessFailure("APP_WINDOW_COUNT_UNEXPECTED")
+        if self.win32.foreground_window() != app.hwnd:
+            raise HarnessFailure("APP_WINDOW_FOREGROUND_LOST")
+        record(observed, "web_security_window_count", len(windows))
+        # Leaving the Web pane hands keyboard ownership back to the main
         # window before the Review shortcut is sent, without a refocus.
         self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
         self.editor_control(app)
@@ -728,7 +1251,9 @@ class Goal07Harness(NativeHarness):
         self.decide_hunks(app, [False], total, decided=1)
         self.undo_decision(app, 1, total)
         record(
-            observed, "decisions_clipboard_copied", fingerprint_text(self.copy_approved(app))
+            observed,
+            "decisions_clipboard_copied",
+            fixture_text_fingerprint(self.copy_approved(app), self.network_probes),
         )
         # An edit over the whole document touches the open h2's part: the
         # field says so and offers no Accept.
@@ -745,10 +1270,7 @@ class Goal07Harness(NativeHarness):
         ):
             raise HarnessFailure("REVISION_OFFERS_ACCEPT")
         self.done(app, REVISION_APPLIED)
-        record(observed, "decisions_disk_after", sha256_file(source))
-        # The accepted write revoked the trust granted to the text before it.
-        self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-        self.wait_name(app, RESTRICTED_BANNER, "Text", "SCRIPTS_RESTRICTED_TIMEOUT")
+        record(observed, "decisions_disk_after", fixture_fingerprint(source, self.network_probes))
         provider.verify_chain()
         return observed
 
@@ -761,38 +1283,43 @@ class Goal07Harness(NativeHarness):
     ) -> dict[str, Any]:
         """Reap the app before the provider's last check and the privacy scan."""
         self.reap(app)
+        self.network_probes.close()
+        record_network_contacts({}, self.network_probes)
         provider.verify_chain()
         observations["provider_request_count"] = provider.request_count
         observations["runtime_scan"] = scan_case_artifacts(case_root, self._credential)
         return observations
 
     def scenario_revision_session(self) -> dict[str, Any]:
-        provider = provider_fixtures.LoopbackRevisionServer().start()
-        app = None
-        try:
-            case_root, data, config, workspace, stderr = self.profile(provider.base_url)
-            source = workspace / TRUST_FILE
-            app = self.launch_app(source, data, config, workspace, stderr)
-            observations: dict[str, Any] = {
-                "flow": CASE_FLOWS[CASE_REVISION_SESSION],
-                "process_context": app.security_context.evidence(),
-            }
-            phases = (self.phase_trust, self.phase_decisions)
-            for run, name_of_phase in zip(phases, PHASES, strict=True):
-                with phase(name_of_phase.upper()):
-                    observations.update(run(app, provider, source))
-            # The tab is dirty: quit through the guard, unsaved.
-            with phase("QUIT"):
-                self.quit_via_menu(app)
-                self.click_lifecycle_decision(app, "Discard")
-                self.wait_process_exit(app)
-            return self._finalize_observations(provider, case_root, app, observations)
-        finally:
+        with NetworkProbeListeners() as network_probes:
+            provider = provider_fixtures.LoopbackRevisionServer().start()
+            app = None
             try:
-                if app is not None and app.process.poll() is None:
-                    self.reap(app)
+                case_root, data, config, workspace, stderr = self.profile(
+                    provider.base_url, network_probes
+                )
+                source = workspace / FIXTURE_FILE
+                app = self.launch_app(source, data, config, workspace, stderr)
+                observations: dict[str, Any] = {
+                    "flow": CASE_FLOWS[CASE_REVISION_SESSION],
+                    "process_context": app.security_context.evidence(),
+                }
+                phases = (self.phase_web_security, self.phase_decisions)
+                for run, name_of_phase in zip(phases, PHASES, strict=True):
+                    with phase(name_of_phase.upper()):
+                        observations.update(run(app, provider, source))
+                # The tab is dirty: quit through the guard, unsaved.
+                with phase("QUIT"):
+                    self.quit_via_menu(app)
+                    self.click_lifecycle_decision(app, "Discard")
+                    self.wait_process_exit(app)
+                return self._finalize_observations(provider, case_root, app, observations)
             finally:
-                provider.close()
+                try:
+                    if app is not None and app.process.poll() is None:
+                        self.reap(app)
+                finally:
+                    provider.close()
 
     def scenario(self, case_id: str) -> dict[str, Any]:
         observations = {CASE_REVISION_SESSION: self.scenario_revision_session}[case_id]()

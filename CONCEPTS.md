@@ -149,19 +149,13 @@ eligible environment credentials without placing their values in settings or UI 
 storage. A persistent credential is keyed by Model Endpoint Identity and is considered stored
 only after a read-back verifies the write.
 
-## Trust
+## Web Preview Isolation
 
-### Trust Level
-How much of a document's own content the Web Renderer is permitted to do. Every document
-starts at the restricted level, on the premise that a file obtained by cloning a
-repository is not automatically trustworthy; raising it is an explicit, per-document act.
-
-What trust grants depends on the document type, and the difference is the whole boundary.
-For MDX it is script execution, still under a policy that refuses all *subresource*
-network access — trusted content may run but cannot fetch or load anything remote. For a
-local HTML file it is instead the filesystem: the file is loaded from disk rather than
-from an opaque origin, so its own relative images and stylesheets resolve, which is the
-only reason to trust one. That also places it outside the policy above.
+The Web Renderer puts Markdown, MDX and HTML in the same sandboxed frame.
+Inline scripts can run immediately, but the document has no file base or
+application message handler. Its policy denies network and file resource
+loads, form submissions, new windows and navigation to external documents.
+Remote scripts and relative assets do not load.
 
 ## Review
 

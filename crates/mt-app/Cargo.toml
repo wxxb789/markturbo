@@ -41,6 +41,9 @@ tracing.workspace = true
 markdown.workspace = true
 encoding_rs.workspace = true
 dirs.workspace = true
+getrandom = "0.4"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
 rust-embed.workspace = true
 
 nsh-core = "=0.6.1"

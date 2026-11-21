@@ -257,7 +257,7 @@ class StatePlanTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "CLEAN_PROFILE_WELCOME_DOCUMENT_OPEN")
 
     def test_a_document_state_waits_for_the_fixture_tab(self) -> None:
-        ui = FakeUi({"title-file"}, {"title-menu-web": {"web-trust"}})
+        ui = FakeUi({"title-file"}, {"title-menu-web": {"web-view"}})
         ui.names["title-file"] = "other.md"
         with self.assertRaises(runtime.HarnessFailure) as raised:
             fake_harness(ui).prepare(APP, cell("web-compatibility-preview"), Path("p"), None)
@@ -265,7 +265,7 @@ class StatePlanTests(unittest.TestCase):
 
         ui.names["title-file"] = visual.PLAN_NAME
         markers = fake_harness(ui).prepare(APP, cell("web-compatibility-preview"), Path("p"), None)
-        self.assertEqual(markers[-1], "web-trust")
+        self.assertEqual(markers[-1], "web-view")
 
     def test_review_sends_only_through_the_consent_hold(self) -> None:
         ui = FakeUi(

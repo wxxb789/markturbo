@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import socket
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +34,7 @@ ALL_ACCEPTED = runtime.fingerprint_bytes(HARNESS.apply_edits(HARNESS.EDITOR_SOUR
 DISK = runtime.fingerprint_bytes(HARNESS.SOURCE_BYTES)
 STALE = runtime.fingerprint_text(HARNESS.STALE_EDIT)
 PROPOSAL_AFTER = 'goal07 = "new"'
+PIXEL_CELL_RESULTS = [True] * (len(HARNESS.FIXTURE_ATTEMPT_SOURCE) + 3)
 
 
 def credential_target(endpoint: str) -> str:
@@ -41,7 +45,8 @@ def passing_observations(case_id: str = CASE) -> dict[str, Any]:
     """A passed session's observations: every phase's measurements as expected."""
     return case_observations(
         HARNESS.CASE_FLOWS[case_id],
-        **HARNESS.expected_fingerprints(),
+        **HARNESS.expected_observations(),
+        web_security_cell_results=list(PIXEL_CELL_RESULTS),
         provider_request_count=HARNESS.EXPECTED_REQUEST_COUNT,
     )
 
@@ -101,8 +106,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertGreater(script["range"]["start"], multibyte_line_end)
         self.assertLess(script["range"]["end"], owner["range"]["start"])
         accepted = HARNESS.apply_edits(HARNESS.SOURCE_BYTES, PROVIDER.fixture_edits(HARNESS.SOURCE_TEXT)[:1])
-        self.assertIn(b'<script>window.goal07 = "new";</script>\r\n<p>owner: TBD</p>', accepted)
-        self.assertIn("<p>trusted 文档 🚀</p>\r\n".encode("utf-8"), accepted)
+        self.assertIn(b'window.goal07 = "new";\r\n', accepted)
+        self.assertIn(b"<p>owner: TBD</p>\r\n", accepted)
+        self.assertIn("<p>fixture 文档 🚀</p>\r\n".encode("utf-8"), accepted)
 
     def test_each_fingerprint_must_hold_its_expected_bytes(self) -> None:
         for key in sorted(HARNESS.FINGERPRINT_OBSERVATION_KEYS):
@@ -110,6 +116,72 @@ class EvidenceTests(unittest.TestCase):
                 evidence = valid_evidence()
                 evidence["cases"][0]["observations"][key] = fingerprint(b"other bytes")
                 with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected bytes"):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_cell_results_and_window_count_are_required_and_typed(self) -> None:
+        invalid_results = list(PIXEL_CELL_RESULTS)
+        invalid_results[1] = False
+        malformed_results = list(PIXEL_CELL_RESULTS)
+        malformed_results[1] = 1
+        for key, value, message in (
+            ("web_security_cell_results", invalid_results, "WebView pixel cells are incomplete"),
+            (
+                "web_security_post_navigation_cell_results",
+                [1],
+                "invalid post-navigation pixel-cell observations",
+            ),
+            (
+                "web_security_post_navigation_cell_results",
+                [True],
+                "web_security_post_navigation_cell_results does not hold the expected value",
+            ),
+            (
+                "web_security_cell_results",
+                malformed_results,
+                "invalid WebView pixel-cell observations",
+            ),
+            ("web_security_window_count", 2, "web_security_window_count does not hold the expected value"),
+            ("web_security_window_count", True, "web_security_window_count does not hold the expected value"),
+        ):
+            with self.subTest(key=key, value=value):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_passed_evidence_requires_the_exact_dynamic_cell_count(self) -> None:
+        for cell_results in (PIXEL_CELL_RESULTS[:-1], [*PIXEL_CELL_RESULTS, True]):
+            with self.subTest(cell_count=len(cell_results)):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"]["web_security_cell_results"] = cell_results
+                with self.assertRaisesRegex(ValueError, "invalid WebView pixel-cell observations"):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_each_new_web_observation_is_required_on_its_own(self) -> None:
+        for key in (
+            "web_security_cell_results",
+            "web_security_post_navigation_cell_results",
+            "web_security_tcp_contact_count",
+            "web_security_udp_contact_count",
+        ):
+            with self.subTest(key=key):
+                evidence = valid_evidence()
+                observations = evidence["cases"][0]["observations"]
+                self.assertIn(key, observations)
+                del observations[key]
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_network_observations_require_zero_listener_contacts(self) -> None:
+        for key, value in (
+            ("web_security_tcp_contact_count", 1),
+            ("web_security_udp_contact_count", 1),
+            ("web_security_tcp_contact_count", False),
+        ):
+            with self.subTest(key=key, value=value):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected value"):
                     HARNESS.validate_evidence(evidence)
 
     def test_the_session_needs_exactly_one_review_and_one_revision(self) -> None:
@@ -311,6 +383,9 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                 (case_root / "config" / "settings.toml").write_bytes(b"keyless")
                 (case_root / "stderr.log").write_bytes(b"")
                 provider = mock.Mock(request_count=2)
+                harness.network_probes = mock.Mock(
+                    snapshot=mock.Mock(return_value={"tcp_contacts": 0, "udp_contacts": 0})
+                )
                 real_scan = HARNESS.scan_case_artifacts
 
                 def scan(*args):
@@ -326,6 +401,7 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                 self.assertEqual(result["provider_request_count"], 2)
                 self.assertEqual(result["runtime_scan"]["files_scanned"], 3)
                 self.assertCountEqual(kernel.closed, kernel.opened)
+                harness.network_probes.close.assert_called_once_with()
 
     def test_quiescence_failure_never_reaches_provider_finalization_or_privacy_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -416,20 +492,24 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
 class SessionTests(unittest.TestCase):
     """The single launch: its profile, its phases in order and their failures."""
 
-    def test_profile_writes_only_the_trusted_document_and_never_touches_credential_manager(
+    def test_profile_writes_only_the_security_fixture_and_never_touches_credential_manager(
         self,
     ) -> None:
         win32 = mock.Mock()
         harness = bare_harness(win32=win32)
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, HARNESS.NetworkProbeListeners() as probes:
             harness.root = Path(directory)
             case_root, data, config, workspace, stderr = harness.profile(
-                "http://127.0.0.1:43123/v1/"
+                "http://127.0.0.1:43123/v1/", probes
             )
             self.assertEqual(case_root, data.parent)
+            fixture = HARNESS.fixture_source(probes).encode("utf-8")
             self.assertEqual(
                 {path.name: path.read_bytes() for path in workspace.iterdir()},
-                {HARNESS.TRUST_FILE: HARNESS.SOURCE_BYTES},
+                {HARNESS.FIXTURE_FILE: fixture},
+            )
+            self.assertEqual(
+                HARNESS.canonicalize_fixture_source(fixture, probes), HARNESS.SOURCE_BYTES
             )
             self.assertEqual(
                 (config / "settings.toml").read_bytes(),
@@ -449,7 +529,7 @@ class SessionTests(unittest.TestCase):
         harness = bare_harness(
             profile=mock.Mock(return_value=(Path("case"), Path("data"), Path("config"), workspace, Path("stderr"))),
             launch_app=order.launch_app,
-            phase_trust=order.phase_trust,
+            phase_web_security=order.phase_web_security,
             phase_decisions=order.phase_decisions,
             quit_via_menu=order.quit_via_menu,
             click_lifecycle_decision=order.click_lifecycle_decision,
@@ -458,7 +538,11 @@ class SessionTests(unittest.TestCase):
             _finalize_observations=lambda _provider, _root, _app, observations: observations,
         )
         order.launch_app.return_value = app
-        order.phase_trust.return_value = {"trust_disk_before": DISK.evidence()}
+        order.phase_web_security.return_value = {
+            "web_security_disk_before": DISK.evidence(),
+            "web_security_cell_results": list(PIXEL_CELL_RESULTS),
+            "web_security_window_count": 1,
+        }
         order.phase_decisions.return_value = {"decisions_editor_stale": STALE.evidence()}
         return harness, order, app, provider
 
@@ -467,7 +551,7 @@ class SessionTests(unittest.TestCase):
         with mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider):
             observations = harness.scenario_revision_session()
 
-        source = Path("workspace") / HARNESS.TRUST_FILE
+        source = Path("workspace") / HARNESS.FIXTURE_FILE
         self.assertEqual(
             # The app is the launch's return value: its own calls are not steps.
             [call for call in order.mock_calls if not call[0].startswith("launch_app()")],
@@ -475,7 +559,7 @@ class SessionTests(unittest.TestCase):
                 mock.call.launch_app(
                     source, Path("data"), Path("config"), Path("workspace"), Path("stderr"),
                 ),
-                mock.call.phase_trust(app, provider, source),
+                mock.call.phase_web_security(app, provider, source),
                 mock.call.phase_decisions(app, provider, source),
                 mock.call.quit_via_menu(app),
                 mock.call.click_lifecycle_decision(app, "Discard"),
@@ -483,17 +567,21 @@ class SessionTests(unittest.TestCase):
                 mock.call.reap(app),
             ],
         )
-        self.assertEqual(observations["trust_disk_before"], DISK.evidence())
+        self.assertEqual(observations["web_security_disk_before"], DISK.evidence())
         self.assertEqual(observations["decisions_editor_stale"], STALE.evidence())
         self.assertEqual(observations["flow"], HARNESS.CASE_FLOWS[CASE])
         provider.close.assert_called_once_with()
 
     def test_a_phase_failure_names_its_phase_and_stops_the_session(self) -> None:
         harness, order, app, provider = self.session_harness()
-        order.phase_trust.side_effect = runtime.HarnessFailure("SCRIPTS_TRUSTED_TIMEOUT")
+        order.phase_web_security.side_effect = runtime.HarnessFailure(
+            "WEB_SECURITY_PIXEL_CELLS_TIMEOUT"
+        )
         with (
             mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
-            self.assertRaisesRegex(runtime.HarnessFailure, "^TRUST_SCRIPTS_TRUSTED_TIMEOUT$"),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "^WEB_SECURITY_PIXEL_CELLS_TIMEOUT$"
+            ),
         ):
             harness.scenario_revision_session()
         order.phase_decisions.assert_not_called()
@@ -503,7 +591,9 @@ class SessionTests(unittest.TestCase):
 
     def test_an_unexpected_measurement_fails_with_its_phase_key(self) -> None:
         for key, value, code in (
-            ("trust_disk_before", REVIEWED, "TRUST_DISK_BEFORE_UNEXPECTED"),
+            ("web_security_disk_before", REVIEWED, "WEB_SECURITY_DISK_BEFORE_UNEXPECTED"),
+            ("web_security_window_count", 2, "WEB_SECURITY_WINDOW_COUNT_UNEXPECTED"),
+            ("web_security_window_count", True, "WEB_SECURITY_WINDOW_COUNT_UNEXPECTED"),
             ("decisions_editor_one_accepted", ALL_ACCEPTED, "DECISIONS_EDITOR_ONE_ACCEPTED_UNEXPECTED"),
             ("decisions_clipboard_copied", ALL_ACCEPTED, "DECISIONS_CLIPBOARD_COPIED_UNEXPECTED"),
             ("decisions_disk_after", ONE_ACCEPTED, "DECISIONS_DISK_AFTER_UNEXPECTED"),
@@ -511,7 +601,8 @@ class SessionTests(unittest.TestCase):
             with self.subTest(code=code):
                 observed: dict[str, Any] = {}
                 with self.assertRaisesRegex(runtime.HarnessFailure, f"^{code}$"):
-                    with HARNESS.phase(key.partition("_")[0].upper()):
+                    phase_name = "WEB_SECURITY" if key.startswith("web_security_") else "DECISIONS"
+                    with HARNESS.phase(phase_name):
                         HARNESS.record(observed, key, value)
                 self.assertEqual(observed, {})
         observed = {}
@@ -527,63 +618,670 @@ class SessionTests(unittest.TestCase):
             harness.scenario(CASE)
 
 
+class PixelCellObservationTests(unittest.TestCase):
+    def synthetic_grid(
+        self, colors: list[tuple[int, int, int] | None], missing: int | None = None
+    ) -> Any:
+        from PIL import Image, ImageDraw
+
+        size = HARNESS.CELL_SIZE
+        gap = HARNESS.CELL_GAP
+        left = HARNESS.CELL_GRID_LEFT
+        top = HARNESS.CELL_GRID_TOP
+        image = Image.new(
+            "RGB",
+            (left + len(colors) * (size + gap), top + size + gap),
+            HARNESS.CELL_PAGE_COLOR,
+        )
+        draw = ImageDraw.Draw(image)
+        for index, color in enumerate(colors):
+            if index == missing:
+                continue
+            x = left + index * (size + gap)
+            draw.rectangle(
+                (x, top, x + size - 1, top + size - 1),
+                fill=HARNESS.CELL_PENDING_COLOR,
+                outline=HARNESS.CELL_BORDER_COLOR,
+                width=HARNESS.CELL_BORDER_WIDTH,
+            )
+            if color is not None:
+                draw.rectangle(
+                    (
+                        x + HARNESS.CELL_BORDER_WIDTH,
+                        top + HARNESS.CELL_BORDER_WIDTH,
+                        x + size - HARNESS.CELL_BORDER_WIDTH - 1,
+                        top + size - HARNESS.CELL_BORDER_WIDTH - 1,
+                    ),
+                    fill=color,
+                )
+        return image
+
+    def test_detector_reports_each_dynamic_cell_with_color_tolerance(self) -> None:
+        expected = [
+            HARNESS.CELL_SCRIPT_COLOR,
+            *([HARNESS.CELL_ATTEMPT_COLOR] * len(HARNESS.FIXTURE_ATTEMPT_SOURCE)),
+            HARNESS.CELL_COMPLETE_COLOR,
+            HARNESS.CELL_ASSIGNED_COLOR,
+        ]
+        image = self.synthetic_grid(expected)
+        self.assertEqual(HARNESS.detect_fixture_cells(image), [True] * len(expected))
+
+        noisy = self.synthetic_grid(
+            [tuple(channel + 5 for channel in color) for color in expected]
+        )
+        self.assertEqual(HARNESS.detect_fixture_cells(noisy), [True] * len(expected))
+
+    def test_detector_rejects_a_missing_or_wrong_color_cell(self) -> None:
+        expected = [
+            HARNESS.CELL_SCRIPT_COLOR,
+            *([HARNESS.CELL_ATTEMPT_COLOR] * len(HARNESS.FIXTURE_ATTEMPT_SOURCE)),
+            HARNESS.CELL_COMPLETE_COLOR,
+            HARNESS.CELL_ASSIGNED_COLOR,
+        ]
+        missing = self.synthetic_grid(expected, missing=1)
+        incomplete = [True, False, *([True] * (len(expected) - 2))]
+        self.assertEqual(HARNESS.detect_fixture_cells(missing), incomplete)
+
+        wrong_color = self.synthetic_grid(
+            [expected[0], (255, 0, 0), *expected[2:]]
+        )
+        self.assertEqual(
+            HARNESS.detect_fixture_cells(wrong_color), incomplete
+        )
+
+    def test_unpainted_attempt_cells_cannot_satisfy_the_verdict(self) -> None:
+        complete = list(PIXEL_CELL_RESULTS)
+        unpainted = list(complete)
+        unpainted[1] = False
+        self.assertTrue(HARNESS.fixture_cells_complete(complete))
+        self.assertFalse(HARNESS.fixture_cells_complete(unpainted))
+        self.assertFalse(HARNESS.fixture_cells_complete(complete[:-1]))
+        self.assertFalse(HARNESS.fixture_cells_complete([*complete, True]))
+
+
 class PhaseTests(unittest.TestCase):
     """Each phase's UI steps, in order, against fakes."""
 
-    def trust_harness(self, focus_returns: bool) -> tuple[HARNESS.Goal07Harness, mock.Mock, mock.Mock]:
+    def test_pixel_capture_locates_webview_before_window_capture(self) -> None:
+        from PIL import Image
+
+        from scripts.markturbo_tools.native import visual
+
+        calls: list[str] = []
+        app = mock.Mock(hwnd=73)
+        app.window = object()
+        win32 = mock.Mock()
+        harness = bare_harness(win32=win32)
+        window = mock.Mock()
+        window.webview_rect.side_effect = lambda _timeout: calls.append("rect") or (10, 20, 50, 60)
+        image = Image.new("RGB", (100, 90), (255, 255, 255))
+
+        def capture(_hwnd: int) -> Any:
+            calls.append("capture")
+            return image
+
+        with (
+            mock.patch.object(visual, "AppWindow", return_value=window),
+            mock.patch.object(visual, "capture_window", side_effect=capture),
+            mock.patch.object(HARNESS, "detect_fixture_cells", return_value=PIXEL_CELL_RESULTS) as detect,
+        ):
+            results = harness.read_fixture_cell_results(app)
+
+        self.assertEqual(calls, ["rect", "capture"])
+        self.assertEqual(results, PIXEL_CELL_RESULTS)
+        self.assertEqual(detect.call_args.args[0].size, (40, 40))
+
+    def web_security_harness(
+        self, focus_returns: bool
+    ) -> tuple[HARNESS.Goal07Harness, mock.Mock, mock.Mock]:
         order = mock.Mock()
         app = mock.Mock(hwnd=73)
-        harness = bare_harness(win32=mock.Mock())
-        for name in (
-            "menu_command", "_press", "confirm_system_alert", "wait_name", "editor_control",
-        ):
+        win32 = mock.Mock()
+        win32.foreground_focus.return_value = app.hwnd if focus_returns else 0
+        win32.foreground_window.return_value = app.hwnd
+        win32.visible_top_level_windows.return_value = (app.hwnd,)
+        app.process.poll.return_value = None
+        app.process.active_process_ids.return_value = (73, 74)
+        probes = mock.Mock()
+        probes.snapshot.return_value = {"tcp_contacts": 0, "udp_contacts": 0}
+        harness = bare_harness(win32=win32, network_probes=probes)
+        order.read_fixture_cell_results.side_effect = [list(PIXEL_CELL_RESULTS), []]
+        for name in ("menu_command", "read_fixture_cell_results", "editor_control"):
             setattr(harness, name, getattr(order, name))
-        harness.name_present = mock.Mock(return_value=False)
-        harness.win32.foreground_focus.return_value = app.hwnd if focus_returns else 0
         return harness, order, app
 
-    def test_trust_phase_trusts_scripts_then_hands_the_keyboard_back(self) -> None:
-        harness, order, app = self.trust_harness(focus_returns=True)
+    def test_web_phase_checks_pixel_cells_before_network_and_window_then_hands_keyboard_back(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
         ):
-            observed = harness.phase_trust(app, order.provider, Path("trusted.html"))
+            observed = harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
         self.assertEqual(
             order.mock_calls,
             [
                 mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
-                mock.call._press(app, HARNESS.TRUST_SCRIPTS_AUTOMATION_ID, "WEB_TRUST"),
-                mock.call.confirm_system_alert(
-                    app, mock.ANY, "SCRIPTS_TRUSTED_BEFORE_CONFIRMATION", confirmed=mock.ANY
-                ),
-                mock.call.wait_name(app, HARNESS.TRUSTED_BANNER, "Text", "SCRIPTS_TRUSTED_TIMEOUT"),
+                mock.call.read_fixture_cell_results(app),
+                mock.call.read_fixture_cell_results(app),
                 mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
                 mock.call.editor_control(app),
             ],
         )
-        self.assertEqual(observed, {"trust_disk_before": DISK.evidence()})
-        # The Run scripts alert is outside UIA: Enter answers it only while
-        # trust is still off, then the banner proves it.
-        still_undecided = order.confirm_system_alert.call_args.args[1]
-        self.assertTrue(still_undecided())
-        harness.name_present.return_value = True
-        self.assertFalse(still_undecided())
-        harness.name_present.assert_called_with(app, HARNESS.TRUSTED_BANNER, "Text")
+        self.assertEqual(
+            observed,
+            {
+                "web_security_disk_before": DISK.evidence(),
+                "web_security_cell_results": list(PIXEL_CELL_RESULTS),
+                "web_security_post_navigation_cell_results": [],
+                "web_security_window_count": 1,
+                "web_security_tcp_contact_count": 0,
+                "web_security_udp_contact_count": 0,
+            },
+        )
+        harness.win32.sleep.assert_has_calls(
+            [mock.call(HARNESS.NETWORK_PROBE_SETTLE_SECONDS)]
+        )
+        harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
+        harness.win32.foreground_window.assert_called_once_with()
+        harness.network_probes.snapshot.assert_called_once_with()
 
-    def test_trust_phase_fails_while_the_web_view_keeps_the_keyboard(self) -> None:
-        harness, order, app = self.trust_harness(focus_returns=False)
+    def test_web_phase_fails_when_sample_two_still_shows_the_fixture(self) -> None:
+        for post_navigation_cells in (PIXEL_CELL_RESULTS, PIXEL_CELL_RESULTS[:-1], [True]):
+            with self.subTest(post_navigation_cells=post_navigation_cells):
+                harness, order, app = self.web_security_harness(focus_returns=True)
+                order.read_fixture_cell_results.side_effect = [
+                    list(PIXEL_CELL_RESULTS),
+                    list(post_navigation_cells),
+                ]
+                with (
+                    mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+                    mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+                    self.assertRaisesRegex(
+                        runtime.HarnessFailure, "SELF_NAVIGATION_FRAME_NOT_REPLACED"
+                    ),
+                ):
+                    harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+                self.assertEqual(order.read_fixture_cell_results.call_count, 2)
+                harness.network_probes.snapshot.assert_not_called()
+                harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_does_not_treat_a_failed_sample_two_capture_as_empty(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [
+            list(PIXEL_CELL_RESULTS),
+            runtime.HarnessFailure("WEBVIEW_PIXEL_REGION_INVALID"),
+        ]
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(runtime.HarnessFailure, "WEBVIEW_PIXEL_REGION_INVALID"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        self.assertEqual(order.read_fixture_cell_results.call_count, 2)
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_requires_the_assigned_cell_in_sample_one(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [list(PIXEL_CELL_RESULTS[:-1]), []]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_fails_when_sample_one_is_blank(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [[], []]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_fails_when_sample_two_is_never_read(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+
+        def skip_navigation_sample(check: Callable[[], Any], *_args: Any, **_kwargs: Any) -> Any:
+            if order.read_fixture_cell_results.call_count == 0:
+                return wait_once(check, 1, "PIXEL_CELLS_TIMEOUT")
+            return True
+
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=skip_navigation_sample),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_SAMPLE_TWO_NOT_OBSERVED"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        self.assertEqual(order.read_fixture_cell_results.call_count, 1)
+        harness.network_probes.snapshot.assert_not_called()
+
+    def test_unpainted_pixel_cell_fails_before_network_or_window_verdict(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        incomplete = [True, *([False] * (len(PIXEL_CELL_RESULTS) - 1))]
+        order.read_fixture_cell_results.side_effect = [incomplete]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+        order.editor_control.assert_not_called()
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+
+    def test_web_phase_fails_closed_when_a_listener_counts_a_contact(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        harness.network_probes.snapshot.return_value = {"tcp_contacts": 1, "udp_contacts": 0}
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "TCP_CONTACT_COUNT_UNEXPECTED"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.win32.visible_top_level_windows.assert_not_called()
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.editor_control.assert_not_called()
+
+    def test_fixture_attempts_use_only_the_run_targets(self) -> None:
+        with HARNESS.NetworkProbeListeners() as probes:
+            source = HARNESS.fixture_source(probes)
+            self.assertIn(f'const tcpPort = "{probes.tcp_port}";', source)
+            self.assertIn(f'const udpPort = "{probes.udp_port}";', source)
+            self.assertIn(HARNESS.NETWORK_PROBE_HOST, source)
+            for attempt in (
+                "function fetchProbe",
+                "function imageProbe",
+                "navigator.sendBeacon",
+                "new WebSocket",
+                "new RTCPeerConnection",
+                "stun:127.0.0.1:${udpPort}",
+                "turn:127.0.0.1:${tcpPort}",
+                "dns-prefetch",
+                "preconnect",
+                'form.method = "post"',
+                "link.click()",
+                "form.requestSubmit()",
+                "new SubmitEvent(\"submit\", { bubbles: true, cancelable: true })",
+                "submitEvent.defaultPrevented",
+                'target="_self"',
+                'target="_blank"',
+                "frame.src = `https://127.0.0.1:${tcpPort}/subframe`",
+            ):
+                with self.subTest(attempt=attempt):
+                    self.assertIn(attempt, source)
+            self.assertIn('`https://127.0.0.1:${tcpPort}`', source)
+            self.assertNotIn("location = `${tcpLoopback}/frame`", source)
+            self.assertEqual(
+                source.count('location.href = "https://blocked-preview-navigation.invalid/"'), 1
+            )
+            self_location = source.index(
+                'location.href = "https://blocked-preview-navigation.invalid/"'
+            )
+            for attempt in (
+                'window.open(`${tcpLoopback}/popup`',
+                "top.location = `https://${probeHost}/top`",
+                "frame.src = `https://127.0.0.1:${tcpPort}/subframe`",
+                "submitForm(`${tcpLoopback}/form`)",
+                "submitForm(`${tcpHostname}/form`)",
+            ):
+                with self.subTest(script_navigation_before_self_location=attempt):
+                    self.assertLess(source.index(attempt), self_location)
+
+    def test_equal_dynamic_ports_canonicalize_at_their_declarations_only(self) -> None:
+        probes = mock.Mock(tcp_port=43123, udp_port=43123)
+        source = HARNESS.fixture_source(probes).encode("utf-8")
+        self.assertEqual(HARNESS.canonicalize_fixture_source(source, probes), HARNESS.SOURCE_BYTES)
+
+    def test_fixture_script_runs_all_attempts_in_order_with_fake_browser_apis(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is unavailable")
+        with HARNESS.NetworkProbeListeners() as probes:
+            source = HARNESS.fixture_source(probes)
+        start = source.index("<script>\r\n") + len("<script>\r\n")
+        end = source.index("</script>", start)
+        script = source[start:end]
+        node_harness = r"""
+const vm = require("node:vm");
+const expectedAttempts = Number(process.argv[1]);
+const mode = process.argv[2];
+const webrtcAttemptIndex = Number(process.argv[3]);
+const samplePauseMilliseconds = Number(process.argv[4]);
+const [pendingColor, scriptColor, attemptColor, completeColor, assignedColor] = process.argv.slice(5);
+const cells = [];
+const calls = [];
+const cellWrites = [];
+let sampleOne = null;
+let replaceAfterAssigned = false;
+let cellGrid;
+function makeStyle() {
+  let backgroundColor = "";
+  return {
+    width: "",
+    height: "",
+    border: "",
+    left: "",
+    top: "",
+    gap: "",
+    set backgroundColor(value) {
+      backgroundColor = value;
+      cellWrites.push([value, calls.length]);
+      if (value === assignedColor) {
+        sampleOne = sampleCells();
+        if (replaceAfterAssigned) cellGrid.children.length = 0;
+      }
+    },
+    get backgroundColor() { return backgroundColor; },
+  };
+}
+function makeCell() {
+  const cell = { style: makeStyle(), className: "" };
+  cells.push(cell);
+  return cell;
+}
+const scriptCell = makeCell();
+cellGrid = {
+  style: makeStyle(),
+  appendChild(cell) { this.children.push(cell); },
+  children: [scriptCell],
+};
+function sampleCells() {
+  return cellGrid.children.map((cell, index) => {
+    let expected = attemptColor;
+    if (index === 0) expected = scriptColor;
+    else if (index === expectedAttempts + 1) expected = completeColor;
+    else if (index === expectedAttempts + 2) expected = assignedColor;
+    return cell.style.backgroundColor === expected;
+  });
+}
+const userLink = {
+  href: "",
+  target: "_self",
+  listeners: {},
+  addEventListener(name, callback) { this.listeners[name] = callback; },
+  click() {
+    calls.push(["user-link", this.href, this.target]);
+    this.listeners.click?.({ defaultPrevented: true });
+  },
+};
+const userForm = {
+  action: "",
+  target: "_blank",
+  syntheticSubmitPrevented: false,
+  dispatchEvent(event) {
+    if (event.type !== "submit" || !event.bubbles || !event.cancelable) throw new Error("submit event shape mismatch");
+    event.defaultPrevented = true;
+    this.syntheticSubmitPrevented = event.defaultPrevented;
+    return false;
+  },
+  requestSubmit() {
+    if (!this.syntheticSubmitPrevented) throw new Error("submit cancellation missing");
+    calls.push(["user-form", this.action, this.target]);
+  },
+};
+const nodes = new Map([
+  ["goal07-cells", cellGrid],
+  ["goal07-script-cell", scriptCell],
+  ["goal07-user-link", userLink],
+  ["goal07-user-form", userForm],
+]);
+function element(tag) {
+  const value = { tag, style: {}, action: "", rel: "" };
+  if (tag === "img") Object.defineProperty(value, "src", { set(url) { calls.push(["img", url]); } });
+  if (tag === "link") Object.defineProperty(value, "href", { set(url) { calls.push(["link", value.rel, url]); } });
+  if (tag === "form") value.submit = () => { calls.push(["form", value.action]); throw new Error("blocked"); };
+  if (tag === "iframe") Object.defineProperty(value, "src", { set(url) { calls.push(["iframe", url]); } });
+  return value;
+}
+const context = {
+  document: {
+    getElementById: id => nodes.get(id),
+    createElement: tag => tag === "span" ? makeCell() : element(tag),
+    body: { appendChild() {} },
+    head: { appendChild() {} },
+  },
+  window: {
+    devicePixelRatio: 1,
+    open(url) { calls.push(["open", url]); return null; },
+  },
+  navigator: {
+    sendBeacon(url) { calls.push(["beacon", url]); return true; },
+  },
+  fetch(url) { calls.push(["fetch", url]); return Promise.resolve(); },
+  WebSocket: function (url) { calls.push(["websocket", url]); },
+  SubmitEvent: function (type, options) {
+    this.type = type;
+    this.bubbles = options.bubbles;
+    this.cancelable = options.cancelable;
+    this.defaultPrevented = false;
+  },
+  RTCPeerConnection: mode === "rtc-available" ? function (configuration) {
+    calls.push(["rtc"]);
+    context.__iceServers = configuration.iceServers;
+    this.createDataChannel = () => { context.__dataChannel = true; };
+    this.createOffer = () => Promise.resolve({ type: "offer" });
+    this.setLocalDescription = () => Promise.resolve();
+    this.close = () => {};
+  } : mode === "rtc-fails" ? function () { throw new Error("blocked"); } : undefined,
+  setTimeout(callback, milliseconds) {
+    if (milliseconds === samplePauseMilliseconds) {
+      if (mode === "missing-navigation") return 0;
+    }
+    if (mode !== "never-run") callback();
+    return 0;
+  },
+};
+context.top = {};
+Object.defineProperty(context.top, "location", {
+  set(url) { calls.push(["top", url]); throw new Error("blocked"); },
+});
+const location = {};
+Object.defineProperty(location, "href", {
+  set(url) {
+    calls.push(["location", url]);
+    if (mode === "setter-throws") throw new Error("blocked");
+    replaceAfterAssigned = mode === "success" || mode === "rtc-fails";
+  },
+});
+context.location = location;
+async function main() {
+  const source = require("node:fs").readFileSync(0, "utf8");
+  const runCall = "runAttempts();";
+  const callIndex = source.lastIndexOf(runCall);
+  if (callIndex < 0 || source.slice(callIndex + runCall.length).trim()) throw new Error("fixture runner call was not found");
+  const code = source.slice(0, callIndex) + "globalThis.__run = runAttempts();" + source.slice(callIndex + runCall.length);
+  const runner = vm.runInNewContext(code, context);
+  if (mode === "missing-navigation") await new Promise(setImmediate);
+  else if (mode !== "never-run") await runner;
+  const attemptCells = cells.slice(1, -2);
+  const completeCell = cells[cells.length - 2];
+  const assignedCell = cells[cells.length - 1];
+  const results = sampleCells();
+  if (attemptCells.length !== expectedAttempts) throw new Error("attempt cell count mismatch");
+  if (mode === "never-run") {
+    if (calls.length !== 0) throw new Error("fake browser unexpectedly ran an attempt");
+    if (attemptCells[0].style.backgroundColor !== pendingColor || completeCell.style.backgroundColor !== pendingColor || assignedCell.style.backgroundColor !== pendingColor) throw new Error("unstarted attempt painted a cell");
+    if (results.every(Boolean)) throw new Error("unstarted attempt passed the cell verdict");
+    console.log("pixel-cell verdict rejected unstarted attempts");
+    return;
+  }
+  if (mode === "setter-throws") {
+    if (sampleOne !== null || assignedCell.style.backgroundColor !== pendingColor) throw new Error("throwing navigation painted the assigned marker");
+    console.log("throwing navigation did not paint the assigned marker");
+    return;
+  }
+  if (mode === "rtc-available") {
+    if (!calls.some(([kind]) => kind === "rtc") || sampleOne !== null || results.every(Boolean) || context.__iceServers.length !== 2 || !context.__dataChannel) throw new Error("working WebRTC unexpectedly passed");
+    console.log("working WebRTC did not reach self-navigation");
+    return;
+  }
+  if (mode === "missing-navigation") {
+    if (sampleOne !== null || calls.some(([kind]) => kind === "location") || assignedCell.style.backgroundColor !== pendingColor) throw new Error("missing self-navigation reached the assigned marker");
+    console.log("fixture did not reach the assigned marker");
+    return;
+  }
+  if (mode === "rtc-fails") {
+    if (!sampleOne || !sampleOne.every(Boolean)) throw new Error("failed WebRTC attempt did not paint its cell");
+  }
+  const [lastKind, lastUrl] = calls.at(-1);
+  if (lastKind !== "location" || lastUrl !== "https://blocked-preview-navigation.invalid/") throw new Error("HTTPS self-navigation was not the last attempt");
+  if (!sampleOne || !sampleOne.every(Boolean)) throw new Error("sample 1 was incomplete before HTTPS self-navigation");
+  if (mode === "success" && results.length !== 0) throw new Error("browser block page did not replace the fixture");
+  if (mode === "cancelled-navigation" && !results.every(Boolean)) throw new Error("cancelled navigation unexpectedly replaced the fixture");
+  const attemptWrites = cellWrites.filter(([color]) => color === attemptColor);
+  if (attemptWrites.length !== expectedAttempts) throw new Error("attempt cells were not painted individually");
+  if (attemptWrites.slice(0, -1).some(([, callCount], index) => callCount !== index + 1 - (index >= webrtcAttemptIndex ? 1 : 0))) throw new Error("earlier attempt cell was not painted after its call returned");
+  if (attemptWrites.at(-1)[1] !== calls.length - 1) throw new Error("HTTPS navigation cell was not painted before its call");
+  const completeWrites = cellWrites.filter(([color]) => color === completeColor);
+  if (completeWrites.length !== 1 || completeWrites[0][1] !== calls.length - 1) throw new Error("about-to-self-navigate cell was not painted before HTTPS self-navigation");
+  const assignedWrites = cellWrites.filter(([color]) => color === assignedColor);
+  if (assignedWrites.length !== 1 || assignedWrites[0][1] !== calls.length) throw new Error("assigned cell was not painted after HTTPS self-navigation returned");
+  if (calls.length !== expectedAttempts - 1) throw new Error("not every automatic attempt ran");
+}
+main().catch(error => { console.error(error.message); process.exitCode = 1; });
+"""
+        webrtc_index = next(
+            index
+            for index, attempt in enumerate(HARNESS.FIXTURE_ATTEMPT_SOURCE)
+            if "new RTCPeerConnection" in attempt
+        )
+        for mode in (
+            "success",
+            "rtc-fails",
+            "rtc-available",
+            "never-run",
+            "missing-navigation",
+            "cancelled-navigation",
+            "setter-throws",
+        ):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [
+                        node,
+                        "-e",
+                        node_harness,
+                        str(len(HARNESS.FIXTURE_ATTEMPT_SOURCE)),
+                        mode,
+                        str(webrtc_index),
+                        "1000",
+                        HARNESS._css_rgb(HARNESS.CELL_PENDING_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_SCRIPT_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_ATTEMPT_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_COMPLETE_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_ASSIGNED_COLOR),
+                    ],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.strip())
+                if mode == "never-run":
+                    self.assertIn("pixel-cell verdict rejected unstarted attempts", result.stdout)
+                elif mode == "rtc-available":
+                    self.assertIn("working WebRTC did not reach self-navigation", result.stdout)
+                elif mode == "missing-navigation":
+                    self.assertIn("fixture did not reach the assigned marker", result.stdout)
+                elif mode == "setter-throws":
+                    self.assertIn("throwing navigation did not paint the assigned marker", result.stdout)
+
+    def test_probe_listeners_bind_ephemeral_loopback_ports_and_count_only_contacts(self) -> None:
+        with HARNESS.NetworkProbeListeners() as probes:
+            self.assertGreater(probes.tcp_port, 0)
+            self.assertGreater(probes.udp_port, 0)
+            self.assertEqual(probes._tcp_socket.getsockname()[0], "127.0.0.1")
+            self.assertEqual(probes._udp_socket.getsockname()[0], "127.0.0.1")
+            with socket.create_connection(("127.0.0.1", probes.tcp_port), timeout=1.0):
+                pass
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                udp.sendto(b"probe", ("127.0.0.1", probes.udp_port))
+            finally:
+                udp.close()
+            self.assertEqual(probes.snapshot(), {"tcp_contacts": 1, "udp_contacts": 1})
+
+    def test_listener_failure_cannot_be_reported_as_zero_contacts(self) -> None:
+        class FailingListener:
+            def accept(self):
+                raise OSError("fixture socket failure")
+
+        probes = HARNESS.NetworkProbeListeners()
+        probes._started = True
+        probes._tcp_socket = FailingListener()
+        with self.assertRaisesRegex(runtime.HarnessFailure, "NETWORK_PROBE_LISTENER_FAILED"):
+            probes.snapshot()
+
+    def test_web_phase_rejects_a_missing_completion_cell(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [[*PIXEL_CELL_RESULTS[:-2], False, True], []]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^PIXEL_CELLS_TIMEOUT$"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.read_fixture_cell_results.assert_called_once_with(app)
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_fails_if_a_popup_creates_an_extra_owned_window(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        harness.win32.visible_top_level_windows.return_value = (app.hwnd, 93)
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_COUNT_UNEXPECTED"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.editor_control.assert_not_called()
+
+    def test_web_phase_fails_when_a_new_window_leaves_the_app_foreground(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        harness.win32.foreground_window.return_value = 93
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_FOREGROUND_LOST"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
+
+    def test_web_phase_fails_while_the_web_view_keeps_the_keyboard(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=False)
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
             self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"),
         ):
-            harness.phase_trust(app, order.provider, Path("trusted.html"))
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
     def decisions_harness(self, accept_offered: bool = False) -> tuple[HARNESS.Goal07Harness, mock.Mock]:
         order = mock.Mock()
-        harness = bare_harness()
+        harness = bare_harness(network_probes=mock.Mock())
         for name in (
             "review_and_revise", "_named_texts", "editor_fingerprint", "decide_hunks",
             "undo_decision", "copy_approved", "replace_editor", "wait_name", "control_absent",
@@ -600,11 +1298,11 @@ class PhaseTests(unittest.TestCase):
         order.control_absent.return_value = not accept_offered
         return harness, order
 
-    def test_decisions_phase_walks_accept_reject_undo_copy_stale_done_restricted(self) -> None:
+    def test_decisions_phase_walks_accept_reject_undo_copy_stale_and_done(self) -> None:
         harness, order = self.decisions_harness()
         app, provider = mock.Mock(hwnd=73), order.provider
-        with mock.patch.object(HARNESS, "sha256_file", return_value=DISK):
-            observed = harness.phase_decisions(app, provider, Path("trusted.html"))
+        with mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK):
+            observed = harness.phase_decisions(app, provider, Path(HARNESS.FIXTURE_FILE))
 
         self.assertEqual(
             order.mock_calls,
@@ -630,10 +1328,6 @@ class PhaseTests(unittest.TestCase):
                     "REVISION_ACCEPT_UIA_QUERY_FAILED", "REVISION_ACCEPT_UIA_CONTRACT_MISMATCH",
                 ),
                 mock.call.done(app, HARNESS.REVISION_APPLIED),
-                mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
-                mock.call.wait_name(
-                    app, HARNESS.RESTRICTED_BANNER, "Text", "SCRIPTS_RESTRICTED_TIMEOUT"
-                ),
                 mock.call.provider.verify_chain(),
             ],
         )
@@ -648,26 +1342,41 @@ class PhaseTests(unittest.TestCase):
             set(observed),
         )
 
+    def test_decisions_phase_canonicalizes_dynamic_ports_in_the_clipboard(self) -> None:
+        probes = mock.Mock(tcp_port=43123, udp_port=54234)
+        harness, order = self.decisions_harness()
+        harness.network_probes = probes
+        order.copy_approved.return_value = HARNESS.fixture_source(probes).replace(
+            "\r\n", "\n"
+        ).replace('window.goal07 = "old";', 'window.goal07 = "new";')
+
+        with mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK):
+            observed = harness.phase_decisions(
+                mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE)
+            )
+
+        self.assertEqual(observed["decisions_clipboard_copied"], ONE_ACCEPTED.evidence())
+
     def test_a_wrong_measurement_stops_the_phase_before_its_next_step(self) -> None:
         # Accept wrote nothing: the read fails at once, before Reject could
         # time out first.
         harness, order = self.decisions_harness()
         order.editor_fingerprint.side_effect = [REVIEWED, REVIEWED]
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "^EDITOR_ONE_ACCEPTED_UNEXPECTED$"),
         ):
-            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path("trusted.html"))
+            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE))
         self.assertEqual(order.decide_hunks.call_count, 1)
         order.copy_approved.assert_not_called()
 
     def test_decisions_phase_fails_when_the_changed_part_still_offers_accept(self) -> None:
         harness, order = self.decisions_harness(accept_offered=True)
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "^REVISION_OFFERS_ACCEPT$"),
         ):
-            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path("trusted.html"))
+            harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE))
         order.done.assert_not_called()
 
 
@@ -711,7 +1420,11 @@ class StepTests(unittest.TestCase):
 
     def test_the_chain_is_bound_to_the_document_before_the_review(self) -> None:
         order = mock.Mock()
-        harness = bare_harness(run_review=order.run_review, request_revision=order.request_revision)
+        harness = bare_harness(
+            run_review=order.run_review,
+            request_revision=order.request_revision,
+            editor_source_text=HARNESS.EDITOR_SOURCE_TEXT,
+        )
         app, provider = mock.Mock(), order.provider
 
         hunks = harness.review_and_revise(app, provider)

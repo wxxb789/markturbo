@@ -100,7 +100,6 @@ pub struct Tab {
     pub dirty: Signal<bool>,
     pub revision: Signal<u64>,
     pub pane: Signal<Pane>,
-    pub web_trusted: Signal<bool>,
     pub conflict: Signal<bool>,
     pub untitled: bool,
     pub recovery_key: RecoveryKey,
@@ -1065,7 +1064,6 @@ impl AppState {
                 dirty: signal(dirty),
                 revision: signal(0),
                 pane: signal(self.chosen_pane.get()),
-                web_trusted: signal(false),
                 conflict: signal(false),
                 untitled: true,
                 recovery_key,
@@ -1108,7 +1106,6 @@ impl AppState {
                 dirty: signal(dirty),
                 revision: signal(0),
                 pane: signal(self.chosen_pane.get()),
-                web_trusted: signal(false),
                 conflict: signal(false),
                 untitled: false,
                 recovery_key,
@@ -1838,12 +1835,10 @@ impl AppState {
     }
 
     /// Replace the tab's buffer with the file as it is on disk, which the
-    /// tab now tracks. Trust was granted to the buffer it replaces: it is
-    /// revoked first, so the disk's text never runs scripts under it.
+    /// tab now tracks.
     fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
-        tab.web_trusted.set(false);
         tab.text.set(SharedString::from(text));
         tab.dirty.set(false);
         tab.conflict.set(false);
@@ -1853,11 +1848,8 @@ impl AppState {
     }
 
     /// Write model-produced text (a translation, a Revision decision) into
-    /// the tab as one unsaved edit. Trust was granted to the text before this
-    /// write: it is revoked first, so the new text never runs scripts under
-    /// it.
+    /// the tab as one unsaved edit.
     fn write_model_text(&self, tab: &Tab, text: String) {
-        tab.web_trusted.set(false);
         tab.text.set(SharedString::from(text));
         tab.dirty.set(true);
         tab.revision.update(|revision| *revision += 1);
@@ -1994,27 +1986,6 @@ impl AppState {
             tab.pane.set(pane);
             self.chosen_pane.set(pane);
         }
-    }
-
-    /// Scripts in the Web pane need one explicit decision per tab.
-    pub fn request_web_trust(&self, id: u64) {
-        let state = self.clone();
-        self.spawn_task(async move {
-            let answer = alert_dialog()
-                .title("Run scripts in this document?")
-                .description(
-                    "Trusted HTML and MDX may execute scripts inside the Web pane. Only trust content you opened deliberately.",
-                )
-                .destructive("trust", "Run scripts")
-                .cancel("cancel", "Cancel")
-                .show()
-                .await;
-            if answer.is_ok_and(|answer| answer.action.as_deref() == Some("trust")) {
-                for tab in state.tabs.get().iter().filter(|tab| tab.id == id) {
-                    tab.web_trusted.set(true);
-                }
-            }
-        });
     }
 
     /// Saves the active document through the core's guarded commit. A conflict
@@ -3811,47 +3782,24 @@ mod tests {
 
     const SOURCE: &str = "compiles but no check\n";
 
-    /// What the probe saw: the text and trust after the accept and after
-    /// the undo, then every (text, trust) a text watcher observed.
-    type Outcome = ((String, bool), (String, bool), Vec<(String, bool)>);
+    /// What the probe saw after the accept and undo.
+    type Outcome = (String, String);
 
     static OUTCOME: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
 
-    /// Every (text, trust) a watcher of the tab's text observes, as the Web
-    /// pane does: the trust is read when the text changes, not watched.
-    fn watch_text_and_trust(tab: &Tab) -> Rc<RefCell<Vec<(String, bool)>>> {
-        let seen = Rc::new(RefCell::new(Vec::new()));
-        let watch = seen.clone();
-        let (text, trusted) = (tab.text, tab.web_trusted);
-        effect(move || {
-            let text = text.get().to_string();
-            let trusted = untracked(|| trusted.get());
-            watch.borrow_mut().push((text, trusted));
-        });
-        seen
+    fn read_text(tab: &Tab) -> String {
+        tab.text.get().to_string()
     }
 
-    fn read(tab: &Tab) -> (String, bool) {
-        (tab.text.get().to_string(), tab.web_trusted.get())
-    }
-
-    /// Accepts, then undoes, one Revision change in a trusted document, as
-    /// the hunk card does.
+    /// Accepts, then undoes, one Revision change, as the hunk card does.
     #[component]
-    fn TrustProbe() -> impl IntoElement {
+    fn RevisionWriteProbe() -> impl IntoElement {
         let (state, tab) = proposed();
-
-        // Whatever watches the text (the Web pane) must never see revised
-        // text under the trust granted to the text before it.
-        let seen = watch_text_and_trust(&tab);
-
-        tab.web_trusted.set(true);
         assert!(state.set_revision_change_applied(0, true), "accept");
-        let accepted = read(&tab);
-        tab.web_trusted.set(true);
+        let accepted = read_text(&tab);
         assert!(state.set_revision_change_applied(0, false), "undo");
-        let undone = read(&tab);
-        *OUTCOME.lock().expect("the outcome") = Some((accepted, undone, seen.borrow().clone()));
+        let undone = read_text(&tab);
+        *OUTCOME.lock().expect("the outcome") = Some((accepted, undone));
         view()
     }
 
@@ -3882,32 +3830,20 @@ mod tests {
     }
 
     #[test]
-    fn every_revision_write_revokes_web_script_trust_first() {
+    fn revision_accept_and_undo_update_the_buffer() {
         let mut app =
             nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                TrustProbe,
+                RevisionWriteProbe,
             >()))
             .expect("start the probe");
         app.first_render().expect("render the probe");
-        let (accepted, undone, seen) = OUTCOME
+        let (accepted, undone) = OUTCOME
             .lock()
             .expect("the outcome")
             .take()
             .expect("the probe ran");
-        assert_eq!(
-            accepted,
-            (
-                "compiles, but no check
-"
-                .to_owned(),
-                false
-            )
-        );
-        assert_eq!(undone, (SOURCE.to_owned(), false));
-        assert!(
-            seen.iter().skip(1).all(|(_, trusted)| !trusted),
-            "a watcher saw revised text under old trust: {seen:?}"
-        );
+        assert_eq!(accepted, "compiles, but no check\n");
+        assert_eq!(undone, SOURCE);
     }
 
     /// The status after a first and a second `Done` over one proposal.
@@ -4143,10 +4079,10 @@ mod tests {
         );
     }
 
-    static REPLACED: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
+    static REPLACED: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
     /// Lands a translation, then takes the disk version (the conflict's
-    /// `Use disk version`), each over a document whose scripts are trusted.
+    /// `Use disk version`).
     #[component]
     fn ReplaceProbe() -> impl IntoElement {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -4160,59 +4096,34 @@ mod tests {
         state.new_document();
         let tab = state.active_tab().expect("the new document");
         tab.text.set(SharedString::from(SOURCE));
-        let seen = watch_text_and_trust(&tab);
-
-        tab.web_trusted.set(true);
         state.write_model_text(
             &tab,
             "translated
 "
             .to_owned(),
         );
-        let translated = read(&tab);
-        tab.web_trusted.set(true);
+        let translated = read_text(&tab);
         state.adopt_disk_version(&tab, io::load(&path).expect("load the file"));
-        let reloaded = read(&tab);
-        *REPLACED.lock().expect("the outcome") =
-            Some((translated, reloaded, seen.borrow().clone()));
+        let reloaded = read_text(&tab);
+        *REPLACED.lock().expect("the outcome") = Some((translated, reloaded));
         view()
     }
 
     #[test]
-    fn a_translation_and_the_disk_version_revoke_web_script_trust_first() {
+    fn a_translation_and_disk_reload_update_the_buffer() {
         let mut app =
             nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
                 ReplaceProbe,
             >()))
             .expect("start the probe");
         app.first_render().expect("render the probe");
-        let (translated, reloaded, seen) = REPLACED
+        let (translated, reloaded) = REPLACED
             .lock()
             .expect("the outcome")
             .take()
             .expect("the probe ran");
-        assert_eq!(
-            translated,
-            (
-                "translated
-"
-                .to_owned(),
-                false
-            )
-        );
-        assert_eq!(
-            reloaded,
-            (
-                "on disk
-"
-                .to_owned(),
-                false
-            )
-        );
-        assert!(
-            seen.iter().skip(1).all(|(_, trusted)| !trusted),
-            "a watcher saw replaced text under old trust: {seen:?}"
-        );
+        assert_eq!(translated, "translated\n");
+        assert_eq!(reloaded, "on disk\n");
     }
 }
 
