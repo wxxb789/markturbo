@@ -407,16 +407,22 @@ fn a_fading_menu_row_does_not_take_a_press_and_workspace_remains_reachable() {
     let split = "id:title-menu-split";
 
     press_without_settling(&app, settings);
-    app.wait_for(split).expect("the split row is open");
-    for _ in 0..2 {
-        app.next_frame(Duration::from_millis(16))
-            .expect("advance the menu entrance");
-    }
+    app.wait_for("id:title-menu-split-web")
+        .expect("the split web row is open");
+    app.press("id:title-menu-split-web")
+        .expect("show the web pane in the field");
+    app.wait_for("id:web-trust")
+        .expect("the untrusted web pane's action");
+
+    app.press(settings)
+        .expect("reopen the menu over the web pane");
     let split_row = app
         .screen()
         .press_target(split)
         .expect("the selector parses")
         .expect("the open row receives presses");
+
+    app.answer_dialogs_myself();
 
     press_without_settling(&app, settings);
     for _ in 0..2 {
@@ -424,10 +430,20 @@ fn a_fading_menu_row_does_not_take_a_press_and_workspace_remains_reachable() {
             .expect("advance into the menu exit");
     }
     let exit_nodes = app.screen().layout_nodes();
-    exit_nodes
+    let menu = exit_nodes
         .iter()
         .find(|node| node.test_id.as_deref() == Some("title-menu"))
         .expect("the menu remains mounted during the fade");
+    let web_trust = exit_nodes
+        .iter()
+        .find(|node| node.test_id.as_deref() == Some("web-trust"))
+        .expect("the web action remains under the menu during the fade");
+    assert!(
+        menu.bounds.contains(&web_trust.bounds.center()),
+        "the web action center {:?} lies under the exiting menu {:?}",
+        web_trust.bounds.center(),
+        menu.bounds
+    );
     exit_nodes
         .iter()
         .find(|node| node.id == split_row)
@@ -440,7 +456,23 @@ fn a_fading_menu_row_does_not_take_a_press_and_workspace_remains_reachable() {
     );
     app.press(split)
         .expect_err("the fading split row cannot take a press");
-    // Headless::press dispatches the selected press before settling the animation.
+    // Headless::press checks the control's center against overlays; the trust
+    // prompt proves the underlay action received the press.
+    app.press("id:web-trust")
+        .expect("the web action remains reachable during the menu exit");
+    support::wait_for_pending_dialog(
+        &mut app,
+        "the web trust action received the press",
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        app.pending_dialog()
+            .and_then(|dialog| dialog.title.as_deref()),
+        Some("Run scripts in this document?"),
+        "the web action, not the exiting menu, received the press"
+    );
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Cancel".to_owned()))
+        .expect("cancel the web trust prompt");
     app.press("label:plan.md")
         .expect("the workspace rail remains reachable during the exit");
     app.wait_for("id:title-file >> text:plan.md")

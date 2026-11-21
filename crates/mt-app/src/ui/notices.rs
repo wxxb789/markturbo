@@ -23,7 +23,7 @@
 //! Every control carries an accessibility label.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ops::Range,
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -33,6 +33,7 @@ use mt_core::{recovery::RecoveredRecord, settings::Language};
 use nsh_base::editor::{EditorDecoration, EditorPosition, EditorRange};
 use nsh_core::{
     Color, DecorationStyle, PropertyValue, StyleKey, TextDecoration,
+    element::AnimatedValue,
     element::{KeyOptions, Style, on_key_with},
     keymap::When,
     prelude::*,
@@ -290,6 +291,25 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
     let disk_state = state.clone();
     let save_as_state = state.clone();
     let panel_state = state.clone();
+    let comparison = signal(None::<Rc<Comparison>>);
+    effect({
+        let state = state.clone();
+        let previous = Cell::new(None);
+        move || {
+            let active = state.active.get();
+            let changed_tab = previous.replace(active) != active;
+            if let Some(tab) = state.active_tab().filter(|tab| tab.conflict.get()) {
+                let content = (state.conflict_compare.get() == Some(tab.id))
+                    .then(|| comparison_content(&state, &tab))
+                    .flatten();
+                comparison.set(content.map(Rc::new));
+            } else if changed_tab {
+                comparison.set(None);
+            }
+            // On resolution the document is already replaced. Leave the last
+            // comparison intact until its parent banner finishes fading.
+        }
+    });
     let disabled = move || !has_conflict(&state);
     view()
         .test_id("conflict-banner")
@@ -339,11 +359,8 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
                 ),
         )
         .child(when(
-            {
-                let state = panel_state.clone();
-                move || compare_open(&state).is_some()
-            },
-            move || compare_panel(panel_state.clone(), language).into_element(),
+            move || comparison.get().is_some(),
+            move || compare_panel(panel_state.clone(), comparison, language).into_element(),
         ))
         .child(banner_rule())
 }
@@ -431,19 +448,26 @@ fn step_difference(state: &AppState, delta: isize) {
 ///
 /// Its lines are keyed by (difference, line), so stepping to another
 /// difference replaces them, and the counter is bound to the state.
-fn compare_panel(state: AppState, language: Language) -> impl IntoElement {
-    bind_compare_keys(&state);
-    let counter_state = state.clone();
-    let lines_state = state.clone();
-    let hidden_state = state.clone();
+fn compare_panel(
+    state: AppState,
+    comparison: Signal<Option<Rc<Comparison>>>,
+    language: Language,
+) -> impl IntoElement {
+    let keys_state = state.clone();
+    let active_state = state.clone();
     let back_state = state.clone();
     let forward_state = state.clone();
+    let hidden = move || comparison.get().map_or(0, |content| content.hidden);
     view()
         .test_id("conflict-compare")
         .w_full()
         .flex_col()
         .gap(px(SPACE_2))
         .pt(px(SPACE_4))
+        .child(when(
+            move || has_conflict(&active_state),
+            move || bind_compare_keys(&keys_state),
+        ))
         .child(
             view()
                 .w_full()
@@ -451,12 +475,19 @@ fn compare_panel(state: AppState, language: Language) -> impl IntoElement {
                 .items_center()
                 .gap(px(SPACE_2))
                 .child(
-                    text(move || counter_text(&counter_state, language))
-                        .font_family(tokens::FONT_UI)
-                        .text_size(px(tokens::TYPE_UI))
-                        .line_height(px(tokens::TYPE_UI_LINE))
-                        .tabular_nums()
-                        .text_color(move || tokens::palette().ink_rest),
+                    text(move || {
+                        comparison
+                            .get()
+                            .and_then(|content| content.current)
+                            .map_or_else(String::new, |(index, total)| {
+                                difference_text(index + 1, total, language)
+                            })
+                    })
+                    .font_family(tokens::FONT_UI)
+                    .text_size(px(tokens::TYPE_UI))
+                    .line_height(px(tokens::TYPE_UI_LINE))
+                    .tabular_nums()
+                    .text_color(move || tokens::palette().ink_rest),
                 )
                 .child(view().flex_1())
                 .child(prims::kbd("J"))
@@ -480,7 +511,11 @@ fn compare_panel(state: AppState, language: Language) -> impl IntoElement {
                 .border_l(px(HAIRLINE))
                 .border_l_color(move || tokens::palette().hairline)
                 .child(each(
-                    move || compare_lines(&lines_state),
+                    move || {
+                        comparison
+                            .get()
+                            .map_or_else(Vec::new, |content| content.lines.clone())
+                    },
                     |line: &CompareLine| (line.difference, line.line),
                     move |line: ReadSignal<CompareLine>, _| {
                         compare_line(&line.get().spans).into_element()
@@ -488,11 +523,8 @@ fn compare_panel(state: AppState, language: Language) -> impl IntoElement {
                 )),
         )
         .child(when(
-            {
-                let state = hidden_state.clone();
-                move || hidden_lines(&state) > 0
-            },
-            move || prims::faint(more_lines_text(hidden_lines(&hidden_state), language)),
+            move || hidden() > 0,
+            move || prims::faint(more_lines_text(hidden(), language)),
         ))
 }
 
@@ -541,13 +573,11 @@ struct CompareLine {
 /// have them (the dashed mark). Whitespace never marks.
 type Marked = (String, bool);
 
-/// 'Difference 2 of 5' for the comparison's current state, empty while it is
-/// closed or nothing differs.
-fn counter_text(state: &AppState, language: Language) -> String {
-    let Some((index, total)) = compare_summary(state) else {
-        return String::new();
-    };
-    difference_text(index + 1, total, language)
+#[derive(Default, PartialEq)]
+struct Comparison {
+    current: Option<(usize, usize)>,
+    lines: Vec<CompareLine>,
+    hidden: usize,
 }
 
 /// Which difference of how many the comparison shows, clamped to what
@@ -562,34 +592,17 @@ fn compare_summary(state: &AppState) -> Option<(usize, usize)> {
     Some((state.conflict_difference.get().min(total - 1), total))
 }
 
-/// The disk lines of the comparison's current difference, at most
-/// [`COMPARE_MAX_LINES`] of them, each marked against the buffer.
-fn compare_lines(state: &AppState) -> Vec<CompareLine> {
-    compare_region(state).0
-}
-
-/// How many lines of the current difference the panel's cap hides.
-fn hidden_lines(state: &AppState) -> usize {
-    compare_region(state).1
-}
-
-/// The comparison's current region: the disk lines the panel shows, and how
-/// many more lines the difference has.
-fn compare_region(state: &AppState) -> (Vec<CompareLine>, usize) {
-    let Some((index, _)) = compare_summary(state) else {
-        return (Vec::new(), 0);
-    };
-    let Some(tab) = compare_open(state) else {
-        return (Vec::new(), 0);
-    };
-    let Some(disk) = disk_text(state, &tab) else {
-        return (Vec::new(), 0);
-    };
+/// Capture the panel's marked disk lines and counter together, so both can
+/// outlive the conflict during the banner's exit.
+fn comparison_content(state: &AppState, tab: &Tab) -> Option<Comparison> {
+    let disk = disk_text(state, tab)?;
     let mine = tab.text.get().to_string();
     let diffs = differences(&mine, &disk);
-    let Some(difference) = diffs.get(index) else {
-        return (Vec::new(), 0);
-    };
+    if diffs.is_empty() {
+        return Some(Comparison::default());
+    }
+    let index = state.conflict_difference.get().min(diffs.len() - 1);
+    let difference = &diffs[index];
     let mine_lines = split_lines(&mine);
     let disk_lines = split_lines(&disk);
     let mine_region = mine_lines[difference.mine.clone()].join("\n");
@@ -606,7 +619,11 @@ fn compare_region(state: &AppState) -> (Vec<CompareLine>, usize) {
             spans,
         })
         .collect();
-    (lines, hidden)
+    Some(Comparison {
+        current: Some((index, diffs.len())),
+        lines,
+        hidden,
+    })
 }
 
 /// `text.split('\n')` without the trailing empty line a final newline makes
@@ -1215,19 +1232,33 @@ fn card_action(
 
 // ─── status line ──────────────────────────────────────────────────────────
 
+fn clear_status_if_current(state: &AppState, generation: u64) {
+    if state.status_generation.get_untracked() == generation {
+        state.status.set(SharedString::default());
+    }
+}
+
 /// The quiet line at the foot of the column: what the app last did, at resting
 /// ink. Local, so it never glows. Something done fades after a moment and
 /// leaves the line empty; an error, a refusal or a wait
 /// ([`AppState::notify_held`]) stays until the next message. The line keeps
 /// its height either way, so nothing under or above it moves.
 pub fn status_line(state: AppState, language: Language) -> impl IntoElement {
+    status_line_with_opacity(state, language, animated_value(0.0))
+}
+
+fn status_line_with_opacity(
+    state: AppState,
+    language: Language,
+    opacity: AnimatedValue,
+) -> impl IntoElement {
     let _ = language;
-    let opacity = animated_value(0.0);
     let rise = animated_value(motion::CARD_RISE_PX);
     let steps: Rc<RefCell<Vec<Spawned<()>>>> = Rc::default();
     let watched = state.clone();
     effect(move || {
         let message = watched.status.get();
+        let generation = watched.status_generation.get();
         let held = watched.status_held.get_untracked();
         // A new message cancels the last one's fade and retargets from the
         // current opacity and offset.
@@ -1271,11 +1302,7 @@ pub fn status_line(state: AppState, language: Language) -> impl IntoElement {
         let clearing = watched.clone();
         let clear = set_timeout(
             Duration::from_millis(motion::STATUS_HOLD_MS + enter_ms as u64 + exit_ms as u64),
-            move || {
-                if clearing.status.get_untracked() == message {
-                    clearing.status.set(SharedString::default());
-                }
-            },
+            move || clear_status_if_current(&clearing, generation),
         );
         steps.borrow_mut().extend([fade, clear]);
     });
@@ -1305,7 +1332,7 @@ pub fn banner_rule() -> impl IntoElement {
 
 /// J and K walk the differences while the comparison is on screen (and no text
 /// input is being edited, so the editor keeps its own letters); Escape closes
-/// it. The bindings die with the panel.
+/// it. The bindings die when the comparison stops being active.
 fn bind_compare_keys(state: &AppState) {
     for (key, delta) in [("j", 1isize), ("k", -1isize)] {
         let state = state.clone();
@@ -1407,6 +1434,7 @@ fn more_lines_text(hidden: usize, language: Language) -> String {
 mod tests {
     use super::*;
     use std::{
+        cell::Cell,
         sync::mpsc,
         time::{Duration, SystemTime},
     };
@@ -1414,11 +1442,42 @@ mod tests {
     use nsh_engine::{EngineConfig, Points, Root};
     use nsh_testing::Headless;
 
+    #[derive(Clone, PartialEq, Props)]
+    struct StatusProbeProps {
+        content: Option<Renderer<bool>>,
+    }
+
     #[component]
-    fn StatusProbe() -> impl IntoElement {
+    fn StatusProbe(props: StatusProbeProps) -> impl IntoElement {
+        props.content.unwrap().render("status-probe", true)
+    }
+
+    #[component]
+    fn StatusClearProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let clear_state = state.clone();
+        view()
+            .test_id("status-clear-trigger")
+            .on_press(move |_: &PressEvent| {
+                clear_state.notify("First status");
+                let first = clear_state.status_generation.get_untracked();
+                clear_state.notify_held("Second status");
+                clear_status_if_current(&clear_state, first);
+
+                let second = clear_state.status_generation.get_untracked();
+                clear_state.notify_held("Second status");
+                clear_status_if_current(&clear_state, second);
+            })
+            .child(prims::ink("Trigger status clear"))
+            .child(text(move || state.status.get()))
+    }
+
+    fn status_probe_content(samples: mpsc::Sender<f32>) -> impl IntoElement {
         let state = AppState::new();
         let start = state.clone();
         let takeover = state.clone();
+        let opacity = animated_value(0.0);
+        let read_task = Cell::new(None::<Spawned<()>>);
         view()
             .w(px(400.0))
             .h(px(120.0))
@@ -1441,7 +1500,19 @@ mod tests {
                     })
                     .child(prims::ink("Take over")),
             )
-            .child(status_line(state, Language::English))
+            .child(status_line_with_opacity(state, Language::English, opacity))
+            .child(
+                view()
+                    .test_id("status-opacity-read")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        let samples = samples.clone();
+                        read_task.set(Some(spawn(async move {
+                            let _ = samples.send(opacity.value().await);
+                        })));
+                    })
+                    .child(prims::ink("Read opacity")),
+            )
     }
 
     fn press_without_settling(app: &mut Headless, selector: &str) {
@@ -1462,8 +1533,16 @@ mod tests {
         app.catch_up();
     }
 
-    fn status_app() -> Headless {
-        let mut config = EngineConfig::new(Root::of::<StatusProbe>());
+    fn status_app(samples: mpsc::Sender<f32>) -> Headless {
+        let root = Root::new::<StatusProbe>(move || {
+            let samples = samples.clone();
+            StatusProbeProps {
+                content: Some(Renderer::new(move |_| {
+                    status_probe_content(samples.clone())
+                })),
+            }
+        });
+        let mut config = EngineConfig::new(root);
         config.clock = nsh_core::time::Clock::manual(SystemTime::now());
         let mut app = Headless::start(config).expect("start the status harness");
         app.set_viewport(nsh_core::Size::new(Points(400.0), Points(120.0)))
@@ -1473,9 +1552,23 @@ mod tests {
         app
     }
 
+    fn status_opacity(app: &mut Headless, samples: &mpsc::Receiver<f32>) -> f32 {
+        press_without_settling(app, "id:status-opacity-read");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            app.catch_up();
+            match samples.recv_timeout(Duration::from_millis(10)) {
+                Ok(value) => return value,
+                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("read status opacity: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn a_new_status_takes_over_during_the_previous_exit() {
-        let mut app = status_app();
+        let (sent, samples) = mpsc::channel();
+        let mut app = status_app(sent);
         press_without_settling(&mut app, "id:status-start");
         assert!(app.screen().shows("First status"));
         app.next_frame(Duration::from_millis(16))
@@ -1486,15 +1579,41 @@ mod tests {
         app.wait(Duration::from_millis(before_old_clear))
             .expect("advance halfway through the old status exit");
         assert!(app.screen().shows("First status"));
+        let old_opacity = status_opacity(&mut app, &samples);
+        assert!(
+            old_opacity > 0.0 && old_opacity < 1.0,
+            "the old status must be partway through its exit, got {old_opacity}"
+        );
 
         press_without_settling(&mut app, "id:status-takeover");
         assert!(app.screen().shows("Second status"));
+
+        app.wait(Duration::from_millis(motion::ENTER_MS as u64 + 16))
+            .expect("finish the replacement's enter animation");
+        let opacity = status_opacity(&mut app, &samples);
+        assert!(
+            (opacity - 1.0).abs() < 0.001,
+            "the replacement status opacity must reach 1, got {opacity}"
+        );
 
         app.wait(Duration::from_millis(motion::EXIT_MS as u64 + 250))
             .expect("advance past the old status clear deadline");
         assert!(
             app.screen().shows("Second status"),
             "the old status timeout must not clear its replacement"
+        );
+    }
+
+    #[test]
+    fn an_old_status_clear_does_not_remove_a_newer_notice() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<StatusClearProbe>()))
+            .expect("start the status-clear probe");
+        app.wait_for("id:status-clear-trigger")
+            .expect("the status-clear control");
+        press_without_settling(&mut app, "id:status-clear-trigger");
+        assert!(
+            app.screen().shows("Second status"),
+            "an old clear must not remove a newer notice, even when its text repeats"
         );
     }
 

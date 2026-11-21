@@ -92,18 +92,28 @@ pub(super) struct Presence {
 
 impl Presence {
     pub fn new(open: impl Fn() -> bool + 'static) -> Self {
+        Self::scoped(move || ((), open()))
+    }
+
+    /// A change of owner replaces the surface instantly rather than animating
+    /// the previous owner's content into or out of the new owner's view.
+    pub fn scoped<K: Copy + Eq + 'static>(target: impl Fn() -> (K, bool) + 'static) -> Self {
         let visible = signal(false);
         let opacity = animated_value(0.0);
         let previous = Cell::new(None);
         let hide = Cell::new(None::<Spawned<()>>);
         effect(move || {
-            let open = open();
+            let (key, open) = target();
             let reduced = reduced_motion();
-            if previous.replace(Some((open, reduced))) == Some((open, reduced)) {
+            let before = previous.replace(Some((key, open, reduced)));
+            if before == Some((key, open, reduced)) {
                 return;
             }
             hide.set(None);
-            if open {
+            if before.is_some_and(|(previous_key, _, _)| previous_key != key) {
+                opacity.set(if open { 1.0 } else { 0.0 });
+                visible.set(open);
+            } else if open {
                 visible.set(true);
                 let ms = if reduced {
                     REDUCED_CROSSFADE_MS

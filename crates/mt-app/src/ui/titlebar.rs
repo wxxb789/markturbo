@@ -1059,5 +1059,22 @@ mod tests {
             closing.1,
             reopening.1
         );
+
+        for _ in 0..2 {
+            app.next_frame(Duration::from_millis(16)).unwrap();
+        }
+        let advancing = menu_values(&mut app, &samples);
+        assert!(
+            advancing.0 > reopening.0,
+            "reopened opacity advances toward 1: {} to {}",
+            reopening.0,
+            advancing.0
+        );
+        assert!(
+            advancing.1 > reopening.1,
+            "reopened scale advances toward 1: {} to {}",
+            reopening.1,
+            advancing.1
+        );
     }
 }

@@ -176,12 +176,17 @@ fn column(state: AppState, language: Language, layout: Layout) -> impl IntoEleme
         })
         .child(banner_slot(
             "recovery-banner-slot",
-            move || notices::has_recovery(&recovery_state),
+            move || (None, notices::has_recovery(&recovery_state)),
             move || notices::recovery_banner(state_for_recovery.clone(), language),
         ))
         .child(banner_slot(
             "conflict-banner-slot",
-            move || notices::has_conflict(&conflict_state),
+            move || {
+                (
+                    conflict_state.active.get(),
+                    notices::has_conflict(&conflict_state),
+                )
+            },
             move || notices::conflict_banner(conflict_banner_state.clone(), language),
         ))
         .child(
@@ -274,7 +279,7 @@ fn draw_field(state: AppState, language: Language, want: FieldSurface) -> AnyEle
 ///
 /// The overlay sits above the whole window: the room dims to 30% under it while
 /// a consent is waiting, and the card floats — the app's only shadow.
-fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
+pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
     let consent_state = state.clone();
     let guard_state = state.clone();
     overlay()
@@ -328,26 +333,30 @@ fn overlay_layer(state: AppState, language: Language) -> impl IntoElement {
 /// keeps its natural height while the slot clips it and moves the text below.
 fn banner_slot<E: IntoElement + 'static>(
     id: &'static str,
-    open: impl Fn() -> bool + Clone + 'static,
+    target: impl Fn() -> (Option<u64>, bool) + Clone + 'static,
     content: impl Fn() -> E + 'static,
 ) -> impl IntoElement {
     let frame = element_ref();
     let laid_out = signal(false);
-    let expanded = move || laid_out.get() && open();
-    let presence = motion::Presence::new(expanded.clone());
-    let before = Cell::new(false);
-    effect({
-        let expanded = expanded.clone();
-        move || {
-            let open = expanded();
-            if before.replace(open) != open && !motion::reduced_motion() {
-                let ms = if open {
-                    motion::ENTER_MS
-                } else {
-                    motion::EXIT_MS
-                };
-                frame.animate_layout(motion::ease_out_layout(ms));
-            }
+    let target = move || {
+        let (tab, open) = target();
+        (tab, laid_out.get() && open)
+    };
+    let expanded = {
+        let target = target.clone();
+        move || target().1
+    };
+    let presence = motion::Presence::scoped(target.clone());
+    let before = Cell::new(None);
+    effect(move || {
+        let (tab, open) = target();
+        if before.replace(Some((tab, open))) == Some((tab, !open)) && !motion::reduced_motion() {
+            let ms = if open {
+                motion::ENTER_MS
+            } else {
+                motion::EXIT_MS
+            };
+            frame.animate_layout(motion::ease_out_layout(ms));
         }
     });
     view()
@@ -584,6 +593,136 @@ mod tests {
     }
 
     #[component]
+    fn ConflictBannerProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let other = state.active.get().expect("untitled tab");
+        let dir = tempfile::tempdir().expect("conflict fixture directory");
+        let path = dir.path().join("conflict.md");
+        std::fs::write(&path, "Original buffer").expect("write fixture");
+        state.open_file(path.clone());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .child(control("probe-conflict", &state, move |state| {
+                let _keep_file = &dir;
+                std::fs::write(&path, "Updated disk contents").expect("external write");
+                state.active_tab().expect("file tab").conflict.set(true);
+            }))
+            .child(control("probe-switch-tab", &state, move |state| {
+                let next = if state.active.get() == Some(other) {
+                    state.tabs.get().last().expect("file tab").id
+                } else {
+                    other
+                };
+                state.set_active(next);
+            }))
+            .child(shell(state, Language::English, Layout::Wide))
+    }
+
+    fn conflict_probe() -> Headless {
+        let mut config =
+            EngineConfig::new(Root::of::<ConflictBannerProbe>().tokens(tokens::theme()));
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("the probe's window");
+        app.wait_for("text:Original buffer").expect("file loaded");
+        press_without_settling(&mut app, "probe-conflict");
+        app.wait_for("id:conflict-banner").expect("conflict banner");
+        app
+    }
+
+    #[test]
+    fn switching_tabs_does_not_animate_the_conflict_banner() {
+        use nsh_core::MountItem;
+
+        let mut app = conflict_probe();
+        let batches = capture_batches(&mut app);
+        for expected_open in [false, true] {
+            press_without_settling(&mut app, "probe-switch-tab");
+            let height = node(&app, "conflict-banner-slot").bounds.size.height.0;
+            assert_eq!(height > 0.0, expected_open, "banner must follow the tab");
+            assert!(
+                !batches.try_iter().flatten().any(|item| matches!(
+                    item,
+                    MountItem::LayoutAnimation(animation) if animation.update.is_some()
+                )),
+                "switching to a tab with conflict={expected_open} animated layout"
+            );
+            assert_eq!(
+                app.screen()
+                    .layout_nodes()
+                    .iter()
+                    .any(|node| node.test_id.as_deref() == Some("conflict-banner")),
+                expected_open,
+                "switching must not leave the old banner mounted"
+            );
+        }
+    }
+
+    #[test]
+    fn using_disk_version_keeps_compare_content_mounted_during_banner_exit() {
+        use nsh_core::{EventKind, EventPayload, PayloadValue, ROOT_ID};
+
+        fn content(node: &LayoutNode) -> Option<&str> {
+            node.text.as_ref().map(|text| text.text.text.as_str())
+        }
+
+        let mut app = conflict_probe();
+        press_without_settling(&mut app, "conflict-compare");
+        app.wait_for("id:conflict-previous").expect("comparison");
+        let before = app.screen().layout_nodes();
+        let watched: Vec<_> = before
+            .iter()
+            .filter(|node| {
+                node.test_id.as_deref() == Some("conflict-previous")
+                    || matches!(
+                        content(node),
+                        Some("Difference 1 of 1" | "Updated disk contents")
+                    )
+            })
+            .collect();
+        assert_eq!(watched.len(), 3, "Compare controls, counter and disk text");
+        press_without_settling(&mut app, "conflict-use-disk");
+        // Answer without Headless's settle step, which would finish the fade.
+        let dialog = app.pending_dialog().expect("reload confirmation");
+        let reload = dialog
+            .buttons
+            .iter()
+            .position(|button| button.text == "Reload")
+            .expect("reload action");
+        app.engine().control().dispatch_event(
+            ROOT_ID,
+            EventKind::Dialog,
+            EventPayload::Map(vec![
+                ("id", PayloadValue::Number(f64::from(dialog.id))),
+                ("index", PayloadValue::Number(reload as f64)),
+            ]),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app
+            .screen()
+            .matches("id:source-editor >> text:Updated disk contents")
+            .unwrap()
+        {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            app.next_batch(remaining).expect("reload batch");
+        }
+        // Headless clips against the final zero-height frame, not the native
+        // interpolated frame. Check the mounted nodes rather than visibility.
+        let after = app.screen().layout_nodes();
+        for expected in watched {
+            assert!(
+                after
+                    .iter()
+                    .any(|node| node.id == expected.id && content(node) == content(expected)),
+                "Compare content was removed or changed during the fade: {expected:?}"
+            );
+        }
+    }
+
+    #[component]
     fn GuardProbe() -> impl IntoElement {
         let state = AppState::new();
         state.new_document();
@@ -796,12 +935,10 @@ mod tests {
         app
     }
 
-    fn capture_motion(app: &mut Headless) -> std::sync::mpsc::Receiver<nsh_core::MountItem> {
+    fn capture_batches(app: &mut Headless) -> std::sync::mpsc::Receiver<Vec<nsh_core::MountItem>> {
         let (send, receive) = std::sync::mpsc::channel();
         app.observe(move |_, batch| {
-            for item in &batch.items {
-                let _ = send.send(item.clone());
-            }
+            let _ = send.send(batch.items.clone());
         });
         receive
     }
@@ -866,9 +1003,9 @@ mod tests {
             config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
             let mut app = Headless::start(config).expect("start the probe");
             app.wait_for(&format!("id:{open}")).expect("open control");
-            let batches = capture_motion(&mut app);
+            let batches = capture_batches(&mut app);
             press_without_settling(&mut app, open);
-            let entry: Vec<_> = batches.try_iter().collect();
+            let entry: Vec<_> = batches.try_iter().flatten().collect();
             let layer_id = node(&app, layer).id;
             let card_id = node(&app, card).id;
             let opacity = binding_nodes(&entry, layer_id)[0];
@@ -889,7 +1026,7 @@ mod tests {
             animator.tick(0.0);
             animator.tick(0.04);
             press_without_settling(&mut app, close);
-            for item in batches.try_iter() {
+            for item in batches.try_iter().flatten() {
                 animator.apply(&item);
             }
             animator.tick(0.08);
@@ -902,7 +1039,7 @@ mod tests {
             );
 
             press_without_settling(&mut app, open);
-            for item in batches.try_iter() {
+            for item in batches.try_iter().flatten() {
                 animator.apply(&item);
             }
             animator.tick(0.08);
@@ -940,18 +1077,21 @@ mod tests {
         let mut app = recovery_probe();
         let before = node(&app, "recovery-banner-slot");
         let document = node(&app, "document-slot");
-        let batches = capture_motion(&mut app);
+        let batches = capture_batches(&mut app);
         press(&mut app, "probe-show-recovery");
         let after = node(&app, "recovery-banner-slot");
-        let transitioned =
-            transitioned_frames(&batches.try_iter().collect::<Vec<_>>(), motion::ENTER_MS);
+        let transitioned: Vec<_> = batches
+            .try_iter()
+            .map(|batch| transitioned_frames(&batch, motion::ENTER_MS))
+            .collect();
         assert!(
             before.id == after.id
                 && before.bounds.size.height.0 == 0.0
                 && after.bounds.size.height.0 > 0.0
                 && node(&app, "document-slot").bounds.origin.y.0 > document.bounds.origin.y.0
-                && transitioned.contains(&before.id)
-                && transitioned.contains(&document.id),
+                && transitioned
+                    .iter()
+                    .any(|frames| frames.contains(&before.id) && frames.contains(&document.id)),
             "the existing banner slot must expand from zero and move the document in the same transition: {transitioned:?}"
         );
     }
@@ -961,25 +1101,28 @@ mod tests {
         use nsh_core::{MountItem, animation::AnimationOp};
 
         let mut app = recovery_probe();
-        let batches = capture_motion(&mut app);
+        let batches = capture_batches(&mut app);
         press(&mut app, "probe-show-recovery");
         let slot = node(&app, "recovery-banner-slot");
         let document = node(&app, "document-slot");
-        let all: Vec<_> = batches.try_iter().collect();
+        let all: Vec<_> = batches.try_iter().flatten().collect();
         let fade = node(&app, "banner-fade");
         let opacity = binding_nodes(&all, fade.id)[0];
         press(&mut app, "recovery-discard-0");
         app.wait_for_gone("id:recovery-banner", std::time::Duration::from_secs(2))
             .unwrap();
         let exit: Vec<_> = batches.try_iter().collect();
-        let transitioned = transitioned_frames(&exit, motion::EXIT_MS);
+        let transitioned: Vec<_> = exit
+            .iter()
+            .map(|batch| transitioned_frames(batch, motion::EXIT_MS))
+            .collect();
         let mut animator = nsh_core::animation::Animator::default();
         animator.apply(&MountItem::Animation(AnimationOp::CreateValue {
             node: opacity,
             value: 1.0,
         }));
         animator.tick(1.0);
-        for item in &exit {
+        for item in exit.iter().flatten() {
             if matches!(item, MountItem::Animation(AnimationOp::Start { node, .. }) if *node == opacity)
             {
                 animator.apply(item);
@@ -990,8 +1133,9 @@ mod tests {
         let mid_fade = animator.value(opacity);
         animator.tick(1.2);
         assert!(
-            transitioned.contains(&slot.id)
-                && transitioned.contains(&document.id)
+            transitioned
+                .iter()
+                .any(|frames| frames.contains(&slot.id) && frames.contains(&document.id))
                 && node(&app, "recovery-banner-slot").bounds.size.height.0 == 0.0
                 && mid_fade > 0.0
                 && mid_fade < 1.0

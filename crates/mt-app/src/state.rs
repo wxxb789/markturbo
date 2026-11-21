@@ -124,6 +124,9 @@ pub struct AppState {
     pub tabs: Signal<Vec<Tab>>,
     pub active: Signal<Option<u64>>,
     pub status: Signal<SharedString>,
+    /// Distinguishes notifications even when their text is identical, so an
+    /// older fade cannot clear a newer status line.
+    pub(crate) status_generation: Signal<u64>,
     /// Whether the status line's message holds until the next one (an error,
     /// a refusal, a wait) rather than fading after a moment (something done).
     /// Write both through [`AppState::notify`] and [`AppState::notify_held`].
@@ -596,6 +599,7 @@ impl AppState {
             tabs: signal(Vec::new()),
             active: signal(None),
             status: signal(status),
+            status_generation: signal(0_u64),
             status_held: signal(notice.is_some()),
             search_query: signal(String::new()),
             search_results: signal(Vec::new()),
@@ -705,6 +709,8 @@ impl AppState {
     /// Say something the app did on the status line; it fades after a moment.
     pub fn notify(&self, message: impl Into<SharedString>) {
         self.status_held.set(false);
+        self.status_generation
+            .set(self.status_generation.get_untracked().wrapping_add(1));
         self.status.set(message.into());
     }
 
@@ -712,6 +718,8 @@ impl AppState {
     /// still happening: the line holds it until the next message.
     pub fn notify_held(&self, message: impl Into<SharedString>) {
         self.status_held.set(true);
+        self.status_generation
+            .set(self.status_generation.get_untracked().wrapping_add(1));
         self.status.set(message.into());
     }
 
@@ -1854,9 +1862,12 @@ impl AppState {
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
         tab.web_trusted.set(false);
-        tab.text.set(SharedString::from(text));
-        tab.dirty.set(false);
-        tab.conflict.set(false);
+        // The retiring comparison must not diff the reloaded buffer.
+        batch(|| {
+            tab.text.set(SharedString::from(text));
+            tab.dirty.set(false);
+            tab.conflict.set(false);
+        });
         tab.revision.update(|revision| *revision += 1);
         self.retire_tab_recovery(tab);
         self.recovery_tracks.borrow_mut().remove(&tab.id);

@@ -40,40 +40,36 @@ in `ui/motion.rs`. `ui/prims.rs` checks the pressed plate for a quiet action,
 plate button and row while the gesture is held, using the native pressed-state
 report that Headless does not send automatically. It also checks the mounted
 transition on press-down and on a theme change under stationary hover.
-`ui/titlebar.rs` checks
-disabled Review and samples live menu opacity and scale on both sides of each
-reversal without advancing the clock between samples. `ui/consent.rs` checks
-that a reduced-motion card mounts without transform bindings in its subtree.
+`ui/titlebar.rs` checks disabled Review and samples live menu opacity and scale
+on both sides of each reversal, then advances the clock to verify that both move toward the open
+target. `ui/consent.rs` checks that the production consent wrapper and its
+subtree mount without transform bindings under reduced motion.
 Headless checks editor typing after closing a Revision result, that reopening
 Review does not replay the previous anchor, and that Accept stays visible
 and non-actionable when unavailable.
 The clean-profile welcome test checks that Review remains visible and disabled.
-Headless checks the banner's persistent zero-height slot, the scoped frame
-updates for that slot and the document, and the exit fade. It reports target
-layout frames, not native in-flight positions. The modal tests sample the
+Headless checks the banner's persistent zero-height slot, that the slot and
+document frame updates share one batch with the layout animation, and the
+exit fade. The conflict banner switches tabs without animating and keeps
+Compare mounted during resolution. These tests report target layout frames,
+not native in-flight positions. The modal tests sample the
 mounted animation graph through a close/reopen and check that discarding a
 dirty tab does not animate removal of its rail row or editor.
-The menu exit test checks that the scrim is gone and the workspace action
-still executes. Headless routes those presses semantically; native pointer
-hit testing remains part of desktop acceptance.
+The menu exit test checks that the scrim is gone and a workspace control
+under the fading panel receives a press. Native pointer hit testing remains
+part of desktop acceptance. The notice takeover test samples the replacement
+at full opacity and checks that stale cleanup cannot clear it.
 
 | Command | Exit | Result |
 | --- | ---: | --- |
 | `cargo fmt --all -- --check` | 0 | No formatting differences. |
 | `cargo clippy --profile ci -p mt-core -p mt-app --all-targets` | 0 | 2 existing mt-core warnings and 1 existing mt-app test warning; no new warnings. |
-| `cargo test --profile ci -p mt-app` | 0 | 42 test targets; 252 passed, 0 failed, 0 ignored (245 passed before the review fixes). |
-| `cargo test --profile ci -p mt-core --features model-transport` | 0 | 833 passed, 0 failed, 7 ignored. |
-| `uv run --locked --project scripts scripts/mt.py check fast` | 1 | 232 passed; 1 known failure in 1 of 8 tooling shards. |
+| `cargo test --profile ci -p mt-app` | 0 | 42 test targets; 255 passed, 0 failed, 0 ignored (252 passed before this fix round). |
+| `cargo test --profile ci -p mt-core --features model-transport` | 0 | 835 passed, 0 failed, 7 ignored. |
+| `uv run --locked --project scripts scripts/mt.py check fast` | 0 | 234 passed across 8 tooling shards. |
 
-During implementation, `mt.py check ci` stopped at the same tooling failure
-before the Rust phase. The review fix stage reran the Rust gates directly.
-
-The failing probe was
-`Goal04BuildEvidenceTests.test_cargo_config_context_records_only_content_free_fingerprints`.
-It reproduced in isolation (1 test, 1 failure, exit 1): the enclosing
-worktree directory's shared Cargo config is fingerprinted alongside the
-test's temporary Cargo-home config, so the count is 2 instead of 1. No shared
-configuration or probe assertions were changed.
+The review fix stage ran the Rust gates directly. The earlier Goal 04
+Cargo-config probe failure no longer reproduces with the fix in the merged base.
 
 ## Desktop acceptance
 
@@ -89,6 +85,9 @@ executable or receipts were generated in this implementation stage.
   midpoint of the exit, verify the content below is between its start and end
   positions while the banner is still fading. With Animation effects off,
   verify the banner dismounts immediately without animated reflow.
+- Open **Compare** on a conflict banner and choose **Use disk version**.
+  Confirm the reload and verify that the comparison remains intact while
+  the banner fades and collapses with the document reflow.
 - With two tabs open, edit the active tab, close it and choose **Don't save**.
   Verify that its rail row and editor disappear immediately while the guard
   fades, and that the remaining editor accepts input during the fade.

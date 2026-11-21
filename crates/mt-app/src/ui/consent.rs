@@ -1978,7 +1978,6 @@ mod tests {
     fn ReducedMotionHarness() -> impl IntoElement {
         let state = AppState::new();
         let open_state = state.clone();
-        let card_state = state.clone();
         view()
             .w(px(1_200.0))
             .h(px(800.0))
@@ -1988,10 +1987,7 @@ mod tests {
                     .set(Some(SharedString::from("disclosure text")));
                 open_state.review_manifest.set(Some(sample_consent()));
             }))
-            .child(when(
-                move || is_open(&state),
-                move || card(card_state.clone(), Language::English),
-            ))
+            .child(crate::ui::shell::overlay_layer(state, Language::English))
     }
 
     pub(super) fn start_harness() -> Headless {
@@ -2035,12 +2031,12 @@ mod tests {
         });
         app.press("id:reduced-open").expect("open consent");
         app.wait_for("id:consent-card").expect("the consent card");
-        let card = app
+        let motion_card = app
             .screen()
             .layout_nodes()
             .into_iter()
-            .find(|node| node.test_id.as_deref() == Some("consent-card"))
-            .expect("the consent card")
+            .find(|node| node.test_id.as_deref() == Some("consent-motion-card"))
+            .expect("the consent motion card")
             .id;
         use nsh_core::geometry::point;
         app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
@@ -2054,7 +2050,7 @@ mod tests {
             .filter(|node| {
                 let mut current = node.id;
                 loop {
-                    if current == card {
+                    if current == motion_card {
                         return true;
                     }
                     let Some(parent) = layout_nodes
