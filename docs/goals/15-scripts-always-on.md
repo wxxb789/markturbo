@@ -80,6 +80,27 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
 
      The listeners must record **zero** contacts. Unit tests assert the exact argument string and
      that it is set before the first web view.
+3c. **Fail closed, and close the non-browser paths** (amended 2026-11-21 after the PR #53 review).
+   - **Elevated host.** WebView2 ignores `WEBVIEW2_*` environment variables in a host at high
+     integrity level (Microsoft's WebView2 security guidance). When the app runs elevated, the web
+     layouts do not create a WebView; they show a short, visible reason instead, and the native
+     preview is unaffected. Test the decision with a seam; add a native checklist line.
+   - **PlantUML.** It runs outside the browser, so the WebView switch cannot cover it. The renderer
+     starts PlantUML with the `SANDBOX` security profile (the `PLANTUML_SECURITY_PROFILE`
+     environment variable or the Java system property), so a diagram cannot read files or URLs.
+     Test the child's command or environment; it covers both the native and web previews.
+   - **In-frame navigation.** A user clicking a link, or submitting a form, in the preview leaves
+     the page exactly where it is. A tiny capture-phase prelude in the frame, injected ahead of
+     author markup, cancels anchor and form default navigation. A script that deliberately
+     navigates the frame may land on the browser's blocked page. That is acceptable, because no
+     request leaves; the next document update restores the preview.
+   - **Size.** An HTML document whose page exceeds the WebView's `NavigateToString` limit shows a
+     visible diagnostic instead of a blank or failed preview. Escape only what a double-quoted
+     attribute needs (`&` and `"`), to keep the inflation minimal.
+   - **What native acceptance cannot see.** DNS egress for a hostname is not observable on
+     loopback. The resolver rule's exact string, and the fact that it is applied before the first
+     web view on the production entry path, are proven by unit tests; the native proof covers
+     IP-literal channels.
 4. **Scripts run without a click.** A headless or unit test shows that an MDX component, or a
    browser-side diagram that needs scripts, is in the built page for a freshly opened tab, with no
    preceding action.
