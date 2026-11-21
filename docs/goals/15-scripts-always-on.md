@@ -80,11 +80,24 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
 
      The listeners must record **zero** contacts. Unit tests assert the exact argument string and
      that it is set before the first web view.
-3c. **Fail closed, and close the non-browser paths** (amended 2026-11-21 after the PR #53 review).
-   - **Elevated host.** WebView2 ignores `WEBVIEW2_*` environment variables in a host at high
-     integrity level (Microsoft's WebView2 security guidance). When the app runs elevated, the web
-     layouts do not create a WebView; they show a short, visible reason instead, and the native
-     preview is unaffected. Test the decision with a seam; add a native checklist line.
+3c. **The web preview is never turned off; close the non-browser paths** (owner decision,
+   2026-11-21: the WebView preview is the core experience on every platform and must not be
+   disabled for security).
+   - **Where the process-level switch is unavailable**, the WebView still runs with scripts on,
+     and the in-page layers carry the guarantee. Those places are: Windows at high integrity level
+     (WebView2 ignores `WEBVIEW2_*` variables there), macOS (WKWebView) and Linux (WebKitGTK).
+     The in-page layers are:
+     - CSP and the sandboxed frame;
+     - a prelude, ahead of all author code, that removes the WebRTC constructors and prototypes
+       (`RTCPeerConnection`, `webkitRTCPeerConnection`, `RTCDataChannel`, `RTCIceTransport`,
+       `RTCRtpSender`/`Receiver`, `RTCSctpTransport`, and so on) from the frame's realm, so author
+       code cannot reach them. No fresh realm is available: nested frames and blob/data workers
+       are refused by the CSP;
+     - `<meta http-equiv="x-dns-prefetch-control" content="off">`.
+
+     On Windows, the process-level switch remains the primary layer wherever WebView2 honours it.
+     Document the residual risk of these platforms and modes in the README and architecture
+     security text. Do not disable the preview.
    - **PlantUML.** It runs outside the browser, so the WebView switch cannot cover it. The renderer
      starts PlantUML with the `SANDBOX` security profile (the `PLANTUML_SECURITY_PROFILE`
      environment variable or the Java system property), so a diagram cannot read files or URLs.
@@ -97,11 +110,6 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
    - **Size.** An HTML document whose page exceeds the WebView's `NavigateToString` limit shows a
      visible diagnostic instead of a blank or failed preview. Escape only what a double-quoted
      attribute needs (`&` and `"`), to keep the inflation minimal.
-   - **Non-Windows platforms** (amended 2026-11-21 after review round 3). The macOS (WKWebView)
-     and Linux (WebKitGTK) backends have no equivalent process-level network switch, and WebRTC
-     stays available there. Windows 11 x64 is the only public-quality target, so on macOS and
-     Linux the web layouts fail closed, as an elevated host does: no WebView is created, a visible
-     reason is shown, and the native preview is unaffected.
    - **In-frame navigation, refined.** The Navigation API does not fire in an opaque-origin
      (sandboxed) frame, so it is not used. The capture-phase click and submit guard covers links and
      forms in the document and in open shadow roots. A link inside a **closed** shadow root exists
