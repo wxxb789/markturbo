@@ -75,7 +75,7 @@ table.
 
 - Any animation on a row marked *instant*.
 - A duration or curve literal outside `motion.rs`.
-- An ease-in curve on an entrance; a scale below 0.96; travel over 8px.
+- An ease-in curve on an entrance; a scale below 0.96; a surface that travels more than 8px. This limit applies to surfaces entering or leaving. It does not apply to the editor viewport gliding to the anchor of newly arrived model findings, which is the one place where motion is meant to be felt.
 - Input blocked during a transition.
 - A control that gives no feedback on press-down.
 
