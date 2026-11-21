@@ -607,7 +607,7 @@ class PhaseTests(unittest.TestCase):
         probes = mock.Mock()
         probes.snapshot.return_value = {"tcp_contacts": 0, "udp_contacts": 0}
         harness = bare_harness(win32=win32, network_probes=probes)
-        for name in ("menu_command", "wait_name", "editor_control"):
+        for name in ("menu_command", "wait_name", "find_named", "click_control", "editor_control"):
             setattr(harness, name, getattr(order, name))
         return harness, order, app
 
@@ -628,18 +628,32 @@ class PhaseTests(unittest.TestCase):
                 ),
                 mock.call.wait_name(
                     app,
+                    HARNESS.USER_NAVIGATION_BLOCKED_TEXT,
+                    "Text",
+                    "USER_NAVIGATION_NOT_BLOCKED",
+                ),
+                mock.call.wait_name(
+                    app,
                     HARNESS.NETWORK_ATTEMPTS_COMPLETE_TEXT,
                     "Text",
                     "NETWORK_ATTEMPTS_TIMEOUT",
                 ),
                 mock.call.wait_name(
                     app,
-                    HARNESS.NAVIGATION_ATTEMPTS_COMPLETE_TEXT,
+                    HARNESS.SCRIPT_NAVIGATION_READY_TEXT,
                     "Text",
-                    "NAVIGATION_ATTEMPTS_TIMEOUT",
+                    "SCRIPT_NAVIGATION_READY_TIMEOUT",
                 ),
-                mock.call.wait_name(
-                    app, HARNESS.SCRIPT_EFFECT_TEXT, "Text", "PREVIEW_LEFT_FIXTURE"
+                mock.call.find_named(
+                    app,
+                    HARNESS.SCRIPT_NAVIGATION_RELEASE_NAME,
+                    "Button",
+                    "SCRIPT_NAVIGATION_RELEASE_UIA_TIMEOUT",
+                    "SCRIPT_NAVIGATION_RELEASE_UIA_MISMATCH",
+                    anonymous=False,
+                ),
+                mock.call.click_control(
+                    order.find_named.return_value, "SCRIPT_NAVIGATION_RELEASE_CLICK_FAILED"
                 ),
                 mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
                 mock.call.editor_control(app),
@@ -674,18 +688,20 @@ class PhaseTests(unittest.TestCase):
         )
 
         def wait_for_marker(_app: Any, _name: str, _kind: str, failure_code: str) -> None:
-            if failure_code == "NAVIGATION_ATTEMPTS_TIMEOUT":
+            if failure_code == "SCRIPT_NAVIGATION_READY_TIMEOUT":
                 raise runtime.HarnessFailure(failure_code)
 
         order.wait_name.side_effect = wait_for_marker
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            self.assertRaisesRegex(runtime.HarnessFailure, "NAVIGATION_ATTEMPTS_TIMEOUT"),
+            self.assertRaisesRegex(runtime.HarnessFailure, "SCRIPT_NAVIGATION_READY_TIMEOUT"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
         harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
+        order.find_named.assert_not_called()
+        order.click_control.assert_not_called()
         order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
 
     def test_web_phase_fails_closed_when_a_listener_counts_a_contact(self) -> None:
@@ -711,8 +727,14 @@ class PhaseTests(unittest.TestCase):
             self.assertIn(f'const tcpPort = "{probes.tcp_port}";', source)
             self.assertIn(f'const udpPort = "{probes.udp_port}";', source)
             self.assertIn(HARNESS.NETWORK_PROBE_HOST, source)
-            self.assertEqual(source.count("{ run:"), HARNESS.NETWORK_PROBE_COUNT)
+            self.assertEqual(
+                source.count("{ run:"),
+                HARNESS.NETWORK_PROBE_COUNT + HARNESS.NAVIGATION_ATTEMPT_COUNT,
+            )
             self.assertEqual(source.count("navigation: true"), HARNESS.NAVIGATION_ATTEMPT_COUNT)
+            self.assertEqual(
+                source.count("scriptNavigation: true"), HARNESS.SCRIPT_NAVIGATION_ATTEMPT_COUNT
+            )
             for attempt in (
                 "function fetchProbe",
                 "function imageProbe",
@@ -724,22 +746,53 @@ class PhaseTests(unittest.TestCase):
                 "dns-prefetch",
                 "preconnect",
                 'form.method = "post"',
+                "link.click()",
+                "form.requestSubmit()",
+                "new SubmitEvent(\"submit\", { bubbles: true, cancelable: true })",
+                "submitEvent.defaultPrevented",
+                'target="_self"',
+                'target="_blank"',
+                "frame.src = `https://127.0.0.1:${tcpPort}/subframe`",
             ):
                 with self.subTest(attempt=attempt):
                     self.assertIn(attempt, source)
             self.assertIn('`https://127.0.0.1:${tcpPort}`', source)
+            self_location = source.index("try { location = `${tcpLoopback}/frame`")
+            for attempt in (
+                'window.open(`${tcpLoopback}/popup`',
+                "top.location = `https://${probeHost}/top`",
+                "frame.src = `https://127.0.0.1:${tcpPort}/subframe`",
+                "submitForm(`${tcpLoopback}/form`)",
+                "submitForm(`${tcpHostname}/form`)",
+            ):
+                with self.subTest(script_navigation_before_self_location=attempt):
+                    self.assertLess(source.index(attempt), self_location)
+            run_attempts = source[source.index("async function runAttempts()") :]
+            release_handler = run_attempts.index("navigationRelease.addEventListener(\"click\"")
+            deferred_loop = run_attempts.index("for (const attempt of scriptNavigationAttempts)")
             self.assertLess(
-                source.index("networkStatus.textContent = `Network probe attempted"),
-                source.index("const result = attempt.run();"),
+                run_attempts.index(
+                    "networkStatus.textContent = `Network probes complete ${networkIndex}/${networkProbeCount}`"
+                ),
+                release_handler,
             )
             self.assertLess(
-                source.index("navigationStatus.textContent = `Navigation attempt"),
-                source.index("const result = attempt.run();"),
+                run_attempts.index("userNavigationStatus.textContent = `User navigation blocked"),
+                release_handler,
             )
-            self.assertGreater(
-                source.index("navigationStatus.textContent = `Navigation attempts complete"),
-                source.index("const result = attempt.run();"),
+            self.assertLess(
+                run_attempts.index("navigationReleaseStatus.textContent = `Ready to run script navigation probes"),
+                run_attempts.index("navigationRelease.disabled = false"),
             )
+            handler_end = run_attempts.index("}, { once: true });", release_handler)
+            self.assertGreater(deferred_loop, release_handler)
+            for marker in (
+                "networkStatus",
+                "navigationStatus",
+                "userNavigationStatus",
+                "navigationReleaseStatus",
+            ):
+                self.assertNotIn(f"{marker}.textContent =", run_attempts[release_handler:handler_end])
 
     def test_equal_dynamic_ports_canonicalize_at_their_declarations_only(self) -> None:
         probes = mock.Mock(tcp_port=43123, udp_port=43123)
@@ -765,10 +818,14 @@ if (callIndex < 0 || source.slice(callIndex + runCall.length).trim()) throw new 
 const code = source.slice(0, callIndex) + "globalThis.__run = runAttempts();" + source.slice(callIndex + runCall.length);
 const expectedNetworkCount = Number(process.argv[1]);
 const expectedNavigationCount = Number(process.argv[2]);
+const expectedUserNavigationCount = Number(process.argv[3]);
+const expectedScriptNavigationCount = Number(process.argv[4]);
 const calls = [];
 const effect = { textContent: "" };
 const networkWrites = [];
 const navigationWrites = [];
+const userNavigationWrites = [];
+const navigationReleaseWrites = [];
 const statusNode = writes => ({
   value: "",
   get textContent() { return this.value; },
@@ -776,20 +833,68 @@ const statusNode = writes => ({
 });
 const network = statusNode(networkWrites);
 const navigation = statusNode(navigationWrites);
+const userNavigation = statusNode(userNavigationWrites);
+const navigationReleaseStatus = statusNode(navigationReleaseWrites);
+const navigationRelease = {
+  disabled: true,
+  listeners: {},
+  addEventListener(name, callback) { this.listeners[name] = callback; },
+  click() {
+    if (this.disabled) throw new Error("navigation release is disabled");
+    if (navigationReleaseStatus.textContent !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("ready marker missing before release");
+    this.listeners.click?.();
+  },
+};
 const nodes = new Map([
   ["goal07-effect", effect],
   ["goal07-network", network],
   ["goal07-navigation", navigation],
+  ["goal07-user-link", {
+    href: "",
+    target: "_self",
+    listeners: {},
+    addEventListener(name, callback) { this.listeners[name] = callback; },
+    click() {
+      assertReady(true);
+      calls.push(["user-link", this.href, this.target]);
+      this.listeners.click?.({ defaultPrevented: true });
+    },
+  }],
+  ["goal07-user-form", {
+    action: "",
+    target: "_blank",
+    syntheticSubmitPrevented: false,
+    dispatchEvent(event) {
+      if (event.type !== "submit" || !event.bubbles || !event.cancelable) throw new Error("submit event shape mismatch");
+      event.defaultPrevented = true;
+      this.syntheticSubmitPrevented = event.defaultPrevented;
+      return false;
+    },
+    requestSubmit() {
+      assertReady(true);
+      if (!this.syntheticSubmitPrevented) throw new Error("capture-phase submit cancellation missing");
+      calls.push(["user-form", this.action, this.target]);
+    },
+  }],
+  ["goal07-user-navigation", userNavigation],
+  ["goal07-navigation-release-status", navigationReleaseStatus],
+  ["goal07-navigation-release", navigationRelease],
 ]);
-function assertReady(isNavigation = false) {
-  if (!network.textContent.startsWith("Network probe attempted ")) throw new Error("network marker missing");
+function assertReady(isNavigation = false, isScriptNavigation = false) {
+  if (isScriptNavigation) {
+    if (network.textContent !== `Network probes complete ${expectedNetworkCount}/${expectedNetworkCount}`) throw new Error("network marker missing before script navigation");
+    if (navigationReleaseStatus.textContent !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("script navigation marker missing");
+    return;
+  }
+  if (!network.textContent.startsWith("Network probe attempted ") && !network.textContent.startsWith("Network probes complete ")) throw new Error("network marker missing");
   if (isNavigation && !navigation.textContent.startsWith("Navigation attempt ")) throw new Error("navigation marker missing");
 }
 function element(tag) {
   const value = { tag, action: "", rel: "" };
   if (tag === "img") Object.defineProperty(value, "src", { set(url) { assertReady(); calls.push(["img", url]); } });
   if (tag === "link") Object.defineProperty(value, "href", { set(url) { assertReady(); calls.push(["link", value.rel, url]); } });
-  if (tag === "form") value.submit = () => { assertReady(true); calls.push(["form", value.action]); throw new Error("blocked"); };
+  if (tag === "form") value.submit = () => { assertReady(true, true); calls.push(["form", value.action]); throw new Error("blocked"); };
+  if (tag === "iframe") Object.defineProperty(value, "src", { set(url) { assertReady(true, true); calls.push(["iframe", url]); } });
   return value;
 }
 const context = {
@@ -800,13 +905,19 @@ const context = {
     head: { appendChild() {} },
   },
   window: {
-    open(url) { assertReady(true); calls.push(["open", url]); return null; },
+    open(url) { assertReady(true, true); calls.push(["open", url]); return null; },
   },
   navigator: {
     sendBeacon(url) { assertReady(); calls.push(["beacon", url]); return true; },
   },
   fetch(url) { assertReady(); calls.push(["fetch", url]); return Promise.resolve(); },
   WebSocket: function (url) { assertReady(); calls.push(["websocket", url]); },
+  SubmitEvent: function (type, options) {
+    this.type = type;
+    this.bubbles = options.bubbles;
+    this.cancelable = options.cancelable;
+    this.defaultPrevented = false;
+  },
   RTCPeerConnection: function (configuration) {
     assertReady();
     calls.push(["rtc"]);
@@ -819,34 +930,56 @@ const context = {
 };
 context.top = {};
 Object.defineProperty(context.top, "location", {
-  set(url) { assertReady(true); calls.push(["top", url]); throw new Error("blocked"); },
+  set(url) { assertReady(true, true); calls.push(["top", url]); throw new Error("blocked"); },
 });
 Object.defineProperty(context, "location", {
-  set(url) { assertReady(true); calls.push(["location", url]); throw new Error("blocked"); },
+  set(url) { assertReady(true, true); calls.push(["location", url]); throw new Error("blocked"); },
 });
 async function main() {
   await vm.runInNewContext(code, context);
   if (effect.textContent !== "Script ran automatically") throw new Error("script effect missing");
-  if (calls.length !== expectedNetworkCount) throw new Error("not every network probe ran");
+  if (navigationRelease.disabled) throw new Error("navigation release was not enabled");
+  if (calls.length !== expectedNetworkCount + expectedUserNavigationCount) throw new Error("script navigation ran before release");
+  if (navigationReleaseStatus.textContent !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("script navigation ready marker missing");
+  navigationRelease.click();
+  const scriptNavigationKinds = new Set(["open", "top", "location", "form", "iframe"]);
+  const userNavigationKinds = new Set(["user-link", "user-form"]);
+  const networkCallCount = calls.filter(([kind]) => !scriptNavigationKinds.has(kind) && !userNavigationKinds.has(kind)).length;
+  const scriptNavigationCalls = calls.filter(([kind]) => scriptNavigationKinds.has(kind));
+  const userNavigationCalls = calls.filter(([kind]) => userNavigationKinds.has(kind));
+  if (networkCallCount !== expectedNetworkCount) throw new Error("not every network probe ran");
+  if (userNavigationCalls.length !== expectedUserNavigationCount) throw new Error("not every user navigation ran");
+  if (scriptNavigationCalls.length !== expectedScriptNavigationCount) throw new Error("not every script navigation ran");
+  if (calls.length !== expectedNetworkCount + expectedNavigationCount) throw new Error("attempt count mismatch");
   if (network.textContent !== `Network probes complete ${expectedNetworkCount}/${expectedNetworkCount}`) throw new Error("network attempts incomplete");
-  if (navigation.textContent !== `Navigation attempts complete ${expectedNavigationCount}/${expectedNavigationCount}`) throw new Error("navigation attempts incomplete");
+  if (navigationWrites.length !== expectedUserNavigationCount) throw new Error("user navigation attempts are not marked");
+  for (let index = 1; index <= expectedUserNavigationCount; index += 1) {
+    if (navigationWrites[index - 1][0] !== `Navigation attempt ${index}/${expectedNavigationCount} attempted` || navigationWrites[index - 1][1] !== expectedNetworkCount + index - 1) throw new Error("user navigation marker ordering invalid");
+  }
+  if (userNavigation.textContent !== `User navigation blocked ${expectedUserNavigationCount}/${expectedUserNavigationCount}`) throw new Error("user navigation was not blocked");
+  if (navigationReleaseWrites.length !== 1) throw new Error("navigation ready marker missing");
+  if (navigationReleaseWrites[0][0] !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("navigation ready marker changed");
   const networkCompletions = networkWrites.filter(([value]) => value.startsWith("Network probes complete "));
   if (networkCompletions.length !== expectedNetworkCount) throw new Error("network completion markers missing");
   for (let index = 1; index <= expectedNetworkCount; index += 1) {
     if (networkCompletions[index - 1][0] !== `Network probes complete ${index}/${expectedNetworkCount}` || networkCompletions[index - 1][1] !== index) throw new Error("network completion ordering invalid");
   }
-  const navigationCompletions = navigationWrites.filter(([value]) => value.startsWith("Navigation attempts complete "));
-  if (navigationCompletions.length !== expectedNavigationCount) throw new Error("navigation completion markers missing");
-  for (let index = 1; index <= expectedNavigationCount; index += 1) {
-    const expectedCalls = expectedNetworkCount - expectedNavigationCount + index;
-    if (navigationCompletions[index - 1][0] !== `Navigation attempts complete ${index}/${expectedNavigationCount}` || navigationCompletions[index - 1][1] !== expectedCalls) throw new Error("navigation completion ordering invalid");
-  }
+  const firstScriptNavigationCall = calls.findIndex(([kind]) => scriptNavigationKinds.has(kind));
+  if (networkWrites.some(([, callCount]) => callCount > firstScriptNavigationCall) || navigationWrites.some(([, callCount]) => callCount > firstScriptNavigationCall) || userNavigationWrites.some(([, callCount]) => callCount > firstScriptNavigationCall) || navigationReleaseWrites.some(([, callCount]) => callCount > firstScriptNavigationCall)) throw new Error("a marker was written after script navigation began");
   if (context.__iceServers.length !== 2 || !context.__dataChannel) throw new Error("WebRTC setup incomplete");
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
 """
         result = subprocess.run(
-            [node, "-e", node_harness, str(HARNESS.NETWORK_PROBE_COUNT), str(HARNESS.NAVIGATION_ATTEMPT_COUNT)],
+            [
+                node,
+                "-e",
+                node_harness,
+                str(HARNESS.NETWORK_PROBE_COUNT),
+                str(HARNESS.NAVIGATION_ATTEMPT_COUNT),
+                str(HARNESS.USER_NAVIGATION_ATTEMPT_COUNT),
+                str(HARNESS.SCRIPT_NAVIGATION_ATTEMPT_COUNT),
+            ],
             input=script,
             text=True,
             capture_output=True,
@@ -881,21 +1014,23 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
         with self.assertRaisesRegex(runtime.HarnessFailure, "NETWORK_PROBE_LISTENER_FAILED"):
             probes.snapshot()
 
-    def test_web_phase_fails_when_navigation_replaces_the_fixture(self) -> None:
+    def test_web_phase_does_not_release_script_navigation_without_the_ready_marker(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
-        def fail_preview_check(
+        def fail_ready_check(
             _app: Any, _name: str, _kind: str, failure_code: str, *_args: Any
         ) -> None:
-            if failure_code == "PREVIEW_LEFT_FIXTURE":
+            if failure_code == "SCRIPT_NAVIGATION_READY_TIMEOUT":
                 raise runtime.HarnessFailure(failure_code)
 
-        order.wait_name.side_effect = fail_preview_check
+        order.wait_name.side_effect = fail_ready_check
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            self.assertRaisesRegex(runtime.HarnessFailure, "PREVIEW_LEFT_FIXTURE"),
+            self.assertRaisesRegex(runtime.HarnessFailure, "SCRIPT_NAVIGATION_READY_TIMEOUT"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
         order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.find_named.assert_not_called()
+        order.click_control.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
 
     def test_web_phase_fails_if_a_popup_creates_an_extra_owned_window(self) -> None:
@@ -990,6 +1125,21 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
             {key for key in HARNESS.OBSERVATION_KEYS if key.startswith("decisions_")},
             set(observed),
         )
+
+    def test_decisions_phase_canonicalizes_dynamic_ports_in_the_clipboard(self) -> None:
+        probes = mock.Mock(tcp_port=43123, udp_port=54234)
+        harness, order = self.decisions_harness()
+        harness.network_probes = probes
+        order.copy_approved.return_value = HARNESS.fixture_source(probes).replace(
+            "\r\n", "\n"
+        ).replace('window.goal07 = "old";', 'window.goal07 = "new";')
+
+        with mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK):
+            observed = harness.phase_decisions(
+                mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE)
+            )
+
+        self.assertEqual(observed["decisions_clipboard_copied"], ONE_ACCEPTED.evidence())
 
     def test_a_wrong_measurement_stops_the_phase_before_its_next_step(self) -> None:
         # Accept wrote nothing: the read fails at once, before Reject could

@@ -10,12 +10,26 @@ use mt_core::{Block, BlockKind, DocType, Document};
 
 const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:";
 const HOST_FRAME_SRC: &str = "; frame-src 'self'";
+// WebView2 NavigateToString limits the UTF-16 htmlContent to 2 * 1024 * 1024 bytes.
+const MAX_HOST_UTF16_UNITS: usize = 1024 * 1024;
+const NAVIGATION_PRELUDE: &str = r#"<script>(() => {
+    const cancelLink = event => {
+        if (event.composedPath().some(node =>
+            (node.localName === "a" || node.localName === "area") &&
+            (node.hasAttribute("href") || node.hasAttribute("xlink:href")))) {
+            event.preventDefault();
+        }
+    };
+    addEventListener("click", cancelLink, true);
+    addEventListener("auxclick", cancelLink, true);
+    addEventListener("submit", event => event.preventDefault(), true);
+})();</script>"#;
 
 /// Build a base-free WebView host; only the opaque-origin frame runs scripts.
 pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> String {
-    let csp = csp_meta("");
+    let head_prefix = format!("{}{NAVIGATION_PRELUDE}", csp_meta(""));
     let page = match doc.doc_type() {
-        DocType::Html => build_html_raw(doc.source(), &csp),
+        DocType::Html => build_html_raw(doc.source(), &head_prefix),
         kind => {
             let body = if kind == DocType::Mdx {
                 render_mdx_body(doc, registry)
@@ -23,19 +37,40 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
                 render_markdown_body(doc, registry)
             };
             format!(
-                "<!doctype html><html><head>{csp}<meta charset=\"utf-8\">\
+                "<!doctype html><html><head>{head_prefix}<meta charset=\"utf-8\">\
                  <style>{vars}\n{STYLE}</style></head><body>{body}</body></html>",
                 vars = css_variables(dark),
             )
         }
     };
-    format!(
+    let host = format!(
         "<!doctype html><html><head>{host_csp}<meta charset=\"utf-8\">\
          <style>iframe{{position:fixed;inset:0;width:100%;height:100%;border:0}}</style>\
          </head><body><iframe sandbox=\"allow-scripts\" srcdoc=\"{}\"></iframe></body></html>",
-        escape(&page),
+        escape_srcdoc(&page),
         host_csp = csp_meta(HOST_FRAME_SRC),
-    )
+    );
+    if host.encode_utf16().count() > MAX_HOST_UTF16_UNITS {
+        format!(
+            "<!doctype html><html><head>{}<meta charset=\"utf-8\"></head>\
+             <body><p role=\"alert\">This preview is too large to display.</p></body></html>",
+            csp_meta("")
+        )
+    } else {
+        host
+    }
+}
+
+fn escape_srcdoc(page: &str) -> String {
+    let mut out = String::with_capacity(page.len());
+    for c in page.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn csp_meta(extra: &str) -> String {
@@ -44,7 +79,7 @@ fn csp_meta(extra: &str) -> String {
 
 /// Preserve the original shell when its leading structure is unambiguous.
 /// Otherwise let the HTML parser imply a head from the leading policy meta.
-fn build_html_raw(source: &str, csp: &str) -> String {
+fn build_html_raw(source: &str, head_prefix: &str) -> String {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let start = skip_html_trivia(source);
     let (after_doctype, has_doctype) = match html_doctype_end(start) {
@@ -56,7 +91,7 @@ fn build_html_raw(source: &str, csp: &str) -> String {
     let head = opening_tag_end(skip_html_trivia(after_html), "head");
     let (prefix, rest) = source.split_at(source.len() - head.unwrap_or(after_html).len());
     let doctype = if has_doctype { "" } else { "<!doctype html>" };
-    format!("{doctype}{prefix}{csp}{rest}")
+    format!("{doctype}{prefix}{head_prefix}{rest}")
 }
 
 fn html_whitespace(c: char) -> bool {
@@ -183,11 +218,11 @@ fn opening_tag_end<'a>(source: &'a str, name: &str) -> Option<&'a str> {
             return None;
         }
         let attr = &attrs[..name_end];
-        if attr.eq_ignore_ascii_case("style")
-            || attr.eq_ignore_ascii_case("manifest")
-            || attr
-                .get(..2)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on"))
+        if attr.eq_ignore_ascii_case("manifest")
+            || (name == "head"
+                && attr
+                    .get(..2)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on")))
         {
             return None;
         }
@@ -293,7 +328,7 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
             ..markdown::CompileOptions::default()
         },
     };
-    let (source, inline_scripts) = preserve_inline_scripts(run, doc.doc_type(), &options.parse);
+    let (source, inline_scripts) = preserve_inline_scripts(run, &options.parse);
     match markdown::to_html_with_options(source.as_ref(), &options) {
         Ok(html) => out.push_str(&restore_inline_scripts(html, inline_scripts)),
         Err(message) => out.push_str(&diagnostic_html("markdown", &message.reason, run)),
@@ -303,14 +338,12 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
 
 fn preserve_inline_scripts<'a>(
     source: &'a str,
-    doc_type: DocType,
     parse_options: &markdown::ParseOptions,
 ) -> (Cow<'a, str>, Vec<(String, String)>) {
-    if doc_type != DocType::Markdown
-        || !source
-            .as_bytes()
-            .windows(b"<script".len())
-            .any(|tag| tag.eq_ignore_ascii_case(b"<script"))
+    if !source
+        .as_bytes()
+        .windows(b"<script".len())
+        .any(|tag| tag.eq_ignore_ascii_case(b"<script"))
     {
         return (Cow::Borrowed(source), Vec::new());
     }
@@ -319,7 +352,7 @@ fn preserve_inline_scripts<'a>(
         return (Cow::Borrowed(source), Vec::new());
     };
     let mut ranges = Vec::new();
-    collect_inline_script_ranges(&ast, &mut ranges);
+    collect_inline_script_ranges(&ast, source, &mut ranges);
     ranges.sort_unstable_by_key(|(start, _)| *start);
     if ranges.is_empty() {
         return (Cow::Borrowed(source), Vec::new());
@@ -335,21 +368,49 @@ fn preserve_inline_scripts<'a>(
         if start < cursor {
             continue;
         }
-        let mut marker = format!("<!--MTMARKDOWNRAWSCRIPT{index}END-->");
+        let mut marker = format!("MTMARKDOWNRAWSCRIPT{index}END");
         while source.contains(&marker) {
             marker.push('X');
         }
         protected.push_str(&source[cursor..start]);
-        protected.push_str(&marker);
-        scripts.push((marker, script.to_string()));
+        // MDX rejects HTML comments, but code spans preserve the marker literally.
+        let rendered_marker = if parse_options.constructs.mdx_jsx_text {
+            protected.push('`');
+            protected.push_str(&marker);
+            protected.push('`');
+            format!("<code>{marker}</code>")
+        } else {
+            let comment = format!("<!--{marker}-->");
+            protected.push_str(&comment);
+            comment
+        };
+        scripts.push((rendered_marker, script.to_string()));
         cursor = end;
     }
     protected.push_str(&source[cursor..]);
     (Cow::Owned(protected), scripts)
 }
 
-fn collect_inline_script_ranges(node: &markdown::mdast::Node, ranges: &mut Vec<(usize, usize)>) {
-    if matches!(node, markdown::mdast::Node::Paragraph(_)) {
+fn collect_inline_script_ranges(
+    node: &markdown::mdast::Node,
+    source: &str,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    use markdown::mdast::Node;
+    if let Node::MdxJsxTextElement(jsx) = node
+        && jsx.name.as_deref() == Some("script")
+        && let Some(position) = &jsx.position
+        && let Some(raw) = source.get(position.start.offset..position.end.offset)
+        && !raw.ends_with("/>")
+    {
+        ranges.push((position.start.offset, position.end.offset));
+        return;
+    }
+
+    if matches!(
+        node,
+        Node::Paragraph(_) | Node::Heading(_) | Node::TableCell(_)
+    ) {
         let mut tags = Vec::new();
         collect_html_tags(node, &mut tags);
         tags.sort_unstable_by_key(|(start, _, _)| *start);
@@ -364,12 +425,11 @@ fn collect_inline_script_ranges(node: &markdown::mdast::Node, ranges: &mut Vec<(
                 ranges.push((start, end));
             }
         }
-        return;
     }
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_inline_script_ranges(child, ranges);
+            collect_inline_script_ranges(child, source, ranges);
         }
     }
 }
@@ -422,7 +482,7 @@ fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> S
 
 /// Render an MDX document.
 ///
-/// JSX still uses the shared placeholders; this path does not compile MDX components.
+/// Raw script elements reach the frame; other JSX uses the shared placeholders.
 fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
     let mut out = String::new();
     let mut markdown_run = String::new();
@@ -436,7 +496,15 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
         match block.kind {
             BlockKind::Mdx(kind) => {
                 flush_markdown(&mut out, &mut markdown_run, doc);
-                out.push_str(&mdx_placeholder(kind, &block.content));
+                if kind == mt_core::document::block::MdxKind::JsxElement
+                    && mt_core::document::outline::jsx_tag_name(&block.content).as_deref()
+                        == Some("script")
+                    && !block.content.ends_with("/>")
+                {
+                    out.push_str(&block.content);
+                } else {
+                    out.push_str(&mdx_placeholder(kind, &block.content));
+                }
             }
             _ => {
                 markdown_run.push_str(&doc.source()[block.range.clone()]);
@@ -648,13 +716,7 @@ mod tests {
             .unwrap();
         let (encoded, tail) = iframe.split_once('"').unwrap();
         assert_eq!(tail, "></iframe></body></html>");
-        assert!(!encoded.contains(['<', '>']));
-        encoded
-            .replace("&quot;", "\"")
-            .replace("&#39;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&")
+        encoded.replace("&quot;", "\"").replace("&amp;", "&")
     }
 
     #[test]
@@ -664,11 +726,16 @@ mod tests {
         let host = build_html(&doc, &registry(), false);
         assert!(host.starts_with(&format!("<!doctype html><html><head>{HOST_POLICY}")));
         assert_eq!(host.matches("<iframe ").count(), 1);
-        assert!(!host.contains("<script"));
+        let (before_srcdoc, encoded) = host.split_once(" srcdoc=\"").unwrap();
+        assert!(!before_srcdoc.contains("<script"));
+        assert!(
+            encoded
+                .contains(r#"<script>const text = '&quot;</iframe>&amp;lt;&amp;quot;';</script>"#)
+        );
         let document = frame_document(&host);
         assert_eq!(
             document,
-            format!("<!doctype html>{DOCUMENT_POLICY}{author}")
+            format!("<!doctype html>{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}{author}")
         );
     }
 
@@ -707,17 +774,19 @@ mod tests {
             "<!DOCTYPE html SYSTEM \"about:legacy-compat\">",
         ];
         let heads = [
-            "<head id=\"author\" data-mode='one'>",
+            "<head id=\"author\" data-mode='one' style='color: red'>",
             "<HEAD lang=en data-label=\"the head\">",
         ];
         let author = "<title>Author</title><script>run()</script>";
 
         for doctype in doctypes {
             for head in heads {
-                let source = format!("{doctype}<html lang=en>{head}{author}</head></html>");
+                let html = r#"<html lang=en class='page' style="color: red" onclick="run()">"#;
+                let source = format!("{doctype}{html}{head}{author}</head></html>");
                 let doc = Document::with_type(DocType::Html, source);
-                let expected =
-                    format!("{doctype}<html lang=en>{head}{DOCUMENT_POLICY}{author}</head></html>");
+                let expected = format!(
+                    "{doctype}{html}{head}{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}{author}</head></html>"
+                );
                 assert_eq!(
                     page(&doc, &registry(), false),
                     expected,
@@ -743,10 +812,78 @@ mod tests {
     }
 
     #[test]
+    fn markdown_heading_and_table_scripts_keep_their_raw_text() {
+        let script = r#"<script>document.body.dataset.x="A & B"</script>"#;
+        let registry = registry();
+        let heading = page(&md(&format!("# Title {script}")), &registry, false);
+        assert!(body(&heading).contains(&format!("<h1>Title {script}</h1>")));
+        let table = page(
+            &md(&format!("| Column |\n| --- |\n| {script} |")),
+            &registry,
+            false,
+        );
+        assert!(body(&table).contains(&format!("<td>{script}</td>")));
+    }
+
+    #[test]
+    fn mdx_script_elements_keep_their_raw_text() {
+        let script = r#"<script>document.body.dataset.x="A & B"</script>"#;
+        let registry = registry();
+        let doc = Document::with_type(DocType::Mdx, script.into());
+        assert!(body(&page(&doc, &registry, false)).contains(script));
+        let doc = Document::with_type(DocType::Mdx, format!("# Title {script}"));
+        assert!(body(&page(&doc, &registry, false)).contains(&format!("<h1>Title {script}</h1>")));
+        let flow = "<script>\ndocument.body.dataset.x=\"A & B\"\n</script>";
+        let doc = Document::with_type(DocType::Mdx, flow.into());
+        assert_eq!(body(&page(&doc, &registry, false)), flow);
+    }
+
+    #[test]
+    fn installs_the_navigation_prelude_after_csp_and_before_authored_scripts() {
+        let author = "<script>author()</script>";
+        let registry = registry();
+        for kind in [DocType::Html, DocType::Markdown, DocType::Mdx] {
+            let doc = Document::with_type(kind, author.into());
+            let document = page(&doc, &registry, false);
+            let (_, after_policy) = document.split_once(DOCUMENT_POLICY).unwrap();
+            let (before_author, _) = after_policy.split_once(author).unwrap();
+            assert!(before_author.starts_with("<script>"), "{kind:?}");
+            assert!(before_author.contains(r#"addEventListener("click", cancelLink, true)"#));
+            assert!(before_author.contains(r#"addEventListener("auxclick", cancelLink, true)"#));
+            assert!(
+                before_author.contains(
+                    r#"addEventListener("submit", event => event.preventDefault(), true)"#
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_host_pages_over_the_windows_string_load_limit() {
+        let registry = registry();
+        let build = |text| {
+            let doc = Document::with_type(DocType::Html, text);
+            build_html(&doc, &registry, false)
+        };
+        let prefix = "<p>&\"";
+        let suffix = "\u{1f642}</p>";
+        let overhead = build(format!("{prefix}{suffix}")).encode_utf16().count();
+        let capacity = 1024 * 1024 - overhead;
+        for size in [capacity - 1, capacity] {
+            let host = build(format!("{prefix}{}{suffix}", "a".repeat(size)));
+            assert_eq!(host.encode_utf16().count(), overhead + size);
+            assert!(host.contains("srcdoc=\""));
+        }
+        let above = build(format!("{prefix}{}{suffix}", "a".repeat(capacity + 1)));
+        assert!(above.contains("This preview is too large to display."));
+        assert!(!above.contains("<iframe"));
+    }
+
+    #[test]
     fn html_inserts_csp_at_the_start_of_the_real_or_implied_head() {
         let registry = registry();
         let author = r#"<link rel="stylesheet" href="relative.css"><script>run()</script>"#;
-        let policy = DOCUMENT_POLICY;
+        let policy = format!("{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}");
         for (prefix, expected_prefix) in [
             ("<!doctype html><html><head>", "<!doctype html><html><head>"),
             (
@@ -756,6 +893,10 @@ mod tests {
             (
                 "<!-- <head> --><head>",
                 "<!doctype html><!-- <head> --><head>",
+            ),
+            (
+                "<html style=\"background:url(relative.png)\"><head>",
+                "<!doctype html><html style=\"background:url(relative.png)\"><head>",
             ),
             ("<!DOCTYPE HTML><html>", "<!DOCTYPE HTML><html>"),
             ("\u{feff}<head>", "<!doctype html><head>"),
@@ -770,7 +911,6 @@ mod tests {
         for unsafe_prefix in [
             "<head data-x='",
             "<head",
-            "<html style=\"background:url(relative.png)\"><head>",
             "<head onload='run()'>",
             "<!--><script>early()</script>--><head>",
             "<!-- --!><script>early()</script>--><head>",
@@ -794,7 +934,7 @@ mod tests {
         let doc = Document::with_type(DocType::Html, format!("{before}{author}"));
         assert_eq!(
             page(&doc, &registry(), true),
-            format!("{before}{DOCUMENT_POLICY}{author}")
+            format!("{before}{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}{author}")
         );
     }
 

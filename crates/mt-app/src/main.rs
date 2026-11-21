@@ -13,14 +13,7 @@ use nsh_platform_windows as platform;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
     #[cfg(target_os = "windows")]
-    let result = with_webview_network_block(
-        |name, value| {
-            // SAFETY: std::env::set_var is documented as safe on Windows, even when
-            // other threads access the process environment.
-            unsafe { std::env::set_var(name, value) }
-        },
-        run_app,
-    );
+    let result = with_webview_network_block(set_webview_environment, run_app);
 
     #[cfg(not(target_os = "windows"))]
     let result = run_app();
@@ -30,6 +23,9 @@ fn main() -> impl std::process::Termination {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_app() -> impl std::process::Termination {
+    #[cfg(all(test, target_os = "windows"))]
+    tests::observe_app_start();
+
     // `cargo test` builds this binary with the crate's test features, so the
     // copy it leaves in target/<profile>/ keeps keys in memory only. Such a
     // build must never pass for the shipped app or accept a person's key.
@@ -63,6 +59,19 @@ fn run_app() -> impl std::process::Termination {
             ..Default::default()
         },
     )
+}
+
+#[cfg(target_os = "windows")]
+fn set_webview_environment(name: &str, value: &str) {
+    #[cfg(test)]
+    tests::record_webview_environment(name, value);
+
+    #[cfg(not(test))]
+    {
+        // SAFETY: std::env::set_var is documented as safe on Windows, even when
+        // other threads access the process environment.
+        unsafe { std::env::set_var(name, value) }
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -102,6 +111,30 @@ mod tests {
     use super::{app_capabilities, with_webview_network_block};
     use nsh_core::access::Access;
     use std::cell::RefCell;
+
+    #[cfg(target_os = "windows")]
+    thread_local! {
+        static WEBVIEW_ARGUMENTS: RefCell<Option<String>> = const { RefCell::new(None) };
+        static APP_STARTUP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(target_os = "windows")]
+    #[derive(Debug)]
+    struct AppStartupReached;
+
+    #[cfg(target_os = "windows")]
+    pub(super) fn record_webview_environment(name: &str, value: &str) {
+        assert_eq!(name, super::WEBVIEW2_ARGUMENTS_ENV);
+        WEBVIEW_ARGUMENTS.with(|arguments| *arguments.borrow_mut() = Some(value.to_owned()));
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(super) fn observe_app_start() {
+        let callback = APP_STARTUP.with(|hook| hook.borrow_mut().take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
 
     #[test]
     fn engine_webview_capability_allows_inline_documents_but_no_external_hosts() {
@@ -154,6 +187,39 @@ mod tests {
                     EXPECTED_ARGUMENTS.to_owned(),
                 ),
             ],
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn main_applies_webview_network_block_before_starting_the_app() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        WEBVIEW_ARGUMENTS.with(|arguments| {
+            *arguments.borrow_mut() = Some("--inherited-browser-arguments".to_owned())
+        });
+        APP_STARTUP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                let arguments = WEBVIEW_ARGUMENTS.with(|arguments| arguments.borrow().clone());
+                assert_eq!(
+                    arguments.as_deref(),
+                    Some(super::WEBVIEW2_NETWORK_BLOCK_ARGUMENTS)
+                );
+                std::panic::panic_any(AppStartupReached);
+            }))
+        });
+
+        let result = catch_unwind(AssertUnwindSafe(super::main));
+        APP_STARTUP.with(|hook| *hook.borrow_mut() = None);
+        WEBVIEW_ARGUMENTS.with(|arguments| *arguments.borrow_mut() = None);
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the test hook stops before opening a native window"),
+        };
+        assert!(
+            error.is::<AppStartupReached>(),
+            "the test reached app startup only after installing the network block"
         );
     }
 }

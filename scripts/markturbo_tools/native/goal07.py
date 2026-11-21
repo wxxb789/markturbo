@@ -8,9 +8,10 @@ reads or writes the Windows Credential Manager: the child process gets one
 fresh synthetic key in its environment only.
 
 One launch opens `security-fixture.html` from argv (a new tab opens in Split),
-checks that its inline script runs and its navigation attempts stay in the
-preview, then runs one Review -> answer -> Revision chain against the loopback,
-across two phases, each with its own observation-key prefix and failure-code prefix:
+checks that its inline script runs, user-style link/form navigation is canceled,
+and script navigation attempts are released only after the visible ready marker;
+then it runs one Review -> answer -> Revision chain against the loopback, across
+two phases, each with its own observation-key prefix and failure-code prefix:
 
 1. `web_security`: the Web pane shows the inline script's effect without a
    trust action; its popup, top-level/frame navigation and form attempts leave
@@ -142,14 +143,23 @@ SCRIPT_EFFECT_TEXT = "Script ran automatically"
 NETWORK_PROBE_HOST = "goal07-egress.invalid"
 TCP_PORT_TOKEN = "__GOAL07_TCP_PORT__"
 UDP_PORT_TOKEN = "__GOAL07_UDP_PORT__"
-NETWORK_PROBE_COUNT = 17
-NAVIGATION_ATTEMPT_COUNT = 5
+NETWORK_PROBE_COUNT = 12
+USER_NAVIGATION_ATTEMPT_COUNT = 2
+SCRIPT_NAVIGATION_ATTEMPT_COUNT = 6
+NAVIGATION_ATTEMPT_COUNT = (
+    USER_NAVIGATION_ATTEMPT_COUNT + SCRIPT_NAVIGATION_ATTEMPT_COUNT
+)
 NETWORK_ATTEMPTS_COMPLETE_TEXT = (
     f"Network probes complete {NETWORK_PROBE_COUNT}/{NETWORK_PROBE_COUNT}"
 )
-NAVIGATION_ATTEMPTS_COMPLETE_TEXT = (
-    f"Navigation attempts complete {NAVIGATION_ATTEMPT_COUNT}/{NAVIGATION_ATTEMPT_COUNT}"
+USER_NAVIGATION_BLOCKED_TEXT = (
+    f"User navigation blocked {USER_NAVIGATION_ATTEMPT_COUNT}/{USER_NAVIGATION_ATTEMPT_COUNT}"
 )
+SCRIPT_NAVIGATION_READY_TEXT = (
+    f"Ready to run script navigation probes {SCRIPT_NAVIGATION_ATTEMPT_COUNT}/"
+    f"{SCRIPT_NAVIGATION_ATTEMPT_COUNT}"
+)
+SCRIPT_NAVIGATION_RELEASE_NAME = "Run script navigation probes"
 # h1 (the executable script value) sits after the CJK/emoji line, so its
 # accepted write proves multibyte and CRLF offsets; h2 is the owner line.
 SOURCE_TEXT = (
@@ -158,6 +168,13 @@ SOURCE_TEXT = (
     "<p id=\"goal07-effect\">Script has not run</p>\r\n"
     "<p id=\"goal07-network\">Network probe not attempted</p>\r\n"
     "<p id=\"goal07-navigation\">Navigation probe not attempted</p>\r\n"
+    "<p><a id=\"goal07-user-link\" target=\"_self\">User link navigation probe</a></p>\r\n"
+    "<form id=\"goal07-user-form\" method=\"post\" target=\"_blank\">\r\n"
+    "<button type=\"submit\">User form navigation probe</button>\r\n"
+    "</form>\r\n"
+    "<p id=\"goal07-user-navigation\">User navigation not tested</p>\r\n"
+    "<p id=\"goal07-navigation-release-status\">Script navigation probes waiting</p>\r\n"
+    "<button id=\"goal07-navigation-release\" type=\"button\" disabled>Run script navigation probes</button>\r\n"
     "<script>\r\n"
     "window.goal07 = \"old\";\r\n"
     "document.getElementById(\"goal07-effect\").textContent = "
@@ -171,6 +188,9 @@ SOURCE_TEXT = (
     "const websocketHostname = `ws://${probeHost}:${tcpPort}/socket`;\r\n"
     "const networkStatus = document.getElementById(\"goal07-network\");\r\n"
     "const navigationStatus = document.getElementById(\"goal07-navigation\");\r\n"
+    "const userNavigationStatus = document.getElementById(\"goal07-user-navigation\");\r\n"
+    "const navigationReleaseStatus = document.getElementById(\"goal07-navigation-release-status\");\r\n"
+    "const navigationRelease = document.getElementById(\"goal07-navigation-release\");\r\n"
     "const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));\r\n"
     "function submitForm(action) {\r\n"
     "  const form = document.createElement(\"form\");\r\n"
@@ -202,21 +222,31 @@ SOURCE_TEXT = (
     "  { run: () => linkProbe(\"dns-prefetch\", `http://${probeHost}`) },\r\n"
     "  { run: () => linkProbe(\"preconnect\", `https://127.0.0.1:${tcpPort}`) },\r\n"
     "  { run: () => linkProbe(\"preconnect\", `https://${probeHost}:${tcpPort}`) },\r\n"
-    "  { run: () => { if (typeof window.open !== \"function\") throw new Error(); try { window.open(`${tcpLoopback}/popup`, \"_blank\"); } catch (_) {} }, navigation: true },\r\n"
-    "  { run: () => { try { top.location = `https://${probeHost}/top`; } catch (_) {} }, navigation: true },\r\n"
-    "  { run: () => { try { location = `${tcpLoopback}/frame`; } catch (_) {} }, navigation: true },\r\n"
-    "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} }, navigation: true },\r\n"
-    "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} }, navigation: true },\r\n"
+    "  { run: () => { const link = document.getElementById(\"goal07-user-link\"); let prevented = false; link.href = `${tcpLoopback}/link`; link.addEventListener(\"click\", event => { prevented = event.defaultPrevented; }, { once: true }); link.click(); if (!prevented) throw new Error(); }, navigation: true, userNavigation: true },\r\n"
+    "  { run: () => { const form = document.getElementById(\"goal07-user-form\"); form.action = `${tcpLoopback}/user-form`; const submitEvent = new SubmitEvent(\"submit\", { bubbles: true, cancelable: true }); form.dispatchEvent(submitEvent); form.requestSubmit(); if (!submitEvent.defaultPrevented) throw new Error(); }, navigation: true, userNavigation: true },\r\n"
+    "  { run: () => { if (typeof window.open !== \"function\") throw new Error(); try { window.open(`${tcpLoopback}/popup`, \"_blank\"); } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
+    "  { run: () => { try { top.location = `https://${probeHost}/top`; } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
+    "  { run: () => { const frame = document.createElement(\"iframe\"); frame.src = `https://127.0.0.1:${tcpPort}/subframe`; document.body.appendChild(frame); }, navigation: true, scriptNavigation: true },\r\n"
+    "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
+    "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
+    "  { run: () => { try { location = `${tcpLoopback}/frame`; } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
     "];\r\n"
+    "const networkProbeCount = networkAttempts.filter(attempt => !attempt.navigation).length;\r\n"
     "const navigationAttemptCount = networkAttempts.filter(attempt => attempt.navigation).length;\r\n"
+    "const userNavigationAttemptCount = networkAttempts.filter(attempt => attempt.userNavigation).length;\r\n"
+    "const scriptNavigationAttempts = networkAttempts.filter(attempt => attempt.scriptNavigation);\r\n"
     "async function runAttempts() {\r\n"
+    "  let networkIndex = 0;\r\n"
     "  let navigationIndex = 0;\r\n"
-    "  for (let index = 0; index < networkAttempts.length; index += 1) {\r\n"
-    "    networkStatus.textContent = `Network probe attempted ${index + 1}/${networkAttempts.length}`;\r\n"
-    "    const attempt = networkAttempts[index];\r\n"
+    "  let userNavigationIndex = 0;\r\n"
+    "  for (const attempt of networkAttempts) {\r\n"
+    "    if (attempt.scriptNavigation) continue;\r\n"
     "    if (attempt.navigation) {\r\n"
     "      navigationIndex += 1;\r\n"
     "      navigationStatus.textContent = `Navigation attempt ${navigationIndex}/${navigationAttemptCount} attempted`;\r\n"
+    "    } else {\r\n"
+    "      networkIndex += 1;\r\n"
+    "      networkStatus.textContent = `Network probe attempted ${networkIndex}/${networkProbeCount}`;\r\n"
     "    }\r\n"
     "    await delay(50);\r\n"
     "    try {\r\n"
@@ -224,12 +254,26 @@ SOURCE_TEXT = (
     "      if (result && typeof result.then === \"function\") {\r\n"
     "        await result;\r\n"
     "      }\r\n"
-    "    } catch (_) { networkStatus.textContent = `Network probe failed ${index + 1}/${networkAttempts.length}`; return; }\r\n"
-    "    if (attempt.navigation) {\r\n"
-    "      navigationStatus.textContent = `Navigation attempts complete ${navigationIndex}/${navigationAttemptCount}`;\r\n"
+    "    } catch (_) {\r\n"
+    "      if (attempt.userNavigation) userNavigationStatus.textContent = `User navigation failed ${userNavigationIndex + 1}/${userNavigationAttemptCount}`;\r\n"
+    "      else networkStatus.textContent = `Network probe failed ${networkIndex}/${networkProbeCount}`;\r\n"
+    "      return;\r\n"
     "    }\r\n"
-    "    networkStatus.textContent = `Network probes complete ${index + 1}/${networkAttempts.length}`;\r\n"
+    "    if (attempt.userNavigation) {\r\n"
+    "      userNavigationIndex += 1;\r\n"
+    "      userNavigationStatus.textContent = `User navigation blocked ${userNavigationIndex}/${userNavigationAttemptCount}`;\r\n"
+    "    }\r\n"
+    "    if (!attempt.navigation) {\r\n"
+    "      networkStatus.textContent = `Network probes complete ${networkIndex}/${networkProbeCount}`;\r\n"
+    "    }\r\n"
     "  }\r\n"
+    "  navigationRelease.addEventListener(\"click\", () => {\r\n"
+    "    for (const attempt of scriptNavigationAttempts) {\r\n"
+    "      try { attempt.run(); } catch (_) {}\r\n"
+    "    }\r\n"
+    "  }, { once: true });\r\n"
+    "  navigationReleaseStatus.textContent = `Ready to run script navigation probes ${scriptNavigationAttempts.length}/${scriptNavigationAttempts.length}`;\r\n"
+    "  navigationRelease.disabled = false;\r\n"
     "}\r\n"
     "runAttempts();\r\n"
     "</script>\r\n"
@@ -395,9 +439,12 @@ def fixture_source(network_probes: NetworkProbeListeners) -> str:
 
 
 def canonicalize_fixture_source(
-    value: str | bytes, network_probes: NetworkProbeListeners
+    value: str | bytes, network_probes: NetworkProbeListeners | None = None
 ) -> str | bytes:
-    """Replace this run's ports before fingerprinting the fixture or editor."""
+    """Replace this run's ports before fingerprinting the fixture, editor, or
+    clipboard."""
+    if network_probes is None:
+        return value
     if isinstance(value, bytes):
         return (
             value.replace(
@@ -417,6 +464,15 @@ def canonicalize_fixture_source(
             f'const udpPort = "{UDP_PORT_TOKEN}";',
         )
     )
+
+
+def fixture_text_fingerprint(
+    value: str, network_probes: NetworkProbeListeners | None = None
+) -> Fingerprint:
+    canonical = canonicalize_fixture_source(value, network_probes)
+    if not isinstance(canonical, str):
+        raise TypeError("fixture text fingerprint must be text")
+    return fingerprint_text(canonical)
 
 
 def fixture_fingerprint(path: Path, network_probes: NetworkProbeListeners) -> Fingerprint:
@@ -523,7 +579,8 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
     disk = fingerprint_bytes(SOURCE_BYTES)
     # Accept(h1) alone: Reject(h2) writes nothing and its Undo leaves h2 open,
     # so this is also the approved result Copy exports.
-    one_accepted = fingerprint_bytes(apply_edits(EDITOR_SOURCE_BYTES, edits[:1]))
+    one_accepted_source = apply_edits(EDITOR_SOURCE_BYTES, edits[:1]).decode("utf-8")
+    one_accepted = fixture_text_fingerprint(one_accepted_source)
     expected = {
         "web_security_disk_before": disk,
         # The field shows the docked h1's replacement itself, not its line.
@@ -740,10 +797,10 @@ class Goal07Harness(NativeHarness):
         if editor is None or not editor.is_visible() or not editor.is_enabled():
             return None
         text = self.read_editor_text(app, editor)
-        text = canonicalize_fixture_source(text, self.network_probes)
-        if not isinstance(text, str):
-            raise HarnessFailure("SOURCE_EDITOR_TEXT_INVALID")
-        return fingerprint_text(text)
+        try:
+            return fixture_text_fingerprint(text, self.network_probes)
+        except TypeError:
+            raise HarnessFailure("SOURCE_EDITOR_TEXT_INVALID") from None
 
     def _require_foreground(self, app: Any) -> None:
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
@@ -980,12 +1037,18 @@ class Goal07Harness(NativeHarness):
     def phase_web_security(
         self, app: Any, _provider: provider_fixtures.LoopbackRevisionServer, source: Path
     ) -> dict[str, Any]:
-        """Prove scripts run and navigation attempts stay in the sandboxed preview."""
+        """Release script navigation probes only after user-style navigation is blocked."""
         observed: dict[str, Any] = {}
         network_probes = self.network_probes
         record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
         self.wait_name(app, SCRIPT_EFFECT_TEXT, "Text", "SCRIPT_EFFECT_TIMEOUT")
+        self.wait_name(
+            app,
+            USER_NAVIGATION_BLOCKED_TEXT,
+            "Text",
+            "USER_NAVIGATION_NOT_BLOCKED",
+        )
         self.wait_name(
             app,
             NETWORK_ATTEMPTS_COMPLETE_TEXT,
@@ -994,12 +1057,20 @@ class Goal07Harness(NativeHarness):
         )
         self.wait_name(
             app,
-            NAVIGATION_ATTEMPTS_COMPLETE_TEXT,
+            SCRIPT_NAVIGATION_READY_TEXT,
             "Text",
-            "NAVIGATION_ATTEMPTS_TIMEOUT",
+            "SCRIPT_NAVIGATION_READY_TIMEOUT",
         )
+        release = self.find_named(
+            app,
+            SCRIPT_NAVIGATION_RELEASE_NAME,
+            "Button",
+            "SCRIPT_NAVIGATION_RELEASE_UIA_TIMEOUT",
+            "SCRIPT_NAVIGATION_RELEASE_UIA_MISMATCH",
+            anonymous=False,
+        )
+        self.click_control(release, "SCRIPT_NAVIGATION_RELEASE_CLICK_FAILED")
         self.win32.sleep(SCRIPT_NAVIGATION_SETTLE_SECONDS)
-        self.wait_name(app, SCRIPT_EFFECT_TEXT, "Text", "PREVIEW_LEFT_FIXTURE")
         if app.process.poll() is not None:
             raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
         windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
@@ -1050,7 +1121,9 @@ class Goal07Harness(NativeHarness):
         self.decide_hunks(app, [False], total, decided=1)
         self.undo_decision(app, 1, total)
         record(
-            observed, "decisions_clipboard_copied", fingerprint_text(self.copy_approved(app))
+            observed,
+            "decisions_clipboard_copied",
+            fixture_text_fingerprint(self.copy_approved(app), self.network_probes),
         )
         # An edit over the whole document touches the open h2's part: the
         # field says so and offers no Accept.

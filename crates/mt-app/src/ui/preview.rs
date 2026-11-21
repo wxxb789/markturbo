@@ -120,6 +120,23 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
 /// The web compatibility pane: the document as a page, in the column (Web)
 /// or in the field (SplitWeb).
 pub fn web(state: AppState, language: Language) -> AnyElement {
+    web_for_host(state, language, is_high_integrity_host())
+}
+
+fn web_for_host(state: AppState, language: Language, high_integrity_host: bool) -> AnyElement {
+    if high_integrity_host {
+        return view()
+            .test_id("web-preview-disabled")
+            .flex_1()
+            .min_h(px(0.0))
+            .h(relative(1.0))
+            .child(prims::ink(SharedString::from(i18n::t(
+                language,
+                Key::WebPreviewDisabledElevated,
+            ))))
+            .into_element();
+    }
+
     let Some(tab) = state.active_tab() else {
         return quiet_label(move || SharedString::from(i18n::t(language, Key::ModeWeb)))
             .into_element();
@@ -138,6 +155,49 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
                 .flex_1(),
         )
         .into_element()
+}
+
+#[cfg(target_os = "windows")]
+fn is_high_integrity_host() -> bool {
+    use std::ffi::c_void;
+    use windows::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle for this process.
+    let process = unsafe { GetCurrentProcess() };
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is valid and `token` is a writable output slot.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_err() {
+        return true;
+    }
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0;
+    // SAFETY: `token` is queryable, and `elevation` provides a correctly sized,
+    // aligned output buffer for the TokenElevation information class.
+    let result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    // SAFETY: `token` is the handle returned by the successful OpenProcessToken call above.
+    let _ = unsafe { CloseHandle(token) };
+
+    result.is_err()
+        || (returned as usize) < std::mem::size_of::<TOKEN_ELEVATION>()
+        || elevation.TokenIsElevated != 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_high_integrity_host() -> bool {
+    false
 }
 
 /// A quiet label for a surface that has nothing else to say.
@@ -685,6 +745,38 @@ mod tests {
         app.settle();
         assert_eq!(web_view_count(&app), 1, "{}", dump(&app));
         assert_document(&app, "Document 1", "Document 2");
+    }
+
+    #[component]
+    fn ElevatedWebPaneProbe() -> impl IntoElement {
+        web_for_host(probe_state(), Language::English, true)
+    }
+
+    #[test]
+    fn elevated_web_pane_shows_reason_without_mounting_a_webview() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ElevatedWebPaneProbe>()))
+            .expect("start the elevated-host probe");
+        app.settle();
+
+        let nodes = app.screen().layout_nodes();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.test_id.as_deref() == Some("web-preview-disabled")),
+            "{}",
+            dump(&app)
+        );
+        assert_eq!(
+            web_view_count(&app),
+            0,
+            "an elevated host must not mount a WebView: {}",
+            dump(&app)
+        );
+        assert!(
+            texts(&app).contains("Web preview is disabled while MarkTurbo runs elevated."),
+            "{}",
+            dump(&app)
+        );
     }
 
     fn web_view_count(app: &Headless) -> usize {

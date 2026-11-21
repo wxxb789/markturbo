@@ -3186,6 +3186,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "windows 0.61.3",
 ]
 
 [[package]]
